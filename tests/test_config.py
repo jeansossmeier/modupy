@@ -71,6 +71,35 @@ def test_malformed_pyproject_is_silently_skipped(tmp_path: Path) -> None:
     assert cfg.outbox == "memory"
 
 
+# ----- contracts_module (convention with a configurable default) -------------
+
+
+def test_contracts_module_defaults_to_convention() -> None:
+    """Unset, the contracts module follows the 'contracts' convention."""
+    cfg = load_configuration(package="x")
+    assert cfg.contracts_module == "contracts"
+    assert not cfg.is_explicit("contracts_module")
+
+
+def test_contracts_module_override() -> None:
+    """The convention is a default, not a hardcode — it can be overridden."""
+    cfg = load_configuration(package="x", contracts_module="shared")
+    assert cfg.contracts_module == "shared"
+    assert cfg.is_explicit("contracts_module")
+
+
+def test_contracts_module_from_pyproject(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text('[tool.modulith]\ncontracts_module = "shared"\n')
+    cfg = load_configuration()
+    assert cfg.contracts_module == "shared"
+
+
+def test_contracts_module_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("MODULITH_CONTRACTS_MODULE", "kernel")
+    cfg = load_configuration(package="x")
+    assert cfg.contracts_module == "kernel"
+
+
 # ----- Environment variables -------------------------------------------------
 
 
@@ -138,6 +167,35 @@ def test_production_with_durable_outbox_is_allowed() -> None:
     assert cfg.outbox == "postgres"
 
 
+def test_process_topology_with_default_memory_broker_refuses_to_start() -> None:
+    """topology=processes + the default memory broker can't deliver cross-process.
+
+    Regression: this combination used to validate clean and then silently
+    no-op delivery deep in the runtime instead of failing fast.
+    """
+    with pytest.raises(ConfigurationError, match="requires a cross-process broker"):
+        load_configuration(topology="processes")
+
+
+def test_subinterpreters_topology_with_memory_broker_refuses_to_start() -> None:
+    """Same coupling applies to the subinterpreters topology."""
+    with pytest.raises(ConfigurationError, match="requires a cross-process broker"):
+        load_configuration(topology="subinterpreters", broker="memory")
+
+
+def test_process_topology_with_real_broker_is_allowed() -> None:
+    """A process topology with a non-memory broker validates clean."""
+    cfg = load_configuration(topology="processes", broker="redis-streams")
+    assert cfg.topology == "processes"
+    assert cfg.broker == "redis-streams"
+
+
+def test_single_topology_with_memory_broker_is_allowed() -> None:
+    """The default single-process topology is fine on the memory broker."""
+    cfg = load_configuration(topology="single")
+    assert cfg.broker == "memory"
+
+
 # ----- Boolean coercion (T0.3) -----------------------------------------------
 
 
@@ -200,6 +258,26 @@ def test_pyproject_workers_subtable_maps_to_workers_field(tmp_path: Path) -> Non
     (tmp_path / "pyproject.toml").write_text("[tool.modulith.workers]\ndefault = 1\nreports = 4\n")
     cfg = load_configuration()
     assert cfg.workers == {"default": 1, "reports": 4}
+
+
+def test_pyproject_broker_subtable_maps_to_broker_options(tmp_path: Path) -> None:
+    """[tool.modulith.broker] populates broker_options (the SPEC's broker config).
+
+    Regression: the subtable was previously dropped (no broker_options field),
+    so SPEC-documented TOML broker settings were silently ignored.
+    """
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.modulith.broker]\n"
+        'url = "redis://cache:6379"\n'
+        'consumer_group = "modulith-orders"\n'
+    )
+    cfg = load_configuration()
+    assert cfg.broker_options == {
+        "url": "redis://cache:6379",
+        "consumer_group": "modulith-orders",
+    }
+    # Subtable form leaves the broker *name* at its default (set out-of-band).
+    assert cfg.broker == "memory"
 
 
 def test_pyproject_unknown_subtable_is_silently_dropped(tmp_path: Path) -> None:

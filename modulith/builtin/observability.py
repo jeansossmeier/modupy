@@ -4,13 +4,12 @@ When OTel is installed and a tracer provider is configured, this plugin
 automatically creates spans for:
   - Every cross-module event publication (parent span)
   - Every listener dispatch (child span linked to the publication)
-  - Every plugin hook call (debug-level — high volume, opt-in)
 
 When OTel is NOT installed, the plugin loads but does nothing. No
 errors, no warnings — true silent no-op. This matters because most
 apps ship with OTel as a soft dependency (configured per environment).
-
-Implementation status: SKELETON. ~120 lines when complete.
+Even when OTel *is* installed but no provider is configured, the proxy
+tracer hands back non-recording spans, so the cost is negligible.
 
 Distributed via the `modulith[otel]` extra. The plugin auto-detects
 OTel availability at import time via a try/except block.
@@ -19,30 +18,48 @@ Spans emitted:
 
   modulith.event.publish
     attributes:
-      event.type     — fully-qualified class name
-      event.module   — source module (where publish was called from)
-      modulith.outbox = true | false
+      event.type           — fully-qualified class name
+      event.module         — source module (where publish was called from)
+      modulith.duration_ms — wall-clock from before → after publish
     duration: from before_event_published hook to after_event_published
 
   modulith.event.dispatch
     attributes:
       event.type
       listener.name
-      listener.module
-      listener.duration_ms
-    parent: linked to modulith.event.publish span
-    duration: just the listener invocation
+      publication.id
+    parent: the modulith.event.publish span
+    duration: just the listener invocation (dispatch → complete)
+    status: ERROR (with recorded exception) when the listener raises
+
+Span lifecycle relies on the paired hooks: ``modulith_before_event_published``
+/ ``modulith_after_event_published`` bracket the publish span, and
+``modulith_on_listener_dispatch`` / ``modulith_on_listener_complete`` bracket
+each dispatch span. ``modulith_on_listener_complete`` always fires (success or
+failure), so dispatch spans are guaranteed to end.
+
+Durable (outbox) path: when an outbox store is configured *and* a transaction
+session is bound, ``Runtime.publish`` persists the event and returns before any
+in-memory dispatch — ``modulith_after_event_published`` never fires in the
+publishing context, so starting a publish span there would leak. We detect that
+case and skip the publish span; the later outbox dispatch still emits its own
+dispatch spans.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from contextvars import ContextVar
 from typing import Any
 
 from modulith import EventPublication, hookimpl
 
 logger = logging.getLogger("modulith.observability")
+
+# Instrumenting-library version recorded on the tracer. Passed positionally —
+# OTel >= 1.43 removed the ``version=`` keyword from get_tracer().
+_INSTRUMENTING_VERSION = "0.1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -54,20 +71,23 @@ try:
     from opentelemetry.trace import Status, StatusCode
 
     _OTEL_AVAILABLE = True
-    _tracer = trace.get_tracer("modulith", version="0.1.0")
+    _tracer: Any = trace.get_tracer("modulith", _INSTRUMENTING_VERSION)
 except ImportError:
     _OTEL_AVAILABLE = False
     _tracer = None
 
 
 # ---------------------------------------------------------------------------
-# Per-publication span context
+# Per-publication / per-dispatch span context
 # ---------------------------------------------------------------------------
 
-# We keep the active span around so the listener-dispatch hook can link
-# its span to the publication's span.
-_active_span: ContextVar[Any] = ContextVar("_modulith_active_span", default=None)
+# The active publish span, so the listener-dispatch hook can parent its span
+# to it. Each listener runs in its own copied context (asyncio.gather wraps
+# each coroutine in a Task), so the dispatch span set here is isolated per
+# listener and pairs cleanly with the completion hook in the same context.
+_publish_span: ContextVar[Any] = ContextVar("_modulith_publish_span", default=None)
 _publish_start: ContextVar[float] = ContextVar("_modulith_publish_start", default=0.0)
+_dispatch_span: ContextVar[Any] = ContextVar("_modulith_dispatch_span", default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -77,41 +97,36 @@ _publish_start: ContextVar[float] = ContextVar("_modulith_publish_start", defaul
 
 @hookimpl
 def modulith_before_event_published(event: Any) -> None:
-    """Start a span for this publication.
-
-    IMPLEMENTATION TODO:
-    if not _OTEL_AVAILABLE: return
+    """Start the publication span (in-memory path only)."""
+    if not _OTEL_AVAILABLE:
+        return
+    if _durable_path_owns_dispatch():
+        # The outbox will dispatch after commit; after_event_published won't
+        # fire in this context, so a span started here would never end.
+        return
     span = _tracer.start_span(
         "modulith.event.publish",
         attributes={
-            "event.type": f"{type(event).__module__}.{type(event).__qualname__}",
+            "event.type": _event_type(event),
             "event.module": _detect_calling_module(),
         },
     )
-    _active_span.set(span)
+    _publish_span.set(span)
     _publish_start.set(time.monotonic())
-    """
-    if not _OTEL_AVAILABLE:
-        return
-    raise NotImplementedError("Phase 2 — see TODO above")
 
 
 @hookimpl
 def modulith_after_event_published(event: Any, publication: EventPublication) -> None:
-    """End the publication span.
-
-    IMPLEMENTATION TODO:
-    if not _OTEL_AVAILABLE: return
-    span = _active_span.get()
-    if span is None: return
+    """End the publication span, recording its wall-clock duration."""
+    if not _OTEL_AVAILABLE:
+        return
+    span = _publish_span.get()
+    if span is None:
+        return
     duration_ms = (time.monotonic() - _publish_start.get()) * 1000
     span.set_attribute("modulith.duration_ms", duration_ms)
     span.end()
-    _active_span.set(None)
-    """
-    if not _OTEL_AVAILABLE:
-        return
-    raise NotImplementedError("Phase 2")
+    _publish_span.set(None)
 
 
 @hookimpl
@@ -120,52 +135,41 @@ def modulith_on_listener_dispatch(
     listener_name: str,
     publication: EventPublication,
 ) -> None:
-    """Start a span for one listener invocation.
-
-    IMPLEMENTATION TODO:
-    if not _OTEL_AVAILABLE: return
-    parent = _active_span.get()
+    """Start a span for one listener invocation, parented to the publish span."""
+    if not _OTEL_AVAILABLE:
+        return
+    parent = _publish_span.get()
+    context = trace.set_span_in_context(parent) if parent is not None else None
     span = _tracer.start_span(
         "modulith.event.dispatch",
-        context=trace.set_span_in_context(parent) if parent else None,
+        context=context,
         attributes={
-            "event.type": f"{type(event).__module__}.{type(event).__qualname__}",
+            "event.type": _event_type(event),
             "listener.name": listener_name,
             "publication.id": str(publication.id),
         },
     )
-
-    NOTE: the listener invocation runs synchronously after this hook in
-    the event bus. We need a corresponding span.end() somewhere. Two
-    options:
-      1. Add a modulith_after_listener_dispatch hookspec (cleaner).
-      2. Wrap the listener call ourselves via hookwrapper (uglier).
-
-    Decision pending — see SPEC.md §4.1 hookspec list. For v1.1 add
-    the after_dispatch hookspec; for v1 use hookwrapper.
-    """
-    if not _OTEL_AVAILABLE:
-        return
-    raise NotImplementedError("Phase 2")
+    _dispatch_span.set(span)
 
 
 @hookimpl
-def modulith_on_listener_error(
+def modulith_on_listener_complete(
     event: Any,
     listener_name: str,
     publication: EventPublication,
-    exception: BaseException,
+    exception: BaseException | None,
 ) -> None:
-    """Mark the dispatch span as errored.
-
-    IMPLEMENTATION TODO:
-    if not _OTEL_AVAILABLE: return
-    span = trace.get_current_span()  # or maintain our own ContextVar
-    span.record_exception(exception)
-    span.set_status(Status(StatusCode.ERROR, str(exception)))
-    """
+    """End the listener-dispatch span; mark it errored if the listener raised."""
     if not _OTEL_AVAILABLE:
         return
+    span = _dispatch_span.get()
+    if span is None:
+        return
+    if exception is not None:
+        span.record_exception(exception)
+        span.set_status(Status(StatusCode.ERROR, str(exception)))
+    span.end()
+    _dispatch_span.set(None)
 
 
 # ---------------------------------------------------------------------------
@@ -173,23 +177,59 @@ def modulith_on_listener_error(
 # ---------------------------------------------------------------------------
 
 
-def _detect_calling_module() -> str:
-    """Best-effort detection of which module called publish().
+def _event_type(event: Any) -> str:
+    return f"{type(event).__module__}.{type(event).__qualname__}"
 
-    IMPLEMENTATION TODO:
-    Walk the call stack looking for a frame whose module is under the
-    application package and isn't modulith itself. The first such
-    module is the publisher.
 
-    Returns "unknown" if detection fails — observability shouldn't
-    block business logic over best-effort metadata.
+def _durable_path_owns_dispatch() -> bool:
+    """Mirror ``Runtime._outbox_owns_dispatch`` without importing the runtime.
+
+    The durable path owns dispatch when an outbox store is configured *and* a
+    transaction session is bound to the current context.
     """
+    from . import outbox
+
+    return outbox._store is not None and outbox._current_session.get() is not None
+
+
+def _detect_calling_module() -> str:
+    """Best-effort: which application module called ``publish()``.
+
+    Walks the call stack for the first frame whose module is under the
+    configured application package and isn't modulith itself. Returns
+    ``"unknown"`` if detection fails — observability must never block or
+    perturb business logic over best-effort metadata.
+    """
+    try:
+        from ..runtime import _runtime
+
+        cfg = _runtime.config
+        app_package = cfg.package if cfg is not None else None
+        if not app_package:
+            return "unknown"
+
+        import sys
+
+        depth = 1
+        while True:
+            try:
+                frame = sys._getframe(depth)
+            except ValueError:
+                break
+            name = str(frame.f_globals.get("__name__", ""))
+            if (name == app_package or name.startswith(app_package + ".")) and not name.startswith(
+                "modulith"
+            ):
+                return name
+            depth += 1
+    except Exception:  # pragma: no cover - detection is best-effort only
+        logger.debug("calling-module detection failed", exc_info=True)
     return "unknown"
 
 
 __all__ = [
     "modulith_after_event_published",
     "modulith_before_event_published",
+    "modulith_on_listener_complete",
     "modulith_on_listener_dispatch",
-    "modulith_on_listener_error",
 ]

@@ -22,6 +22,19 @@ from modulith import event, listener
 from modulith.runtime import _runtime
 
 
+# Event types are defined at MODULE scope on purpose. This file uses
+# ``from __future__ import annotations`` (PEP 563), so a listener's event
+# annotation reaches @listener as the *string* "E" — @listener resolves it
+# against the function's module globals. A class defined in local (function)
+# scope would be invisible to that resolution; module scope is the supported
+# pattern for PEP 563 (see tests/test_sync.py for the no-future-import
+# alternative used with local-scope events).
+@event
+@dataclass(frozen=True)
+class E:
+    pass
+
+
 @pytest.fixture(autouse=True)
 def _reset_runtime() -> None:
     """Each test gets a clean runtime so listener registrations don't leak."""
@@ -50,11 +63,6 @@ def test_event_marks_class() -> None:
 
 
 def test_listener_accepts_async_function() -> None:
-    @event
-    @dataclass(frozen=True)
-    class E:
-        pass
-
     @listener
     async def handler(evt: E) -> None:
         pass
@@ -66,11 +74,6 @@ def test_listener_accepts_wrapped_async_function() -> None:
     """Regression test for B1: @functools.wraps-decorated async listeners
     must register correctly even though the wrapper hides the coroutine
     nature from naive isinstance/iscoroutinefunction checks."""
-
-    @event
-    @dataclass(frozen=True)
-    class E:
-        pass
 
     def timing(f):
         @functools.wraps(f)
@@ -91,11 +94,6 @@ def test_listener_accepts_wrapped_async_function() -> None:
 
 def test_listener_accepts_double_wrapped_async_function() -> None:
     """Multiple decorator layers (each preserving __wrapped__) must work."""
-
-    @event
-    @dataclass(frozen=True)
-    class E:
-        pass
 
     def deco_one(f):
         @functools.wraps(f)
@@ -123,11 +121,6 @@ def test_listener_accepts_double_wrapped_async_function() -> None:
 def test_listener_accepts_sync_function() -> None:
     """T1.2.4: sync functions with a valid event annotation are now accepted."""
 
-    @event
-    @dataclass(frozen=True)
-    class E:
-        pass
-
     @listener
     def handler(evt: E) -> None:
         pass
@@ -139,11 +132,6 @@ def test_listener_accepts_sync_function() -> None:
 
 def test_listener_accepts_wrapped_sync_function() -> None:
     """A sync wrapper around a sync target is accepted (executor dispatch)."""
-
-    @event
-    @dataclass(frozen=True)
-    class E:
-        pass
 
     def naive_wrap(f):
         @functools.wraps(f)

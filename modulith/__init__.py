@@ -12,6 +12,14 @@ Public API for two audiences:
 Anything not re-exported here is internal and may change without notice.
 """
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+
+try:
+    __version__ = _pkg_version("modulith")
+except PackageNotFoundError:  # running from a source checkout that isn't installed
+    __version__ = "0.1.0"
+
 # ----- Application-facing API (what most users need) -----------------------
 # ----- Broker dispatch registry --------------------------------------------
 from .brokers import (
@@ -22,7 +30,7 @@ from .brokers import (
 
 # ----- Configuration ------------------------------------------------------
 from .config import Configuration, ConfigurationError
-from .decorators import configure, event, listener, publish
+from .decorators import configure, event, externalized, listener, publish
 
 # ----- Plugin manager (advanced — most users don't need this) -------------
 from .manager import create_plugin_manager
@@ -39,6 +47,9 @@ from .protocols import (
     EventSerializer,
     PublicationStore,
 )
+
+# ----- Sync entrypoint (sync views, scripts, sync DB code) -----------------
+from .sync import publish_sync
 
 # ----- Plugin contract types -----------------------------------------------
 from .types import (
@@ -66,6 +77,7 @@ __all__ = [
     "UnknownBrokerError",
     "Violation",
     "ViolationSeverity",
+    "__version__",
     "configure",
     # Manager (advanced)
     "create_plugin_manager",
@@ -73,9 +85,11 @@ __all__ = [
     "declare_module",
     # Application API
     "event",
+    "externalized",
     "get_manifest",
     # Plugin authoring
     "hookimpl",
     "listener",
     "publish",
+    "publish_sync",
 ]

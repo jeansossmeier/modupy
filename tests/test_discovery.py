@@ -9,6 +9,7 @@ walker out and exercise pyproject.toml resolution in isolation.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -104,3 +105,65 @@ def test_call_stack_strategy_returns_a_package_when_called_from_a_module() -> No
     pkg = detect_application_package()
     assert isinstance(pkg, str)
     assert pkg  # non-empty
+
+
+# ----- _is_stdlib_frame (installed-app detectability) -----------------------
+
+
+def test_is_stdlib_frame_excludes_site_and_dist_packages() -> None:
+    """An installed app under site-/dist-packages must NOT be treated as stdlib.
+
+    Regression: classifying site-packages as third-party made every
+    ``pip install``ed application undetectable via the stack walk.
+    """
+    from modulith.discovery import _is_stdlib_frame
+
+    assert _is_stdlib_frame(Path("/usr/lib/python3.11/site-packages/myapp/orders.py")) is False
+    assert _is_stdlib_frame(Path("/usr/lib/python3/dist-packages/myapp/orders.py")) is False
+
+
+def test_is_stdlib_frame_flags_real_stdlib_path() -> None:
+    """A file under <prefix>/lib (but not site-packages) is stdlib."""
+    from modulith.discovery import _is_stdlib_frame
+
+    stdlib_file = Path(sys.prefix) / "lib" / "python3.11" / "json" / "__init__.py"
+    assert _is_stdlib_frame(stdlib_file) is True
+
+
+def test_is_stdlib_frame_excludes_project_paths() -> None:
+    """A plain project file is neither stdlib nor skipped."""
+    from modulith.discovery import _is_stdlib_frame
+
+    assert _is_stdlib_frame(Path("/home/dev/myapp/orders/service.py")) is False
+
+
+# ----- builtin discovery resilience (broken module / manifest) --------------
+
+
+def test_builtin_discovery_survives_a_broken_module(make_fake_app) -> None:
+    """One module failing to import must not crash discovery of the others.
+
+    The broken module also ships a ``_manifest.py``: probing for it via
+    ``find_spec`` re-imports the (broken) parent, so without the
+    import-ok guard the whole hook would raise and discover *nothing*.
+    """
+    import sys as _sys
+
+    from modulith.builtin.discovery import modulith_discover_modules
+
+    pkg = make_fake_app(
+        {
+            "good": "value = 1\n",
+            "broken": "raise RuntimeError('boom at import time')\n",
+        },
+        extra_files={"broken/_manifest.py": "x = 1\n"},
+    )
+
+    modules = modulith_discover_modules(pkg)
+
+    names = {m.name for m in modules}
+    # Both modules are *recorded* (discovery is structural); the broken one
+    # simply fails to import — it doesn't abort the walk.
+    assert names == {"good", "broken"}
+    # The good module imported successfully despite its broken sibling.
+    assert f"{pkg}.good" in _sys.modules

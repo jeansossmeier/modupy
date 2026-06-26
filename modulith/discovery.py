@@ -1,9 +1,18 @@
 """Auto-detection of the application's root package.
 
 Strategies, in priority order:
-  1. Walk the call stack for the first non-modulith frame; take its
-     top-level package name (skipping site-packages and __main__).
+  1. Walk the call stack for the first non-modulith, non-stdlib frame; take
+     its top-level package name (skipping stdlib and __main__).
   2. Read [project].name from pyproject.toml in cwd or parents.
+
+Auto-detection is best-effort and dev-oriented. It deliberately does NOT
+treat ``site-packages`` as third-party: an installed application (``pip
+install``, including many ``-e`` layouts) lives there, and skipping it would
+misclassify the app's own frames. The trade-off is that a third-party library
+that calls modulith on the user's behalf as the *immediate* caller could be
+mis-detected — embedded/installed deployments should set the package
+explicitly (``configure(package=...)``, ``[tool.modulith].package``, or
+``MODULITH_PACKAGE``) rather than rely on the stack walk.
 
 Detection runs once during bootstrap. If both strategies fail, raise a
 ConfigurationError with explicit instructions on how to set the package
@@ -73,20 +82,22 @@ def _detect_from_caller_stack() -> str | None:
             frame = frame.f_back
             continue
 
-        # Skip stdlib and site-packages frames (third-party libs that
-        # might call modulith on the user's behalf).
-        if _is_stdlib_or_third_party(frame_file):
-            frame = frame.f_back
-            continue
-
         # Read the module name from the frame's globals. This is what
         # Python sets as __name__ when the module is imported normally.
         # Cast to str since f_globals is dict[str, Any].
         module_name = str(frame.f_globals.get("__name__", ""))
+        top = module_name.split(".")[0] if module_name else ""
+
+        # Skip stdlib frames — by module name (robust across install layouts)
+        # and by path. NOT site-packages: an installed app lives there and must
+        # remain detectable (see module docstring for the trade-off).
+        if not top or top in sys.stdlib_module_names or _is_stdlib_frame(frame_file):
+            frame = frame.f_back
+            continue
 
         # __main__ frames don't tell us anything useful — fall through.
-        if module_name and module_name != "__main__":
-            return module_name.split(".")[0]
+        if module_name != "__main__":
+            return top
 
         frame = frame.f_back
 
@@ -104,13 +115,17 @@ def _detect_from_pyproject_name() -> str | None:
             with candidate.open("rb") as f:
                 data = tomllib.load(f)
         except (OSError, tomllib.TOMLDecodeError):
-            return None
+            # Unreadable/malformed pyproject — keep walking up the parent chain
+            # rather than abandoning detection at the first bad file.
+            continue
 
         name = data.get("project", {}).get("name")
         if name:
             # PEP 503 normalizes hyphens to underscores for import names.
             return str(name).replace("-", "_")
-        return None
+        # A pyproject without [project].name isn't a package declaration
+        # (e.g. a tooling-only or monorepo-root file); try the next parent.
+        continue
     return None
 
 
@@ -123,16 +138,18 @@ def _is_inside(path: Path, root: Path) -> bool:
         return False
 
 
-def _is_stdlib_or_third_party(path: Path) -> bool:
-    """Heuristic: True if the path is in stdlib or installed packages.
+def _is_stdlib_frame(path: Path) -> bool:
+    """True if ``path`` is a stdlib file — NOT site-packages/dist-packages.
 
-    Not perfect — Python's installation layout varies — but catches the
-    common cases (site-packages on Linux/macOS, dist-packages on Debian,
-    Lib on Windows). False positives just delay detection by one frame.
+    Complements the name-based ``sys.stdlib_module_names`` check for stdlib
+    modules whose frame name is unusual (frozen bootstrap, runpy). Crucially it
+    excludes site-packages/dist-packages so an *installed application* there is
+    still detected as the app, not skipped as third-party.
     """
     parts = path.parts
-    return (
-        "site-packages" in parts
-        or "dist-packages" in parts
-        or path.is_relative_to(Path(sys.prefix) / "lib")
-    )
+    if "site-packages" in parts or "dist-packages" in parts:
+        return False
+    for prefix in {sys.prefix, sys.base_prefix}:
+        if path.is_relative_to(Path(prefix) / "lib"):
+            return True
+    return False

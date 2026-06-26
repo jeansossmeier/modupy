@@ -4,8 +4,6 @@ Provides fixtures for testing applications built with modulith without
 the global-state nightmares that come with Python's import system and
 asyncio loops.
 
-Implementation status: SKELETON. ~150 lines when complete.
-
 Distributed in two ways:
   1. As `modulith[test]` extra in v1 — included with main package.
   2. Eventually as `pytest-modulith` standalone in v2 — separate release
@@ -29,12 +27,22 @@ Plus markers:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+import inspect
+import os
+import subprocess
+import sys
+import time
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
+
+from .markers import hookimpl
 
 # ---------------------------------------------------------------------------
 # Fixture: modulith_app — fresh runtime per test
@@ -62,26 +70,54 @@ class ModulithTestApp:
         self.listener_calls.clear()
 
 
+class _SpyPlugin:
+    """A plugin that records hook activity into a ModulithTestApp.
+
+    Registered with the runtime's plugin manager (via ``_extra_plugins``)
+    so it observes every publish and every listener dispatch without the
+    application code knowing it exists. pluggy matches hook arguments by
+    name, so each method only needs to accept the kwargs it uses.
+    """
+
+    def __init__(self, app: ModulithTestApp) -> None:
+        self._app = app
+
+    @hookimpl
+    def modulith_after_event_published(self, event: Any) -> None:
+        self._app.published_events.append(event)
+
+    @hookimpl
+    def modulith_on_listener_dispatch(self, listener_name: str, event: Any) -> None:
+        self._app.listener_calls.append((listener_name, event))
+
+
 @pytest.fixture
-def modulith_app() -> ModulithTestApp:
+def modulith_app() -> Iterator[ModulithTestApp]:
     """Provide a fresh modulith runtime for each test.
 
-    IMPLEMENTATION TODO:
-    1. Reset the global runtime singleton:
-         from modulith.runtime import _runtime
-         _runtime._reset()  # add this method to Runtime class
-    2. Build a ModulithTestApp instance.
-    3. Register a "spy" plugin via the runtime's plugin manager that
-       hooks modulith_after_event_published and modulith_on_listener_dispatch
-       to populate the test app's lists.
-    4. Yield the test app to the test.
-    5. After test: reset runtime, clear listeners, restore sys.modules
-       to the snapshot taken before the test.
-
-    The sys.modules snapshot is essential — modules imported during one
-    test must not leak into the next. Snapshot before test, restore after.
+    Resets the global runtime singleton, registers an event-capturing spy
+    plugin, and yields a handle exposing what was published and dispatched.
+    On teardown the runtime is reset again and any application modules
+    imported during the test are dropped from ``sys.modules`` so they can't
+    leak into the next test. modulith's own modules are preserved — their
+    identity backs the runtime singleton and other global state.
     """
-    raise NotImplementedError("Phase 2 — see TODO above")
+    from .runtime import _runtime
+
+    snapshot = set(sys.modules)
+    _runtime._reset_for_testing()
+
+    test_app = ModulithTestApp()
+    _runtime._extra_plugins.append(_SpyPlugin(test_app))
+
+    try:
+        yield test_app
+    finally:
+        _runtime._reset_for_testing()
+        for name in set(sys.modules) - snapshot:
+            if name.split(".")[0] == "modulith":
+                continue
+            del sys.modules[name]
 
 
 # ---------------------------------------------------------------------------
@@ -94,32 +130,55 @@ def _module_isolation(
     target_module: str,
     *,
     mock_modules: list[str] | None = None,
-):
-    """Context manager: only target_module is loaded; others are mocked.
+) -> Iterator[None]:
+    """Context manager: only ``target_module`` is loaded; others are mocked.
 
-    IMPLEMENTATION TODO:
-    1. Snapshot sys.modules.
-    2. Remove every module starting with the application package, except
-       target_module and its submodules.
-    3. For each module in mock_modules: install a MagicMock at that path
-       in sys.modules so importers get a mock instead of the real module.
-    4. yield
-    5. Restore sys.modules to the snapshot.
+    Within the block, every sibling under the application package (the top
+    segment of ``target_module``) is removed from ``sys.modules`` except the
+    target, its submodules, and its ancestors; each name in ``mock_modules``
+    is replaced with a ``MagicMock`` so importers get a stand-in. On exit the
+    original ``sys.modules`` is restored exactly.
     """
-    raise NotImplementedError("Phase 2")
+    mocks = mock_modules or []
+    app_package = target_module.split(".")[0]
+    ancestors = {
+        ".".join(target_module.split(".")[:i]) for i in range(1, target_module.count(".") + 1)
+    }
+    snapshot = dict(sys.modules)
+
+    for name in list(sys.modules):
+        if not (name == app_package or name.startswith(app_package + ".")):
+            continue
+        if name == target_module or name.startswith(target_module + "."):
+            continue
+        if name in ancestors:
+            continue
+        del sys.modules[name]
+
+    for name in mocks:
+        sys.modules[name] = MagicMock(name=name)
+
+    try:
+        yield
+    finally:
+        for name in set(sys.modules) - set(snapshot):
+            del sys.modules[name]
+        for name, module in snapshot.items():
+            sys.modules[name] = module
 
 
 @pytest.fixture
-def modulith_module():
+def modulith_module() -> Callable[..., Any]:
     """Test a single module in isolation from siblings.
 
-    Usage:
+    Usage::
+
         def test_orders_in_isolation(modulith_module):
-            with modulith_module("orders", mock_modules=["inventory"]):
+            with modulith_module("myapp.orders", mock_modules=["myapp.inventory"]):
                 from myapp.orders import create_order
                 create_order(...)
 
-    Returns the _module_isolation context manager. Tests call it with
+    Returns the ``_module_isolation`` context manager. Tests call it with
     the target module name and any mocks they need.
     """
     return _module_isolation
@@ -133,40 +192,41 @@ def modulith_module():
 class Scenario:
     """Fluent builder for event-driven flow tests.
 
-    Spring Modulith has Scenario; we mirror the API. Pattern:
+    Spring Modulith has Scenario; we mirror the API. Pattern::
 
         scenario.publish(OrderPlaced(...)) \\
                 .expect_event(OrderConfirmed) \\
                 .matching(lambda e: e.order_id == "123") \\
                 .within(seconds=2)
 
-    Each method returns self for chaining. .within() is the terminal
-    operation — it polls the test app's published_events list with
-    timeout, raises on miss.
+    Each method returns self for chaining. ``.within()`` is the terminal
+    operation — it triggers the publish/call, then polls the test app's
+    captured ``published_events`` for the expected event, raising on miss.
     """
 
     def __init__(self, app: ModulithTestApp) -> None:
         self._app = app
         self._initial_event: Any = None
-        self._initial_call: Callable | None = None
-        self._initial_call_args: tuple = ()
+        self._initial_call: Callable[..., Any] | None = None
+        self._initial_call_args: tuple[Any, ...] = ()
+        self._initial_call_kwargs: dict[str, Any] = {}
         self._expected_type: type | None = None
         self._predicate: Callable[[Any], bool] | None = None
 
     def publish(self, event: Any) -> Scenario:
         """Publish an event as the trigger.
 
-        IMPLEMENTATION TODO: store the event, return self.
-        Actual publishing happens in within() to allow setup to complete first.
+        The event is stored and actually published in ``within()`` so the
+        rest of the chain (and any test setup) completes first.
         """
         self._initial_event = event
         return self
 
-    def call(self, fn: Callable, *args: Any, **kwargs: Any) -> Scenario:
+    def call(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Scenario:
         """Call a function as the trigger (alternative to publish)."""
         self._initial_call = fn
         self._initial_call_args = args
-        # IMPLEMENTATION: also store kwargs
+        self._initial_call_kwargs = kwargs
         return self
 
     def expect_event(self, event_type: type) -> Scenario:
@@ -182,24 +242,46 @@ class Scenario:
     def within(self, seconds: float) -> Any:
         """Terminal: trigger and poll for the expected event.
 
-        IMPLEMENTATION TODO:
-        1. Mark current state of self._app.published_events (length).
-        2. Trigger: if self._initial_event, call publish_sync;
-                    if self._initial_call, call it.
-        3. Poll loop with timeout:
-             deadline = time.monotonic() + seconds
-             while time.monotonic() < deadline:
-                 new_events = self._app.published_events[mark:]
-                 for event in new_events:
-                     if isinstance(event, self._expected_type):
-                         if self._predicate is None or self._predicate(event):
-                             return event
-                 await asyncio.sleep(0.01)
-             raise AssertionError(f"Expected event {self._expected_type.__name__} "
-                                  f"not seen within {seconds}s")
-        4. Use anyio for cross-loop compatibility if pytest-asyncio config differs.
+        ``publish_sync`` (and any synchronous trigger function) blocks until
+        all listeners — and the events they publish in turn — have been
+        dispatched and captured, so the poll loop usually finds the event on
+        its first pass. The timeout is a safety net for genuinely async
+        fan-out and a clean failure mode when the event never arrives.
         """
-        raise NotImplementedError("Phase 2 — see TODO above")
+        if self._expected_type is None:
+            raise ValueError("call expect_event(...) before within(...)")
+        if self._initial_event is None and self._initial_call is None:
+            raise ValueError("call publish(...) or call(...) before within(...)")
+
+        from .sync import _get_or_create_loop, publish_sync
+
+        mark = len(self._app.published_events)
+
+        if self._initial_event is not None:
+            publish_sync(self._initial_event)
+        else:
+            assert self._initial_call is not None
+            result = self._initial_call(*self._initial_call_args, **self._initial_call_kwargs)
+            if inspect.iscoroutine(result):
+                future: Future[Any] = asyncio.run_coroutine_threadsafe(
+                    result, _get_or_create_loop()
+                )
+                future.result(timeout=seconds)
+
+        deadline = time.monotonic() + seconds
+        while True:
+            for event in self._app.published_events[mark:]:
+                if isinstance(event, self._expected_type) and (
+                    self._predicate is None or self._predicate(event)
+                ):
+                    return event
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+
+        raise AssertionError(
+            f"expected event {self._expected_type.__name__} not seen within {seconds}s"
+        )
 
 
 @pytest.fixture
@@ -229,14 +311,75 @@ def pytest_configure(config: pytest.Config) -> None:
 # Hook: subprocess-per-test isolation for marked tests
 # ---------------------------------------------------------------------------
 
-# IMPLEMENTATION TODO:
-# Use pytest-xdist's worker_id mechanism, OR a custom pytest_runtest_protocol
-# hook that detects @pytest.mark.modulith_isolated and reruns the test in
-# a subprocess via subprocess.run([sys.executable, "-m", "pytest", "::test_id"]).
-#
-# The subprocess approach is heavier (~100ms fork) but gives true isolation —
-# import-time side effects can't leak between tests. Use sparingly; mark
-# tests that genuinely need it.
+# Set in the child process so the re-run there executes the test inline
+# instead of recursing into another subprocess.
+_ISOLATION_GUARD = "MODULITH_ISOLATED_SUBPROCESS"
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> bool | None:
+    """Run ``@pytest.mark.modulith_isolated`` tests in a fresh subprocess.
+
+    True isolation: import-time side effects and global state from other
+    tests can't leak in. We re-invoke pytest on this single test in a child
+    process (guarded by an env var to prevent infinite recursion), then
+    synthesize a report from the child's exit code. Returning ``None`` for
+    every other case hands control straight back to pytest's default
+    protocol, so unmarked tests are completely unaffected.
+    """
+    if item.get_closest_marker("modulith_isolated") is None:
+        return None
+    if os.environ.get(_ISOLATION_GUARD) == "1":
+        return None  # already inside the child — run normally
+
+    from _pytest.runner import CallInfo
+
+    ihook = item.ihook
+    ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
+
+    env = dict(os.environ)
+    env[_ISOLATION_GUARD] = "1"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            item.nodeid,
+            "-p",
+            "no:cacheprovider",
+            "-o",
+            "addopts=",
+            "-q",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    def _outcome() -> None:
+        if completed.returncode != 0:
+            raise AssertionError(
+                f"isolated subprocess for {item.nodeid} exited "
+                f"{completed.returncode}\n"
+                f"--- stdout ---\n{completed.stdout}\n"
+                f"--- stderr ---\n{completed.stderr}"
+            )
+
+    call = CallInfo.from_call(_outcome, when="call")
+    report = ihook.pytest_runtest_makereport(item=item, call=call)
+    ihook.pytest_runtest_logreport(report=report)
+    # The test body ran entirely in the child, so this item's per-test
+    # plugin hooks (setup/teardown) never ran here. We must still reconcile
+    # the fixture stack to nextitem, or the next item's setup trips
+    # "previous item was not torn down properly". Drive SetupState directly
+    # rather than the pytest_runtest_teardown hook: the latter also invokes
+    # other plugins' teardown (e.g. logging's caplog stash cleanup) whose
+    # matching setup we skipped. teardown_exact only finalizes the collector
+    # stack and does not require this item to have been set up.
+    item.session._setupstate.teardown_exact(nextitem)
+    ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
+    return True
 
 
 __all__ = [

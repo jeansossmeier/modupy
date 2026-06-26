@@ -38,9 +38,14 @@ ENTRY_POINT_GROUP = "modulith"
 # its name in the ``disable`` argument and register their replacement
 # via ``extra_plugins`` or an entry point.
 #
-# Additional built-ins (verifier, outbox, observability, docs) will be
-# added as they're implemented. The list is the single source of truth.
-BUILTIN_PLUGINS = ("modulith.builtin.discovery",)
+# The list is the single source of truth for which built-ins load.
+BUILTIN_PLUGINS = (
+    "modulith.builtin.discovery",
+    "modulith.builtin.outbox",
+    "modulith.builtin.verifier",
+    "modulith.builtin.docs",
+    "modulith.builtin.observability",
+)
 
 
 def create_plugin_manager(

@@ -568,7 +568,10 @@ uvicorn modulith._worker:create_app --factory \
 `create_app()`:
 - Reads `MODULITH_MODULE` from env
 - Imports only that module's package
-- Configures the event bus to route cross-module events through the broker
+- Routes this module's cross-module *publishes* out through the broker, and
+  (via the lifespan) starts a `BrokerConsumer` that subscribes to the streams
+  for the events this module's listeners consume, deserializes each via its
+  `event_type` header, and dispatches it to the local listeners
 - Returns a FastAPI app exposing only that module's router
 
 Standard uvicorn machinery from there — workers, reload, signals, graceful shutdown.
@@ -655,14 +658,29 @@ CREATE INDEX idx_pending ON event_publications (published_at)
 
 Package: `modulith-redis`. Implements `Broker` against `redis.asyncio`. Default broker for process-per-module mode because of microsecond latencies and ubiquity.
 
+Select the broker by name, and supply connection options under the
+`[tool.modulith.broker]` subtable. TOML forbids one key (`broker`) being both a
+string and a table in the same file, so when you use the options subtable the
+broker *name* comes from `MODULITH_BROKER` or `configure(broker="redis-streams")`:
+
 ```toml
+# Name only (no connection options): scalar form.
 [tool.modulith]
 broker = "redis-streams"
-
-[tool.modulith.broker.options]
-url = "${REDIS_URL}"
-consumer_group = "modulith-${MODULITH_MODULE}"
 ```
+
+```toml
+# With connection options: subtable form. Set the name out-of-band, e.g.
+#   export MODULITH_BROKER=redis-streams
+[tool.modulith.broker]
+url = "redis://localhost:6379"
+consumer_group = "modulith-orders"
+```
+
+Each option also has an environment variable that takes precedence at deploy
+time: `REDIS_URL`, `MODULITH_CONSUMER_GROUP`, `MODULITH_STREAM_PREFIX`,
+`MODULITH_STREAM_MAXLEN`. (Values are literal — there is no `${VAR}`
+interpolation inside the TOML.)
 
 ### 10.3 Kafka Broker
 

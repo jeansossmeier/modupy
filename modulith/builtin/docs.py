@@ -5,8 +5,6 @@ Produces three artifacts from the live module model:
   2. Per-module Markdown "canvas" — public API, events, dependencies
   3. Mermaid sequence diagram of event flows
 
-Implementation status: SKELETON. ~150 lines when complete.
-
 Why Mermaid over PlantUML:
   - Renders natively on GitHub/GitLab
   - No separate server needed
@@ -19,11 +17,14 @@ Output goes to docs/modulith/ by default. Configurable via
 
 from __future__ import annotations
 
+import ast
 import logging
+from collections import defaultdict
 from pathlib import Path
 
 from modulith import ModuleInfo, hookimpl
-from modulith.manifest import get_manifest
+from modulith.builtin.verifier import _collect_imports, _owning_module, _package_dir
+from modulith.manifest import all_manifests, get_manifest
 
 logger = logging.getLogger("modulith.docs")
 
@@ -73,30 +74,63 @@ def modulith_render_documentation(
 # ---------------------------------------------------------------------------
 
 
+def _event_edges(modules: list[ModuleInfo]) -> list[tuple[str, str, str]]:
+    """Manifest-derived (publisher, consumer, event) edges across modules."""
+    manifests = all_manifests()
+    name_by_pkg = {m.package: m.name for m in modules}
+    publishers: dict[str, set[str]] = defaultdict(set)
+    consumers: dict[str, set[str]] = defaultdict(set)
+    for pkg, manifest in manifests.items():
+        name = name_by_pkg.get(pkg)
+        if name is None:
+            # A manifest registered for a package not in this render's module
+            # list (stale / out-of-scope registry entry, e.g. test pollution or
+            # multiple bootstraps). Skip it so we never emit an edge to a node
+            # the diagram never declares — Mermaid would ghost-create it.
+            continue
+        for event in manifest.publishes:
+            publishers[event].add(name)
+        for event in manifest.consumes:
+            consumers[event].add(name)
+
+    edges: list[tuple[str, str, str]] = []
+    for event in sorted(set(publishers) | set(consumers)):
+        for src in sorted(publishers.get(event, set())):
+            for dst in sorted(consumers.get(event, set())):
+                if src != dst:
+                    edges.append((src, dst, event))
+    return edges
+
+
+def _import_edges(modules: list[ModuleInfo]) -> list[tuple[str, str]]:
+    """Fallback (importer, imported) edges when no manifests are declared."""
+    seen: set[tuple[str, str]] = set()
+    for module in modules:
+        for record in _collect_imports(module):
+            owner = _owning_module(record.target_module, modules)
+            if owner is not None and owner.name != module.name:
+                seen.add((module.name, owner.name))
+    return sorted(seen)
+
+
 def _render_architecture_diagram(modules: list[ModuleInfo]) -> str:
-    """Render a Mermaid C4 component diagram.
+    """Render a Mermaid component diagram of modules and their dependencies.
 
-    IMPLEMENTATION TODO:
-    Output structure:
-
-        graph TD
-            orders[Orders Module]
-            inventory[Inventory Module]
-            payments[Payments Module]
-            orders -->|publishes OrderCreated| inventory
-            payments -->|publishes PaymentReceived| orders
-
-    Build by:
-    1. One node per module: f"  {module.name}[{module.name.title()} Module]"
-    2. One edge per cross-module event flow: source publishes event,
-       destination consumes it. Get this from manifests.
-    3. If no manifests, fall back to "module A imports from module B"
-       edges as a weaker proxy.
+    Edges come from event flow (publisher publishes → consumer consumes) when
+    manifests exist; otherwise from observed cross-module imports as a weaker
+    proxy.
     """
     lines = ["graph TD"]
     for module in modules:
         lines.append(f"  {module.name}[{module.name.title()} Module]")
-    # IMPLEMENTATION: walk manifests, add edges
+
+    edges = _event_edges(modules)
+    if edges:
+        for src, dst, event in edges:
+            lines.append(f"  {src} -->|publishes {event}| {dst}")
+    else:
+        for src, dst in _import_edges(modules):
+            lines.append(f"  {src} --> {dst}")
     return "\n".join(lines) + "\n"
 
 
@@ -127,11 +161,12 @@ def _render_module_canvas(module: ModuleInfo) -> str:
         - `orders`
         - `order_items`
 
-    IMPLEMENTATION TODO:
-    1. Get manifest via get_manifest(module.package).
-    2. If manifest exists, drive sections from it.
-    3. If no manifest, use introspection: scan the module's __init__.py
-       for public function definitions, scan for @event-decorated classes.
+    Sections are manifest-driven when a ``_manifest.py`` exists. When it does
+    not, the events sections fall back to AST introspection (``@event`` classes
+    → Published, ``@listener`` param types → Consumed) so modules using the
+    ``@event``/``@listener`` API without the optional manifest still document
+    their event topology. Dependencies and Owned Tables are manifest-only (they
+    have no reliable introspection signal).
     """
     lines = [
         f"# {module.name.title()} Module",
@@ -139,16 +174,30 @@ def _render_module_canvas(module: ModuleInfo) -> str:
         f"**Package:** `{module.package}`",
         "",
     ]
+
+    public_api = _public_api(module)
+    if public_api:
+        lines.append("## Public API")
+        lines.extend(f"- `{name}`" for name in public_api)
+        lines.append("")
+
     manifest = get_manifest(module.package)
     if manifest is not None:
-        if manifest.publishes:
-            lines.append("## Events Published")
-            lines.extend(f"- `{name}`" for name in manifest.publishes)
-            lines.append("")
-        if manifest.consumes:
-            lines.append("## Events Consumed")
-            lines.extend(f"- `{name}`" for name in manifest.consumes)
-            lines.append("")
+        published: list[str] = list(manifest.publishes)
+        consumed: list[str] = list(manifest.consumes)
+    else:
+        published, consumed = _introspect_events(module)
+
+    if published:
+        lines.append("## Events Published")
+        lines.extend(f"- `{name}`" for name in published)
+        lines.append("")
+    if consumed:
+        lines.append("## Events Consumed")
+        lines.extend(f"- `{name}`" for name in consumed)
+        lines.append("")
+
+    if manifest is not None:
         if manifest.declared_dependencies:
             lines.append("## Dependencies")
             lines.extend(f"- `{dep}` (declared)" for dep in manifest.declared_dependencies)
@@ -157,15 +206,111 @@ def _render_module_canvas(module: ModuleInfo) -> str:
             lines.append("## Owned Tables")
             lines.extend(f"- `{t}`" for t in manifest.owns_tables)
             lines.append("")
-    else:
+    elif not public_api and not published and not consumed:
         lines.append("_No manifest declared. Add a `_manifest.py` for richer documentation._")
+
+    internal = _internal_files(module)
+    if internal:
+        lines.append("## Internal Files")
+        lines.extend(f"- `{name}`" for name in internal)
+        lines.append("")
+
     return "\n".join(lines) + "\n"
+
+
+def _has_decorator(node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef, name: str) -> bool:
+    """True if ``node`` carries a ``@name`` decorator (bare or attribute form)."""
+    for decorator in node.decorator_list:
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if isinstance(target, ast.Name) and target.id == name:
+            return True
+        if isinstance(target, ast.Attribute) and target.attr == name:
+            return True
+    return False
+
+
+def _annotation_name(expr: ast.expr | None) -> str | None:
+    """The rightmost identifier of a type annotation (handles forward-ref strings)."""
+    if isinstance(expr, ast.Name):
+        return expr.id
+    if isinstance(expr, ast.Attribute):
+        return expr.attr
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return expr.value.rsplit(".", 1)[-1]
+    return None
+
+
+def _introspect_events(module: ModuleInfo) -> tuple[list[str], list[str]]:
+    """Best-effort ``(published, consumed)`` event names via AST, no manifest.
+
+    The documented introspection fallback: a module's ``@event``-decorated
+    classes are what it publishes; the event type annotated on the first
+    parameter of each ``@listener`` handler is what it consumes. Names only
+    (the canvas lists names), de-duplicated and sorted. Modules following the
+    ``@event``/``@listener`` API but shipping no ``_manifest.py`` still get
+    their event topology documented.
+    """
+    root = _package_dir(module.package)
+    if root is None:
+        return [], []
+    published: set[str] = set()
+    consumed: set[str] = set()
+    for path in sorted(root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and _has_decorator(node, "event"):
+                published.add(node.name)
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and _has_decorator(
+                node, "listener"
+            ):
+                params = [*node.args.posonlyargs, *node.args.args]
+                if params and (evt := _annotation_name(params[0].annotation)):
+                    consumed.add(evt)
+    return sorted(published), sorted(consumed)
+
+
+def _public_api(module: ModuleInfo) -> list[str]:
+    """Public top-level functions/classes defined in the module's __init__.py."""
+    root = _package_dir(module.package)
+    if root is None:
+        return []
+    init = root / "__init__.py"
+    if not init.exists():
+        return []
+    try:
+        tree = ast.parse(init.read_text(encoding="utf-8"), filename=str(init))
+    except (SyntaxError, UnicodeDecodeError):
+        return []
+    names: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            if not node.name.startswith("_"):
+                names.append(node.name)
+    return names
+
+
+def _internal_files(module: ModuleInfo) -> list[str]:
+    """Private (``_``-prefixed) files/dirs under the module package."""
+    root = _package_dir(module.package)
+    if root is None:
+        return []
+    names: set[str] = set()
+    for path in root.rglob("_*.py"):
+        if path.name == "__init__.py":
+            continue
+        names.add(str(path.relative_to(root)))
+    for path in root.iterdir():
+        if path.is_dir() and path.name.startswith("_") and path.name != "__pycache__":
+            names.add(path.name + "/")
+    return sorted(names)
 
 
 def _render_event_flow_diagram(modules: list[ModuleInfo]) -> str:
     """Render a Mermaid sequence diagram of event flows.
 
-    IMPLEMENTATION TODO:
     Output structure:
 
         sequenceDiagram
@@ -182,7 +327,8 @@ def _render_event_flow_diagram(modules: list[ModuleInfo]) -> str:
     lines = ["sequenceDiagram"]
     for module in modules:
         lines.append(f"  participant {module.name}")
-    # IMPLEMENTATION: walk manifests, add arrows
+    for src, dst, event in _event_edges(modules):
+        lines.append(f"  {src}->>{dst}: {event}")
     return "\n".join(lines) + "\n"
 
 

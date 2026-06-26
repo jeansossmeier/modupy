@@ -45,6 +45,11 @@ class Configuration:
     # The application's root Python package. None means "auto-detect".
     package: str | None = None
 
+    # Name of the shared-contracts subpackage — where cross-module event types
+    # live. A convention ("contracts") with a sensible default, not a hardcode:
+    # override it if your app names that module differently.
+    contracts_module: str = "contracts"
+
     # Outbox storage. "memory" = no persistence (default for dev).
     # Other values name a registered adapter (e.g. "postgres", "mongodb").
     outbox: str = "memory"
@@ -69,6 +74,10 @@ class Configuration:
     # Keeping them here means the dataclass remains the single source of
     # truth — no scattered globals or hidden config files.
     outbox_options: dict[str, Any] = field(default_factory=dict)
+    # Broker connection settings from the [tool.modulith.broker] subtable
+    # (url, consumer_group, stream_prefix, max_stream_len). Consumed by the
+    # selected broker adapter's registration hook; env vars still override.
+    broker_options: dict[str, Any] = field(default_factory=dict)
     workers: dict[str, int] = field(default_factory=dict)
 
     # None = auto-detect from installed packages. True/False = force.
@@ -111,12 +120,19 @@ def _read_pyproject() -> dict[str, Any]:
 
     The documented pyproject.toml convention uses subtables for compound
     options (e.g. ``[tool.modulith.outbox]`` for outbox completion mode,
+    ``[tool.modulith.broker]`` for broker connection settings,
     ``[tool.modulith.workers]`` for per-module worker counts). TOML parses
     these as nested dicts under the ``modulith`` key. We separate scalar
     keys (which map directly to Configuration fields) from subtables
-    (which map to dict-typed Configuration fields like outbox_options
-    and workers) so users can write idiomatic TOML without hitting the
-    "unknown config key" guard.
+    (which map to dict-typed Configuration fields like outbox_options,
+    broker_options and workers) so users can write idiomatic TOML without
+    hitting the "unknown config key" guard.
+
+    Note: TOML forbids a key being both a scalar and a table, so the broker
+    *name* (scalar ``broker = "redis-streams"``) and broker *options*
+    (subtable ``[tool.modulith.broker]``) cannot share the ``broker`` key in
+    one file — set the name via ``MODULITH_BROKER`` / ``configure(broker=...)``
+    when supplying options through the subtable, exactly as for ``outbox``.
 
     Subtables not yet backed by a Configuration field (currently
     ``verify``, which Phase 1 will add) are dropped silently — the
@@ -142,6 +158,7 @@ def _read_pyproject() -> dict[str, Any]:
     # not in this mapping are forward-compatibility space and dropped.
     SUBTABLE_FIELD = {
         "outbox": "outbox_options",
+        "broker": "broker_options",
         "workers": "workers",
     }
 
@@ -173,12 +190,17 @@ def _find_pyproject() -> Path | None:
 def _read_env_vars() -> dict[str, Any]:
     """Read MODULITH_* environment variables.
 
-    Standard 12-factor pattern: every Configuration field has a matching
-    env var. Booleans accept 1/true/yes (case-insensitive) for True.
+    Standard 12-factor pattern: every *scalar* Configuration field has a
+    matching env var. Booleans accept 1/true/yes (case-insensitive) for True;
+    any other value is False. The dict-typed fields (outbox_options, workers)
+    have no env var — they come from the [tool.modulith.*] subtables in
+    pyproject.toml.
     """
     result: dict[str, Any] = {}
     if val := os.environ.get("MODULITH_PACKAGE"):
         result["package"] = val
+    if val := os.environ.get("MODULITH_CONTRACTS_MODULE"):
+        result["contracts_module"] = val
     if val := os.environ.get("MODULITH_OUTBOX"):
         result["outbox"] = val
     if val := os.environ.get("MODULITH_TOPOLOGY"):
@@ -187,6 +209,12 @@ def _read_env_vars() -> dict[str, Any]:
         result["broker"] = val
     if val := os.environ.get("MODULITH_PRODUCTION"):
         result["production"] = val.lower() in ("1", "true", "yes")
+    if val := os.environ.get("MODULITH_AUTO_DISCOVER"):
+        result["auto_discover"] = val.lower() in ("1", "true", "yes")
+    if val := os.environ.get("MODULITH_OBSERVABILITY"):
+        result["observability"] = val.lower() in ("1", "true", "yes")
+    if val := os.environ.get("MODULITH_VERIFY_MANIFESTS"):
+        result["verify_manifests"] = val.lower() in ("1", "true", "yes")
     return result
 
 
@@ -205,6 +233,23 @@ def _validate(data: dict[str, Any]) -> None:
         raise ConfigurationError(
             f"invalid topology {data['topology']!r}; "
             f"expected one of: {', '.join(_VALID_TOPOLOGIES)}"
+        )
+
+    # Cross-field: a multi-process topology needs a real cross-process broker.
+    # The in-memory broker can't carry events between processes, so
+    # "topology=processes, broker=memory" would validate clean and then
+    # silently no-op delivery deep in the runtime. Fail fast with the
+    # documented constraint (config.py field docstring on `broker`). Effective
+    # values include defaults — a process topology left on the default memory
+    # broker is exactly the misconfiguration this guards.
+    effective_topology = data.get("topology", "single")
+    effective_broker = data.get("broker", "memory")
+    if effective_topology in ("processes", "subinterpreters") and effective_broker == "memory":
+        raise ConfigurationError(
+            f"topology={effective_topology!r} requires a cross-process broker, but "
+            "broker is the in-memory default. Set [tool.modulith].broker to a real "
+            "adapter (e.g. 'redis-streams'); broker='memory' is only valid for "
+            "topology='single'."
         )
 
     # Production mode + default memory outbox = silent data loss on restart.

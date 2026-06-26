@@ -16,7 +16,7 @@ event bus. The minimum that proves the architecture works.
 - [x] `modulith/__init__.py` — public API exports
 - [x] `modulith/types.py` — `ModuleInfo`, `EventPublication`, `Violation`
 - [x] `modulith/protocols.py` — driver protocols
-- [x] `modulith/hooks.py` — the 10 hookspecs
+- [x] `modulith/hooks.py` — the 11 hookspecs
 - [x] `modulith/markers.py` — `@hookimpl` re-export
 - [x] `modulith/brokers.py` — `BrokerRegistry`
 - [x] `modulith/manager.py` — plugin manager factory
@@ -26,64 +26,64 @@ event bus. The minimum that proves the architecture works.
 - [x] `modulith/runtime.py` — runtime singleton with lazy bootstrap
 - [x] `modulith/decorators.py` — `@event`, `@listener`, `publish`, `configure`
 - [x] `modulith/builtin/discovery.py` — default subpackage walker
-- [x] `tests/test_*.py` — 29 tests, all passing
+- [x] `tests/test_*.py` — full suite green (`pytest`, `mypy --strict`, `ruff`)
 - [x] `examples/redis_streams_broker.py` — reference broker implementation
 - [x] `examples/naming_convention_verifier.py` — reference verifier plugin
 
 ---
 
-## Phase 1 — v1 Essentials (4-6 weeks)
+## Phase 1 — v1 Essentials ✅ CODE COMPLETE
 
 The minimum scope where modulith provides value over "FastAPI plus folders."
 
 ### Sync entrypoint (Gap 3)
-- [ ] `modulith/sync.py` — `publish_sync()`, persistent event loop, sync listener wrapping
-- [ ] `modulith/decorators.py` — accept sync `@listener` functions
-- [ ] `tests/test_sync.py` — sync publish, sync listeners, mixed flows
+- [x] `modulith/sync.py` — `publish_sync()`, persistent event loop, sync listener wrapping
+- [x] `modulith/decorators.py` — accept sync `@listener` functions
+- [x] `tests/test_sync.py` — sync publish, sync listeners, mixed flows
 
 ### Manifests (Gap 4)
-- [ ] `modulith/manifest.py` — `declare_module()` API, `Manifest` dataclass
-- [ ] `modulith/runtime.py` — verify_manifest at startup
-- [ ] `tests/test_manifest.py` — declared-vs-registered checks
+- [x] `modulith/manifest.py` — `declare_module()` API, `Manifest` dataclass
+- [x] `modulith/runtime.py` — verify_manifest at startup
+- [x] `tests/test_manifest.py` — declared-vs-registered checks
 
 ### Boundary verifier (core feature)
-- [ ] `modulith/builtin/verifier.py` — AST walker, the five default rules
-- [ ] Cycle detection
-- [ ] `tests/test_verifier.py` — each rule, cycle detection
+- [x] `modulith/builtin/verifier.py` — AST walker, the five default rules
+- [x] Cycle detection
+- [x] `tests/test_verifier.py` — each rule, cycle detection
 
 ### Ratcheting verifier (Gap 6)
-- [ ] Baseline file format + load/save
-- [ ] `modulith verify --mode=ratchet` semantics
-- [ ] `modulith verify --update-baseline` regenerates the file
-- [ ] `tests/test_ratchet.py`
+- [x] Baseline file format + load/save
+- [x] `modulith verify --mode=ratchet` semantics
+- [x] `modulith verify --update-baseline` regenerates the file
+- [x] Ratchet + baseline coverage (in `tests/test_verifier.py` and `tests/test_cli.py`)
 
 ### Transactional outbox (the differentiator)
-- [ ] `modulith/builtin/outbox.py` — outbox plugin, retry loop, completion modes
-- [ ] `modulith/adapters/postgres_outbox.py` — Postgres + SQLAlchemy adapter
-- [ ] Schema migrations (alembic)
-- [ ] `tests/test_outbox.py` — crash recovery, retry, dead-lettering
+- [x] `modulith/builtin/outbox.py` — outbox plugin, retry loop, completion modes
+- [x] `modulith/adapters/postgres_outbox.py` — Postgres + SQLAlchemy adapter
+- [x] Schema migrations (alembic)
+- [x] `tests/test_outbox.py` — crash recovery, retry, dead-lettering
 
 ### CLI
-- [ ] `modulith/cli.py` — typer-based commands
-- [ ] `modulith dev` — like `uvicorn --reload` with banner
-- [ ] `modulith run` — production mode
-- [ ] `modulith verify` — boundary checks
-- [ ] `modulith docs` — generate documentation
-- [ ] `modulith outbox {status,retry,purge}` — operational commands
-- [ ] `modulith info` — show detected config
+- [x] `modulith/cli.py` — typer-based commands
+- [x] `modulith dev` — like `uvicorn --reload` with banner
+- [x] `modulith run` — production mode
+- [x] `modulith verify` — boundary checks
+- [x] `modulith docs` — generate documentation
+- [x] `modulith outbox {status,retry,purge}` — operational commands
+- [x] `modulith info` — show detected config
 
 ### Documentation generator
-- [ ] `modulith/builtin/docs.py` — Mermaid diagrams + Markdown canvases
-- [ ] Architecture diagram
-- [ ] Per-module canvas
-- [ ] Event flow sequence diagram
+- [x] `modulith/builtin/docs.py` — Mermaid diagrams + Markdown canvases
+- [x] Architecture diagram
+- [x] Per-module canvas
+- [x] Event flow sequence diagram
 
 ### Real documentation (the project lives or dies on this)
-- [ ] Updated `README.md` with v1 surface
-- [ ] Architecture guide (how modulith works internally)
-- [ ] Migration guide for existing FastAPI apps
+- [x] Updated `README.md` with v1 surface
+- [ ] Architecture guide (how modulith works internally) — covered by [SPEC.md](SPEC.md) + module docstrings; standalone guide pending
+- [x] Migration guide for existing FastAPI apps — [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)
 - [ ] API reference (auto-generated from docstrings)
-- [ ] Cookbook with 5-10 common patterns
+- [ ] Cookbook with 5-10 common patterns — [`examples/demo_app`](examples/demo_app) is a worked example; full cookbook pending
 
 ### Phase 1 kill criteria
 
@@ -94,37 +94,37 @@ The minimum scope where modulith provides value over "FastAPI plus folders."
 
 ---
 
-## Phase 2 — v1.1 Polish (2-3 weeks)
+## Phase 2 — v1.1 Polish ✅ COMPLETE
 
 Quality-of-life improvements that take v1 from "usable" to "good."
 
 ### Testing
-- [ ] `modulith/testing.py` — pytest plugin with fixtures
-- [ ] `modulith_app` fixture — fresh runtime per test
-- [ ] `modulith_module` fixture — module-isolated tests
-- [ ] `scenario` fixture — fluent event-driven test API
-- [ ] `@pytest.mark.modulith_isolated` — subprocess isolation
-- [ ] `tests/test_testing_plugin.py` — meta tests
+- [x] `modulith/testing.py` — pytest plugin with fixtures
+- [x] `modulith_app` fixture — fresh runtime per test
+- [x] `modulith_module` fixture — module-isolated tests
+- [x] `scenario` fixture — fluent event-driven test API
+- [x] `@pytest.mark.modulith_isolated` — subprocess isolation
+- [x] `tests/test_testing_plugin.py` — meta tests
 
 ### Audit + Doctor
-- [ ] `modulith/audit.py` — codebase analysis for brownfield migration
-- [ ] `modulith/doctor.py` — health diagnostics
-- [ ] `modulith audit` CLI command
-- [ ] `modulith doctor` CLI command
-- [ ] Tests for both
+- [x] `modulith/audit.py` — codebase analysis for brownfield migration
+- [x] `modulith/doctor.py` — health diagnostics
+- [x] `modulith audit` CLI command
+- [x] `modulith doctor` CLI command
+- [x] Tests for both
 
 ### Observability
-- [ ] `modulith/builtin/observability.py` — OpenTelemetry auto-instrumentation
-- [ ] Spans for publish + dispatch
-- [ ] Soft OTel import (silent no-op if not installed)
-- [ ] Tests with mock tracer provider
+- [x] `modulith/builtin/observability.py` — OpenTelemetry auto-instrumentation
+- [x] Spans for publish + dispatch
+- [x] Soft OTel import (silent no-op if not installed)
+- [x] Tests with mock tracer provider
 
 ### Redis Streams broker
-- [ ] `modulith/adapters/redis_broker.py` — production-grade implementation
-- [ ] Consumer group handling
-- [ ] Pending entry recovery on restart
-- [ ] Dead-letter handling
-- [ ] Integration test with real Redis
+- [x] `modulith/adapters/redis_broker.py` — production-grade implementation
+- [x] Consumer group handling
+- [x] Pending entry recovery on restart
+- [x] Dead-letter handling
+- [x] Integration test with real Redis
 
 ### Phase 2 kill criteria
 
@@ -134,18 +134,18 @@ Quality-of-life improvements that take v1 from "usable" to "good."
 
 ---
 
-## Phase 3 — v2 Process-Per-Module (3-4 weeks)
+## Phase 3 — v2 Process-Per-Module ✅ CODE COMPLETE
 
 The differentiator. Makes "modulith now, microservices later" credible.
 
-- [ ] `modulith/_worker.py` — per-module FastAPI app generator
-- [ ] `modulith/supervisor.py` — process orchestration with crash recovery
-- [ ] `modulith/proxy.py` — reverse proxy for routing requests to workers
-- [ ] Cross-process event integration (events flow through broker when topology != "single")
-- [ ] Topology configuration in pyproject + CLI flags
-- [ ] Health check propagation
-- [ ] Graceful shutdown cascade
-- [ ] Documentation: deployment patterns, scaling stories
+- [x] `modulith/_worker.py` — per-module FastAPI app generator
+- [x] `modulith/supervisor.py` — process orchestration with crash recovery
+- [x] `modulith/proxy.py` — reverse proxy for routing requests to workers
+- [x] Cross-process event integration (events flow through broker when topology != "single")
+- [x] Topology configuration in pyproject + CLI flags
+- [x] Health check propagation
+- [x] Graceful shutdown cascade
+- [ ] Documentation: deployment patterns, scaling stories — touched by [`examples/demo_app`](examples/demo_app); dedicated guide pending
 
 ### Phase 3 kill criteria
 

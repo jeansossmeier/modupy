@@ -138,6 +138,24 @@ def modulith_on_listener_dispatch(
 
 
 @hookspec
+def modulith_on_listener_complete(
+    event: Any,
+    listener_name: str,
+    publication: EventPublication,
+    exception: BaseException | None,
+) -> None:
+    """Run after a listener invocation finishes, success or failure.
+
+    Fires once per (event, listener) pair, paired with the earlier
+    ``modulith_on_listener_dispatch``. ``exception`` is None on success or
+    the raised error on failure. This is the hook observability plugins
+    use to *end* the per-listener span started in dispatch — without it,
+    spans could only be started, never closed. Like the other observe
+    hooks it must not re-raise.
+    """
+
+
+@hookspec
 def modulith_on_listener_error(
     event: Any,
     listener_name: str,

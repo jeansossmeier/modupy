@@ -6,8 +6,6 @@ declared dependencies — in a `_manifest.py` file. The framework reads
 manifests at startup, validates them against observed reality, and uses
 them to drive documentation, verification, and the audit tool.
 
-Implementation status: SKELETON. ~120 lines when complete.
-
 Example usage:
 
     # myapp/orders/_manifest.py
@@ -22,17 +20,29 @@ Example usage:
         declared_dependencies=["payments"],
     )
 
-What the framework does with this:
+What the framework does with this — split across two surfaces by cost:
 
-  1. Validates that every name in `listeners` actually got registered.
-     Catches "module silently failed to import" — the worst kind of bug.
-  2. Validates that every type in `publishes` is actually published.
-     Catches dead code and renamed events.
-  3. Validates that imports match `declared_dependencies`. Anything
-     imported from a module not in the list is a violation.
-  4. Feeds the documentation generator. The Application Module Canvas
-     is built directly from manifests.
-  5. Feeds the audit tool. Manifest coverage is a readiness signal.
+  Bootstrap manifest verification (`verify_manifest`, runs every startup
+  when ``verify_manifests`` is on — cheap, in-process, no AST):
+    1. Validates that every name in `listeners` actually got registered.
+       Catches "module silently failed to import" — the worst kind of bug.
+    2. Validates that every type in `publishes` is defined in the package
+       namespace. Catches dead code and renamed events.
+
+  AST boundary verifier (`builtin/verifier.py`, optional — runs via the
+  ``modulith verify`` CLI / pre-commit, NOT during bootstrap):
+    3. Validates that cross-module imports match `declared_dependencies`
+       and that table access respects `owns_tables`. These need static
+       analysis of the source tree, so they deliberately live outside the
+       hot bootstrap path — run the verifier in CI to enforce them.
+
+  Documentation + audit (read-only consumers):
+    4. Feeds the documentation generator. The Application Module Canvas
+       is built directly from manifests (`publishes`/`consumes`/etc.).
+    5. Feeds the audit tool. Manifest coverage is a readiness signal.
+
+`consumes` is currently descriptive only — it drives docs/audit and is not
+cross-validated at bootstrap (no single process knows every publisher).
 """
 
 from __future__ import annotations
@@ -142,14 +152,32 @@ def all_manifests() -> dict[str, Manifest]:
 def verify_manifest(manifest: Manifest, registered_listeners: set[Callable[..., Any]]) -> list[str]:
     """Check a manifest against observed reality.
 
+    Scope is deliberately narrow — the two checks that are cheap and need no
+    source analysis: (1) declared `listeners` are registered, (2) declared
+    `publishes` names exist in the package namespace. `declared_dependencies`
+    and `owns_tables` require AST analysis and are enforced by the boundary
+    verifier (``builtin/verifier.py``), not here; `consumes` is descriptive
+    (docs/audit). See the module docstring for the full split.
+
     Returns errors as plain strings rather than Violation objects because
     these are *manifest correctness* errors, not boundary violations.
     Different surface — different error path.
     """
     errors: list[str] = []
 
+    # Sync listeners register as async wrappers (see sync.wrap_sync_listener),
+    # but a manifest references the *original* sync function. Each wrapper carries
+    # a __modulith_sync_wrapped__ marker pointing back at that original, so fold the
+    # originals into the set we test against — otherwise a declared sync listener is
+    # falsely reported as "not registered" and bootstrap aborts.
+    effective_listeners: set[Callable[..., Any]] = set(registered_listeners)
+    for registered in registered_listeners:
+        original = getattr(registered, "__modulith_sync_wrapped__", None)
+        if original is not None:
+            effective_listeners.add(original)
+
     for func in manifest.listeners:
-        if func not in registered_listeners:
+        if func not in effective_listeners:
             qualname = getattr(func, "__qualname__", repr(func))
             errors.append(
                 f"listener {qualname} declared in {manifest.package} "

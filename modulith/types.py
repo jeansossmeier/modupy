@@ -86,6 +86,13 @@ class EventPublication:
     # to a reasonable length by the store implementation.
     last_error: str | None = None
 
+    # When the most recent delivery attempt ran. None until the first
+    # *retry* (the after-commit/crash-sweep first delivery leaves it None).
+    # Retry backoff is measured from this, not from ``published_at`` — so a
+    # persistently-failing listener actually backs off instead of being
+    # retried on every sweep once the record ages past the (capped) backoff.
+    last_attempt_at: datetime | None = None
+
 
 class ViolationSeverity(Enum):
     """Severity level for verification findings."""

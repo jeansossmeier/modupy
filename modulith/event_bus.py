@@ -92,6 +92,15 @@ class InMemoryEventBus:
         """Return registered listeners for an event type — useful for tests."""
         return list(self._handlers.get(event_type, []))
 
+    def registered_event_types(self) -> list[type]:
+        """Event types that have at least one registered listener.
+
+        Used by the cross-process consumer to derive the broker streams a
+        worker must subscribe to — exactly the events its local listeners
+        consume.
+        """
+        return [event_type for event_type, handlers in self._handlers.items() if handlers]
+
     def clear(self) -> None:
         """Remove all registered listeners. Used between tests."""
         self._handlers.clear()

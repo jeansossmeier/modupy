@@ -41,6 +41,101 @@ def event(cls: type[T]) -> type[T]:
     return cls
 
 
+def externalized(cls: type[T] | None = None, *, target: str | None = None) -> Any:
+    """Mark an event as *externalized* — routed to the configured broker so
+    workers in other processes can consume it (process-per-module topology).
+
+    Two forms::
+
+        @externalized
+        class OrderPlaced: ...        # default target: "{broker}:{module.qualname}"
+
+        @externalized(target="redis-streams:orders.placed")
+        class OrderPlaced: ...        # explicit "scheme:destination"
+
+    An externalized event is published to the broker *whether or not it also
+    has a local listener* (fan-out across processes). In single-process
+    topology this is an inert marker — there is no broker.
+
+    The runtime resolves an event's broker target in priority order:
+      1. the ``modulith_resolve_event_target`` hook (dynamic / tenant-aware),
+      2. this annotation's explicit ``target`` (static per-event override),
+      3. the default scheme ``{broker}:{fully-qualified-event-name}``.
+    """
+
+    def wrap(klass: type[T]) -> type[T]:
+        klass.__modulith_externalized__ = True  # type: ignore[attr-defined]
+        if target is not None:
+            klass.__modulith_broker_target__ = target  # type: ignore[attr-defined]
+        return klass
+
+    # Bare ``@externalized`` passes the class as the first positional arg;
+    # ``@externalized(target=...)`` passes cls=None and returns the wrapper.
+    if cls is None:
+        return wrap
+    return wrap(cls)
+
+
+def _resolve_event_type(func: Callable[..., Any], target: Callable[..., Any]) -> type:
+    """Resolve the event type from a listener's first parameter annotation.
+
+    Two annotation forms must both work:
+
+      * Eager (no ``from __future__ import annotations``): the annotation is
+        already the class object — returned as-is.
+      * Stringized (PEP 563, the modern default used across this project and
+        the SPEC/README examples): the annotation is a *string* like
+        ``'OrderCreated'``. It is resolved against the function's own module
+        globals via ``inspect.get_annotations(eval_str=True)``.
+
+    ``func`` is used only for error messages; ``target`` is the object whose
+    signature and ``__globals__`` we read (the unwrapped function for sync
+    handlers, so functools.wraps chains don't hide the parameter list).
+    """
+    sig = inspect.signature(target)
+    params = list(sig.parameters.values())
+    if not params:
+        raise TypeError(f"@listener {func.__qualname__!r} must accept an event argument")
+
+    first = params[0]
+    annotation = first.annotation
+    if annotation is inspect.Parameter.empty:
+        raise TypeError(
+            f"@listener {func.__qualname__!r} must annotate its event "
+            f"parameter so modulith knows which event type to route. "
+            f"Example: 'async def handler(event: OrderCreated)'"
+        )
+
+    if isinstance(annotation, str):
+        # PEP 563 stored the annotation as a string. Un-stringize it against
+        # the function's module globals. Names defined only in local scope
+        # (e.g. an event class nested in a function) are invisible here — that
+        # is an inherent PEP 563 limitation, surfaced as a clear TypeError
+        # rather than a downstream ``str has no attribute __name__`` crash.
+        try:
+            resolved = inspect.get_annotations(target, eval_str=True)
+            annotation = resolved.get(first.name, annotation)
+        except (NameError, AttributeError, SyntaxError) as exc:
+            raise TypeError(
+                f"@listener {func.__qualname__!r} annotates its event parameter "
+                f"as {first.annotation!r}, but modulith could not resolve that "
+                f"name to a class. Define the event type at module scope so its "
+                f"annotation resolves (classes in local scope are invisible "
+                f"under 'from __future__ import annotations')."
+            ) from exc
+
+    if not isinstance(annotation, type):
+        # Either an eager non-class annotation, or a string that resolved to a
+        # non-class. The bus keys on ``type(event)``, so a non-class can never
+        # be a routing key — fail fast with a clear message instead of a dead
+        # listener that silently never fires.
+        raise TypeError(
+            f"@listener {func.__qualname__!r} could not resolve its event "
+            f"annotation to a class (got {annotation!r})."
+        )
+    return annotation
+
+
 def listener(func: F) -> F:
     """Register a listener for a specific event type.
 
@@ -69,21 +164,10 @@ def listener(func: F) -> F:
     unwrapped = inspect.unwrap(func)
     is_async = inspect.iscoroutinefunction(unwrapped)
 
-    # Pull the event type from the first positional parameter's annotation.
-    # Use the unwrapped signature for sync functions so functools.wraps
-    # chains don't hide the original parameter list.
-    sig = inspect.signature(unwrapped if not is_async else func)
-    params = list(sig.parameters.values())
-    if not params:
-        raise TypeError(f"@listener {func.__qualname__!r} must accept an event argument")
-
-    event_type = params[0].annotation
-    if event_type is inspect.Parameter.empty:
-        raise TypeError(
-            f"@listener {func.__qualname__!r} must annotate its event "
-            f"parameter so modulith knows which event type to route. "
-            f"Example: 'async def handler(event: OrderCreated)'"
-        )
+    # Pull the event type from the first positional parameter's annotation,
+    # resolving PEP 563 string annotations. Use the unwrapped function for sync
+    # handlers so functools.wraps chains don't hide the parameter list.
+    event_type = _resolve_event_type(func, func if is_async else unwrapped)
 
     if is_async:
         # Async handler: register as-is.
@@ -94,7 +178,7 @@ def listener(func: F) -> F:
         # is directly testable without going through the async machinery.
         from .sync import wrap_sync_listener
 
-        wrapped = wrap_sync_listener(func)  # type: ignore[arg-type]
+        wrapped = wrap_sync_listener(func)
         _runtime.register_listener(event_type, wrapped)
 
     # The runtime queues this if bootstrap hasn't happened yet, registers

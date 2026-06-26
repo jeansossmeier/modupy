@@ -1,0 +1,394 @@
+"""Cross-process broker CONSUMER loop — the half that was entirely missing.
+
+The producer (``runtime._maybe_route_to_broker``) serializes a cross-module
+event and XADDs it to the broker; before this, NOTHING consumed those streams,
+so every cross-process event in ``topology='processes'`` was silently dropped
+(the CRITICAL audit finding).
+
+These tests drive the consumer half end-to-end:
+  * a full producer→consumer round-trip WITHOUT Redis — the exact payload +
+    event_type header the runtime producer emits is fed straight into the
+    consumer, which must deserialize and dispatch it to a local listener;
+  * dispatch semantics: ack on success, dead-letter poison/undeliverable;
+  * a real-Redis integration test (gated on MODULITH_TEST_REDIS_URL).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from dataclasses import dataclass
+from typing import Any
+
+import pytest
+
+from modulith import configure, event
+from modulith._consumer import BrokerConsumer, consumer_targets
+from modulith.event_bus import InMemoryEventBus
+from modulith.runtime import _runtime
+from modulith.serializers import JsonEventSerializer
+
+# Module scope so the serializer resolves the fully-qualified class name on the
+# round trip (consumer deserializes by the event_type header).
+
+
+@event
+@dataclass(frozen=True)
+class CrossEvent:
+    value: int
+
+
+# ---------------------------------------------------------------------------
+# Test doubles
+# ---------------------------------------------------------------------------
+
+
+class RecordingBroker:
+    """Records publish() calls — the producer-side fake (cf. test_cross_process)."""
+
+    def __init__(self) -> None:
+        self.published: list[tuple[str, bytes, dict[str, str] | None]] = []
+
+    async def publish(self, target: str, payload: bytes, headers: dict[str, str] | None = None) -> None:
+        self.published.append((target, payload, headers))
+
+    async def close(self) -> None:  # pragma: no cover - registry contract
+        pass
+
+
+class FakeConsumerBroker:
+    """In-memory stand-in for the broker's consumer surface (no Redis).
+
+    Holds queued messages per stream; ``read`` hands out (and clears) new
+    messages; ``ack``/``dead_letter`` are recorded; ``reclaim`` serves anything
+    staged in ``pending``.
+    """
+
+    def __init__(self) -> None:
+        self.streams: dict[str, list[tuple[str, dict[bytes, bytes]]]] = {}
+        self.pending: dict[str, list[tuple[str, dict[bytes, bytes]]]] = {}
+        self.groups: list[tuple[str, str]] = []
+        self.acked: list[tuple[str, str]] = []
+        self.dead: list[tuple[str, str, dict[bytes, bytes]]] = []
+        self._counter = 0
+
+    def deliver(self, target: str, data: bytes, headers: dict[str, str]) -> str:
+        """Stage a message exactly as the producer would have XADD'd it."""
+        self._counter += 1
+        mid = f"{self._counter}-0"
+        fields: dict[bytes, bytes] = {b"data": data}
+        for key, value in headers.items():
+            fields[f"h:{key}".encode()] = value.encode()
+        self.streams.setdefault(target, []).append((mid, fields))
+        return mid
+
+    async def ensure_group(self, target: str, group: str | None = None) -> None:
+        self.groups.append((target, group or ""))
+
+    async def read(
+        self, target: str, *, consumer: str, group: str | None = None, count: int = 10, block_ms: int = 1000
+    ) -> Any:
+        queued = self.streams.get(target, [])
+        if not queued:
+            await asyncio.sleep(block_ms / 1000)  # mimic XREADGROUP BLOCK so the loop yields
+            return []
+        self.streams[target] = []
+        return [(target, queued)]
+
+    async def ack(self, target: str, message_id: str, group: str | None = None) -> None:
+        self.acked.append((target, message_id))
+
+    async def reclaim(
+        self, target: str, *, consumer: str, group: str | None = None, min_idle_ms: int, count: int = 100
+    ) -> Any:
+        return (b"0-0", self.pending.pop(target, []), [])
+
+    async def dead_letter(
+        self, target: str, message_id: str, fields: dict[bytes, bytes], group: str | None = None
+    ) -> None:
+        self.dead.append((target, message_id, fields))
+
+
+async def _until(predicate, *, timeout: float = 1.0, interval: float = 0.01) -> None:
+    """Poll until predicate() is truthy or timeout — keeps loop tests bounded."""
+    waited = 0.0
+    while waited < timeout:
+        if predicate():
+            return
+        await asyncio.sleep(interval)
+        waited += interval
+
+
+def _make_consumer(broker: Any, bus: InMemoryEventBus, *, targets: list[str]) -> BrokerConsumer:
+    return BrokerConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=JsonEventSerializer(),
+        consumer_name="orders:1",
+        group="modulith-orders",
+        targets=targets,
+        poll_block_ms=10,
+        reclaim_min_idle_ms=0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Headline: full producer → consumer round-trip, no Redis
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_producer_to_consumer_roundtrip_without_redis(make_fake_app) -> None:
+    """An event published in 'process A' reaches a listener in 'process B'.
+
+    The producer (runtime) serializes + routes; we capture that exact message
+    and feed it into the consumer, which deserializes via the event_type header
+    and dispatches it. Previously only the producer half was asserted (#1/#2/#62).
+    """
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event, externalized, publish
+
+                @externalized
+                @event
+                @dataclass(frozen=True)
+                class OrderPlaced:
+                    order_id: str
+
+                async def place(order_id: str) -> None:
+                    await publish(OrderPlaced(order_id=order_id))
+            """
+        }
+    )
+    # --- Producer side: capture the serialized cross-process message ---
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+    _runtime.ensure_bootstrapped()
+    assert _runtime.broker_registry is not None
+    rec = RecordingBroker()
+    _runtime.broker_registry.register("testbroker", rec)
+
+    import fakeapp.orders as orders  # type: ignore[import-not-found]
+
+    await orders.place("o-42")
+    assert len(rec.published) == 1
+    target, payload, headers = rec.published[0]
+    assert headers is not None
+
+    # --- Consumer side: a fresh worker bus with a listener for the SAME event ---
+    from fakeapp.orders import OrderPlaced  # type: ignore[import-not-found]
+
+    received: list[Any] = []
+
+    async def on_placed(evt: Any) -> None:
+        received.append(evt)
+
+    bus = InMemoryEventBus()
+    bus.register(OrderPlaced, on_placed)
+
+    feed = FakeConsumerBroker()
+    mid = feed.deliver(target, payload, dict(headers))
+    consumer = _make_consumer(feed, bus, targets=[target])
+
+    await consumer.start()
+    try:
+        await _until(lambda: received)
+    finally:
+        await consumer.stop()
+
+    # The listener in the consumer process received the reconstructed event...
+    assert received == [OrderPlaced(order_id="o-42")]
+    # ...and the message was ACK'd so it won't be redelivered.
+    assert (target, mid) in feed.acked
+    assert feed.dead == []
+
+
+# ---------------------------------------------------------------------------
+# Dispatch semantics (direct, deterministic)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_acks_on_success() -> None:
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    broker = FakeConsumerBroker()
+    consumer = _make_consumer(broker, bus, targets=["t"])
+
+    fqn = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+    payload = JsonEventSerializer().serialize(CrossEvent(value=5))
+    fields = {b"data": payload, b"h:event_type": fqn.encode()}
+
+    await consumer._dispatch_one("t", b"1-0", fields)
+
+    assert received == [5]
+    assert broker.acked == [("t", "1-0")]
+    assert broker.dead == []
+
+
+@pytest.mark.asyncio
+async def test_undeserializable_message_is_dead_lettered() -> None:
+    bus = InMemoryEventBus()  # no listener needed; deserialize fails first
+    broker = FakeConsumerBroker()
+    consumer = _make_consumer(broker, bus, targets=["t"])
+
+    # event_type names a class that cannot be resolved → deserialize raises.
+    fields = {b"data": b"{}", b"h:event_type": b"nonexistent.module.Ghost"}
+    await consumer._dispatch_one("t", b"9-0", fields)
+
+    assert broker.dead == [("t", "9-0", fields)]
+    assert broker.acked == []  # poison is NOT acked on the source via ack()
+
+
+@pytest.mark.asyncio
+async def test_missing_event_type_header_is_dead_lettered() -> None:
+    bus = InMemoryEventBus()
+    broker = FakeConsumerBroker()
+    consumer = _make_consumer(broker, bus, targets=["t"])
+
+    fields = {b"data": b"{}"}  # no h:event_type
+    await consumer._dispatch_one("t", b"3-0", fields)
+
+    assert broker.dead == [("t", "3-0", fields)]
+
+
+@pytest.mark.asyncio
+async def test_repeated_dispatch_failure_eventually_dead_letters() -> None:
+    async def boom(evt: CrossEvent) -> None:
+        raise ValueError("listener down")
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, boom)
+    broker = FakeConsumerBroker()
+    consumer = _make_consumer(broker, bus, targets=["t"])
+
+    fqn = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+    fields = {
+        b"data": JsonEventSerializer().serialize(CrossEvent(value=1)),
+        b"h:event_type": fqn.encode(),
+    }
+
+    # First failures are NOT acked and NOT dead-lettered (stay pending for retry).
+    for _ in range(4):
+        await consumer._dispatch_one("t", b"7-0", fields)
+    assert broker.dead == []
+    assert broker.acked == []
+    # The 5th attempt exceeds the cap → dead-lettered.
+    await consumer._dispatch_one("t", b"7-0", fields)
+    assert broker.dead == [("t", "7-0", fields)]
+
+
+@pytest.mark.asyncio
+async def test_start_is_noop_without_targets() -> None:
+    broker = FakeConsumerBroker()
+    consumer = _make_consumer(broker, InMemoryEventBus(), targets=[])
+    await consumer.start()
+    await consumer.stop()
+    # No groups created, no background task.
+    assert broker.groups == []
+
+
+def test_consumer_targets_are_fully_qualified_event_names() -> None:
+    bus = InMemoryEventBus()
+
+    async def handler(evt: CrossEvent) -> None: ...
+
+    bus.register(CrossEvent, handler)
+    targets = consumer_targets(bus)
+    assert targets == [f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"]
+
+
+@pytest.mark.asyncio
+async def test_reclaim_recovers_pending_on_start() -> None:
+    """Crash recovery: messages a crashed peer left pending are reclaimed and
+    dispatched on startup (the at-least-once recovery path)."""
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    broker = FakeConsumerBroker()
+
+    fqn = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+    fields = {b"data": JsonEventSerializer().serialize(CrossEvent(value=99)), b"h:event_type": fqn.encode()}
+    broker.pending["t"] = [("5-0", fields)]
+
+    consumer = _make_consumer(broker, bus, targets=["t"])
+    await consumer.start()
+    try:
+        await _until(lambda: received)
+    finally:
+        await consumer.stop()
+
+    assert received == [99]
+    assert ("t", "5-0") in broker.acked
+
+
+# ---------------------------------------------------------------------------
+# Integration (real Redis) — gated on MODULITH_TEST_REDIS_URL
+# ---------------------------------------------------------------------------
+
+_REDIS_URL = os.environ.get("MODULITH_TEST_REDIS_URL")
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(_REDIS_URL is None, reason="MODULITH_TEST_REDIS_URL not set")
+@pytest.mark.asyncio
+async def test_integration_publish_then_consume_roundtrip() -> None:
+    """Real Redis: publish to a stream, then the consumer reads, deserializes,
+    and dispatches it to a local listener (the genuine cross-process path)."""
+    import redis.asyncio as redis
+
+    from modulith.adapters.redis_broker import RedisStreamsBroker
+
+    client = redis.from_url(_REDIS_URL)
+    try:
+        await client.ping()
+    except Exception:  # pragma: no cover - environment-dependent
+        pytest.skip("Redis not reachable")
+
+    target = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+    broker = RedisStreamsBroker(url=_REDIS_URL, stream_prefix="modulith.itest", consumer_group="g")
+    stream = f"modulith.itest.{target}"
+    await client.delete(stream)
+
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+
+    consumer = BrokerConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=JsonEventSerializer(),
+        consumer_name="itest:1",
+        group="modulith-itest",
+        targets=[target],
+        poll_block_ms=50,
+        reclaim_min_idle_ms=0,
+    )
+    try:
+        await broker.ensure_group(target, "modulith-itest")
+        payload = JsonEventSerializer().serialize(CrossEvent(value=7))
+        await broker.publish(target, payload, {"event_type": target})
+
+        await consumer.start()
+        await _until(lambda: received, timeout=5.0)
+    finally:
+        await consumer.stop()
+        await client.delete(stream)
+        await broker.close()
+        await client.aclose()
+
+    assert received == [7]

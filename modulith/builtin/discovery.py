@@ -65,19 +65,29 @@ def modulith_discover_modules(app_package: str) -> list[ModuleInfo]:
         # Import eagerly so @listener decorators run and register their
         # handlers. Failure here is a real bug in the user's code —
         # log it loudly but don't crash discovery for other modules.
+        imported_ok = True
         try:
             importlib.import_module(package_name)
         except Exception as exc:
+            imported_ok = False
             logger.exception("module %r failed to import: %s", package_name, exc)
 
-        # Auto-import _manifest.py if present. find_spec avoids an import
-        # attempt (and its noise) when the file simply doesn't exist.
-        manifest_name = f"{package_name}._manifest"
-        spec = importlib.util.find_spec(manifest_name)
-        if spec is not None:
+        # Auto-import _manifest.py if present. Only probe when the parent
+        # imported cleanly: find_spec re-imports the parent to read its
+        # __path__, so on a broken parent it would raise ModuleNotFoundError
+        # and crash discovery for every *other* module — violating this hook's
+        # "never raises" contract. Guard find_spec itself too, defensively.
+        if imported_ok:
+            manifest_name = f"{package_name}._manifest"
             try:
-                importlib.import_module(manifest_name)
-            except Exception:
-                logger.exception("module %r failed to import its manifest", package_name)
+                spec = importlib.util.find_spec(manifest_name)
+            except (ImportError, AttributeError, ValueError) as exc:
+                logger.debug("could not probe for %r manifest: %s", package_name, exc)
+                spec = None
+            if spec is not None:
+                try:
+                    importlib.import_module(manifest_name)
+                except Exception:
+                    logger.exception("module %r failed to import its manifest", package_name)
 
     return modules

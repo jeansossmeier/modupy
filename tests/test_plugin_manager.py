@@ -54,6 +54,23 @@ def test_extra_plugin_is_registered_and_invoked() -> None:
     assert plugin.brokers_called_with == [registry]
 
 
+def test_builtin_outbox_plugin_loaded_by_default() -> None:
+    """The outbox ships as a default built-in, registered under its module path.
+
+    Built-ins are not privileged — the outbox loads through the same path as
+    any plugin, so it must be present (and its publish-lifecycle hook
+    discoverable) on a default manager.
+    """
+    pm = create_plugin_manager(load_entrypoints=False)
+
+    assert pm.has_plugin("modulith.builtin.outbox")
+    impls = pm.hook.modulith_before_event_published.get_hookimpls()
+    plugins = {impl.plugin for impl in impls}
+    from modulith.builtin import outbox
+
+    assert outbox in plugins
+
+
 def test_plugin_manager_handles_missing_entry_points() -> None:
     """Discovery succeeds even with no entry points installed."""
     # Real test environment has no "modulith" entry points registered,

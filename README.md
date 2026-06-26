@@ -11,11 +11,25 @@
 
 ## Status
 
-**Pre-1.0, alpha.** Phase 0 (the plugin contract, auto-discovery,
-configuration system, and in-memory event bus) is complete and tested
-with 29 passing tests. Phase 1 (sync entrypoint, manifest, verifier,
-Postgres outbox, CLI, docs generator) is in active development. See
-[ROADMAP.md](ROADMAP.md) for the detailed phase plan.
+**Pre-1.0, alpha.** All three implementation phases are code-complete and
+covered by a passing test suite (`pytest`, `mypy --strict`, and `ruff` all
+green):
+
+- **Phase 1 — v1 essentials:** sync entrypoint, manifests, boundary verifier
+  (with ratcheting baselines), transactional outbox (Postgres adapter +
+  alembic migrations), the CLI, and the documentation generator.
+- **Phase 2 — polish:** the pytest plugin, codebase audit + `doctor`
+  diagnostics, OpenTelemetry auto-instrumentation, and the production Redis
+  Streams broker.
+- **Phase 3 — process-per-module:** the worker factory, process supervisor
+  with crash recovery, reverse proxy, and cross-process event delivery through
+  the broker (publishing *and* consuming — each worker subscribes to the
+  streams for the events it consumes).
+
+A runnable example lives in [`examples/demo_app`](examples/demo_app) — three
+modules wired together purely through events. What remains before 1.0 is
+ecosystem breadth (more broker/store adapters — Phase 4) and long-form docs
+(a cookbook and an auto-generated API reference). See [ROADMAP.md](ROADMAP.md).
 
 The full design is documented in [SPEC.md](SPEC.md) — start there if
 you want to understand the project completely or contribute.
@@ -172,8 +186,9 @@ The CLI is a progressive enhancement, not a requirement. Plain
 - **[SPEC.md](SPEC.md)** — complete project specification, every design decision (this is the canonical reference)
 - **[ROADMAP.md](ROADMAP.md)** — phase plan with checkboxes and kill criteria
 - **[MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)** — adopting on existing codebases
+- **[examples/demo_app](examples/demo_app)** — a runnable three-module shop; the fastest way to see modulith end-to-end
 
-For built-in plugin examples, see `examples/`. For tests demonstrating
+For single-file plugin examples, see `examples/`. For tests demonstrating
 the public API, see `tests/`.
 
 ---
@@ -203,7 +218,7 @@ The project is currently in single-author development with the goal of
 shipping v1 in 3 months. Contributions are welcome but the design is
 opinionated; please read [SPEC.md](SPEC.md) before opening large PRs.
 
-The plugin contract (10 hookspecs, 3 protocols) is the most stable
+The plugin contract (11 hookspecs, 3 protocols) is the most stable
 part of the project — additions are easy, signature changes require
 strong justification.
 

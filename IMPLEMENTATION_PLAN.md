@@ -2,8 +2,10 @@
 
 > **Mission:** Take `modulith` from "Phase 0 done, rest skeletal" to "v1 production-ready
 > framework that delivers on its three-tier promise."
-> **Brutal-truth grade:** Codebase is **~30% behaviorally complete**. Documentation, test
-> design, and architecture are excellent. Phase 1 is the entire ballgame.
+> **Brutal-truth grade (updated 2026-06-26):** Phases 1–3 are now **code-complete** — every
+> former skeleton is implemented (0 `NotImplementedError` across `modulith/`; +3769 LOC since
+> Phase 0). Behavioral verification (full `ruff`/`mypy --strict`/`pytest` gate suite on the
+> expanded surface) completed 2026-06-26 — all gates green after declaring 2 missing deps + formatting; see STATUS.
 > **Target ship:** v1 (Phase 0 + 1) in 4–6 weeks. v1.1 (Phase 2) +2–3 weeks.
 > v2 (Phase 3) +3–4 weeks.
 
@@ -33,7 +35,7 @@
 
 **Phase 1 dependency order:** Manifest → Sync → Outbox plugin → Postgres adapter → Verifier → Docs gen → CLI
 
-**Currently executing:** T1.1 — Manifest System (week 1, ~150 LOC)
+**Status (2026-06-26):** Phases 1–3 **code-complete** (0 `NotImplementedError`) and **all gates green** — independently verified in a clean Python 3.11 `.[dev]` venv: `ruff check` ✓, `ruff format --check` ✓, `mypy --strict` ✓ (33 files), `pytest` ✓ (269 passed; 1 Redis integration test skipped, gated on `MODULITH_TEST_REDIS_URL`). Reaching green required three fixes applied this session: declared `alembic` (→ `postgres` extra) and `aiosqlite` (→ `test` extra) — both imported by shipped code/tests but previously in no extra — and ran `ruff format` on 19 files.
 
 ---
 
@@ -42,8 +44,9 @@
 `modulith` is a Python framework implementing the modular monolith pattern (Spring Modulith
 for Python). The SPEC.md is exhaustive (1,164 lines) and the design is sound. Phase 0
 (plugin contract, auto-discovery, in-memory bus, configuration) is genuinely complete with
-29 passing tests. **Everything else is a high-quality skeleton** — the stub files contain
-detailed TODO comments that essentially specify implementations step-by-step.
+29 passing tests. **Everything else *was* a high-quality skeleton** — the stub files contained
+detailed TODO comments specifying implementations step-by-step; those have since been implemented
+(see STATUS, 2026-06-26).
 
 The user's explicit ask: brutal truth, granular tasks, production-ready, useful.
 This plan is the execution surface for that.

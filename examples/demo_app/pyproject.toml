@@ -1,0 +1,13 @@
+# Demo app configuration.
+#
+# The presence of [tool.modulith] here lets the CLI auto-detect the
+# application package when you run `modulith verify` / `modulith info` /
+# `modulith docs` from this directory.
+
+[tool.modulith]
+package = "shop"
+# contracts_module defaults to "contracts" (this demo uses that convention);
+# set it here to use a different name for the shared-events subpackage.
+# outbox = "memory"     # the default; switch to "postgres" for durable delivery
+# broker = "memory"     # the default; switch to "redis-streams" for IPC
+# topology = "single"   # "single" | "processes"

@@ -3,97 +3,160 @@
 Used by uvicorn in process-per-module mode. The supervisor spawns one
 of these per module; uvicorn calls create_app() to get the ASGI app.
 
-Implementation status: SKELETON. ~80 lines when complete.
-
 Invoked as:
     uvicorn modulith._worker:create_app --factory \
-        --host 127.0.0.1 --port 9001 \
-        --env MODULITH_MODULE=orders \
-        --env MODULITH_APP_PACKAGE=myapp
+        --host 127.0.0.1 --port 9001
+
+with MODULITH_MODULE / MODULITH_APP_PACKAGE in the worker's environment.
 
 Critical correctness: the worker imports ONLY the configured module
 (plus the contracts module). Other modules are NOT imported. This is
 what gives each worker its own GIL — it has its own process, its own
 import graph, its own event loop, its own memory.
 
-Cross-module events flow through the broker, not in-memory dispatch.
-The runtime's event bus is replaced (or wrapped) to publish to the
-broker for any event whose listeners aren't local to this worker.
+Cross-module events flow through the broker, not in-memory dispatch. This
+factory wires BOTH halves: the runtime routes cross-module *publishes* to the
+broker, and the worker's lifespan starts a ``BrokerConsumer`` (see
+``modulith._consumer``) that *subscribes* to this module's consumed-event
+streams, deserializes each message via its ``event_type`` header, and
+dispatches it to the local listeners. The consumer is skipped (HTTP-only
+worker) in single topology, when no broker is registered, or when the module
+consumes nothing.
 """
 
 from __future__ import annotations
 
+import importlib
 import logging
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
 
 logger = logging.getLogger("modulith.worker")
 
 
-def create_app():
+def create_app() -> FastAPI:
     """Build a FastAPI app exposing only this worker's module.
 
-    Called by uvicorn via --factory. Reads configuration from env vars
-    so each worker process has its own context.
+    Called by uvicorn via ``--factory``. Reads configuration from env vars so
+    each worker process has its own context:
 
-    IMPLEMENTATION TODO:
+      * ``MODULITH_MODULE``       — the single module this worker hosts (required)
+      * ``MODULITH_APP_PACKAGE``  — the application package (required)
 
-    1. Read env vars:
-       - MODULITH_MODULE: which module this worker hosts (required)
-       - MODULITH_APP_PACKAGE: the application package (required)
-       - MODULITH_BROKER: broker URL for cross-module events
-       - All standard MODULITH_* config
-
-    2. Configure modulith for this worker:
-       from modulith import configure
-       configure(
-           package=os.environ["MODULITH_APP_PACKAGE"],
-           # Disable auto-discovery — we'll register one module manually.
-           auto_discover=False,
-           # Topology is processes here; the runtime knows to route
-           # cross-module events through the broker.
-           topology="processes",
-       )
-
-    3. Import the contracts module (always, for event types):
-       importlib.import_module(f"{app_package}.contracts")
-
-    4. Import only this worker's module:
-       module = importlib.import_module(f"{app_package}.{module_name}")
-
-    5. Build the FastAPI app:
-       from fastapi import FastAPI
-       app = FastAPI(title=f"modulith-{module_name}")
-
-    6. Mount the module's router if it has one:
-       router = getattr(module, "router", None)
-       if router is not None:
-           app.include_router(router, prefix=f"/{module_name}")
-
-    7. Add the standard health endpoint:
-       @app.get("/health")
-       async def health():
-           return {"status": "ok", "module": module_name}
-
-    8. Return app.
-
-    The runtime, plugin manager, and event bus are constructed by
-    modulith's normal bootstrap path. The differences from single-process:
-    - auto_discover=False so we don't import other modules
-    - The event bus's publish() routes through the broker for events
-      whose listeners are not local
-
-    ROUTING DETAILS:
-    Each worker subscribes to its consumed-event topics on the broker
-    at startup (via the manifest's `consumes` list, or via runtime
-    inspection of registered listeners). When a cross-module event is
-    published from this worker, the runtime sees no local listeners,
-    falls through to broker publish on topic
-    f"modulith.events.{event_type_qualname}".
-
-    Subscriptions deliver events back through the broker's consumer
-    callback, which then runs through the local event bus to dispatch
-    to listeners in this worker's module.
+    Configures modulith with ``auto_discover=False`` so bootstrap imports no
+    modules, then selectively imports the contracts module (shared event types,
+    if present) and this worker's module. Mounts the module's ``router`` (if it
+    exposes one) under ``/<module>`` and adds a ``/health`` endpoint.
     """
-    raise NotImplementedError("Phase 3 — see TODO above")
+    module_name = os.environ.get("MODULITH_MODULE")
+    app_package = os.environ.get("MODULITH_APP_PACKAGE")
+    if not module_name or not app_package:
+        raise RuntimeError(
+            "process-per-module worker requires the MODULITH_MODULE and "
+            "MODULITH_APP_PACKAGE environment variables to be set"
+        )
+
+    from fastapi import FastAPI
+
+    from . import configure
+    from .runtime import _runtime
+
+    # auto_discover=False: bootstrap must NOT walk and import sibling modules —
+    # selective import is the whole point of an isolated worker.
+    configure(package=app_package, auto_discover=False, topology="processes")
+    _runtime.ensure_bootstrapped()
+
+    contracts_module = _runtime.config.contracts_module if _runtime.config else "contracts"
+    _import_contracts(app_package, contracts_module)
+    module = importlib.import_module(f"{app_package}.{module_name}")
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # Startup: subscribe to this module's consumed-event streams so
+        # cross-process events actually get delivered (the consumer half of the
+        # process-per-module topology). Teardown: stop the consumer and release
+        # the runtime's broker connections so the worker doesn't leak its client.
+        consumer = _build_consumer(module_name)
+        if consumer is not None:
+            await consumer.start()
+        try:
+            yield
+        finally:
+            if consumer is not None:
+                await consumer.stop()
+            await _runtime.shutdown()
+
+    app = FastAPI(title=f"modulith-{module_name}", lifespan=lifespan)
+
+    router = getattr(module, "router", None)
+    if router is not None:
+        app.include_router(router, prefix=f"/{module_name}")
+        logger.info("mounted router for module %r under /%s", module_name, module_name)
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok", "module": module_name}
+
+    logger.info("worker app built for module %r (package %r)", module_name, app_package)
+    return app
+
+
+def _build_consumer(module_name: str) -> Any:
+    """Build this worker's broker consumer, or None when there's nothing to do.
+
+    Returns None — and the worker runs HTTP-only — when topology is not
+    ``processes``, no broker is registered for the configured scheme, or the
+    module's listeners consume no events. This keeps single-process and
+    HTTP-only test setups free of any broker connection.
+    """
+    from ._consumer import BrokerConsumer, consumer_targets
+    from .runtime import _runtime
+    from .serializers import JsonEventSerializer
+
+    cfg = _runtime.config
+    bus = _runtime.event_bus
+    registry = _runtime.broker_registry
+    if cfg is None or bus is None or registry is None:
+        return None
+    if cfg.topology == "single" or cfg.broker not in registry.schemes():
+        return None
+
+    targets = consumer_targets(bus)
+    if not targets:
+        return None
+
+    broker = registry.get(cfg.broker)
+    return BrokerConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=JsonEventSerializer(),
+        # Unique per worker process so replicas of a module are distinct
+        # consumers within the shared per-module group.
+        consumer_name=f"{module_name}:{os.getpid()}",
+        group=f"modulith-{module_name}",
+        targets=targets,
+    )
+
+
+def _import_contracts(app_package: str, contracts_module: str = "contracts") -> None:
+    """Import ``<app_package>.<contracts_module>`` if it exists; tolerate absence.
+
+    Only swallows the "no contracts package" case — a ModuleNotFoundError for
+    something the contracts module itself imports must still surface.
+    """
+    contracts = f"{app_package}.{contracts_module}"
+    try:
+        importlib.import_module(contracts)
+    except ModuleNotFoundError as exc:
+        if exc.name == contracts:
+            logger.debug("no contracts module under %s", app_package)
+            return
+        raise
 
 
 __all__ = ["create_app"]

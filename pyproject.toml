@@ -60,21 +60,25 @@ dependencies = [
 # conscious decision to test against the next major before letting users
 # resolve to it. We loosen these per release as compatibility is verified.
 [project.optional-dependencies]
-# Postgres outbox adapter. Pulls in async SQLAlchemy + asyncpg.
+# Postgres outbox adapter. Pulls in async SQLAlchemy + asyncpg, plus
+# Alembic for the outbox schema migrations in adapters/migrations/.
 postgres = [
     "sqlalchemy>=2.0,<3.0",
     "asyncpg>=0.29,<1.0",
+    "alembic>=1.13,<2.0",
 ]
 
 # Redis Streams broker. The default broker for process-per-module mode.
+# redis-py 5/6/7 are API-compatible for the commands the adapter uses
+# (XADD/XREADGROUP/XAUTOCLAIM/XACK and aclose()); upper bound tracks the next
+# unverified major.
 redis = [
-    "redis>=5.0,<7.0",
+    "redis>=5.0,<8.0",
 ]
 
-# Kafka broker. For teams that already run Kafka.
-kafka = [
-    "aiokafka>=0.10,<0.13",
-]
+# NOTE: a Kafka broker is on the roadmap (SPEC §10.3) but no adapter ships yet,
+# so there is intentionally no `kafka` extra — we don't advertise a dependency
+# for a feature that does not exist. It will return when the adapter lands.
 
 # OpenTelemetry auto-instrumentation. Silent no-op if user hasn't
 # configured a provider; just spans across module boundaries.
@@ -100,9 +104,21 @@ cli = [
 
 # Test plugin (separate package conceptually, included here for v1
 # convenience; will split into pytest-modulith in Phase 2).
+#
+# This extra must install everything the default (non-integration) test suite
+# imports at collection time, so `pip install modulith[test] && pytest` is
+# reproducible. The suite runs the Postgres adapter against aiosqlite, so we
+# pull SQLAlchemy + alembic + aiosqlite directly (NOT asyncpg — the sqlite path
+# doesn't need it), plus the feature extras whose libraries the tests import
+# (fastapi/httpx for proxy+worker, typer for CLI, otel for observability, redis
+# for the broker unit tests).
 test = [
     "pytest>=7.4,<10.0",
     "pytest-asyncio>=0.23,<2.0",
+    "sqlalchemy>=2.0,<3.0",
+    "alembic>=1.13,<2.0",
+    "aiosqlite>=0.19,<1.0",
+    "modulith[redis,otel,fastapi,cli]",
 ]
 
 # Everything. For "I want all the features" users.
@@ -159,6 +175,10 @@ packages = ["modulith"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = "test_*.py"
+markers = [
+    "integration: requires an external service (Redis, Postgres); skipped unless reachable",
+    "modulith_isolated: run this test in a subprocess for full module isolation",
+]
 
 [tool.ruff]
 line-length = 100
@@ -182,36 +202,13 @@ ignore = [
 # Typer's idiomatic API uses Argument(...) and Option(...) as defaults;
 # B008 ("function call in default") is a false positive for click/typer apps.
 "modulith/cli.py" = ["B008"]
-# Stub files contain unused imports that clear when implementations land.
-"modulith/builtin/observability.py" = ["F401"]
-# Adapter file structures imports below the design docstring on purpose;
-# E402 resolves when the implementation lands and imports move up.
-"modulith/adapters/redis_broker.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.11"
 strict = true
 warn_unreachable = true
 disallow_untyped_decorators = false  # decorators with TypeVar are awkward
-# Stub files (NotImplementedError bodies pending Phase 1/2 implementation)
-# trip a long list of strict-mode checks that resolve once their bodies
-# are real. Until then we exclude them from the strict lane and rely on
-# tests + the per-file ruff ignores above.
-exclude = [
-    "modulith/_worker\\.py$",
-    "modulith/audit\\.py$",
-    "modulith/cli\\.py$",
-    "modulith/doctor\\.py$",
-    "modulith/proxy\\.py$",
-    "modulith/supervisor\\.py$",
-    "modulith/testing\\.py$",
-    "modulith/builtin/docs\\.py$",
-    "modulith/builtin/observability\\.py$",
-    "modulith/builtin/outbox\\.py$",
-    "modulith/builtin/verifier\\.py$",
-    "modulith/adapters/postgres_outbox\\.py$",
-    "modulith/adapters/redis_broker\\.py$",
-]
+# No exclusions: every module is implemented and type-checks under --strict.
 
 [[tool.mypy.overrides]]
 # pluggy's hookspec module-level decorator usage produces empty-body
@@ -231,7 +228,7 @@ disable_error_code = ["empty-body"]
 # outbox = "memory"          # default — switch to "postgres" for production
 # broker = "memory"          # default — switch to "redis-streams" for IPC
 # topology = "single"        # "single" | "processes" | "subinterpreters"
-# contracts_module = "contracts"  # subpackage under app for shared events
+# contracts_module = "contracts"  # name of the shared-events subpackage (default: "contracts")
 
 [tool.modulith.verify]
 # mode = "strict"            # "strict" for new projects, "ratchet" for migration

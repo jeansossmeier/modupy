@@ -1,0 +1,537 @@
+"""Behavioral tests for the SQLAlchemy outbox adapter.
+
+The adapter is named for Postgres (it ships in ``modulith[postgres]`` with
+asyncpg) but is built on portable SQLAlchemy 2.0 Core/ORM, so these tests run
+it against an in-memory aiosqlite engine — no Docker. The same code path runs
+on Postgres in production; only the dialect (and the partial-index variant)
+differs.
+
+Covered:
+  * schema creates cleanly and round-trips an EventPublication;
+  * save() inside a bound transaction enlists the row + queues it on the
+    session, and the after-commit hook dispatches it (rollback drops it);
+  * save() outside a transaction upserts in its own short transaction;
+  * mark_complete / find_incomplete / archive / delete contracts;
+  * the duck-typed maintenance helpers count_completed / purge_completed.
+
+The cross-process crash-recovery test (the outbox's forcing function) lives
+in tests/test_outbox_crash_recovery.py and uses a file-based SQLite DB.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections import Counter
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.orm import Session as SyncSession
+from sqlalchemy.pool import StaticPool
+
+from modulith import EventPublication, event
+from modulith.adapters import postgres_outbox
+from modulith.adapters.postgres_outbox import (
+    Base,
+    EventPublicationRow,
+    PostgresPublicationStore,
+    bind_session,
+)
+from modulith.builtin import outbox
+from modulith.runtime import _runtime
+from modulith.serializers import JsonEventSerializer
+
+
+@event
+@dataclass(frozen=True)
+class PgEvent:
+    value: int
+
+
+received: list[int] = []
+
+
+async def record(event: PgEvent) -> None:
+    received.append(event.value)
+
+
+@pytest.fixture
+async def engine():
+    """A shared in-memory aiosqlite engine (StaticPool so all sessions see it)."""
+    eng = create_async_engine(
+        "sqlite+aiosqlite://",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    async with eng.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield eng
+    await eng.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _reset():
+    received.clear()
+    _runtime._reset_for_testing()
+    outbox._reset_for_testing()
+    postgres_outbox._reset_for_testing()
+    yield
+    _runtime._reset_for_testing()
+    outbox._reset_for_testing()
+    postgres_outbox._reset_for_testing()
+
+
+def _bootstrap_with_listener() -> None:
+    _runtime.configure(package="pgtest", auto_discover=False)
+    _runtime.ensure_bootstrapped()
+    assert _runtime.event_bus is not None
+    _runtime.event_bus.register(PgEvent, record)
+
+
+def _pub(value: int, **overrides) -> EventPublication:
+    serializer = JsonEventSerializer()
+    defaults = dict(
+        id=uuid4(),
+        payload=serializer.serialize(PgEvent(value=value)),
+        event_type=f"{PgEvent.__module__}.{PgEvent.__qualname__}",
+        # Module-qualified identity, mirroring persist() — so the after-commit
+        # dispatch's _resolve_listener matches the registered handler.
+        listener=outbox._listener_id(record),
+        published_at=datetime.now(UTC),
+    )
+    defaults.update(overrides)
+    return EventPublication(**defaults)
+
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+
+async def test_schema_creates_cleanly(engine) -> None:
+    # The fixture already created the schema; verify the table is mapped.
+    assert EventPublicationRow.__tablename__ == "event_publications"
+    cols = {c.name for c in EventPublicationRow.__table__.columns}
+    assert {
+        "id",
+        "event_type",
+        "payload",
+        "listener",
+        "published_at",
+        "completed_at",
+        "attempt_count",
+        "last_error",
+        "last_attempt_at",
+        "is_dead_lettered",
+    } <= cols
+
+
+# ---------------------------------------------------------------------------
+# save() inside a transaction + after-commit dispatch
+# ---------------------------------------------------------------------------
+
+
+async def test_after_commit_dispatches(engine) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener()
+
+    sessionmaker = async_sessionmaker(engine)
+    async with sessionmaker() as session:
+        token = bind_session(session)
+        try:
+            pub = _pub(5)
+            await store.save(pub)
+            await session.commit()
+        finally:
+            outbox._current_session.reset(token)
+
+    await store.wait_for_dispatch()
+
+    assert received == [5]
+    # update completion mode → row marked complete, still present.
+    async with sessionmaker() as s:
+        row = await s.get(EventPublicationRow, pub.id)
+        assert row is not None
+        assert row.completed_at is not None
+
+
+async def test_rollback_drops_pending(engine) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener()
+
+    sessionmaker = async_sessionmaker(engine)
+    async with sessionmaker() as session:
+        token = bind_session(session)
+        try:
+            await store.save(_pub(6))
+            await session.rollback()
+        finally:
+            outbox._current_session.reset(token)
+
+    await store.wait_for_dispatch()
+
+    assert received == []  # rolled back → never dispatched
+    async with sessionmaker() as s:
+        rows = (await s.execute(EventPublicationRow.__table__.select())).all()
+        assert rows == []
+
+
+def test_after_commit_without_running_loop_defers_to_retry_sweep(tmp_path, caplog) -> None:
+    """Degraded path (postgres_outbox.py:154-162): a *sync* SQLAlchemy session
+    committing from a thread with no running event loop fires the global
+    after_commit hook, but dispatch tasks can't be scheduled. The hook must NOT
+    crash — it logs and leaves the committed row for the retry sweep.
+
+    Proven end-to-end: the sync commit persists the row (with no loop running,
+    so the get_running_loop()→RuntimeError branch is genuinely taken), and the
+    async store's find_incomplete recovers it. This test is intentionally
+    synchronous so that no event loop is running at commit time.
+    """
+    db = tmp_path / "noloop.db"
+    sync_engine = create_engine(f"sqlite:///{db}")
+    Base.metadata.create_all(sync_engine)
+
+    # Constructing the store is synchronous: it registers the global after_commit
+    # hook and becomes the _active_store the hook routes to.
+    store = PostgresPublicationStore(engine=create_async_engine(f"sqlite+aiosqlite:///{db}"))
+    pub = _pub(11)
+
+    with caplog.at_level(logging.WARNING, logger="modulith.adapters.postgres"):
+        with SyncSession(sync_engine) as session:
+            # Mirror what save() does inside a bound transaction.
+            session.add(
+                EventPublicationRow(
+                    id=pub.id,
+                    event_type=pub.event_type,
+                    payload=pub.payload,
+                    listener=pub.listener,
+                    published_at=pub.published_at,
+                    completed_at=None,
+                    attempt_count=0,
+                    last_error=None,
+                    last_attempt_at=None,
+                    is_dead_lettered=False,
+                )
+            )
+            session.info.setdefault("_modulith_pending", []).append(pub.id)
+            session.commit()  # fires after_commit with NO running loop
+
+    # The degraded branch was taken: warning logged, no dispatch task created.
+    assert any("without a running loop" in r.getMessage() for r in caplog.records)
+    assert store._inflight == set()
+
+    # And the committed row is recoverable by the retry sweep (the safety net).
+    found = asyncio.run(store.find_incomplete(timedelta(0)))
+    assert [p.id for p in found] == [pub.id]
+
+    asyncio.run(store.dispose())
+    sync_engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# the 5 store methods
+# ---------------------------------------------------------------------------
+
+
+async def test_save_standalone_upserts(engine) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1)
+    await store.save(pub)  # no bound session → standalone insert
+
+    found = await store.find_incomplete(timedelta(0))
+    assert len(found) == 1
+    assert found[0].id == pub.id
+    assert found[0].payload == pub.payload
+    assert found[0].event_type == pub.event_type
+    assert found[0].listener == pub.listener
+
+    # Re-save with a mutated attempt_count → upsert (no duplicate row).
+    pub.attempt_count = 4
+    pub.last_error = "boom"
+    await store.save(pub)
+    found = await store.find_incomplete(timedelta(0))
+    assert len(found) == 1
+    assert found[0].attempt_count == 4
+    assert found[0].last_error == "boom"
+
+
+async def test_mark_complete_excludes_from_incomplete(engine) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1)
+    await store.save(pub)
+    await store.mark_complete(pub.id)
+
+    assert await store.find_incomplete(timedelta(0)) == []
+    assert await store.count_completed() == 1
+
+
+async def test_find_incomplete_respects_staleness(engine) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    fresh = _pub(1, published_at=datetime.now(UTC))
+    stale = _pub(2, published_at=datetime.now(UTC) - timedelta(seconds=120))
+    await store.save(fresh)
+    await store.save(stale)
+
+    found = await store.find_incomplete(timedelta(seconds=30))
+    ids = {p.id for p in found}
+    assert stale.id in ids
+    assert fresh.id not in ids
+
+
+async def test_delete_removes_row(engine) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1)
+    await store.save(pub)
+    await store.delete(pub.id)
+    assert await store.find_incomplete(timedelta(0)) == []
+
+
+async def test_archive_moves_row_out_of_primary(engine) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1)
+    await store.save(pub)
+    await store.archive(pub.id)
+    assert await store.find_incomplete(timedelta(0)) == []
+
+
+async def test_purge_completed_removes_old(engine) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1)
+    await store.save(pub)
+    await store.mark_complete(pub.id)
+    # Backdate completion so it's past the purge threshold.
+    sessionmaker = async_sessionmaker(engine)
+    async with sessionmaker() as s:
+        row = await s.get(EventPublicationRow, pub.id)
+        row.completed_at = datetime.now(UTC) - timedelta(days=40)
+        await s.commit()
+
+    removed = await store.purge_completed(timedelta(days=30))
+    assert removed == 1
+    assert await store.count_completed() == 0
+
+
+# ---------------------------------------------------------------------------
+# regression: reopen guard, dead-letter exclusion, unbounded counts (audit)
+# ---------------------------------------------------------------------------
+
+
+async def test_standalone_save_never_reopens_completed_row(engine) -> None:
+    # A completed row must not be resurrected by a stale failed re-save (the
+    # crash sweep racing the after-commit task). merge() used to blank
+    # completed_at; the guarded upsert refuses to touch a completed row.
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1)
+    await store.save(pub)
+    await store.mark_complete(pub.id)
+    assert await store.find_incomplete(timedelta(0)) == []
+
+    # Stale in-memory copy still has completed_at=None and a fresh failure.
+    pub.completed_at = None
+    pub.attempt_count = 1
+    pub.last_error = "late failure after completion"
+    await store.save(pub)
+
+    assert await store.find_incomplete(timedelta(0)) == []  # not reopened
+    sessionmaker = async_sessionmaker(engine)
+    async with sessionmaker() as s:
+        row = await s.get(EventPublicationRow, pub.id)
+        assert row.completed_at is not None
+        assert row.attempt_count == 0  # stale failure was dropped
+
+
+async def test_find_incomplete_excludes_dead_lettered(engine) -> None:
+    # Dead-lettered rows are filtered at the SQL level so the LIMIT-100 retry
+    # window is never starved by exhausted records.
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=3)
+    live = _pub(1, attempt_count=1)
+    dead = _pub(2, attempt_count=3)  # >= threshold → dead-lettered
+    await store.save(live)
+    await store.save(dead)
+
+    found_ids = {p.id for p in await store.find_incomplete(timedelta(0))}
+    assert live.id in found_ids
+    assert dead.id not in found_ids
+
+    dl = await store.find_dead_lettered()
+    assert [p.id for p in dl] == [dead.id]
+
+
+async def test_count_open_and_dead_lettered_are_unbounded_and_accurate(engine) -> None:
+    # count_* are the operational source of truth (find_incomplete is capped).
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=2)
+    for i in range(3):
+        await store.save(_pub(i, attempt_count=0))  # open
+    for i in range(2):
+        await store.save(_pub(100 + i, attempt_count=2))  # dead-lettered
+    done = _pub(999)
+    await store.save(done)
+    await store.mark_complete(done.id)
+
+    assert await store.count_open() == 3
+    assert await store.count_dead_lettered() == 2
+    assert await store.count_completed() == 1
+
+
+async def test_status_distinguishes_open_completed_dead_via_store_counts(engine) -> None:
+    # status() must use the unbounded store counts — find_incomplete now
+    # excludes dead-letters, so the old partition-by-attempt path would report 0.
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=2)
+    outbox.configure(store, JsonEventSerializer(), dead_letter_after_attempts=2, start_loop=False)
+    for i in range(3):
+        await store.save(_pub(i, attempt_count=0))
+    for i in range(2):
+        await store.save(_pub(100 + i, attempt_count=2))
+    done = _pub(999)
+    await store.save(done)
+    await store.mark_complete(done.id)
+
+    assert await outbox.status() == {"incomplete": 3, "completed": 1, "dead_lettered": 2}
+
+
+async def test_force_retry_reaches_dead_lettered_publication(engine) -> None:
+    # find_incomplete excludes dead-letters, so force_retry must reach a
+    # dead-lettered row via the dedicated dead-letter lookup instead.
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=2)
+    outbox.configure(store, JsonEventSerializer(), dead_letter_after_attempts=2, start_loop=False)
+    _bootstrap_with_listener()
+
+    dead = _pub(7, attempt_count=2)  # >= threshold → dead-lettered
+    await store.save(dead)
+    assert await store.find_incomplete(timedelta(0)) == []  # not in retry window
+
+    await outbox.force_retry(dead.id)
+
+    assert received == [7]  # delivered despite being dead-lettered
+
+
+async def test_last_attempt_at_persists_and_round_trips(engine) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    ts = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    pub = _pub(1, attempt_count=1, last_attempt_at=ts)
+    await store.save(pub)
+
+    (found,) = await store.find_incomplete(timedelta(0))
+    assert found.last_attempt_at == ts
+
+
+# ---------------------------------------------------------------------------
+# regression: after-commit hook + active-store lifecycle (audit)
+# ---------------------------------------------------------------------------
+
+
+async def test_dispose_unregisters_after_commit_hook(engine) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    assert postgres_outbox._hook_installed is True
+    assert postgres_outbox._active_store is store
+
+    await store.dispose()
+
+    assert postgres_outbox._hook_installed is False
+    assert postgres_outbox._active_store is None
+
+
+async def test_second_store_restores_previous_on_dispose(engine) -> None:
+    # Constructing a second store must not permanently hijack dispatch routing;
+    # disposing it restores the first (LIFO), rather than blanking it.
+    first = PostgresPublicationStore(engine=engine)
+    second = PostgresPublicationStore(engine=engine)
+    assert postgres_outbox._active_store is second
+
+    await second.dispose()
+    assert postgres_outbox._active_store is first  # restored, not None
+    assert postgres_outbox._hook_installed is True  # first still needs the hook
+
+    await first.dispose()
+    assert postgres_outbox._active_store is None
+    assert postgres_outbox._hook_installed is False
+
+
+# ---------------------------------------------------------------------------
+# regression: FOR UPDATE SKIP LOCKED row-claiming (concurrent-sweep safety)
+# ---------------------------------------------------------------------------
+
+
+async def test_skip_locked_enabled_only_on_postgres() -> None:
+    """The row-claim optimization is gated on the Postgres dialect: SQLite has
+    no row locking and would reject the clause. The flag drives whether
+    find_incomplete adds it (#37).
+
+    The Postgres case uses a stub engine exposing only ``dialect.name`` — the
+    constructor reads exactly that to set the flag, and the asyncpg driver isn't
+    installed in this (driverless) test environment.
+    """
+
+    class _StubDialect:
+        name = "postgresql"
+
+    class _StubEngine:
+        dialect = _StubDialect()
+
+    assert PostgresPublicationStore(engine=_StubEngine())._supports_skip_locked is True
+
+    sqlite = create_async_engine("sqlite+aiosqlite://")
+    try:
+        assert PostgresPublicationStore(engine=sqlite)._supports_skip_locked is False
+    finally:
+        await sqlite.dispose()
+
+
+def test_find_incomplete_statement_emits_skip_locked_on_postgres() -> None:
+    """The locking clause find_incomplete attaches compiles to the exact
+    Postgres SQL that lets concurrent sweepers partition rows instead of both
+    grabbing the same ones. Pins the SQL so a regression dropping the clause
+    (silently reintroducing cross-worker double-dispatch) is caught in CI
+    without a Postgres server."""
+    stmt = (
+        select(EventPublicationRow)
+        .where(EventPublicationRow.completed_at.is_(None))
+        .with_for_update(skip_locked=True)
+    )
+    compiled = str(stmt.compile(dialect=postgresql.dialect()))
+    assert "FOR UPDATE SKIP LOCKED" in compiled
+
+
+async def test_after_commit_and_sweep_race_is_bounded(engine) -> None:
+    """The after-commit dispatch task and the retry sweep can race for the SAME
+    freshly-committed rows. The reopen-guard + mark_complete must keep that
+    bounded: every event delivered (at-least-once), but no row delivered more
+    than once per racing path (#41). A regression that re-delivers in a loop
+    would blow past the bound."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener()
+
+    sessionmaker = async_sessionmaker(engine)
+    n = 20
+    pubs = [_pub(i) for i in range(n)]
+    async with sessionmaker() as session:
+        token = bind_session(session)
+        try:
+            for pub in pubs:
+                await store.save(pub)
+            await session.commit()  # schedules after-commit tasks; rows now sweepable
+        finally:
+            outbox._current_session.reset(token)
+
+    # Race a manual sweep (the retry-loop path) against the in-flight
+    # after-commit dispatch tasks for the very same rows.
+    async def sweep() -> None:
+        for pub in await store.find_incomplete(timedelta(0)):
+            await store._dispatch_after_commit(pub.id)
+
+    await asyncio.gather(store.wait_for_dispatch(), sweep())
+
+    # At-least-once: nothing lost.
+    assert set(received) == set(range(n))
+    # Bounded: two racing delivery paths → at most 2 deliveries per event, never
+    # an unbounded storm.
+    counts = Counter(received)
+    assert max(counts.values()) <= 2, f"unbounded re-delivery: {counts}"

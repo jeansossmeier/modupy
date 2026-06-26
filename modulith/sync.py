@@ -52,7 +52,7 @@ def _get_or_create_loop() -> asyncio.AbstractEventLoop:
         return _loop
     with _loop_lock:
         if _loop is not None:  # double-checked locking
-            return _loop
+            return _loop  # type: ignore[unreachable]
         loop = asyncio.new_event_loop()
         thread = threading.Thread(
             target=loop.run_forever,

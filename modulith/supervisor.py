@@ -3,8 +3,6 @@
 Spawns one subprocess per module, monitors them, restarts crashed
 workers, multiplexes their logs back to the supervisor's stdout.
 
-Implementation status: SKELETON. ~200 lines when complete.
-
 Mental model:
 
     ┌─────────────────────────────────────────────────────┐
@@ -39,7 +37,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
+import time
+from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .proxy import RoutingRule
 
 logger = logging.getLogger("modulith.supervisor")
 
@@ -55,9 +62,90 @@ class WorkerSpec:
 
     module_name: str  # e.g. "orders"
     package: str  # e.g. "myapp"
-    port: int  # uvicorn binds here
+    port: int  # uvicorn binds here (first replica; +1 per extra replica)
     worker_count: int = 1  # multiple processes per module if needed
-    env: dict[str, str] = None  # additional env vars
+    env: dict[str, str] | None = None  # additional env vars
+
+
+# A command builder maps (spec, port) -> argv. Injectable so tests can spawn
+# trivial processes instead of a full uvicorn worker.
+CommandBuilder = Callable[[WorkerSpec, int], list[str]]
+
+
+def _default_command(spec: WorkerSpec, port: int) -> list[str]:
+    """The production worker command: uvicorn hosting one module's app."""
+    return [
+        sys.executable,
+        "-m",
+        "uvicorn",
+        "modulith._worker:create_app",
+        "--factory",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Restart policy: backoff + circuit breaker (pure, unit-testable)
+# ---------------------------------------------------------------------------
+
+
+class _RestartPolicy:
+    """Per-instance restart state: exponential backoff + a crash-loop breaker.
+
+    Kept as a pure object (no I/O, time injected) so the two non-trivial
+    decisions are deterministically testable without spawning subprocesses or
+    sleeping:
+
+      * Backoff reset (recovery): a worker that stayed up beyond
+        ``healthy_uptime`` has effectively recovered, so its backoff resets to
+        ``initial_delay`` — otherwise a flapping-then-stable worker stays pinned
+        at ``max_delay`` for every later transient crash.
+      * Circuit breaker: more than ``max_restarts`` crashes inside a rolling
+        ``window`` means the module is deterministically broken; stop respawning
+        rather than fork-churn forever.
+    """
+
+    def __init__(
+        self,
+        *,
+        initial_delay: float,
+        max_delay: float,
+        healthy_uptime: float,
+        max_restarts: int,
+        window: float,
+    ) -> None:
+        self._initial = initial_delay
+        self._max = max_delay
+        self._healthy_uptime = healthy_uptime
+        self._max_restarts = max_restarts
+        self._window = window
+        self._delay = initial_delay
+        self._crashes: deque[float] = deque()
+
+    def on_crash(self, *, uptime: float, now: float) -> float | None:
+        """Record a crash; return the delay to wait before respawn.
+
+        Returns ``None`` when the breaker has tripped (caller must give up and
+        not respawn). ``now`` is a monotonic timestamp; ``uptime`` is how long
+        the just-exited worker had been running.
+        """
+        # Recovery → reset backoff before this crash's delay is read.
+        if uptime >= self._healthy_uptime:
+            self._delay = self._initial
+
+        # Circuit breaker: prune crashes outside the window, then bound the rate.
+        self._crashes.append(now)
+        while self._crashes and now - self._crashes[0] > self._window:
+            self._crashes.popleft()
+        if len(self._crashes) > self._max_restarts:
+            return None
+
+        delay = self._delay
+        self._delay = min(self._delay * 2, self._max)
+        return delay
 
 
 # ---------------------------------------------------------------------------
@@ -70,8 +158,8 @@ class Supervisor:
 
     Lifecycle:
       1. start() — spawn all configured workers
-      2. monitor — watch for crashes, restart with backoff
-      3. stop() — graceful SIGTERM cascade, kill on timeout
+      2. monitor — watch for crashes, restart with exponential backoff
+      3. stop() — graceful SIGTERM cascade, SIGKILL stragglers on timeout
     """
 
     def __init__(
@@ -81,89 +169,195 @@ class Supervisor:
         restart_initial_delay: float = 1.0,
         restart_max_delay: float = 60.0,
         shutdown_timeout: float = 30.0,
+        command_builder: CommandBuilder | None = None,
+        max_restarts: int = 5,
+        restart_window: float = 60.0,
+        restart_healthy_uptime: float | None = None,
     ) -> None:
         self._specs = specs
         self._restart_initial_delay = restart_initial_delay
         self._restart_max_delay = restart_max_delay
         self._shutdown_timeout = shutdown_timeout
+        self._command_builder: CommandBuilder = command_builder or _default_command
+        # Circuit-breaker bounds: more than `max_restarts` crashes within
+        # `restart_window` seconds → give up on that instance (a deterministic
+        # crash must not be respawned forever). A worker that stays up at least
+        # `restart_healthy_uptime` seconds is treated as recovered and its
+        # backoff resets; defaults to restart_max_delay.
+        self._max_restarts = max_restarts
+        self._restart_window = restart_window
+        self._restart_healthy_uptime = (
+            restart_healthy_uptime if restart_healthy_uptime is not None else restart_max_delay
+        )
+        # Keyed by instance name (module_name, or module_name-N for replicas).
         self._processes: dict[str, asyncio.subprocess.Process] = {}
-        self._monitor_tasks: list[asyncio.Task] = []
+        self._monitor_tasks: list[asyncio.Task[None]] = []
+        self._log_tasks: list[asyncio.Task[None]] = []
+        # Instances the breaker has given up on — surfaced for health reporting.
+        self._failed_instances: set[str] = set()
         self._stopping = False
 
+    def _instance_plan(self) -> list[tuple[str, WorkerSpec, int]]:
+        """Expand specs into one (instance_name, spec, port) per replica."""
+        plan: list[tuple[str, WorkerSpec, int]] = []
+        for spec in self._specs:
+            for i in range(max(1, spec.worker_count)):
+                name = spec.module_name if spec.worker_count == 1 else f"{spec.module_name}-{i}"
+                plan.append((name, spec, spec.port + i))
+        return plan
+
     async def start(self) -> None:
-        """Spawn all workers and start monitoring them.
+        """Spawn all workers and start monitoring them."""
+        self._stopping = False
+        for name, spec, port in self._instance_plan():
+            proc = await self._spawn(name, spec, port)
+            self._monitor_tasks.append(
+                asyncio.create_task(self._monitor_worker(name, spec, port, proc))
+            )
+        logger.info("supervisor started %d worker(s)", len(self._processes))
 
-        IMPLEMENTATION TODO:
-        For each spec:
-          1. Build the uvicorn command:
-             [sys.executable, "-m", "uvicorn",
-              "modulith._worker:create_app", "--factory",
-              "--host", "127.0.0.1", "--port", str(spec.port)]
-          2. Build env: os.environ + MODULITH_MODULE + spec.env
-          3. proc = await asyncio.create_subprocess_exec(
-                 *cmd, env=env,
-                 stdout=PIPE, stderr=PIPE,
-             )
-          4. Store in self._processes[spec.module_name].
-          5. Start a monitor task: asyncio.create_task(
-                 self._monitor_worker(spec, proc))
-          6. Start log-forwarder tasks for stdout/stderr.
+    async def _spawn(self, name: str, spec: WorkerSpec, port: int) -> asyncio.subprocess.Process:
+        """Build env + command, spawn one worker, register it, forward its logs.
 
-        The monitor task watches proc.wait() — when it returns, the
-        process exited. Either intentional shutdown (self._stopping)
-        or a crash. Crashes get restarted with exponential backoff.
+        Registration into ``self._processes`` happens with no ``await`` between
+        process creation and the dict assignment, so ``stop()`` can never miss a
+        live process (which would orphan its subprocess transport).
         """
-        raise NotImplementedError("Phase 3 — see TODO above")
+        cmd = self._command_builder(spec, port)
+        env = {
+            **os.environ,
+            "MODULITH_MODULE": spec.module_name,
+            "MODULITH_APP_PACKAGE": spec.package,
+            "MODULITH_TOPOLOGY": "processes",
+        }
+        if spec.env:
+            env.update(spec.env)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        self._processes[name] = proc  # atomic: no await before this point
+        logger.info("spawned worker %r on port %d (pid %s)", spec.module_name, port, proc.pid)
+        if proc.stdout is not None:
+            self._log_tasks.append(
+                asyncio.create_task(self._forward_logs(spec.module_name, proc.stdout))
+            )
+        if proc.stderr is not None:
+            self._log_tasks.append(
+                asyncio.create_task(self._forward_logs(spec.module_name, proc.stderr))
+            )
+        return proc
 
-    async def _monitor_worker(self, spec: WorkerSpec, proc: asyncio.subprocess.Process) -> None:
-        """Watch one worker; restart on crash with backoff.
+    async def _monitor_worker(
+        self, name: str, spec: WorkerSpec, port: int, proc: asyncio.subprocess.Process
+    ) -> None:
+        """Watch one worker; restart on crash with backoff + a crash-loop cap.
 
-        IMPLEMENTATION TODO:
-        delay = self._restart_initial_delay
-        while not self._stopping:
+        Loops as ``while True`` (rather than ``while not self._stopping``)
+        because ``self._stopping`` is flipped by ``stop()`` *across* the
+        ``await proc.wait()`` below — the post-await re-checks are the real
+        termination guards, and ``stop()`` also cancels this task.
+
+        Backoff and the give-up decision are delegated to ``_RestartPolicy``:
+        a worker that exceeds ``max_restarts`` crashes within ``restart_window``
+        is abandoned (logged + marked failed) instead of respawned forever, and
+        one that ran healthily long enough has its backoff reset.
+        """
+        policy = _RestartPolicy(
+            initial_delay=self._restart_initial_delay,
+            max_delay=self._restart_max_delay,
+            healthy_uptime=self._restart_healthy_uptime,
+            max_restarts=self._max_restarts,
+            window=self._restart_window,
+        )
+        while True:
+            started = time.monotonic()
             return_code = await proc.wait()
             if self._stopping:
                 return
+            uptime = time.monotonic() - started
+            delay = policy.on_crash(uptime=uptime, now=time.monotonic())
+            if delay is None:
+                logger.error(
+                    "worker %s exceeded %d restarts within %.0fs (last exit code %s) — "
+                    "giving up; not respawning. Fix the module and restart the supervisor.",
+                    name,
+                    self._max_restarts,
+                    self._restart_window,
+                    return_code,
+                )
+                self._failed_instances.add(name)
+                return
             logger.warning(
-                "worker %s exited with code %d; restarting in %.1fs",
-                spec.module_name, return_code, delay,
+                "worker %s exited with code %s; restarting in %.1fs",
+                name,
+                return_code,
+                delay,
             )
             await asyncio.sleep(delay)
-            delay = min(delay * 2, self._restart_max_delay)
-            # Respawn
-            proc = await self._spawn(spec)
-            self._processes[spec.module_name] = proc
-        """
-        raise NotImplementedError("Phase 3")
+            if self._stopping:
+                # Reachable: stop() may flip _stopping during the sleep above.
+                # mypy narrows it to False from the earlier check and can't
+                # model concurrent mutation across the await (cf. runtime.py).
+                return  # type: ignore[unreachable]
+            proc = await self._spawn(name, spec, port)
 
     async def _forward_logs(self, prefix: str, stream: asyncio.StreamReader) -> None:
-        """Read worker output line-by-line, prefix with worker name, log it.
-
-        IMPLEMENTATION TODO:
-        async for line in stream:
-            text = line.decode().rstrip()
-            print(f"[{prefix}] {text}")
-
-        Use a configurable formatter so users can route this to their
-        own logging systems. For dev mode, raw stdout is fine.
-        """
-        raise NotImplementedError("Phase 3")
+        """Read a worker's output line-by-line and re-log it with its name."""
+        try:
+            async for line in stream:
+                logger.info("[%s] %s", prefix, line.decode(errors="replace").rstrip())
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # a dead pipe must not crash the supervisor
+            logger.debug("log forwarder for %s stopped", prefix, exc_info=True)
 
     async def stop(self) -> None:
         """Graceful shutdown: SIGTERM all workers, wait, SIGKILL stragglers.
 
-        IMPLEMENTATION TODO:
-        1. Set self._stopping = True so monitors don't restart.
-        2. For each process: process.terminate() (SIGTERM).
-        3. Wait up to self._shutdown_timeout for all to exit.
-        4. Any still alive: process.kill() (SIGKILL).
-        5. Cancel monitor tasks.
+        Monitors are allowed to observe the termination and return on their own
+        (so a monitor mid-respawn finishes registering its process); they're
+        cancelled only as a timeout backstop. A final reap sweep then waits on
+        every tracked process — including any spawned during shutdown — so no
+        subprocess transport is left to be garbage-collected after the loop.
         """
-        raise NotImplementedError("Phase 3")
+        self._stopping = True
 
-    async def _spawn(self, spec: WorkerSpec) -> asyncio.subprocess.Process:
-        """Helper: build env + command and spawn one worker."""
-        raise NotImplementedError("Phase 3")
+        for proc in self._processes.values():
+            if proc.returncode is None:
+                proc.terminate()
+
+        # Let monitors exit naturally; cancel only if they overrun the timeout.
+        if self._monitor_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._monitor_tasks, return_exceptions=True),
+                    timeout=self._shutdown_timeout,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "monitors did not settle in %.0fs; cancelling", self._shutdown_timeout
+                )
+                for task in self._monitor_tasks:
+                    task.cancel()
+                await asyncio.gather(*self._monitor_tasks, return_exceptions=True)
+
+        # Final reap: kill and wait on anything still alive (covers late respawns).
+        for proc in self._processes.values():
+            if proc.returncode is None:
+                proc.kill()
+        await asyncio.gather(
+            *(proc.wait() for proc in self._processes.values()), return_exceptions=True
+        )
+
+        for task in self._log_tasks:
+            task.cancel()
+        await asyncio.gather(*self._log_tasks, return_exceptions=True)
+        self._monitor_tasks.clear()
+        self._log_tasks.clear()
+        logger.info("supervisor stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -171,46 +365,117 @@ class Supervisor:
 # ---------------------------------------------------------------------------
 
 
+def _rules_from_specs(specs: list[WorkerSpec]) -> list[RoutingRule]:
+    """Build the reverse-proxy routing table: one rule per module.
+
+    Each module's public prefix (``/orders``) maps to its worker's loopback
+    backend (``http://127.0.0.1:9001``). When a module runs multiple replicas
+    the proxy targets the first replica's port; cross-replica load balancing
+    is a v2 enhancement (the broker already load-shares event consumption
+    across replicas via the shared consumer group).
+    """
+    from .proxy import RoutingRule
+
+    return [
+        RoutingRule(
+            prefix=f"/{spec.module_name}",
+            backend_url=f"http://127.0.0.1:{spec.port}",
+        )
+        for spec in specs
+    ]
+
+
+async def _serve_uvicorn(app: Any, host: str, port: int) -> None:
+    """Default proxy server: run uvicorn until a shutdown signal arrives.
+
+    uvicorn installs its own SIGINT/SIGTERM handlers and ``serve()`` returns
+    when one fires, which lets ``run_supervised`` fall through to its
+    ``finally`` and stop the workers cleanly.
+    """
+    import uvicorn
+
+    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    await uvicorn.Server(config).serve()
+
+
 async def run_supervised(
     specs: list[WorkerSpec],
     proxy_host: str,
     proxy_port: int,
+    *,
+    supervisor: Supervisor | None = None,
+    serve: Callable[[Any, str, int], Awaitable[None]] | None = None,
 ) -> None:
     """Run the supervisor + reverse proxy together.
 
-    IMPLEMENTATION TODO:
-    1. Build Supervisor with specs.
-    2. Build reverse proxy (modulith.proxy.create_proxy_app()) with a
-       routing table derived from specs (module_name -> port).
-    3. await supervisor.start()
-    4. Run uvicorn programmatically against the proxy app on
-       (proxy_host, proxy_port).
-    5. Install SIGINT/SIGTERM handlers that call supervisor.stop()
-       and shut down the proxy.
-    6. Wait for shutdown signal.
+    Spawns one worker subprocess per module (via the Supervisor), builds a
+    reverse proxy whose routing table maps each module's prefix to its
+    worker's port, and serves that proxy on ``(proxy_host, proxy_port)`` until
+    a shutdown signal arrives. On the way out — normal exit *or* exception —
+    the workers are always stopped so none are orphaned.
+
+    ``supervisor`` and ``serve`` are injection seams for testing; production
+    callers pass neither and get a real Supervisor plus a uvicorn server.
     """
-    raise NotImplementedError("Phase 3")
+    from .proxy import create_proxy_app
+
+    rules = _rules_from_specs(specs)
+    proxy_app = create_proxy_app(rules)
+    sup = supervisor if supervisor is not None else Supervisor(specs)
+    serve_fn = serve if serve is not None else _serve_uvicorn
+
+    await sup.start()
+    try:
+        await serve_fn(proxy_app, proxy_host, proxy_port)
+    finally:
+        await sup.stop()
 
 
-def derive_specs_from_config(config: dict) -> list[WorkerSpec]:
-    """Read pyproject.toml config, build worker specs.
+def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
+    """Read application config, discover modules, build one WorkerSpec each.
 
-    Reads:
-      - [tool.modulith].package
-      - [tool.modulith.workers] for per-module worker counts
-      - Discovered modules (default: all)
-      - [tool.modulith.isolate] for selective isolation
+    ``config`` is a ``[tool.modulith]``-shaped dict:
+      - ``package``  — application root package (required)
+      - ``workers``  — ``{module_name: count}`` plus optional ``default``
+      - ``isolate``  — restrict to this subset of modules (optional)
 
-    IMPLEMENTATION TODO: load the application package, run discovery,
-    build one WorkerSpec per discovered module. Assign ports starting
-    at 9001, incrementing.
+    Ports are assigned from 9001, incrementing by each module's worker_count
+    so replicas never collide.
     """
-    raise NotImplementedError("Phase 3")
+    package = config.get("package")
+    if not package:
+        raise ValueError(
+            "derive_specs_from_config requires a 'package' key "
+            "(set [tool.modulith].package or pass it explicitly)"
+        )
+
+    from .manager import create_plugin_manager
+
+    pm = create_plugin_manager()
+    module_infos = pm.hook.modulith_discover_modules(app_package=package) or []
+    names = sorted(m.name for m in module_infos)
+
+    isolate = config.get("isolate")
+    if isolate:
+        wanted = set(isolate)
+        names = [n for n in names if n in wanted]
+
+    workers = config.get("workers") or {}
+    default_count = int(workers.get("default", 1))
+
+    specs: list[WorkerSpec] = []
+    port = 9001
+    for name in names:
+        count = int(workers.get(name, default_count))
+        specs.append(WorkerSpec(module_name=name, package=package, port=port, worker_count=count))
+        port += count
+    return specs
 
 
 __all__ = [
     "Supervisor",
     "WorkerSpec",
+    "_rules_from_specs",
     "derive_specs_from_config",
     "run_supervised",
 ]

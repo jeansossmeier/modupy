@@ -197,6 +197,8 @@ from modulith.adapters.postgres_outbox import (
     bind_session,
 )
 from modulith.builtin import outbox
+from modulith.builtin.outbox import _current_session
+from modulith.serializers import JsonEventSerializer
 
 # At startup
 store = PostgresPublicationStore(engine=async_engine)
@@ -209,6 +211,7 @@ async def get_db():
         try:
             yield session
         finally:
+            # bind_session returned this token; reset it when the request ends.
             _current_session.reset(token)
 ```
 
