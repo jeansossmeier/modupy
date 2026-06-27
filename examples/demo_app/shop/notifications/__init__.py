@@ -8,7 +8,6 @@ contract. Add or remove this module and the others are unaffected.
 from __future__ import annotations
 
 from modulith import listener
-
 from shop.contracts.events import StockReserved
 
 # Toy "outbox of sent notifications" the demo can inspect.

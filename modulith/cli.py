@@ -42,7 +42,7 @@ except ImportError:
     sys.exit(1)
 
 from .builtin import outbox, verifier
-from .config import ConfigurationError
+from .config import ConfigurationError, load_configuration
 from .manifest import get_manifest
 from .runtime import Runtime, _runtime
 from .types import Violation, ViolationSeverity
@@ -96,6 +96,26 @@ def _bootstrap_or_exit() -> Runtime:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from None
     return _runtime
+
+
+def _package_from_app_module(app_module: str) -> str:
+    """Infer the root package from ``package.module:app`` CLI syntax."""
+    module_path = app_module.partition(":")[0]
+    return module_path.split(".", 1)[0]
+
+
+def _configure_process_runtime(app_module: str) -> None:
+    """Apply process-topology CLI intent before bootstrapping the runtime."""
+    try:
+        resolved = load_configuration(topology="processes")
+    except ConfigurationError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+
+    overrides: dict[str, Any] = {"topology": "processes"}
+    if resolved.package is None:
+        overrides["package"] = _package_from_app_module(app_module)
+    _runtime.configure(**overrides)
 
 
 _DURATION_RE = re.compile(r"^(\d+)([dhms])$")
@@ -167,6 +187,7 @@ def _require_outbox_store() -> None:
 
 def _run_process_topology(
     *,
+    app_module: str,
     workers_json: str | None,
     isolate: str | None,
     host: str,
@@ -181,11 +202,16 @@ def _run_process_topology(
     """
     from .supervisor import derive_specs_from_config, run_supervised
 
+    _configure_process_runtime(app_module)
     rt = _bootstrap_or_exit()
     cfg = rt.config
     assert cfg is not None  # ensure_bootstrapped guarantees this
 
-    config: dict[str, Any] = {"package": cfg.package}
+    config: dict[str, Any] = {
+        "package": cfg.package,
+        "workers": dict(cfg.workers),
+        "env": {"MODULITH_BROKER": cfg.broker},
+    }
     if workers_json:
         try:
             config["workers"] = json.loads(workers_json)
@@ -232,7 +258,13 @@ def dev(
     process topology in v1.)
     """
     if topology != "single" or isolate is not None:
-        _run_process_topology(workers_json=None, isolate=isolate, host=host, port=port)
+        _run_process_topology(
+            app_module=app_module,
+            workers_json=None,
+            isolate=isolate,
+            host=host,
+            port=port,
+        )
         return
 
     argv = ["uvicorn", app_module, "--host", host, "--port", str(port)]
@@ -265,7 +297,13 @@ def run(
     a plain uvicorn.
     """
     if topology != "single":
-        _run_process_topology(workers_json=workers, isolate=None, host=host, port=port)
+        _run_process_topology(
+            app_module=app_module,
+            workers_json=workers,
+            isolate=None,
+            host=host,
+            port=port,
+        )
         return
 
     argv = ["uvicorn", app_module, "--host", host, "--port", str(port)]

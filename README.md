@@ -151,7 +151,7 @@ outbox = "postgres"             # default "memory" — switch for production
 broker = "redis-streams"        # default "memory" — for process-per-module
 topology = "single"             # "single" | "processes"
 
-[tool.modulith.outbox]
+[tool.modulith.outbox_options]
 completion_mode = "update"      # update | delete | archive
 
 [tool.modulith.workers]
@@ -221,6 +221,41 @@ opinionated; please read [SPEC.md](SPEC.md) before opening large PRs.
 The plugin contract (11 hookspecs, 3 protocols) is the most stable
 part of the project — additions are easy, signature changes require
 strong justification.
+
+### Running the tests
+
+There are two suites. The **default suite** is fast, hermetic, and needs no
+Docker — the Postgres outbox runs against in-memory SQLite and the broker runs
+against fakes:
+
+```bash
+pip install -e '.[test]'
+pytest                     # ~400 tests, no external services
+```
+
+The **integration suite** exercises the real adapters end-to-end — a real
+Postgres (the outbox, its Alembic migration, `FOR UPDATE SKIP LOCKED`), a real
+Redis (Streams broker, consumer groups, `XAUTOCLAIM` reclaim, dead-lettering),
+real cross-process event delivery, and real `uvicorn` worker subprocesses behind
+the reverse proxy. It uses [testcontainers](https://testcontainers.com) to spin
+up disposable `postgres:16` and `redis:7` containers, so it needs a running
+Docker daemon:
+
+```bash
+pip install -e '.[integration]'
+pytest -m integration      # spins up Postgres + Redis containers
+```
+
+These tests are marked `@pytest.mark.integration` and **auto-skip when Docker is
+unreachable**, so a plain `pytest` on a machine without Docker stays green. To
+run against services you already have (e.g. in CI) instead of letting
+testcontainers manage them, point the suite at them:
+
+```bash
+export MODULITH_TEST_POSTGRES_URL='postgresql+asyncpg://user:pass@localhost:5432/test'
+export MODULITH_TEST_REDIS_URL='redis://localhost:6379'
+pytest -m integration
+```
 
 ---
 

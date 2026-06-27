@@ -35,7 +35,7 @@ def upgrade() -> None:
         sa.Column("attempt_count", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("last_error", sa.String(), nullable=True),
         sa.Column("last_attempt_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("is_dead_lettered", sa.Boolean(), nullable=False, server_default=sa.text("0")),
+        sa.Column("is_dead_lettered", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.PrimaryKeyConstraint("id"),
     )
     # Partial index on Postgres (small even with millions of completed rows);

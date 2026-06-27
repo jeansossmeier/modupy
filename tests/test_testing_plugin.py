@@ -154,3 +154,12 @@ def test_isolated_marker_runs_in_subprocess() -> None:
     # with the guard env var set. If it ran inline (no isolation), the guard
     # is absent and this assertion fails — so a pass *proves* isolation.
     assert os.environ.get("MODULITH_ISOLATED_SUBPROCESS") == "1"
+
+
+@pytest.mark.modulith_no_outbox
+def test_no_outbox_marker_disables_outbox_configuration() -> None:
+    from modulith.builtin import outbox
+
+    outbox.configure(store=object(), serializer=object())
+
+    assert outbox._store is None

@@ -253,7 +253,9 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
         ),
         consumer_group=os.environ.get("MODULITH_CONSUMER_GROUP") or opts.get("consumer_group"),
         max_stream_len=int(
-            os.environ.get("MODULITH_STREAM_MAXLEN") or opts.get("max_stream_len") or _DEFAULT_MAXLEN
+            os.environ.get("MODULITH_STREAM_MAXLEN")
+            or opts.get("max_stream_len")
+            or _DEFAULT_MAXLEN
         ),
         dlq_max_stream_len=int(dlq_maxlen) if dlq_maxlen is not None else None,
     )

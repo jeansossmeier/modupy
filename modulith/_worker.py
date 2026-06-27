@@ -134,7 +134,7 @@ def _build_consumer(module_name: str) -> Any:
     return BrokerConsumer(
         broker=broker,
         bus=bus,
-        serializer=JsonEventSerializer(),
+        serializer=JsonEventSerializer(allowed_event_types=bus.registered_event_types()),
         # Unique per worker process so replicas of a module are distinct
         # consumers within the shared per-module group.
         consumer_name=f"{module_name}:{os.getpid()}",

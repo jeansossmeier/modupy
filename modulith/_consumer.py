@@ -81,7 +81,9 @@ class BrokerConsumer:
         module with no @listener has no streams to read.
         """
         if not self._targets:
-            logger.debug("consumer %r has no subscribed streams — not starting", self._consumer_name)
+            logger.debug(
+                "consumer %r has no subscribed streams — not starting", self._consumer_name
+            )
             return
         for target in self._targets:
             await self._broker.ensure_group(target, self._group)
@@ -121,6 +123,7 @@ class BrokerConsumer:
                 # No per-target _stopping check: stop() also cancels this task,
                 # so the in-flight read below raises CancelledError and unwinds
                 # immediately — the top-of-loop check handles the rest.
+                await self._reclaim(target)
                 try:
                     messages = await self._broker.read(
                         target,

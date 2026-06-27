@@ -72,6 +72,7 @@ _dead_letter_after_attempts: int = 10
 _retry_interval_seconds: float = 30.0
 _max_retry_backoff_seconds: float = 300.0
 _retry_stale_seconds: float = 30.0
+_retry_loop_enabled: bool = True
 _retry_task: asyncio.Task[None] | None = None
 
 # Publication ids currently being dispatched in THIS process. The after-commit
@@ -129,7 +130,7 @@ def configure(
     """
     global _store, _serializer, _completion_mode
     global _dead_letter_after_attempts, _retry_interval_seconds
-    global _max_retry_backoff_seconds, _retry_stale_seconds
+    global _max_retry_backoff_seconds, _retry_stale_seconds, _retry_loop_enabled
 
     if completion_mode not in ("update", "delete", "archive"):
         raise ValueError(
@@ -143,6 +144,7 @@ def configure(
     _retry_interval_seconds = retry_interval_seconds
     _max_retry_backoff_seconds = max_retry_backoff_seconds
     _retry_stale_seconds = retry_stale_seconds
+    _retry_loop_enabled = start_loop
 
     if start_loop:
         _ensure_retry_loop()
@@ -195,6 +197,8 @@ async def persist(event: Any) -> None:
     from .. import runtime as _rt
 
     assert _store is not None  # owns-dispatch guarantees this
+    if _retry_loop_enabled:
+        _ensure_retry_loop()
     bus = _rt._runtime.event_bus
     if bus is None:
         return
@@ -246,6 +250,22 @@ async def _complete(publication: EventPublication) -> None:
         await _store.mark_complete(publication.id)
 
 
+async def _record_failure(publication: EventPublication, exc: Exception) -> None:
+    """Persist one failed delivery attempt without hiding the publication."""
+    assert _store is not None
+    publication.attempt_count += 1
+    publication.last_error = str(exc)[:500]
+    publication.last_attempt_at = datetime.now(UTC)
+    await _store.save(publication)
+    if publication.attempt_count >= _dead_letter_after_attempts:
+        logger.error(
+            "publication %s dead-lettered after %d attempt(s): %s",
+            publication.id,
+            publication.attempt_count,
+            publication.last_error,
+        )
+
+
 async def _dispatch_publication(publication: EventPublication) -> None:
     """Deliver one publication to its listener and complete or fail it.
 
@@ -267,16 +287,26 @@ async def _dispatch_publication(publication: EventPublication) -> None:
         return
     _inflight_ids.add(publication.id)
     try:
-        event = _serializer.deserialize(publication.payload, publication.event_type)
+        try:
+            event = _serializer.deserialize(publication.payload, publication.event_type)
+        except Exception as exc:
+            logger.exception(
+                "could not deserialize publication %s (%s) — recording failed attempt",
+                publication.id,
+                publication.event_type,
+            )
+            await _record_failure(publication, exc)
+            return
+
         handler = _resolve_listener(publication, event)
         pm = _rt._runtime.plugin_manager
 
         if handler is None:
-            logger.warning(
-                "no registered listener %r for publication %s — leaving incomplete",
-                publication.listener,
-                publication.id,
+            err = LookupError(
+                f"no registered listener {publication.listener!r} for publication {publication.id}"
             )
+            logger.warning("%s", err)
+            await _record_failure(publication, err)
             return
 
         if pm is not None:
@@ -287,10 +317,7 @@ async def _dispatch_publication(publication: EventPublication) -> None:
         try:
             await handler(event)
         except Exception as exc:
-            publication.attempt_count += 1
-            publication.last_error = str(exc)[:500]
-            publication.last_attempt_at = datetime.now(UTC)
-            await _store.save(publication)
+            await _record_failure(publication, exc)
             if pm is not None:
                 pm.hook.modulith_on_listener_error(
                     event=event,
@@ -303,13 +330,6 @@ async def _dispatch_publication(publication: EventPublication) -> None:
                     listener_name=publication.listener,
                     publication=publication,
                     exception=exc,
-                )
-            if publication.attempt_count >= _dead_letter_after_attempts:
-                logger.error(
-                    "publication %s dead-lettered after %d attempt(s): %s",
-                    publication.id,
-                    publication.attempt_count,
-                    publication.last_error,
                 )
             return
 
@@ -506,7 +526,7 @@ def _reset_for_testing() -> None:
     """Reset module state to uninitialized. ONLY for tests."""
     global _store, _serializer, _completion_mode, _retry_task
     global _dead_letter_after_attempts, _retry_interval_seconds
-    global _max_retry_backoff_seconds, _retry_stale_seconds
+    global _max_retry_backoff_seconds, _retry_stale_seconds, _retry_loop_enabled
     _store = None
     _serializer = None
     _completion_mode = "update"
@@ -514,6 +534,7 @@ def _reset_for_testing() -> None:
     _retry_interval_seconds = 30.0
     _max_retry_backoff_seconds = 300.0
     _retry_stale_seconds = 30.0
+    _retry_loop_enabled = True
     _retry_task = None
     _inflight_ids.clear()
 

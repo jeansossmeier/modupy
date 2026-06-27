@@ -8,7 +8,6 @@ clear error instead of quietly dropping events.
 from __future__ import annotations
 
 from modulith import declare_module
-
 from shop.inventory import reserve_stock
 
 declare_module(

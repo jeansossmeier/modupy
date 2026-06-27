@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from modulith import declare_module
-
 from shop.notifications import notify_customer
 
 declare_module(

@@ -165,6 +165,7 @@ def test_dev_processes_topology_runs_supervisor(make_fake_app, monkeypatch):
     # hands them to the supervisor — it must NOT exec a single uvicorn.
     make_fake_app({"orders": "", "inventory": ""})
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
     monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
 
     captured: dict[str, object] = {}
@@ -183,9 +184,41 @@ def test_dev_processes_topology_runs_supervisor(make_fake_app, monkeypatch):
     assert captured["port"] == 8080
 
 
+def test_dev_processes_topology_uses_app_module_package_and_worker_env(make_fake_app, monkeypatch):
+    """CLI-only process runs must hand package/broker config to workers.
+
+    A user should not need ``MODULITH_PACKAGE`` just because they chose the
+    process topology: the required ``app_module`` argument already names the
+    application package. The spawned worker specs also need the same broker
+    name, otherwise child processes validate ``topology=processes`` against the
+    default in-memory broker and fail at startup.
+    """
+    make_fake_app(
+        {"orders": ""},
+        extra_files={"main.py": "from fastapi import FastAPI\napp = FastAPI()\n"},
+    )
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["dev", "fakeapp.main:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    (spec,) = captured["specs"]
+    assert spec.package == "fakeapp"
+    assert spec.env["MODULITH_BROKER"] == "testbroker"
+
+
 def test_run_processes_topology_runs_supervisor(make_fake_app, monkeypatch):
     make_fake_app({"orders": "", "inventory": ""})
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
     monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
 
     captured: dict[str, object] = {}
@@ -204,6 +237,36 @@ def test_run_processes_topology_runs_supervisor(make_fake_app, monkeypatch):
     by_name = {s.module_name: s for s in captured["specs"]}
     assert set(by_name) == {"orders", "inventory"}
     assert by_name["orders"].worker_count == 2
+
+
+def test_run_processes_topology_uses_pyproject_worker_counts(make_fake_app, monkeypatch, tmp_path):
+    """[tool.modulith.workers] must feed process-topology worker specs."""
+    make_fake_app(
+        {"orders": "", "inventory": ""},
+        extra_files={"main.py": "from fastapi import FastAPI\napp = FastAPI()\n"},
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.modulith]\n"
+        'package = "fakeapp"\n'
+        'broker = "testbroker"\n'
+        "[tool.modulith.workers]\n"
+        "orders = 3\n"
+    )
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["run", "fakeapp.main:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    by_name = {s.module_name: s for s in captured["specs"]}
+    assert by_name["orders"].worker_count == 3
+    assert by_name["inventory"].worker_count == 1
 
 
 # ---------------------------------------------------------------------------

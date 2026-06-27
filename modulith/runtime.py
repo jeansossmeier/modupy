@@ -157,12 +157,16 @@ class Runtime:
             # Durable path: persist one record per listener inside the bound
             # transaction. Dispatch happens after commit via the adapter's
             # after-commit hook — never in-memory here (that would double-fire
-            # listeners and run them before the business commit). Persistence
-            # is async, so it's driven here rather than in the synchronous
-            # modulith_before_event_published pluggy hook.
+            # local listeners and run them before the business commit).
+            # Broker routing is separate: process-mode remote consumers still
+            # need the serialized event even when local listener dispatch is
+            # delayed by the transactional outbox.
             from .builtin import outbox
 
+            assert self._event_bus is not None
+            handlers = self._event_bus.listeners_for(type(event))
             await outbox.persist(event)
+            await self._maybe_route_to_broker(event, has_local_handler=bool(handlers))
             # Fire the post-publish hook on the durable path too: the event is
             # now persisted, which is exactly what the hookspec documents
             # ("after an event has been persisted to the outbox"). Omitting it
@@ -459,12 +463,17 @@ class Runtime:
         Fulfils the Broker.close() / BrokerRegistry.close_all() contract
         ("called once on application shutdown"), which previously had no caller:
         a redis-streams client's connection leaked for the process lifetime.
-        Idempotent and safe to call when no broker was ever registered. Invoke
-        from a worker's ASGI lifespan teardown and the supervisor's shutdown.
+        Also stops the first-party outbox retry loop when the runtime owns the
+        process lifecycle. Idempotent and safe to call when no broker/outbox was
+        ever registered. Invoke from a worker's ASGI lifespan teardown and the
+        supervisor's shutdown.
         """
         registry = self._broker_registry
         if registry is not None:
             await registry.close_all()
+        from .builtin import outbox
+
+        await outbox.shutdown()
 
     # ----- Test support -----------------------------------------------------
 

@@ -9,7 +9,6 @@ modules, each ignorant of the others.
 from __future__ import annotations
 
 from modulith import listener, publish
-
 from shop.contracts.events import OrderPlaced, StockReserved
 
 # Toy state the demo can inspect.

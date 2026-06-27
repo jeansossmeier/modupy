@@ -145,6 +145,31 @@ def test_deserialize_unknown_module_raises() -> None:
         serializer.deserialize(data, "no.such.module.Nope")
 
 
+def test_allowlist_blocks_importable_but_unregistered_event_type() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[_fqcn(SimpleEvent)])
+    data = serializer.serialize(
+        RichEvent(
+            order_id="o",
+            amount=Decimal("1.00"),
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            due=date(2026, 1, 1),
+            correlation_id=uuid4(),
+        )
+    )
+
+    with pytest.raises(ValueError, match="not in the allowed event types"):
+        serializer.deserialize(data, _fqcn(RichEvent))
+
+
+def test_allowlist_allows_registered_event_type() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[SimpleEvent])
+    original = SimpleEvent(order_id="allowed", quantity=2)
+
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(SimpleEvent))
+
+    assert restored == original
+
+
 def test_round_trip_parameterized_containers_coerce_inner_types() -> None:
     # Regression for the audit finding: list[datetime] / dict[str, Decimal] /
     # set[UUID] / tuple[date, ...] must coerce their *inner* elements, not leave

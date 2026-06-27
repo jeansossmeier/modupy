@@ -121,14 +121,34 @@ test = [
     "modulith[redis,otel,fastapi,cli]",
 ]
 
+# Integration test suite — the testcontainers-backed end-to-end tests
+# (tests/test_*_e2e.py, test_*_integration.py, test_migration_postgres.py,
+# test_process_topology_e2e.py). These spin up real Postgres + Redis via
+# Docker, so they need the REAL drivers, not the sqlite stand-in:
+#   - testcontainers: starts disposable postgres:16 / redis:7 containers
+#   - asyncpg: the async Postgres driver the outbox runs on in production
+#   - psycopg[binary]: the SYNC driver Alembic uses for the migration test
+#     (postgresql+psycopg://) — asyncpg can't drive Alembic's sync engine
+# Layered on `test` so it also gets pytest, redis, fastapi, etc. Run with
+# `pip install modulith[integration] && pytest -m integration`; the suite
+# auto-skips these when Docker is unreachable (see tests/conftest.py).
+integration = [
+    "modulith[test]",
+    "testcontainers>=4.0,<5.0",
+    "asyncpg>=0.29,<1.0",
+    "psycopg[binary]>=3.1,<4.0",
+]
+
 # Everything. For "I want all the features" users.
 all = [
     "modulith[postgres,redis,otel,fastapi,cli,test]",
 ]
 
 # Development dependencies — for working ON modulith, not WITH it.
+# Includes `integration` so contributors can run the full testcontainers
+# suite locally; `all` alone only covers the sqlite-backed default tests.
 dev = [
-    "modulith[all]",
+    "modulith[all,integration]",
     "ruff>=0.4,<1.0",
     "mypy>=1.10,<2.0",
     "pytest-cov>=4.1,<8.0",

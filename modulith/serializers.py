@@ -24,6 +24,7 @@ import importlib
 import json
 import types
 import typing
+from collections.abc import Iterable
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
@@ -84,6 +85,13 @@ def _resolve_class(fqcn: str) -> type:
             continue
         return obj  # type: ignore[no-any-return]
     raise ImportError(f"could not resolve event type {fqcn!r}")
+
+
+def _event_type_name(event_type: str | type) -> str:
+    """Normalize a class or fully-qualified name to the stored event_type."""
+    if isinstance(event_type, str):
+        return event_type
+    return f"{event_type.__module__}.{event_type.__qualname__}"
 
 
 def _coerce(value: Any, hint: Any) -> Any:
@@ -162,6 +170,13 @@ class JsonEventSerializer:
     (duck-typed; no inheritance required).
     """
 
+    def __init__(self, *, allowed_event_types: Iterable[str | type] | None = None) -> None:
+        self._allowed_event_types = (
+            None
+            if allowed_event_types is None
+            else {_event_type_name(event_type) for event_type in allowed_event_types}
+        )
+
     def serialize(self, event: Any) -> bytes:
         """Encode an event instance to JSON bytes.
 
@@ -188,6 +203,8 @@ class JsonEventSerializer:
         then reconstructs it, coercing each field back to its annotated
         type so a round-trip is equality-preserving.
         """
+        if self._allowed_event_types is not None and event_type not in self._allowed_event_types:
+            raise ValueError(f"event type {event_type!r} is not in the allowed event types")
         cls = _resolve_class(event_type)
         raw = json.loads(data.decode("utf-8"))
         if dataclasses.is_dataclass(cls):

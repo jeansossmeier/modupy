@@ -9,15 +9,15 @@ Two layers:
     XACK, XAUTOCLAIM for crash recovery, dead-letter XADD) without a server.
 
   * **Integration** (``@pytest.mark.integration``) — a real publish→consume
-    round-trip against a live Redis. Skipped unless ``MODULITH_TEST_REDIS_URL``
-    points at a reachable server, so the suite stays green without Docker.
+    round-trip against a live Redis provisioned by the ``redis_url``/
+    ``redis_client`` fixtures (a throwaway testcontainers Redis when Docker is
+    available, or ``MODULITH_TEST_REDIS_URL`` when set), else skipped.
 
 The fake matches redis-py's async surface for the methods the adapter uses.
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import pytest
@@ -432,6 +432,26 @@ def test_register_hook_registers_when_configured(make_fake_app, monkeypatch) -> 
     assert "redis-streams" in registry.schemes()
 
 
+def test_runtime_loads_redis_broker_builtin_when_configured(make_fake_app, monkeypatch) -> None:
+    """Normal bootstrap must load the shipped Redis adapter.
+
+    Unit tests that call ``modulith_register_brokers`` directly are not enough:
+    process topology uses the runtime's plugin manager, so the adapter must be
+    registered through the same built-in plugin path as the rest of modulith.
+    """
+    make_fake_app({"orders": ""})
+    from modulith import configure
+    from modulith.runtime import _runtime
+
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
+    configure(package="fakeapp", broker="redis-streams")
+
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.broker_registry is not None
+    assert "redis-streams" in _runtime.broker_registry.schemes()
+
+
 def test_register_hook_reads_broker_options_from_config(make_fake_app, monkeypatch) -> None:
     """[tool.modulith.broker] settings (broker_options) reach the adapter.
 
@@ -480,29 +500,17 @@ def test_env_var_overrides_broker_options(make_fake_app, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Integration (real Redis) — gated on MODULITH_TEST_REDIS_URL
+# Integration (real Redis) — see the redis_url/redis_client fixtures (conftest)
 # ---------------------------------------------------------------------------
-
-_REDIS_URL = os.environ.get("MODULITH_TEST_REDIS_URL")
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(_REDIS_URL is None, reason="MODULITH_TEST_REDIS_URL not set")
-async def test_integration_publish_and_consume_roundtrip() -> None:
-    import redis.asyncio as redis
-
-    client = redis.from_url(_REDIS_URL)
-    try:
-        await client.ping()
-    except Exception:  # pragma: no cover - environment-dependent
-        pytest.skip("Redis not reachable")
-
+async def test_integration_publish_and_consume_roundtrip(redis_url, redis_client) -> None:
+    # redis_client flushes the DB before/after this test for cross-suite isolation.
     broker = RedisStreamsBroker(
-        url=_REDIS_URL, stream_prefix="modulith.test", consumer_group="itest"
+        url=redis_url, stream_prefix="modulith.test", consumer_group="itest"
     )
     stream = "roundtrip"
-    full = "modulith.test.roundtrip"
-    await client.delete(full)
     try:
         await broker.ensure_group(stream)
         await broker.publish(stream, b'{"hello": "world"}', headers={"k": "v"})
@@ -516,6 +524,4 @@ async def test_integration_publish_and_consume_roundtrip() -> None:
         assert fields[b"h:k"] == b"v"
         await broker.ack(stream, msg_id.decode() if isinstance(msg_id, bytes) else msg_id)
     finally:
-        await client.delete(full)
         await broker.close()
-        await client.aclose()

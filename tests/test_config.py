@@ -224,19 +224,15 @@ def test_production_env_var_falsy_value_is_strict_false(monkeypatch) -> None:
 
 
 def test_pyproject_outbox_subtable_maps_to_outbox_options(tmp_path: Path) -> None:
-    """[tool.modulith.outbox] (subtable) populates Configuration.outbox_options
-    rather than the scalar Configuration.outbox field. TOML disallows a key
-    being both string and table, so users pick one form per project."""
+    """[tool.modulith.outbox_options] can coexist with scalar outbox."""
     (tmp_path / "pyproject.toml").write_text(
         '[tool.modulith]\noutbox = "postgres"\n'
-        "[tool.modulith.outbox_options]\n"  # use distinct name in scalar+subtable test
+        "[tool.modulith.outbox_options]\n"
         'completion_mode = "delete"\n'
     )
-    # Reading the documented form: scalar + subtable with different names.
-    # Validate with an explicit-only setup since same-name conflict is a TOML
-    # error users hit at parse time.
     cfg = load_configuration()
     assert cfg.outbox == "postgres"
+    assert cfg.outbox_options == {"completion_mode": "delete"}
 
 
 def test_pyproject_subtable_outbox_alone_maps_to_options(tmp_path: Path) -> None:
@@ -267,9 +263,7 @@ def test_pyproject_broker_subtable_maps_to_broker_options(tmp_path: Path) -> Non
     so SPEC-documented TOML broker settings were silently ignored.
     """
     (tmp_path / "pyproject.toml").write_text(
-        "[tool.modulith.broker]\n"
-        'url = "redis://cache:6379"\n'
-        'consumer_group = "modulith-orders"\n'
+        '[tool.modulith.broker]\nurl = "redis://cache:6379"\nconsumer_group = "modulith-orders"\n'
     )
     cfg = load_configuration()
     assert cfg.broker_options == {

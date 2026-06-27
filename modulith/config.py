@@ -119,8 +119,8 @@ def _read_pyproject() -> dict[str, Any]:
     """Read [tool.modulith] from pyproject.toml. Returns {} if absent.
 
     The documented pyproject.toml convention uses subtables for compound
-    options (e.g. ``[tool.modulith.outbox]`` for outbox completion mode,
-    ``[tool.modulith.broker]`` for broker connection settings,
+    options (e.g. ``[tool.modulith.outbox_options]`` for outbox completion
+    mode, ``[tool.modulith.broker]`` for broker connection settings,
     ``[tool.modulith.workers]`` for per-module worker counts). TOML parses
     these as nested dicts under the ``modulith`` key. We separate scalar
     keys (which map directly to Configuration fields) from subtables
@@ -131,8 +131,8 @@ def _read_pyproject() -> dict[str, Any]:
     Note: TOML forbids a key being both a scalar and a table, so the broker
     *name* (scalar ``broker = "redis-streams"``) and broker *options*
     (subtable ``[tool.modulith.broker]``) cannot share the ``broker`` key in
-    one file — set the name via ``MODULITH_BROKER`` / ``configure(broker=...)``
-    when supplying options through the subtable, exactly as for ``outbox``.
+    one file. Use ``[tool.modulith.broker_options]`` when the scalar broker
+    name is also set in the same file.
 
     Subtables not yet backed by a Configuration field (currently
     ``verify``, which Phase 1 will add) are dropped silently — the
@@ -158,7 +158,9 @@ def _read_pyproject() -> dict[str, Any]:
     # not in this mapping are forward-compatibility space and dropped.
     SUBTABLE_FIELD = {
         "outbox": "outbox_options",
+        "outbox_options": "outbox_options",
         "broker": "broker_options",
+        "broker_options": "broker_options",
         "workers": "workers",
     }
 

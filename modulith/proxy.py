@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
 logger = logging.getLogger("modulith.proxy")
+DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -56,7 +57,13 @@ def _match_rule(path: str, rules: list[RoutingRule]) -> RoutingRule | None:
     return None
 
 
-def create_proxy_app(rules: list[RoutingRule], *, client: Any | None = None) -> FastAPI:
+def create_proxy_app(
+    rules: list[RoutingRule],
+    *,
+    client: Any | None = None,
+    max_request_body_bytes: int | None = DEFAULT_MAX_REQUEST_BODY_BYTES,
+    actuator_token: str | None = None,
+) -> FastAPI:
     """Build the reverse-proxy ASGI app.
 
     ``client`` (an ``httpx.AsyncClient``) may be injected — for tests, or to
@@ -74,14 +81,28 @@ def create_proxy_app(rules: list[RoutingRule], *, client: Any | None = None) -> 
 
     app = FastAPI(title="modulith-proxy", lifespan=lifespan)
 
+    def _actuator_auth_response(request: Request) -> JSONResponse | None:
+        if actuator_token is None:
+            return None
+        expected = f"Bearer {actuator_token}"
+        if request.headers.get("authorization") == expected:
+            return None
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+
     # Actuator routes are registered before the catch-all so they win for
     # /_modulith/* paths.
-    @app.get("/_modulith/topology")
-    async def topology() -> dict[str, Any]:
+    @app.get("/_modulith/topology", response_model=None)
+    async def topology(request: Request) -> dict[str, Any] | JSONResponse:
+        denied = _actuator_auth_response(request)
+        if denied is not None:
+            return denied
         return {"routes": [{"prefix": r.prefix, "backend": r.backend_url} for r in rules]}
 
-    @app.get("/_modulith/health")
-    async def health() -> dict[str, Any]:
+    @app.get("/_modulith/health", response_model=None)
+    async def health(request: Request) -> dict[str, Any] | JSONResponse:
+        denied = _actuator_auth_response(request)
+        if denied is not None:
+            return denied
         backends: dict[str, str] = {}
         overall = "ok"
         for rule in rules:
@@ -109,7 +130,12 @@ def create_proxy_app(rules: list[RoutingRule], *, client: Any | None = None) -> 
         if request.url.query:
             upstream += "?" + request.url.query
 
+        too_large = _body_too_large(request, max_request_body_bytes)
+        if too_large is not None:
+            return too_large
         body = await request.body()
+        if max_request_body_bytes is not None and len(body) > max_request_body_bytes:
+            return JSONResponse({"detail": "request body too large"}, status_code=413)
         fwd_headers = _filter_headers(dict(request.headers))
         # Drop the client's Host so httpx sets it to the loopback worker's
         # authority. Forwarding the external Host (e.g. api.example.com) makes
@@ -130,11 +156,16 @@ def create_proxy_app(rules: list[RoutingRule], *, client: Any | None = None) -> 
             # unresponsive), ReadError/ReadTimeout/RemoteProtocolError (worker
             # died mid-handshake). All mean "backend unavailable" → 502, never
             # an uncaught 500.
-            logger.warning("backend %s unreachable for %s: %s", rule.backend_url, upstream, exc)
+            logger.warning(
+                "backend %s unreachable for %s: %s",
+                rule.backend_url,
+                _without_query(upstream),
+                exc,
+            )
             return JSONResponse({"detail": "backend unreachable"}, status_code=502)
 
         return StreamingResponse(
-            _safe_stream(upstream_resp, upstream),
+            _safe_stream(upstream_resp, _without_query(upstream)),
             status_code=upstream_resp.status_code,
             headers=_filter_headers(dict(upstream_resp.headers)),
             background=BackgroundTask(upstream_resp.aclose),
@@ -165,6 +196,27 @@ HOP_BY_HOP_HEADERS = frozenset(
 def _filter_headers(headers: dict[str, str]) -> dict[str, str]:
     """Strip hop-by-hop headers before forwarding."""
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
+
+
+def _body_too_large(request: Request, limit: int | None) -> JSONResponse | None:
+    """Reject oversized requests before buffering the body when possible."""
+    if limit is None:
+        return None
+    content_length = request.headers.get("content-length")
+    if content_length is None:
+        return None
+    try:
+        size = int(content_length)
+    except ValueError:
+        return None
+    if size > limit:
+        return JSONResponse({"detail": "request body too large"}, status_code=413)
+    return None
+
+
+def _without_query(url: str) -> str:
+    """Remove query strings before logging so credentials are not persisted."""
+    return url.partition("?")[0]
 
 
 async def _safe_stream(resp: Any, upstream: str) -> AsyncIterator[bytes]:

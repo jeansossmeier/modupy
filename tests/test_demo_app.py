@@ -69,7 +69,7 @@ async def test_demo_modules_are_auto_discovered(demo_app) -> None:
 
 
 def test_demo_http_endpoint_triggers_chain(demo_app) -> None:
-    from shop import inventory
+    from shop import inventory, notifications
     from shop.main import app
 
     with TestClient(app) as client:
@@ -77,4 +77,7 @@ def test_demo_http_endpoint_triggers_chain(demo_app) -> None:
 
     assert resp.status_code == 200
     order_id = resp.json()["order_id"]
+    # Both hops of the chain fire through the HTTP entry point: orders →
+    # inventory (reserve) → notifications (notify).
     assert any(r.order_id == order_id for r in inventory.reserved)
+    assert any(n.order_id == order_id for n in notifications.sent)

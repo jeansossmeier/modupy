@@ -45,6 +45,7 @@ BUILTIN_PLUGINS = (
     "modulith.builtin.verifier",
     "modulith.builtin.docs",
     "modulith.builtin.observability",
+    "modulith.adapters.redis_broker",
 )
 
 

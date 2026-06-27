@@ -462,12 +462,21 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
 
     workers = config.get("workers") or {}
     default_count = int(workers.get("default", 1))
+    worker_env = dict(config.get("env") or {})
 
     specs: list[WorkerSpec] = []
     port = 9001
     for name in names:
         count = int(workers.get(name, default_count))
-        specs.append(WorkerSpec(module_name=name, package=package, port=port, worker_count=count))
+        specs.append(
+            WorkerSpec(
+                module_name=name,
+                package=package,
+                port=port,
+                worker_count=count,
+                env=worker_env.copy() or None,
+            )
+        )
         port += count
     return specs
 

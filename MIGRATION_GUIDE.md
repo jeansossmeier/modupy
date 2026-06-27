@@ -180,7 +180,7 @@ uv add 'modulith[postgres]'
 [tool.modulith]
 outbox = "postgres"
 
-[tool.modulith.outbox]
+[tool.modulith.outbox_options]
 completion_mode = "update"      # keep history visible
 ```
 

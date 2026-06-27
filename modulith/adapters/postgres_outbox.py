@@ -52,6 +52,7 @@ from sqlalchemy import (
     String,
     Uuid,
     delete,
+    false,
     func,
     select,
     text,
@@ -92,11 +93,9 @@ class EventPublicationRow(Base):
         Integer, nullable=False, default=0, server_default="0"
     )
     last_error: Mapped[str | None] = mapped_column(String, nullable=True)
-    last_attempt_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_dead_lettered: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=text("0")
+        Boolean, nullable=False, default=False, server_default=false()
     )
 
     __table_args__ = (
@@ -124,9 +123,7 @@ class EventPublicationArchiveRow(Base):
         Integer, nullable=False, default=0, server_default="0"
     )
     last_error: Mapped[str | None] = mapped_column(String, nullable=True)
-    last_attempt_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 # ---------------------------------------------------------------------------

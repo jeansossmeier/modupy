@@ -503,13 +503,15 @@ For data ownership rules, parse SQLAlchemy queries via static analysis of `.sele
 
 ### 8.3 Ratcheting Mode
 
-For brownfield adoption. Configure:
+For brownfield adoption, run:
 
-```toml
-[tool.modulith.verify]
-mode = "ratchet"  # or "strict" for new projects
-baseline = ".modulith-baseline.json"
+```bash
+modulith verify --mode=ratchet --baseline=.modulith-baseline.json
 ```
+
+`[tool.modulith.verify]` is reserved for a future config-backed default. The
+current implementation intentionally ignores that subtable for forward
+compatibility; use the CLI flags above today.
 
 The baseline file records existing violations. The verifier:
 - Passes any violation listed in the baseline (grandfathered)
@@ -605,7 +607,10 @@ modulith dev --isolate=reports  # only reports gets its own process
 /_modulith/* → supervisor's own actuator
 ```
 
-Implementation: `httpx.AsyncClient` for streaming proxy. WebSocket support is v2.1 enhancement.
+Implementation: `httpx.AsyncClient` for streaming proxy. The proxy bounds
+buffered request bodies, logs upstream URLs without query strings, and can
+guard `/_modulith/*` actuator metadata with an optional bearer token. WebSocket
+support is v2.1 enhancement.
 
 ### 9.5 Topology Configuration
 
@@ -774,7 +779,7 @@ Activated via `@pytest.mark.modulith_isolated`. Each test runs in its own Python
 modulith dev [--topology=single|processes] [--isolate=MODULE] [--reload]
 modulith run [--topology=single|processes] [--workers=JSON]
 modulith verify [--mode=strict|ratchet] [--baseline=PATH] [--update-baseline]
-modulith docs [--output-dir=DIR] [--format=mermaid|plantuml]
+modulith docs [--output-dir=DIR]
 modulith audit [--output=FILE]
 modulith doctor
 modulith outbox status
@@ -1137,9 +1142,18 @@ modulith = "modulith.cli:app"
 
 Three layers:
 
-1. **Unit tests** (`tests/test_*.py`) — fast, isolated, no I/O. Cover individual modules.
+1. **Unit tests** (`tests/test_*.py`) — fast, isolated, no I/O. Cover individual modules. The Postgres outbox adapter is exercised here against in-memory SQLite so the bootstrap/retry/dead-letter logic is covered with zero external services.
 2. **Integration tests** — exercise the full bootstrap + dispatch flow. Use the fake-app fixture in `test_zero_config.py` as the template.
-3. **End-to-end tests** — a real Postgres database, real Redis, real subprocess workers. Run in CI only. Test crash recovery, broker failures, outbox retries.
+3. **End-to-end tests** (`tests/test_*_e2e.py`, `test_*_integration.py`, `test_migration_postgres.py`) — real Postgres, real Redis, and real `uvicorn` subprocess workers, provisioned on demand by [testcontainers](https://testcontainers.com) (`postgres:16` + `redis:7`). They cover the outbox against real Postgres (including the Alembic migration and `FOR UPDATE SKIP LOCKED`), Redis Streams consumer-group delivery / `XAUTOCLAIM` reclaim / dead-lettering, cross-process event delivery, and the process-per-module supervisor + proxy. Marked `@pytest.mark.integration` and gated behind Docker — they auto-skip when no daemon is reachable, so the default `pytest` run stays hermetic.
+
+Running them:
+
+```bash
+pip install -e '.[integration]'   # testcontainers + asyncpg + psycopg[binary]
+pytest -m integration             # spins up Postgres + Redis containers
+```
+
+Set `MODULITH_TEST_POSTGRES_URL` / `MODULITH_TEST_REDIS_URL` to run against pre-existing services instead of containers (e.g. a CI service container).
 
 Minimum bar for shipping v1: 90%+ line coverage on the core package, 100% on the outbox plugin (the hardest piece), passing crash-recovery tests with random kill timing.
 

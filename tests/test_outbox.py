@@ -74,12 +74,14 @@ class StubStore:
 
     def __init__(self) -> None:
         self.rows: dict[UUID, EventPublication] = {}
+        self.saved: list[UUID] = []
         self.find_incomplete_calls: list[timedelta] = []
         self.completed: list[UUID] = []
         self.deleted: list[UUID] = []
         self.archived: list[UUID] = []
 
     async def save(self, publication: EventPublication) -> None:
+        self.saved.append(publication.id)
         self.rows[publication.id] = publication
         session = outbox._current_session.get()
         if session is not None:
@@ -175,6 +177,57 @@ async def test_configure_starts_retry_loop_and_crash_sweep() -> None:
     await asyncio.sleep(0.05)
     assert store.find_incomplete_calls
     assert timedelta(0) in store.find_incomplete_calls  # crash sweep
+
+
+def test_transactional_publish_starts_retry_loop_when_configured_synchronously() -> None:
+    """Synchronous startup defers the loop, but first async publish starts it."""
+    from modulith import publish
+
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
+    _bootstrap_with_listener(record)
+
+    async def scenario() -> None:
+        session = FakeSession()
+        token = outbox._current_session.set(session)
+        try:
+            await publish(OutboxEvent(value=8))
+        finally:
+            outbox._current_session.reset(token)
+        assert outbox._retry_task is not None
+
+    asyncio.run(scenario())
+
+
+def test_transactional_publish_respects_start_loop_false() -> None:
+    from modulith import publish
+
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+
+    async def scenario() -> None:
+        session = FakeSession()
+        token = outbox._current_session.set(session)
+        try:
+            await publish(OutboxEvent(value=9))
+        finally:
+            outbox._current_session.reset(token)
+
+    asyncio.run(scenario())
+
+    assert outbox._retry_task is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_stops_outbox_retry_loop() -> None:
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
+    assert outbox._retry_task is not None
+
+    await _runtime.shutdown()
+
+    assert outbox._retry_task is None
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +343,48 @@ async def test_dispatch_failure_increments_count_and_records_error() -> None:
     assert pub.last_error is not None and "dispatch failed" in pub.last_error
     assert pub.completed_at is None
     assert pub.last_attempt_at is not None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_deserialize_failure_increments_count_and_records_error() -> None:
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+
+    pub = EventPublication(
+        id=uuid4(),
+        payload=b"{}",
+        event_type="no.such.module.Ghost",
+        listener=outbox._listener_id(record),
+        published_at=datetime.now(UTC),
+    )
+    await store.save(pub)
+
+    await outbox._dispatch_publication(pub)
+
+    assert pub.attempt_count == 1
+    assert pub.last_error is not None
+    assert "no.such.module" in pub.last_error
+    assert pub.completed_at is None
+    assert store.saved == [pub.id, pub.id]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_missing_listener_increments_count_and_records_error() -> None:
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+
+    pub = _make_pub(record, value=31, listener="missing.listener")
+    await store.save(pub)
+
+    await outbox._dispatch_publication(pub)
+
+    assert pub.attempt_count == 1
+    assert pub.last_error is not None
+    assert "missing.listener" in pub.last_error
+    assert pub.completed_at is None
+    assert store.saved == [pub.id, pub.id]
 
 
 @pytest.mark.asyncio

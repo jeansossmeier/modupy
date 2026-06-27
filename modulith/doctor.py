@@ -268,9 +268,7 @@ def _event_fingerprints(rt: Runtime) -> dict[str, str]:
                             # flips a field from required to optional — a real
                             # wire-compatibility change the fingerprint must see.
                             default = ast.unparse(stmt.value) if stmt.value is not None else None
-                            fields.append(
-                                (stmt.target.id, ast.unparse(stmt.annotation), default)
-                            )
+                            fields.append((stmt.target.id, ast.unparse(stmt.annotation), default))
                     digest = hashlib.sha256(repr(sorted(fields)).encode("utf-8")).hexdigest()[:12]
                     fingerprints[f"{module.name}.{node.name}"] = digest
     return fingerprints
@@ -342,9 +340,7 @@ def _check_outbox_health(rt: Runtime) -> HealthCheck:
     counts = asyncio.run(outbox.status())
     dead = counts["dead_lettered"]
     incomplete = counts["incomplete"]
-    summary = (
-        f"{incomplete} incomplete, {counts['completed']} completed, {dead} dead-lettered"
-    )
+    summary = f"{incomplete} incomplete, {counts['completed']} completed, {dead} dead-lettered"
     if dead > _DEAD_LETTER_ERROR_THRESHOLD:
         return HealthCheck(
             "outbox health",

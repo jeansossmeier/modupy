@@ -11,7 +11,6 @@ from __future__ import annotations
 from uuid import uuid4
 
 from modulith import publish
-
 from shop.contracts.events import OrderPlaced
 
 # A toy "database" the demo can inspect. A real module would write to its own

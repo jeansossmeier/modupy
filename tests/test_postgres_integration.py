@@ -6,28 +6,25 @@ points this adapter is tuned for: ``FOR UPDATE SKIP LOCKED`` row-claiming,
 tz-aware ``TIMESTAMPTZ``, ``BYTEA`` payloads, and the ``WHERE completed_at IS
 NULL`` partial index. A regression in any of those ships green on SQLite.
 
-These tests close that gap against a live Postgres. They are skipped unless
-``MODULITH_TEST_POSTGRES_URL`` points at a reachable server (e.g.
-``postgresql+asyncpg://user:pass@localhost:5432/modulith_test``), mirroring the
-Redis integration pattern — so the suite stays green without Docker, and CI can
-opt in by setting the env var.
+These tests close that gap against a live Postgres provisioned by the shared
+``postgres_url``/``pg_engine`` fixtures (conftest): a throwaway testcontainers
+Postgres when Docker is available, or ``MODULITH_TEST_POSTGRES_URL`` when set —
+otherwise skipped, so the suite stays green without Docker.
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from modulith import EventPublication, event
 from modulith.adapters import postgres_outbox
 from modulith.adapters.postgres_outbox import (
-    Base,
     EventPublicationRow,
     PostgresPublicationStore,
     bind_session,
@@ -36,12 +33,7 @@ from modulith.builtin import outbox
 from modulith.runtime import _runtime
 from modulith.serializers import JsonEventSerializer
 
-_PG_URL = os.environ.get("MODULITH_TEST_POSTGRES_URL")
-
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(_PG_URL is None, reason="MODULITH_TEST_POSTGRES_URL not set"),
-]
+pytestmark = [pytest.mark.integration]
 
 
 @event
@@ -58,16 +50,9 @@ async def _record(evt: PgIntegrationEvent) -> None:
 
 
 @pytest.fixture
-async def engine():
-    """A real-Postgres engine with a freshly-created (then dropped) schema."""
-    eng = create_async_engine(_PG_URL)
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(Base.metadata.create_all)
-    yield eng
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-    await eng.dispose()
+async def engine(pg_engine):
+    """Alias the shared real-Postgres engine fixture (fresh outbox schema)."""
+    yield pg_engine
 
 
 @pytest.fixture(autouse=True)

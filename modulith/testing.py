@@ -307,6 +307,34 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
 
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Apply per-test marker behavior before the test body runs."""
+    if item.get_closest_marker("modulith_no_outbox") is None:
+        return
+
+    from .builtin import outbox
+
+    item._modulith_original_outbox_configure = outbox.configure  # type: ignore[attr-defined]
+    outbox._reset_for_testing()
+
+    def _disabled_configure(*_args: Any, **_kwargs: Any) -> None:
+        outbox._reset_for_testing()
+
+    outbox.configure = _disabled_configure
+
+
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> None:
+    """Restore any monkeypatched modulith test marker state."""
+    original = getattr(item, "_modulith_original_outbox_configure", None)
+    if original is None:
+        return
+
+    from .builtin import outbox
+
+    outbox.configure = original
+    outbox._reset_for_testing()
+
+
 # ---------------------------------------------------------------------------
 # Hook: subprocess-per-test isolation for marked tests
 # ---------------------------------------------------------------------------

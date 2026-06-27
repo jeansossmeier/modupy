@@ -20,6 +20,7 @@ reset, so test order can never matter.
 
 from __future__ import annotations
 
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -139,3 +140,129 @@ def fake_app(make_fake_app: Callable[..., str]) -> str:
             """,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Integration fixtures: real Postgres / Redis via testcontainers
+# ---------------------------------------------------------------------------
+#
+# These back the ``@pytest.mark.integration`` suite. Each provides a reachable
+# service URL with a three-step resolution that keeps the default ``pytest``
+# run fast and Docker-free while letting the integration suite run anywhere
+# Docker is present:
+#
+#   1. An explicit ``MODULITH_TEST_*_URL`` env var (CI pointing at a managed
+#      service, or a developer's already-running container) — used as-is.
+#   2. A throwaway testcontainers container, started once per session, when
+#      Docker and the ``testcontainers`` package are both available.
+#   3. ``pytest.skip`` — so a machine with neither Docker nor the env var
+#      still collects and runs the unit suite green.
+#
+# Container images are pinned (overridable via env) so a registry change can
+# never silently shift the Postgres/Redis version a test ran against.
+
+_PG_IMAGE = os.environ.get("MODULITH_TEST_POSTGRES_IMAGE", "postgres:16-alpine")
+_REDIS_IMAGE = os.environ.get("MODULITH_TEST_REDIS_IMAGE", "redis:7-alpine")
+
+# Deterministic teardown happens at session end via the context managers below,
+# so the Ryuk resource-reaper (an extra image pull) is unnecessary. Opt back in
+# by exporting TESTCONTAINERS_RYUK_DISABLED=false before running.
+os.environ.setdefault("TESTCONTAINERS_RYUK_DISABLED", "true")
+
+
+def _docker_available() -> bool:
+    """True when a Docker daemon is reachable from this process."""
+    try:
+        import docker
+    except ImportError:
+        return False
+    try:
+        client = docker.from_env()
+        client.ping()
+        return True
+    except Exception:
+        return False
+
+
+@pytest.fixture(scope="session")
+def postgres_url() -> Callable[..., str]:
+    """A reachable Postgres URL (asyncpg driver) for integration tests.
+
+    Yields ``MODULITH_TEST_POSTGRES_URL`` when set, else a throwaway
+    testcontainers Postgres, else skips. Session-scoped: one container serves
+    every Postgres integration test in the run.
+    """
+    env_url = os.environ.get("MODULITH_TEST_POSTGRES_URL")
+    if env_url:
+        yield env_url
+        return
+    try:
+        from testcontainers.postgres import PostgresContainer
+    except ImportError:
+        pytest.skip("testcontainers not installed and MODULITH_TEST_POSTGRES_URL unset")
+    if not _docker_available():
+        pytest.skip("Docker unavailable and MODULITH_TEST_POSTGRES_URL unset")
+    with PostgresContainer(_PG_IMAGE, driver="asyncpg") as pg:
+        yield pg.get_connection_url()
+
+
+@pytest.fixture(scope="session")
+def redis_url() -> Callable[..., str]:
+    """A reachable Redis URL for integration tests.
+
+    Yields ``MODULITH_TEST_REDIS_URL`` when set, else a throwaway
+    testcontainers Redis, else skips. Session-scoped.
+    """
+    env_url = os.environ.get("MODULITH_TEST_REDIS_URL")
+    if env_url:
+        yield env_url
+        return
+    try:
+        from testcontainers.redis import RedisContainer
+    except ImportError:
+        pytest.skip("testcontainers not installed and MODULITH_TEST_REDIS_URL unset")
+    if not _docker_available():
+        pytest.skip("Docker unavailable and MODULITH_TEST_REDIS_URL unset")
+    with RedisContainer(_REDIS_IMAGE) as rc:
+        host = rc.get_container_host_ip()
+        port = rc.get_exposed_port(6379)
+        yield f"redis://{host}:{port}"
+
+
+@pytest.fixture
+async def pg_engine(postgres_url: str):
+    """A real-Postgres async engine with a freshly-created outbox schema.
+
+    Drops and recreates the outbox tables around each test so the shared
+    session container stays clean between tests (the suite runs serially).
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from modulith.adapters.postgres_outbox import Base
+
+    engine = create_async_engine(postgres_url)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+    try:
+        yield engine
+    finally:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+        await engine.dispose()
+
+
+@pytest.fixture
+async def redis_client(redis_url: str):
+    """A real-Redis async client, flushed before and after each test."""
+    import redis.asyncio as redis
+
+    client = redis.Redis.from_url(redis_url)
+    await client.flushdb()
+    try:
+        yield client
+    finally:
+        try:
+            await client.flushdb()
+        finally:
+            await client.aclose()

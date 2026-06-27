@@ -132,6 +132,23 @@ def test_health_actuator_flags_unreachable_backend() -> None:
     assert resp.json()["backends"]["/orders"] in {"unreachable", "unhealthy"}
 
 
+def test_actuator_token_guards_metadata_endpoints(proxy_app) -> None:
+    app = create_proxy_app(
+        [RoutingRule(prefix="/orders", backend_url="http://orders-worker")],
+        client=httpx.AsyncClient(transport=httpx.ASGITransport(app=_upstream_app())),
+        actuator_token="secret-token",
+    )
+    with TestClient(app) as client:
+        denied = client.get("/_modulith/topology")
+        allowed = client.get(
+            "/_modulith/topology",
+            headers={"authorization": "Bearer secret-token"},
+        )
+
+    assert denied.status_code == 401
+    assert allowed.status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # regression: Host rewrite + broadened transport-error mapping (audit)
 # ---------------------------------------------------------------------------
@@ -175,8 +192,37 @@ class _FailingClient:
 def test_proxy_maps_all_transport_errors_to_502(exc: Exception) -> None:
     # ConnectError used to be the only caught case; reachable-but-unresponsive
     # or mid-handshake-death backends leaked as 500. All TransportError → 502.
-    app = create_proxy_app([RoutingRule("/orders", "http://orders-worker")], client=_FailingClient(exc))
+    app = create_proxy_app(
+        [RoutingRule("/orders", "http://orders-worker")], client=_FailingClient(exc)
+    )
     with TestClient(app) as client:
         resp = client.get("/orders/ping")
     assert resp.status_code == 502
     assert resp.json()["detail"] == "backend unreachable"
+
+
+def test_proxy_rejects_body_over_limit() -> None:
+    app = create_proxy_app(
+        [RoutingRule("/orders", "http://orders-worker")],
+        client=httpx.AsyncClient(transport=httpx.ASGITransport(app=_upstream_app())),
+        max_request_body_bytes=4,
+    )
+    with TestClient(app) as client:
+        resp = client.post("/orders/echo", content=b"too-large")
+
+    assert resp.status_code == 413
+
+
+def test_proxy_transport_error_logs_omit_query_string_secrets(caplog) -> None:
+    caplog.set_level("WARNING", logger="modulith.proxy")
+    app = create_proxy_app(
+        [RoutingRule("/orders", "http://orders-worker")],
+        client=_FailingClient(httpx.ConnectError("refused")),
+    )
+
+    with TestClient(app) as client:
+        resp = client.get("/orders/ping?token=secret")
+
+    assert resp.status_code == 502
+    assert "token=secret" not in caplog.text
+    assert "/orders/ping" in caplog.text

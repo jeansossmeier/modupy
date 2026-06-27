@@ -10,8 +10,13 @@ the runtime's broker registry — no real broker required.
 
 from __future__ import annotations
 
-from modulith import configure
+from datetime import timedelta
+from uuid import UUID
+
+from modulith import EventPublication, configure
+from modulith.builtin import outbox
 from modulith.runtime import _runtime
+from modulith.serializers import JsonEventSerializer
 
 
 class FakeBroker:
@@ -28,6 +33,35 @@ class FakeBroker:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class Store:
+    """Minimal PublicationStore used to activate the transactional path."""
+
+    def __init__(self) -> None:
+        self.saved: list[EventPublication] = []
+
+    async def save(self, publication: EventPublication) -> None:
+        self.saved.append(publication)
+
+    async def mark_complete(self, publication_id: UUID) -> None:
+        pass
+
+    async def find_incomplete(self, older_than: timedelta) -> list[EventPublication]:
+        return []
+
+    async def archive(self, publication_id: UUID) -> None:
+        pass
+
+    async def delete(self, publication_id: UUID) -> None:
+        pass
+
+
+class Session:
+    """Only the outbox context binding matters for this runtime test."""
+
+    def __init__(self) -> None:
+        self.info: dict[str, object] = {}
 
 
 def _register_fake_broker(scheme: str) -> FakeBroker:
@@ -74,6 +108,49 @@ async def test_event_without_local_listener_routes_to_broker(make_fake_app) -> N
     assert b"o-1" in payload
     # The fully-qualified event type rides in headers so a consumer in another
     # process can resolve the class to deserialize.
+    assert headers is not None
+    assert headers["event_type"] == "fakeapp.orders.OrderPlaced"
+
+
+async def test_transactional_event_without_local_listener_still_routes_to_broker(
+    make_fake_app,
+) -> None:
+    """The durable local-listener outbox must not swallow remote-only events."""
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event, publish
+
+                @event
+                @dataclass(frozen=True)
+                class OrderPlaced:
+                    order_id: str
+
+                async def place(order_id: str) -> None:
+                    await publish(OrderPlaced(order_id=order_id))
+            """
+        }
+    )
+    store = Store()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+    _runtime.ensure_bootstrapped()
+    fake = _register_fake_broker("testbroker")
+
+    import fakeapp.orders as orders
+
+    token = outbox._current_session.set(Session())
+    try:
+        await orders.place("o-tx")
+    finally:
+        outbox._current_session.reset(token)
+
+    assert store.saved == []  # no local listeners, so no local outbox rows
+    assert len(fake.published) == 1
+    destination, payload, headers = fake.published[0]
+    assert destination == "fakeapp.orders.OrderPlaced"
+    assert b"o-tx" in payload
     assert headers is not None
     assert headers["event_type"] == "fakeapp.orders.OrderPlaced"
 

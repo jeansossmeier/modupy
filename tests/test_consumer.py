@@ -10,13 +10,12 @@ These tests drive the consumer half end-to-end:
     event_type header the runtime producer emits is fed straight into the
     consumer, which must deserialize and dispatch it to a local listener;
   * dispatch semantics: ack on success, dead-letter poison/undeliverable;
-  * a real-Redis integration test (gated on MODULITH_TEST_REDIS_URL).
+  * a real-Redis integration test (via the redis_url/redis_client fixtures).
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,7 +48,9 @@ class RecordingBroker:
     def __init__(self) -> None:
         self.published: list[tuple[str, bytes, dict[str, str] | None]] = []
 
-    async def publish(self, target: str, payload: bytes, headers: dict[str, str] | None = None) -> None:
+    async def publish(
+        self, target: str, payload: bytes, headers: dict[str, str] | None = None
+    ) -> None:
         self.published.append((target, payload, headers))
 
     async def close(self) -> None:  # pragma: no cover - registry contract
@@ -86,7 +87,13 @@ class FakeConsumerBroker:
         self.groups.append((target, group or ""))
 
     async def read(
-        self, target: str, *, consumer: str, group: str | None = None, count: int = 10, block_ms: int = 1000
+        self,
+        target: str,
+        *,
+        consumer: str,
+        group: str | None = None,
+        count: int = 10,
+        block_ms: int = 1000,
     ) -> Any:
         queued = self.streams.get(target, [])
         if not queued:
@@ -99,7 +106,13 @@ class FakeConsumerBroker:
         self.acked.append((target, message_id))
 
     async def reclaim(
-        self, target: str, *, consumer: str, group: str | None = None, min_idle_ms: int, count: int = 100
+        self,
+        target: str,
+        *,
+        consumer: str,
+        group: str | None = None,
+        min_idle_ms: int,
+        count: int = 100,
     ) -> Any:
         return (b"0-0", self.pending.pop(target, []), [])
 
@@ -318,7 +331,10 @@ async def test_reclaim_recovers_pending_on_start() -> None:
     broker = FakeConsumerBroker()
 
     fqn = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
-    fields = {b"data": JsonEventSerializer().serialize(CrossEvent(value=99)), b"h:event_type": fqn.encode()}
+    fields = {
+        b"data": JsonEventSerializer().serialize(CrossEvent(value=99)),
+        b"h:event_type": fqn.encode(),
+    }
     broker.pending["t"] = [("5-0", fields)]
 
     consumer = _make_consumer(broker, bus, targets=["t"])
@@ -332,33 +348,52 @@ async def test_reclaim_recovers_pending_on_start() -> None:
     assert ("t", "5-0") in broker.acked
 
 
-# ---------------------------------------------------------------------------
-# Integration (real Redis) — gated on MODULITH_TEST_REDIS_URL
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_reclaim_retries_pending_while_worker_stays_alive() -> None:
+    """Live workers must reclaim failed/pending messages after startup too."""
+    received: list[int] = []
 
-_REDIS_URL = os.environ.get("MODULITH_TEST_REDIS_URL")
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    broker = FakeConsumerBroker()
+
+    fqn = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+    fields = {
+        b"data": JsonEventSerializer().serialize(CrossEvent(value=123)),
+        b"h:event_type": fqn.encode(),
+    }
+
+    consumer = _make_consumer(broker, bus, targets=["t"])
+    await consumer.start()
+    try:
+        broker.pending["t"] = [("6-0", fields)]
+        await _until(lambda: received)
+    finally:
+        await consumer.stop()
+
+    assert received == [123]
+    assert ("t", "6-0") in broker.acked
+
+
+# ---------------------------------------------------------------------------
+# Integration (real Redis) — see the redis_url/redis_client fixtures (conftest)
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(_REDIS_URL is None, reason="MODULITH_TEST_REDIS_URL not set")
-@pytest.mark.asyncio
-async def test_integration_publish_then_consume_roundtrip() -> None:
+async def test_integration_publish_then_consume_roundtrip(redis_url, redis_client) -> None:
     """Real Redis: publish to a stream, then the consumer reads, deserializes,
-    and dispatches it to a local listener (the genuine cross-process path)."""
-    import redis.asyncio as redis
+    and dispatches it to a local listener (the genuine cross-process path).
 
+    ``redis_client`` flushes the DB around the test for isolation.
+    """
     from modulith.adapters.redis_broker import RedisStreamsBroker
 
-    client = redis.from_url(_REDIS_URL)
-    try:
-        await client.ping()
-    except Exception:  # pragma: no cover - environment-dependent
-        pytest.skip("Redis not reachable")
-
     target = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
-    broker = RedisStreamsBroker(url=_REDIS_URL, stream_prefix="modulith.itest", consumer_group="g")
-    stream = f"modulith.itest.{target}"
-    await client.delete(stream)
+    broker = RedisStreamsBroker(url=redis_url, stream_prefix="modulith.itest", consumer_group="g")
 
     received: list[int] = []
 
@@ -387,8 +422,6 @@ async def test_integration_publish_then_consume_roundtrip() -> None:
         await _until(lambda: received, timeout=5.0)
     finally:
         await consumer.stop()
-        await client.delete(stream)
         await broker.close()
-        await client.aclose()
 
     assert received == [7]
