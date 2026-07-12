@@ -95,14 +95,17 @@ def modulith_verify_module(
 
 @hookspec
 def modulith_before_event_published(event: Any) -> None:
-    """Run immediately before an event is added to the outbox.
+    """Run at the publish boundary, before dispatch or persistence.
 
     Use for validation, enrichment, or audit logging at the publish
     boundary. Raising an exception aborts publication; if the publish
     call was inside a transaction, the transaction will roll back.
 
-    This hook does **not** run for direct in-process dispatch outside
-    a transaction context — it's specifically about the durable path.
+    This hook fires on **every** ``publish()`` call, before the runtime
+    decides between the durable outbox path and direct in-process
+    dispatch — plugins that only care about one path must check for
+    themselves (the built-in outbox plugin, for example, persists the
+    event here only when a transaction session is bound).
     """
 
 
@@ -133,7 +136,9 @@ def modulith_on_listener_dispatch(
     listeners triggers this hook three times. Use for per-listener
     span creation, log correlation, or rate-limit decisions. The
     listener invocation happens regardless of what this hook does —
-    it observes, it doesn't gate.
+    it observes, it doesn't gate. The plugin manager enforces this:
+    exceptions raised by implementations are logged and swallowed
+    (see ``_ObserveContractShield`` in modulith.manager).
     """
 
 
@@ -151,7 +156,9 @@ def modulith_on_listener_complete(
     the raised error on failure. This is the hook observability plugins
     use to *end* the per-listener span started in dispatch — without it,
     spans could only be started, never closed. Like the other observe
-    hooks it must not re-raise.
+    hooks it must not re-raise; the plugin manager enforces this by
+    logging and swallowing implementation exceptions, so a failing
+    span exporter can never mask the listener's own outcome.
     """
 
 
@@ -167,8 +174,9 @@ def modulith_on_listener_error(
     The publication remains incomplete after this hook; the retry loop
     will pick it up on its next pass. Use this hook for alerting,
     structured error logging, or feeding dead-letter handlers. Do not
-    re-raise — exceptions from this hook are swallowed to prevent one
-    plugin's failure from masking another's.
+    re-raise — exceptions from this hook are logged and swallowed by
+    the plugin manager so a plugin's failure can never mask the
+    listener's own exception.
     """
 
 

@@ -15,14 +15,17 @@ system in the future without breaking existing plugins. They keep
 importing from ``modulith``; we keep the import surface stable.
 
 The project name string ("modulith") must match the one passed to
-HookspecMarker in modulith.hooks — pluggy uses it to validate that a
-hook implementation matches a known spec.
+HookspecMarker in modulith.hooks — pluggy uses it to recognize which
+functions on a registered plugin are modulith hook implementations.
 """
 
 import pluggy
 
 # The decorator plugin authors use to mark their hook implementations.
-# Pluggy validates at registration time that the function name matches
-# a declared hookspec, catching typos at startup rather than silently
-# failing to invoke the hook.
+# Validation is two-staged: pluggy checks the *signature* (argument
+# names) against the declared hookspec at registration time, while
+# misspelled hook *names* are caught by the pm.check_pending() call at
+# the end of modulith.manager.create_plugin_manager(). Both surface as
+# PluginValidationError at startup, rather than a plugin that silently
+# never fires.
 hookimpl = pluggy.HookimplMarker("modulith")

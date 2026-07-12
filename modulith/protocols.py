@@ -1,10 +1,11 @@
 """Driver-shaped adapter contracts.
 
 Drivers are "one wins" adapters — exactly one PublicationStore is active
-per application, exactly one EventSerializer. They're configured directly
-(``Modulith(store=PostgresStore(...))``) or auto-resolved from installed
-packages via the entry point groups ``modulith.stores`` and
-``modulith.serializers``.
+per application, exactly one EventSerializer. They're wired explicitly
+at startup: application setup passes instances to
+``modulith.builtin.outbox.configure(store, serializer)``. There is no
+entry-point auto-discovery for drivers — only hook plugins are
+discovered via entry points (the ``modulith`` group).
 
 Brokers are different: multiple can be active simultaneously, routed by
 URI scheme. The Broker protocol defines the contract; the BrokerRegistry
