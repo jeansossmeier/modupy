@@ -42,24 +42,33 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import (
-    Boolean,
-    CursorResult,
-    DateTime,
-    Index,
-    Integer,
-    LargeBinary,
-    String,
-    Uuid,
-    delete,
-    false,
-    func,
-    select,
-    text,
-)
-from sqlalchemy import event as sa_event
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+try:
+    # Module-level (not lazy like the broker adapters' in-__init__ imports):
+    # the ORM schema classes below need SQLAlchemy at import time. Guarded so
+    # a base install fails with the actionable extra, not a bare ModuleNotFound.
+    from sqlalchemy import (
+        Boolean,
+        CursorResult,
+        DateTime,
+        Index,
+        Integer,
+        LargeBinary,
+        String,
+        Uuid,
+        delete,
+        false,
+        func,
+        select,
+        text,
+    )
+    from sqlalchemy import event as sa_event
+    from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+    from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+except ImportError as exc:  # pragma: no cover — exercised in a subprocess test
+    raise ImportError(
+        "modulith.adapters.postgres_outbox requires SQLAlchemy (async). "
+        "Install the extra: pip install 'modulith[postgres]'"
+    ) from exc
 
 from modulith import EventPublication
 from modulith.builtin import outbox
@@ -136,6 +145,14 @@ class EventPublicationArchiveRow(Base):
 _active_store: PostgresPublicationStore | None = None
 _hook_installed = False
 
+# Every live (constructed, not-yet-disposed) store, in creation order; the
+# active store is always the top. An explicit stack — not a per-store
+# back-pointer — so dispose() can remove a store from *anywhere* in it:
+# a single ``_prev_store`` link only unwound correctly in strict LIFO order
+# and would resurrect an already-disposed (possibly engine-closed) store as
+# the dispatch target when stores were disposed in creation order.
+_store_stack: list[PostgresPublicationStore] = []
+
 
 def _schedule_after_commit_dispatch(session: Session) -> None:
     """Sync after-commit callback: schedule dispatch of queued publications.
@@ -145,8 +162,22 @@ def _schedule_after_commit_dispatch(session: Session) -> None:
     fire-and-forget; the retry loop is the safety net if a task is lost.
     """
     pending = session.info.pop("_modulith_pending", [])
+    if not pending:
+        return
     store = _active_store
-    if not pending or store is None:
+    if store is None:
+        # dispose() deactivated the store after save() queued these ids but
+        # before this session committed. The rows ARE durably committed
+        # (completed_at NULL), so the next configured store's retry sweep
+        # delivers them — but the skipped after-commit dispatch must be
+        # observable, exactly like the no-running-loop branch below.
+        logger.warning(
+            "after_commit fired with %d queued publication(s) but no active "
+            "PostgresPublicationStore (disposed before this session committed?); "
+            "the committed row(s) will be delivered by the retry sweep of the "
+            "next configured store instead",
+            len(pending),
+        )
         return
     try:
         loop = asyncio.get_running_loop()
@@ -173,6 +204,38 @@ def _aware(value: datetime | None) -> datetime | None:
     if value is not None and value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value
+
+
+def _to_utc(value: datetime | None) -> datetime | None:
+    """Normalize an aware timestamp to UTC before persisting.
+
+    Dialect-agnostic write-side guarantee: the SQLite driver stores the
+    wall-clock digits and drops the offset, so a non-UTC-aware value written
+    as-is would come back from ``_aware`` shifted by its offset (silent
+    corruption of the instant). Converting on write makes the read-side
+    "naive means UTC" assumption hold on every dialect. Naive values are
+    passed through unchanged — they are already interpreted as UTC on read,
+    and guessing a zone for them here would corrupt rather than fix.
+    """
+    if value is not None and value.tzinfo is not None:
+        return value.astimezone(UTC)
+    return value
+
+
+def _pub_to_row(publication: EventPublication, *, dead: bool) -> EventPublicationRow:
+    """Build the ORM row for a publication, normalizing timestamps to UTC."""
+    return EventPublicationRow(
+        id=publication.id,
+        event_type=publication.event_type,
+        payload=publication.payload,
+        listener=publication.listener,
+        published_at=_to_utc(publication.published_at),
+        completed_at=_to_utc(publication.completed_at),
+        attempt_count=publication.attempt_count,
+        last_error=publication.last_error,
+        last_attempt_at=_to_utc(publication.last_attempt_at),
+        is_dead_lettered=dead,
+    )
 
 
 def _row_to_pub(row: EventPublicationRow) -> EventPublication:
@@ -216,16 +279,17 @@ class PostgresPublicationStore:
         # FOR UPDATE SKIP LOCKED is a Postgres row-claim optimization; SQLite
         # (tests) has no row locking and would reject the clause, so gate on it.
         self._supports_skip_locked = engine.dialect.name == "postgresql"
-        # Remember whoever was active so dispose() can restore it (LIFO), rather
-        # than blanking dispatch routing — and warn loudly instead of silently
-        # hijacking a still-live store's after-commit dispatches.
-        self._prev_store = _active_store
+        # Push onto the live-store stack so dispose() can restore whichever
+        # live store remains, rather than blanking dispatch routing — and warn
+        # loudly instead of silently hijacking a still-live store's
+        # after-commit dispatches.
         if _active_store is not None and _active_store is not self:
             logger.warning(
                 "another PostgresPublicationStore is already active; the global "
                 "after-commit hook now routes to this new store. Two live stores "
                 "on different engines will contend — dispose the previous one first."
             )
+        _store_stack.append(self)
         _active_store = self
         self._install_session_hooks()
 
@@ -253,39 +317,19 @@ class PostgresPublicationStore:
         dead = publication.attempt_count >= self._dead_letter_after_attempts
 
         if session is not None:
-            row = EventPublicationRow(
-                id=publication.id,
-                event_type=publication.event_type,
-                payload=publication.payload,
-                listener=publication.listener,
-                published_at=publication.published_at,
-                completed_at=publication.completed_at,
-                attempt_count=publication.attempt_count,
-                last_error=publication.last_error,
-                last_attempt_at=publication.last_attempt_at,
-                is_dead_lettered=dead,
-            )
-            session.add(row)
-            session.sync_session.info.setdefault("_modulith_pending", []).append(publication.id)
+            session.add(_pub_to_row(publication, dead=dead))
+            # ``.info`` lives on the sync Session; an AsyncSession exposes it
+            # via ``.sync_session``, while a plain (sync) Session — legitimate
+            # on the documented no-running-loop degraded path — IS the sync
+            # session already. bind_session() accepts either.
+            sync_session = getattr(session, "sync_session", session)
+            sync_session.info.setdefault("_modulith_pending", []).append(publication.id)
             return
 
         async with self._sessionmaker() as s:
             existing = await s.get(EventPublicationRow, publication.id)
             if existing is None:
-                s.add(
-                    EventPublicationRow(
-                        id=publication.id,
-                        event_type=publication.event_type,
-                        payload=publication.payload,
-                        listener=publication.listener,
-                        published_at=publication.published_at,
-                        completed_at=publication.completed_at,
-                        attempt_count=publication.attempt_count,
-                        last_error=publication.last_error,
-                        last_attempt_at=publication.last_attempt_at,
-                        is_dead_lettered=dead,
-                    )
-                )
+                s.add(_pub_to_row(publication, dead=dead))
                 await s.commit()
                 return
             if existing.completed_at is not None:
@@ -293,7 +337,7 @@ class PostgresPublicationStore:
                 return
             existing.attempt_count = publication.attempt_count
             existing.last_error = publication.last_error
-            existing.last_attempt_at = publication.last_attempt_at
+            existing.last_attempt_at = _to_utc(publication.last_attempt_at)
             existing.is_dead_lettered = dead
             await s.commit()
 
@@ -305,13 +349,22 @@ class PostgresPublicationStore:
                 await s.commit()
 
     async def find_incomplete(self, older_than: timedelta) -> list[EventPublication]:
-        """Return up to 100 *retryable* incomplete publications, oldest first.
+        """Return up to 100 *retryable* incomplete publications, least-recently-
+        attempted first (never-attempted rows sort by ``published_at``).
 
         Dead-lettered rows are excluded at the SQL level so the LIMIT 100 window
         is never starved by exhausted records that the sweep would only skip —
         a backlog of dead-letters could otherwise hide live retryable rows past
         row 100. Operational counts come from the unbounded ``count_*`` helpers,
         not this capped query.
+
+        The ordering key is ``coalesce(last_attempt_at, published_at)``, not raw
+        ``published_at``: retries update ``last_attempt_at`` but never
+        ``published_at``, so a >100-row backlog of legitimately-retrying rows
+        would otherwise occupy the capped window on every sweep and starve newer
+        publications indefinitely. Sorting by the last attempt rotates each
+        attempted row to the back of the queue, bounding how long any row —
+        old or new — can wait for a slot.
 
         ``FOR UPDATE SKIP LOCKED`` (Postgres; a no-op on SQLite) lets concurrent
         sweeps in different workers partition the rows instead of both grabbing
@@ -328,7 +381,12 @@ class PostgresPublicationStore:
                     EventPublicationRow.is_dead_lettered.is_(False),
                     EventPublicationRow.published_at <= cutoff,
                 )
-                .order_by(EventPublicationRow.published_at)
+                .order_by(
+                    func.coalesce(
+                        EventPublicationRow.last_attempt_at,
+                        EventPublicationRow.published_at,
+                    )
+                )
                 .limit(100)
             )
             if self._supports_skip_locked:
@@ -474,15 +532,26 @@ class PostgresPublicationStore:
     async def dispose(self) -> None:
         """Drain in-flight dispatches and deactivate this store.
 
-        Restores the previously-active store (so nested construct/dispose is
-        non-destructive). When no store remains active, unregisters the global
-        after-commit listener so it stops firing on every commit in the host
-        application and doesn't leak across process/test lifetimes.
+        Removes this store from the live-store stack — wherever it sits, so
+        disposal in any order is safe (nested construct/dispose restores the
+        previous store; creation-order disposal never resurrects an
+        already-disposed one). When no live store remains, unregisters the
+        global after-commit listener so it stops firing on every commit in the
+        host application and doesn't leak across process/test lifetimes.
+
+        Ordering hazard: dispose only after every session that publications
+        were saved through has committed. A session that commits *after* the
+        last store is disposed fires no after-commit dispatch (the hook is
+        gone) — its committed rows are not lost (they are durable and the next
+        configured store's retry sweep delivers them), but nothing is
+        dispatched or logged at that commit.
         """
         global _active_store, _hook_installed
         await self.wait_for_dispatch()
+        if self in _store_stack:
+            _store_stack.remove(self)
         if _active_store is self:
-            _active_store = self._prev_store
+            _active_store = _store_stack[-1] if _store_stack else None
             if _active_store is None and _hook_installed:
                 sa_event.remove(Session, "after_commit", _schedule_after_commit_dispatch)
                 _hook_installed = False
@@ -522,12 +591,41 @@ def _reset_for_testing() -> None:
     ONLY for tests. The after-commit hook is registered on the global sync
     ``Session`` class, so without this it leaks across tests/process lifetime
     (the outbox plugin's own ``_reset_for_testing`` can't reach these globals).
+
+    In-flight after-commit dispatch tasks are cancelled (best-effort,
+    thread-safely — mirroring ``outbox._cancel_retry_task``) before the
+    globals are cleared: an orphaned task would otherwise resume against
+    already-reset outbox module state and die on a swallowed AssertionError,
+    leaving its publication silently incomplete. Production code paths use
+    ``dispose()``, which *drains* in-flight tasks instead.
     """
     global _active_store, _hook_installed
+    for store in _store_stack:
+        for task in list(store._inflight):
+            _cancel_task_threadsafe(task)
+    _store_stack.clear()
     _active_store = None
     if _hook_installed:
         sa_event.remove(Session, "after_commit", _schedule_after_commit_dispatch)
         _hook_installed = False
+
+
+def _cancel_task_threadsafe(task: asyncio.Task[None]) -> None:
+    """Request cancellation of ``task`` from any thread. Best-effort: a task
+    whose loop is already closed has nothing left to cancel."""
+    if task.done():
+        return
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if task.get_loop() is running:
+        task.cancel()
+    else:
+        try:
+            task.get_loop().call_soon_threadsafe(task.cancel)
+        except RuntimeError:
+            pass  # the task's loop is already closed
 
 
 __all__ = [
