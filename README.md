@@ -94,7 +94,11 @@ transactions don't leak ghost events.
 
 **Optional process-per-module runtime.** When one module needs its own
 CPU/memory budget, run it in its own process via the supervisor. Same
-code, no rewrite for the messaging layer.
+code, no rewrite for the messaging layer. Cross-module events route
+through the configured broker automatically; mark an event
+`@externalized` when remote workers must consume it *in addition to*
+local listeners, or `@externalized(target="scheme:destination")` to pin
+its destination.
 
 **Auto-discovery and zero-config.** Install, define modules as
 subpackages, run with uvicorn as you always have. The framework

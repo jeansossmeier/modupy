@@ -115,7 +115,15 @@ async def test_event_without_local_listener_routes_to_broker(make_fake_app) -> N
 async def test_transactional_event_without_local_listener_still_routes_to_broker(
     make_fake_app,
 ) -> None:
-    """The durable local-listener outbox must not swallow remote-only events."""
+    """The durable local-listener outbox must not swallow remote-only events.
+
+    TEST-CHANGES (A2-r4-168): this test used to assert the broker received
+    the payload synchronously inside publish() — i.e. BEFORE the business
+    transaction committed, which a rollback could not un-send. The fixed
+    contract is commit-gated: publish() persists a broker-route publication
+    row in the bound session (atomic with the business work) and the
+    after-commit dispatch delivers it to the broker.
+    """
     make_fake_app(
         {
             "orders": """
@@ -146,7 +154,19 @@ async def test_transactional_event_without_local_listener_still_routes_to_broker
     finally:
         outbox._current_session.reset(token)
 
-    assert store.saved == []  # no local listeners, so no local outbox rows
+    # Commit-gated: nothing on the wire at publish() time — a rollback could
+    # not un-send a broker message, so the send must wait for the commit.
+    assert fake.published == []
+    # No local listeners, so the only row is the deferred broker route,
+    # enlisted in the bound session (atomic with the business transaction).
+    assert len(store.saved) == 1
+    route = store.saved[0]
+    assert route.listener is not None
+    assert route.listener.startswith(outbox._BROKER_ROUTE_LISTENER_PREFIX)
+
+    # After-commit dispatch (driven by the adapter's after_commit hook).
+    await outbox._dispatch_publication(route)
+
     assert len(fake.published) == 1
     destination, payload, headers = fake.published[0]
     assert destination == "fakeapp.orders.OrderPlaced"

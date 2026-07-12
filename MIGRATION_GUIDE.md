@@ -247,7 +247,21 @@ modulith run --topology=processes
 The supervisor spawns workers. The reverse proxy routes requests by
 URL prefix. Cross-module events flow through Redis Streams (or your
 configured broker). **No code changes needed if you've been following
-events for cross-module communication.**
+events for cross-module communication** — an event whose consumer lives
+in another worker routes to the broker automatically. The one exception
+is fan-out: an event consumed *both* by a local listener *and* by a
+remote worker must be marked `@externalized` (from `modulith`), or
+`@externalized(target="scheme:destination")` to pin a destination:
+
+```python
+from modulith import event, externalized
+
+@externalized          # local listeners still run; remote workers also consume
+@event
+@dataclass(frozen=True)
+class OrderPlaced:
+    order_id: str
+```
 
 If you have direct cross-module function calls remaining, they will
 break here — that's the cliff that `modulith doctor` was warning about.

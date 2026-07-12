@@ -255,6 +255,14 @@ from modulith import event, listener, publish, configure
 
 **`configure(**kwargs)`** — overrides defaults before bootstrap. Most users never call it.
 
+Applications adopting the process-per-module topology (Part IX) use a fifth name:
+
+**`@externalized`** — marks an event as *externalized*: routed to the configured
+broker so workers in other processes can consume it, even when it also has local
+listeners (fan-out). `@externalized(target="scheme:destination")` overrides the
+destination per event. Single-process applications never need it — the four
+names above are the complete single-process API. See [§9.2](#92-the-worker-pattern).
+
 ### 5.2 Sync vs Async
 
 The `decorators.py` module exposes both:
@@ -577,6 +585,38 @@ uvicorn modulith._worker:create_app --factory \
 - Returns a FastAPI app exposing only that module's router
 
 Standard uvicorn machinery from there — workers, reload, signals, graceful shutdown.
+
+**Externalized events.** An event crosses to the broker when it has no local
+listener (a cross-module event whose only consumer lives in another worker —
+routed automatically under the default scheme), or when it carries an explicit
+externalization signal:
+
+```python
+from dataclasses import dataclass
+from modulith import event, externalized
+
+@externalized                       # fan-out: local listeners AND remote workers
+@event
+@dataclass(frozen=True)
+class OrderPlaced:
+    order_id: str
+
+@externalized(target="redis-streams:orders.priority")  # explicit destination
+@event
+@dataclass(frozen=True)
+class PriorityOrderPlaced:
+    order_id: str
+```
+
+Dynamic routing (tenant-aware topics, A/B channels) goes through the
+`modulith_resolve_event_target` hook, which takes precedence over the static
+annotation. When the transactional outbox is enabled, broker routing is
+commit-gated like local dispatch: the route is persisted as its own outbox
+row inside the business transaction and delivered to the broker after commit
+— a rollback discards it, so remote consumers never see an un-committed event.
+Publishing a cross-process event whose target scheme has no registered broker
+adapter raises `ConfigurationError` (uniformly for the default scheme and
+explicit targets).
 
 ### 9.3 The Supervisor
 

@@ -1,13 +1,18 @@
-"""User-facing API: @event, @listener, publish, configure.
+"""User-facing API: @event, @listener, publish, configure — plus the
+topology-specific @externalized.
 
-These are thin wrappers over the runtime singleton. The whole point of
-this module is that users only need to know these four names to be
-productive:
+These are thin wrappers over the runtime singleton. Users need four
+names to be productive in single-process mode:
 
     @event       — mark a class as a domain event
     @listener    — register an async function to receive an event type
     publish      — emit an event to all registered listeners
     configure    — override defaults (only when needed)
+
+Applications adopting the process-per-module topology use a fifth:
+
+    @externalized — mark an event as routed to the configured broker so
+                    workers in other processes can consume it
 
 Everything else (plugins, hooks, protocols) is for adapter authors.
 """
@@ -142,7 +147,10 @@ def listener(func: F) -> F:
     The event type is inferred from the function's first argument
     annotation. Listeners may be ``async def`` (preferred) or ``def``.
     Sync listeners run in the event loop's default executor so they never
-    block the event loop.
+    block the event loop. Note that multiple sync listeners for the same
+    event run concurrently on separate executor threads — see
+    ``modulith.sync.wrap_sync_listener`` for the sharp edges around shared
+    sessions/resources.
 
     Example:
         @listener

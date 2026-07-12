@@ -22,7 +22,7 @@ from uuid import uuid4
 from .brokers import BrokerRegistry
 from .config import Configuration, ConfigurationError, load_configuration
 from .discovery import detect_application_package
-from .event_bus import InMemoryEventBus
+from .event_bus import InMemoryEventBus, _require_async_handler
 from .manager import create_plugin_manager
 from .types import EventPublication, ModuleInfo
 
@@ -43,7 +43,17 @@ class Runtime:
         self._bootstrapped = False
         # Lock around the bootstrap path so concurrent first-uses don't
         # race. After bootstrap, the flag is read without locking.
-        self._lock = threading.Lock()
+        # REENTRANT: bootstrap imports application code (discovery) and runs
+        # plugin hooks while holding it; a module-level @listener decorator or
+        # a plugin calling back into the runtime on the same thread must not
+        # self-deadlock (a plain Lock froze the process forever here).
+        self._lock = threading.RLock()
+        # The thread currently running _bootstrap(), or None. Lets re-entrant
+        # calls (configure()/ensure_bootstrapped()/publish_sync() reached from
+        # code imported or hooked *during* bootstrap) fail fast with a clear
+        # error instead of recursing into a second bootstrap or silently
+        # mutating state the current bootstrap already consumed.
+        self._bootstrapping_thread: int | None = None
 
         # Caller-supplied overrides via configure(). Applied during boot.
         self._config_overrides: dict[str, Any] = {}
@@ -108,6 +118,19 @@ class Runtime:
         _config_overrides — silently dropping the override instead of raising.
         """
         with self._lock:
+            if self._bootstrapping_thread == threading.get_ident():
+                # Re-entered from code running *inside* bootstrap (a module
+                # imported by discovery, or a plugin hook). The configuration
+                # was already resolved in step 1, so the override would be
+                # silently dropped — fail loudly instead. (The reentrant lock
+                # lets us get here rather than deadlocking forever.)
+                raise ConfigurationError(
+                    "configure() called while modulith is bootstrapping (from "
+                    "module import code or a plugin hook). Configuration is "
+                    "already resolved at this point — call configure() at "
+                    "application startup, before the first @listener "
+                    "registration or publish() call."
+                )
             if self._bootstrapped:
                 raise ConfigurationError(
                     "configure() cannot be called after modulith has bootstrapped. "
@@ -119,18 +142,28 @@ class Runtime:
     def register_listener(self, event_type: type, handler: Callable[..., Any]) -> None:
         """Register a listener. Works before, during, and after bootstrap.
 
-        Pre-bootstrap (no bus yet): queue for flush during bootstrap.
-        Mid-bootstrap (bus exists, discovery running): register directly.
-        Post-bootstrap: register directly.
+        Pre-bootstrap and mid-bootstrap (no *published* bus yet): queue for
+        the single flush that runs near the end of bootstrap.
+        Post-bootstrap: register directly on the live bus.
 
-        Gating on the bus's existence (not the bootstrapped flag) is
-        what makes module-level @listener decorators work correctly when
-        they fire during the discovery import phase.
+        The check-then-act runs under the runtime lock, so a registration
+        racing _bootstrap()'s flush can never land in a pending list that
+        has already been consumed (which silently lost the listener
+        forever): another thread's registration either arrives before the
+        flush, or blocks until bootstrap finishes and registers directly.
+        The lock is reentrant, so module-level @listener decorators firing
+        during the discovery import phase (on the bootstrap thread itself)
+        enter without deadlocking.
         """
-        if self._event_bus is not None:
-            self._event_bus.register(event_type, handler)
-        else:
-            self._pending_listeners.append((event_type, handler))
+        # Validate here — not only inside the bus — so a sync handler is
+        # rejected at the registration call site instead of surfacing as a
+        # confusing failure when the queued listener is flushed at bootstrap.
+        _require_async_handler(event_type, handler)
+        with self._lock:
+            if self._event_bus is not None:
+                self._event_bus.register(event_type, handler)
+            else:
+                self._pending_listeners.append((event_type, handler))
 
     async def publish(self, event: Any) -> None:
         """Publish an event. Triggers bootstrap if not yet done.
@@ -158,15 +191,20 @@ class Runtime:
             # transaction. Dispatch happens after commit via the adapter's
             # after-commit hook — never in-memory here (that would double-fire
             # local listeners and run them before the business commit).
-            # Broker routing is separate: process-mode remote consumers still
-            # need the serialized event even when local listener dispatch is
-            # delayed by the transactional outbox.
+            # Broker routing is commit-gated the same way: the route is
+            # persisted as its own publication row in the bound session and
+            # sent after commit. Sending synchronously here handed the event
+            # to remote consumers *before* the business transaction committed
+            # — a rollback could not un-send it, the exact inconsistency the
+            # outbox exists to prevent.
             from .builtin import outbox
 
             assert self._event_bus is not None
             handlers = self._event_bus.listeners_for(type(event))
             await outbox.persist(event)
-            await self._maybe_route_to_broker(event, has_local_handler=bool(handlers))
+            target = self._broker_route_target(event, has_local_handler=bool(handlers))
+            if target is not None:
+                await outbox.persist_broker_route(event, target)
             # Fire the post-publish hook on the durable path too: the event is
             # now persisted, which is exactly what the hookspec documents
             # ("after an event has been persisted to the outbox"). Omitting it
@@ -174,7 +212,10 @@ class Runtime:
             # publish — the production path the outbox exists for.
             event_type = f"{type(event).__module__}.{type(event).__qualname__}"
             publish_pub = EventPublication(
-                id=uuid4(), payload=b"", event_type=event_type, published_at=datetime.now(UTC)
+                id=uuid4(),
+                payload=self._serialized_payload(event),
+                event_type=event_type,
+                published_at=datetime.now(UTC),
             )
             pm.hook.modulith_after_event_published(event=event, publication=publish_pub)
             return
@@ -193,6 +234,31 @@ class Runtime:
 
         return outbox._store is not None and outbox._current_session.get() is not None
 
+    def _serialized_payload(self, event: Any) -> bytes:
+        """Best-effort serialized bytes for hook-facing EventPublications.
+
+        The lifecycle/observability hooks (dead-letter handlers, audit logs)
+        receive real payload bytes on the durable outbox path; the in-memory
+        path used to hand them a hardcoded ``b""``, silently defeating those
+        use cases. In-memory dispatch must not *require* serializability
+        (only the durable outbox does), so failures degrade back to ``b""``
+        with a debug log instead of failing the publish. Serialization uses
+        the default JSON serializer; these publications are observational
+        only — they are never persisted or redelivered.
+        """
+        from .serializers import JsonEventSerializer
+
+        try:
+            return JsonEventSerializer().serialize(event)
+        except Exception:
+            logger.debug(
+                "could not serialize %s for hook publications; hooks receive "
+                "an empty payload for this event",
+                type(event).__name__,
+                exc_info=True,
+            )
+            return b""
+
     async def _dispatch_with_hooks(self, event: Any) -> None:
         """Dispatch in-memory, wrapping each listener with lifecycle hooks.
 
@@ -207,8 +273,12 @@ class Runtime:
         pm = self._plugin_manager
 
         event_type = f"{type(event).__module__}.{type(event).__qualname__}"
+        # Serialize once per publish; every hook-facing publication below
+        # shares the same bytes (real data for dead-letter/audit hooks, not
+        # the hardcoded b"" they used to receive on this path).
+        payload = self._serialized_payload(event)
         publish_pub = EventPublication(
-            id=uuid4(), payload=b"", event_type=event_type, published_at=datetime.now(UTC)
+            id=uuid4(), payload=payload, event_type=event_type, published_at=datetime.now(UTC)
         )
 
         handlers = bus.listeners_for(type(event))
@@ -225,7 +295,7 @@ class Runtime:
             name = getattr(handler, "__qualname__", repr(handler))
             pub = EventPublication(
                 id=uuid4(),
-                payload=b"",
+                payload=payload,
                 event_type=event_type,
                 listener=name,
                 published_at=datetime.now(UTC),
@@ -303,11 +373,11 @@ class Runtime:
 
         return None
 
-    async def _maybe_route_to_broker(self, event: Any, *, has_local_handler: bool) -> None:
-        """Route an event to the configured broker when it crosses processes.
+    def _broker_route_target(self, event: Any, *, has_local_handler: bool) -> str | None:
+        """The validated broker target for this publish, or None (in-process).
 
-        Only fires in non-``single`` topology. An event reaches the broker when
-        EITHER:
+        Only resolves in non-``single`` topology. An event routes to the
+        broker when EITHER:
           * it resolves to an explicit/dynamic target (the
             ``modulith_resolve_event_target`` hook or an ``@externalized``
             annotation) — routed *regardless* of local listeners, so a fan-out
@@ -321,24 +391,58 @@ class Runtime:
         event name (module + qualname), matching the ``event_type`` header so a
         future consumer keys producer and consumer identically.
 
-        No-ops when topology is ``single`` or no broker is registered for the
-        configured scheme (the event then simply has no remote consumers).
+        Returns None when topology is ``single`` or when the event carries no
+        cross-process signal. When the event DOES resolve to a broker target
+        but no broker is registered for that target's scheme, raises
+        ConfigurationError — uniformly for the default scheme and for
+        explicit ``@externalized(target=...)`` overrides. (The old behavior
+        was the worst of both worlds: the default-scheme case silently
+        dropped the event forever, while an explicit target crashed with an
+        undocumented UnknownBrokerError.)
         """
         cfg = self._config
         if cfg is None or cfg.topology == "single":
-            return
+            return None
         registry = self._broker_registry
-        if registry is None or cfg.broker not in registry.schemes():
-            return
+        if registry is None:  # pre-bootstrap safety; publish() bootstraps first
+            return None
 
         target = self._resolve_broker_target(event)
         if target is None:
             # No externalization signal. Route only a listener-less event, by
             # the default scheme; an in-process-only event isn't broker traffic.
             if has_local_handler:
-                return
+                return None
             fqn = f"{type(event).__module__}.{type(event).__qualname__}"
             target = f"{cfg.broker}:{fqn}"
+
+        event_type = f"{type(event).__module__}.{type(event).__qualname__}"
+        scheme = target.partition(":")[0]
+        if scheme not in registry.schemes():
+            raise ConfigurationError(
+                f"cannot route event {event_type} to broker target {target!r}: "
+                f"no broker adapter is registered for scheme {scheme!r} "
+                f"(registered schemes: {registry.schemes() or 'none'}). In "
+                f"topology={cfg.topology!r} this event crosses processes, so "
+                f"dropping it silently would lose it for every remote "
+                f"consumer. Install or register the broker adapter, or fix "
+                f"the configured scheme."
+            )
+        return target
+
+    async def _maybe_route_to_broker(self, event: Any, *, has_local_handler: bool) -> None:
+        """Send an event to the broker when it crosses processes (direct path).
+
+        Routing rules and failure modes live in ``_broker_route_target``.
+        Used ONLY by the non-durable dispatch path — inside a transaction the
+        runtime persists the route via ``outbox.persist_broker_route`` instead
+        and the send happens after commit (see ``publish``).
+        """
+        target = self._broker_route_target(event, has_local_handler=has_local_handler)
+        if target is None:
+            return
+        registry = self._broker_registry
+        assert registry is not None  # _broker_route_target resolved a target
 
         from .serializers import JsonEventSerializer
 
@@ -348,7 +452,21 @@ class Runtime:
         logger.debug("routed %s to broker target %s", event_type, target)
 
     def ensure_bootstrapped(self) -> None:
-        """Run bootstrap if not yet done. Safe to call repeatedly."""
+        """Run bootstrap if not yet done. Safe to call repeatedly.
+
+        A *failed* bootstrap leaves the runtime un-bootstrapped and otherwise
+        untouched: _bootstrap() builds all state in local variables and
+        installs it on ``self`` only after every step succeeds, so a retry
+        after fixing the problem starts from a clean slate. Listeners whose
+        modules were already imported by the failed attempt stay queued in
+        the pending list (Python caches the imports, so their decorators
+        never re-fire) and are flushed by the next attempt.
+
+        Re-entrant calls from inside bootstrap itself (module import code or
+        a plugin hook calling back into publish()/ensure_bootstrapped())
+        raise ConfigurationError instead of recursing into a second
+        bootstrap.
+        """
         # Fast path: already bootstrapped, no lock needed.
         if self._bootstrapped:
             return
@@ -360,78 +478,137 @@ class Runtime:
             # branch is the entire reason DCL exists — keep it.
             if self._bootstrapped:
                 return  # type: ignore[unreachable]
-            self._bootstrap()
+            if self._bootstrapping_thread == threading.get_ident():
+                raise ConfigurationError(
+                    "modulith bootstrap re-entered from within bootstrap "
+                    "itself (publish()/ensure_bootstrapped() called from "
+                    "module import code or a plugin hook). Defer runtime use "
+                    "until after startup."
+                )
+            self._bootstrapping_thread = threading.get_ident()
+            try:
+                self._bootstrap()
+            finally:
+                self._bootstrapping_thread = None
 
     # ----- Bootstrap --------------------------------------------------------
 
     def _bootstrap(self) -> None:
-        """One-time initialization. Runs under the lock."""
+        """One-time initialization. Runs under the lock.
+
+        ATOMIC: every piece of state is built in local variables and
+        installed on ``self`` only after all steps succeed. An exception at
+        any step — a discovery import error, a failed manifest verification —
+        leaves the runtime exactly as it was, so ensure_bootstrapped() can
+        genuinely be retried. The previous in-place version left a half-built
+        bus behind and cleared the pending-listener queue, so a retry
+        "succeeded" with every already-imported module's listeners silently
+        gone (imports are cached; their @listener decorators never re-fire).
+
+        One deliberate exception: the resolved configuration is installed
+        just before the broker-registration hook (step 4.5) because adapter
+        hookimpls and discovery-imported module code read it lazily via
+        ``_runtime.config`` — and it is rolled back to None if any later
+        step fails, preserving the clean-retry guarantee.
+        """
         # 1. Resolve configuration from all sources.
-        self._config = load_configuration(**self._config_overrides)
+        config = load_configuration(**self._config_overrides)
 
         # 2. Detect application package if it wasn't configured.
-        if self._config.package is None:
+        if config.package is None:
             detected = detect_application_package()
-            self._config = replace(self._config, package=detected)
+            config = replace(config, package=detected)
 
         # 3. Create the plugin manager (loads built-ins + entry points, plus
         # any programmatically-injected extras such as the test spy).
-        self._plugin_manager = create_plugin_manager(extra_plugins=self._extra_plugins)
+        plugin_manager = create_plugin_manager(extra_plugins=self._extra_plugins)
 
-        # 4. Build the event bus. Future versions may swap this for a
-        # broker-backed bus when topology != "single".
-        self._event_bus = InMemoryEventBus()
+        # 4. Build the event bus — kept LOCAL until bootstrap succeeds, so
+        # register_listener() keeps queueing into _pending_listeners for the
+        # whole bootstrap (including the discovery import phase) and a failed
+        # attempt can't strand listeners in a discarded bus. Future versions
+        # may swap this for a broker-backed bus when topology != "single".
+        event_bus = InMemoryEventBus()
 
         # 4.5. Build the broker registry and let plugins register adapters.
         # Brokers must be available before any events flow, hence before
         # discovery imports module code that may publish on import.
-        self._broker_registry = BrokerRegistry()
-        self._plugin_manager.hook.modulith_register_brokers(registry=self._broker_registry)
+        # The resolved configuration is installed on ``self`` HERE, before the
+        # hook fires: adapter hookimpls (the redis-streams broker) and module
+        # code imported by discovery read it lazily via ``_runtime.config``,
+        # so keeping it local until the commit point silently turned broker
+        # registration into a no-op. It is the ONE piece of state exposed
+        # early; the except-block rolls it back so a failed bootstrap still
+        # leaves the runtime pristine for a clean retry.
+        broker_registry = BrokerRegistry()
+        self._config = config
+        try:
+            plugin_manager.hook.modulith_register_brokers(registry=broker_registry)
 
-        # 5. Flush listeners that were registered before bootstrap.
-        for event_type, handler in self._pending_listeners:
-            self._event_bus.register(event_type, handler)
+            # 5. Trigger module discovery via the plugin hook. This imports
+            # each discovered module; the @listener decorators they contain
+            # queue into _pending_listeners (the bus above isn't published yet).
+            modules: list[ModuleInfo] = []
+            if config.auto_discover:
+                result = plugin_manager.hook.modulith_discover_modules(
+                    app_package=config.package,
+                )
+                # firstresult=True returns the winning plugin's value directly.
+                modules = result if result else []
+
+            # 6. Flush every queued listener — those registered before bootstrap
+            # AND those the discovery imports just queued, in registration order —
+            # into the local bus. The queue is NOT cleared until the very end:
+            # a failure below must leave it intact for the next attempt.
+            for event_type, handler in list(self._pending_listeners):
+                event_bus.register(event_type, handler)
+
+            # 6.5. Verify manifests against observed reality. Iterates the LOCAL
+            # bus (unpublished, and register_listener blocks on the runtime lock
+            # for the duration of bootstrap), so no concurrent registration can
+            # mutate the handler dict mid-iteration.
+            if config.verify_manifests:
+                from . import manifest as _manifest_module
+                from .config import ConfigurationError
+
+                manifests = _manifest_module.all_manifests()
+                if manifests:
+                    registered: set[Callable[..., Any]] = set()
+                    for handlers in list(event_bus._handlers.values()):
+                        registered.update(handlers)
+                    all_errors: list[str] = []
+                    for pkg, m in manifests.items():
+                        errors = _manifest_module.verify_manifest(m, registered)
+                        all_errors.extend(f"[{pkg}] {e}" for e in errors)
+                    if all_errors:
+                        raise ConfigurationError(
+                            "Manifest verification failed:\n  - " + "\n  - ".join(all_errors)
+                        )
+
+            # 6.6. Notify plugins that each module is loaded. Fires AFTER
+            # discovery (modules imported, @listener decorators run) and
+            # manifest verification so the hookspec's "after all listeners and
+            # event types are wired" contract holds. Previously declared but
+            # never invoked — plugins that implement it (startup metrics,
+            # module-scoped resources, doc canvases) silently never ran.
+            for module in modules:
+                plugin_manager.hook.modulith_after_module_load(module=module)
+        except BaseException:
+            # Roll back the early config install (see step 4.5) — a failed
+            # bootstrap must leave the runtime exactly as it was.
+            self._config = None
+            raise
+
+        # 7. Commit point — install all state on self. Nothing above mutated
+        # the runtime, so an exception in steps 1-6.6 left it pristine.
+        self._config = config
+        self._plugin_manager = plugin_manager
+        self._event_bus = event_bus
+        self._broker_registry = broker_registry
+        self._modules = modules
         self._pending_listeners.clear()
 
-        # 6. Trigger module discovery via the plugin hook. This imports
-        # each discovered module, which fires any @listener decorators
-        # they contain (those flush into the bus we just built).
-        if self._config.auto_discover:
-            result = self._plugin_manager.hook.modulith_discover_modules(
-                app_package=self._config.package,
-            )
-            # firstresult=True returns the winning plugin's value directly.
-            self._modules = result if result else []
-
-        # 6.5. Verify manifests against observed reality.
-        if self._config.verify_manifests:
-            from . import manifest as _manifest_module
-            from .config import ConfigurationError
-
-            manifests = _manifest_module.all_manifests()
-            if manifests:
-                registered: set[Callable[..., Any]] = set()
-                for handlers in self._event_bus._handlers.values():
-                    registered.update(handlers)
-                all_errors: list[str] = []
-                for pkg, m in manifests.items():
-                    errors = _manifest_module.verify_manifest(m, registered)
-                    all_errors.extend(f"[{pkg}] {e}" for e in errors)
-                if all_errors:
-                    raise ConfigurationError(
-                        "Manifest verification failed:\n  - " + "\n  - ".join(all_errors)
-                    )
-
-        # 6.6. Notify plugins that each module is loaded. Fires AFTER discovery
-        # (modules imported, @listener decorators run) and manifest verification
-        # so the hookspec's "after all listeners and event types are wired"
-        # contract holds. Previously declared but never invoked — plugins that
-        # implement it (startup metrics, module-scoped resources, doc canvases)
-        # silently never ran.
-        for module in self._modules:
-            self._plugin_manager.hook.modulith_after_module_load(module=module)
-
-        # 7. Friendly startup banner so users see what's active.
+        # 7.5. Friendly startup banner so users see what's active.
         self._log_banner()
 
         # 8. Mark complete. Future calls take the fast path.
@@ -448,6 +625,27 @@ class Runtime:
         else:
             logger.info("no modules discovered under %r", cfg.package)
         logger.info("outbox=%s, broker=%s, topology=%s", cfg.outbox, cfg.broker, cfg.topology)
+        registry = self._broker_registry
+        if (
+            cfg.topology != "single"
+            and registry is not None
+            and cfg.broker not in registry.schemes()
+        ):
+            # A cross-process topology whose configured scheme has no adapter
+            # is almost certainly a typo or a missing plugin. Publishing a
+            # cross-process event in this state raises ConfigurationError
+            # (see _maybe_route_to_broker); warn at startup too so the
+            # mismatch is visible before the first publish. Not fatal here:
+            # embedders and tests legitimately register brokers after
+            # bootstrap via runtime.broker_registry.
+            logger.warning(
+                "topology=%r but no broker adapter is registered for the "
+                "configured scheme %r (registered: %s) — cross-process "
+                "publishes will fail until one is registered",
+                cfg.topology,
+                cfg.broker,
+                registry.schemes() or "none",
+            )
         if cfg.outbox == "memory" and not cfg.production:
             logger.info(
                 "outbox disabled — set [tool.modulith].outbox = 'postgres' "
@@ -467,18 +665,51 @@ class Runtime:
         process lifecycle. Idempotent and safe to call when no broker/outbox was
         ever registered. Invoke from a worker's ASGI lifespan teardown and the
         supervisor's shutdown.
+
+        Order matters: the outbox retry loop stops first (no new dispatches),
+        then the active publication store's in-flight after-commit dispatch
+        tasks are drained when the store exposes ``wait_for_dispatch()``
+        (duck-typed; the Postgres adapter does) — so a listener already
+        mid-flight finishes instead of being abandoned to a future crash
+        sweep — and brokers close last, after any fan-out those listeners
+        route.
+
+        TERMINAL, not reversible: the bootstrapped flag stays set and the
+        (now closed) brokers stay registered, so this runtime never
+        re-bootstraps in-process. A publish() after shutdown that reaches a
+        closed broker raises that adapter's own error, not a modulith error.
+        Restart the process to get a working runtime (tests use
+        ``_reset_for_testing`` instead).
         """
-        registry = self._broker_registry
-        if registry is not None:
-            await registry.close_all()
         from .builtin import outbox
 
         await outbox.shutdown()
+        store = outbox._store
+        waiter = getattr(store, "wait_for_dispatch", None) if store is not None else None
+        if waiter is not None:
+            await waiter()
+        registry = self._broker_registry
+        if registry is not None:
+            await registry.close_all()
 
     # ----- Test support -----------------------------------------------------
 
     def _reset_for_testing(self) -> None:
-        """Reset to uninitialized state. ONLY for tests."""
+        """Reset to uninitialized state. ONLY for tests.
+
+        Beyond nulling the runtime's own fields, this tears down the
+        cross-cutting machinery the old implementation leaked between
+        tests: registered brokers are closed (their connections otherwise
+        outlive the "fresh runtime") and the outbox plugin's module state —
+        store, serializer, retry task — is cleared, so a store configured by
+        one test can't silently flip a later test's publish() onto the
+        durable dispatch path. Closing brokers needs an event loop: with no
+        loop running (the sync fixtures this method serves) a temporary one
+        is used; inside a running loop the retry task is cancelled in place
+        and broker close() is skipped (close_all() logs-and-swallows, so a
+        loop-bound client can't fail the reset either way).
+        """
+        self._teardown_test_resources()
         self._bootstrapped = False
         self._config_overrides = {}
         self._config = None
@@ -496,6 +727,30 @@ class Runtime:
         from . import manifest as _manifest_module
 
         _manifest_module._reset_for_testing()
+
+    def _teardown_test_resources(self) -> None:
+        """Close brokers and clear outbox module state for _reset_for_testing."""
+        from .builtin import outbox
+
+        registry = self._broker_registry
+        retry_task = outbox._retry_task
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            if registry is not None and registry.schemes():
+                try:
+                    asyncio.run(registry.close_all())
+                except RuntimeError:  # pragma: no cover - loop-policy edge cases
+                    logger.debug("could not close brokers during test reset", exc_info=True)
+            if retry_task is not None and not retry_task.done():
+                try:
+                    retry_task.cancel()
+                except RuntimeError:  # pragma: no cover - task's loop already closed
+                    pass
+        else:
+            if retry_task is not None and not retry_task.done():
+                retry_task.cancel()
+        outbox._reset_for_testing()
 
 
 # The module-level singleton. Decorators and publish() reach through this.

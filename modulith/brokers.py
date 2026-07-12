@@ -13,6 +13,7 @@ manages its own configuration.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from .protocols import Broker
@@ -109,12 +110,16 @@ class BrokerRegistry:
 
         Closes every broker even if some raise — partial cleanup is
         better than aborting on the first failure during shutdown.
-        Errors are logged, not propagated.
+        Errors are logged, not propagated. ``asyncio.CancelledError`` is
+        caught too (it subclasses BaseException since 3.8): one broker's
+        close() being cancelled — e.g. a shutdown wrapped in
+        ``asyncio.wait_for`` timing out on a hanging client — must not
+        skip the close() of every broker registered after it.
         """
         for scheme, broker in self._brokers.items():
             try:
                 await broker.close()
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 logger.exception(
                     "broker %s (scheme %r) failed to close cleanly",
                     type(broker).__name__,

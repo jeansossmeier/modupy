@@ -81,6 +81,17 @@ _retry_task: asyncio.Task[None] | None = None
 # process (the cross-process case is handled by the store's row-level claim).
 _inflight_ids: set[UUID] = set()
 
+# Listener-column sentinel marking a publication row as a *deferred broker
+# send* rather than a local listener delivery. The durable path must not hand
+# an event to the broker inside publish() — the business transaction hasn't
+# committed yet and a broker send cannot be un-sent on rollback — so the route
+# is persisted as its own row (enlisted in the bound session, atomic with the
+# business work) and dispatched to the broker after commit, with the same
+# at-least-once retry machinery local listeners get. The double-underscore
+# namespace can't collide with a real listener id (module-qualified qualnames
+# never start with it).
+_BROKER_ROUTE_LISTENER_PREFIX = "__modulith.broker_route__:"
+
 
 def _listener_id(handler: Any) -> str:
     """Stable, module-qualified identity for a listener.
@@ -220,6 +231,31 @@ async def persist(event: Any) -> None:
         await _store.save(pub)
 
 
+async def persist_broker_route(event: Any, target: str) -> None:
+    """Persist a deferred broker send for this transaction's publish.
+
+    Called by ``Runtime.publish`` on the durable path when the event resolves
+    to a broker target (cross-process topology). The route commits — or rolls
+    back — atomically with the business transaction; the after-commit dispatch
+    (``_dispatch_publication``) recognizes the sentinel listener id and sends
+    the already-serialized payload to the broker. See
+    ``_BROKER_ROUTE_LISTENER_PREFIX`` for why the send must not happen inside
+    publish() itself.
+    """
+    assert _store is not None  # owns-dispatch guarantees this
+    if _retry_loop_enabled:
+        _ensure_retry_loop()
+    fqcn = f"{type(event).__module__}.{type(event).__qualname__}"
+    pub = EventPublication(
+        id=uuid4(),
+        payload=_serializer.serialize(event),
+        event_type=fqcn,
+        listener=_BROKER_ROUTE_LISTENER_PREFIX + target,
+        published_at=datetime.now(UTC),
+    )
+    await _store.save(pub)
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -287,6 +323,12 @@ async def _dispatch_publication(publication: EventPublication) -> None:
         return
     _inflight_ids.add(publication.id)
     try:
+        if (publication.listener or "").startswith(_BROKER_ROUTE_LISTENER_PREFIX):
+            # A deferred broker send (see persist_broker_route) — no local
+            # listener to resolve; the serialized payload goes to the wire.
+            await _dispatch_broker_route(publication)
+            return
+
         try:
             event = _serializer.deserialize(publication.payload, publication.event_type)
         except Exception as exc:
@@ -343,6 +385,40 @@ async def _dispatch_publication(publication: EventPublication) -> None:
             )
     finally:
         _inflight_ids.discard(publication.id)
+
+
+async def _dispatch_broker_route(publication: EventPublication) -> None:
+    """Deliver a deferred broker send (see ``persist_broker_route``).
+
+    Runs after commit (or from the retry loop / crash sweep). Success applies
+    the configured completion mode; failure records the attempt so the retry
+    loop re-sends — broker delivery gets the same at-least-once guarantee as
+    local listeners, and a crash between commit and send is recovered by the
+    sweep instead of losing the event for every remote consumer.
+    """
+    from .. import runtime as _rt
+
+    assert publication.listener is not None  # caller matched the prefix
+    target = publication.listener[len(_BROKER_ROUTE_LISTENER_PREFIX) :]
+    try:
+        registry = _rt._runtime.broker_registry
+        scheme = target.partition(":")[0]
+        if registry is None or scheme not in registry.schemes():
+            registered = registry.schemes() if registry is not None else []
+            raise LookupError(
+                f"no broker adapter registered for scheme {scheme!r} "
+                f"(publication {publication.id} targeting {target!r}; "
+                f"registered schemes: {registered or 'none'})"
+            )
+        await registry.publish(
+            target, publication.payload, {"event_type": publication.event_type or ""}
+        )
+    except Exception as exc:
+        logger.warning("broker route %s failed for publication %s: %s", target, publication.id, exc)
+        await _record_failure(publication, exc)
+        return
+    await _complete(publication)
+    logger.debug("routed publication %s to broker target %s", publication.id, target)
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +623,7 @@ __all__ = [
     "modulith_after_event_published",
     "modulith_before_event_published",
     "persist",
+    "persist_broker_route",
     "purge_completed",
     "retry_all_dead_lettered",
     "shutdown",
