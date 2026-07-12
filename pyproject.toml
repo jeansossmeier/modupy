@@ -312,7 +312,7 @@ ignore_missing_imports = true
 # package = "myapp"          # auto-detected if not set
 # outbox = "memory"          # default — switch to "postgres" for production
 # broker = "memory"          # default — switch to "redis-streams" for IPC
-# topology = "single"        # "single" | "processes" | "subinterpreters"
+# topology = "single"        # "single" | "processes" ("subinterpreters" reserved, not yet implemented)
 # contracts_module = "contracts"  # name of the shared-events subpackage (default: "contracts")
 
 [tool.modulith.verify]
