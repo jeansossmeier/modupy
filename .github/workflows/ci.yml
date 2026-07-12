@@ -37,7 +37,38 @@ jobs:
         run: uv pip install --system -e ".[all]"
 
       - name: Run pytest
-        run: pytest -v --tb=short
+        # Deselect the integration suite explicitly: in this job the
+        # testcontainers drivers are absent, so `-m integration` tests would
+        # silently skip — a permanently-green lane proving nothing. The real
+        # integration lane below runs them against Docker.
+        run: pytest -m "not integration" -v --tb=short
+
+  integration:
+    name: pytest -m integration (testcontainers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install project with integration extras
+        # `.[integration]` layers testcontainers + the REAL Postgres drivers
+        # (asyncpg for the outbox, sync psycopg for Alembic) on top of the
+        # default test extra. GitHub-hosted ubuntu runners ship a working
+        # Docker daemon, which testcontainers uses to start disposable
+        # postgres:16 / redis:7 containers.
+        run: uv pip install --system -e ".[integration]"
+
+      - name: Run integration suite
+        run: pytest -m integration -v
 
   lint:
     name: ruff
@@ -54,7 +85,9 @@ jobs:
         uses: astral-sh/setup-uv@v3
 
       - name: Install ruff
-        run: uv pip install --system "ruff>=0.4"
+        # Constraint mirrors pyproject.toml's dev extra verbatim — guarded by
+        # tests/test_ci_config.py so the two specs can never drift apart.
+        run: uv pip install --system "ruff>=0.4,<1.0"
 
       - name: Lint
         run: ruff check modulith tests
@@ -79,12 +112,16 @@ jobs:
         uses: astral-sh/setup-uv@v3
 
       - name: Install project + mypy
-        run: |
-          uv pip install --system -e ".[all]"
-          uv pip install --system "mypy>=1.10"
+        # `.[dev]` is the single source of truth for the mypy version
+        # constraint (no duplicated ad-hoc pin here that could drift from
+        # pyproject.toml) and pulls the integration extras so mypy can
+        # resolve the imports in tests/ (testcontainers, asyncpg, psycopg).
+        run: uv pip install --system -e ".[dev]"
 
       - name: Type check
-        run: mypy --strict modulith/
+        # tests/ is type-checked too; per-module strictness relaxations for
+        # tests live in pyproject.toml [[tool.mypy.overrides]].
+        run: mypy --strict modulith/ tests/
 
   build:
     name: build wheel + sdist

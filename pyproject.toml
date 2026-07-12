@@ -150,7 +150,11 @@ all = [
 dev = [
     "modulith[all,integration]",
     "ruff>=0.4,<1.0",
-    "mypy>=1.10,<2.0",
+    # mypy 2.0 verified: modulith/ + tests/ type-check clean under --strict
+    # with mypy 2.0.0, so the bound is <3.0 (next unverified major). CI's
+    # typecheck job installs this extra rather than an ad-hoc pin, so this
+    # line is the ONLY place the constraint lives.
+    "mypy>=1.10,<3.0",
     "pytest-cov>=4.1,<8.0",
 ]
 
@@ -229,12 +233,73 @@ strict = true
 warn_unreachable = true
 disallow_untyped_decorators = false  # decorators with TypeVar are awkward
 # No exclusions: every module is implemented and type-checks under --strict.
+# tests/ is type-checked in CI too (mypy --strict modulith/ tests/).
+# tests/ has no __init__.py, so explicit package bases are needed for the
+# files to map to `tests.*` module names (which the per-module strictness
+# relaxations below key on) instead of colliding top-level names.
+explicit_package_bases = true
 
 [[tool.mypy.overrides]]
 # pluggy's hookspec module-level decorator usage produces empty-body
 # warnings under --strict because hookspecs are signature-only contracts.
 module = "modulith.hooks"
 disable_error_code = ["empty-body"]
+
+[[tool.mypy.overrides]]
+# Tests are type-checked, but not under full --strict: test functions are
+# conventionally unannotated (pytest discovers them by name, not signature),
+# and forcing `-> None` + fixture annotations on hundreds of tests adds
+# noise without catching real bugs. Everything mypy can infer inside
+# annotated code is still checked; only the strictness ratchets below are
+# relaxed for the tests.* modules.
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+disallow_untyped_decorators = false
+disallow_any_generics = false
+warn_return_any = false
+warn_unused_ignores = false
+warn_unreachable = false
+
+[[tool.mypy.overrides]]
+# RATCHET — legacy tests written before tests/ came under mypy. They lean
+# on runtime duck typing (stub engines/supervisors passed where the real
+# type is annotated, tomllib `object` returns, dynamic attributes), which
+# trips these codes inside otherwise-annotated functions. Do NOT add new
+# modules here; new test files must type-check without entries in this
+# list. Shrink it by annotating/narrowing the legacy files over time.
+module = [
+    "tests.conftest",
+    "tests.test_cli",
+    "tests.test_decorators",
+    "tests.test_observability",
+    "tests.test_outbox",
+    "tests.test_postgres_adapter",
+    "tests.test_postgres_integration",
+    "tests.test_postgres_outbox_e2e",
+    "tests.test_proxy",
+    "tests.test_redis_broker",
+    "tests.test_runtime_hooks",
+    "tests.test_supervisor",
+    "tests.test_sync",
+    "tests.test_testing_plugin",
+]
+disable_error_code = [
+    "arg-type",
+    "attr-defined",
+    "has-type",
+    "misc",
+    "operator",
+    "union-attr",
+]
+
+[[tool.mypy.overrides]]
+# Synthetic app packages that tests generate on disk at runtime (fixture
+# factories write `fakeapp/`, the demo app installs as `shop`); they don't
+# exist at type-check time. testcontainers and docker ship no py.typed.
+module = ["fakeapp", "fakeapp.*", "shop", "shop.*", "testcontainers.*", "docker", "docker.*"]
+ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------
 # Self-application of modulith (the framework using itself)
@@ -255,7 +320,10 @@ disable_error_code = ["empty-body"]
 # baseline = ".modulith-baseline.json"
 # disabled_rules = []        # rule names to skip, e.g. ["uses-contracts-module"]
 
-[tool.modulith.outbox]
+# NOTE: the options subtable is `outbox_options` (NOT `outbox` — that
+# spelling is the top-level string key selecting the adapter, and a legacy
+# `[tool.modulith.outbox]` subtable is rejected with a ConfigurationError).
+[tool.modulith.outbox_options]
 # completion_mode = "update" # "update" | "delete" | "archive"
 # retry_interval_seconds = 30
 # max_attempts = 10
