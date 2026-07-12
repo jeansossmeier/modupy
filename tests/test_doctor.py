@@ -189,15 +189,18 @@ def test_split_readiness_high_when_event_driven(make_fake_app) -> None:
     assert _check(report, "process-split readiness").status == "ok"
 
 
-def test_split_readiness_error_on_direct_coupling(make_fake_app) -> None:
+def test_split_readiness_warns_on_direct_coupling(make_fake_app) -> None:
     # orders reaches directly into inventory's public API (no events at all).
+    # A9-r4-183: readiness is an informational maturity metric (SPEC/
+    # MIGRATION_GUIDE frame it as "are you ready to split?"), so a low score
+    # caps at "warn" — it must never fail the doctor CI gate on its own.
     make_fake_app({"orders": "from fakeapp.inventory import thing\n", "inventory": "thing = 1\n"})
     configure(package="fakeapp")
 
     report = run_doctor()
 
     check = _check(report, "process-split readiness")
-    assert check.status == "error"
+    assert check.status == "warn"
     assert any("orders" in d for d in check.details)
 
 
@@ -555,3 +558,67 @@ def test_outbox_health_errors_on_large_dead_letter_pile(make_fake_app) -> None:
     check = _check(run_doctor(), "outbox health")
     assert check.status == "error"
     assert "500 dead-lettered" in check.summary
+
+
+# ---------------------------------------------------------------------------
+# regression: W2 audit fixes (G06_cli)
+# ---------------------------------------------------------------------------
+
+
+def test_split_readiness_ok_at_80_percent(make_fake_app) -> None:
+    """A9-r1-32: MIGRATION_GUIDE documents '80%+' as split-ready — the 80%
+    boundary must be inclusive 'ok', not 'warn'."""
+    make_fake_app(
+        {
+            # 1 direct cross-module import + 4 publish calls → exactly 80%.
+            "orders": (
+                "from fakeapp.inventory import thing\n"
+                "from modulith import publish\n\n"
+                "async def go() -> None:\n" + "".join(f"    await publish({i})\n" for i in range(4))
+            ),
+            "inventory": "thing = 1\n",
+        }
+    )
+    configure(package="fakeapp")
+
+    check = _check(run_doctor(), "process-split readiness")
+
+    assert check.status == "ok"
+    assert "80%" in check.summary
+    assert "process-split ready" in check.summary
+
+
+def test_split_readiness_names_microservice_tier_at_95_percent(make_fake_app) -> None:
+    """A9-r1-32: MIGRATION_GUIDE's 95%+ 'microservice-ready' tier must be
+    visible in the report, distinct from plain 80%+ split-readiness."""
+    make_fake_app(
+        {
+            # 1 direct cross-module import + 19 publish calls → exactly 95%.
+            "orders": (
+                "from fakeapp.inventory import thing\n"
+                "from modulith import publish\n\n"
+                "async def go() -> None:\n"
+                + "".join(f"    await publish({i})\n" for i in range(19))
+            ),
+            "inventory": "thing = 1\n",
+        }
+    )
+    configure(package="fakeapp")
+
+    check = _check(run_doctor(), "process-split readiness")
+
+    assert check.status == "ok"
+    assert "95%" in check.summary
+    assert "microservice-ready" in check.summary
+
+
+def test_doctor_cli_passes_with_low_readiness_score(make_fake_app, monkeypatch) -> None:
+    """A9-r4-183: a low readiness score is an informational maturity signal —
+    it renders as 'warn' and must not fail the doctor CI gate on its own."""
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": "from fakeapp.inventory import thing\n", "inventory": "thing = 1\n"})
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 0, result.output
+    assert "⚠ process-split readiness" in result.output

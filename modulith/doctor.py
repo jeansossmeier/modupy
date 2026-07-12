@@ -235,13 +235,24 @@ def _check_split_readiness(rt: Runtime) -> HealthCheck:
         return HealthCheck("process-split readiness", "ok", "no cross-module interactions detected")
 
     score = round(100 * publish_total / total)
-    status = "ok" if score > 80 else "warn" if score >= 50 else "error"
+    # MIGRATION_GUIDE.md's documented milestones are inclusive: 80%+ = ready
+    # to split a module into its own process, 95%+ = ready to extract a
+    # microservice (A9-r1-32). Below that the score is an informational
+    # maturity signal and caps at "warn" — never "error": doctor doubles as a
+    # CI gate, and a low score is the framework's own recommended starting
+    # state for a migration, not a defect (A9-r4-183).
+    if score >= 95:
+        status, tier = "ok", " — microservice-ready"
+    elif score >= 80:
+        status, tier = "ok", " — process-split ready"
+    else:
+        status, tier = "warn", ""
     top = sorted(direct_by_module.items(), key=lambda kv: -kv[1])[:5]
     details = [f"{name}: {n} direct cross-module import(s)" for name, n in top if n]
     return HealthCheck(
         "process-split readiness",
         status,
-        f"{score}% of cross-module interactions via events",
+        f"{score}% of cross-module interactions via events{tier}",
         details,
     )
 

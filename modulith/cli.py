@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sys
+import traceback
 from collections import defaultdict
 from datetime import timedelta
 from pathlib import Path
@@ -43,6 +44,7 @@ except ImportError:
 
 from .builtin import outbox, verifier
 from .config import ConfigurationError, load_configuration
+from .discovery import _detect_from_pyproject_name
 from .manifest import get_manifest
 from .runtime import Runtime, _runtime
 from .types import Violation, ViolationSeverity
@@ -89,7 +91,32 @@ def _bootstrap_or_exit() -> Runtime:
     ConfigurationError here means the user's project isn't set up (no
     detectable package, failing manifest); surface its actionable message
     and exit 1 rather than dumping a traceback.
+
+    CLI bootstrap must never fall back to the caller-stack package heuristic:
+    every frame above a CLI command belongs to typer/click, so the stack walk
+    would "detect" the CLI framework itself as the application package and
+    the command would silently run against the wrong package — ``verify``
+    exited 0 without ever scanning the real app (A9-r2-94). Resolve the
+    package up front instead: explicit configuration wins, then pyproject
+    ``[project].name``, otherwise exit 1 with actionable guidance.
     """
+    if not _runtime._bootstrapped:
+        try:
+            resolved = load_configuration(**_runtime._config_overrides)
+        except ConfigurationError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=1) from None
+        if resolved.package is None:
+            pkg = _detect_from_pyproject_name()
+            if pkg is None:
+                typer.echo(
+                    "error: could not determine the application package. Set "
+                    "[tool.modulith].package or [project].name in pyproject.toml, "
+                    "or the MODULITH_PACKAGE environment variable.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            _runtime.configure(package=pkg)
     try:
         _runtime.ensure_bootstrapped()
     except ConfigurationError as exc:
@@ -105,17 +132,66 @@ def _package_from_app_module(app_module: str) -> str:
 
 
 def _configure_process_runtime(app_module: str) -> None:
-    """Apply process-topology CLI intent before bootstrapping the runtime."""
+    """Apply process-topology CLI intent before bootstrapping the runtime.
+
+    The package comes from explicit configuration when present; otherwise it
+    is derived from ``app_module``. When both exist and disagree, warn loudly:
+    the process topology runs the *configured* package's modules and never
+    reads ``app_module`` again, so silence here launched a different app's
+    workers on a typo'd argument (A9-r4-182).
+    """
     try:
         resolved = load_configuration(topology="processes")
     except ConfigurationError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from None
 
+    implied = _package_from_app_module(app_module)
     overrides: dict[str, Any] = {"topology": "processes"}
     if resolved.package is None:
-        overrides["package"] = _package_from_app_module(app_module)
+        if not implied:
+            typer.echo(
+                f"invalid app module {app_module!r}: expected 'package.module:app'",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        overrides["package"] = implied
+    elif implied and implied != resolved.package:
+        typer.echo(
+            f"warning: app module {app_module!r} implies package {implied!r}, but the "
+            f"configured package is {resolved.package!r} — the process topology runs "
+            "the configured package's modules and ignores the app-module argument",
+            err=True,
+        )
     _runtime.configure(**overrides)
+
+
+_TOPOLOGIES = ("single", "processes")
+
+
+def _validate_topology(topology: str) -> None:
+    """Reject anything outside the two supported topologies (A9-r1-30).
+
+    Anything unrecognized used to route to the process-per-module supervisor
+    (the branch was ``!= "single"``), silently launching the wrong
+    architecture on a typo.
+    """
+    if topology not in _TOPOLOGIES:
+        typer.echo(
+            f"invalid --topology {topology!r}: expected 'single' or 'processes'",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
+def _validate_app_module(app_module: str) -> None:
+    """Reject empty app-module arguments with a clean CLI error (A9-r3-144)."""
+    if not app_module.strip():
+        typer.echo(
+            f"invalid app module {app_module!r}: expected 'package.module:app'",
+            err=True,
+        )
+        raise typer.Exit(code=1)
 
 
 _DURATION_RE = re.compile(r"^(\d+)([dhms])$")
@@ -167,6 +243,80 @@ def _print_violations(violations: list[Violation]) -> None:
     typer.echo(f"\n{errors} error(s), {warnings} warning(s)")
 
 
+def _collect_violations(rt: Runtime) -> list[Violation]:
+    """Aggregate every boundary rule: plugin verify hooks + cycle detection."""
+    modules = rt.modules
+    pm = rt.plugin_manager
+    violations: list[Violation] = []
+    for module in modules:
+        for result in pm.hook.modulith_verify_module(module=module, all_modules=modules):
+            violations.extend(result)
+    violations.extend(verifier.detect_cycles(modules))
+    return violations
+
+
+def _echo_violation_warnings(violations: list[Violation]) -> None:
+    """Echo violations as dev-time warnings on stderr (never exits)."""
+    if not violations:
+        return
+    typer.echo(
+        f"modulith: {len(violations)} boundary violation(s) — non-fatal in dev, "
+        "run `modulith verify` for the hard check:",
+        err=True,
+    )
+    for v in violations:
+        location = f" ({v.location})" if v.location else ""
+        typer.echo(
+            f"  [{v.severity.value.upper()}] {v.module}: {v.rule}: {v.message}{location}",
+            err=True,
+        )
+
+
+def _echo_dev_verify_warnings(app_module: str) -> None:
+    """Best-effort boundary check at ``modulith dev`` startup (S2-r4-195).
+
+    Implements SPEC §3.2's "warnings in dev, hard checks via `modulith
+    verify` in CI": bootstrap the runtime (deriving the package from
+    ``app_module`` when nothing is configured), print the discovered module
+    list, and echo any boundary violations as warnings. Never fatal — a dev
+    server must start even when the project is half-configured, so every
+    failure here downgrades to a note on stderr.
+    """
+    added_package = False
+    try:
+        added_package = _configure_dev_package(app_module)
+        _runtime.ensure_bootstrapped()
+        modules = _runtime.modules
+        violations = _collect_violations(_runtime)
+    except Exception as exc:  # dev-time signal only — never block the server
+        if added_package:
+            # Leave the (un-bootstrapped) runtime as we found it.
+            _runtime._config_overrides.pop("package", None)
+        typer.echo(f"modulith: boundary check skipped ({exc})", err=True)
+        return
+    names = ", ".join(sorted(m.name for m in modules)) or "(none discovered)"
+    typer.echo(f"modulith: discovered modules: {names}")
+    _echo_violation_warnings(violations)
+
+
+def _configure_dev_package(app_module: str) -> bool:
+    """Name a package for the dev warn-pass when configuration doesn't.
+
+    Returns True when this call added the override, so a failed bootstrap
+    can remove it again and leave the runtime exactly as it was.
+    """
+    if _runtime._bootstrapped:
+        return False
+    resolved = load_configuration(**_runtime._config_overrides)
+    if resolved.package is not None:
+        return False
+    pkg = _package_from_app_module(app_module)
+    if not pkg:
+        raise ConfigurationError(f"cannot derive an application package from {app_module!r}")
+    _runtime.configure(package=pkg)
+    return True
+
+
 def _require_outbox_store() -> None:
     """Exit 1 with guidance when no durable outbox store is configured.
 
@@ -185,6 +335,28 @@ def _require_outbox_store() -> None:
         raise typer.Exit(code=1)
 
 
+def _parse_workers_json(workers_json: str) -> dict[str, Any]:
+    """Parse ``--workers`` into a dict, exiting 1 on anything else.
+
+    JSON that parses but isn't an object (a list, number, string…) used to
+    crash the supervisor with an AttributeError traceback (A9-r1-31) — the
+    option's contract is an object like ``{"reports": 4}``.
+    """
+    try:
+        parsed = json.loads(workers_json)
+    except json.JSONDecodeError as exc:
+        typer.echo(f"invalid --workers JSON: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    if not isinstance(parsed, dict):
+        typer.echo(
+            'invalid --workers JSON: expected an object like {"reports": 4}, '
+            f"got {type(parsed).__name__}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    return parsed
+
+
 def _run_process_topology(
     *,
     app_module: str,
@@ -192,32 +364,40 @@ def _run_process_topology(
     isolate: str | None,
     host: str,
     port: int,
+    verify_warn: bool = False,
 ) -> None:
     """Spin up the process-per-module runtime: one worker per module + proxy.
 
     Bootstraps to resolve the application package, derives a ``WorkerSpec``
     per discovered module (honoring ``--workers`` counts and ``--isolate``),
     then runs the supervisor and reverse proxy on ``(host, port)``. Blocks
-    until a shutdown signal arrives.
+    until a shutdown signal arrives. With ``verify_warn`` (``modulith dev``),
+    boundary violations are echoed as non-fatal warnings after bootstrap.
     """
     from .supervisor import derive_specs_from_config, run_supervised
 
+    # Argument validation precedes environment preconditions (bootstrap).
+    workers_map: dict[str, Any] | None = None
+    if workers_json:
+        workers_map = _parse_workers_json(workers_json)
+
     _configure_process_runtime(app_module)
     rt = _bootstrap_or_exit()
+    if verify_warn:
+        try:
+            _echo_violation_warnings(_collect_violations(rt))
+        except Exception as exc:  # dev-time signal only — never fatal
+            typer.echo(f"modulith: boundary check skipped ({exc})", err=True)
     cfg = rt.config
     assert cfg is not None  # ensure_bootstrapped guarantees this
 
     config: dict[str, Any] = {
         "package": cfg.package,
-        "workers": dict(cfg.workers),
+        # --workers replaces the pyproject [tool.modulith.workers] table
+        # entirely — a full override, not a per-module patch (A9-r5-216).
+        "workers": workers_map if workers_map is not None else dict(cfg.workers),
         "env": {"MODULITH_BROKER": cfg.broker},
     }
-    if workers_json:
-        try:
-            config["workers"] = json.loads(workers_json)
-        except json.JSONDecodeError as exc:
-            typer.echo(f"invalid --workers JSON: {exc}", err=True)
-            raise typer.Exit(code=1) from None
     if isolate:
         config["isolate"] = [isolate]
 
@@ -250,23 +430,33 @@ def dev(
 ) -> None:
     """Run the application in development mode.
 
-    The single-process path execs uvicorn (optionally with ``--reload``),
-    so the dev experience is identical to running uvicorn directly. The
-    process-per-module path (``--topology processes`` / ``--isolate``) runs
-    the supervisor + reverse proxy: one worker subprocess per module behind a
-    routing proxy on ``(host, port)``. (``--reload`` does not apply to the
-    process topology in v1.)
+    Startup runs the boundary verifier and echoes violations as *non-fatal*
+    warnings — the dev-time signal promised by SPEC §3.2 (``modulith verify``
+    remains the hard CI gate). The single-process path execs uvicorn
+    (optionally with ``--reload``), so the dev experience is identical to
+    running uvicorn directly. The process-per-module path (``--topology
+    processes`` / ``--isolate``) runs the supervisor + reverse proxy: one
+    worker subprocess per module behind a routing proxy on ``(host, port)``.
+    (``--reload`` does not apply to the process topology in v1.)
+
+    Exit codes: 0 on a clean launch (dev-time verifier warnings never fail
+    the command), 1 on invalid arguments or configuration errors, 2 on
+    unexpected internal errors.
     """
-    if topology != "single" or isolate is not None:
+    _validate_topology(topology)
+    _validate_app_module(app_module)
+    if topology == "processes" or isolate is not None:
         _run_process_topology(
             app_module=app_module,
             workers_json=None,
             isolate=isolate,
             host=host,
             port=port,
+            verify_warn=True,
         )
         return
 
+    _echo_dev_verify_warnings(app_module)
     argv = ["uvicorn", app_module, "--host", host, "--port", str(port)]
     if reload:
         argv.append("--reload")
@@ -284,19 +474,29 @@ def dev(
 @app.command()
 def run(
     app_module: str = typer.Argument(...),
-    topology: str = typer.Option("single"),
-    workers: str | None = typer.Option(None, help='JSON: {"reports": 4}'),
+    topology: str = typer.Option("single", help="single | processes"),
+    workers: str | None = typer.Option(
+        None,
+        help='JSON: {"reports": 4} (replaces the pyproject [tool.modulith.workers] table entirely)',
+    ),
     host: str = typer.Option("0.0.0.0"),
     port: int = typer.Option(8000),
 ) -> None:
     """Run the application in production mode.
 
-    Like ``dev`` minus reload. Per-module worker counts (``--workers``) apply
-    to the process-per-module topology: each module's worker count comes from
-    the JSON map (with a ``default`` fallback). The single-process path execs
-    a plain uvicorn.
+    Like ``dev`` minus reload (and minus the dev-time verifier warnings).
+    Per-module worker counts (``--workers``) apply to the process-per-module
+    topology: each module's worker count comes from the JSON map (with a
+    ``default`` fallback). Passing ``--workers`` replaces the pyproject
+    ``[tool.modulith.workers]`` table entirely — a full override, not a
+    per-module patch. The single-process path execs a plain uvicorn.
+
+    Exit codes: 0 on a clean launch, 1 on invalid arguments or configuration
+    errors, 2 on unexpected internal errors.
     """
-    if topology != "single":
+    _validate_topology(topology)
+    _validate_app_module(app_module)
+    if topology == "processes":
         _run_process_topology(
             app_module=app_module,
             workers_json=workers,
@@ -321,22 +521,29 @@ def verify(
     mode: str = typer.Option("strict", help="strict | ratchet"),
     baseline: Path = typer.Option(Path(".modulith-baseline.json")),
     update_baseline: bool = typer.Option(False, "--update-baseline"),
+    fail_on_warnings: bool = typer.Option(
+        False,
+        "--fail-on-warnings",
+        help="Also exit 1 when WARNING-severity violations are reported.",
+    ),
 ) -> None:
     """Run boundary verification.
 
-    Exit code 0 if clean (strict) or no *new* violations (ratchet); 1
-    otherwise. Designed to drop into CI as a single line. ``--update-baseline``
+    Exit code 0 when no ERROR-severity violations are reported (strict) or
+    none are new relative to the baseline (ratchet) — WARNING-severity
+    violations are printed but pass unless ``--fail-on-warnings`` is set.
+    Exit code 1 on violations or invalid usage; 2 on unexpected internal
+    errors. Designed to drop into CI as a single line. ``--update-baseline``
     records the current violation set as the accepted baseline and exits 0.
     """
-    rt = _bootstrap_or_exit()
-    modules = rt.modules
-    pm = rt.plugin_manager
+    # Argument validation precedes bootstrap: a typo'd mode used to fall
+    # through to strict semantics, ignoring the baseline (A9-r3-142).
+    if mode not in ("strict", "ratchet"):
+        typer.echo(f"invalid --mode {mode!r}: expected 'strict' or 'ratchet'", err=True)
+        raise typer.Exit(code=1)
 
-    violations: list[Violation] = []
-    for module in modules:
-        for result in pm.hook.modulith_verify_module(module=module, all_modules=modules):
-            violations.extend(result)
-    violations.extend(verifier.detect_cycles(modules))
+    rt = _bootstrap_or_exit()
+    violations = _collect_violations(rt)
 
     if update_baseline:
         verifier.write_baseline(baseline, violations)
@@ -352,6 +559,8 @@ def verify(
     _print_violations(reported)
 
     if any(v.severity is ViolationSeverity.ERROR for v in reported):
+        raise typer.Exit(code=1)
+    if fail_on_warnings and reported:
         raise typer.Exit(code=1)
 
 
@@ -427,7 +636,8 @@ def doctor() -> None:
 
     Runs five checks — boundary health, process-split readiness, schema
     drift, outbox health, and listener registration — and prints a report.
-    Exits non-zero if any check reports an error, so it doubles as a CI gate.
+    Exits 1 if any check reports an error, so it doubles as a CI gate
+    (warnings are reported but pass); 2 on unexpected internal errors.
     """
     from .doctor import render_report, run_doctor
 
@@ -457,17 +667,46 @@ def outbox_status() -> None:
     typer.echo(f"dead-lettered: {counts['dead_lettered']}")
 
 
+async def _force_retry_known(pub_id: UUID) -> bool:
+    """Retry ``pub_id`` via the outbox; False when no such publication exists.
+
+    ``outbox.force_retry`` only *logs* a warning on the not-found path —
+    invisible whenever the application configures its own logging — so the
+    CLI checks existence against the same candidate set force_retry scans
+    (retryable + dead-lettered) and reports honestly (A9-r3-143).
+    """
+    store = outbox._store
+    assert store is not None  # _require_outbox_store already ran
+    candidates = list(await store.find_incomplete(timedelta(0)))
+    candidates += await outbox.list_dead_lettered()
+    if not any(pub.id == pub_id for pub in candidates):
+        return False
+    await outbox.force_retry(pub_id)
+    return True
+
+
 @outbox_app.command("retry")
 def outbox_retry(publication_id: str) -> None:
-    """Force retry of a specific publication, bypassing backoff."""
-    _bootstrap_or_exit()
-    _require_outbox_store()
+    """Force retry of a specific publication, bypassing backoff.
+
+    Exit code 1 when the id is not a UUID or names no retryable publication
+    (unknown, or already complete) — success is only reported for ids that
+    were actually resubmitted.
+    """
+    # Argument validation precedes environment preconditions.
     try:
         pub_id = UUID(publication_id)
     except ValueError:
         typer.echo(f"invalid publication id {publication_id!r}: expected a UUID", err=True)
         raise typer.Exit(code=1) from None
-    asyncio.run(outbox.force_retry(pub_id))
+    _bootstrap_or_exit()
+    _require_outbox_store()
+    if not asyncio.run(_force_retry_known(pub_id)):
+        typer.echo(
+            f"publication {pub_id} not found (or already complete) — nothing was retried",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     typer.echo(f"requested retry of publication {pub_id}")
 
 
@@ -502,12 +741,14 @@ def outbox_dead_letter(
     ``--retry-all`` are mutually exclusive — passing both is an error rather
     than silently doing one (the previously-inert ``--list`` masked this).
     """
-    _bootstrap_or_exit()
-    _require_outbox_store()
-
+    # Argument validation precedes environment preconditions: the flag
+    # conflict must be reported even when no store is configured (A9-r3-145).
     if retry_all and list_dead:
         typer.echo("--list and --retry-all are mutually exclusive", err=True)
         raise typer.Exit(code=1)
+
+    _bootstrap_or_exit()
+    _require_outbox_store()
 
     if retry_all:
         count = asyncio.run(outbox.retry_all_dead_lettered())
@@ -582,8 +823,17 @@ def info() -> None:
 
 
 def main() -> None:
-    """Console-script entry point."""
-    app()
+    """Console-script entry point.
+
+    Exit codes: 0 = success (warnings may still be reported), 1 = violations
+    or user error (commands raise ``typer.Exit(1)``), 2 = unexpected internal
+    error (traceback printed to stderr).
+    """
+    try:
+        app()
+    except Exception:  # final safety net: internal bugs exit 2, distinctly
+        traceback.print_exc()
+        sys.exit(2)
 
 
 if __name__ == "__main__":
