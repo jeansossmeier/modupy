@@ -4,19 +4,33 @@ Walks every ``.py`` file under each application module with ``ast.parse()``,
 collects imports (and table references), and emits ``Violation``s for any
 cross-module access that breaks the rules. Source is parsed, never executed.
 
-The five default rules:
+The six default rules:
   1. No cross-module *private* imports — ``myapp.orders`` cannot import from
      ``myapp.inventory._internal`` (or any other ``_``-prefixed subpackage).
   2. No cyclic dependencies — the module dependency graph must be a DAG
      (``detect_cycles``, run once over all modules by the CLI).
   3. Declared dependencies match observed — when a manifest declares
-     ``declared_dependencies``, only those modules (plus ``contracts``) may
-     be imported.
+     ``declared_dependencies`` (any value other than None), only those
+     modules (plus ``contracts``) may be imported. A manifest that never
+     declares the field (None) leaves the rule off; an explicit empty
+     tuple means "depends on nothing".
   4. Cross-module *type* imports must come from the ``contracts`` module, not
-     another module's package (uppercase-name heuristic).
+     another module's package (uppercase-name heuristic). Wildcard
+     cross-module imports are flagged outright — they cannot be resolved to
+     specific names.
   5. Module data ownership — when manifests declare ``owns_tables``, a
      ``Table("x")`` reference in another module is flagged (best-effort,
      warning; full coverage is v1.1 with runtime SQLAlchemy events).
+     Conflicting ownership declarations (two manifests claiming the same
+     table) are surfaced as their own warning.
+  6. Contracts is a sink — everyone may import from the contracts module;
+     it may not import from any application module (SPEC 5.3).
+
+``if TYPE_CHECKING:`` imports are collected too (tagged ``type_only``) and
+checked by the boundary rules (1, 3, 4) — wrapping an import in the guard
+must not bypass encapsulation. They are exempt only from cycle detection
+(rule 2): a type-only import imposes no runtime dependency and is the
+sanctioned idiom for breaking a runtime import cycle.
 
 Ratcheting mode: existing violations get grandfathered via a baseline file;
 only new violations fail the build.
@@ -29,7 +43,8 @@ import hashlib
 import importlib.util
 import json
 import logging
-from dataclasses import dataclass
+from collections.abc import Collection
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from modulith import ModuleInfo, Violation, hookimpl
@@ -70,7 +85,7 @@ def modulith_verify_module(
     module: ModuleInfo,
     all_modules: list[ModuleInfo],
 ) -> list[Violation]:
-    """Run the per-module default rules (1, 3, 4, 5) against a module.
+    """Run the per-module default rules (1, 3, 4, 5, 6) against a module.
 
     Aggregating hook: returns one module's violations; other plugins run
     alongside and contribute their own. Cycle detection (rule 2) is global
@@ -85,6 +100,7 @@ def modulith_verify_module(
     violations.extend(_check_uses_contracts_module(module, imports, all_modules, contracts_module))
     violations.extend(_check_declared_dependencies(module, imports, all_modules, contracts_module))
     violations.extend(_check_data_ownership(module, all_modules))
+    violations.extend(_check_contracts_is_sink(module, imports, all_modules, contracts_module))
 
     return violations
 
@@ -103,6 +119,19 @@ class ImportRecord:
     target_module: str  # full dotted path being imported
     imported_names: list[str]  # names brought in (empty for "import x")
 
+    # Locally-bound names, parallel to imported_names (``asname or name``).
+    # Rule 4 matches runtime usage against these so an aliased import
+    # (``from x import Y as Z``) is tracked under the name the file
+    # actually uses (A10-r2-96).
+    local_names: list[str] = field(default_factory=list)
+
+    # True when the import sits inside an ``if TYPE_CHECKING:`` block.
+    # Boundary rules (1, 3, 4) still check these; cycle detection (rule 2)
+    # skips them — a type-only import imposes no runtime dependency and is
+    # the sanctioned idiom for breaking a runtime cycle (A10-r1-34,
+    # A10-r3-146).
+    type_only: bool = False
+
 
 def _package_dir(package: str) -> Path | None:
     """Resolve a package's on-disk directory without executing its code."""
@@ -115,13 +144,26 @@ def _package_dir(package: str) -> Path | None:
     return Path(next(iter(spec.submodule_search_locations)))
 
 
-def _is_type_checking(test: ast.expr) -> bool:
-    """True for ``if TYPE_CHECKING:`` (bare name or ``typing.TYPE_CHECKING``)."""
+def _is_type_checking(test: ast.expr, aliases: Collection[str] = ("TYPE_CHECKING",)) -> bool:
+    """True for ``if TYPE_CHECKING:`` guards.
+
+    Recognizes the bare name, any ``<mod>.TYPE_CHECKING`` attribute, and —
+    via *aliases* — names bound by ``from typing import TYPE_CHECKING as TC``
+    (A10-r5-217: an unresolved alias made the guard invisible, so guarded
+    imports were treated as unconditional runtime imports).
+    """
     if isinstance(test, ast.Name):
-        return test.id == "TYPE_CHECKING"
+        return test.id in aliases
     if isinstance(test, ast.Attribute):
         return test.attr == "TYPE_CHECKING"
     return False
+
+
+def _type_checking_aliases(node: ast.ImportFrom) -> list[str]:
+    """Aliases bound to ``typing.TYPE_CHECKING`` by this import, if any."""
+    if node.level or node.module != "typing":
+        return []
+    return [a.asname for a in node.names if a.name == "TYPE_CHECKING" and a.asname]
 
 
 def _file_package(root: Path, root_package: str, path: Path) -> str:
@@ -134,15 +176,27 @@ def _file_package(root: Path, root_package: str, path: Path) -> str:
 
 
 class _ImportCollector(ast.NodeVisitor):
-    """Collect Import/ImportFrom records, skipping TYPE_CHECKING blocks."""
+    """Collect Import/ImportFrom records, tagging TYPE_CHECKING-guarded ones.
+
+    Imports inside ``if TYPE_CHECKING:`` blocks are collected with
+    ``type_only=True`` so the boundary rules (1, 3, 4) still see them —
+    wrapping an import in the guard must not bypass encapsulation
+    (A10-r1-34, A10-r3-146) — while cycle detection (rule 2) can skip them.
+    """
 
     def __init__(self, source_file: Path, file_package: str) -> None:
         self.records: list[ImportRecord] = []
         self.source_file = source_file
         self.file_package = file_package
+        self._tc_aliases: set[str] = {"TYPE_CHECKING"}
+        self._type_only_depth = 0
 
     def visit_If(self, node: ast.If) -> None:
-        if _is_type_checking(node.test):
+        if _is_type_checking(node.test, self._tc_aliases):
+            self._type_only_depth += 1
+            for child in node.body:
+                self.visit(child)
+            self._type_only_depth -= 1
             for child in node.orelse:  # the else-branch is still runtime code
                 self.visit(child)
             return
@@ -150,12 +204,32 @@ class _ImportCollector(ast.NodeVisitor):
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
-            self.records.append(ImportRecord(self.source_file, node.lineno, alias.name, []))
+            self.records.append(
+                ImportRecord(
+                    self.source_file,
+                    node.lineno,
+                    alias.name,
+                    [],
+                    local_names=[],
+                    type_only=self._type_only_depth > 0,
+                )
+            )
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self._tc_aliases.update(_type_checking_aliases(node))
         target = self._resolve(node)
         names = [a.name for a in node.names]
-        self.records.append(ImportRecord(self.source_file, node.lineno, target, names))
+        locals_ = [a.asname or a.name for a in node.names]
+        self.records.append(
+            ImportRecord(
+                self.source_file,
+                node.lineno,
+                target,
+                names,
+                local_names=locals_,
+                type_only=self._type_only_depth > 0,
+            )
+        )
 
     def _resolve(self, node: ast.ImportFrom) -> str:
         if not node.level:  # absolute import
@@ -252,6 +326,22 @@ class _NameUsageCollector(ast.NodeVisitor):
 
     def __init__(self) -> None:
         self.runtime_names: set[str] = set()
+        self._tc_aliases: set[str] = {"TYPE_CHECKING"}
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        # Track TYPE_CHECKING aliases so visit_If recognizes guarded blocks.
+        self._tc_aliases.update(_type_checking_aliases(node))
+
+    def visit_If(self, node: ast.If) -> None:
+        # Code inside ``if TYPE_CHECKING:`` never executes, so names
+        # referenced there are NOT runtime uses — counting them let an
+        # unrelated guarded reference exempt a real annotation-only import
+        # from rule 4 (A10-r4-185). The else-branch is runtime code.
+        if _is_type_checking(node.test, self._tc_aliases):
+            for child in node.orelse:
+                self.visit(child)
+            return
+        self.generic_visit(node)
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         # Argument/return annotations are NOT runtime uses — skip them so an
@@ -283,14 +373,17 @@ def _runtime_loaded_names(module: ModuleInfo) -> set[str]:
     root = _package_dir(module.package)
     if root is None:
         return set()
-    collector = _NameUsageCollector()
+    names: set[str] = set()
     for path in sorted(root.rglob("*.py")):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         except (SyntaxError, UnicodeDecodeError):
             continue
+        # Fresh collector per file: TYPE_CHECKING aliases are file-scoped.
+        collector = _NameUsageCollector()
         collector.visit(tree)
-    return collector.runtime_names
+        names |= collector.runtime_names
+    return names
 
 
 def _check_uses_contracts_module(
@@ -307,6 +400,11 @@ def _check_uses_contracts_module(
     only flagged when it is NOT used at runtime in this module — i.e. it appears
     only in annotations, or is imported but unused. A name raised, compared, or
     instantiated is a runtime value, not a shared type, and is left alone.
+
+    Runtime usage is matched against the *locally-bound* name (``asname or
+    name``) so aliased imports are classified by the name the file actually
+    uses (A10-r2-96). Wildcard imports cannot be resolved to specific names,
+    so the ``import *`` itself is flagged (A10-r3-147).
     """
     violations: list[Violation] = []
     runtime_names: set[str] | None = None  # computed lazily on first candidate
@@ -314,12 +412,32 @@ def _check_uses_contracts_module(
         owner = _owning_module(record.target_module, all_modules)
         if owner is None or owner.package == module.package or owner.name == contracts_module:
             continue
-        candidates = [n for n in record.imported_names if n[:1].isupper()]
+        if "*" in record.imported_names:
+            violations.append(
+                Violation(
+                    rule="use-contracts",
+                    message=(
+                        f"{module.name} imports * from {owner.name}. Wildcard "
+                        f"cross-module imports hide which names are shared — import "
+                        f"explicitly, with shared types coming from the "
+                        f"{contracts_module!r} module."
+                    ),
+                    module=module.name,
+                    location=_location(record),
+                )
+            )
+            continue
+        pairs = (
+            list(zip(record.imported_names, record.local_names, strict=True))
+            if len(record.local_names) == len(record.imported_names)
+            else [(n, n) for n in record.imported_names]
+        )
+        candidates = [(orig, local) for orig, local in pairs if orig[:1].isupper()]
         if not candidates:
             continue
         if runtime_names is None:
             runtime_names = _runtime_loaded_names(module)
-        type_names = [n for n in candidates if n not in runtime_names]
+        type_names = [orig for orig, local in candidates if local not in runtime_names]
         if type_names:
             violations.append(
                 Violation(
@@ -343,12 +461,23 @@ def _check_declared_dependencies(
     all_modules: list[ModuleInfo],
     contracts_module: str = CONTRACTS_MODULE,
 ) -> list[Violation]:
-    """Rule 3: imports must match the manifest's declared_dependencies."""
+    """Rule 3: imports must match the manifest's declared_dependencies.
+
+    The rule only applies when the manifest *declared* the field: None (the
+    default — e.g. a manifest added just for ``owns_tables``) leaves the
+    rule off, while an explicit empty tuple means "depends on nothing" and
+    enforces deny-all, contracts excepted (A10-r1-36, adjudicated).
+
+    The violation message deliberately does NOT embed the module's current
+    declared_dependencies list: the ratchet baseline hashes the message, so
+    embedding module-wide state would reopen every grandfathered rule-3
+    violation whenever any one dependency is added (A10-r2-97).
+    """
     from modulith.manifest import get_manifest
 
     manifest = get_manifest(module.package)
-    if manifest is None:
-        return []  # rule only applies to modules that declared a manifest
+    if manifest is None or manifest.declared_dependencies is None:
+        return []
 
     allowed = set(manifest.declared_dependencies) | {contracts_module}
     violations: list[Violation] = []
@@ -362,8 +491,8 @@ def _check_declared_dependencies(
                     rule="undeclared-dependency",
                     message=(
                         f"{module.name} imports from {owner.name}, which is not in its "
-                        f"declared_dependencies {sorted(manifest.declared_dependencies)!r}. "
-                        f"Add {owner.name!r} to the manifest or remove the import."
+                        f"declared_dependencies. Add {owner.name!r} to the manifest or "
+                        f"remove the import."
                     ),
                     module=module.name,
                     location=_location(record),
@@ -423,38 +552,108 @@ def _check_data_ownership(
     module: ModuleInfo,
     all_modules: list[ModuleInfo],
 ) -> list[Violation]:
-    """Rule 5: flag references to tables owned by another module (warning)."""
+    """Rule 5: flag references to tables owned by another module (warning).
+
+    Ownership is tracked as table -> *set* of declaring modules: two
+    manifests claiming the same table is a manifest-authoring conflict that
+    must be surfaced, not silently resolved last-write-wins — which both
+    hid the conflict and falsely flagged the first-declared owner
+    (A10-r3-149). A module that co-declared ownership is never flagged for
+    referencing the table; the conflict itself is reported instead.
+    """
     from modulith.manifest import all_manifests
 
     manifests = all_manifests()
     if not manifests:
         return []
 
-    # table name -> owning module name
-    owner_of: dict[str, str] = {}
+    # table name -> set of module names declaring ownership
+    owners_of: dict[str, set[str]] = {}
     pkg_to_name = {m.package: m.name for m in all_modules}
     for pkg, manifest in manifests.items():
         owner_name = pkg_to_name.get(pkg, pkg.rsplit(".", 1)[-1])
         for table in manifest.owns_tables:
-            owner_of[table] = owner_name
+            owners_of.setdefault(table, set()).add(owner_name)
 
     violations: list[Violation] = []
-    for table, location in _collect_table_refs(module):
-        owner = owner_of.get(table)
-        if owner is not None and owner != module.name:
+    for table, claimants in sorted(owners_of.items()):
+        if len(claimants) > 1 and module.name in claimants:
+            names = ", ".join(sorted(claimants))
             violations.append(
                 Violation(
                     rule="data-ownership",
                     message=(
-                        f"{module.name} references table {table!r}, owned by {owner}. "
-                        f"Access another module's data through its events or public API "
-                        f"(best-effort static check)."
+                        f"table {table!r} is declared in owns_tables by multiple "
+                        f"modules: {names}. Exactly one module may own a table — "
+                        f"resolve the manifest conflict."
                     ),
                     module=module.name,
                     severity=ViolationSeverity.WARNING,
-                    location=location,
                 )
             )
+
+    for table, location in _collect_table_refs(module):
+        owners = owners_of.get(table)
+        if owners is None or module.name in owners:
+            continue
+        owner_text = " and ".join(sorted(owners))
+        violations.append(
+            Violation(
+                rule="data-ownership",
+                message=(
+                    f"{module.name} references table {table!r}, owned by {owner_text}. "
+                    f"Access another module's data through its events or public API "
+                    f"(best-effort static check)."
+                ),
+                module=module.name,
+                severity=ViolationSeverity.WARNING,
+                location=location,
+            )
+        )
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Rule 6: contracts is an import sink
+# ---------------------------------------------------------------------------
+
+
+def _check_contracts_is_sink(
+    module: ModuleInfo,
+    imports: list[ImportRecord],
+    all_modules: list[ModuleInfo],
+    contracts_module: str = CONTRACTS_MODULE,
+) -> list[Violation]:
+    """Rule 6: the contracts module may not import from application modules.
+
+    SPEC 5.3 treats contracts as a sink: everyone may import from it; it
+    may not import from any module. None of rules 1/3/4 covers the reverse
+    direction (their heuristics gate on privacy, manifests, and type-shaped
+    names), so an ordinary runtime import from e.g. ``orders`` into
+    contracts sailed through undetected (A10-r1-35). This rule flags ANY
+    import — runtime or type-only — whose owner is another application
+    module when the module under check IS the contracts module.
+    """
+    if module.name != contracts_module:
+        return []
+    violations: list[Violation] = []
+    for record in imports:
+        owner = _owning_module(record.target_module, all_modules)
+        if owner is None or owner.package == module.package:
+            continue
+        violations.append(
+            Violation(
+                rule="contracts-is-sink",
+                message=(
+                    f"{contracts_module} imports from {owner.name}. The contracts "
+                    f"module is a dependency sink: any module may import from it, "
+                    f"but it may not import from application modules — move the "
+                    f"shared code into {contracts_module!r} or invert the dependency."
+                ),
+                module=module.name,
+                location=_location(record),
+            )
+        )
     return violations
 
 
@@ -469,6 +668,11 @@ def detect_cycles(all_modules: list[ModuleInfo]) -> list[Violation]:
     graph: dict[str, set[str]] = {m.name: set() for m in all_modules}
     for mod in all_modules:
         for record in _collect_imports(mod):
+            if record.type_only:
+                # TYPE_CHECKING-guarded imports impose no runtime dependency
+                # and are the sanctioned way to break a runtime cycle — no
+                # graph edge (they ARE still checked by rules 1, 3, 4).
+                continue
             owner = _owning_module(record.target_module, all_modules)
             if owner is not None and owner.name != mod.name and owner.name in names:
                 graph[mod.name].add(owner.name)
@@ -556,8 +760,24 @@ class BaselineEntry:
 
     rule: str
     module: str
-    location: str  # file:line
+    location: str  # source file only — line stripped, see _normalize_location
     message_hash: str  # first 8 chars of sha256(message)
+
+
+def _normalize_location(location: str | None) -> str:
+    """Reduce a ``file:line`` location to just the file.
+
+    The exact line is presentation metadata, not identity: any unrelated
+    edit above a grandfathered violation shifts its line, and a line-exact
+    fingerprint would resurrect it as a "new" failing violation
+    (A10-r1-33). Identity therefore uses the file path only.
+    """
+    if not location:
+        return ""
+    head, sep, tail = location.rpartition(":")
+    if sep and tail.isdigit():
+        return head
+    return location
 
 
 def _entry_for(violation: Violation) -> BaselineEntry:
@@ -565,25 +785,61 @@ def _entry_for(violation: Violation) -> BaselineEntry:
     return BaselineEntry(
         rule=violation.rule,
         module=violation.module,
-        location=violation.location or "",
+        location=_normalize_location(violation.location),
         message_hash=digest,
     )
 
 
 def load_baseline(path: Path) -> set[BaselineEntry]:
-    """Read the baseline file; return the set of grandfathered violations."""
+    """Read the baseline file; return the set of grandfathered violations.
+
+    A corrupted or schema-mismatched file raises ConfigurationError naming
+    the path and the regeneration command — never a raw JSONDecodeError or
+    KeyError traceback (A10-r5-219). Legacy entries carrying ``file:line``
+    locations are normalized on load so old baselines keep matching.
+    """
+    from modulith.config import ConfigurationError
+
     if not path.exists():
         return set()
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return {
-        BaselineEntry(
-            rule=item["rule"],
-            module=item["module"],
-            location=item["location"],
-            message_hash=item["message_hash"],
+    hint = "regenerate it with `modulith verify --mode=ratchet --update-baseline`"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigurationError(f"baseline file {path} is not valid JSON ({exc}); {hint}") from exc
+    if not isinstance(data, list):
+        raise ConfigurationError(
+            f"baseline file {path} must contain a JSON list of entries, "
+            f"got {type(data).__name__}; {hint}"
         )
-        for item in data
-    }
+    entries: set[BaselineEntry] = set()
+    for item in data:
+        if not isinstance(item, dict):
+            raise ConfigurationError(
+                f"baseline file {path} contains a non-object entry {item!r}; {hint}"
+            )
+        try:
+            rule = item["rule"]
+            module = item["module"]
+            location = item["location"]
+            message_hash = item["message_hash"]
+        except KeyError as exc:
+            raise ConfigurationError(
+                f"baseline file {path} has an entry missing key {exc}; {hint}"
+            ) from exc
+        if not all(isinstance(v, str) for v in (rule, module, location, message_hash)):
+            raise ConfigurationError(
+                f"baseline file {path} has an entry with non-string fields; {hint}"
+            )
+        entries.add(
+            BaselineEntry(
+                rule=rule,
+                module=module,
+                location=_normalize_location(location),
+                message_hash=message_hash,
+            )
+        )
+    return entries
 
 
 def filter_against_baseline(

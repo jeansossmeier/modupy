@@ -126,7 +126,13 @@ class TestDeclareModule:
         assert m.listeners[0] is on_order_created
 
     def test_empty_defaults_produce_empty_tuples(self):
-        """Calling with no kwargs gives all-empty tuple fields."""
+        """Calling with no kwargs gives all-empty tuple fields.
+
+        Exception: ``declared_dependencies`` defaults to None ("not
+        declared" — the verifier's rule 3 stays off), distinct from an
+        explicit empty tuple ("depends on nothing" — deny-all). W2 G11:
+        A10-r1-36 (adjudicated design change).
+        """
         _run_declare_in_fake_module("fakeapp.billing._manifest")
         m = manifest_module.get_manifest("fakeapp.billing")
         assert m is not None
@@ -134,7 +140,7 @@ class TestDeclareModule:
         assert m.consumes == ()
         assert m.listeners == ()
         assert m.owns_tables == ()
-        assert m.declared_dependencies == ()
+        assert m.declared_dependencies is None
 
     def test_manifest_is_frozen_dataclass(self):
         """Manifest instances must be immutable (frozen=True)."""

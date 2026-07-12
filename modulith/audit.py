@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,6 +70,12 @@ class AuditResult:
     # Files containing functions that look like they could become listeners
     listener_candidates: list[Path]
 
+    # How many .py files the audit actually parsed. Zero means the audited
+    # path contained no Python at all (wrong path, docs-only dir, empty
+    # scaffold) — the readiness score is meaningless then and the report
+    # must say so instead of a confident 100/100 (A10-r4-186).
+    files_scanned: int = 0
+
 
 def audit_codebase(root: Path) -> AuditResult:
     """Run the full audit pipeline over a directory tree.
@@ -89,6 +96,7 @@ def audit_codebase(root: Path) -> AuditResult:
         cross_module_imports=cross,
         shared_tables=shared,
         listener_candidates=listeners,
+        files_scanned=len(files),
     )
 
 
@@ -141,12 +149,30 @@ def _propose_module_structure(root: Path, files: list[Path]) -> dict[str, list[P
     return dict(modules)
 
 
-def _target_module(dotted: str, root_package: str, module_names: set[str]) -> str | None:
-    """Map a dotted import path to a proposed module name, if it is one."""
+def _target_module(
+    dotted: str,
+    root_package: str,
+    module_names: set[str],
+    root_is_package: bool,
+) -> str | None:
+    """Map a dotted import path to a proposed module name, if it is one.
+
+    A bare top-level import (``import types``) that merely *shares a name*
+    with a local module directory must not count as internal coupling
+    (A10-r5-218): when the audited root is itself a package, its children
+    are only importable as ``root.child``, so bare names are external by
+    construction; in a flat (non-package) layout a bare name can be local,
+    but a stdlib name is resolved as stdlib, not as coupling.
+    """
     parts = dotted.split(".")
     if not parts or not parts[0]:
         return None
-    candidate = parts[1] if (parts[0] == root_package and len(parts) > 1) else parts[0]
+    if parts[0] == root_package and len(parts) > 1:
+        candidate = parts[1]
+    else:
+        if root_is_package or parts[0] in sys.stdlib_module_names:
+            return None
+        candidate = parts[0]
     return candidate if candidate in module_names else None
 
 
@@ -161,6 +187,7 @@ def _find_cross_module_imports(
     module_names = set(modules)
     counts: dict[tuple[str, str], int] = defaultdict(int)
     samples: dict[tuple[str, str], Path] = {}
+    root_is_package = (root / "__init__.py").exists()
 
     for path in files:
         tree = _parse(path)
@@ -170,7 +197,7 @@ def _find_cross_module_imports(
         collector = _ImportCollector(path, _file_package(root, root.name, path))
         collector.visit(tree)
         for record in collector.records:
-            target = _target_module(record.target_module, root.name, module_names)
+            target = _target_module(record.target_module, root.name, module_names, root_is_package)
             if target is None or target == source_module:
                 continue
             # The conventional ``contracts`` module is the sanctioned shared
@@ -278,7 +305,10 @@ def _compute_readiness_score(
     cross-module import is a future boundary violation) and *event-shaped*
     code already present (listener candidates — the patterns that convert
     cleanly to events). A codebase with no cross-module interaction at all
-    is already modular, so it scores 100.
+    is already modular, so it scores 100 — note this branch also fires for
+    an empty tree (zero files scanned), which ``render_report`` calls out
+    explicitly (A10-r4-186). Shared tables are deliberately not part of the
+    formula; the report carries a caveat when they exist (A10-r3-148).
     """
     direct = sum(count for _src, _tgt, count, _sample in cross_module_imports)
     event_like = len(listener_candidates)
@@ -308,6 +338,15 @@ def render_report(result: AuditResult) -> str:
         "",
         f"**Readiness score: {result.readiness_score}/100**",
         "",
+    ]
+    if result.files_scanned == 0:
+        lines += [
+            "**Warning: no Python files were found under the audited path.** "
+            "The readiness score is meaningless for an empty tree — check that "
+            "the path points at your codebase.",
+            "",
+        ]
+    lines += [
         f"Your codebase is approximately {result.readiness_score}% ready for "
         "modulith adoption. Top blockers:",
         "",
@@ -316,12 +355,22 @@ def render_report(result: AuditResult) -> str:
         f"  - {len(result.shared_tables)} shared database table(s) (need ownership decisions)",
         "",
     ]
+    if result.shared_tables:
+        lines += [
+            "Note: the readiness score reflects the import/listener balance only — "
+            "shared-table entanglement is listed as a blocker but is not included "
+            "in the score.",
+            "",
+        ]
 
     # Proposed module structure
     lines += ["## Proposed Module Structure", ""]
-    for module in sorted(result.proposed_modules):
-        file_count = len(result.proposed_modules[module])
-        lines.append(f"- `{module}` ({file_count} file{'s' if file_count != 1 else ''})")
+    if result.proposed_modules:
+        for module in sorted(result.proposed_modules):
+            file_count = len(result.proposed_modules[module])
+            lines.append(f"- `{module}` ({file_count} file{'s' if file_count != 1 else ''})")
+    else:
+        lines.append("None — no Python modules detected.")
     lines.append("")
 
     # Cross-module violations

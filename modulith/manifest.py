@@ -48,6 +48,7 @@ cross-validated at bootstrap (no single process knows every publisher).
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import sys
 from collections.abc import Callable
@@ -83,7 +84,12 @@ class Manifest:
     owns_tables: tuple[str, ...] = ()
 
     # Modules this module is allowed to import from. Verifier uses this.
-    declared_dependencies: tuple[str, ...] = ()
+    # None means "not declared" — the verifier's declared-dependencies rule
+    # is skipped, so a manifest added for an unrelated field (e.g. just
+    # owns_tables) doesn't silently switch on deny-all import enforcement.
+    # An explicit empty tuple means "depends on nothing" (deny-all,
+    # contracts excepted).
+    declared_dependencies: tuple[str, ...] | None = None
 
 
 # Module-level registry. Keyed by package name. Populated by declare_module
@@ -97,12 +103,17 @@ def declare_module(
     consumes: list[str] | tuple[str, ...] = (),
     listeners: list[Callable[..., Any]] | tuple[Callable[..., Any], ...] = (),
     owns_tables: list[str] | tuple[str, ...] = (),
-    declared_dependencies: list[str] | tuple[str, ...] = (),
+    declared_dependencies: list[str] | tuple[str, ...] | None = None,
 ) -> None:
     """Register a manifest for the calling module.
 
     Call this at module scope in `_manifest.py`. The package name is
     auto-detected from the calling frame.
+
+    ``declared_dependencies`` distinguishes "not declared" (None, the
+    default — the verifier's rule 3 stays off) from an explicit empty
+    sequence ("this module depends on nothing" — deny-all enforcement,
+    contracts excepted).
     """
     from .config import ConfigurationError
 
@@ -135,7 +146,9 @@ def declare_module(
         consumes=tuple(consumes),
         listeners=tuple(listeners),
         owns_tables=tuple(owns_tables),
-        declared_dependencies=tuple(declared_dependencies),
+        declared_dependencies=(
+            tuple(declared_dependencies) if declared_dependencies is not None else None
+        ),
     )
 
 
@@ -147,6 +160,29 @@ def get_manifest(package: str) -> Manifest | None:
 def all_manifests() -> dict[str, Manifest]:
     """Return all registered manifests. Used by verifier and docs."""
     return dict(_manifests)
+
+
+# Sentinel distinguishing "attribute missing" from "attribute bound to None"
+# in the publishes check below.
+_MISSING: Any = object()
+
+
+def _listener_location(func: Callable[..., Any]) -> str | None:
+    """Best-effort ``file:line`` of a listener's definition site.
+
+    SPEC 5.4 promises manifest-verification failures 'with a clear error
+    and file:line' (A4-r1-11). Returns None for objects the inspect module
+    cannot resolve (builtins, C extensions) — the error stays useful
+    without a location rather than failing the failure path.
+    """
+    try:
+        source_file = inspect.getsourcefile(func)
+        _, line = inspect.getsourcelines(func)
+    except (OSError, TypeError):
+        return None
+    if source_file is None:
+        return None
+    return f"{source_file}:{line}"
 
 
 def verify_manifest(manifest: Manifest, registered_listeners: set[Callable[..., Any]]) -> list[str]:
@@ -179,8 +215,10 @@ def verify_manifest(manifest: Manifest, registered_listeners: set[Callable[..., 
     for func in manifest.listeners:
         if func not in effective_listeners:
             qualname = getattr(func, "__qualname__", repr(func))
+            location = _listener_location(func)
+            where = f" ({location})" if location else ""
             errors.append(
-                f"listener {qualname} declared in {manifest.package} "
+                f"listener {qualname}{where} declared in {manifest.package} "
                 "but not registered against the event bus "
                 "— module may have failed to import"
             )
@@ -191,15 +229,31 @@ def verify_manifest(manifest: Manifest, registered_listeners: set[Callable[..., 
         # Import failure is surfaced elsewhere; skip publishes check silently.
         return errors
 
+    errors.extend(_publishes_errors(manifest, mod))
+    return errors
+
+
+def _publishes_errors(manifest: Manifest, mod: Any) -> list[str]:
+    """Errors for declared ``publishes`` names missing from the package."""
+    errors: list[str] = []
+    mod_file = getattr(mod, "__file__", None)
+    where = f" ({mod_file})" if mod_file else ""
     for name in manifest.publishes:
-        # hasattr (not "is None") so that an event class explicitly bound
-        # to None — e.g. a failed conditional import — still gets flagged.
-        if not hasattr(mod, name):
+        # getattr with a sentinel (not hasattr) so that an event class
+        # explicitly bound to None — e.g. a failed conditional import —
+        # gets flagged too, not just a missing name (A4-r2-81).
+        value = getattr(mod, name, _MISSING)
+        if value is _MISSING:
             errors.append(
                 f"event type {name!r} declared in {manifest.package} "
-                "but not defined in package namespace"
+                f"but not defined in package namespace{where}"
             )
-
+        elif value is None:
+            errors.append(
+                f"event type {name!r} declared in {manifest.package} "
+                f"is bound to None in the package namespace{where} "
+                "— failed conditional import or renamed event"
+            )
     return errors
 
 

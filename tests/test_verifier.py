@@ -57,8 +57,14 @@ def test_collect_imports(make_fake_app) -> None:
     assert ("fakeapp.payments", ("charge",)) in targets
     # Relative import resolved to absolute.
     assert ("fakeapp.orders.helpers", ("util",)) in targets
-    # TYPE_CHECKING-only import is skipped (not a runtime dependency).
-    assert all(r.target_module != "fakeapp.secret" for r in records)
+    # TYPE_CHECKING-only imports are collected but tagged type_only, so the
+    # boundary rules (1, 3, 4) still see them while cycle detection skips
+    # them (W2 G11: A10-r1-34 / A10-r3-146 — the guard must not be an
+    # encapsulation escape hatch).
+    guarded = [r for r in records if r.target_module == "fakeapp.secret"]
+    assert len(guarded) == 1
+    assert guarded[0].type_only
+    assert all(not r.type_only for r in records if r.target_module != "fakeapp.secret")
 
 
 # ---------------------------------------------------------------------------
