@@ -727,6 +727,17 @@ time: `REDIS_URL`, `MODULITH_CONSUMER_GROUP`, `MODULITH_STREAM_PREFIX`,
 `MODULITH_STREAM_MAXLEN`. (Values are literal — there is no `${VAR}`
 interpolation inside the TOML.)
 
+Retention caveat: `max_stream_len` / `MODULITH_STREAM_MAXLEN` is enforced via
+`XADD MAXLEN ~`, which trims by stream length alone and is blind to
+consumer-group pending state — an undersized cap lets a publish burst silently
+trim entries that were delivered but never ACK'd (permanently losing them
+despite the XAUTOCLAIM recovery path) or never delivered at all. The consumer
+surfaces such losses at ERROR level (via XAUTOCLAIM's deleted-ids element).
+Size `max_stream_len` well above the worst-case backlog (publish rate ×
+consumer downtime/latency). The dead-letter stream is likewise bounded
+(`dlq_max_stream_len`, default 10× `max_stream_len`) and best-effort, not a
+durable audit log — size it to the forensic retention window you need.
+
 ### 10.3 Kafka Broker
 
 Package: `modulith-kafka`. Implements `Broker` against `aiokafka`. For teams already running Kafka.

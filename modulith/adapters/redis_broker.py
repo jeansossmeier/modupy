@@ -34,11 +34,20 @@ across multiple workers of the same module.
 Production hardening over the bare example (examples/redis_streams_broker.py):
   - Consumer group registration (XGROUP CREATE … MKSTREAM), idempotent.
   - Bounded retention via XADD MAXLEN ~ (approximate trim) so a stalled
-    stream can't grow without limit.
-  - Pending-entry recovery on restart via XAUTOCLAIM (reclaims messages a
-    crashed worker never ACK'd).
+    stream can't grow without limit. CAVEAT: trimming is by stream length
+    alone — it is blind to consumer-group PEL state, so an undersized
+    ``max_stream_len`` lets a publish burst push out entries that are still
+    pending (delivered but never ACK'd) or not yet delivered at all. A
+    trimmed pending entry is PERMANENTLY LOST (at-least-once is violated for
+    it); the consumer detects such losses via XAUTOCLAIM's deleted-ids
+    element and logs them at ERROR. Size ``max_stream_len`` well above the
+    worst-case backlog: publish rate x (consumer downtime + processing
+    latency + reclaim_min_idle_ms).
+  - Pending-entry recovery via XAUTOCLAIM, run at startup and periodically
+    from the consumer poll loop (reclaims messages a crashed or stalled
+    worker never ACK'd) — subject to the retention caveat above.
   - Explicit dead-letter routing to a ``<stream>.dead`` stream for poison
-    messages.
+    messages (itself MAXLEN-bounded — see ``dead_letter``).
   - Structured logging on every operation.
 """
 
@@ -125,7 +134,9 @@ class RedisStreamsBroker:
 
         Body goes under ``data``; each header is lifted to its own ``h:<key>``
         field so consumers read them without unpacking the payload. ``MAXLEN ~``
-        caps the stream approximately (cheap radix-tree-aligned trim).
+        caps the stream approximately (cheap radix-tree-aligned trim); the trim
+        ignores consumer-group pending state — see the module docstring's
+        retention caveat on sizing ``max_stream_len``.
         """
         stream = self._stream_name(target)
         fields: dict[bytes, bytes] = {b"data": payload}
@@ -186,8 +197,14 @@ class RedisStreamsBroker:
     ) -> Any:
         """XAUTOCLAIM pending entries idle longer than ``min_idle_ms``.
 
-        Run on worker startup to recover messages a crashed peer claimed but
-        never ACK'd — the at-least-once guarantee's recovery path.
+        The at-least-once guarantee's recovery path. The consumer loop runs
+        this at worker startup AND periodically on every poll cycle — not only
+        after a crash. XAUTOCLAIM is purely idle-time based (it has no
+        crash/liveness detection), so a message a live, healthy peer is still
+        processing WILL be claimed away and re-dispatched once it has been
+        pending longer than ``min_idle_ms``. Keep ``min_idle_ms`` above the
+        worst-case handler latency, and keep handlers idempotent regardless
+        (at-least-once delivery).
         """
         stream = self._stream_name(target)
         group_name = group or self._consumer_group
@@ -205,8 +222,12 @@ class RedisStreamsBroker:
         """Route a poison message to ``<stream>.dead`` and ACK the original.
 
         Called by the worker once a message has exhausted its processing
-        retries. ACKing the source stops the redelivery loop; the DLQ stream
-        preserves the payload for inspection/replay.
+        retries. ACKing the source stops the redelivery loop. The DLQ stream
+        retains the payload for inspection/replay on a bounded, best-effort
+        basis ONLY: it is itself capped (``dlq_max_stream_len``, MAXLEN ~
+        approximate trim), so once enough dead-lettered volume accumulates the
+        OLDEST entries are silently discarded. It is not a durable audit log —
+        size ``dlq_max_stream_len`` to the forensic retention window you need.
         """
         stream = self._stream_name(target)
         group_name = group or self._consumer_group
