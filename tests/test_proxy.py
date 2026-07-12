@@ -269,3 +269,60 @@ def test_proxy_transport_error_logs_omit_query_string_secrets(caplog) -> None:
     assert resp.status_code == 502
     assert "token=secret" not in caplog.text
     assert "/orders/ping" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# mid-stream backend death — _safe_stream (S3-r2-123)
+# ---------------------------------------------------------------------------
+
+
+class _DyingStream(httpx.AsyncByteStream):
+    """Body stream that yields one chunk then dies — models a worker sending
+    headers + partial body before its socket hard-closes."""
+
+    async def __aiter__(self):
+        yield b"partial-"
+        raise httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body"
+        )
+
+    async def aclose(self) -> None:
+        pass
+
+
+class _DiesMidStreamClient:
+    """httpx-shaped client whose send() SUCCEEDS (status + headers delivered)
+    but whose response body iterator raises mid-stream — the distinct code
+    path ``_safe_stream`` guards, which ``_FailingClient`` (connect-time
+    failure only) structurally cannot reach."""
+
+    def build_request(self, *, method, url, headers=None, content=None):
+        return httpx.Request(method, url, headers=headers, content=content)
+
+    async def send(self, request, *, stream: bool = False):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            stream=_DyingStream(),
+            request=request,
+        )
+
+    async def aclose(self) -> None:
+        pass
+
+
+def test_proxy_ends_stream_cleanly_when_backend_dies_mid_response(caplog) -> None:
+    """S3-r2-123: once headers are sent, a mid-stream TransportError cannot
+    become a 502 — the client must receive the 200 with the partial body and
+    no unhandled ASGI error, and the interruption must be logged."""
+    caplog.set_level("WARNING", logger="modulith.proxy")
+    app = create_proxy_app(
+        [RoutingRule("/orders", "http://orders-worker")], client=_DiesMidStreamClient()
+    )
+
+    with TestClient(app) as client:
+        resp = client.get("/orders/ping")
+
+    assert resp.status_code == 200
+    assert resp.content == b"partial-"
+    assert "backend stream interrupted" in caplog.text

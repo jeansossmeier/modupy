@@ -875,3 +875,42 @@ def test_main_unexpected_internal_error_exits_2(monkeypatch) -> None:
         cli.main()
 
     assert excinfo.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# uvicorn console script missing from PATH (S3-r2-124)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "S3-r2-124 (production gap): os.execvp('uvicorn', ...) is unguarded in "
+        "`modulith run`/`dev`, so a missing uvicorn binary — an environment/user "
+        "error per the documented exit-code scheme — escapes as a raw "
+        "FileNotFoundError traceback with exit code 2 (reserved for internal "
+        "bugs) instead of an actionable message with exit code 1"
+    ),
+)
+def test_run_missing_uvicorn_binary_is_a_clean_user_error(monkeypatch, capsys) -> None:
+    """S3-r2-124: when the uvicorn console script is not on PATH, the CLI
+    should print an actionable error naming uvicorn and exit 1 (user/
+    environment error) — never a raw traceback with the internal-error code."""
+    import sys as _sys
+
+    import modulith.cli as cli
+
+    def missing_execvp(file: str, args: list[str]) -> None:
+        # What the real os.execvp raises for an unresolvable executable.
+        raise FileNotFoundError(2, "No such file or directory", file)
+
+    monkeypatch.setattr(os, "execvp", missing_execvp)
+    monkeypatch.setattr(_sys, "argv", ["modulith", "run", "myapp:app"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 1  # user/environment error, not internal (2)
+    assert "uvicorn" in captured.err.lower()
+    assert "Traceback" not in captured.err

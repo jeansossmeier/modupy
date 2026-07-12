@@ -163,3 +163,28 @@ def test_no_outbox_marker_disables_outbox_configuration() -> None:
     outbox.configure(store=object(), serializer=object())
 
     assert outbox._store is None
+
+
+# ---------------------------------------------------------------------------
+# ModulithTestApp.reset() — public API (A11-r3-154)
+# ---------------------------------------------------------------------------
+
+
+def test_modulith_test_app_reset_clears_captured_state(modulith_app) -> None:
+    """A11-r3-154: reset() is public API — it must clear both captured lists
+    (published events and listener dispatches) so a test can reuse one handle
+    across phases."""
+    _isolate()
+
+    @listener
+    async def on_placed(evt: OrderPlaced) -> None:
+        pass
+
+    publish_sync(OrderPlaced(order_id="r1"))
+    assert modulith_app.published_events
+    assert modulith_app.listener_calls
+
+    modulith_app.reset()
+
+    assert modulith_app.published_events == []
+    assert modulith_app.listener_calls == []

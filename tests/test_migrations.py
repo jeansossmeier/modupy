@@ -74,3 +74,60 @@ def test_alembic_downgrade_removes_schema(tmp_path: Path) -> None:
     tables = _objects(db, "table")
     assert "event_publications" not in tables
     assert "event_publications_archive" not in tables
+
+
+def test_migration_column_metadata_matches_orm(tmp_path: Path) -> None:
+    """A6-r4-178: the name-set comparison above is blind to type/nullable/
+    server_default drift — the exact bug class that already shipped one
+    CRITICAL (boolean server_default rendered as integer 0). Compare the full
+    PRAGMA table_info metadata of the migrated schema against a schema created
+    straight from the ORM metadata: inspector-to-inspector, so both sides
+    render through the same dialect and equivalent definitions compare equal."""
+    from sqlalchemy import create_engine
+
+    from modulith.adapters.postgres_outbox import (
+        Base,
+        EventPublicationArchiveRow,
+        EventPublicationRow,
+    )
+
+    migrated_db = tmp_path / "migrated.db"
+    command.upgrade(_cfg(migrated_db), "head")
+
+    orm_db = tmp_path / "orm.db"
+    engine = create_engine(f"sqlite:///{orm_db}")
+    try:
+        Base.metadata.create_all(engine)
+    finally:
+        engine.dispose()
+
+    def snapshot(db_path: Path, table: str) -> dict[str, tuple[str, int, object, int]]:
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        finally:
+            conn.close()
+        # Keyed by name (declaration order may legitimately differ):
+        # name -> (type, notnull, dflt_value, pk)
+        return {r[1]: (r[2], r[3], r[4], r[5]) for r in rows}
+
+    for model in (EventPublicationRow, EventPublicationArchiveRow):
+        table = model.__tablename__
+        migrated = snapshot(migrated_db, table)
+        orm = snapshot(orm_db, table)
+        assert migrated == orm, f"{table}: migration {migrated} != ORM {orm}"
+
+
+def test_alembic_offline_mode_emits_full_ddl(tmp_path: Path, capsys) -> None:
+    """A6-r2-89: offline/--sql mode (env.py's run_migrations_offline) must
+    render the complete DDL — both tables and the pending partial index —
+    without ever touching a database."""
+    db = tmp_path / "offline.db"
+    command.upgrade(_cfg(db), "head", sql=True)
+
+    ddl = capsys.readouterr().out
+    assert "CREATE TABLE event_publications (" in ddl
+    assert "CREATE TABLE event_publications_archive (" in ddl
+    assert "idx_pending" in ddl
+    # Offline mode renders SQL only — the database file is never created.
+    assert not db.exists()

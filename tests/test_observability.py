@@ -239,3 +239,57 @@ async def test_durable_path_emits_publish_span(span_exporter) -> None:
     assert publish_spans[0].attributes["modulith.duration_ms"] >= 0.0
     # The after-hook ended the span and cleared the ContextVar — no leak.
     assert observability._publish_span.get() is None
+
+
+# ---------------------------------------------------------------------------
+# event.module attribute (A11-r4-190)
+# ---------------------------------------------------------------------------
+
+
+async def test_publish_span_carries_calling_module(make_fake_app, span_exporter) -> None:
+    """A11-r4-190: the publish span's documented ``event.module`` attribute
+    must name the application module publish() was called from (populated by
+    ``_detect_calling_module``'s stack walk)."""
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event, publish
+
+                @event
+                @dataclass(frozen=True)
+                class ModPing:
+                    n: int
+
+                async def go() -> None:
+                    await publish(ModPing(n=1))
+            """
+        }
+    )
+    configure(package="fakeapp")
+    import fakeapp.orders as orders
+
+    await orders.go()
+
+    (publish_span,) = _spans_by_name(span_exporter, "modulith.event.publish")
+    assert publish_span.attributes["event.module"] == "fakeapp.orders"
+
+
+def test_publish_span_event_module_falls_back_to_unknown(span_exporter) -> None:
+    """A11-r4-190: when no application package is configured, calling-module
+    detection degrades to the documented ``"unknown"`` fallback instead of
+    perturbing the publish path."""
+    from uuid import uuid4
+
+    from modulith import EventPublication
+    from modulith.runtime import _runtime
+
+    _runtime._reset_for_testing()  # config is None → no package to match against
+
+    observability.modulith_before_event_published(event=object())
+    observability.modulith_after_event_published(
+        event=object(), publication=EventPublication(id=uuid4(), payload=b"")
+    )
+
+    (publish_span,) = _spans_by_name(span_exporter, "modulith.event.publish")
+    assert publish_span.attributes["event.module"] == "unknown"

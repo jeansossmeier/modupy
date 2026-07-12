@@ -167,3 +167,47 @@ def test_builtin_discovery_survives_a_broken_module(make_fake_app) -> None:
     assert names == {"good", "broken"}
     # The good module imported successfully despite its broken sibling.
     assert f"{pkg}.good" in _sys.modules
+
+
+# ----- builtin discovery skip/guard branches (A4-r1-12) ----------------------
+
+
+def test_builtin_discovery_skips_underscore_and_single_file_submodules(make_fake_app) -> None:
+    """A4-r1-12: underscore-prefixed subpackages are private and skipped, and
+    a top-level single ``.py`` file is not a module (modules are packages) —
+    neither may appear in the returned ModuleInfo list."""
+    from modulith.builtin.discovery import modulith_discover_modules
+
+    pkg = make_fake_app(
+        {"good": "value = 1\n", "_private": "value = 2\n"},
+        extra_files={"single_file_module.py": "value = 3\n"},
+    )
+
+    modules = modulith_discover_modules(pkg)
+
+    assert {m.name for m in modules} == {"good"}
+
+
+def test_builtin_discovery_returns_empty_for_unimportable_app_package() -> None:
+    """A4-r1-12: a missing/unimportable app package degrades to an empty
+    module list — the hook's docstring promises it never raises."""
+    from modulith.builtin.discovery import modulith_discover_modules
+
+    assert modulith_discover_modules(app_package="definitely_not_installed_xyz_123") == []
+
+
+def test_builtin_discovery_returns_empty_for_single_file_app_package(
+    make_fake_app, tmp_path: Path
+) -> None:
+    """A4-r1-12: an app package that is itself a plain module (no ``__path__``)
+    has no subpackages to discover — returns [] without raising."""
+    import sys as _sys
+
+    from modulith.builtin.discovery import modulith_discover_modules
+
+    make_fake_app({})  # prepends tmp_path to sys.path
+    (tmp_path / "solo_file_app.py").write_text("value = 1\n")
+    try:
+        assert modulith_discover_modules(app_package="solo_file_app") == []
+    finally:
+        _sys.modules.pop("solo_file_app", None)

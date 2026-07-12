@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from enum import Enum, IntEnum
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
@@ -326,3 +327,55 @@ def test_slotted_event_serializes_and_round_trips() -> None:
     assert restored.order_id == "o-slot"
     assert isinstance(restored.stamp, datetime)
     assert restored.stamp == original.stamp
+
+
+# ---------------------------------------------------------------------------
+# Enum / IntEnum round-tripping (A6-r2-88)
+# ---------------------------------------------------------------------------
+
+
+class Color(Enum):
+    RED = "red"
+    BLUE = "blue"
+
+
+class Priority(IntEnum):
+    LOW = 1
+    HIGH = 2
+
+
+@dataclass(frozen=True)
+class EnumEvent:
+    color: Color
+    priority: Priority
+
+
+def test_enum_field_round_trips_with_exact_json() -> None:
+    """A6-r2-88: a str-valued Enum field encodes as its value (via the
+    serializer's dedicated Enum branch) and decodes back to the member —
+    both the wire format and the restored type identity are pinned."""
+    serializer = JsonEventSerializer()
+    original = EnumEvent(color=Color.BLUE, priority=Priority.HIGH)
+
+    raw = serializer.serialize(original)
+    assert raw == b'{"color":"blue","priority":2}'
+
+    restored = serializer.deserialize(raw, _fqcn(EnumEvent))
+    assert restored == original
+    assert isinstance(restored.color, Color)
+    assert restored.color is Color.BLUE
+
+
+def test_int_enum_field_round_trips_to_member_identity() -> None:
+    """A6-r2-88: IntEnum members are int subclasses, so encode bypasses the
+    Enum branch entirely (json's native int encoder wins) — only decode-side
+    coercion restores the member. A reordering of _coerce's checks (e.g. an
+    early int fast-path) would silently break this; pin it."""
+    serializer = JsonEventSerializer()
+    original = EnumEvent(color=Color.RED, priority=Priority.LOW)
+
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(EnumEvent))
+
+    assert restored == original
+    assert isinstance(restored.priority, Priority)
+    assert restored.priority is Priority.LOW

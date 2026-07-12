@@ -229,3 +229,40 @@ def test_docs_registered_as_builtin() -> None:
 
     pm = create_plugin_manager(load_entrypoints=False)
     assert pm.has_plugin("modulith.builtin.docs")
+
+
+# ---------------------------------------------------------------------------
+# Introspection resilience to unparseable files (A11-r4-191)
+# ---------------------------------------------------------------------------
+
+
+def test_introspection_skips_unparseable_file_and_keeps_good_events(make_fake_app) -> None:
+    """A11-r4-191: a file that fails to parse (SyntaxError) is skipped without
+    aborting event introspection of the module's other, valid files."""
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event
+
+                @event
+                @dataclass(frozen=True)
+                class OrderCreated:
+                    order_id: str
+            """,
+        },
+        extra_files={"orders/broken.py": "def broken(:\n    pass\n"},
+    )
+
+    published, consumed = docs._introspect_events(_module("orders"))
+
+    assert published == ["OrderCreated"]
+    assert consumed == []
+
+
+def test_public_api_returns_empty_for_unparseable_init(make_fake_app) -> None:
+    """A11-r4-191: an unparseable ``__init__.py`` degrades to an empty public
+    API list instead of raising out of the docs generator."""
+    make_fake_app({"badinit": "def broken(:\n    pass\n"})
+
+    assert docs._public_api(_module("badinit")) == []

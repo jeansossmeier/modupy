@@ -205,3 +205,73 @@ async def test_skip_locked_partitions_concurrent_sweepers(engine) -> None:
         await sa.close()
         await sb.close()
     await store.dispose()
+
+
+# ---------------------------------------------------------------------------
+# find_incomplete: dead-letter exclusion + LIMIT-100 window — S3-r1-64
+# ---------------------------------------------------------------------------
+
+
+def _row(*, published_at, dead: bool = False, attempts: int = 0) -> EventPublicationRow:
+    return EventPublicationRow(
+        id=uuid4(),
+        event_type=f"{PgIntegrationEvent.__module__}.{PgIntegrationEvent.__qualname__}",
+        payload=b'{"value":1}',
+        listener="pgint.listener",
+        published_at=published_at,
+        completed_at=None,
+        attempt_count=attempts,
+        last_error=None,
+        last_attempt_at=None,
+        is_dead_lettered=dead,
+    )
+
+
+async def test_find_incomplete_dead_letter_backlog_does_not_starve_live_rows(engine) -> None:
+    """S3-r1-64: the docstring's exact starvation scenario on real Postgres —
+    a backlog of >100 dead-lettered rows, all OLDER than the live rows, would
+    fill the LIMIT-100 window and hide every live retryable row if the
+    ``is_dead_lettered IS FALSE`` filter regressed out of the WHERE clause.
+    The SQL-level exclusion must surface every live row regardless."""
+    base = datetime.now(UTC) - timedelta(hours=1)
+    dead_rows = [
+        _row(published_at=base + timedelta(seconds=i), dead=True, attempts=5) for i in range(150)
+    ]
+    live_rows = [_row(published_at=base + timedelta(minutes=30, seconds=i)) for i in range(5)]
+    live_ids = {r.id for r in live_rows}  # captured pre-commit (commit expires instances)
+
+    sessionmaker = async_sessionmaker(engine)
+    async with sessionmaker() as s:
+        s.add_all([*dead_rows, *live_rows])
+        await s.commit()
+
+    store = PostgresPublicationStore(engine=engine)
+    try:
+        found = await store.find_incomplete(timedelta(0))
+    finally:
+        await store.dispose()
+
+    assert {p.id for p in found} == live_ids
+
+
+async def test_find_incomplete_caps_the_sweep_window_at_100_rows(engine) -> None:
+    """S3-r1-64: the sweep window is capped at 100 rows on real Postgres, and
+    the cap admits the least-recently-attempted rows first (never-attempted
+    rows sort by ``published_at``)."""
+    base = datetime.now(UTC) - timedelta(hours=1)
+    live_rows = [_row(published_at=base + timedelta(seconds=i)) for i in range(120)]
+    oldest_100_ids = {r.id for r in live_rows[:100]}  # captured pre-commit
+
+    sessionmaker = async_sessionmaker(engine)
+    async with sessionmaker() as s:
+        s.add_all(live_rows)
+        await s.commit()
+
+    store = PostgresPublicationStore(engine=engine)
+    try:
+        found = await store.find_incomplete(timedelta(0))
+    finally:
+        await store.dispose()
+
+    assert len(found) == 100
+    assert {p.id for p in found} == oldest_100_ids

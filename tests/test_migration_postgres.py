@@ -103,3 +103,40 @@ def test_alembic_downgrade_base_on_real_postgres(clean_pg) -> None:
     tables = set(inspect(engine).get_table_names())
     assert _TABLES[0] not in tables
     assert _TABLES[1] not in tables
+
+
+def test_migration_column_metadata_matches_orm_on_real_postgres(clean_pg) -> None:
+    """A6-r3-136: the name-set comparison above is blind to type/nullable/
+    server_default drift — the exact bug class this file's docstring cites
+    (boolean server_default rendered as integer 0). Compare full column
+    metadata of the migrated schema against a schema created straight from
+    the ORM metadata on the same live Postgres: inspector-to-inspector, so
+    both sides render through pg_catalog and equivalent definitions compare
+    equal without hand-rolled normalization."""
+    from modulith.adapters.postgres_outbox import (
+        Base,
+        EventPublicationArchiveRow,
+        EventPublicationRow,
+    )
+
+    url, engine = clean_pg
+    tables = [m.__tablename__ for m in (EventPublicationRow, EventPublicationArchiveRow)]
+
+    def snapshot() -> dict[str, dict[str, tuple[str, bool, object]]]:
+        insp = inspect(engine)
+        return {
+            table: {
+                c["name"]: (str(c["type"]), c["nullable"], c["default"])
+                for c in insp.get_columns(table)
+            }
+            for table in tables
+        }
+
+    command.upgrade(_cfg(url), "head")
+    migrated = snapshot()
+    _drop(engine)
+
+    Base.metadata.create_all(engine)
+    orm = snapshot()
+
+    assert migrated == orm

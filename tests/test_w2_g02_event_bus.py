@@ -7,12 +7,13 @@ failing-first against the pre-fix code (strict TDD).
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from dataclasses import dataclass
 
 import pytest
 
-from modulith.brokers import BrokerRegistry
+from modulith.brokers import BrokerRegistry, DuplicateBrokerError
 from modulith.event_bus import InMemoryEventBus
 
 
@@ -187,3 +188,158 @@ async def test_close_all_continues_after_cancelled_close() -> None:
 
     assert first.closed is True
     assert last.closed is True
+
+
+# ---------------------------------------------------------------------------
+# W2 COVERAGE batch — closes audit coverage-gap findings (ids in docstrings)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingBroker:
+    """Minimal Broker double recording publishes and close() calls."""
+
+    def __init__(self) -> None:
+        self.published: list[tuple[str, bytes]] = []
+        self.closed = False
+
+    async def publish(
+        self, target: str, payload: bytes, headers: dict[str, str] | None = None
+    ) -> None:
+        self.published.append((target, payload))
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_close_all_logs_and_continues_after_raising_close(caplog) -> None:
+    """A1-r1-3: a broker whose close() raises a plain Exception must not abort
+    cleanup of brokers registered after it, and the error must be logged
+    rather than propagated — the partial-failure contract close_all()'s
+    docstring documents."""
+
+    class _FailingBroker(_RecordingBroker):
+        async def close(self) -> None:
+            raise RuntimeError("redis connection already dead")
+
+    registry = BrokerRegistry()
+    first = _RecordingBroker()
+    failing = _FailingBroker()
+    last = _RecordingBroker()
+    registry.register("first", first)
+    registry.register("failing", failing)
+    registry.register("last", last)
+
+    with caplog.at_level(logging.ERROR, logger="modulith.brokers"):
+        await registry.close_all()  # must not raise
+
+    assert first.closed is True
+    assert last.closed is True
+    logged = [r.getMessage() for r in caplog.records if "failed to close cleanly" in r.getMessage()]
+    assert any("'failing'" in message for message in logged)
+
+
+def test_unregister_is_a_noop_for_an_absent_scheme() -> None:
+    """A1-r2-73: unregister() on a scheme that was never registered is the
+    documented silent no-op (0/1 boundary)."""
+    registry = BrokerRegistry()
+
+    registry.unregister("ghost")  # must not raise
+
+    assert registry.schemes() == []
+
+
+async def test_unregister_then_register_replaces_the_broker() -> None:
+    """A1-r2-73: the sanctioned replace sequence — unregister, then register —
+    must succeed and route subsequent publishes to the replacement broker
+    (re-registering without unregister stays a loud DuplicateBrokerError)."""
+    registry = BrokerRegistry()
+    original = _RecordingBroker()
+    replacement = _RecordingBroker()
+    registry.register("kafka", original)
+
+    with pytest.raises(DuplicateBrokerError):
+        registry.register("kafka", replacement)
+
+    registry.unregister("kafka")
+    registry.register("kafka", replacement)
+
+    await registry.publish("kafka:orders", b"payload")
+
+    assert replacement.published == [("orders", b"payload")]
+    assert original.published == []
+
+
+def test_registered_event_types_lists_exactly_the_listened_types() -> None:
+    """A3-r1-8: registered_event_types() feeds the worker's deserialization
+    allowlist (modulith/_worker.py) and its broker-stream subscriptions
+    (modulith/_consumer.py), so its output must be exactly the event types
+    with at least one registered listener — no duplicates, no strays."""
+
+    @dataclass(frozen=True)
+    class OtherEvent:
+        s: str
+
+    @dataclass(frozen=True)
+    class NeverListened:
+        s: str
+
+    bus = InMemoryEventBus()
+
+    async def handler(event: object) -> None:  # pragma: no cover
+        pass
+
+    bus.register(BusEvent, handler)
+    bus.register(BusEvent, handler)  # a second listener must not duplicate the type
+    bus.register(OtherEvent, handler)
+
+    types = bus.registered_event_types()
+
+    assert set(types) == {BusEvent, OtherEvent}
+    assert len(types) == 2
+    assert NeverListened not in types
+
+
+def test_clear_empties_listeners_and_registered_event_types() -> None:
+    """A3-r3-132: clear() removes every listener, emptying both listeners_for()
+    and registered_event_types() — the documented embedder-facing reset."""
+    bus = InMemoryEventBus()
+
+    async def handler(event: object) -> None:  # pragma: no cover
+        pass
+
+    bus.register(BusEvent, handler)
+    bus.clear()
+
+    assert bus.listeners_for(BusEvent) == []
+    assert bus.registered_event_types() == []
+
+
+async def test_publish_logs_every_failing_listener_and_reraises_the_first(caplog) -> None:
+    """A3-r3-132: with several failing listeners, publish() logs each failure
+    individually (debugging must not depend on which exception happens to be
+    re-raised), re-raises the first in registration order, and still runs the
+    healthy sibling."""
+    bus = InMemoryEventBus()
+    ran: list[str] = []
+
+    async def fails_first(event: BusEvent) -> None:
+        raise ValueError("first failure")
+
+    async def healthy(event: BusEvent) -> None:
+        ran.append("healthy")
+
+    async def fails_second(event: BusEvent) -> None:
+        raise RuntimeError("second failure")
+
+    bus.register(BusEvent, fails_first)
+    bus.register(BusEvent, healthy)
+    bus.register(BusEvent, fails_second)
+
+    with caplog.at_level(logging.ERROR, logger="modulith.event_bus"):
+        with pytest.raises(ValueError, match="first failure"):
+            await bus.publish(BusEvent(n=1))
+
+    assert ran == ["healthy"]
+    failures = [r.getMessage() for r in caplog.records if "failed for BusEvent" in r.getMessage()]
+    assert any("fails_first" in message for message in failures)
+    assert any("fails_second" in message for message in failures)

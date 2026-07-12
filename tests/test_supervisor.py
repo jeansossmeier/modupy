@@ -15,7 +15,10 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import socket
 import sys
+import time
 
 import pytest
 
@@ -316,3 +319,53 @@ async def test_crash_loop_gives_up_after_max_restarts() -> None:
         assert settled <= sup._max_restarts + 1
     finally:
         await sup.stop()
+
+
+# ---------------------------------------------------------------------------
+# _serve_uvicorn — the real production proxy server (S3-r2-121)
+# ---------------------------------------------------------------------------
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port: int = sock.getsockname()[1]
+    return port
+
+
+@pytest.mark.integration
+async def test_run_supervised_default_serve_binds_real_uvicorn() -> None:
+    """S3-r2-121: with no ``serve=`` override, run_supervised must serve the
+    proxy via the real ``_serve_uvicorn`` — the production default behind
+    ``modulith run``/``dev`` (cli.py calls run_supervised with no override) —
+    and actually be reachable over HTTP on the requested port.
+
+    Every other test bypasses this: CLI tests monkeypatch run_supervised, the
+    supervisor tests inject ``serve=``, and the proxy e2e tests use an
+    ASGITransport. This is the one place the shipped server binding runs.
+    """
+    import httpx
+
+    port = _free_port()
+    # No worker specs: the proxy serves only its actuator endpoints, so no
+    # subprocesses spawn and the test exercises exactly the uvicorn binding.
+    task = asyncio.create_task(run_supervised([], "127.0.0.1", port))
+
+    try:
+        async with httpx.AsyncClient() as client:
+            deadline = time.monotonic() + 15.0
+            while True:  # bounded readiness poll — no fixed-sleep synchronization
+                try:
+                    resp = await client.get(f"http://127.0.0.1:{port}/_modulith/health")
+                    break
+                except httpx.TransportError:
+                    assert not task.done(), f"server died during startup: {task.exception()!r}"
+                    assert time.monotonic() < deadline, "uvicorn never became reachable"
+                    await asyncio.sleep(0.05)
+
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok", "backends": {}}
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
