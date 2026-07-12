@@ -201,6 +201,49 @@ def test_proxy_maps_all_transport_errors_to_502(exc: Exception) -> None:
     assert resp.json()["detail"] == "backend unreachable"
 
 
+class _BuildRequestFailingClient:
+    """httpx-shaped client whose build_request() itself raises — the call path
+    the passthrough _FailingClient above structurally never exercises (audit
+    S3-r1-63): its build_request never raised, so no test could reach the
+    proxy's build_request guard."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.send_calls = 0
+
+    def build_request(self, *, method, url, headers=None, content=None):
+        raise self._exc
+
+    async def send(self, request, *, stream: bool = False):
+        self.send_calls += 1
+        raise AssertionError("send() must not be reached when build_request raises")
+
+    async def aclose(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        # httpx.InvalidURL subclasses Exception directly (not TransportError) —
+        # e.g. percent-encoded non-printable ASCII in the path.
+        httpx.InvalidURL("Invalid non-printable ASCII character in URL"),
+        # A header carrying a raw non-ASCII octet raises UnicodeEncodeError.
+        UnicodeEncodeError("ascii", "h\xe9ader", 1, 2, "ordinal not in range(128)"),
+    ],
+)
+def test_proxy_maps_build_request_failures_to_400(exc: Exception) -> None:
+    """A request the client itself cannot forward is answered 400 — never an
+    uncaught 500 — and is never sent upstream."""
+    client = _BuildRequestFailingClient(exc)
+    app = create_proxy_app([RoutingRule("/orders", "http://orders-worker")], client=client)
+    with TestClient(app) as test_client:
+        resp = test_client.get("/orders/ping")
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "invalid request"
+    assert client.send_calls == 0  # failed at build time; nothing was forwarded
+
+
 def test_proxy_rejects_body_over_limit() -> None:
     app = create_proxy_app(
         [RoutingRule("/orders", "http://orders-worker")],

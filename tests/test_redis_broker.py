@@ -39,6 +39,11 @@ class FakeRedis:
         self.xreadgroup_calls: list[dict] = []
         self.xacks: list[tuple[str, str, tuple]] = []
         self.xautoclaim_calls: list[dict] = []
+        # Canned XAUTOCLAIM reply — (cursor, claimed, deleted). Tests may
+        # override it (e.g. to stage a non-empty deleted list, the
+        # trimmed-while-pending loss channel real Redis reports; audit
+        # S3-r3-160 — the old hardcoded return made that path unmodelable).
+        self.xautoclaim_result: Any = (b"0-0", [(b"1-0", {b"data": b"{}"})], [])
         self.closed = False
         self._existing_groups: set[tuple[str, str]] = set()
 
@@ -102,7 +107,7 @@ class FakeRedis:
                 "count": count,
             }
         )
-        return (b"0-0", [(b"1-0", {b"data": b"{}"})], [])
+        return self.xautoclaim_result
 
     async def aclose(self) -> None:
         self.closed = True
@@ -248,20 +253,44 @@ class StatefulFakeRedis:
     """In-memory Redis Streams + consumer groups, faithful enough to test
     delivery semantics without a server.
 
-    Models: append-only streams with monotonic ``<seq>-0`` ids; per-(stream,
-    group) last-delivered cursor and a pending-entries list (PEL); ``>`` reads
-    deliver only past-the-cursor messages and add them to the PEL; XACK removes
-    from the PEL; XAUTOCLAIM returns all currently-pending entries (it treats
-    every pending message as idle past the threshold — sufficient to assert
-    recoverability of an un-ACK'd message).
+    Models (semantics probed against real Redis 7 / redis-py 6.4):
+      * append-only streams with monotonic ``<seq>-0`` ids; ``maxlen`` trims
+        the stream WITHOUT touching any group's PEL (real MAXLEN trimming is
+        blind to pending state — audit A7-r1-24);
+      * per-(stream, group) last-delivered cursor and a pending-entries dict
+        (PEL) recording the owning consumer and a delivery timestamp on the
+        fake's **virtual clock** (``now_ms`` / ``advance()`` — deterministic,
+        no sleeps);
+      * ``>`` reads deliver only past-the-cursor messages and add them to the
+        PEL; XACK removes from the PEL;
+      * XREADGROUP with no data returns ``[]`` for ``block=None`` and any
+        ``block > 0`` (redis-py returns ``[]`` on a BLOCK timeout; the fake
+        skips the actual wait). ``block == 0`` on an empty read raises — real
+        Redis blocks FOREVER there (audit A7-r2-92), which a fake cannot
+        model, so it fails loudly instead of returning the inverted ``[]``;
+      * XAUTOCLAIM honors ``min_idle_time`` against the virtual clock (audit
+        S3-r2-120), caps claims at ``count`` (Redis default 100) and returns
+        an inclusive continuation cursor — ``0-0`` once the PEL scan
+        completes (audit A7-r3-140); claiming reassigns the consumer and
+        RESETS the idle clock; pending ids no longer present in the stream
+        (trimmed/XDEL'd while pending) are reported via the third (deleted)
+        tuple element and purged from the PEL (audits S3-r3-160, A7-r1-24).
     """
 
     def __init__(self) -> None:
         self.streams: dict[str, list[tuple[bytes, dict[bytes, bytes]]]] = {}
-        # (stream, group) -> {"cursor": int, "pel": dict[bytes, str]}
+        # (stream, group) -> {"cursor": int, "pel": dict[bytes, dict]}
+        # pel entry: mid -> {"consumer": str, "delivered_ms": int}
         self.groups: dict[tuple[str, str], dict[str, Any]] = {}
         self._seq: dict[str, int] = {}
         self.closed = False
+        # Virtual clock (ms). Deliveries/claims are stamped with it; tests
+        # advance it to make idle-time behavior deterministic.
+        self.now_ms = 0
+
+    def advance(self, ms: int) -> None:
+        """Advance the virtual clock — 'time passes' for idle-time checks."""
+        self.now_ms += ms
 
     async def xadd(
         self, name: str, fields: dict, *, maxlen: int | None = None, approximate: bool = True
@@ -302,12 +331,20 @@ class StatefulFakeRedis:
                 seq = int(mid.split(b"-")[0])
                 if seq > grp["cursor"]:
                     delivered.append((mid, fields))
-                    grp["pel"][mid] = consumername
+                    grp["pel"][mid] = {"consumer": consumername, "delivered_ms": self.now_ms}
                     grp["cursor"] = seq
                     if count is not None and len(delivered) >= count:
                         break
             if delivered:
                 out.append((name.encode(), delivered))
+        if not out and block == 0:
+            raise NotImplementedError(
+                "XREADGROUP BLOCK 0 with no data blocks FOREVER on real Redis "
+                "(audit A7-r2-92) — the fake cannot model an infinite block; "
+                "pass block > 0 (returns [] on timeout) or block=None."
+            )
+        # No data: redis-py returns [] both non-blocking and after a BLOCK
+        # timeout (probed, Redis 7 / redis-py 6.4). The fake skips the wait.
         return out
 
     async def xack(self, name: str, groupname: str, *ids: str) -> int:
@@ -325,25 +362,52 @@ class StatefulFakeRedis:
         groupname: str,
         consumername: str,
         min_idle_time: int,
-        start_id: str = "0-0",
+        start_id: str | bytes = "0-0",
         count: int | None = None,
     ) -> Any:
+        limit = 100 if count is None else count  # Redis COUNT default is 100
         pel = self.groups[(name, groupname)]["pel"]
         by_id = dict(self.streams.get(name, []))
-        claimed = []
-        for mid in list(pel.keys()):
-            pel[mid] = consumername  # reassign to the claiming consumer
-            claimed.append((mid, by_id.get(mid, {})))
-        return (b"0-0", claimed, [])
+        sid = start_id.decode() if isinstance(start_id, bytes) else start_id
+        start_seq = int(sid.split("-")[0])
+        claimed: list[tuple[bytes, dict[bytes, bytes]]] = []
+        deleted: list[bytes] = []
+        cursor = b"0-0"  # scan completed unless the count cap interrupts it
+        for mid in sorted(pel.keys(), key=lambda m: int(m.split(b"-")[0])):
+            if int(mid.split(b"-")[0]) < start_seq:
+                continue  # start_id is INCLUSIVE (probed real-Redis behavior)
+            if len(claimed) + len(deleted) >= limit:
+                cursor = mid  # continuation cursor: next unscanned entry
+                break
+            if mid not in by_id:
+                # Trimmed/XDEL'd while still pending: real Redis reports the id
+                # via the third tuple element and purges it from the PEL as a
+                # side effect (audits S3-r3-160, A7-r1-24) — it is NOT handed
+                # back as a claimable entry with empty fields.
+                del pel[mid]
+                deleted.append(mid)
+                continue
+            entry = pel[mid]
+            if self.now_ms - entry["delivered_ms"] < min_idle_time:
+                continue  # not idle long enough — real XAUTOCLAIM skips it
+            entry["consumer"] = consumername  # reassign to the claiming consumer
+            entry["delivered_ms"] = self.now_ms  # claiming RESETS the idle clock
+            claimed.append((mid, by_id[mid]))
+        return (cursor, claimed, deleted)
 
     async def aclose(self) -> None:
         self.closed = True
 
 
 @pytest.fixture
-def stateful_broker() -> RedisStreamsBroker:
+def stateful_fake() -> StatefulFakeRedis:
+    return StatefulFakeRedis()
+
+
+@pytest.fixture
+def stateful_broker(stateful_fake: StatefulFakeRedis) -> RedisStreamsBroker:
     return RedisStreamsBroker(
-        client=StatefulFakeRedis(), stream_prefix="modulith.events", consumer_group="g"
+        client=stateful_fake, stream_prefix="modulith.events", consumer_group="g"
     )
 
 
@@ -351,20 +415,22 @@ async def test_publish_then_consume_round_trip(stateful_broker) -> None:
     await stateful_broker.ensure_group("orders")
     await stateful_broker.publish("orders", b'{"id": 1}', headers={"event_type": "Order"})
 
-    messages = await stateful_broker.read("orders", consumer="c1", count=10, block_ms=0)
+    messages = await stateful_broker.read("orders", consumer="c1", count=10, block_ms=1)
     assert messages
     _stream, entries = messages[0]
     (_mid, fields) = entries[0]
     assert fields[b"data"] == b'{"id": 1}'
     assert fields[b"h:event_type"] == b"Order"
     # A second ">" read returns nothing new — the message was delivered once.
-    assert await stateful_broker.read("orders", consumer="c1", count=10, block_ms=0) == []
+    # block_ms must be POSITIVE: BLOCK 0 on an exhausted stream blocks forever
+    # on real Redis (audit A7-r2-92); a positive BLOCK times out and returns [].
+    assert await stateful_broker.read("orders", consumer="c1", count=10, block_ms=1) == []
 
 
 async def test_unacked_message_is_recoverable_via_reclaim(stateful_broker) -> None:
     await stateful_broker.ensure_group("orders")
     await stateful_broker.publish("orders", b"payload")
-    [(_s, [(mid, _f)])] = await stateful_broker.read("orders", consumer="c1", block_ms=0)
+    [(_s, [(mid, _f)])] = await stateful_broker.read("orders", consumer="c1", block_ms=1)
 
     # Not ACK'd → still pending → another consumer can reclaim it (crash recovery).
     _cursor, claimed, _deleted = await stateful_broker.reclaim(
@@ -376,7 +442,7 @@ async def test_unacked_message_is_recoverable_via_reclaim(stateful_broker) -> No
 async def test_ack_clears_message_from_pending(stateful_broker) -> None:
     await stateful_broker.ensure_group("orders")
     await stateful_broker.publish("orders", b"payload")
-    [(_s, [(mid, _f)])] = await stateful_broker.read("orders", consumer="c1", block_ms=0)
+    [(_s, [(mid, _f)])] = await stateful_broker.read("orders", consumer="c1", block_ms=1)
 
     await stateful_broker.ack("orders", mid.decode())
 
@@ -394,10 +460,108 @@ async def test_group_created_at_id_zero_delivers_pre_existing_backlog(stateful_b
     await stateful_broker.publish("orders", b"published-before-subscribe")
     await stateful_broker.ensure_group("orders")  # adapter passes id='0'
 
-    messages = await stateful_broker.read("orders", consumer="c1", count=10, block_ms=0)
+    messages = await stateful_broker.read("orders", consumer="c1", count=10, block_ms=1)
     assert messages
     _stream, [(_mid, fields)] = messages[0]
     assert fields[b"data"] == b"published-before-subscribe"
+
+
+async def test_read_with_block_zero_on_empty_stream_is_rejected_by_fake(stateful_broker) -> None:
+    """BLOCK 0 on an empty stream blocks FOREVER on real Redis (audit
+    A7-r2-92) — the old fake returned [] immediately, the inverted contract.
+    The fake cannot block forever, so it must fail loudly instead."""
+    await stateful_broker.ensure_group("orders")
+    with pytest.raises(NotImplementedError, match="BLOCK 0"):
+        await stateful_broker.read("orders", consumer="c1", block_ms=0)
+
+
+async def test_reclaim_honors_min_idle_time(stateful_fake, stateful_broker) -> None:
+    """XAUTOCLAIM must NOT steal a freshly-delivered in-flight message (audit
+    S3-r2-120): real Redis refuses to claim entries idle < min_idle_time; the
+    old fake claimed everything unconditionally."""
+    await stateful_broker.ensure_group("orders")
+    await stateful_broker.publish("orders", b"payload")
+    [(_s, [(mid, _f)])] = await stateful_broker.read("orders", consumer="c1", block_ms=1)
+
+    # Freshly delivered (idle ~0) — the production 60s threshold must not
+    # claim it away from the (possibly just slow) owning consumer.
+    _cursor, claimed, _deleted = await stateful_broker.reclaim(
+        "orders", consumer="c2", min_idle_ms=60_000
+    )
+    assert claimed == []
+
+    # Once it has been pending past the threshold, it IS reclaimable.
+    stateful_fake.advance(60_000)
+    _cursor, claimed, _deleted = await stateful_broker.reclaim(
+        "orders", consumer="c2", min_idle_ms=60_000
+    )
+    assert [m for m, _ in claimed] == [mid]
+
+    # Claiming RESET the idle clock (probed real-Redis behavior): the entry is
+    # immediately un-reclaimable again until it re-ages past the threshold.
+    _cursor, claimed, _deleted = await stateful_broker.reclaim(
+        "orders", consumer="c3", min_idle_ms=1
+    )
+    assert claimed == []
+
+
+async def test_reclaim_caps_at_count_and_pages_via_cursor(stateful_fake, stateful_broker) -> None:
+    """Real XAUTOCLAIM enforces COUNT and returns a continuation cursor (audit
+    A7-r3-140) — the old fake returned the entire PEL in one call, giving
+    false confidence that a single reclaim() drains any backlog size."""
+    await stateful_broker.ensure_group("orders")
+    for i in range(5):
+        await stateful_broker.publish("orders", f"m{i}".encode())
+    await stateful_broker.read("orders", consumer="c1", count=100, block_ms=1)  # 5 → PEL
+
+    cursor, claimed, _deleted = await stateful_broker.reclaim(
+        "orders", consumer="c2", min_idle_ms=0, count=2
+    )
+    assert len(claimed) == 2  # capped at count, NOT all 5
+    assert cursor != b"0-0"  # continuation cursor — more pending remain
+
+    # Following the cursor pages through the rest (raw-client level: the
+    # adapter always restarts at 0-0 and relies on periodic reclaim cycles).
+    cursor2, claimed2, _ = await stateful_fake.xautoclaim(
+        "modulith.events.orders", "g", "c2", 0, start_id=cursor, count=2
+    )
+    assert len(claimed2) == 2
+    cursor3, claimed3, _ = await stateful_fake.xautoclaim(
+        "modulith.events.orders", "g", "c2", 0, start_id=cursor2, count=2
+    )
+    assert len(claimed3) == 1
+    assert cursor3 == b"0-0"  # PEL scan completed
+    assert len({m for m, _ in claimed + claimed2 + claimed3}) == 5  # no overlap, full drain
+
+
+async def test_trimmed_pending_entry_is_reported_deleted_and_purged(stateful_fake) -> None:
+    """MAXLEN-trim vs PEL (audits A7-r1-24 / S3-r3-160): an entry trimmed from
+    the stream while still pending is reported via XAUTOCLAIM's third
+    (deleted) element and purged from the PEL — NOT handed back as a claimable
+    entry with empty fields (the old fake's silently-different failure mode).
+    """
+    broker = RedisStreamsBroker(
+        client=stateful_fake,
+        stream_prefix="modulith.events",
+        consumer_group="g",
+        max_stream_len=2,
+    )
+    await broker.ensure_group("orders")
+    await broker.publish("orders", b"m1")
+    [(_s, [(mid1, _f)])] = await broker.read("orders", consumer="c1", count=10, block_ms=1)
+
+    # Publish burst trims m1 out of the stream while it is still pending.
+    await broker.publish("orders", b"m2")
+    await broker.publish("orders", b"m3")
+
+    _cursor, claimed, deleted = await broker.reclaim("orders", consumer="c2", min_idle_ms=0)
+    assert deleted == [mid1]  # reported as permanently lost
+    assert claimed == []  # m2/m3 were never delivered → not in the PEL
+
+    # Purged from the PEL server-side: a second reclaim reports nothing.
+    _cursor, claimed2, deleted2 = await broker.reclaim("orders", consumer="c2", min_idle_ms=0)
+    assert claimed2 == []
+    assert deleted2 == []
 
 
 # ---------------------------------------------------------------------------

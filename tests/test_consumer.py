@@ -60,14 +60,26 @@ class RecordingBroker:
 class FakeConsumerBroker:
     """In-memory stand-in for the broker's consumer surface (no Redis).
 
-    Holds queued messages per stream; ``read`` hands out (and clears) new
-    messages; ``ack``/``dead_letter`` are recorded; ``reclaim`` serves anything
-    staged in ``pending``.
+    Holds queued messages per stream; ``read`` hands out (and clears) up to
+    ``count`` new messages per call — real XREADGROUP caps delivery at COUNT
+    (audit S3-r1-65) — and rejects ``block_ms <= 0`` loudly (real Redis BLOCK 0
+    blocks forever; BrokerConsumer clamps to >=1ms — audit A7-r2-92);
+    ``ack``/``dead_letter`` are recorded; ``reclaim`` serves entries staged in
+    ``pending``, honoring ``min_idle_ms`` and ``count`` like real XAUTOCLAIM
+    (audits S3-r2-120 / A7-r3-140). A staged pending entry defaults to
+    idle-forever (a crashed peer's message); set ``pending_idle_ms`` per
+    (target, mid) to model a freshly-delivered in-flight message. Ids staged
+    in ``lost`` are returned once via XAUTOCLAIM's third (deleted) element —
+    the trimmed-while-pending loss channel (audit S3-r3-160).
     """
 
     def __init__(self) -> None:
         self.streams: dict[str, list[tuple[str, dict[bytes, bytes]]]] = {}
         self.pending: dict[str, list[tuple[str, dict[bytes, bytes]]]] = {}
+        # (target, mid) -> idle ms; absent = idle forever (crashed peer).
+        self.pending_idle_ms: dict[tuple[str, str], float] = {}
+        # target -> ids to report via reclaim's deleted element (once).
+        self.lost: dict[str, list[str]] = {}
         self.groups: list[tuple[str, str]] = []
         self.acked: list[tuple[str, str]] = []
         self.dead: list[tuple[str, str, dict[bytes, bytes]]] = []
@@ -95,12 +107,20 @@ class FakeConsumerBroker:
         count: int = 10,
         block_ms: int = 1000,
     ) -> Any:
+        if block_ms <= 0:
+            raise NotImplementedError(
+                "XREADGROUP BLOCK 0 blocks forever on real Redis (audit "
+                "A7-r2-92) — BrokerConsumer clamps poll_block_ms to >=1; the "
+                "fake rejects a non-positive block loudly instead of modeling it."
+            )
         queued = self.streams.get(target, [])
         if not queued:
             await asyncio.sleep(block_ms / 1000)  # mimic XREADGROUP BLOCK so the loop yields
             return []
-        self.streams[target] = []
-        return [(target, queued)]
+        # Real XREADGROUP delivers at most COUNT entries per call (audit
+        # S3-r1-65) — the remainder stays queued for the next read.
+        delivered, self.streams[target] = queued[:count], queued[count:]
+        return [(target, delivered)]
 
     async def ack(self, target: str, message_id: str, group: str | None = None) -> None:
         self.acked.append((target, message_id))
@@ -114,7 +134,21 @@ class FakeConsumerBroker:
         min_idle_ms: int,
         count: int = 100,
     ) -> Any:
-        return (b"0-0", self.pending.pop(target, []), [])
+        # Real XAUTOCLAIM only claims entries idle >= min_idle_time (audit
+        # S3-r2-120) and caps claims at COUNT (audit A7-r3-140).
+        claimed: list[tuple[str, dict[bytes, bytes]]] = []
+        kept: list[tuple[str, dict[bytes, bytes]]] = []
+        for mid, fields in self.pending.get(target, []):
+            idle = self.pending_idle_ms.get((target, mid), float("inf"))
+            if idle >= min_idle_ms and len(claimed) < count:
+                claimed.append((mid, fields))
+            else:
+                kept.append((mid, fields))
+        if kept:
+            self.pending[target] = kept
+        else:
+            self.pending.pop(target, None)
+        return (b"0-0", claimed, self.lost.pop(target, []))
 
     async def dead_letter(
         self, target: str, message_id: str, fields: dict[bytes, bytes], group: str | None = None
@@ -376,6 +410,98 @@ async def test_reclaim_retries_pending_while_worker_stays_alive() -> None:
 
     assert received == [123]
     assert ("t", "6-0") in broker.acked
+
+
+@pytest.mark.asyncio
+async def test_fake_read_caps_delivery_at_count() -> None:
+    """Real XREADGROUP delivers at most COUNT entries per call (audit
+    S3-r1-65) — the old fake drained the whole backlog in one read."""
+    broker = FakeConsumerBroker()
+    for i in range(3):
+        broker.deliver("t", f'{{"n": {i}}}'.encode(), {"event_type": "X"})
+
+    [(_t, first)] = await broker.read("t", consumer="c", count=2, block_ms=10)
+    assert len(first) == 2  # capped, NOT all 3
+    [(_t, second)] = await broker.read("t", consumer="c", count=2, block_ms=10)
+    assert len(second) == 1  # the remainder was left queued, not dropped
+    assert await broker.read("t", consumer="c", count=2, block_ms=1) == []
+
+
+@pytest.mark.asyncio
+async def test_reclaim_does_not_steal_fresh_in_flight_messages() -> None:
+    """The consumer's reclaim must honor min_idle_ms (audit S3-r2-120): a
+    freshly-delivered message a live peer is still processing is NOT
+    redispatched; once idle past the threshold, it is."""
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    broker = FakeConsumerBroker()
+
+    fqn = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+    fields = {
+        b"data": JsonEventSerializer().serialize(CrossEvent(value=42)),
+        b"h:event_type": fqn.encode(),
+    }
+    consumer = BrokerConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=JsonEventSerializer(),
+        consumer_name="orders:1",
+        group="modulith-orders",
+        targets=["t"],
+        poll_block_ms=10,
+        reclaim_min_idle_ms=60_000,  # the production default
+    )
+
+    broker.pending["t"] = [("8-0", fields)]
+    broker.pending_idle_ms[("t", "8-0")] = 0  # freshly delivered to a live peer
+    await consumer._reclaim("t")
+    assert received == []  # NOT stolen from the in-flight peer
+    assert broker.acked == []
+    assert broker.pending["t"] == [("8-0", fields)]  # still pending
+
+    broker.pending_idle_ms[("t", "8-0")] = 120_000  # now idle past threshold
+    await consumer._reclaim("t")
+    assert received == [42]
+    assert ("t", "8-0") in broker.acked
+
+
+@pytest.mark.asyncio
+async def test_fake_reclaim_caps_at_count() -> None:
+    """Real XAUTOCLAIM caps claims at COUNT (audit A7-r3-140) — the old fake
+    handed back the entire staged backlog in one call."""
+    broker = FakeConsumerBroker()
+    broker.pending["t"] = [(f"{i}-0", {b"data": b"{}"}) for i in range(1, 4)]
+
+    _cursor, claimed, _deleted = await broker.reclaim("t", consumer="c", min_idle_ms=0, count=2)
+    assert [m for m, _ in claimed] == ["1-0", "2-0"]  # capped at count
+    assert [m for m, _ in broker.pending["t"]] == ["3-0"]  # remainder stays pending
+
+
+@pytest.mark.asyncio
+async def test_reclaim_surfaces_trimmed_pending_ids_as_lost(caplog) -> None:
+    """XAUTOCLAIM's third element reports pending ids trimmed out of the
+    stream — permanently lost messages (audit S3-r3-160). The consumer must
+    surface the loss loudly and drop its retry bookkeeping, not dispatch or
+    dead-letter them."""
+    bus = InMemoryEventBus()
+    broker = FakeConsumerBroker()
+    consumer = _make_consumer(broker, bus, targets=["t"])
+    consumer._attempts[("t", "4-0")] = 3  # stale retry state for the lost id
+
+    broker.lost["t"] = ["4-0"]
+    with caplog.at_level("ERROR", logger="modulith.consumer"):
+        await consumer._reclaim("t")
+
+    assert "permanently lost" in caplog.text
+    assert "4-0" in caplog.text
+    assert ("t", "4-0") not in consumer._attempts  # bookkeeping cleared
+    assert broker.acked == []  # a lost message is neither acked...
+    assert broker.dead == []  # ...nor dead-lettered — it no longer exists
 
 
 # ---------------------------------------------------------------------------

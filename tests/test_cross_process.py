@@ -13,6 +13,8 @@ from __future__ import annotations
 from datetime import timedelta
 from uuid import UUID
 
+import pytest
+
 from modulith import EventPublication, configure
 from modulith.builtin import outbox
 from modulith.runtime import _runtime
@@ -361,3 +363,62 @@ async def test_resolve_event_target_hook_overrides_routing(make_fake_app) -> Non
     assert len(fake.published) == 1
     destination, _, _ = fake.published[0]
     assert destination == "dynamic.dest"
+
+
+# ---------------------------------------------------------------------------
+# Broker publish failure — producer-side fake that CAN fail (audit S3-r2-122)
+# ---------------------------------------------------------------------------
+
+
+class RaisingBroker:
+    """Broker whose publish() always fails — e.g. Redis unreachable. Every
+    other producer-side fake unconditionally succeeds (audit S3-r2-122), so
+    the failure path of cross-process routing had zero coverage."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def publish(
+        self, target: str, payload: bytes, headers: dict[str, str] | None = None
+    ) -> None:
+        raise self._exc
+
+    async def close(self) -> None:  # pragma: no cover - registry contract
+        pass
+
+
+async def test_broker_publish_failure_propagates_to_publisher(make_fake_app) -> None:
+    """Pins the CURRENT (de-facto) contract: on the direct (non-durable)
+    path, a broker publish failure propagates uncaught out of ``publish()``
+    into the caller's own business logic — runtime._maybe_route_to_broker
+    wraps ``registry.publish()`` in nothing (runtime.py:451). Whether that is
+    the *intended* contract (vs. a modulith-specific BrokerPublishError or
+    graceful degradation) is an OPEN design decision (audit S3-r2-122); this
+    test makes the behavior visible so a deliberate change shows up here.
+    """
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event, publish
+
+                @event
+                @dataclass(frozen=True)
+                class OrderPlaced:
+                    order_id: str
+
+                async def place(order_id: str) -> None:
+                    await publish(OrderPlaced(order_id=order_id))
+            """
+        }
+    )
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+    _runtime.ensure_bootstrapped()
+    registry = _runtime.broker_registry
+    assert registry is not None  # bootstrapped
+    registry.register("testbroker", RaisingBroker(ConnectionError("redis unreachable")))
+
+    import fakeapp.orders as orders
+
+    with pytest.raises(ConnectionError, match="redis unreachable"):
+        await orders.place("o-boom")  # the caller's business logic sees the failure
