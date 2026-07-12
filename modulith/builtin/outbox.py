@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -75,11 +76,26 @@ _retry_stale_seconds: float = 30.0
 _retry_loop_enabled: bool = True
 _retry_task: asyncio.Task[None] | None = None
 
+# Guards check-then-set access to ``_retry_task``. The module slot is
+# process-global while event loops are not: the main loop and sync.py's
+# persistent daemon-thread loop can race _ensure_retry_loop() from two OS
+# threads, and without a threading-level lock each would spawn its own
+# retry-loop task, orphaning one with no cancellation path.
+_retry_task_lock = threading.Lock()
+
 # Publication ids currently being dispatched in THIS process. The after-commit
 # dispatch task and the crash-recovery sweep can both pick up the same freshly
 # committed row; this set makes a publication's delivery non-reentrant within a
 # process (the cross-process case is handled by the store's row-level claim).
 _inflight_ids: set[UUID] = set()
+
+# Guards the check-then-add on ``_inflight_ids``. The non-reentrancy guarantee
+# is documented at *process* granularity, but a bare set is only safe against
+# interleaving on a single event loop — two loops on two OS threads (main loop
+# + sync.py's daemon-thread loop) could both pass the membership check before
+# either added, delivering the same publication concurrently. The lock is only
+# ever held across the synchronous check+add / discard, never across an await.
+_inflight_lock = threading.Lock()
 
 # Listener-column sentinel marking a publication row as a *deferred broker
 # send* rather than a local listener delivery. The durable path must not hand
@@ -138,6 +154,11 @@ def configure(
     ``start_loop=False`` binds state without starting the loop — used by
     tests that drive ``_dispatch_publication`` directly, and by callers that
     start the loop later on their own running loop.
+
+    ``configure()`` and ``shutdown()`` are a paired lifecycle. Re-configuring
+    while a previous retry loop is still alive cancels that stale task first:
+    letting it live meant it silently kept polling the NEW store without ever
+    running the new configuration's one-shot crash sweep.
     """
     global _store, _serializer, _completion_mode
     global _dead_letter_after_attempts, _retry_interval_seconds
@@ -147,6 +168,15 @@ def configure(
         raise ValueError(
             f"completion_mode must be 'update', 'delete', or 'archive', got {completion_mode!r}"
         )
+    if dead_letter_after_attempts < 1:
+        # 0 or negative would make every record — including never-attempted
+        # crash-recovered ones — count as already dead-lettered: the sweep
+        # would skip them all forever, silently blackholing publications.
+        raise ValueError(
+            f"dead_letter_after_attempts must be >= 1, got {dead_letter_after_attempts!r}"
+        )
+
+    _cancel_retry_task()
 
     _store = store
     _serializer = serializer
@@ -167,15 +197,49 @@ def _ensure_retry_loop() -> None:
     No-ops outside a running loop (e.g. synchronous bootstrap). The loop is
     then started lazily on the first transactional publish, which always
     happens inside a running loop.
+
+    The check-then-create runs under ``_retry_task_lock``: without it, two
+    event loops on two OS threads could both see the slot empty and each
+    spawn a retry-loop task, with the single-slot module global orphaning
+    the loser (no reference, no cancellation path).
     """
     global _retry_task
-    if _retry_task is not None and not _retry_task.done():
-        return
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    _retry_task = loop.create_task(_retry_loop())
+    with _retry_task_lock:
+        if _retry_task is not None and not _retry_task.done():
+            return
+        _retry_task = loop.create_task(_retry_loop())
+
+
+def _cancel_retry_task() -> None:
+    """Best-effort, non-blocking cancellation of the current retry task.
+
+    Used by the synchronous teardown paths (``configure()`` replacing a live
+    loop, ``_reset_for_testing()``) that cannot ``await`` the cancellation
+    like ``shutdown()`` does. The task may live on another thread's loop
+    (sync.py's daemon loop), so cancellation is scheduled thread-safely; a
+    task whose loop is already closed has nothing left to cancel.
+    """
+    global _retry_task
+    with _retry_task_lock:
+        task = _retry_task
+        _retry_task = None
+    if task is None or task.done():
+        return
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if task.get_loop() is running:
+        task.cancel()
+    else:
+        try:
+            task.get_loop().call_soon_threadsafe(task.cancel)
+        except RuntimeError:
+            pass  # the task's loop is already closed
 
 
 # ---------------------------------------------------------------------------
@@ -316,12 +380,15 @@ async def _dispatch_publication(publication: EventPublication) -> None:
     assert _store is not None and _serializer is not None
     assert publication.event_type is not None
 
-    if publication.id in _inflight_ids:
-        # Already being delivered by a concurrent task in this process (the
-        # after-commit dispatch racing the crash-recovery sweep, say). Skip so a
-        # publication is never delivered twice concurrently within one process.
-        return
-    _inflight_ids.add(publication.id)
+    with _inflight_lock:
+        if publication.id in _inflight_ids:
+            # Already being delivered by a concurrent task in this process (the
+            # after-commit dispatch racing the crash-recovery sweep, say). Skip so
+            # a publication is never delivered twice concurrently within one
+            # process — the lock makes the check+add atomic across OS threads,
+            # not just across tasks on one event loop.
+            return
+        _inflight_ids.add(publication.id)
     try:
         if (publication.listener or "").startswith(_BROKER_ROUTE_LISTENER_PREFIX):
             # A deferred broker send (see persist_broker_route) — no local
@@ -375,7 +442,26 @@ async def _dispatch_publication(publication: EventPublication) -> None:
                 )
             return
 
-        await _complete(publication)
+        try:
+            await _complete(publication)
+        except Exception as exc:
+            # Completion-marking failed AFTER a successful delivery. Route it
+            # through _record_failure like a listener failure: otherwise the
+            # record stays at attempt_count == 0 forever, _backoff_elapsed
+            # treats it as immediately eligible on every sweep, and it can
+            # never dead-letter — unbounded duplicate listener invocations.
+            # The re-invocation this schedules is the documented at-least-once
+            # property #3; listeners must be idempotent.
+            logger.exception(
+                "completion (%s) failed for publication %s after successful "
+                "delivery — recording the attempt so backoff and dead-lettering "
+                "still apply",
+                _completion_mode,
+                publication.id,
+            )
+            await _record_failure(publication, exc)
+        # The listener itself succeeded, so the dispatch/complete span pairing
+        # reports exception=None regardless of the completion write's outcome.
         if pm is not None:
             pm.hook.modulith_on_listener_complete(
                 event=event,
@@ -384,7 +470,8 @@ async def _dispatch_publication(publication: EventPublication) -> None:
                 exception=None,
             )
     finally:
-        _inflight_ids.discard(publication.id)
+        with _inflight_lock:
+            _inflight_ids.discard(publication.id)
 
 
 async def _dispatch_broker_route(publication: EventPublication) -> None:
@@ -417,7 +504,21 @@ async def _dispatch_broker_route(publication: EventPublication) -> None:
         logger.warning("broker route %s failed for publication %s: %s", target, publication.id, exc)
         await _record_failure(publication, exc)
         return
-    await _complete(publication)
+    try:
+        await _complete(publication)
+    except Exception as exc:
+        # Same rationale as the local-listener path: a failed completion write
+        # must age the record so backoff/dead-lettering engage — the broker
+        # send already happened, so the retry this schedules is the documented
+        # at-least-once delivery, not a lost event.
+        logger.exception(
+            "completion (%s) failed for broker-routed publication %s — "
+            "recording the attempt so backoff and dead-lettering still apply",
+            _completion_mode,
+            publication.id,
+        )
+        await _record_failure(publication, exc)
+        return
     logger.debug("routed publication %s to broker target %s", publication.id, target)
 
 
@@ -442,6 +543,12 @@ def _backoff_elapsed(publication: EventPublication) -> bool:
     anchor = publication.last_attempt_at or publication.published_at
     if anchor is None:
         return True
+    if anchor.tzinfo is None:
+        # The plugin always WRITES UTC-aware timestamps, but a custom store's
+        # find_incomplete() may round-trip them naive (SQLite, for one, drops
+        # the tz). Interpret naive as UTC instead of letting the naive/aware
+        # subtraction below raise TypeError and kill the sweep.
+        anchor = anchor.replace(tzinfo=UTC)
     backoff = min(2.0 ** (publication.attempt_count - 1), _max_retry_backoff_seconds)
     age = (datetime.now(UTC) - anchor).total_seconds()
     return age >= backoff
@@ -458,6 +565,22 @@ async def _sweep(older_than: timedelta) -> None:
         await _dispatch_publication(pub)
 
 
+async def _guarded_sweep(older_than: timedelta) -> None:
+    """Run one sweep, containing failures so the retry loop survives them.
+
+    A transient store error (connection blip, failover) must only cost the
+    one sweep it hit — without this containment it killed the retry-loop
+    task outright, permanently stalling retries for EVERY pending
+    publication until the next transactional publish happened to restart it.
+    ``asyncio.CancelledError`` (a BaseException) still propagates for clean
+    shutdown.
+    """
+    try:
+        await _sweep(older_than)
+    except Exception:
+        logger.exception("outbox sweep failed — retrying on the next interval")
+
+
 async def _retry_loop() -> None:
     """Background task: poll for incomplete publications and retry them.
 
@@ -466,31 +589,47 @@ async def _retry_loop() -> None:
     interval with a staleness threshold so freshly-published-but-not-yet-
     committed-dispatched events aren't thrashed. Cancels cleanly on shutdown.
     """
+    # The task copied the *creating* call site's contextvars (PEP 567). On the
+    # lazy-start path that call site is a live request with a bound session —
+    # frozen into this task forever, so a cascading publish() from a
+    # retry-dispatched listener would enlist in that stale, already-closed
+    # session and never be committed. Every dispatch this loop drives must run
+    # session-less (a listener's own transactional work rebinds explicitly).
+    _current_session.set(None)
     try:
-        await _sweep(timedelta(0))  # crash recovery
+        await _guarded_sweep(timedelta(0))  # crash recovery
         while True:
             await asyncio.sleep(_retry_interval_seconds)
-            await _sweep(timedelta(seconds=_retry_stale_seconds))
+            await _guarded_sweep(timedelta(seconds=_retry_stale_seconds))
     except asyncio.CancelledError:
         logger.debug("outbox retry loop stopping")
-        raise
-    except Exception:  # pragma: no cover - defensive: a loop must not die silently
-        logger.exception("outbox retry loop crashed")
         raise
 
 
 async def shutdown() -> None:
-    """Cancel the retry loop and wait for it to stop. Idempotent."""
+    """Cancel the retry loop and wait for it to stop. Idempotent.
+
+    The module slot keeps pointing at the task until cancellation has
+    actually completed: nulling it up front opened a window (cancel() only
+    *requests*; the task needs another loop turn to unwind) where a
+    concurrent transactional publish's ``_ensure_retry_loop()`` saw "no
+    loop" and spawned a second retry task that survived shutdown entirely.
+    """
     global _retry_task
     task = _retry_task
-    _retry_task = None
-    if task is None or task.done():
+    if task is None:
         return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    if not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    with _retry_task_lock:
+        # Clear the slot only if no concurrent configure()/_ensure_retry_loop()
+        # installed a fresh task while we awaited the cancellation.
+        if _retry_task is task:
+            _retry_task = None
 
 
 # ---------------------------------------------------------------------------
@@ -599,10 +738,17 @@ async def retry_all_dead_lettered() -> int:
 
 
 def _reset_for_testing() -> None:
-    """Reset module state to uninitialized. ONLY for tests."""
-    global _store, _serializer, _completion_mode, _retry_task
+    """Reset module state to uninitialized. ONLY for tests.
+
+    Cancels any live retry task (best-effort, like ``shutdown()`` but
+    synchronous): merely dropping the reference leaked ghost retry loops
+    that kept polling — and dispatching against — whatever store a later
+    ``configure()`` bound.
+    """
+    global _store, _serializer, _completion_mode
     global _dead_letter_after_attempts, _retry_interval_seconds
     global _max_retry_backoff_seconds, _retry_stale_seconds, _retry_loop_enabled
+    _cancel_retry_task()
     _store = None
     _serializer = None
     _completion_mode = "update"
@@ -611,8 +757,8 @@ def _reset_for_testing() -> None:
     _max_retry_backoff_seconds = 300.0
     _retry_stale_seconds = 30.0
     _retry_loop_enabled = True
-    _retry_task = None
-    _inflight_ids.clear()
+    with _inflight_lock:
+        _inflight_ids.clear()
 
 
 __all__ = [

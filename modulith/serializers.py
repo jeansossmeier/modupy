@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import json
+import sys
 import types
 import typing
 from collections.abc import Iterable
@@ -34,14 +35,21 @@ from uuid import UUID
 __all__ = ["JsonEventSerializer"]
 
 
-def _json_default(obj: Any) -> Any:
-    """Encode types JSON doesn't handle natively.
+def _to_jsonable(obj: Any) -> Any:
+    """Recursively convert an event's value graph to JSON-encodable values.
 
     ``datetime``/``date`` → ISO 8601 string, ``UUID`` → str, ``Decimal``
     → str (string, not float, so precision survives), ``Enum`` → its
-    value. Anything else raises ``TypeError`` — better a loud failure at
-    publish time than silent data corruption in the outbox.
+    value, nested dataclasses → dicts of their fields, ``set``/
+    ``frozenset`` → list (decode coerces back). Dict *keys* are encoded
+    here too, via :func:`_encode_dict_key` — ``json.dumps`` never routes
+    keys through its ``default=`` hook, so a ``dict[UUID, X]`` field used
+    to crash with the json module's own opaque TypeError instead of being
+    handled. Anything unsupported raises ``TypeError`` — better a loud
+    failure at publish time than silent data corruption in the outbox.
     """
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
     if isinstance(obj, (datetime, date)):  # datetime is a subclass of date
         return obj.isoformat()
     if isinstance(obj, UUID):
@@ -49,15 +57,40 @@ def _json_default(obj: Any) -> Any:
     if isinstance(obj, Decimal):
         return str(obj)
     if isinstance(obj, Enum):
-        return obj.value
+        return _to_jsonable(obj.value)
     # Nested dataclass: descend into its fields so a field typed as another
     # @dataclass event/value object round-trips instead of raising TypeError.
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        return {f.name: getattr(obj, f.name) for f in dataclasses.fields(obj)}
-    # set/frozenset aren't JSON-native; encode as a list (decode coerces back).
-    if isinstance(obj, (set, frozenset)):
-        return list(obj)
+        return {f.name: _to_jsonable(getattr(obj, f.name)) for f in dataclasses.fields(obj)}
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [_to_jsonable(v) for v in obj]
+    if isinstance(obj, dict):
+        return {_encode_dict_key(k): _to_jsonable(v) for k, v in obj.items()}
     raise TypeError(f"cannot JSON-serialize {type(obj).__name__} in event payload")
+
+
+def _encode_dict_key(key: Any) -> Any:
+    """Encode a dict key to something ``json.dumps`` accepts natively.
+
+    JSON-native key types pass through (``json.dumps`` stringifies them
+    itself — including ``True``/``False`` → ``"true"``/``"false"``, which
+    ``_coerce`` reverses for ``dict[bool, X]`` hints). The rich key types
+    ``_coerce`` knows how to decode (datetime/date/UUID/Decimal/Enum) are
+    stringified the same way as values. Anything else fails loudly with a
+    serializer error naming the offending key type, instead of the json
+    module's generic "keys must be str, int, float, bool or None".
+    """
+    if key is None or isinstance(key, (bool, int, float, str)):
+        return key
+    if isinstance(key, (datetime, date)):
+        return key.isoformat()
+    if isinstance(key, UUID):
+        return str(key)
+    if isinstance(key, Decimal):
+        return str(key)
+    if isinstance(key, Enum):
+        return _encode_dict_key(key.value)
+    raise TypeError(f"cannot JSON-serialize dict key of type {type(key).__name__} in event payload")
 
 
 def _resolve_class(fqcn: str) -> type:
@@ -92,6 +125,55 @@ def _event_type_name(event_type: str | type) -> str:
     if isinstance(event_type, str):
         return event_type
     return f"{event_type.__module__}.{event_type.__qualname__}"
+
+
+def _safe_type_hints(obj: Any) -> dict[str, Any]:
+    """Resolve type hints without one bad annotation blocking all the rest.
+
+    ``typing.get_type_hints`` resolves EVERY annotation eagerly, so a single
+    ``TYPE_CHECKING``-only forward reference (a name importable only for the
+    type checker) raised ``NameError`` and blocked reconstruction of the whole
+    event — even when the offending field's value needed no coercion. When
+    the eager pass fails, fall back to resolving each annotation on its own
+    (the same eval-against-module-globals mechanism ``get_type_hints`` uses);
+    names that don't resolve simply yield no coercion for that field.
+    """
+    try:
+        resolved = typing.get_type_hints(obj)
+    except Exception:
+        resolved = None
+    if resolved is not None:
+        return {name: hint for name, hint in resolved.items() if name != "return"}
+
+    if isinstance(obj, type):
+        sources = [
+            (
+                dict(vars(klass).get("__annotations__", {}) or {}),
+                getattr(sys.modules.get(klass.__module__), "__dict__", {}),
+            )
+            for klass in reversed(obj.__mro__)
+        ]
+    else:  # a function, e.g. cls.__init__
+        sources = [
+            (
+                dict(getattr(obj, "__annotations__", {}) or {}),
+                getattr(obj, "__globals__", {}),
+            )
+        ]
+
+    hints: dict[str, Any] = {}
+    for raw_annotations, globalns in sources:
+        for name, annotation in raw_annotations.items():
+            if name == "return":
+                continue
+            if not isinstance(annotation, str):
+                hints[name] = annotation
+                continue
+            try:
+                hints[name] = eval(annotation, dict(globalns))
+            except Exception:
+                hints[name] = None  # unresolvable → leave this field uncoerced
+    return hints
 
 
 def _coerce(value: Any, hint: Any) -> Any:
@@ -148,6 +230,17 @@ def _coerce(value: Any, hint: Any) -> Any:
         return UUID(value)
     if hint is Decimal:
         return Decimal(value)
+    if hint is bool:
+        # bool VALUES round-trip natively, but json.dumps stringifies bool
+        # dict KEYS to "true"/"false" without consulting the default hook —
+        # so dict[bool, ...] keys need decoding back, like int keys below.
+        if isinstance(value, bool):
+            return value
+        if value == "true":
+            return True
+        if value == "false":
+            return False
+        return value
     if hint is int and not isinstance(value, bool):
         # JSON round-trips int values natively, but dict keys decode as strings
         # (json.dumps stringifies non-string keys), so dict[int, ...] needs this.
@@ -158,9 +251,36 @@ def _coerce(value: Any, hint: Any) -> Any:
         return hint(value)
     # Nested dataclass field: reconstruct recursively from the decoded dict.
     if dataclasses.is_dataclass(hint) and isinstance(hint, type) and isinstance(value, dict):
-        sub_hints = typing.get_type_hints(hint)
+        sub_hints = _safe_type_hints(hint)
         return hint(**{k: _coerce(v, sub_hints.get(k)) for k, v in value.items()})
     return value
+
+
+def _instance_attrs(event: Any) -> dict[str, Any]:
+    """Read a non-dataclass event's instance attributes.
+
+    Prefers ``__dict__`` (the documented ``vars(event)`` fallback), but also
+    supports ``__slots__``-based classes — a bare ``vars()`` call crashed on
+    those with the raw "vars() argument must have __dict__ attribute"
+    TypeError even though slotted events serialize perfectly well.
+    """
+    attrs = getattr(event, "__dict__", None)
+    if attrs is not None:
+        return dict(attrs)
+    names: list[str] = []
+    for klass in type(event).__mro__:
+        slots = vars(klass).get("__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for name in slots:
+            if name not in ("__dict__", "__weakref__") and name not in names:
+                names.append(name)
+    if not names:
+        raise TypeError(
+            f"cannot serialize {type(event).__name__}: it is not a dataclass and "
+            "exposes no __dict__ or __slots__ instance attributes"
+        )
+    return {name: getattr(event, name) for name in names if hasattr(event, name)}
 
 
 class JsonEventSerializer:
@@ -168,6 +288,15 @@ class JsonEventSerializer:
 
     Conforms structurally to :class:`modulith.protocols.EventSerializer`
     (duck-typed; no inheritance required).
+
+    ``allowed_event_types`` is a deserialization allowlist: when given, only
+    the listed event types (classes or fully-qualified names) may be
+    reconstructed — any other ``event_type`` raises ``ValueError`` before the
+    class is resolved. Set it in production whenever payloads can originate
+    outside the trusted process boundary (a shared outbox table, a broker):
+    ``deserialize`` imports the module named in ``event_type``, so without an
+    allowlist a forged record can trigger arbitrary-module import and
+    instantiation.
     """
 
     def __init__(self, *, allowed_event_types: Iterable[str | type] | None = None) -> None:
@@ -181,17 +310,16 @@ class JsonEventSerializer:
         """Encode an event instance to JSON bytes.
 
         Reads dataclass fields when the event is a dataclass (the
-        documented ``@event @dataclass`` pattern), falling back to
-        ``vars(event)`` otherwise. Keys are sorted for stable, diffable
-        output in the outbox table.
+        documented ``@event @dataclass`` pattern), falling back to the
+        instance attributes (``__dict__`` or ``__slots__``) otherwise.
+        Keys are sorted for stable, diffable output in the outbox table.
         """
         if dataclasses.is_dataclass(event) and not isinstance(event, type):
             raw = {f.name: getattr(event, f.name) for f in dataclasses.fields(event)}
         else:
-            raw = dict(vars(event))
+            raw = _instance_attrs(event)
         return json.dumps(
-            raw,
-            default=_json_default,
+            _to_jsonable(raw),
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
@@ -201,14 +329,22 @@ class JsonEventSerializer:
 
         Resolves the class from ``event_type`` (the fully-qualified name),
         then reconstructs it, coercing each field back to its annotated
-        type so a round-trip is equality-preserving.
+        type so a round-trip is equality-preserving. Non-dataclass events
+        are coerced too, using the class-level annotations merged with
+        ``__init__``'s parameter annotations — previously this path
+        silently left datetime/UUID/Decimal fields as raw strings.
         """
         if self._allowed_event_types is not None and event_type not in self._allowed_event_types:
             raise ValueError(f"event type {event_type!r} is not in the allowed event types")
         cls = _resolve_class(event_type)
         raw = json.loads(data.decode("utf-8"))
-        if dataclasses.is_dataclass(cls):
-            hints = typing.get_type_hints(cls)
-            kwargs = {key: _coerce(val, hints.get(key)) for key, val in raw.items()}
-            return cls(**kwargs)
-        return cls(**raw)
+        hints = _safe_type_hints(cls)
+        if not dataclasses.is_dataclass(cls):
+            # cls is a plain `type` here, so __init__ access is sound; mypy's
+            # instance-__init__ caveat doesn't apply to resolving annotations.
+            init = cls.__init__  # type: ignore[misc]
+            for key, hint in _safe_type_hints(init).items():
+                if hint is not None:
+                    hints[key] = hint
+        kwargs = {key: _coerce(val, hints.get(key)) for key, val in raw.items()}
+        return cls(**kwargs)

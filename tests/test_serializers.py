@@ -10,12 +10,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 import pytest
 
 from modulith.protocols import EventSerializer
 from modulith.serializers import JsonEventSerializer
+
+if TYPE_CHECKING:
+    # Deliberately unimportable at runtime — mirrors an event module whose
+    # annotation-only dependency isn't installed in the worker process
+    # (regression scaffolding for audit A6-r5-210).
+    from w2_g03_nonexistent_debug_module import DebugInfo
 
 # ---------------------------------------------------------------------------
 # Test event types — defined at module scope so they're importable by their
@@ -64,6 +71,45 @@ class NestedEvent:
     order_id: str
     item: LineItem
     extra: list[LineItem]
+
+
+class PlainEvent:
+    """Non-dataclass event exercising the documented vars() fallback."""
+
+    def __init__(self, when: datetime, uid: UUID, amount: Decimal) -> None:
+        self.when = when
+        self.uid = uid
+        self.amount = amount
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, PlainEvent) and vars(self) == vars(other)
+
+
+class SlottedEvent:
+    """Non-dataclass event with __slots__ (no __dict__)."""
+
+    __slots__ = ("order_id", "stamp")
+
+    def __init__(self, order_id: str, stamp: datetime) -> None:
+        self.order_id = order_id
+        self.stamp = stamp
+
+
+@dataclass(frozen=True)
+class FlagCounts:
+    counts: dict[bool, int]
+
+
+@dataclass(frozen=True)
+class UuidKeyed:
+    scores: dict[UUID, int]
+
+
+@dataclass(frozen=True)
+class ForwardRefEvent:
+    order_id: str
+    amount: Decimal
+    debug: DebugInfo | None = None
 
 
 def _fqcn(cls: type) -> str:
@@ -206,3 +252,77 @@ def test_round_trip_nested_dataclass_fields() -> None:
     assert isinstance(restored.item.price, Decimal)
     assert isinstance(restored.extra[0], LineItem)
     assert isinstance(restored.extra[0].added_at, datetime)
+
+
+def test_non_dataclass_event_round_trip_coerces_types() -> None:
+    """A6-r1-18: the non-dataclass deserialize path silently reverted rich
+    fields (datetime/UUID/Decimal) to raw strings — it must coerce using the
+    class/__init__ annotations, like the dataclass path does."""
+    serializer = JsonEventSerializer()
+    original = PlainEvent(
+        when=datetime(2022, 3, 3, tzinfo=UTC), uid=uuid4(), amount=Decimal("9.99")
+    )
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(PlainEvent))
+    assert isinstance(restored.when, datetime)
+    assert isinstance(restored.uid, UUID)
+    assert isinstance(restored.amount, Decimal)
+    assert restored == original
+
+
+def test_dict_bool_keys_round_trip() -> None:
+    """A6-r5-209: json.dumps stringifies bool dict keys to "true"/"false"
+    without consulting the default hook; the round trip must restore real
+    bool keys so dataclass equality survives."""
+    serializer = JsonEventSerializer()
+    original = FlagCounts(counts={True: 3, False: 7})
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(FlagCounts))
+    assert restored == original
+    assert all(isinstance(k, bool) for k in restored.counts)
+
+
+def test_dict_uuid_keys_serialize_and_round_trip() -> None:
+    """A6-r2-87: dict[UUID, X] fields crashed serialize() with the json
+    module's own opaque TypeError (keys never hit the default hook); keys
+    must be pre-encoded and coerced back on the way in."""
+    serializer = JsonEventSerializer()
+    original = UuidKeyed(scores={uuid4(): 1, uuid4(): 2})
+    data = serializer.serialize(original)  # must not raise the raw json TypeError
+    restored = serializer.deserialize(data, _fqcn(UuidKeyed))
+    assert restored == original
+    assert all(isinstance(k, UUID) for k in restored.scores)
+
+
+def test_unsupported_dict_key_type_raises_serializer_error() -> None:
+    """A6-r2-87: unsupported key types must fail loudly with the serializer's
+    own message, not the json module's generic one."""
+
+    @dataclass(frozen=True)
+    class Weird:
+        mapping: dict[object, int]
+
+    serializer = JsonEventSerializer()
+    with pytest.raises(TypeError, match="dict key"):
+        serializer.serialize(Weird(mapping={object(): 1}))
+
+
+def test_type_checking_forward_ref_does_not_block_deserialize() -> None:
+    """A6-r5-210: a TYPE_CHECKING-only forward-referenced field made
+    get_type_hints raise NameError, blocking reconstruction of the whole
+    event even though the offending field needed no coercion."""
+    serializer = JsonEventSerializer()
+    original = ForwardRefEvent(order_id="o1", amount=Decimal("5.00"))
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(ForwardRefEvent))
+    assert restored == original
+    assert restored.debug is None
+    assert isinstance(restored.amount, Decimal)  # resolvable fields still coerce
+
+
+def test_slotted_event_serializes_and_round_trips() -> None:
+    """A6-r5-211: the documented vars() fallback crashed with a raw TypeError
+    for __slots__ classes; slots must be read as the instance attributes."""
+    serializer = JsonEventSerializer()
+    original = SlottedEvent(order_id="o-slot", stamp=datetime(2026, 1, 5, tzinfo=UTC))
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(SlottedEvent))
+    assert restored.order_id == "o-slot"
+    assert isinstance(restored.stamp, datetime)
+    assert restored.stamp == original.stamp
