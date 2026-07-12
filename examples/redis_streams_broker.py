@@ -14,7 +14,7 @@ without any registration boilerplate:
     from modulith import event, externalized
 
     @event
-    @externalized("redis-streams:my-stream")
+    @externalized("redis-streams-example:my-stream")
     @dataclass
     class OrderShipped:
         order_id: str
@@ -22,6 +22,16 @@ without any registration boilerplate:
 The total surface for a broker adapter is one class implementing the
 Broker protocol plus one hookimpl function. No base class to inherit,
 no manifest file, no framework knowledge beyond the protocol contract.
+
+Scheme naming: each broker scheme may be registered exactly once per
+BrokerRegistry — registering a scheme that is already taken raises
+``DuplicateBrokerError`` at startup. Modulith ships a built-in adapter
+under the ``redis-streams`` scheme (``modulith.adapters.redis_broker``),
+so this example registers ``redis-streams-example`` instead. A
+third-party adapter that intentionally wants to REPLACE a built-in
+scheme must ship under the same scheme name and have the application
+disable the built-in first (``create_plugin_manager(disable=
+["modulith.adapters.redis_broker"])``); otherwise pick a unique scheme.
 """
 
 from __future__ import annotations
@@ -73,5 +83,8 @@ class RedisStreamsBroker:
 # once during application startup.
 @hookimpl
 def modulith_register_brokers(registry: BrokerRegistry) -> None:
+    # 'redis-streams-example', NOT 'redis-streams': the built-in adapter
+    # already owns 'redis-streams', and a second register() for the same
+    # scheme raises DuplicateBrokerError (see module docstring).
     url = os.environ.get("REDIS_URL", "redis://localhost:6379")
-    registry.register("redis-streams", RedisStreamsBroker(url))
+    registry.register("redis-streams-example", RedisStreamsBroker(url))
