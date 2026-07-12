@@ -68,12 +68,12 @@ app.include_router(orders_router)
 
 ```bash
 $ uvicorn myapp.main:app
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 INFO:modulith:detected application package 'myapp'
 INFO:modulith:discovered 4 module(s): contracts, inventory, orders, payments
 INFO:modulith:outbox=memory, broker=memory, topology=single
 INFO:modulith:outbox disabled — set [tool.modulith].outbox = 'postgres' for durable event delivery
 INFO:modulith:ready
-INFO:     Uvicorn running on http://127.0.0.1:8000
 ```
 
 The banner is emitted through the standard `modulith` logger at INFO
@@ -81,6 +81,9 @@ level — it inherits your app's logging configuration rather than
 printing directly. Python surfaces only WARNING+ by default (and
 uvicorn configures only its own loggers), so enable INFO logging to
 see it, e.g. `logging.basicConfig(level=logging.INFO)` in `main.py`.
+modulith bootstraps lazily, so the banner follows uvicorn's own startup
+lines: it appears on first use — the first request that `publish()`es
+an event — not at process start.
 
 ---
 
@@ -166,13 +169,19 @@ outbox = "postgres"             # default "memory" — switch for production
 broker = "redis-streams"        # default "memory" — for process-per-module
 topology = "single"             # "single" | "processes"
 
-[tool.modulith.outbox_options]
-completion_mode = "update"      # update | delete | archive
-
 [tool.modulith.workers]
 default = 1
 reports = 4                     # this module gets 4 workers
 ```
+
+Outbox tuning has a reserved home: `[tool.modulith.outbox_options]`. The
+subtable is parsed and validated (it is the *only* outbox options
+subtable — a legacy `[tool.modulith.outbox]` subtable is a loud
+`ConfigurationError`), but the runtime does not read its keys yet, so a
+`completion_mode` set there does not change the active mode. Set the
+completion mode (`update` | `delete` | `archive`) where the outbox is
+wired, via `outbox.configure(completion_mode=...)` — see
+[MIGRATION_GUIDE.md](MIGRATION_GUIDE.md), Step 5.
 
 Any *scalar* key has a `MODULITH_*` env var equivalent for production
 overrides (e.g. `MODULITH_OUTBOX`, `MODULITH_BROKER`, `MODULITH_PRODUCTION`).

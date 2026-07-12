@@ -196,10 +196,13 @@ uv add 'modulith[postgres]'
 ```toml
 [tool.modulith]
 outbox = "postgres"
-
-[tool.modulith.outbox_options]
-completion_mode = "update"      # keep history visible
 ```
+
+The completion mode (`"update"` keeps history visible; `"delete"` and
+`"archive"` are the alternatives) is passed to `outbox.configure()` in
+the wiring code below — the `[tool.modulith.outbox_options]` subtable
+is parsed and validated but currently reserved: the runtime does not
+read its keys yet.
 
 Run the packaged schema migration. modulith ships its alembic config
 *inside* the installed package (your project needs no alembic.ini), so
@@ -239,6 +242,7 @@ store = PostgresPublicationStore(engine=async_engine)
 outbox.configure(
     store=store,
     serializer=JsonEventSerializer(allowed_event_types=[OrderCreated]),
+    completion_mode="update",  # "update" (default) | "delete" | "archive"
 )
 
 # In your dependency for getting a DB session

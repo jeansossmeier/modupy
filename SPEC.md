@@ -483,7 +483,9 @@ When `publish()` is called outside a transaction context, the bus dispatches dir
 
 ### 7.3 Completion Modes
 
-Three modes, configurable via `[tool.modulith.outbox_options].completion_mode`. (`outbox` itself is the scalar adapter-selection key — `outbox = "postgres"` — and TOML forbids one key being both a scalar and a table, so the options subtable is `outbox_options`. A legacy `[tool.modulith.outbox]` subtable is rejected with a `ConfigurationError` pointing at the correct spelling, and a pyproject.toml that fails to parse — including the scalar/table collision — is a loud `ConfigurationError`, never silently-ignored config.)
+Three modes, selected with the `completion_mode` argument to `outbox.configure()` (`modulith/builtin/outbox.py`) when the application wires the store at startup.
+
+In pyproject.toml, `[tool.modulith.outbox_options]` is the *reserved* home for outbox tuning. The subtable is parsed and validated (`outbox` itself is the scalar adapter-selection key — `outbox = "postgres"` — and TOML forbids one key being both a scalar and a table, so the options subtable is `outbox_options`. A legacy `[tool.modulith.outbox]` subtable is rejected with a `ConfigurationError` pointing at the correct spelling, and a pyproject.toml that fails to parse — including the scalar/table collision — is a loud `ConfigurationError`, never silently-ignored config), **but its keys are not yet consumed by the runtime**: `Configuration.outbox_options` is populated and nothing reads it, so a `completion_mode` set there does not change the active mode. Until that wiring lands, pass `completion_mode` to `outbox.configure()`.
 
 - **`update`** (default) — set `completed_at`. Old records remain for inspection until a maintenance job purges them.
 - **`delete`** — remove the row on success. Lower overhead, no historical visibility.
@@ -686,12 +688,9 @@ broker = "redis-streams"     # REQUIRED for topology = "processes"
 [tool.modulith.workers]
 default = 1
 reports = 4
-
-[tool.modulith.supervisor]
-restart_backoff_initial = "1s"
-restart_backoff_max = "60s"
-health_check_interval = "10s"
 ```
+
+There is no `[tool.modulith.supervisor]` subtable — configuration resolution reads only the `outbox_options`, `broker_options`, and `workers` subtables. The supervisor's restart policy is built in, not configurable via pyproject (`modulith/supervisor.py`): per-instance exponential backoff starting at 1s, doubling to a 60s cap, with a crash-loop circuit breaker that stops respawning an instance after more than 5 crashes inside a rolling 60s window, and a backoff reset once an instance has stayed up past the healthy-uptime threshold (defaults to the 60s cap). Crash detection is process-exit-based — the supervisor awaits each worker process; there is no periodic health-check polling.
 
 Startup failure modes for the cross-process broker are deliberately loud:
 

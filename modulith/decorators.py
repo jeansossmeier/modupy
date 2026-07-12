@@ -215,7 +215,7 @@ def configure(**overrides: Any) -> None:
 
     Most projects don't need this — pyproject.toml and env vars cover
     the typical cases. Use configure() for runtime-computed values
-    (DSNs assembled at startup, feature flags from a remote service).
+    (e.g. flags derived from your deploy environment at startup).
 
     Example:
         from modulith import configure
@@ -223,7 +223,12 @@ def configure(**overrides: Any) -> None:
         configure(
             package="myapp",
             outbox="postgres",
-            outbox_options={"dsn": os.environ["DATABASE_URL"]},
+            production=os.environ.get("ENV") == "prod",
         )
+
+    Dict-valued fields like ``outbox_options`` are accepted and
+    validated but currently reserved — the runtime does not read them
+    yet. Outbox tuning (e.g. ``completion_mode``) is passed to
+    ``modulith.builtin.outbox.configure()`` instead.
     """
     _runtime.configure(**overrides)
