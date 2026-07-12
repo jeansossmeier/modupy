@@ -652,14 +652,14 @@ explicit targets).
 - Each is a uvicorn invocation pointing at `modulith._worker:create_app`
 - Stdout/stderr stream back with module-name prefixes
 - SIGTERM cascades; crashed workers restart with exponential backoff
-- Health checks against each worker's `/health` endpoint
+  (crash detection is process exit — there is no periodic health-check polling)
 - Topology changes (worker count, module isolation) without app code changes
 
 Usage:
 ```bash
-modulith run --topology=processes
-modulith run --workers='{"reports": 4, "default": 1}'
-modulith dev --isolate=reports  # only reports gets its own process
+modulith run app.main --topology=processes
+modulith run app.main --workers='{"reports": 4, "default": 1}'
+modulith dev app.main --isolate=reports  # only reports gets its own process
 ```
 
 ### 9.4 The Reverse Proxy
@@ -675,8 +675,10 @@ modulith dev --isolate=reports  # only reports gets its own process
 
 Implementation: `httpx.AsyncClient` for streaming proxy. The proxy bounds
 buffered request bodies, logs upstream URLs without query strings, and can
-guard `/_modulith/*` actuator metadata with an optional bearer token. WebSocket
-support is v2.1 enhancement.
+guard `/_modulith/*` actuator metadata with an optional bearer token. The
+proxy also aggregates worker health: the `/_modulith/health` actuator route
+queries each worker's `/health` endpoint on demand. WebSocket support is a
+v2.1 enhancement.
 
 ### 9.5 Topology Configuration
 
