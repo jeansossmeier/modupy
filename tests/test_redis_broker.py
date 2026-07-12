@@ -505,25 +505,26 @@ async def test_reclaim_honors_min_idle_time(stateful_fake, stateful_broker) -> N
     assert claimed == []
 
 
-async def test_reclaim_caps_at_count_and_pages_via_cursor(stateful_fake, stateful_broker) -> None:
+async def test_fake_xautoclaim_caps_at_count_and_pages_via_cursor(
+    stateful_fake, stateful_broker
+) -> None:
     """Real XAUTOCLAIM enforces COUNT and returns a continuation cursor (audit
-    A7-r3-140) — the old fake returned the entire PEL in one call, giving
-    false confidence that a single reclaim() drains any backlog size."""
+    A7-r3-140, fake-fidelity half) — the old fake returned the entire PEL in
+    one call. Probed at raw-client level; the adapter's reclaim() follows the
+    cursor itself (test_reclaim_follows_cursor_to_drain_full_backlog)."""
     await stateful_broker.ensure_group("orders")
     for i in range(5):
         await stateful_broker.publish("orders", f"m{i}".encode())
     await stateful_broker.read("orders", consumer="c1", count=100, block_ms=1)  # 5 → PEL
 
-    cursor, claimed, _deleted = await stateful_broker.reclaim(
-        "orders", consumer="c2", min_idle_ms=0, count=2
+    cursor1, claimed1, _ = await stateful_fake.xautoclaim(
+        "modulith.events.orders", "g", "c2", 0, start_id="0-0", count=2
     )
-    assert len(claimed) == 2  # capped at count, NOT all 5
-    assert cursor != b"0-0"  # continuation cursor — more pending remain
+    assert len(claimed1) == 2  # capped at count, NOT all 5
+    assert cursor1 != b"0-0"  # continuation cursor — more pending remain
 
-    # Following the cursor pages through the rest (raw-client level: the
-    # adapter always restarts at 0-0 and relies on periodic reclaim cycles).
     cursor2, claimed2, _ = await stateful_fake.xautoclaim(
-        "modulith.events.orders", "g", "c2", 0, start_id=cursor, count=2
+        "modulith.events.orders", "g", "c2", 0, start_id=cursor1, count=2
     )
     assert len(claimed2) == 2
     cursor3, claimed3, _ = await stateful_fake.xautoclaim(
@@ -531,7 +532,29 @@ async def test_reclaim_caps_at_count_and_pages_via_cursor(stateful_fake, statefu
     )
     assert len(claimed3) == 1
     assert cursor3 == b"0-0"  # PEL scan completed
-    assert len({m for m, _ in claimed + claimed2 + claimed3}) == 5  # no overlap, full drain
+    assert len({m for m, _ in claimed1 + claimed2 + claimed3}) == 5  # no overlap, full drain
+
+
+async def test_reclaim_follows_cursor_to_drain_full_backlog(stateful_broker) -> None:
+    """A7-r3-140 (production half, W2 RESIDUALS item 9): reclaim() used to
+    issue a single XAUTOCLAIM(start_id='0-0', count=100) and never follow the
+    continuation cursor, so a >COUNT idle-pending backlog drained only across
+    successive poll cycles. reclaim() must page via the returned cursor until
+    it comes back 0-0 — exactly one full PEL scan, bounded, no spin."""
+    await stateful_broker.ensure_group("orders")
+    for i in range(5):
+        await stateful_broker.publish("orders", f"m{i}".encode())
+    await stateful_broker.read("orders", consumer="c1", count=100, block_ms=1)  # 5 → PEL
+
+    cursor, claimed, deleted = await stateful_broker.reclaim(
+        "orders", consumer="c2", min_idle_ms=0, count=2
+    )
+
+    # ONE reclaim() call drains the whole idle-pending backlog (2+2+1 pages)…
+    assert len({m for m, _ in claimed}) == 5  # no overlap, full drain
+    assert deleted == []
+    # …and reports the completed scan.
+    assert cursor == b"0-0"
 
 
 async def test_trimmed_pending_entry_is_reported_deleted_and_purged(stateful_fake) -> None:

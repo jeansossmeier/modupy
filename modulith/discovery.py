@@ -121,7 +121,11 @@ def _detect_from_pyproject_name() -> str | None:
 
         name = data.get("project", {}).get("name")
         if name:
-            # PEP 503 normalizes hyphens to underscores for import names.
+            # Distribution names may contain hyphens, but import package
+            # names must be valid Python identifiers — the conventional
+            # packaging mapping replaces '-' with '_'. (NOT PEP 503, which
+            # governs package-index name normalization — hyphens/dots/
+            # underscores collapse to '-', the opposite direction; A4-r2-82.)
             return str(name).replace("-", "_")
         # A pyproject without [project].name isn't a package declaration
         # (e.g. a tooling-only or monorepo-root file); try the next parent.

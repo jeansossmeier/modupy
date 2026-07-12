@@ -882,16 +882,6 @@ def test_main_unexpected_internal_error_exits_2(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "S3-r2-124 (production gap): os.execvp('uvicorn', ...) is unguarded in "
-        "`modulith run`/`dev`, so a missing uvicorn binary — an environment/user "
-        "error per the documented exit-code scheme — escapes as a raw "
-        "FileNotFoundError traceback with exit code 2 (reserved for internal "
-        "bugs) instead of an actionable message with exit code 1"
-    ),
-)
 def test_run_missing_uvicorn_binary_is_a_clean_user_error(monkeypatch, capsys) -> None:
     """S3-r2-124: when the uvicorn console script is not on PATH, the CLI
     should print an actionable error naming uvicorn and exit 1 (user/
@@ -913,4 +903,97 @@ def test_run_missing_uvicorn_binary_is_a_clean_user_error(monkeypatch, capsys) -
     captured = capsys.readouterr()
     assert excinfo.value.code == 1  # user/environment error, not internal (2)
     assert "uvicorn" in captured.err.lower()
+    assert "Traceback" not in captured.err
+
+
+def test_dev_missing_uvicorn_binary_is_a_clean_user_error(monkeypatch, capsys) -> None:
+    """S3-r2-124 (W2 RESIDUALS item 4): the `dev` single-process path execs
+    uvicorn too — a missing binary must be the same clean exit-1 user error
+    as `run`, never a raw FileNotFoundError traceback with exit code 2."""
+    import sys as _sys
+
+    import modulith.cli as cli
+
+    def missing_execvp(file: str, args: list[str]) -> None:
+        raise FileNotFoundError(2, "No such file or directory", file)
+
+    monkeypatch.setattr(os, "execvp", missing_execvp)
+    monkeypatch.setattr(_sys, "argv", ["modulith", "dev", "myapp:app"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 1  # user/environment error, not internal (2)
+    assert "uvicorn" in captured.err.lower()
+    assert "Traceback" not in captured.err
+
+
+# ---------------------------------------------------------------------------
+# corrupt ratchet baseline is a user error (G11 disclosure, W2 RESIDUALS)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_ratchet_corrupt_baseline_is_clean_user_error(
+    make_fake_app, monkeypatch, capsys, tmp_path
+) -> None:
+    """G11 disclosure (W2 RESIDUALS item 3): `verify --mode=ratchet` on a
+    corrupt baseline must surface load_baseline's actionable
+    ConfigurationError and exit 1 (user error) — never the raw traceback +
+    exit 2 reserved for internal bugs."""
+    import sys as _sys
+
+    import modulith.cli as cli
+
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text("{not valid json", encoding="utf-8")
+    monkeypatch.setattr(
+        _sys,
+        "argv",
+        ["modulith", "verify", "--mode", "ratchet", "--baseline", str(baseline)],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 1  # user error, not internal (2)
+    assert "baseline" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_docs_command_config_error_from_render_hook_is_clean_user_error(
+    make_fake_app, monkeypatch, capsys, tmp_path
+) -> None:
+    """W2 RESIDUALS follow-through (A11-r4-188/189): the docs generator now
+    raises ConfigurationError for duplicate/unsafe module names — the `docs`
+    command must map it to the documented exit 1 (user error), never the
+    exit-2 traceback reserved for internal bugs."""
+    import sys as _sys
+
+    import modulith.cli as cli
+    from modulith import hookimpl as _hookimpl
+    from modulith.config import ConfigurationError
+    from modulith.runtime import _runtime
+
+    class _BadDocsPlugin:
+        @_hookimpl
+        def modulith_render_documentation(self, modules: list, output_dir: str) -> list[str]:
+            raise ConfigurationError("duplicate module name(s) in documentation render")
+
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    _runtime._extra_plugins.append(_BadDocsPlugin())
+    monkeypatch.setattr(
+        _sys, "argv", ["modulith", "docs", "--output-dir", str(tmp_path / "gen-docs")]
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 1  # user error, not internal (2)
+    assert "duplicate module name" in captured.err
     assert "Traceback" not in captured.err

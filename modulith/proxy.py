@@ -196,6 +196,20 @@ def create_proxy_app(
                 exc,
             )
             return JSONResponse({"detail": "backend unreachable"}, status_code=502)
+        except httpx.RequestError as exc:
+            # RequestError siblings outside the TransportError subtree —
+            # httpx.TooManyRedirects (a redirect-looping backend behind an
+            # injected follow_redirects=True client, S3-r3-162) and
+            # httpx.DecodingError. Both mean "no valid response could be
+            # obtained from the backend" → 502, honoring the
+            # never-an-uncaught-500 contract documented above.
+            logger.warning(
+                "backend %s returned no usable response for %s: %s",
+                rule.backend_url,
+                _without_query(upstream),
+                exc,
+            )
+            return JSONResponse({"detail": "backend error"}, status_code=502)
 
         return StreamingResponse(
             _safe_stream(upstream_resp, _without_query(upstream)),

@@ -74,6 +74,14 @@ class Runtime:
         # event-capturing spy — append here before triggering bootstrap.
         self._extra_plugins: list[Any] = []
 
+        # Plugin names to skip at bootstrap — forwarded to
+        # create_plugin_manager(disable=...). Set via
+        # configure(disable_plugins=[...]); the extra_plugins counterpart.
+        # This is what makes the documented escape hatches (e.g.
+        # disable=['modulith.observe-shield'], or replacing a built-in)
+        # reachable from application configuration (G09 disclosure).
+        self._disabled_plugins: list[str] = []
+
     # ----- Accessors (read-only views for plugins and tooling) -------------
 
     @property
@@ -116,6 +124,12 @@ class Runtime:
         the flag without the lock and a configure() racing a concurrent
         first-publish could pass the guard *after* _bootstrap already consumed
         _config_overrides — silently dropping the override instead of raising.
+
+        Beyond Configuration fields, one runtime-level kwarg is accepted:
+        ``disable_plugins`` — a list/tuple of plugin names to skip at
+        bootstrap (built-in module paths, entry-point names, or the
+        observe-shield's ``modulith.observe-shield``), forwarded to
+        ``create_plugin_manager(disable=...)``.
         """
         with self._lock:
             if self._bootstrapping_thread == threading.get_ident():
@@ -137,6 +151,22 @@ class Runtime:
                     "Call it at application startup, before any @listener "
                     "registration or publish() call."
                 )
+            # Runtime-level (non-Configuration) override: plugin names to skip
+            # at bootstrap. Validated here — a bare string would silently
+            # iterate as characters, disabling nothing.
+            if "disable_plugins" in overrides:
+                disable = overrides.pop("disable_plugins")
+                if (
+                    isinstance(disable, str)
+                    or not isinstance(disable, list | tuple)
+                    or not all(isinstance(name, str) for name in disable)
+                ):
+                    raise ConfigurationError(
+                        "disable_plugins must be a list/tuple of plugin-name "
+                        "strings, e.g. configure(disable_plugins="
+                        f"['modulith.observe-shield']); got {disable!r}"
+                    )
+                self._disabled_plugins = list(disable)
             self._config_overrides.update(overrides)
 
     def register_listener(self, event_type: type, handler: Callable[..., Any]) -> None:
@@ -179,6 +209,18 @@ class Runtime:
              both double-fire listeners and run them before commit.
           3. Otherwise dispatch in-memory, firing the per-listener
              observability hooks around each listener invocation.
+
+        Failure contract on the DIRECT (non-transactional) path: when the
+        event routes to a cross-process broker, the broker send is awaited
+        inline and a broker publish failure PROPAGATES to this caller —
+        fail-loud by design (S3-r2-122), never swallowed: with no outbox
+        row persisted, a swallowed send would lose the event for every
+        remote consumer with zero trace. Callers that need publish() to be
+        decoupled from broker availability should use the transactional
+        outbox path (bind a session + durable store), where the send
+        happens after commit with retry/dead-letter handling. Pinned by
+        tests/test_cross_process.py::
+        test_broker_publish_failure_propagates_to_publisher.
         """
         self.ensure_bootstrapped()
         assert self._plugin_manager is not None  # for type-checker
@@ -520,8 +562,13 @@ class Runtime:
             config = replace(config, package=detected)
 
         # 3. Create the plugin manager (loads built-ins + entry points, plus
-        # any programmatically-injected extras such as the test spy).
-        plugin_manager = create_plugin_manager(extra_plugins=self._extra_plugins)
+        # any programmatically-injected extras such as the test spy), skipping
+        # anything named in configure(disable_plugins=[...]) — the documented
+        # escape hatch for e.g. the observe-shield or replacing a built-in.
+        plugin_manager = create_plugin_manager(
+            extra_plugins=self._extra_plugins,
+            disable=self._disabled_plugins,
+        )
 
         # 4. Build the event bus — kept LOCAL until bootstrap succeeds, so
         # register_listener() keeps queueing into _pending_listeners for the
@@ -719,6 +766,7 @@ class Runtime:
         self._modules = []
         self._pending_listeners = []
         self._extra_plugins = []
+        self._disabled_plugins = []
         # The manifest registry is a separate module-global, populated by
         # declare_module at import time. Resetting the runtime without clearing
         # it leaks manifests across re-bootstraps: a re-imported _manifest.py

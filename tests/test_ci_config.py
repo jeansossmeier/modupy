@@ -86,10 +86,13 @@ def test_integration_extra_provides_testcontainers_drivers() -> None:
 
 
 def test_mypy_job_type_checks_tests() -> None:
-    """S2-r1-56: mypy in CI must cover tests/, not just modulith/."""
+    """S2-r1-56: mypy in CI must cover tests/, not just modulith/ — and it
+    must run under --strict (W2 RESIDUALS item 12a: the previous regex made
+    ``--strict`` optional, so CI silently dropping it would still pass this
+    guard)."""
     ci = _ci_text()
-    assert re.search(r"mypy\s+(--strict\s+)?modulith/?\s+tests/?", ci), (
-        "CI mypy invocation must type-check tests/ alongside modulith/"
+    assert re.search(r"mypy\s+--strict\s+modulith/?\s+tests/?", ci), (
+        "CI mypy invocation must run `mypy --strict` over both modulith/ and tests/"
     )
 
 

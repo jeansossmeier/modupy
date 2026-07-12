@@ -71,6 +71,12 @@ instance/
 # Sphinx documentation
 docs/_build/
 
+# modulith-generated docs in the example apps: the demo README documents
+# running `modulith docs` from examples/demo_app, which writes generated
+# Mermaid/canvas build artifacts into docs/modulith there — build output,
+# never tracked (DX-r1-71).
+examples/*/docs/
+
 # PyBuilder
 .pybuilder/
 target/

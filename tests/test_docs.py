@@ -7,10 +7,14 @@ from __init__.py, internal files from the package tree).
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
+import pytest
 
 from modulith import ModuleInfo
 from modulith.builtin import docs
+from modulith.config import ConfigurationError
 
 
 def _module(name: str) -> ModuleInfo:
@@ -266,3 +270,143 @@ def test_public_api_returns_empty_for_unparseable_init(make_fake_app) -> None:
     make_fake_app({"badinit": "def broken(:\n    pass\n"})
 
     assert docs._public_api(_module("badinit")) == []
+
+
+# ---------------------------------------------------------------------------
+# W2 RESIDUALS — docs.py hardening
+# ---------------------------------------------------------------------------
+
+
+def test_architecture_diagram_escapes_reserved_mermaid_node_ids(make_fake_app) -> None:
+    """A11-r1-41: a module named after a Mermaid reserved word ('end') must not
+    be emitted as a bare node id — that produces an unparseable diagram,
+    contradicting the 'renders natively on GitHub/GitLab' claim. The sanitized
+    id carries the display label with the real name; edges use the same id."""
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+    make_fake_app({"end": "", "orders": ""})
+    _declare("fakeapp.orders", publishes=("OrderCreated",))
+    _declare("fakeapp.end", consumes=("OrderCreated",))
+    try:
+        mmd = docs._render_architecture_diagram([_module("end"), _module("orders")])
+    finally:
+        manifest_module._reset_for_testing()
+
+    lines = mmd.splitlines()
+    assert "  end[End Module]" not in lines  # bare reserved id is a parse error
+    assert "  m_end[End Module]" in lines  # sanitized id, real display label
+    assert "  orders -->|publishes OrderCreated| m_end" in lines  # edges match ids
+    assert "  orders[Orders Module]" in lines  # non-reserved names untouched
+
+
+def test_event_flow_escapes_reserved_mermaid_participants(make_fake_app) -> None:
+    """A11-r1-41: sequence-diagram participants named after Mermaid reserved
+    words ('end' terminates blocks in sequenceDiagram too) get a sanitized id
+    with the real name as the display alias."""
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+    make_fake_app({"end": "", "orders": ""})
+    _declare("fakeapp.orders", publishes=("OrderCreated",))
+    _declare("fakeapp.end", consumes=("OrderCreated",))
+    try:
+        mmd = docs._render_event_flow_diagram([_module("end"), _module("orders")])
+    finally:
+        manifest_module._reset_for_testing()
+
+    lines = mmd.splitlines()
+    assert "  participant end" not in lines  # bare reserved participant
+    assert "  participant m_end as end" in lines  # sanitized id, aliased name
+    assert "  orders->>m_end: OrderCreated" in lines  # edges use the same id
+    assert "  participant orders" in lines  # non-reserved names untouched
+
+
+def test_render_documentation_rejects_path_traversal_module_name(tmp_path: Path) -> None:
+    """A11-r4-188: ModuleInfo.name comes from the pluggable discovery hook and
+    is used directly as a canvas file name — a traversal name must be rejected
+    loudly BEFORE anything is written, never written outside output_dir."""
+    out = tmp_path / "docs"
+    (tmp_path / "outside").mkdir()  # a landing zone the traversal would reach
+    evil = ModuleInfo(name="../../outside/pwned", package="fakeapp.whatever")
+
+    with pytest.raises(ConfigurationError, match="module name"):
+        docs.modulith_render_documentation([evil], str(out))
+
+    assert not (tmp_path / "outside" / "pwned.md").exists()
+    assert not out.exists()  # validation precedes ALL writes
+
+
+def test_render_documentation_rejects_duplicate_module_names(tmp_path: Path) -> None:
+    """A11-r4-189: two modules sharing a name silently overwrote each other's
+    canvas while 'produced' claimed both were written — duplicates must raise
+    a loud error naming the colliding packages instead."""
+    out = tmp_path / "docs"
+    v1 = ModuleInfo(name="orders", package="fakeapp.orders_v1")
+    v2 = ModuleInfo(name="orders", package="fakeapp.orders_v2")
+
+    with pytest.raises(ConfigurationError, match="orders_v1"):
+        docs.modulith_render_documentation([v1, v2], str(out))
+
+    assert not out.exists()  # nothing written for an ambiguous module set
+
+
+def test_introspect_events_skips_unreadable_file_with_warning(
+    make_fake_app, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A11-r5-222: a broken symlink (OSError on read) must not crash the whole
+    render — the file is skipped with a warning naming file and reason, and
+    the module's other, valid files still contribute their events."""
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event
+
+                @event
+                @dataclass(frozen=True)
+                class OrderCreated:
+                    order_id: str
+            """,
+        }
+    )
+    (tmp_path / "fakeapp" / "orders" / "ghost.py").symlink_to(tmp_path / "missing" / "nope.py")
+
+    with caplog.at_level(logging.WARNING, logger="modulith.docs"):
+        published, consumed = docs._introspect_events(_module("orders"))
+
+    assert published == ["OrderCreated"]
+    assert consumed == []
+    assert "ghost.py" in caplog.text
+    assert "FileNotFoundError" in caplog.text
+
+
+def test_introspect_events_logs_warning_for_unparseable_file(
+    make_fake_app, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A11-r4-191 (logging half): the SyntaxError skip at the introspection
+    scan must log a warning with the file and reason, not skip silently."""
+    make_fake_app(
+        {"orders": ""},
+        extra_files={"orders/broken.py": "def broken(:\n    pass\n"},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="modulith.docs"):
+        docs._introspect_events(_module("orders"))
+
+    assert "broken.py" in caplog.text
+    assert "SyntaxError" in caplog.text
+
+
+def test_public_api_logs_warning_for_unparseable_init(
+    make_fake_app, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A11-r4-191 (logging half): the unparseable-__init__ skip in the public
+    API scan must log a warning with the file and reason, not skip silently."""
+    make_fake_app({"badinit": "def broken(:\n    pass\n"})
+
+    with caplog.at_level(logging.WARNING, logger="modulith.docs"):
+        assert docs._public_api(_module("badinit")) == []
+
+    assert "__init__.py" in caplog.text
+    assert "SyntaxError" in caplog.text

@@ -68,6 +68,11 @@ _DEFAULT_GROUP = "modulith"
 _DEFAULT_MAXLEN = 10000
 
 
+def _cursor_str(raw: Any) -> str:
+    """Normalize an XAUTOCLAIM cursor (bytes from redis-py, str from fakes)."""
+    return raw.decode() if isinstance(raw, bytes) else str(raw)
+
+
 # ---------------------------------------------------------------------------
 # Broker implementation
 # ---------------------------------------------------------------------------
@@ -205,12 +210,42 @@ class RedisStreamsBroker:
         pending longer than ``min_idle_ms``. Keep ``min_idle_ms`` above the
         worst-case handler latency, and keep handlers idempotent regardless
         (at-least-once delivery).
+
+        XAUTOCLAIM caps each call at ``count`` and returns a continuation
+        cursor; a single call therefore drains at most ``count`` entries.
+        This method follows the cursor until it returns ``0-0`` — exactly one
+        full PEL scan per reclaim (A7-r3-140), bounded (it never rescans, so
+        it cannot spin) — and returns the aggregated
+        ``(b"0-0", claimed, deleted)`` triple, so a >``count`` idle-pending
+        backlog is recovered in one reclaim cycle instead of leaking across
+        many poll intervals.
         """
         stream = self._stream_name(target)
         group_name = group or self._consumer_group
-        return await self._client.xautoclaim(
-            stream, group_name, consumer, min_idle_ms, start_id="0-0", count=count
-        )
+        cursor = "0-0"
+        claimed: list[Any] = []
+        deleted: list[Any] = []
+        while True:
+            result = await self._client.xautoclaim(
+                stream, group_name, consumer, min_idle_ms, start_id=cursor, count=count
+            )
+            if result and len(result) > 1:
+                claimed.extend(result[1])
+            if result and len(result) > 2:
+                deleted.extend(result[2])
+            next_cursor = _cursor_str(result[0]) if result else "0-0"
+            if next_cursor == "0-0":
+                break  # full PEL scan completed
+            if next_cursor == cursor:  # defensive: no progress → never spin
+                logger.warning(
+                    "xautoclaim cursor did not advance past %s on stream %s — "
+                    "stopping this reclaim cycle",
+                    next_cursor,
+                    stream,
+                )
+                break
+            cursor = next_cursor
+        return (b"0-0", claimed, deleted)
 
     async def dead_letter(
         self,

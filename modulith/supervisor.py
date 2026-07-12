@@ -495,8 +495,13 @@ async def run_supervised(
     sup = supervisor if supervisor is not None else Supervisor(specs)
     serve_fn = serve if serve is not None else _serve_uvicorn
 
-    await sup.start()
+    # start() sits INSIDE the try: Supervisor.start() has no mid-loop
+    # rollback, so a partial-spawn failure (e.g. the 3rd of 5 workers fails
+    # to exec) would otherwise never reach stop() and the already-spawned
+    # workers would be orphaned (S3-r3-161). stop() is safe on a partial
+    # start — it only reaps what _spawn registered.
     try:
+        await sup.start()
         await serve_fn(proxy_app, proxy_host, proxy_port)
     finally:
         await sup.stop()

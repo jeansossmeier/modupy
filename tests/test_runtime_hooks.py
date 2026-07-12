@@ -276,3 +276,56 @@ async def test_shutdown_closes_registered_brokers(fake_app) -> None:
     await _runtime.shutdown()
 
     assert broker.closed is True
+
+
+# ---------------------------------------------------------------------------
+# disable_plugins escape hatch (G09 disclosure, W2 RESIDUALS item 5)
+# ---------------------------------------------------------------------------
+
+
+def test_observe_shield_registered_by_default(make_fake_app) -> None:
+    """Control for the disable escape hatch: a default bootstrap registers
+    the observe-shield under its public, disable-able name."""
+    from modulith.manager import OBSERVE_SHIELD_NAME
+
+    make_fake_app({"orders": ""})
+    _runtime.configure(package="fakeapp")
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.plugin_manager.has_plugin(OBSERVE_SHIELD_NAME)
+
+
+def test_configure_disable_plugins_reaches_plugin_manager(make_fake_app) -> None:
+    """G09 disclosure (W2 RESIDUALS item 5): the documented
+    disable=['modulith.observe-shield'] escape hatch (manager.py) was
+    unreachable from app config — bootstrap called create_plugin_manager
+    without forwarding any disable list. configure(disable_plugins=[...])
+    must reach it, following the extra_plugins pattern."""
+    from modulith.manager import OBSERVE_SHIELD_NAME
+
+    make_fake_app({"orders": ""})
+    _runtime.configure(package="fakeapp", disable_plugins=[OBSERVE_SHIELD_NAME])
+    _runtime.ensure_bootstrapped()
+
+    assert not _runtime.plugin_manager.has_plugin(OBSERVE_SHIELD_NAME)
+
+
+def test_configure_disable_plugins_can_disable_builtins(make_fake_app) -> None:
+    """The same kwarg disables ordinary built-in plugins (the documented
+    replace-a-built-in flow), not just the shield."""
+    make_fake_app({"orders": ""})
+    _runtime.configure(package="fakeapp", disable_plugins=["modulith.builtin.docs"])
+    _runtime.ensure_bootstrapped()
+
+    assert not _runtime.plugin_manager.has_plugin("modulith.builtin.docs")
+    assert _runtime.plugin_manager.has_plugin("modulith.builtin.verifier")
+
+
+def test_configure_disable_plugins_rejects_non_list(make_fake_app) -> None:
+    """A bare string iterates as characters — the classic silent misuse —
+    so it must be rejected loudly, like every other config typo."""
+    from modulith.config import ConfigurationError
+
+    make_fake_app({"orders": ""})
+    with pytest.raises(ConfigurationError, match="disable_plugins"):
+        _runtime.configure(package="fakeapp", disable_plugins="modulith.observe-shield")

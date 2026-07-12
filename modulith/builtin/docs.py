@@ -24,9 +24,100 @@ from pathlib import Path
 
 from modulith import ModuleInfo, hookimpl
 from modulith.builtin.verifier import _collect_imports, _owning_module, _package_dir
+from modulith.config import ConfigurationError
 from modulith.manifest import all_manifests, get_manifest
 
 logger = logging.getLogger("modulith.docs")
+
+# Mermaid reserved words (flowchart + sequenceDiagram grammars) that break
+# parsing when used as bare node ids or participant names — e.g. a module
+# directory named ``end`` (valid Python package, reserved in Mermaid) renders
+# an unparseable diagram (A11-r1-41). Module names come from the pluggable
+# discovery hook, so any valid identifier is possible. Compared lowercase.
+_MERMAID_RESERVED = frozenset(
+    {
+        # flowchart / graph
+        "end",
+        "graph",
+        "flowchart",
+        "subgraph",
+        "direction",
+        "style",
+        "linkstyle",
+        "classdef",
+        "class",
+        "click",
+        "default",
+        "interpolate",
+        # sequenceDiagram
+        "participant",
+        "actor",
+        "loop",
+        "alt",
+        "else",
+        "opt",
+        "par",
+        "and",
+        "rect",
+        "note",
+        "activate",
+        "deactivate",
+        "autonumber",
+        "title",
+        "box",
+        "break",
+        "critical",
+        "option",
+    }
+)
+
+
+def _mermaid_id(name: str) -> str:
+    """A Mermaid-safe node/participant id for a module name.
+
+    Names colliding with Mermaid reserved words get an ``m_`` prefix; the
+    display label / participant alias still carries the real name, so the
+    rendered diagram reads identically while staying parseable.
+    """
+    return f"m_{name}" if name.lower() in _MERMAID_RESERVED else name
+
+
+def _validate_module_names(modules: list[ModuleInfo]) -> None:
+    """Reject module names the docs generator cannot key files by.
+
+    ``ModuleInfo.name`` comes from the pluggable ``modulith_discover_modules``
+    hook, so it is user-controllable input, not trusted framework state.
+    Validated BEFORE anything is written:
+
+      * duplicate names (A11-r4-189) — canvases are keyed by name, so
+        duplicates silently overwrite each other while ``produced`` claims
+        both were written; and
+      * names that are not a single safe path segment (A11-r4-188) — the
+        canvas path ``<output_dir>/modules/<name>.md`` would escape (or nest
+        outside) the output directory.
+    """
+    by_name: dict[str, list[str]] = defaultdict(list)
+    for module in modules:
+        by_name[module.name].append(module.package)
+    duplicates = {name: pkgs for name, pkgs in by_name.items() if len(pkgs) > 1}
+    if duplicates:
+        details = "; ".join(
+            f"{name!r} (packages: {', '.join(pkgs)})" for name, pkgs in sorted(duplicates.items())
+        )
+        raise ConfigurationError(
+            f"duplicate module name(s) in documentation render: {details}. "
+            "Canvas files are keyed by module name, so duplicates would "
+            "silently overwrite each other — give each module a unique name."
+        )
+    for module in modules:
+        name = module.name
+        if not name or name in (".", "..") or Path(name).name != name or "\\" in name:
+            raise ConfigurationError(
+                f"module name {name!r} (package {module.package!r}) is not a "
+                "safe file name — canvas files are written to "
+                "<output_dir>/modules/<name>.md, and this name would escape "
+                "or nest outside that directory."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +133,12 @@ def modulith_render_documentation(
     """Generate all built-in documentation artifacts.
 
     Returns the list of files produced (relative to output_dir).
+
+    Raises ConfigurationError — before anything is written — when the module
+    set carries duplicate names or a name that is not a safe single path
+    segment (see ``_validate_module_names``).
     """
+    _validate_module_names(modules)
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -122,15 +218,15 @@ def _render_architecture_diagram(modules: list[ModuleInfo]) -> str:
     """
     lines = ["graph TD"]
     for module in modules:
-        lines.append(f"  {module.name}[{module.name.title()} Module]")
+        lines.append(f"  {_mermaid_id(module.name)}[{module.name.title()} Module]")
 
     edges = _event_edges(modules)
     if edges:
         for src, dst, event in edges:
-            lines.append(f"  {src} -->|publishes {event}| {dst}")
+            lines.append(f"  {_mermaid_id(src)} -->|publishes {event}| {_mermaid_id(dst)}")
     else:
         for src, dst in _import_edges(modules):
-            lines.append(f"  {src} --> {dst}")
+            lines.append(f"  {_mermaid_id(src)} --> {_mermaid_id(dst)}")
     return "\n".join(lines) + "\n"
 
 
@@ -258,7 +354,17 @@ def _introspect_events(module: ModuleInfo) -> tuple[list[str], list[str]]:
     for path in sorted(root.rglob("*.py")):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        except (SyntaxError, UnicodeDecodeError):
+        except (OSError, SyntaxError, UnicodeDecodeError) as exc:
+            # One unreadable file (broken symlink, permission denied) or
+            # unparseable file must degrade this module's introspection, not
+            # abort the whole render (A11-r5-222) — and never silently
+            # (A11-r4-191): name the file and the reason.
+            logger.warning(
+                "docs: skipping %s during event introspection (%s: %s)",
+                path,
+                type(exc).__name__,
+                exc,
+            )
             continue
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef) and _has_decorator(node, "event"):
@@ -282,7 +388,16 @@ def _public_api(module: ModuleInfo) -> list[str]:
         return []
     try:
         tree = ast.parse(init.read_text(encoding="utf-8"), filename=str(init))
-    except (SyntaxError, UnicodeDecodeError):
+    except (OSError, SyntaxError, UnicodeDecodeError) as exc:
+        # Same graceful-degrade + loud-skip contract as _introspect_events
+        # (A11-r5-222 / A11-r4-191): an unreadable or unparseable __init__.py
+        # yields an empty public API, with the file and reason logged.
+        logger.warning(
+            "docs: skipping public-API scan of %s (%s: %s)",
+            init,
+            type(exc).__name__,
+            exc,
+        )
         return []
     names: list[str] = []
     for node in tree.body:
@@ -326,9 +441,15 @@ def _render_event_flow_diagram(modules: list[ModuleInfo]) -> str:
     """
     lines = ["sequenceDiagram"]
     for module in modules:
-        lines.append(f"  participant {module.name}")
+        pid = _mermaid_id(module.name)
+        if pid != module.name:
+            # Reserved word ('end' terminates blocks in sequenceDiagram too):
+            # sanitized id, real name as the display alias.
+            lines.append(f"  participant {pid} as {module.name}")
+        else:
+            lines.append(f"  participant {module.name}")
     for src, dst, event in _event_edges(modules):
-        lines.append(f"  {src}->>{dst}: {event}")
+        lines.append(f"  {_mermaid_id(src)}->>{_mermaid_id(dst)}: {event}")
     return "\n".join(lines) + "\n"
 
 

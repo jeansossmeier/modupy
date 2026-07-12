@@ -166,6 +166,27 @@ def _configure_process_runtime(app_module: str) -> None:
     _runtime.configure(**overrides)
 
 
+def _exec_uvicorn(argv: list[str]) -> None:
+    """Replace this process with uvicorn, mapping launch failure to exit 1.
+
+    ``os.execvp`` only returns by raising. A missing uvicorn binary
+    (FileNotFoundError) — or any other OSError launching it — is an
+    environment/user error per the documented exit-code scheme, so it must
+    surface as an actionable message with exit 1, never the raw traceback +
+    exit 2 reserved for internal bugs (S3-r2-124).
+    """
+    try:
+        os.execvp("uvicorn", argv)
+    except OSError as exc:
+        typer.echo(
+            f"error: could not launch 'uvicorn' ({exc}). Install it in this "
+            "environment — e.g. `pip install uvicorn` or `pip install "
+            "'modulith[fastapi]'` — or run your ASGI server directly.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
+
+
 _TOPOLOGIES = ("single", "processes")
 
 
@@ -463,7 +484,7 @@ def dev(
     typer.echo(
         f"modulith dev → {app_module} on http://{host}:{port} (reload={'on' if reload else 'off'})"
     )
-    os.execvp("uvicorn", argv)
+    _exec_uvicorn(argv)
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +529,7 @@ def run(
 
     argv = ["uvicorn", app_module, "--host", host, "--port", str(port)]
     typer.echo(f"modulith run → {app_module} on http://{host}:{port}")
-    os.execvp("uvicorn", argv)
+    _exec_uvicorn(argv)
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +572,15 @@ def verify(
         return
 
     if mode == "ratchet":
-        grandfathered = verifier.load_baseline(baseline)
+        try:
+            grandfathered = verifier.load_baseline(baseline)
+        except ConfigurationError as exc:
+            # A corrupt/schema-mismatched baseline is a user error: surface
+            # load_baseline's actionable message (it names the path and the
+            # regeneration command) and exit 1 — never the raw traceback +
+            # exit 2 reserved for internal bugs (G11 disclosure).
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=1) from None
         reported = verifier.filter_against_baseline(violations, grandfathered)
     else:
         reported = violations
@@ -573,16 +602,29 @@ def verify(
 def docs(
     output_dir: Path = typer.Option(Path("docs/modulith")),
 ) -> None:
-    """Generate Mermaid diagrams and module canvases."""
+    """Generate Mermaid diagrams and module canvases.
+
+    Exit codes: 0 on success, 1 on configuration errors (e.g. a discovery
+    hook produced duplicate or unsafe module names — see the built-in docs
+    generator's validation), 2 on unexpected internal errors.
+    """
     rt = _bootstrap_or_exit()
     modules = rt.modules
     pm = rt.plugin_manager
 
     produced: list[str] = []
-    for result in pm.hook.modulith_render_documentation(
-        modules=modules, output_dir=str(output_dir)
-    ):
-        produced.extend(result)
+    try:
+        for result in pm.hook.modulith_render_documentation(
+            modules=modules, output_dir=str(output_dir)
+        ):
+            produced.extend(result)
+    except ConfigurationError as exc:
+        # The built-in generator validates module names (duplicates, unsafe
+        # path segments — A11-r4-188/189) and raises ConfigurationError with
+        # an actionable message: a user/config error per the documented exit
+        # codes, not the exit-2 traceback reserved for internal bugs.
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
 
     if not produced:
         typer.echo("no documentation artifacts produced")

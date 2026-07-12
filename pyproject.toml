@@ -301,6 +301,16 @@ disable_error_code = [
 module = ["fakeapp", "fakeapp.*", "shop", "shop.*", "testcontainers.*", "docker", "docker.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# Deliberately unimportable TYPE_CHECKING-only scaffold module: the G03
+# regression test (tests/test_serializers.py, audit A6-r5-210) mirrors an
+# event module whose annotation-only dependency isn't installed in the
+# worker process. It must never resolve — silence import-not-found so the
+# CI tests-lane `mypy --strict modulith/ tests/` stays green (DX, W2
+# RESIDUALS item 12b).
+module = ["w2_g03_nonexistent_debug_module"]
+ignore_missing_imports = true
+
 # ---------------------------------------------------------------------------
 # Self-application of modulith (the framework using itself)
 # ---------------------------------------------------------------------------

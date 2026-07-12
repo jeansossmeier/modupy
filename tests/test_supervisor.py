@@ -166,6 +166,63 @@ async def test_run_supervised_stops_even_when_serve_raises() -> None:
     assert sup.events == ["start", "serve", "stop"]
 
 
+async def test_run_supervised_stops_workers_when_start_fails_partway() -> None:
+    """S3-r3-161 (W2 RESIDUALS item 8): ``await sup.start()`` used to sit
+    OUTSIDE the try/finally guarding serve_fn, and Supervisor.start() has no
+    mid-loop rollback — a partial-spawn failure (e.g. 3rd of 5 workers fails)
+    never triggered sup.stop(), orphaning the already-spawned workers.
+    start() must be guarded so stop() reaps the partial spawn."""
+
+    class _PartialStartSupervisor(_FakeSupervisor):
+        async def start(self) -> None:
+            # Models: some workers already spawned, then one spawn fails.
+            self.events.append("start-partial")
+            raise RuntimeError("worker 3 of 5 failed to spawn")
+
+    sup = _PartialStartSupervisor()
+    served: list[str] = []
+
+    async def never_serve(app: object, host: str, port: int) -> None:
+        served.append("serve")
+
+    with pytest.raises(RuntimeError, match="failed to spawn"):
+        await run_supervised(
+            [WorkerSpec("orders", "app", 9001)],
+            "127.0.0.1",
+            8000,
+            supervisor=sup,
+            serve=never_serve,
+        )
+
+    assert sup.events == ["start-partial", "stop"]  # cleanup reaps the partial spawn
+    assert served == []  # the proxy never served — start() failed first
+
+
+@pytest.mark.integration
+async def test_run_supervised_reaps_partial_spawn_of_real_workers() -> None:
+    """S3-r3-161 (W2 RESIDUALS item 8), real-subprocess form: the 2nd of two
+    workers fails to spawn (nonexistent binary) partway through start() —
+    the worker spawned before the failure must be reaped, not orphaned."""
+    specs = [WorkerSpec("alpha", "fakeapp", 9001), WorkerSpec("bad", "fakeapp", 9002)]
+
+    def builder(spec: WorkerSpec, port: int) -> list[str]:
+        if spec.module_name == "bad":
+            return ["/nonexistent/modulith-w2-no-such-binary"]
+        return _SLEEP
+
+    sup = Supervisor(specs, command_builder=builder)
+
+    async def never_serve(app: object, host: str, port: int) -> None:
+        pytest.fail("serve must not run when start() fails")
+
+    with pytest.raises(FileNotFoundError):
+        await run_supervised(specs, "127.0.0.1", 8000, supervisor=sup, serve=never_serve)
+
+    # alpha WAS spawned before the failure — and was terminated on the way out.
+    assert "alpha" in sup._processes
+    assert all(p.returncode is not None for p in sup._processes.values())
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle (real subprocesses)
 # ---------------------------------------------------------------------------

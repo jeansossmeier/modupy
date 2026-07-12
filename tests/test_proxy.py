@@ -256,6 +256,31 @@ def test_proxy_rejects_body_over_limit() -> None:
     assert resp.status_code == 413
 
 
+def test_proxy_maps_redirect_loop_to_502(caplog) -> None:
+    """S3-r3-162 (W2 RESIDUALS item 7): httpx.TooManyRedirects is a
+    RequestError sibling of TransportError — with an injected
+    follow_redirects=True client (the documented seam) a redirect-looping
+    backend escaped the TransportError-only mapping as a raw 500, violating
+    the never-uncaught-500 contract. It must map to 502."""
+    caplog.set_level("WARNING", logger="modulith.proxy")
+
+    def _always_redirect(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": str(request.url)})
+
+    # A REAL httpx client that genuinely follows the loop until its own
+    # max_redirects trips — not a stub raising the exception by hand.
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_always_redirect), follow_redirects=True
+    )
+    app = create_proxy_app([RoutingRule("/orders", "http://orders-worker")], client=client)
+
+    with TestClient(app) as test_client:
+        resp = test_client.get("/orders/ping")
+
+    assert resp.status_code == 502  # mapped, never an uncaught 500
+    assert "/orders/ping" in caplog.text
+
+
 def test_proxy_transport_error_logs_omit_query_string_secrets(caplog) -> None:
     caplog.set_level("WARNING", logger="modulith.proxy")
     app = create_proxy_app(
