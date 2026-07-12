@@ -40,10 +40,12 @@ failure), so dispatch spans are guaranteed to end.
 
 Durable (outbox) path: when an outbox store is configured *and* a transaction
 session is bound, ``Runtime.publish`` persists the event and returns before any
-in-memory dispatch — ``modulith_after_event_published`` never fires in the
-publishing context, so starting a publish span there would leak. We detect that
-case and skip the publish span; the later outbox dispatch still emits its own
-dispatch spans.
+in-memory dispatch. ``modulith_after_event_published`` fires on this path too —
+right after the event is persisted, which is the hookspec's documented trigger
+— so the publish span is started unconditionally and, on the durable path,
+brackets the persistence step. Listener dispatch happens after the business
+transaction commits, in a different context, so those later dispatch spans are
+not parented to the publish span.
 """
 
 from __future__ import annotations
@@ -97,12 +99,14 @@ _dispatch_span: ContextVar[Any] = ContextVar("_modulith_dispatch_span", default=
 
 @hookimpl
 def modulith_before_event_published(event: Any) -> None:
-    """Start the publication span (in-memory path only)."""
+    """Start the publication span (both in-memory and durable paths).
+
+    ``modulith_after_event_published`` fires in this same context on both
+    paths — after in-memory dispatch, and on the durable path right after
+    the event is persisted to the outbox — so the span started here is
+    always ended there.
+    """
     if not _OTEL_AVAILABLE:
-        return
-    if _durable_path_owns_dispatch():
-        # The outbox will dispatch after commit; after_event_published won't
-        # fire in this context, so a span started here would never end.
         return
     span = _tracer.start_span(
         "modulith.event.publish",
@@ -179,17 +183,6 @@ def modulith_on_listener_complete(
 
 def _event_type(event: Any) -> str:
     return f"{type(event).__module__}.{type(event).__qualname__}"
-
-
-def _durable_path_owns_dispatch() -> bool:
-    """Mirror ``Runtime._outbox_owns_dispatch`` without importing the runtime.
-
-    The durable path owns dispatch when an outbox store is configured *and* a
-    transaction session is bound to the current context.
-    """
-    from . import outbox
-
-    return outbox._store is not None and outbox._current_session.get() is not None
 
 
 def _detect_calling_module() -> str:

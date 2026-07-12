@@ -97,10 +97,20 @@ def modulith_app() -> Iterator[ModulithTestApp]:
 
     Resets the global runtime singleton, registers an event-capturing spy
     plugin, and yields a handle exposing what was published and dispatched.
-    On teardown the runtime is reset again and any application modules
-    imported during the test are dropped from ``sys.modules`` so they can't
-    leak into the next test. modulith's own modules are preserved — their
-    identity backs the runtime singleton and other global state.
+    On teardown the runtime is reset again and ANY module first imported
+    during the test — application, third-party, or stdlib — is dropped from
+    ``sys.modules`` so import-time state can't leak into the next test.
+    Only ``modulith``'s own modules are preserved: their identity backs the
+    runtime singleton and other global state.
+
+    Two consequences of the delete-and-reimport strategy for modules kept
+    alive across the test boundary: a re-import yields *new* class objects
+    (``isinstance`` checks against instances created in an earlier test
+    fail), and a module whose import-time side effects register against a
+    persistent external registry (e.g. a prometheus_client-style collector)
+    can crash on re-registration in a later test. Import such modules at
+    collection time (module scope / conftest), before this fixture's
+    snapshot, so they are never deleted.
     """
     from .runtime import _runtime
 
@@ -242,6 +252,16 @@ class Scenario:
     def within(self, seconds: float) -> Any:
         """Terminal: trigger and poll for the expected event.
 
+        The trigger phase and the poll phase share ONE ``seconds`` budget:
+        the deadline is computed before the trigger fires, a ``publish``
+        trigger is bounded via ``publish_sync(..., timeout=seconds)``, and a
+        coroutine ``call`` trigger gets the remaining budget. A trigger that
+        overruns the budget is cancelled (best-effort — the cancellation
+        lands at the coroutine's next await point) so it cannot keep running
+        on the shared daemon loop and dispatch into a later test's runtime;
+        events captured before the overrun are still checked. A miss always
+        raises the documented ``AssertionError``, never a bare TimeoutError.
+
         ``publish_sync`` (and any synchronous trigger function) blocks until
         all listeners — and the events they publish in turn — have been
         dispatched and captured, so the poll loop usually finds the event on
@@ -253,22 +273,10 @@ class Scenario:
         if self._initial_event is None and self._initial_call is None:
             raise ValueError("call publish(...) or call(...) before within(...)")
 
-        from .sync import _get_or_create_loop, publish_sync
-
         mark = len(self._app.published_events)
-
-        if self._initial_event is not None:
-            publish_sync(self._initial_event)
-        else:
-            assert self._initial_call is not None
-            result = self._initial_call(*self._initial_call_args, **self._initial_call_kwargs)
-            if inspect.iscoroutine(result):
-                future: Future[Any] = asyncio.run_coroutine_threadsafe(
-                    result, _get_or_create_loop()
-                )
-                future.result(timeout=seconds)
-
         deadline = time.monotonic() + seconds
+        self._fire_trigger(seconds, deadline)
+
         while True:
             for event in self._app.published_events[mark:]:
                 if isinstance(event, self._expected_type) and (
@@ -283,6 +291,38 @@ class Scenario:
             f"expected event {self._expected_type.__name__} not seen within {seconds}s"
         )
 
+    def _fire_trigger(self, seconds: float, deadline: float) -> None:
+        """Fire the publish/call trigger, bounded by the shared budget.
+
+        A trigger that overruns is cancelled and the TimeoutError swallowed:
+        ``within()`` falls through to its poll loop, which checks whatever
+        was captured before the overrun and raises the documented
+        AssertionError on a miss.
+        """
+        from .sync import _get_or_create_loop, publish_sync
+
+        if self._initial_event is not None:
+            try:
+                publish_sync(self._initial_event, timeout=seconds)
+            except TimeoutError:
+                # The trigger overran the shared budget; publish_sync already
+                # cancelled the abandoned dispatch.
+                pass
+            return
+
+        assert self._initial_call is not None
+        result = self._initial_call(*self._initial_call_args, **self._initial_call_kwargs)
+        if inspect.iscoroutine(result):
+            future: Future[Any] = asyncio.run_coroutine_threadsafe(result, _get_or_create_loop())
+            try:
+                future.result(timeout=max(0.0, deadline - time.monotonic()))
+            except TimeoutError:
+                # Cancel the overrunning trigger so it cannot outlive this
+                # test on the shared daemon loop and dispatch into a later
+                # test's runtime (concurrent.futures.TimeoutError is an
+                # alias of TimeoutError on Python >= 3.11).
+                future.cancel()
+
 
 @pytest.fixture
 def scenario(modulith_app: ModulithTestApp) -> Scenario:
@@ -293,6 +333,16 @@ def scenario(modulith_app: ModulithTestApp) -> Scenario:
 # ---------------------------------------------------------------------------
 # Markers — declarative behavior toggles for individual tests
 # ---------------------------------------------------------------------------
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register the plugin's ini options."""
+    parser.addini(
+        "modulith_isolated_timeout",
+        "Seconds an @pytest.mark.modulith_isolated subprocess may run before "
+        "it is killed and reported as a failed test (default: 300).",
+        default="300",
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -343,6 +393,74 @@ def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> 
 # instead of recursing into another subprocess.
 _ISOLATION_GUARD = "MODULITH_ISOLATED_SUBPROCESS"
 
+# Options never forwarded to the isolated child. The child runs with the
+# cacheprovider plugin disabled (``-p no:cacheprovider``), so cache-backed
+# options would be rejected there as unrecognized, and stepwise depends on
+# the cache. ``--basetemp`` is per-run private: pytest WIPES that directory
+# at startup, so sharing the parent's would destroy its live tmp artifacts.
+_CHILD_UNSAFE_FLAGS = {
+    "--cache-clear",
+    "--cache-show",
+    "--failed-first",
+    "--ff",
+    "--lf",
+    "--last-failed",
+    "--new-first",
+    "--nf",
+    "--stepwise",
+    "--stepwise-reset",
+    "--stepwise-skip",
+    "--sw",
+    "--sw-reset",
+    "--sw-skip",
+}
+# Unsafe options that take a value (possibly as a separate argv token).
+_CHILD_UNSAFE_VALUE_OPTS = {"--basetemp", "--lfnf", "--last-failed-no-failures"}
+
+
+def _forwarded_parent_args(config: pytest.Config) -> list[str]:
+    """The parent invocation's CLI args, minus positional test targets and
+    options that are meaningless or destructive in the isolated child.
+
+    The child re-runs a single nodeid, so everything else about the parent
+    invocation — custom ``pytest_addoption`` flags, ``-m``/``-k`` filters,
+    verbosity, coverage options — must carry over; dropping them silently
+    reverted isolated tests to option defaults. Positional targets are
+    identified by membership in ``config.option.file_or_dir`` (an option
+    *value* that string-equals a positional target would be dropped too —
+    a heuristic, but pytest itself offers no cleaner split).
+    """
+    positionals = set(config.option.file_or_dir or [])
+    forwarded: list[str] = []
+    skip_next = False
+    for arg in config.invocation_params.args:
+        if skip_next:
+            skip_next = False
+            continue
+        base = arg.split("=", 1)[0]
+        if base in _CHILD_UNSAFE_VALUE_OPTS:
+            skip_next = "=" not in arg
+            continue
+        if base in _CHILD_UNSAFE_FLAGS:
+            continue
+        if arg in positionals:
+            continue
+        forwarded.append(arg)
+    return forwarded
+
+
+def _stream_text(stream: str | bytes | None) -> str:
+    """Best-effort text for a captured child stream.
+
+    ``subprocess.TimeoutExpired`` may carry ``None`` (POSIX) or bytes for a
+    stream even when the run was started with ``text=True``.
+    """
+    if stream is None:
+        return ""
+    if isinstance(stream, bytes):
+        return stream.decode(errors="replace")
+    return stream
+
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> bool | None:
@@ -354,6 +472,14 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
     synthesize a report from the child's exit code. Returning ``None`` for
     every other case hands control straight back to pytest's default
     protocol, so unmarked tests are completely unaffected.
+
+    The child inherits the parent invocation's CLI arguments (see
+    ``_forwarded_parent_args``), runs from pytest's rootdir so the nodeid
+    resolves regardless of the parent's cwd, and is killed after
+    ``modulith_isolated_timeout`` seconds (ini option, default 300) so one
+    hung test can't block the suite forever. The launch itself happens
+    inside the reported call, so any failure — fork/exec error, timeout,
+    nonzero exit — fails only this test item, never the whole session.
     """
     if item.get_closest_marker("modulith_isolated") is None:
         return None
@@ -367,25 +493,48 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
 
     env = dict(os.environ)
     env[_ISOLATION_GUARD] = "1"
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            item.nodeid,
-            "-p",
-            "no:cacheprovider",
-            "-o",
-            "addopts=",
-            "-q",
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    argv = [
+        sys.executable,
+        "-m",
+        "pytest",
+        *_forwarded_parent_args(item.config),
+        item.nodeid,
+        "-p",
+        "no:cacheprovider",
+        "-o",
+        "addopts=",
+        "-q",
+    ]
 
     def _outcome() -> None:
+        raw_timeout = item.config.getini("modulith_isolated_timeout")
+        try:
+            timeout = float(raw_timeout)
+        except (TypeError, ValueError):
+            raise AssertionError(
+                f"invalid modulith_isolated_timeout ini value {raw_timeout!r}: "
+                "expected a number of seconds"
+            ) from None
+        try:
+            completed = subprocess.run(
+                argv,
+                env=env,
+                # Nodeids are rootdir-relative; the parent's incidental cwd
+                # need not be (and often isn't) the rootdir.
+                cwd=str(item.config.rootpath),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise AssertionError(
+                f"isolated subprocess for {item.nodeid} timed out after "
+                f"{timeout}s (tune via the modulith_isolated_timeout ini "
+                f"option)\n"
+                f"--- stdout ---\n{_stream_text(exc.stdout)}\n"
+                f"--- stderr ---\n{_stream_text(exc.stderr)}"
+            ) from exc
         if completed.returncode != 0:
             raise AssertionError(
                 f"isolated subprocess for {item.nodeid} exited "

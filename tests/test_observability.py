@@ -196,18 +196,46 @@ def test_hooks_are_noop_when_otel_unavailable(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Durable path: no publish span (it would leak — after_event_published does
-# not fire in the publishing context when the outbox owns dispatch)
+# Durable path: publish span brackets before → after (after_event_published
+# fires there too — the event was persisted, per the hookspec contract)
 # ---------------------------------------------------------------------------
 
 
-def test_durable_path_skips_publish_span(span_exporter) -> None:
-    outbox.configure(store=object(), serializer=JsonEventSerializer(), start_loop=False)
+async def test_durable_path_emits_publish_span(span_exporter) -> None:
+    """A11-r4-187: the durable (outbox) path must emit a publish span.
+
+    ``Runtime.publish`` fires ``modulith_after_event_published`` on the
+    durable path right after the event is persisted (the hookspec's
+    documented trigger), so the tracing plugin must start the publish span
+    unconditionally in ``modulith_before_event_published`` and close it in
+    the after-hook. Skipping span creation there made tracing miss every
+    transactional publish — the production path the outbox exists for.
+    """
+    from modulith import publish
+    from modulith.runtime import _runtime
+
+    class _FakeStore:
+        def __init__(self):
+            self.saved = []
+
+        async def save(self, publication):
+            self.saved.append(publication)
+
+    class Ping:
+        pass
+
+    _runtime._reset_for_testing()
+    configure(package="obs_durable_pkg", auto_discover=False)
+    outbox.configure(store=_FakeStore(), serializer=JsonEventSerializer(), start_loop=False)
     token = outbox._current_session.set(object())
     try:
-        observability.modulith_before_event_published(event=123)
-        assert observability._publish_span.get() is None
+        await publish(Ping())
     finally:
         outbox._current_session.reset(token)
+        _runtime._reset_for_testing()
 
-    assert not _spans_by_name(span_exporter, "modulith.event.publish")
+    publish_spans = _spans_by_name(span_exporter, "modulith.event.publish")
+    assert len(publish_spans) == 1, [s.name for s in span_exporter.get_finished_spans()]
+    assert publish_spans[0].attributes["modulith.duration_ms"] >= 0.0
+    # The after-hook ended the span and cleared the ContextVar — no leak.
+    assert observability._publish_span.get() is None
