@@ -16,6 +16,8 @@ stripped per RFC 7230. WebSocket support is a v2.1 enhancement; v1 is HTTP only.
 
 from __future__ import annotations
 
+import asyncio
+import hmac
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -85,7 +87,11 @@ def create_proxy_app(
         if actuator_token is None:
             return None
         expected = f"Bearer {actuator_token}"
-        if request.headers.get("authorization") == expected:
+        supplied = request.headers.get("authorization", "")
+        # Constant-time comparison: a plain `==` short-circuits on the first
+        # mismatched byte, leaking token prefixes through a timing
+        # side-channel. Compare as bytes — compare_digest rejects non-ASCII str.
+        if hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
             return None
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
 
@@ -103,16 +109,18 @@ def create_proxy_app(
         denied = _actuator_auth_response(request)
         if denied is not None:
             return denied
-        backends: dict[str, str] = {}
-        overall = "ok"
-        for rule in rules:
+
+        async def check_one(rule: RoutingRule) -> tuple[str, str]:
             try:
                 resp = await http_client.get(rule.backend_url + "/health", timeout=2.0)
-                backends[rule.prefix] = "ok" if resp.status_code == 200 else "unhealthy"
+                return rule.prefix, "ok" if resp.status_code == 200 else "unhealthy"
             except Exception:
-                backends[rule.prefix] = "unreachable"
-            if backends[rule.prefix] != "ok":
-                overall = "degraded"
+                return rule.prefix, "unreachable"
+
+        # Concurrent fan-out: total latency ~max(per-backend latency), not
+        # the sum — a sequential loop scales O(N * per-backend timeout).
+        backends = dict(await asyncio.gather(*(check_one(rule) for rule in rules)))
+        overall = "ok" if all(state == "ok" for state in backends.values()) else "degraded"
         return {"status": overall, "backends": backends}
 
     @app.api_route(
@@ -133,21 +141,46 @@ def create_proxy_app(
         too_large = _body_too_large(request, max_request_body_bytes)
         if too_large is not None:
             return too_large
-        body = await request.body()
-        if max_request_body_bytes is not None and len(body) > max_request_body_bytes:
-            return JSONResponse({"detail": "request body too large"}, status_code=413)
+        # The Content-Length check above is only a fast path — chunked and
+        # streamed uploads carry no length header. Enforce the cap while
+        # consuming the stream so an oversized body is rejected as soon as
+        # the running total crosses the limit, never fully buffered first
+        # (single-request unbounded-memory DoS otherwise).
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            if max_request_body_bytes is not None and received > max_request_body_bytes:
+                return JSONResponse({"detail": "request body too large"}, status_code=413)
+            chunks.append(chunk)
+        body = b"".join(chunks)
         fwd_headers = _filter_headers(dict(request.headers))
         # Drop the client's Host so httpx sets it to the loopback worker's
         # authority. Forwarding the external Host (e.g. api.example.com) makes
         # workers behave as if internet-facing for URL generation / vhost /
         # Host-allowlist logic — a reverse-proxy correctness/security smell.
         fwd_headers.pop("host", None)
-        upstream_req = http_client.build_request(
-            method=request.method,
-            url=upstream,
-            headers=fwd_headers,
-            content=body,
-        )
+        try:
+            upstream_req = http_client.build_request(
+                method=request.method,
+                url=upstream,
+                headers=fwd_headers,
+                content=body,
+            )
+        except Exception as exc:
+            # build_request failures share no httpx base class the send()
+            # guard below could catch: httpx.InvalidURL (percent-encoded
+            # non-printable ASCII in the path) subclasses Exception directly,
+            # and a header carrying a raw non-ASCII octet raises
+            # UnicodeEncodeError. Both mean the *client's* request cannot be
+            # forwarded — answer 400, honoring the "never an uncaught 500"
+            # contract documented on the TransportError handler.
+            logger.warning(
+                "cannot build upstream request for %s: %s",
+                _without_query(upstream),
+                exc,
+            )
+            return JSONResponse({"detail": "invalid request"}, status_code=400)
         try:
             upstream_resp = await http_client.send(upstream_req, stream=True)
         except httpx.TransportError as exc:

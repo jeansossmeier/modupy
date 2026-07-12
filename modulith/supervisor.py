@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 import sys
 import time
 from collections import deque
@@ -49,6 +50,34 @@ if TYPE_CHECKING:
     from .proxy import RoutingRule
 
 logger = logging.getLogger("modulith.supervisor")
+
+# Parent-death signal support (Linux only). libc is resolved in the *parent*
+# at import time so the child-side preexec_fn — which runs between fork() and
+# exec(), where imports/allocations can deadlock — only makes one
+# already-bound C call.
+_PR_SET_PDEATHSIG = 1  # linux/prctl.h
+_pdeathsig_preexec: Callable[[], None] | None
+if sys.platform == "linux":
+    import ctypes
+
+    _libc = ctypes.CDLL(None, use_errno=True)
+
+    def _linux_pdeathsig_preexec() -> None:
+        """Child-side hook: SIGTERM this worker when its parent dies.
+
+        Runs in the worker between fork() and exec(). Without it a
+        SIGKILL'd/crashed supervisor (e.g. OOM-killed) orphans its workers;
+        the orphans keep their statically-assigned ports bound, so a fresh
+        supervisor's respawns fail with EADDRINUSE until an operator hunts
+        them down.
+        """
+        _libc.prctl(_PR_SET_PDEATHSIG, int(signal.SIGTERM), 0, 0, 0)
+
+    _pdeathsig_preexec = _linux_pdeathsig_preexec
+else:
+    # Non-Linux has no parent-death signal: workers CAN be orphaned when the
+    # supervisor dies without running stop(). Documented limitation.
+    _pdeathsig_preexec = None
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +221,10 @@ class Supervisor:
         # Keyed by instance name (module_name, or module_name-N for replicas).
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._monitor_tasks: list[asyncio.Task[None]] = []
-        self._log_tasks: list[asyncio.Task[None]] = []
+        # A set with drop-on-done callbacks: every (re)spawn adds two log
+        # forwarders, so pruning only in stop() would grow this without bound
+        # under a crash-looping worker (each restart leaks two done tasks).
+        self._log_tasks: set[asyncio.Task[None]] = set()
         # Instances the breaker has given up on — surfaced for health reporting.
         self._failed_instances: set[str] = set()
         self._stopping = False
@@ -222,6 +254,12 @@ class Supervisor:
         Registration into ``self._processes`` happens with no ``await`` between
         process creation and the dict assignment, so ``stop()`` can never miss a
         live process (which would orphan its subprocess transport).
+
+        On Linux, workers are spawned with ``PR_SET_PDEATHSIG`` (SIGTERM) so
+        they self-terminate if the supervisor dies without running ``stop()``
+        (SIGKILL, OOM, hard crash) instead of lingering as orphans that hold
+        their statically-assigned ports. On other platforms no equivalent
+        exists — there, a hard-killed supervisor can still orphan workers.
         """
         cmd = self._command_builder(spec, port)
         env = {
@@ -237,18 +275,29 @@ class Supervisor:
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            preexec_fn=_pdeathsig_preexec,  # None outside Linux
         )
         self._processes[name] = proc  # atomic: no await before this point
         logger.info("spawned worker %r on port %d (pid %s)", spec.module_name, port, proc.pid)
         if proc.stdout is not None:
-            self._log_tasks.append(
+            self._track_log_task(
                 asyncio.create_task(self._forward_logs(spec.module_name, proc.stdout))
             )
         if proc.stderr is not None:
-            self._log_tasks.append(
+            self._track_log_task(
                 asyncio.create_task(self._forward_logs(spec.module_name, proc.stderr))
             )
         return proc
+
+    def _track_log_task(self, task: asyncio.Task[None]) -> None:
+        """Hold a strong reference to a log forwarder only while it runs.
+
+        The done-callback prunes the task the moment it finishes (worker
+        exited → pipe EOF), so restarts don't accumulate completed tasks
+        until stop() — the set stays at ~2 live entries per live worker.
+        """
+        self._log_tasks.add(task)
+        task.add_done_callback(self._log_tasks.discard)
 
     async def _monitor_worker(
         self, name: str, spec: WorkerSpec, port: int, proc: asyncio.subprocess.Process
@@ -303,6 +352,15 @@ class Supervisor:
                 # model concurrent mutation across the await (cf. runtime.py).
                 return  # type: ignore[unreachable]
             proc = await self._spawn(name, spec, port)
+            # Reachable for the same reason as the check above: stop() may
+            # flip _stopping during _spawn's subprocess-creation await, and
+            # its one-shot SIGTERM cascade snapshotted self._processes before
+            # this process was registered. Cascade the SIGTERM here —
+            # otherwise the worker blocks stop() for the full
+            # shutdown_timeout and only ever gets the final SIGKILL reap.
+            # The loop's proc.wait() + _stopping check handle the rest.
+            if self._stopping and proc.returncode is None:  # type: ignore[unreachable]
+                proc.terminate()  # type: ignore[unreachable]
 
     async def _forward_logs(self, prefix: str, stream: asyncio.StreamReader) -> None:
         """Read a worker's output line-by-line and re-log it with its name."""
@@ -352,9 +410,12 @@ class Supervisor:
             *(proc.wait() for proc in self._processes.values()), return_exceptions=True
         )
 
-        for task in self._log_tasks:
+        # Snapshot: done-callbacks discard from the set as tasks finish
+        # cancelling, so iterate and await over a stable copy.
+        log_tasks = list(self._log_tasks)
+        for task in log_tasks:
             task.cancel()
-        await asyncio.gather(*self._log_tasks, return_exceptions=True)
+        await asyncio.gather(*log_tasks, return_exceptions=True)
         self._monitor_tasks.clear()
         self._log_tasks.clear()
         logger.info("supervisor stopped")
@@ -405,6 +466,7 @@ async def run_supervised(
     *,
     supervisor: Supervisor | None = None,
     serve: Callable[[Any, str, int], Awaitable[None]] | None = None,
+    actuator_token: str | None = None,
 ) -> None:
     """Run the supervisor + reverse proxy together.
 
@@ -414,13 +476,22 @@ async def run_supervised(
     a shutdown signal arrives. On the way out — normal exit *or* exception —
     the workers are always stopped so none are orphaned.
 
+    ``actuator_token`` guards the proxy's ``/_modulith/*`` actuator endpoints
+    with a bearer token. When not passed explicitly it falls back to the
+    ``MODULITH_ACTUATOR_TOKEN`` environment variable (empty string = unset),
+    so production deployments can enable the guard without code changes.
+    ``None``/unset leaves the actuator open (the documented default).
+
     ``supervisor`` and ``serve`` are injection seams for testing; production
     callers pass neither and get a real Supervisor plus a uvicorn server.
     """
     from .proxy import create_proxy_app
 
+    if actuator_token is None:
+        actuator_token = os.environ.get("MODULITH_ACTUATOR_TOKEN") or None
+
     rules = _rules_from_specs(specs)
-    proxy_app = create_proxy_app(rules)
+    proxy_app = create_proxy_app(rules, actuator_token=actuator_token)
     sup = supervisor if supervisor is not None else Supervisor(specs)
     serve_fn = serve if serve is not None else _serve_uvicorn
 
@@ -462,12 +533,22 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
 
     workers = config.get("workers") or {}
     default_count = int(workers.get("default", 1))
+    if default_count < 1:
+        raise ValueError(f"[tool.modulith.workers] default must be >= 1, got {default_count}")
     worker_env = dict(config.get("env") or {})
 
     specs: list[WorkerSpec] = []
     port = 9001
     for name in names:
         count = int(workers.get(name, default_count))
+        if count < 1:
+            # Loud-config-error contract: the port counter advances by each
+            # module's count, so a 0/negative entry would silently assign a
+            # later module the same (or an earlier) port as this one.
+            raise ValueError(
+                f"[tool.modulith.workers] {name} must be >= 1, got {count} — "
+                "a module cannot run zero worker processes"
+            )
         specs.append(
             WorkerSpec(
                 module_name=name,
