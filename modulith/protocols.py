@@ -109,6 +109,14 @@ class EventSerializer(Protocol):
         (most do) resolve it via ``importlib.import_module`` plus
         ``getattr``. Serializers that work from the bytes alone (some
         Avro setups) may ignore this argument.
+
+        Treat ``event_type`` as UNTRUSTED input whenever records can
+        originate outside the trusted process boundary (a shared outbox
+        table, a broker): importlib-based resolution turns a forged value
+        into an arbitrary-module import. Implementations should restrict
+        the resolvable types — the default ``JsonEventSerializer``
+        accepts an ``allowed_event_types`` allowlist and raises
+        ``ValueError`` for anything else before resolving the class.
         """
         ...
 

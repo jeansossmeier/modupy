@@ -3,7 +3,8 @@
 # This is the project metadata and build configuration. It defines:
 #   - Package metadata (name, version, description, license, authors)
 #   - Runtime dependencies (just pluggy, intentionally minimal)
-#   - Optional extras (postgres, redis, kafka, otel, fastapi, cli, all)
+#   - Optional extras (postgres, redis, otel, fastapi, cli, test, integration,
+#     all, dev — no kafka extra: the adapter is unshipped, see the NOTE below)
 #   - The `modulith` console script entry point
 #   - The `modulith` plugin entry point group for third-party plugins
 #   - Tool configurations (pytest, ruff, mypy)

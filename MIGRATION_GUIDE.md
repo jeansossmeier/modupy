@@ -11,17 +11,25 @@ different (Django, Flask without async, sync-only stack), the path
 still works but specific commands differ — see the SPEC.md notes on
 your stack.
 
-The migration has five steps. Steps 1-3 are mandatory for any
-modulith adoption. Steps 4-5 are optional and gated on real need.
+The migration has seven steps. Steps 1-3 are mandatory for any
+modulith adoption. Steps 4-5 are optional but recommended — they are
+where the payoff is (events, then the transactional outbox). Steps 6-7
+are optional and gated on real need.
 
 ---
 
 ## Step 1 — Install and audit (Friday afternoon, 2 hours)
 
 ```bash
-uv add modulith                # or: pip install modulith
-modulith audit > MIGRATION.md
+uv add 'modulith[cli]'         # or: pip install 'modulith[cli]'
+modulith audit                 # writes MIGRATION.md (use --output to change)
 ```
+
+(The `cli` extra installs the `modulith` command's dependencies; the bare
+`modulith` package is import-only. Don't shell-redirect stdout onto
+`MIGRATION.md` — the command already writes the full report there and
+echoes a short summary to stdout, so a redirect onto the same file
+corrupts the report it just wrote.)
 
 `modulith audit` reads your codebase non-destructively and produces a
 Markdown report:
@@ -156,6 +164,15 @@ async def on_order_created(event: OrderCreated) -> None:
     await reserve_stock(event.order_id)
 ```
 
+```python
+# app/inventory/__init__.py
+from app.inventory import handlers  # noqa: F401 — registers the @listeners
+```
+
+That last import matters: module discovery imports each module *package*
+(its `__init__.py`), not every submodule — a `@listener` in `handlers.py`
+only registers if the package imports it (or a `_manifest.py` declares it).
+
 Same logic. Different coupling. The orders module no longer knows that
 inventory exists; it just announces what happened. **Do this one
 cross-module call at a time** — each PR is small and reversible.
@@ -184,10 +201,21 @@ outbox = "postgres"
 completion_mode = "update"      # keep history visible
 ```
 
-Run the schema migration (alembic generates it for you):
+Run the packaged schema migration. modulith ships its alembic config
+*inside* the installed package (your project needs no alembic.ini), so
+point alembic's `-c` at it and supply the database URL via the
+`MODULITH_DB_URL` env var (alembic runs on a **sync** driver, e.g.
+`postgresql+psycopg://`, even if your app connects with asyncpg):
+
 ```bash
-alembic upgrade head
+MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
+  alembic -c "$(python -c 'import modulith.adapters, pathlib; print(pathlib.Path(modulith.adapters.__file__).parent / "alembic.ini")')" \
+  upgrade head
 ```
+
+(`-x url=...` works instead of the env var; a bare `alembic upgrade head`
+fails with "No 'script_location' key found" because there is no
+alembic.ini in your project root.)
 
 Wire your SQLAlchemy session to modulith:
 ```python
@@ -200,9 +228,18 @@ from modulith.builtin import outbox
 from modulith.builtin.outbox import _current_session
 from modulith.serializers import JsonEventSerializer
 
-# At startup
+from app.contracts.events import OrderCreated  # your event types
+
+# At startup. allowed_event_types is JsonEventSerializer's deserialization
+# allowlist — recommended in production wherever payloads can originate
+# outside the trusted process boundary (a shared outbox table, a broker):
+# deserialize() imports the module named in the record's event_type, so
+# without an allowlist a forged record can trigger arbitrary-module import.
 store = PostgresPublicationStore(engine=async_engine)
-outbox.configure(store=store, serializer=JsonEventSerializer())
+outbox.configure(
+    store=store,
+    serializer=JsonEventSerializer(allowed_event_types=[OrderCreated]),
+)
 
 # In your dependency for getting a DB session
 async def get_db():
@@ -234,6 +271,8 @@ it to its own process:
 ```toml
 [tool.modulith]
 topology = "processes"
+broker = "redis-streams"        # REQUIRED: processes need a real broker
+                                # (install with: pip install 'modulith[redis]')
 
 [tool.modulith.workers]
 default = 1
@@ -241,8 +280,15 @@ reports = 4                     # this module gets 4 worker processes
 ```
 
 ```bash
-modulith run --topology=processes
+modulith run app.main:app --topology=processes
 ```
+
+The broker line is not optional: `topology = "processes"` with the
+default in-memory broker is a loud `ConfigurationError` at startup — an
+in-memory broker can't carry events between processes. If the configured
+broker *scheme* has no registered adapter (typo, missing extra), startup
+logs a warning and the first cross-process publish raises
+`ConfigurationError` instead of silently dropping the event.
 
 The supervisor spawns workers. The reverse proxy routes requests by
 URL prefix. Cross-module events flow through Redis Streams (or your
@@ -300,6 +346,9 @@ patterns or check-then-act with an idempotency key.
 
 **"Sync FastAPI views can't await publish()."** Use `publish_sync()`.
 It detects context (running loop or not) and dispatches correctly.
+It blocks until dispatch completes, bounded by its `timeout` keyword
+(seconds, default 30.0) — on expiry the dispatch is cancelled and the
+call raises `TimeoutError`; pass `timeout=None` to disable the bound.
 Sync `@listener` functions are also accepted — they run in the event
 loop's executor.
 

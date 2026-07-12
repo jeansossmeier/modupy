@@ -67,13 +67,20 @@ app.include_router(orders_router)
 ```
 
 ```bash
-$ uvicorn myapp:app
-modulith: detected application package 'myapp'
-modulith: discovered 3 modules: orders, inventory, payments
-modulith: outbox=memory, broker=memory, topology=single
-modulith: ready
+$ uvicorn myapp.main:app
+INFO:modulith:detected application package 'myapp'
+INFO:modulith:discovered 4 module(s): contracts, inventory, orders, payments
+INFO:modulith:outbox=memory, broker=memory, topology=single
+INFO:modulith:outbox disabled — set [tool.modulith].outbox = 'postgres' for durable event delivery
+INFO:modulith:ready
 INFO:     Uvicorn running on http://127.0.0.1:8000
 ```
+
+The banner is emitted through the standard `modulith` logger at INFO
+level — it inherits your app's logging configuration rather than
+printing directly. Python surfaces only WARNING+ by default (and
+uvicorn configures only its own loggers), so enable INFO logging to
+see it, e.g. `logging.basicConfig(level=logging.INFO)` in `main.py`.
 
 ---
 
@@ -127,15 +134,19 @@ myapp/
 │   ├── __init__.py            # public API
 │   ├── _internal/             # private — verifier blocks cross-module access
 │   ├── api.py                 # FastAPI router
-│   └── handlers.py            # @listener functions
+│   └── handlers.py            # @listener functions (import from __init__.py!)
 ├── inventory/
 └── main.py                    # FastAPI app
 ```
 
+Discovery imports each module *package* — keep `@listener` functions
+reachable from the module's `__init__.py` (e.g. `from . import handlers`)
+so they register at startup.
+
 ### Run normally
 
 ```bash
-uvicorn myapp:app --reload
+uvicorn myapp.main:app --reload
 ```
 
 The framework auto-detects your package, discovers modules, registers
@@ -163,25 +174,48 @@ default = 1
 reports = 4                     # this module gets 4 workers
 ```
 
-Any key has a `MODULITH_*` env var equivalent for production overrides.
+Any *scalar* key has a `MODULITH_*` env var equivalent for production
+overrides (e.g. `MODULITH_OUTBOX`, `MODULITH_BROKER`, `MODULITH_PRODUCTION`).
+The table-valued keys (`outbox_options`, `broker_options`, `workers`) are
+pyproject-only — no env var. Two adapter-specific env vars exist on top:
+the Redis Streams broker honors `REDIS_URL` (plus
+`MODULITH_CONSUMER_GROUP` / `MODULITH_STREAM_PREFIX` /
+`MODULITH_STREAM_MAXLEN`), and the packaged alembic migration runner reads
+`MODULITH_DB_URL` (see [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md), Step 5).
+
+For `topology = "processes"` a real cross-process broker is required:
+leaving the default `broker = "memory"` in place is a loud
+`ConfigurationError` at startup, and a broker scheme with no registered
+adapter is a startup warning plus a `ConfigurationError` on the first
+cross-process publish — never a silently-dropped event.
 
 ---
 
 ## CLI
 
 ```bash
-modulith dev                      # like uvicorn --reload, with banner
-modulith run --topology=processes # production with process-per-module
+modulith dev myapp.main:app       # like uvicorn --reload, with banner +
+                                  # boundary warnings at startup (non-fatal)
+modulith run myapp.main:app --topology=processes # production, process-per-module
 modulith verify --mode=ratchet    # boundary checks for CI
+                                  # (--fail-on-warnings to fail on WARNINGs too)
 modulith docs                     # generate Mermaid diagrams + canvas
 modulith audit                    # analyze existing codebase for migration
+                                  # (writes MIGRATION.md; --output to change)
 modulith doctor                   # operational + architectural health
 modulith outbox status            # outbox metrics
 modulith info                     # show detected config
 ```
 
-The CLI is a progressive enhancement, not a requirement. Plain
-`uvicorn myapp:app` works the same way.
+The CLI requires the `cli` extra (`pip install 'modulith[cli]'`) and is a
+progressive enhancement, not a requirement. Plain `uvicorn myapp.main:app`
+works the same way.
+
+Exit codes are uniform: **0** success (warnings may still be reported —
+`modulith dev` echoes verifier violations as non-fatal startup warnings,
+and `verify` passes WARNING-severity findings unless `--fail-on-warnings`
+is set), **1** violations or user error (bad flags, config errors),
+**2** unexpected internal error.
 
 ---
 

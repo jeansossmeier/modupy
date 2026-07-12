@@ -147,7 +147,7 @@ The single most important framing principle: **we don't lie about our limitation
 
 The plugin contract is the most stable part of modulith. Once published, every plugin ever written depends on it. Additions are fine; signature changes are major-version events.
 
-### 4.1 The Ten Hookspecs
+### 4.1 The Eleven Hookspecs
 
 Defined in `modulith/hooks.py`. Each is a stable, versioned contract.
 
@@ -161,7 +161,7 @@ Defined in `modulith/hooks.py`. Each is a stable, versioned contract.
 
 3. `modulith_verify_module(module: ModuleInfo, all_modules: list[ModuleInfo]) -> list[Violation]` — aggregate. Plugins return violations; results combine into the full report.
 
-**Event lifecycle (4):**
+**Event lifecycle (5):**
 
 4. `modulith_before_event_published(event: Any) -> None` — pre-publish validation/enrichment. Raising aborts publication.
 
@@ -169,17 +169,19 @@ Defined in `modulith/hooks.py`. Each is a stable, versioned contract.
 
 6. `modulith_on_listener_dispatch(event: Any, listener_name: str, publication: EventPublication) -> None` — per-listener tracing/correlation.
 
-7. `modulith_on_listener_error(event: Any, listener_name: str, publication: EventPublication, exception: BaseException) -> None` — listener failure handling.
+7. `modulith_on_listener_complete(event: Any, listener_name: str, publication: EventPublication, exception: BaseException | None) -> None` — fires after every listener invocation, success or failure (`exception` is None on success). Pairs with `modulith_on_listener_dispatch` so observability plugins can close the spans they open there.
+
+8. `modulith_on_listener_error(event: Any, listener_name: str, publication: EventPublication, exception: BaseException) -> None` — listener failure handling.
 
 **Externalization (2):**
 
-8. `modulith_resolve_event_target(event: Any) -> str | None` — `firstresult=True`. Dynamic routing override; first non-None wins.
+9. `modulith_resolve_event_target(event: Any) -> str | None` — `firstresult=True`. Dynamic routing override; first non-None wins.
 
-9. `modulith_register_brokers(registry: BrokerRegistry) -> None` — broker adapters register at startup.
+10. `modulith_register_brokers(registry: BrokerRegistry) -> None` — broker adapters register at startup.
 
 **Documentation (1):**
 
-10. `modulith_render_documentation(modules: list[ModuleInfo], output_dir: str) -> list[str]` — aggregate. Plugins write artifacts and return paths.
+11. `modulith_render_documentation(modules: list[ModuleInfo], output_dir: str) -> list[str]` — aggregate. Plugins write artifacts and return paths.
 
 ### 4.2 The Three Driver Protocols
 
@@ -199,6 +201,15 @@ async delete(publication_id: UUID) -> None
 serialize(event: Any) -> bytes
 deserialize(data: bytes, event_type: str) -> Any
 ```
+
+`event_type` is the fully-qualified class name recorded on the publication.
+Treat it as untrusted input whenever payloads can originate outside the
+trusted process boundary (a shared outbox table, a broker): the default
+`JsonEventSerializer` resolves the class via `importlib`, so it accepts an
+`allowed_event_types` allowlist (classes or fully-qualified names) and
+rejects any other `event_type` with `ValueError` before resolving the
+class. The cross-process worker applies this automatically, allowlisting
+exactly the event types its listeners consume.
 
 **`Broker`** — external message broker:
 ```
@@ -277,6 +288,13 @@ def create_order():
     publish_sync(OrderCreated(...))
 ```
 
+`publish_sync(event, *, timeout=30.0)` blocks until dispatch completes.
+The `timeout` (seconds) protects against listener deadlocks: on expiry the
+dispatch is cancelled (best-effort) and the call raises `TimeoutError`;
+`timeout=None` disables the bound. Calling it from *inside* async code on
+the loop's own thread raises `RuntimeError` — use `await publish(event)`
+there.
+
 `publish_sync()` detects context:
 - **No event loop running** → uses a persistent thread-pool-backed loop, blocks until done
 - **Event loop running, called from a sync function** (e.g. FastAPI sync view in Starlette's threadpool) → schedules on the running loop, waits via `concurrent.futures.Future`
@@ -308,7 +326,7 @@ myapp/
 
 The verifier treats `myapp.contracts` (or whatever name `[tool.modulith].contracts_module` points at) as a sink: everyone may import from it; it may not import from any module. Schema changes there are intentional and visible.
 
-For the distributed case, `contracts` becomes versioned. The broker carries a `schema_version` header; consumers check it. `modulith` provides this header automatically.
+For the distributed case, `contracts` becomes versioned. Today the broker carries an `event_type` header (the fully-qualified class name) that consumers use to resolve and deserialize each message; arbitrary additional headers pass through the generic `headers` dict. A dedicated `schema_version` header is **planned, not yet provided** — until it lands, consumers that need version checks build them on the headers passthrough (and the doctor's schema-drift check flags event-definition changes as the cue to version consciously, see [§8.5](#85-the-doctor-command)).
 
 ### 5.4 The Manifest File
 
@@ -354,6 +372,8 @@ myapp/
 └── main.py               # FastAPI app; imports nothing from modules
 ```
 
+Discovery imports each module *package* (its `__init__.py`), not every submodule: `@listener` functions in `handlers.py` register only if the package imports them (`from . import handlers`) or a `_manifest.py` declares them.
+
 Conventions enforced by the verifier:
 - Only `myapp.orders.__init__` and explicitly-named submodules are importable from outside
 - `myapp.orders._internal.*` is never importable from outside `myapp.orders.*`
@@ -393,7 +413,7 @@ In `modulith/config.py`. Resolution order (highest priority first):
 3. `[tool.modulith]` section in pyproject.toml
 4. Hardcoded defaults
 
-Every `Configuration` field has an `MODULITH_<KEY>` env var equivalent. Booleans accept `1`, `true`, `yes` (case-insensitive).
+Every *scalar* `Configuration` field has a `MODULITH_<KEY>` env var equivalent: `MODULITH_PACKAGE`, `MODULITH_CONTRACTS_MODULE`, `MODULITH_OUTBOX`, `MODULITH_TOPOLOGY`, `MODULITH_BROKER`, `MODULITH_PRODUCTION`, `MODULITH_AUTO_DISCOVER`, `MODULITH_OBSERVABILITY`, `MODULITH_VERIFY_MANIFESTS`. Booleans accept `1`/`true`/`yes` and `0`/`false`/`no` (case-insensitive); any other non-empty value raises `ConfigurationError`. The dict-typed fields (`outbox_options`, `broker_options`, `workers`) have **no** env var — they come only from the `[tool.modulith.*]` subtables in pyproject.toml. Adapter-specific env vars are separate contracts: the Redis Streams broker reads `REDIS_URL`, `MODULITH_CONSUMER_GROUP`, `MODULITH_STREAM_PREFIX`, `MODULITH_STREAM_MAXLEN` ([§10.2](#102-redis-streams-broker)), and the packaged alembic migration runner reads `MODULITH_DB_URL` ([§10.1](#101-postgres-outbox-store)).
 
 Validation happens before construction. Unknown keys raise `ConfigurationError` with the list of valid keys (catches typos). Production mode + default memory outbox raises (forces explicit opt-in for unsafe defaults).
 
@@ -405,7 +425,7 @@ In `modulith/discovery.py`. Two strategies:
 
 1. **Call-stack walking** (`_detect_from_caller_stack`): use `sys._getframe()` to walk back from the modulith bootstrap call. Skip frames inside modulith itself, stdlib, and site-packages. Return the top-level package of the first user-code frame.
 
-2. **pyproject.toml** (`_detect_from_pyproject_name`): walk up from cwd looking for `pyproject.toml`, read `[project].name`, normalize hyphens to underscores per PEP 503.
+2. **pyproject.toml** (`_detect_from_pyproject_name`): walk up from cwd looking for `pyproject.toml`, read `[project].name`, and replace hyphens with underscores — the conventional distribution-name → import-package mapping. (This is *not* PEP 503, which governs package-index name normalization and collapses hyphens/dots/underscores to `-`, the opposite direction.)
 
 If both fail, raise `ConfigurationError` with all three escape hatches in the message.
 
@@ -415,13 +435,17 @@ Logged at INFO via the `modulith` logger:
 
 ```
 modulith: detected application package 'myapp'
-modulith: discovered 3 modules: orders, inventory, reports
+modulith: discovered 3 module(s): orders, inventory, reports
 modulith: outbox=memory, broker=memory, topology=single
 modulith: outbox disabled — set [tool.modulith].outbox = 'postgres' for durable event delivery
 modulith: ready
 ```
 
+(The contracts subpackage, when present, is discovered and listed as a module too.)
+
 Five log lines that tell the user exactly what's active and how to change it. If they don't want any of it, the message tells them where to turn it off.
+
+The banner goes through the standard `modulith` logger at INFO level — it inherits the application's logging config and is **not** printed directly. Python's root logger surfaces only WARNING+ by default (and uvicorn configures only its own loggers), so the hosting application must enable INFO logging — e.g. `logging.basicConfig(level=logging.INFO)` at startup — for the banner to appear.
 
 ---
 
@@ -455,11 +479,11 @@ When `publish()` is called:
 - After commit, the queued records are dispatched.
 - If commit fails (rollback), the session pops the pending list and nothing is dispatched.
 
-When `publish()` is called outside a transaction context, the bus dispatches directly without persistence (the outbox doesn't apply).
+When `publish()` is called outside a transaction context, the bus dispatches directly without persistence (the outbox doesn't apply). On this direct path, an event that routes to a cross-process broker is sent inline (awaited), and a broker publish failure **propagates to the caller** — fail-loud by design: with no outbox row persisted, a swallowed send would lose the event for every remote consumer with zero trace. Callers that need `publish()` decoupled from broker availability use the transactional outbox path (bind a session + durable store), where the send happens after commit with retry/dead-letter handling.
 
 ### 7.3 Completion Modes
 
-Three modes, configurable via `[tool.modulith.outbox].completion_mode`:
+Three modes, configurable via `[tool.modulith.outbox_options].completion_mode`. (`outbox` itself is the scalar adapter-selection key — `outbox = "postgres"` — and TOML forbids one key being both a scalar and a table, so the options subtable is `outbox_options`. A legacy `[tool.modulith.outbox]` subtable is rejected with a `ConfigurationError` pointing at the correct spelling, and a pyproject.toml that fails to parse — including the scalar/table collision — is a loud `ConfigurationError`, never silently-ignored config.)
 
 - **`update`** (default) — set `completed_at`. Old records remain for inspection until a maintenance job purges them.
 - **`delete`** — remove the row on success. Lower overhead, no historical visibility.
@@ -493,7 +517,7 @@ The built-in verifier in `modulith/builtin/verifier.py` ships these rules:
 
 1. **No cross-module internal imports** — `myapp.orders` cannot import from `myapp.inventory._internal.*`
 2. **No cyclic dependencies** — the module dependency graph must be a DAG
-3. **Declared dependencies match observed** — if a manifest declares `dependencies=["payments"]`, only those modules may be imported (when manifest is present)
+3. **Declared dependencies match observed** — if a manifest declares `declared_dependencies=["payments"]`, only those modules may be imported (when manifest is present)
 4. **Events flow through contracts module** — cross-module type imports must come from `myapp.contracts.*`, not from another module's package
 5. **Module data ownership** — when manifests declare `owns_tables=[...]`, queries against another module's tables are violations
 
@@ -545,7 +569,7 @@ Output is Markdown. Teams can run it on Friday afternoon, generate a baseline, h
 
 - **Boundary health**: violation count, baseline drift over the last N commits
 - **Process-split readiness**: percentage of cross-module interactions that are events vs direct calls (the "are you ready to split this module?" metric)
-- **Schema drift**: events whose definitions changed without a `schema_version` bump
+- **Schema drift**: events whose field definitions (name, annotation, default — fingerprinted via AST) changed since the last doctor run. The check is an unconditional fingerprint diff against a cache file (`.modulith-schemas.json`): it flags *every* definition change as the cue to version consciously — it does not read or compare any `schema_version` attribute
 - **Outbox health**: dead-lettered count, oldest incomplete event age
 - **Listener registration coverage**: declared listeners vs actually-registered listeners
 
@@ -656,7 +680,8 @@ support is v2.1 enhancement.
 
 ```toml
 [tool.modulith]
-topology = "processes"  # or "single" or "subinterpreters"
+topology = "processes"       # or "single" ("subinterpreters" is reserved, not yet implemented)
+broker = "redis-streams"     # REQUIRED for topology = "processes"
 
 [tool.modulith.workers]
 default = 1
@@ -668,40 +693,79 @@ restart_backoff_max = "60s"
 health_check_interval = "10s"
 ```
 
+Startup failure modes for the cross-process broker are deliberately loud:
+
+- `topology = "processes"` (or the reserved `"subinterpreters"`) with the
+  default in-memory broker raises `ConfigurationError` at configuration
+  resolution — an in-memory broker cannot carry events between processes,
+  so this combination would silently no-op delivery.
+- `topology = "subinterpreters"` parses as a known topology but is rejected
+  with "not yet implemented" (reserved for a future release; ROADMAP Phase 4).
+- A cross-process topology whose configured broker *scheme* has no registered
+  adapter (typo, missing plugin, missing extra) logs a WARNING in the startup
+  banner, and any cross-process publish in that state raises
+  `ConfigurationError` rather than dropping the event.
+
 ---
 
 ## Part X — Built-in Adapters
 
-Each ships as a separate package so dependencies stay optional. `pip install modulith[postgres]` pulls in the SQLAlchemy adapter; without it, the outbox can't use Postgres but everything else works.
+Each adapter ships as an optional *extra* of the single `modulith` distribution so dependencies stay optional. `pip install 'modulith[postgres]'` pulls in the SQLAlchemy adapter; without it, the outbox can't use Postgres but everything else works. (Splitting adapters into separately-published packages remains a possible later move — see [Part XVI](#part-xvi--file-inventory) — but is not the shipped model.)
 
 ### 10.1 Postgres Outbox Store
 
-Package: `modulith-postgres`. Implements `PublicationStore` against a SQLAlchemy async engine. Ships:
+Extra: `modulith[postgres]` (`modulith/adapters/postgres_outbox.py`). Implements `PublicationStore` against a SQLAlchemy async engine. Ships:
 
-- Schema migrations (alembic) for `event_publications` and `event_publications_archive`
+- Schema migrations (alembic, packaged under `modulith/adapters/migrations/`) for `event_publications` and `event_publications_archive`
 - The session-event integration described in [§7.2](#72-sqlalchemy-integration)
 - Health check endpoint integration
 
-Schema:
+The alembic migration is the source of truth for the schema (the ORM
+metadata and migration `0001_initial` are asserted identical against a real
+Postgres by the integration suite). Equivalent DDL:
+
 ```sql
 CREATE TABLE event_publications (
     id UUID PRIMARY KEY,
     event_type TEXT NOT NULL,
-    payload JSONB NOT NULL,
+    payload BYTEA NOT NULL,       -- bytes, not JSONB: binary serializers supported
     listener TEXT NOT NULL,
     published_at TIMESTAMPTZ NOT NULL,
     completed_at TIMESTAMPTZ,
-    attempt_count INT DEFAULT 0,
+    attempt_count INT NOT NULL DEFAULT 0,
     last_error TEXT,
-    is_dead_lettered BOOLEAN DEFAULT FALSE
+    last_attempt_at TIMESTAMPTZ,  -- when the most recent retry ran; drives backoff
+    is_dead_lettered BOOLEAN NOT NULL DEFAULT FALSE
 );
 CREATE INDEX idx_pending ON event_publications (published_at)
-    WHERE completed_at IS NULL AND is_dead_lettered = FALSE;
+    WHERE completed_at IS NULL;
+
+-- Populated by the "archive" completion mode.
+CREATE TABLE event_publications_archive (
+    id UUID PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    payload BYTEA NOT NULL,
+    listener TEXT NOT NULL,
+    published_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ,
+    attempt_count INT NOT NULL DEFAULT 0,
+    last_error TEXT,
+    last_attempt_at TIMESTAMPTZ
+);
+```
+
+Apply it with the packaged alembic config rather than hand-running SQL
+(`MODULITH_DB_URL` or `-x url=...` supplies the database URL):
+
+```bash
+MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
+  alembic -c "$(python -c 'import modulith.adapters, pathlib; print(pathlib.Path(modulith.adapters.__file__).parent / "alembic.ini")')" \
+  upgrade head
 ```
 
 ### 10.2 Redis Streams Broker
 
-Package: `modulith-redis`. Implements `Broker` against `redis.asyncio`. Default broker for process-per-module mode because of microsecond latencies and ubiquity.
+Extra: `modulith[redis]` (`modulith/adapters/redis_broker.py`). Implements `Broker` against `redis.asyncio`. Default broker for process-per-module mode because of its low-millisecond latencies (the ~1-5ms per inter-module call of [§9.1](#91-the-topology-decision)) and ubiquity.
 
 Select the broker by name, and supply connection options under the
 `[tool.modulith.broker]` subtable. TOML forbids one key (`broker`) being both a
@@ -738,21 +802,16 @@ consumer downtime/latency). The dead-letter stream is likewise bounded
 (`dlq_max_stream_len`, default 10× `max_stream_len`) and best-effort, not a
 durable audit log — size it to the forensic retention window you need.
 
-### 10.3 Kafka Broker
+### 10.3 Kafka Broker (planned — not shipped)
 
-Package: `modulith-kafka`. Implements `Broker` against `aiokafka`. For teams already running Kafka.
+**Roadmap item (Phase 4), not a shipped adapter.** Will implement `Broker` against `aiokafka` for teams already running Kafka. No `kafka_broker.py` exists and there is intentionally no `kafka` extra in pyproject.toml — we don't advertise a dependency for a feature that does not exist. It returns when the adapter lands.
 
 ### 10.4 OpenTelemetry Observability
 
-Package: `modulith-otel` (or built-in if OTel is detected as installed). Auto-instrumentation:
+Extra: `modulith[otel]` (built-in plugin `modulith/builtin/observability.py`; a silent no-op when OTel isn't installed, or installed without a configured tracer provider). Auto-instrumentation emits two span types via the paired event-lifecycle hooks:
 
-- Every cross-module bean invocation gets a span tagged `modulith.module=<name>` and `modulith.api=<function>`
-- Cross-module calls show as parent-child spans
-- Event dispatches: span links from publisher to listener
-- Routing distribution metrics (which tools called how often)
-- Per-tool error rates, p95 latency
-- Cost per query (when `modulith.cost.usd` attribute is set by adapters)
-- Eval scores over time (when test infrastructure exposes them)
+- `modulith.event.publish` — one per publication, attributes `event.type`, `event.module`, `modulith.duration_ms`
+- `modulith.event.dispatch` — one per listener invocation, child of the publish span, attributes `event.type`, `listener.name`, `publication.id`; status ERROR (with recorded exception) when the listener raises
 
 ### 10.5 Documentation Generator
 
@@ -768,9 +827,9 @@ Mermaid over PlantUML because it renders natively on GitHub/GitLab. Canvas is ma
 
 ## Part XI — Testing
 
-### 11.1 The pytest-modulith Plugin
+### 11.1 The pytest Plugin
 
-Separate package: `pytest-modulith`. Provides:
+Ships bundled in the main distribution as `modulith/testing.py`, installed via the `modulith[test]` extra (registered under pytest's `pytest11` entry point, so the fixtures are available automatically). A standalone `pytest-modulith` package is a planned later split, not current reality. Provides:
 
 ```python
 # Automatic per-test isolation (autouse fixture)
@@ -802,11 +861,11 @@ class Scenario:
     def call(callable, *args, **kwargs) -> Self
     def expect_event(type) -> Self
     def matching(predicate) -> Self
-    def within(seconds: float) -> None  # raises on timeout
-    def with_state_change(callable, predicate) -> Self
+    def within(seconds: float) -> Any  # terminal: returns the matched event;
+                                       # raises AssertionError when it never arrives
 ```
 
-Handles the eventual-consistency dance — async listeners need awaiting in tests. Internally polls the published events list with timeout, no `asyncio.sleep` in user code.
+`within()` is the terminal operation: it fires the trigger and polls for the expected event, with the trigger and the poll sharing one `seconds` budget. Handles the eventual-consistency dance — async listeners need awaiting in tests. Internally polls the published events list with timeout, no `asyncio.sleep` in user code.
 
 ### 11.3 Module-Isolated Tests
 
@@ -816,7 +875,14 @@ For non-isolated tests, the plugin handles state reset via session fixtures: cle
 
 ### 11.4 Subprocess-Per-Test Mode
 
-Activated via `@pytest.mark.modulith_isolated`. Each test runs in its own Python subprocess via pytest-xdist's worker mechanism. State leaks are impossible. Cost: ~100ms per test for the subprocess fork.
+Activated via `@pytest.mark.modulith_isolated`. The plugin re-invokes pytest on that single test in a child process (an env-var guard prevents recursion) and synthesizes the test report from the child's exit code. State leaks are impossible. Cost: a full interpreter + pytest startup per test — fine for integration tests, not for unit tests on save.
+
+Each isolated subprocess is bounded by the `modulith_isolated_timeout` ini option (seconds, default `300`): a hung child is killed and reported as a failure of that one test — with its captured stdout/stderr — instead of blocking the suite forever. Tune it in pytest configuration, e.g.:
+
+```toml
+[tool.pytest.ini_options]
+modulith_isolated_timeout = "120"
+```
 
 ---
 
@@ -827,11 +893,11 @@ Activated via `@pytest.mark.modulith_isolated`. Each test runs in its own Python
 ### Commands
 
 ```
-modulith dev [--topology=single|processes] [--isolate=MODULE] [--reload]
-modulith run [--topology=single|processes] [--workers=JSON]
-modulith verify [--mode=strict|ratchet] [--baseline=PATH] [--update-baseline]
+modulith dev APP_MODULE [--topology=single|processes] [--isolate=MODULE] [--reload/--no-reload] [--host=HOST] [--port=PORT]
+modulith run APP_MODULE [--topology=single|processes] [--workers=JSON] [--host=HOST] [--port=PORT]
+modulith verify [--mode=strict|ratchet] [--baseline=PATH] [--update-baseline] [--fail-on-warnings]
 modulith docs [--output-dir=DIR]
-modulith audit [--output=FILE]
+modulith audit [PATH] [--output=FILE]
 modulith doctor
 modulith outbox status
 modulith outbox retry <id>
@@ -840,12 +906,24 @@ modulith outbox dead-letter [--list|--retry-all]
 modulith info  # show detected config, modules, plugins
 ```
 
+`dev` and `run` take a required positional `APP_MODULE` (the ASGI app, e.g. `myapp.main:app`); `audit` takes an optional positional `PATH` (the codebase root, default `.`).
+
+### Exit codes
+
+Uniform across every command:
+
+- **0** — success. Warnings may still have been reported (verify's WARNING-severity violations without `--fail-on-warnings`, `dev`'s startup boundary warnings, doctor's warn-tier checks).
+- **1** — violations or user error: failed verification, invalid flags/arguments (typo'd `--mode`/`--topology` values are rejected loudly, never silently defaulted), configuration errors, unknown ids, missing uvicorn.
+- **2** — unexpected internal error (a modulith bug; traceback printed to stderr).
+
+`modulith verify` exits 0 when no ERROR-severity violations are reported (strict) or none are new relative to the baseline (ratchet); `--fail-on-warnings` opts in to failing on WARNING-severity findings too. `modulith doctor` exits 1 only when a check reports an error, so both drop into CI as a single line.
+
 ### `modulith dev` semantics
 
 `modulith dev` is *almost* `uvicorn --reload` with quality-of-life additions:
 - Prints the discovered module list at startup
+- Runs the boundary verifier at startup and echoes violations as **non-fatal warnings** on stderr — the "warnings in dev, hard checks via `modulith verify` in CI" promise of [§3.2](#32-defaults-so-good-you-dont-change-them). A dev server must start even when the project is half-configured, so a failing check downgrades to a note; it never blocks the launch
 - Shows a friendly banner with topology and detected adapters
-- Pretty-prints events when `--trace` is set
 
 **It is not a different way to run the app; it's a nicer way.** Users with muscle memory for `uvicorn` keep using `uvicorn`. The CLI is a progressive enhancement.
 
@@ -866,8 +944,8 @@ uv add modulith
 # 2. Define modules as subpackages (zero config)
 mkdir myapp/orders myapp/inventory
 
-# 3. Run
-uvicorn myapp:app --reload
+# 3. Run (the FastAPI app object lives in myapp/main.py)
+uvicorn myapp.main:app --reload
 
 # That's it.
 ```
@@ -875,11 +953,13 @@ uvicorn myapp:app --reload
 ### 13.2 Brownfield Adoption (the path that matters)
 
 ```bash
-# 1. Install
-uv add modulith
+# 1. Install (the CLI needs the cli extra)
+uv add 'modulith[cli]'
 
-# 2. Audit existing structure
-modulith audit > MIGRATION.md
+# 2. Audit existing structure (writes MIGRATION.md by default; --output to change.
+#    Don't shell-redirect stdout onto the same file — the command already writes
+#    the report there and echoes a short summary to stdout.)
+modulith audit
 # Review the proposed structure with the team
 
 # 3. Restructure files into subpackages (no code changes yet)
@@ -897,15 +977,15 @@ modulith verify --mode=ratchet --update-baseline
 # Each PR that fixes a baseline violation removes it via --update-baseline
 ```
 
-### 13.3 The Three-Step Migration
+### 13.3 The Three-Phase Migration
 
-A team migrating an existing FastAPI app:
+A compressed summary of MIGRATION_GUIDE.md's seven steps — three phases, deliberately *not* numbered 1:1 with the guide's step headings:
 
-1. **Install + audit + ratchet.** Boundaries enforced going forward; existing violations grandfathered.
-2. **Add events incrementally.** Pick one cross-module call at a time; replace direct call with `publish` + `@listener`. Each migration is a single PR.
-3. **Enable outbox.** Set `outbox = "postgres"`, run migrations, verify outbox-readiness via `modulith doctor`. Production-grade event delivery.
+1. **Install + audit + ratchet** (guide Steps 1–3). Boundaries enforced going forward; existing violations grandfathered.
+2. **Add events incrementally** (guide Step 4). Pick one cross-module call at a time; replace direct call with `publish` + `@listener`. Each migration is a single PR.
+3. **Enable outbox** (guide Step 5). Set `outbox = "postgres"`, run migrations, verify outbox-readiness via `modulith doctor`. Production-grade event delivery.
 
-Step 4 (process-per-module) and step 5 (true microservices extraction) are optional later moves justified by data, not architecture.
+Process-per-module (guide Step 6) and true microservices extraction (guide Step 7) are optional later moves justified by data, not architecture.
 
 ---
 
@@ -915,7 +995,7 @@ From the brutal-truth analysis. Each gap has a concrete mitigation.
 
 ### Gap 1: Cross-module event imports leak the source module
 
-**Mitigation:** the contracts module pattern ([§5.3](#53-the-contracts-module-pattern)). Events live in `myapp.contracts.*`, a sink in the dependency graph. Verifier treats it specially. For distributed deployments, `contracts` becomes versioned with `schema_version` headers.
+**Mitigation:** the contracts module pattern ([§5.3](#53-the-contracts-module-pattern)). Events live in `myapp.contracts.*`, a sink in the dependency graph. Verifier treats it specially. For distributed deployments, `contracts` becomes versioned (a dedicated `schema_version` broker header is planned — see [§5.3](#53-the-contracts-module-pattern) for what ships today).
 
 ### Gap 2: The "modulith now, microservices later" promise has a hidden cliff
 
@@ -931,7 +1011,7 @@ From the brutal-truth analysis. Each gap has a concrete mitigation.
 
 ### Gap 5: Testing is genuinely harder than the docs admit
 
-**Mitigation:** `pytest-modulith` plugin ([Part XI](#part-xi--testing)). Auto-reset between tests, subprocess-per-test for isolation, Scenario API for event-driven flows.
+**Mitigation:** the bundled pytest plugin, installed via `modulith[test]` ([Part XI](#part-xi--testing)). Auto-reset between tests, subprocess-per-test for isolation, Scenario API for event-driven flows.
 
 ### Gap 6: No story for adopting modulith on existing codebases
 
@@ -939,17 +1019,22 @@ From the brutal-truth analysis. Each gap has a concrete mitigation.
 
 ### Gap 7: The plugin ecosystem might never form
 
-**Mitigation:** reframe the positioning. Plugin system is for internal modularity, not for community ecosystem. We ship 5 first-party adapters (Postgres, Redis, Kafka, OTel, RabbitMQ) covering 95% of users. Community plugins are nice-to-have, not required for success.
+**Mitigation:** reframe the positioning. Plugin system is for internal modularity, not for community ecosystem. We ship 3 first-party adapters today (Postgres outbox, Redis Streams broker, OpenTelemetry observability), with Kafka and RabbitMQ brokers on the Phase 4 roadmap — together covering the large majority of users. Community plugins are nice-to-have, not required for success.
 
 ---
 
 ## Part XV — Implementation Roadmap
 
+> **Planning snapshot.** This part is the original phase plan, kept for the
+> rationale and kill criteria. **[ROADMAP.md](ROADMAP.md) is the live status
+> source** — per its checklist, Phases 0–3 are all code-complete; Phase 4
+> (ecosystem adapters) is the open, demand-driven remainder.
+
 Time-boxed phases. Each has explicit kill criteria.
 
 ### Phase 0: Foundation ✅ DONE
 
-- Plugin contract (10 hookspecs, 3 protocols)
+- Plugin contract (11 hookspecs, 3 protocols)
 - Auto-discovery + lazy bootstrap
 - Configuration system
 - In-memory event bus
@@ -977,7 +1062,7 @@ The minimum scope where modulith provides value over "FastAPI plus folders."
 ### Phase 2: v1.1 Polish (2-3 weeks)
 
 **Should-ship:**
-1. **`pytest-modulith`** as a separate package. ~200 lines.
+1. **The pytest plugin** (planned then as a separate `pytest-modulith` package; shipped instead as the `modulith[test]` extra). ~200 lines.
 2. **Scenario API**. ~100 lines.
 3. **Audit tool** (`modulith audit`) — `modulith/audit.py`. ~150 lines.
 4. **Doctor command** (`modulith doctor`) — `modulith/doctor.py`. ~120 lines.
@@ -1019,11 +1104,14 @@ The minimum scope where modulith provides value over "FastAPI plus folders."
 
 ## Part XVI — File Inventory
 
+> **Planning snapshot, statuses refreshed.** The Lines column preserves the
+> original planning estimates, not current line counts. For live delivery
+> status, [ROADMAP.md](ROADMAP.md) is the single source of truth; the Status
+> column below has been updated to match it.
+
 ### Status legend
-- ✅ — Built, tested, line-budget within target
-- 🚧 — Skeleton with detailed implementation guide
+- ✅ — Built and tested
 - ⏳ — Planned, not yet started
-- 📦 — Separate package
 
 ### Core package: `modulith/`
 
@@ -1032,7 +1120,7 @@ The minimum scope where modulith provides value over "FastAPI plus folders."
 | `__init__.py` | ✅ | 75 | Public API exports |
 | `types.py` | ✅ | 113 | ModuleInfo, EventPublication, Violation |
 | `protocols.py` | ✅ | 151 | PublicationStore, EventSerializer, Broker |
-| `hooks.py` | ✅ | 198 | The 10 hookspecs |
+| `hooks.py` | ✅ | 198 | The 11 hookspecs |
 | `markers.py` | ✅ | 27 | hookimpl re-export |
 | `brokers.py` | ✅ | 128 | BrokerRegistry |
 | `manager.py` | ✅ | 119 | create_plugin_manager |
@@ -1041,15 +1129,17 @@ The minimum scope where modulith provides value over "FastAPI plus folders."
 | `event_bus.py` | ✅ | 95 | InMemoryEventBus |
 | `runtime.py` | ✅ | 174 | Runtime singleton |
 | `decorators.py` | ✅ | 117 | @event, @listener, publish, configure |
-| `sync.py` | 🚧 | ~150 | publish_sync, sync listener support (Phase 1) |
-| `manifest.py` | 🚧 | ~120 | declare_module API (Phase 1) |
-| `audit.py` | ⏳ | ~150 | Codebase analysis (Phase 2) |
-| `doctor.py` | ⏳ | ~120 | Health diagnostics (Phase 2) |
-| `cli.py` | 🚧 | ~150 | Typer-based CLI (Phase 1) |
-| `_worker.py` | ⏳ | ~80 | Per-module FastAPI app generator (Phase 3) |
-| `supervisor.py` | ⏳ | ~200 | Process orchestration (Phase 3) |
-| `proxy.py` | ⏳ | ~120 | Reverse proxy (Phase 3) |
-| `testing.py` | ⏳ | ~100 | pytest plugin entry points (Phase 2) |
+| `serializers.py` | ✅ | — | JsonEventSerializer (default EventSerializer, `allowed_event_types` allowlist) |
+| `sync.py` | ✅ | ~150 | publish_sync, sync listener support (Phase 1) |
+| `manifest.py` | ✅ | ~120 | declare_module API (Phase 1) |
+| `audit.py` | ✅ | ~150 | Codebase analysis (Phase 2) |
+| `doctor.py` | ✅ | ~120 | Health diagnostics (Phase 2) |
+| `cli.py` | ✅ | ~150 | Typer-based CLI (Phase 1) |
+| `_worker.py` | ✅ | ~80 | Per-module FastAPI app generator (Phase 3) |
+| `_consumer.py` | ✅ | — | BrokerConsumer: per-worker stream subscription + dispatch (Phase 3) |
+| `supervisor.py` | ✅ | ~200 | Process orchestration (Phase 3) |
+| `proxy.py` | ✅ | ~120 | Reverse proxy (Phase 3) |
+| `testing.py` | ✅ | ~100 | pytest plugin entry points (Phase 2) |
 
 ### Built-in plugins: `modulith/builtin/`
 
@@ -1057,60 +1147,52 @@ The minimum scope where modulith provides value over "FastAPI plus folders."
 |---|---|---|---|
 | `__init__.py` | ✅ | 11 | Namespace package |
 | `discovery.py` | ✅ | 74 | Default subpackage walker |
-| `verifier.py` | 🚧 | ~200 | AST-based boundary verification (Phase 1) |
-| `outbox.py` | 🚧 | ~150 | Outbox plugin core, calls store adapter (Phase 1) |
-| `observability.py` | ⏳ | ~120 | OTel auto-instrumentation (Phase 2) |
-| `docs.py` | 🚧 | ~150 | Mermaid + canvas generation (Phase 1) |
+| `verifier.py` | ✅ | ~200 | AST-based boundary verification (Phase 1) |
+| `outbox.py` | ✅ | ~150 | Outbox plugin core, calls store adapter (Phase 1) |
+| `observability.py` | ✅ | ~120 | OTel auto-instrumentation (Phase 2) |
+| `docs.py` | ✅ | ~150 | Mermaid + canvas generation (Phase 1) |
 
 ### Storage adapters: `modulith/adapters/`
 
 | File | Status | Lines | Notes |
 |---|---|---|---|
-| `__init__.py` | ⏳ | ~10 | Namespace package |
-| `postgres_outbox.py` | 🚧 | ~180 | SQLAlchemy + Postgres PublicationStore (Phase 1) |
-| `redis_broker.py` | ⏳ | ~80 | Redis Streams Broker (Phase 2) |
-| `kafka_broker.py` | ⏳ | ~80 | Kafka Broker (Phase 4) |
+| `__init__.py` | ✅ | ~10 | Namespace package |
+| `postgres_outbox.py` | ✅ | ~180 | SQLAlchemy + Postgres PublicationStore, alembic migrations (Phase 1) |
+| `redis_broker.py` | ✅ | ~80 | Redis Streams Broker (Phase 2) |
+| `kafka_broker.py` | ⏳ | ~80 | Kafka Broker (Phase 4 — not shipped, see §10.3) |
 
 ### Tests: `tests/`
 
-| File | Status | Notes |
-|---|---|---|
-| `test_plugin_manager.py` | ✅ | 7 tests, plugin manager + broker registry |
-| `test_config.py` | ✅ | 12 tests, config loading and validation |
-| `test_discovery.py` | ✅ | 6 tests, package detection |
-| `test_zero_config.py` | ✅ | 4 tests, end-to-end zero-config flow |
-| `test_sync.py` | ⏳ | Sync entrypoint and sync listeners |
-| `test_outbox.py` | ⏳ | Outbox + crash recovery |
-| `test_verifier.py` | ⏳ | Verifier rules + ratcheting |
-| `test_docs.py` | ⏳ | Documentation generation |
-| `test_cli.py` | ⏳ | CLI commands |
+The suite has grown far past this planning table (~45 test modules, including
+testcontainers-backed integration suites — see Appendix B); the original
+per-file plan is omitted rather than maintained here in parallel.
 
 ### Examples: `examples/`
 
 | File | Status | Notes |
 |---|---|---|
-| `redis_streams_broker.py` | ✅ | Complete broker adapter |
+| `redis_streams_broker.py` | ✅ | Complete broker adapter (example scheme `redis-streams-example`) |
 | `naming_convention_verifier.py` | ✅ | Custom verification rule |
+| `demo_app/` | ✅ | Runnable three-module shop wired purely through events |
 
 ### Top-level
 
 | File | Status | Notes |
 |---|---|---|
-| `pyproject.toml` | 🚧 | Project metadata, dependencies, entry points, CLI script |
-| `README.md` | 🚧 | The first thing users read |
+| `pyproject.toml` | ✅ | Project metadata, dependencies, entry points, CLI script |
+| `README.md` | ✅ | The first thing users read |
 | `SPEC.md` | ✅ | This document |
-| `ROADMAP.md` | 🚧 | Phase plan with checkboxes |
-| `MIGRATION_GUIDE.md` | ⏳ | How to adopt on existing codebases |
-| `LICENSE` | ⏳ | Likely Apache 2.0 |
+| `ROADMAP.md` | ✅ | Phase plan with checkboxes (live status source) |
+| `MIGRATION_GUIDE.md` | ✅ | How to adopt on existing codebases |
+| `LICENSE` | ✅ | Apache 2.0 |
 
-### Separate packages (Phase 2+)
+### Separate packages (re-scoped: shipped as extras)
 
-| Package | Status | Notes |
-|---|---|---|
-| `pytest-modulith` | 📦 | Test plugin |
-| `modulith-postgres` | 📦 | Postgres outbox (could ship as `modulith[postgres]` extra) |
-| `modulith-redis` | 📦 | Redis broker |
-| `modulith-kafka` | 📦 | Kafka broker |
+The original plan floated separately-published packages. The shipped decision
+is **extras of the single `modulith` distribution** (see Part X): the test
+plugin is `modulith[test]` (standalone `pytest-modulith` remains a possible
+v2 split), the Postgres outbox is `modulith[postgres]`, the Redis broker is
+`modulith[redis]`. A Kafka adapter (whether extra or package) is Phase 4.
 
 ---
 
@@ -1169,16 +1251,17 @@ requires-python = ">=3.11"
 dependencies = ["pluggy>=1.3"]
 
 [project.optional-dependencies]
-postgres = ["sqlalchemy>=2.0", "asyncpg>=0.29"]
+postgres = ["sqlalchemy>=2.0", "asyncpg>=0.29", "alembic>=1.13"]
 redis = ["redis>=5.0"]
-kafka = ["aiokafka>=0.10"]
+# no kafka extra — the adapter is Phase 4, unshipped (§10.3)
 otel = ["opentelemetry-api", "opentelemetry-sdk"]
-fastapi = ["fastapi>=0.110", "uvicorn>=0.27"]
-cli = ["typer>=0.12"]
-all = ["modulith[postgres,redis,otel,fastapi,cli]"]
+fastapi = ["fastapi>=0.110", "uvicorn>=0.27", "httpx>=0.26"]
+cli = ["typer>=0.12", "rich>=13.0"]
+test = ["pytest", "pytest-asyncio", "..."]  # see pyproject.toml for the full pins
+all = ["modulith[postgres,redis,otel,fastapi,cli,test]"]
 
 [project.scripts]
-modulith = "modulith.cli:app"
+modulith = "modulith.cli:main"
 
 [project.entry-points."modulith"]
 # Built-in plugins. Users disable via [tool.modulith].disable.

@@ -62,7 +62,12 @@ class EventPublication:
 
     # Fully-qualified type name, e.g. "myapp.orders.events.OrderCreated".
     # Used to resolve the deserialization target on retry. Set by the
-    # outbox plugin when it constructs the publication record.
+    # outbox plugin when it constructs the publication record. When the
+    # record can originate outside the trusted process boundary (a shared
+    # outbox table, a broker), treat this as untrusted input: serializers
+    # resolve it via importlib, so deserialization should be restricted to
+    # an allowlist (see EventSerializer.deserialize and
+    # JsonEventSerializer's allowed_event_types).
     event_type: str | None = None
 
     # Identifier of the listener this publication targets. One event
