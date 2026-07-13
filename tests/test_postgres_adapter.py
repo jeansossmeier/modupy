@@ -2,9 +2,10 @@
 
 The adapter is named for Postgres (it ships in ``modulith[postgres]`` with
 asyncpg) but is built on portable SQLAlchemy 2.0 Core/ORM, so these tests run
-it against an in-memory aiosqlite engine — no Docker. The same code path runs
-on Postgres in production; only the dialect (and the partial-index variant)
-differs.
+it against aiosqlite — no Docker: a tmp-file DB with per-session connections
+(see the ``engine`` fixture for why NOT StaticPool + :memory:). The same code
+path runs on Postgres in production; only the dialect (and the partial-index
+variant) differs.
 
 Covered:
   * schema creates cleanly and round-trips an EventPublication;
@@ -25,6 +26,8 @@ import logging
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -32,7 +35,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session as SyncSession
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool
 
 from modulith import EventPublication, event
 from modulith.adapters import postgres_outbox
@@ -61,12 +64,23 @@ async def record(event: PgEvent) -> None:
 
 
 @pytest.fixture
-async def engine():
-    """A shared in-memory aiosqlite engine (StaticPool so all sessions see it)."""
+async def engine(tmp_path: Path) -> Any:
+    """A file-backed aiosqlite engine with one connection PER session (NullPool).
+
+    Deliberately NOT StaticPool + ``sqlite+aiosqlite://``: that hands every
+    session the same single DBAPI connection, and SQLite has exactly one
+    transaction per connection — so under real concurrency (e.g.
+    test_after_commit_and_sweep_race_is_bounded) one session's close (ROLLBACK)
+    can clobber another session's in-flight INSERT->COMMIT, a topology
+    impossible on per-connection Postgres. Same hazard fixed in
+    tests/test_w2_g04_postgres.py; see its
+    test_concurrent_reader_close_does_not_roll_back_inflight_save for the
+    deterministic repro. A tmp-file DB also survives connection invalidation
+    (a StaticPool reconnect produced a brand-new empty :memory: database
+    mid-test)."""
     eng = create_async_engine(
-        "sqlite+aiosqlite://",
-        poolclass=StaticPool,
-        connect_args={"check_same_thread": False},
+        f"sqlite+aiosqlite:///{tmp_path / 'adapter.db'}",
+        poolclass=NullPool,
     )
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
