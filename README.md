@@ -28,8 +28,8 @@ green):
 
 A runnable example lives in [`examples/demo_app`](examples/demo_app) — three
 modules wired together purely through events. What remains before 1.0 is
-ecosystem breadth (more broker/store adapters — Phase 4) and long-form docs
-(a cookbook and an auto-generated API reference). See [ROADMAP.md](ROADMAP.md).
+ecosystem breadth (more broker/store adapters — Phase 4). See
+[ROADMAP.md](ROADMAP.md).
 
 The full design is documented in [SPEC.md](SPEC.md) — start there if
 you want to understand the project completely or contribute.
@@ -231,6 +231,9 @@ is set), **1** violations or user error (bad flags, config errors),
 ## Documentation
 
 - **[SPEC.md](SPEC.md)** — complete project specification, every design decision (this is the canonical reference)
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — how modulith works internally: runtime, plugin contract, outbox, cross-process delivery, verifier
+- **[docs/COOKBOOK.md](docs/COOKBOOK.md)** — task-oriented recipes for common jobs
+- **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)** — the public API surface (generated from docstrings via `scripts/gen_api_reference.py`)
 - **[ROADMAP.md](ROADMAP.md)** — phase plan with checkboxes and kill criteria
 - **[MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)** — adopting on existing codebases
 - **[examples/demo_app](examples/demo_app)** — a runnable three-module shop; the fastest way to see modulith end-to-end
