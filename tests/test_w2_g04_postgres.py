@@ -1,9 +1,10 @@
 """Regression tests for the W2 G04 Postgres-adapter audit findings.
 
 Each test cites the audit finding id it reproduces in its docstring. The
-adapter is portable SQLAlchemy 2.0, so these run against in-memory aiosqlite
-(no Docker) exactly like tests/test_postgres_adapter.py. Async/timing behavior
-is synchronized with events and bounded DB polls, never with bare sleeps.
+adapter is portable SQLAlchemy 2.0, so these run against aiosqlite (no Docker)
+— a tmp-file DB with per-session connections (see the ``engine`` fixture for
+why NOT StaticPool + :memory:). Async/timing behavior is synchronized with
+events and bounded DB polls, never with bare sleeps.
 """
 
 from __future__ import annotations
@@ -12,17 +13,20 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import StaticPool
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from modulith import EventPublication, event
 from modulith.adapters import postgres_outbox
 from modulith.adapters.postgres_outbox import (
     Base,
+    EventPublicationRow,
     PostgresPublicationStore,
     bind_session,
 )
@@ -45,12 +49,21 @@ async def record(event: G04Event) -> None:
 
 
 @pytest.fixture
-async def engine() -> Any:
-    """A shared in-memory aiosqlite engine (StaticPool so all sessions see it)."""
+async def engine(tmp_path: Path) -> Any:
+    """A file-backed aiosqlite engine with one connection PER session (NullPool).
+
+    Deliberately NOT StaticPool + ``sqlite+aiosqlite://``: that hands every
+    session the same single DBAPI connection, and SQLite has exactly one
+    transaction per connection — so under real concurrency (this file starts
+    the retry loop) one session's close (ROLLBACK) clobbered another session's
+    in-flight INSERT->COMMIT, a topology impossible on per-connection Postgres.
+    See test_concurrent_reader_close_does_not_roll_back_inflight_save for the
+    deterministic repro of the S1-r3-155 retry-loop flake this caused.
+    A tmp-file DB also survives connection invalidation (a StaticPool reconnect
+    produced a brand-new empty :memory: database mid-test)."""
     eng = create_async_engine(
-        "sqlite+aiosqlite://",
-        poolclass=StaticPool,
-        connect_args={"check_same_thread": False},
+        f"sqlite+aiosqlite:///{tmp_path / 'g04.db'}",
+        poolclass=NullPool,
     )
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -187,6 +200,66 @@ async def test_retry_loop_driven_failures_advance_attempt_count_in_db(engine: An
         "retry-loop-driven failures were not persisted: attempt_count is stuck, "
         "so backoff and dead-lettering can never engage"
     )
+
+
+# ---------------------------------------------------------------------------
+# S1-r3-155 flake — concurrent session close must not clobber an in-flight save
+# ---------------------------------------------------------------------------
+
+
+async def test_concurrent_reader_close_does_not_roll_back_inflight_save(engine: Any) -> None:
+    """Regression for the ~7%-under-load flake in
+    test_retry_loop_driven_failures_advance_attempt_count_in_db (S1-r3-155):
+    the old engine fixture (StaticPool + ``sqlite+aiosqlite://``) handed EVERY
+    session the same single DBAPI connection, and SQLite has exactly one
+    transaction per connection. When the retry loop's crash-sweep read session
+    closed (Session close issues ROLLBACK) inside a standalone ``save()``'s
+    INSERT->COMMIT await gap, it rolled back the in-flight INSERT on the shared
+    connection; save's COMMIT then no-opped and returned success, the row never
+    existed, and attempt_count stayed 0 forever (``assert 0 >= 2``). Impossible
+    on real Postgres, where each session has its own connection — so the
+    fixture must give sessions independent connections too.
+
+    This test forces the racing interleave deterministically: ``commit()`` is
+    widened to flush -> wait -> commit (exposing the natural await gap, same
+    barrier technique as the g03 race tests) while a sweep-shaped reader
+    session closes inside the gap. The really-saved row must survive."""
+    store = PostgresPublicationStore(engine=engine)
+    insert_flushed = asyncio.Event()
+    reader_closed = asyncio.Event()
+
+    class GapCommitSession(AsyncSession):
+        async def commit(self) -> None:
+            await self.flush()  # INSERT hits the connection, inside the open tx
+            insert_flushed.set()
+            await reader_closed.wait()  # the sweep-shaped reader closes here
+            await super().commit()
+
+    store._sessionmaker = cast(
+        "async_sessionmaker[AsyncSession]",
+        async_sessionmaker(engine, class_=GapCommitSession, expire_on_commit=False),
+    )
+    plain_sessionmaker = async_sessionmaker(engine)
+
+    async def sweep_like_reader() -> None:
+        # Mirrors _retry_loop's crash sweep -> store.find_incomplete: a
+        # read-only session whose exit closes it (ROLLBACK on its connection).
+        async with plain_sessionmaker() as s:
+            await s.execute(select(EventPublicationRow))
+            await insert_flushed.wait()  # close AFTER the INSERT, BEFORE COMMIT
+        reader_closed.set()
+
+    reader = asyncio.create_task(sweep_like_reader())
+    pub = _pub(11)
+    await store.save(pub)  # the REAL standalone insert+commit path
+    await reader
+
+    found = await store.find_incomplete(timedelta(0))
+    assert [p.id for p in found] == [pub.id], (
+        "a concurrent session close rolled back the in-flight standalone save(): "
+        "the row vanished without any error, so retry bookkeeping can never engage"
+    )
+    await store.dispose()
 
 
 # ---------------------------------------------------------------------------
