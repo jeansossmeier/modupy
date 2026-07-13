@@ -131,7 +131,7 @@ Plugins fall into three shapes; forcing all three into one mechanism makes the w
 
 > Built-in plugins are not privileged, just first-party.
 
-Users must be able to disable any built-in feature and replace it with their own implementation using the same hookspec contract. If this isn't true, we've built two-tier architecture (privileged core + second-class plugins) and people will route around it.
+Users must be able to disable any built-in feature and replace it with their own implementation using the same hookspec contract. The shipped mechanism is `configure(disable_plugins=["modulith.builtin.verifier", ...])` at application startup (or `create_plugin_manager(disable=[...])` when embedding) — there is no `[tool.modulith].disable` pyproject key; the configuration loader rejects unknown keys loudly. If this isn't true, we've built two-tier architecture (privileged core + second-class plugins) and people will route around it.
 
 ### 3.5 Async-Native, Sync-Compatible
 
@@ -201,6 +201,12 @@ async delete(publication_id: UUID) -> None
 serialize(event: Any) -> bytes
 deserialize(data: bytes, event_type: str) -> Any
 ```
+
+The configured serializer governs outbox **storage** only. Broker
+**transport** is not pluggable in v1: the wire format is fixed JSON
+(`JsonEventSerializer`), spoken identically by the direct publish path, the
+durable broker-route path, and the cross-process worker consumer — so a
+binary storage serializer (Avro, Protobuf) never leaks onto the wire.
 
 `event_type` is the fully-qualified class name recorded on the publication.
 Treat it as untrusted input whenever payloads can originate outside the
@@ -811,8 +817,8 @@ durable audit log — size it to the forensic retention window you need.
 
 Extra: `modulith[otel]` (built-in plugin `modulith/builtin/observability.py`; a silent no-op when OTel isn't installed, or installed without a configured tracer provider). Auto-instrumentation emits two span types via the paired event-lifecycle hooks:
 
-- `modulith.event.publish` — one per publication, attributes `event.type`, `event.module`, `modulith.duration_ms`
-- `modulith.event.dispatch` — one per listener invocation, child of the publish span, attributes `event.type`, `listener.name`, `publication.id`; status ERROR (with recorded exception) when the listener raises
+- `modulith.event.publish` — one per publication, attributes `event.type`, `event.module`, `modulith.duration_ms`. On the durable (outbox) path the span brackets the persistence step; a persist/serialize/broker-route failure still ends the span, with the exception recorded and status ERROR (the span never leaks).
+- `modulith.event.dispatch` — one per listener invocation, attributes `event.type`, `listener.name`, `publication.id`; status ERROR (with recorded exception) when the listener raises. Parenting depends on the path: on the **in-memory path** the dispatch span is a child of the publish span; on the **durable (outbox) path** listener dispatch runs after the business transaction commits, in a different context, so those dispatch spans are **not** parented to the publish span — correlate them via `publication.id` instead.
 
 ### 10.5 Documentation Generator
 
@@ -914,8 +920,8 @@ modulith info  # show detected config, modules, plugins
 Uniform across every command:
 
 - **0** — success. Warnings may still have been reported (verify's WARNING-severity violations without `--fail-on-warnings`, `dev`'s startup boundary warnings, doctor's warn-tier checks).
-- **1** — violations or user error: failed verification, invalid flags/arguments (typo'd `--mode`/`--topology` values are rejected loudly, never silently defaulted), configuration errors, unknown ids, missing uvicorn.
-- **2** — unexpected internal error (a modulith bug; traceback printed to stderr).
+- **1** — violations or user error *within a recognized command line*: failed verification, invalid flag **values**/arguments (typo'd `--mode`/`--topology` values are rejected loudly, never silently defaulted), configuration errors, unknown ids, missing uvicorn, unwritable `--baseline` paths.
+- **2** — unexpected internal errors (a modulith bug; traceback printed to stderr) **and CLI usage errors** (a missing required argument, an unknown option): the CLI is built on click, whose convention exits 2 for usage errors — modulith follows it rather than fighting the framework.
 
 `modulith verify` exits 0 when no ERROR-severity violations are reported (strict) or none are new relative to the baseline (ratchet); `--fail-on-warnings` opts in to failing on WARNING-severity findings too. `modulith doctor` exits 1 only when a check reports an error, so both drop into CI as a single line.
 
@@ -1265,7 +1271,8 @@ all = ["modulith[postgres,redis,otel,fastapi,cli,test]"]
 modulith = "modulith.cli:main"
 
 [project.entry-points."modulith"]
-# Built-in plugins. Users disable via [tool.modulith].disable.
+# Built-in plugins. Users disable via configure(disable_plugins=[...]) at
+# startup — [tool.modulith] has no 'disable' key (unknown keys are rejected).
 # (None needed here — built-ins are loaded by manager.BUILTIN_PLUGINS.)
 
 [tool.modulith]

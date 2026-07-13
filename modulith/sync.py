@@ -28,6 +28,20 @@ from typing import Any
 logger = logging.getLogger("modulith.sync")
 
 
+class PublishSyncTimeout(TimeoutError):
+    """publish_sync's OWN budget timeout: the dispatch did not complete
+    within ``timeout`` seconds and was cancelled.
+
+    Distinct by type from a TimeoutError raised BY application code (a
+    listener), which propagates out of publish_sync unchanged — on Python
+    3.11+ ``concurrent.futures.TimeoutError`` IS ``TimeoutError``, so
+    without the dedicated type the two were indistinguishable and the
+    testing plugin's scenario runner swallowed real application failures
+    as budget overruns (W3 R4-W3-01). Subclasses TimeoutError, so existing
+    ``except TimeoutError`` handlers keep working.
+    """
+
+
 # ---------------------------------------------------------------------------
 # SECTION 1: The persistent thread-pool event loop
 # ---------------------------------------------------------------------------
@@ -152,6 +166,12 @@ def publish_sync(event: Any, *, timeout: float | None = 30.0) -> None:
     try:
         future.result(timeout=timeout)
     except FuturesTimeoutError as exc:
+        if future.done():
+            # The dispatch COMPLETED by raising — on 3.11+ FuturesTimeoutError
+            # is TimeoutError, so a listener's own TimeoutError lands in this
+            # handler too. That is an application failure, not a budget
+            # overrun: surface it unchanged (W3 R4-W3-01).
+            raise
         # Cancel the dispatch: without this, a hung listener kept running
         # (or hanging) invisibly on the process-lifetime daemon loop after
         # the caller was already told it failed — one abandoned task per
@@ -162,7 +182,7 @@ def publish_sync(event: Any, *, timeout: float | None = 30.0) -> None:
             timeout,
             type(event).__name__,
         )
-        raise TimeoutError(
+        raise PublishSyncTimeout(
             f"publish_sync({type(event).__name__}) did not complete within {timeout}s"
         ) from exc
 
@@ -199,12 +219,16 @@ def _run_nested_dispatch(
     try:
         done.result(timeout=timeout)
     except FuturesTimeoutError as exc:
+        if done.done():
+            # The nested dispatch completed by raising a TimeoutError of its
+            # own — an application failure, not the budget (W3 R4-W3-01).
+            raise
         logger.warning(
             "publish_sync timeout after %s s for %s (nested dispatch)",
             timeout,
             type(event).__name__,
         )
-        raise TimeoutError(
+        raise PublishSyncTimeout(
             f"publish_sync({type(event).__name__}) did not complete within {timeout}s"
         ) from exc
 
@@ -273,6 +297,7 @@ def wrap_sync_listener(func: Callable[..., None]) -> Callable[..., Any]:
 # ---------------------------------------------------------------------------
 
 __all__ = [
+    "PublishSyncTimeout",
     "publish_sync",
     "wrap_sync_listener",
 ]

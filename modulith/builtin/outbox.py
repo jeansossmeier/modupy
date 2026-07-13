@@ -57,8 +57,18 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from modulith import EventPublication, PublicationStore, hookimpl
+from modulith.serializers import JsonEventSerializer
 
 logger = logging.getLogger("modulith.outbox")
+
+# The broker WIRE serializer. The wire format is fixed JSON in v1: the worker
+# consumer and the direct (non-durable) publish path both speak
+# JsonEventSerializer, so the durable path must put the same bytes on the
+# wire. The *configured* outbox serializer (``configure(serializer=...)``)
+# governs STORAGE of local-listener publication rows only — a binary storage
+# serializer (Avro, Protobuf, pickle) must not leak onto the wire, where the
+# consumer would dead-letter every event as poison.
+_WIRE_SERIALIZER = JsonEventSerializer()
 
 # The current transaction's session, set by adapter integration code
 # (``bind_session``). The plugin only reads it to decide whether a publish
@@ -305,6 +315,11 @@ async def persist_broker_route(event: Any, target: str) -> None:
     the already-serialized payload to the broker. See
     ``_BROKER_ROUTE_LISTENER_PREFIX`` for why the send must not happen inside
     publish() itself.
+
+    The payload is serialized with the WIRE serializer (fixed JSON in v1),
+    not the configured storage serializer — the row's payload goes to the
+    broker verbatim, and the worker consumer decodes the wire format (see
+    ``_WIRE_SERIALIZER``).
     """
     assert _store is not None  # owns-dispatch guarantees this
     if _retry_loop_enabled:
@@ -312,7 +327,7 @@ async def persist_broker_route(event: Any, target: str) -> None:
     fqcn = f"{type(event).__module__}.{type(event).__qualname__}"
     pub = EventPublication(
         id=uuid4(),
-        payload=_serializer.serialize(event),
+        payload=_WIRE_SERIALIZER.serialize(event),
         event_type=fqcn,
         listener=_BROKER_ROUTE_LISTENER_PREFIX + target,
         published_at=datetime.now(UTC),
@@ -555,9 +570,30 @@ def _backoff_elapsed(publication: EventPublication) -> bool:
 
 
 async def _sweep(older_than: timedelta) -> None:
-    """One pass: dispatch every eligible incomplete publication."""
+    """One pass: dispatch every eligible incomplete publication.
+
+    Pre-dispatch guard: when the runtime isn't bootstrapped (startup
+    ordering, or a bootstrap that is currently failing), dispatch cannot
+    succeed for ANY row — no event bus to resolve listeners, no broker
+    registry for routes. That is an infrastructure outage, not a poison
+    message: skip the cycle WITHOUT incrementing attempts or touching
+    backoff bookkeeping, so committed rows aren't burned toward the
+    dead-letter threshold while the outage lasts. Genuine dispatch failures
+    (listener raised, broker rejected) still record attempts and can
+    dead-letter.
+    """
+    from .. import runtime as _rt
+
     assert _store is not None
-    for pub in await _store.find_incomplete(older_than):
+    pending = await _store.find_incomplete(older_than)
+    if pending and _rt._runtime.event_bus is None:
+        logger.info(
+            "outbox sweep: runtime is not bootstrapped — skipping %d pending "
+            "publication(s) this cycle without burning retry attempts",
+            len(pending),
+        )
+        return
+    for pub in pending:
         if pub.attempt_count >= _dead_letter_after_attempts:
             continue  # dead-lettered — no further retries
         if not _backoff_elapsed(pub):

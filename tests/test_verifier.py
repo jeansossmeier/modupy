@@ -335,7 +335,9 @@ def test_baseline_roundtrip(tmp_path: Path) -> None:
 
 
 def test_load_baseline_missing_file_returns_empty(tmp_path: Path) -> None:
-    assert load_baseline(tmp_path / "nope.json") == set()
+    # W3 R3-F2: the baseline is a fingerprint -> count mapping (count-aware
+    # ratchet); a missing file grandfathers nothing.
+    assert load_baseline(tmp_path / "nope.json") == {}
 
 
 def test_filter_against_baseline_removes_grandfathered(tmp_path: Path) -> None:

@@ -96,6 +96,33 @@ def test_mypy_job_type_checks_tests() -> None:
     )
 
 
+def test_integration_job_cannot_go_green_without_docker() -> None:
+    """W3 R5-01: the integration lane must FAIL when Docker is unreachable.
+
+    tests/conftest.py ``pytest.skip``s the entire integration suite when the
+    Docker probe fails, and pytest exits 0 on all-skipped — so a runner-image
+    Docker breakage would turn the lane permanently green while proving
+    nothing (the exact rubber-stamp the unit-lane comment in the same file
+    warns about). Two independent guards are required:
+
+      * a ``docker info`` preflight step, and
+      * a post-run summary assertion: the integration selection must report
+        at least one passed test and no skipped tests.
+    """
+    ci = _ci_text()
+    assert re.search(r"\bdocker info\b", ci), (
+        "integration lane must run a `docker info` preflight step so an "
+        "unreachable Docker daemon fails the job instead of skipping the suite"
+    )
+    assert re.search(r"[0-9$(){}\[\]+]* passed", ci) or "passed" in ci, (
+        "integration lane must assert its pytest summary reports passed tests"
+    )
+    assert "skipped" in ci, (
+        "integration lane must fail when its pytest summary reports skipped "
+        "tests (an all-skip exits 0 and rubber-stamps the lane)"
+    )
+
+
 def test_standalone_tool_pins_mirror_pyproject() -> None:
     """S4-r3-164 / S4-r2-125: no constraint drift between ci.yml and pyproject.
 

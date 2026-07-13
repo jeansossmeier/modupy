@@ -243,10 +243,20 @@ class Runtime:
 
             assert self._event_bus is not None
             handlers = self._event_bus.listeners_for(type(event))
-            await outbox.persist(event)
-            target = self._broker_route_target(event, has_local_handler=bool(handlers))
-            if target is not None:
-                await outbox.persist_broker_route(event, target)
+            try:
+                await outbox.persist(event)
+                target = self._broker_route_target(event, has_local_handler=bool(handlers))
+                if target is not None:
+                    await outbox.persist_broker_route(event, target)
+            except BaseException as exc:
+                # The publish failed BETWEEN the paired publish hooks.
+                # modulith_after_event_published is contractually scoped to
+                # successful persistence, so it must NOT fire — but the
+                # observability publish span started in the before hook would
+                # then leak (never ended, stale ContextVar — W3 R4-W3-02).
+                # Close it explicitly with the failure recorded.
+                self._abort_publish_observability(exc)
+                raise
             # Fire the post-publish hook on the durable path too: the event is
             # now persisted, which is exactly what the hookspec documents
             # ("after an event has been persisted to the outbox"). Omitting it
@@ -275,6 +285,37 @@ class Runtime:
         from .builtin import outbox
 
         return outbox._store is not None and outbox._current_session.get() is not None
+
+    async def _route_to_broker_guarded(self, event: Any, *, has_local_handler: bool) -> None:
+        """``_maybe_route_to_broker`` + publish-span cleanup on failure.
+
+        The inline broker route runs between the paired publish hooks, so a
+        route failure must close the observability publish span before it
+        propagates (W3 R4-W3-02, direct-path leg).
+        """
+        try:
+            await self._maybe_route_to_broker(event, has_local_handler=has_local_handler)
+        except BaseException as exc:
+            self._abort_publish_observability(exc)
+            raise
+
+    @staticmethod
+    def _abort_publish_observability(exc: BaseException) -> None:
+        """Close the built-in observability publish span on a failed publish.
+
+        A publish that raises between ``modulith_before_event_published`` and
+        ``modulith_after_event_published`` (outbox persist/serialize, inline
+        broker route) fires no further hook — the hookspec scopes the after
+        hook to success — so the built-in plugin's publish span leaked:
+        never ended (never exported) with a stale ContextVar mis-parenting
+        the next dispatch span in the same context (W3 R4-W3-02). This is a
+        first-party seam, mirroring ``_outbox_owns_dispatch``'s direct
+        knowledge of the outbox plugin; it is a no-op when OTel is absent or
+        the plugin is disabled (no span was started).
+        """
+        from .builtin import observability
+
+        observability.abort_publish_span(exc)
 
     def _serialized_payload(self, event: Any) -> bytes:
         """Best-effort serialized bytes for hook-facing EventPublications.
@@ -329,7 +370,7 @@ class Runtime:
             # cross-module event bound for a worker in another process —
             # route it to the broker. In single topology it simply has no
             # consumers.
-            await self._maybe_route_to_broker(event, has_local_handler=False)
+            await self._route_to_broker_guarded(event, has_local_handler=False)
             pm.hook.modulith_after_event_published(event=event, publication=publish_pub)
             return
 
@@ -364,7 +405,7 @@ class Runtime:
         # is independent of local delivery, so a local listener failure (raised
         # below) must not suppress it. No-op unless the event resolves to a
         # remote target (see _maybe_route_to_broker).
-        await self._maybe_route_to_broker(event, has_local_handler=True)
+        await self._route_to_broker_guarded(event, has_local_handler=True)
 
         pm.hook.modulith_after_event_published(event=event, publication=publish_pub)
 

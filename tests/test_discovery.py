@@ -188,12 +188,15 @@ def test_builtin_discovery_skips_underscore_and_single_file_submodules(make_fake
     assert {m.name for m in modules} == {"good"}
 
 
-def test_builtin_discovery_returns_empty_for_unimportable_app_package() -> None:
-    """A4-r1-12: a missing/unimportable app package degrades to an empty
-    module list — the hook's docstring promises it never raises."""
+def test_builtin_discovery_fails_loud_for_unimportable_app_package() -> None:
+    """W3 R3-F1 (supersedes A4-r1-12's return-[] contract): a missing or
+    unimportable app package raises ConfigurationError so verify/doctor
+    cannot go CI-green on an app that doesn't import."""
+    from modulith import ConfigurationError
     from modulith.builtin.discovery import modulith_discover_modules
 
-    assert modulith_discover_modules(app_package="definitely_not_installed_xyz_123") == []
+    with pytest.raises(ConfigurationError, match="definitely_not_installed_xyz_123"):
+        modulith_discover_modules(app_package="definitely_not_installed_xyz_123")
 
 
 def test_builtin_discovery_returns_empty_for_single_file_app_package(

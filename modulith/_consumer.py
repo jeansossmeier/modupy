@@ -230,8 +230,34 @@ class BrokerConsumer:
             )
             for lost in lost_ids:
                 self._attempts.pop((target, lost), None)
-        for message_id, fields in claimed:
+        await self._dispatch_claimed(target, claimed)
+
+    async def _dispatch_claimed(self, target: str, claimed: Any) -> None:
+        """Dispatch reclaimed entries, skipping nil rows defensively.
+
+        XAUTOCLAIM on Redis < 7.0 returns nil for a pending entry that was
+        deleted from the stream (7.0+ moves these to the ``deleted`` reply
+        element instead). There is nothing to dispatch for a nil row — skip
+        it so one nil entry cannot kill the consumer task and crash-loop
+        worker startup (W3 R2-01).
+        """
+        nil_entries = 0
+        for entry in claimed:
+            if entry is None:
+                nil_entries += 1
+                continue
+            message_id, fields = entry
+            if fields is None:
+                nil_entries += 1
+                continue
             await self._dispatch_one(target, message_id, fields)
+        if nil_entries:
+            logger.info(
+                "reclaim on %s returned %d nil entr(y/ies) (Redis < 7.0 "
+                "reporting stream-deleted pending messages) — skipped",
+                target,
+                nil_entries,
+            )
 
     async def _recover_after_broker_failure(self, target: str, exc: Exception) -> None:
         """Backoff + NOGROUP recovery after a failed broker ``read``/``reclaim``.

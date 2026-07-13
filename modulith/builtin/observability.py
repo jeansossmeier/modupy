@@ -133,6 +133,35 @@ def modulith_after_event_published(event: Any, publication: EventPublication) ->
     _publish_span.set(None)
 
 
+def abort_publish_span(exception: BaseException) -> None:
+    """End the publish span for a publish that FAILED between the hooks.
+
+    ``modulith_after_event_published`` is contractually scoped to successful
+    persistence/dispatch, so when ``Runtime.publish`` fails between the
+    paired hooks (outbox persist/serialize/broker-route raised — W3
+    R4-W3-02) no hook fires and the span started in
+    ``modulith_before_event_published`` leaked: never ended (so never
+    exported — tracing went blind exactly during the outages the outbox
+    exists for) and left stale in the ContextVar, mis-parenting the next
+    dispatch span in the same context. Called directly by the runtime's
+    publish failure path (a first-party seam, mirroring the runtime's
+    direct knowledge of the outbox plugin); records the exception, sets
+    ERROR status, ends the span, and resets the ContextVar. No-op when
+    OTel is absent or no span is active (e.g. this plugin is disabled).
+    """
+    if not _OTEL_AVAILABLE:
+        return
+    span = _publish_span.get()
+    if span is None:
+        return
+    duration_ms = (time.monotonic() - _publish_start.get()) * 1000
+    span.set_attribute("modulith.duration_ms", duration_ms)
+    span.record_exception(exception)
+    span.set_status(Status(StatusCode.ERROR, str(exception)))
+    span.end()
+    _publish_span.set(None)
+
+
 @hookimpl
 def modulith_on_listener_dispatch(
     event: Any,
@@ -221,6 +250,7 @@ def _detect_calling_module() -> str:
 
 
 __all__ = [
+    "abort_publish_span",
     "modulith_after_event_published",
     "modulith_before_event_published",
     "modulith_on_listener_complete",

@@ -44,14 +44,18 @@ def modulith_discover_modules(app_package: str) -> list[ModuleInfo]:
     Each surviving subpackage is imported eagerly so any @listener
     decorators it contains register against the event bus.
 
-    Returns an empty list if the application package can't be imported
-    (whatever the exception — a missing package and a bug in the app's
-    ``__init__`` both count) or contains no subpackages — this hook never
-    raises, so a misconfigured app still gets a clean error from the
-    runtime banner ("0 modules discovered") rather than a cryptic
-    ImportError. Modules whose *own* import (or whose ``_manifest.py``)
-    fails do not abort the walk either; they are recorded and surfaced as
-    a ConfigurationError when bootstrap fires modulith_after_module_load.
+    Failure semantics (W3 R3-F1):
+
+    * The APPLICATION PACKAGE's own import failure — missing package and a
+      bug in the app's ``__init__`` alike (A4-r5-207 uniformity) — is a
+      fatal misconfiguration: it raises ConfigurationError with the original
+      exception chained as the cause, so bootstrap (and thus ``modulith
+      verify``/``doctor``) fails loudly instead of going CI-green on an app
+      that cannot even be imported.
+    * Individual MODULES whose own import (or whose ``_manifest.py``) fails
+      do not abort the walk; they are recorded and surfaced as a
+      ConfigurationError when bootstrap fires modulith_after_module_load —
+      one broken module must not hide its healthy siblings.
     """
     # Fresh walk, fresh failure ledger — stale entries from a previous
     # bootstrap in the same process must not fail an app that has been
@@ -61,11 +65,18 @@ def modulith_discover_modules(app_package: str) -> list[ModuleInfo]:
     try:
         root = importlib.import_module(app_package)
     except Exception as exc:
-        # Deliberately broad: the docstring promises "never raises", and a
-        # NameError inside the app's __init__ must degrade exactly like a
-        # missing package (ImportError) instead of propagating (A4-r5-207).
+        # Deliberately broad (A4-r5-207): a NameError inside the app's
+        # __init__ must fail exactly like a missing package (ImportError) —
+        # but LOUDLY (W3 R3-F1). Returning [] here made `modulith verify`
+        # print "✓ no boundary violations" and exit 0 on an unimportable
+        # application package.
         logger.exception("could not import application package %r: %s", app_package, exc)
-        return []
+        raise ConfigurationError(
+            f"the application package {app_package!r} failed to import "
+            f"({type(exc).__name__}: {exc}). Nothing can be discovered or "
+            "verified until it imports — fix the error above (full traceback "
+            "logged) or correct [tool.modulith].package / MODULITH_PACKAGE."
+        ) from exc
 
     # Single-file modules (no __path__) have no subpackages to discover.
     if not hasattr(root, "__path__"):

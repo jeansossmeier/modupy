@@ -190,9 +190,13 @@ cython_debug/
 # PyCharm
 #   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#   and can be added to the global gitignore or merged into this file.  For a more nuclear
-#   option (not recommended) you can uncomment the following to ignore the entire idea folder.
-# .idea/
+#   and can be added to the global gitignore or merged into this file.
+.idea/
+
+# graphify knowledge-graph output — locally-built analysis artifacts, never
+# tracked and never packaged (W3 R5-03: a local sdist build swept 386 stray
+# files from these directories into the tarball).
+graphify-out/
 
 # Abstra
 #   Abstra is an AI-powered process automation framework.

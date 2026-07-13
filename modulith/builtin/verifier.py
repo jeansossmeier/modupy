@@ -43,7 +43,8 @@ import hashlib
 import importlib.util
 import json
 import logging
-from collections.abc import Collection
+from collections import Counter
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -790,8 +791,15 @@ def _entry_for(violation: Violation) -> BaselineEntry:
     )
 
 
-def load_baseline(path: Path) -> set[BaselineEntry]:
-    """Read the baseline file; return the set of grandfathered violations.
+def load_baseline(path: Path) -> dict[BaselineEntry, int]:
+    """Read the baseline file; return grandfathered fingerprints with counts.
+
+    The ratchet is count-aware (W3 R3-F2): each fingerprint maps to the
+    number of violations grandfathered under it, so a NEW violation that is
+    identical to a baselined one (same rule/module/file/message, different
+    line) still fails the build. Entries written by older versions carry no
+    ``count`` and read as an allowance of exactly one; duplicate fingerprints
+    in one file accumulate.
 
     A corrupted or schema-mismatched file raises ConfigurationError naming
     the path and the regeneration command — never a raw JSONDecodeError or
@@ -801,7 +809,7 @@ def load_baseline(path: Path) -> set[BaselineEntry]:
     from modulith.config import ConfigurationError
 
     if not path.exists():
-        return set()
+        return {}
     hint = "regenerate it with `modulith verify --mode=ratchet --update-baseline`"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -812,7 +820,7 @@ def load_baseline(path: Path) -> set[BaselineEntry]:
             f"baseline file {path} must contain a JSON list of entries, "
             f"got {type(data).__name__}; {hint}"
         )
-    entries: set[BaselineEntry] = set()
+    entries: dict[BaselineEntry, int] = {}
     for item in data:
         if not isinstance(item, dict):
             raise ConfigurationError(
@@ -831,29 +839,52 @@ def load_baseline(path: Path) -> set[BaselineEntry]:
             raise ConfigurationError(
                 f"baseline file {path} has an entry with non-string fields; {hint}"
             )
-        entries.add(
-            BaselineEntry(
-                rule=rule,
-                module=module,
-                location=_normalize_location(location),
-                message_hash=message_hash,
+        count = item.get("count", 1)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ConfigurationError(
+                f"baseline file {path} has an entry with an invalid count "
+                f"{count!r} (expected a positive integer); {hint}"
             )
+        entry = BaselineEntry(
+            rule=rule,
+            module=module,
+            location=_normalize_location(location),
+            message_hash=message_hash,
         )
+        entries[entry] = entries.get(entry, 0) + count
     return entries
 
 
 def filter_against_baseline(
     violations: list[Violation],
-    baseline: set[BaselineEntry],
+    baseline: Mapping[BaselineEntry, int],
 ) -> list[Violation]:
-    """Return only violations not present in the baseline."""
-    return [v for v in violations if _entry_for(v) not in baseline]
+    """Return the violations beyond the baseline's per-fingerprint allowance.
+
+    Each grandfathered fingerprint admits at most its baselined count; every
+    violation past that allowance is reported (W3 R3-F2). Fewer violations
+    than baselined is an improvement and passes — the ratchet only tightens.
+    """
+    remaining = dict(baseline)
+    reported: list[Violation] = []
+    for v in violations:
+        entry = _entry_for(v)
+        if remaining.get(entry, 0) > 0:
+            remaining[entry] -= 1
+        else:
+            reported.append(v)
+    return reported
 
 
 def write_baseline(path: Path, violations: list[Violation]) -> None:
-    """Write the current violation set as a new baseline (stable JSON)."""
+    """Write the current violation set as a new baseline (stable JSON).
+
+    One entry per fingerprint with its ``count`` (W3 R3-F2), so the
+    multiplicity of identical violations is part of the ratchet.
+    """
+    counts = Counter(_entry_for(v) for v in violations)
     entries = sorted(
-        (_entry_for(v) for v in violations),
+        counts,
         key=lambda e: (e.rule, e.module, e.location, e.message_hash),
     )
     payload = [
@@ -862,6 +893,7 @@ def write_baseline(path: Path, violations: list[Violation]) -> None:
             "module": e.module,
             "location": e.location,
             "message_hash": e.message_hash,
+            "count": counts[e],
         }
         for e in entries
     ]

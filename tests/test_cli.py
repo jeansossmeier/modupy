@@ -309,6 +309,34 @@ def test_verify_dirty_exits_one_and_reports_violation(make_fake_app, monkeypatch
     assert "orders" in result.output
 
 
+def test_verify_unimportable_package_exits_one(make_fake_app, monkeypatch):
+    """W3 R3-F1: an application package whose own __init__ raises must fail
+    `modulith verify` (exit 1 with the cause) — not report '✓ no boundary
+    violations' and exit 0, going CI-green on an unimportable app."""
+    monkeypatch.setenv("MODULITH_PACKAGE", "brokenrootapp")
+    make_fake_app(
+        {},
+        package_name="brokenrootapp",
+        extra_files={"__init__.py": "raise NameError('simulated bug in application __init__')\n"},
+    )
+
+    result = runner.invoke(app, ["verify"])
+
+    assert result.exit_code == 1, result.output
+    assert "brokenrootapp" in result.output
+    assert "no boundary violations" not in result.output
+
+
+def test_verify_missing_package_exits_one(monkeypatch):
+    """W3 R3-F1: a package that doesn't exist at all must also fail verify."""
+    monkeypatch.setenv("MODULITH_PACKAGE", "w3_ghost_pkg_does_not_exist")
+
+    result = runner.invoke(app, ["verify"])
+
+    assert result.exit_code == 1, result.output
+    assert "w3_ghost_pkg_does_not_exist" in result.output
+
+
 def test_verify_ratchet_update_writes_baseline(make_fake_app, monkeypatch, tmp_path):
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app(
@@ -953,6 +981,43 @@ def test_verify_ratchet_corrupt_baseline_is_clean_user_error(
         _sys,
         "argv",
         ["modulith", "verify", "--mode", "ratchet", "--baseline", str(baseline)],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 1  # user error, not internal (2)
+    assert "baseline" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_verify_update_baseline_unwritable_path_is_clean_user_error(
+    make_fake_app, monkeypatch, capsys, tmp_path
+) -> None:
+    """W3 R3-F4: `verify --update-baseline` with a --baseline path in a
+    nonexistent directory must exit 1 with a clean actionable message —
+    never the raw FileNotFoundError traceback + exit 2 reserved for
+    internal bugs."""
+    import sys as _sys
+
+    import modulith.cli as cli
+
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    baseline = tmp_path / "no_such_dir" / "baseline.json"
+    monkeypatch.setattr(
+        _sys,
+        "argv",
+        [
+            "modulith",
+            "verify",
+            "--mode",
+            "ratchet",
+            "--baseline",
+            str(baseline),
+            "--update-baseline",
+        ],
     )
 
     with pytest.raises(SystemExit) as excinfo:

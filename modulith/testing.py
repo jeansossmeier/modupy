@@ -294,34 +294,54 @@ class Scenario:
     def _fire_trigger(self, seconds: float, deadline: float) -> None:
         """Fire the publish/call trigger, bounded by the shared budget.
 
-        A trigger that overruns is cancelled and the TimeoutError swallowed:
-        ``within()`` falls through to its poll loop, which checks whatever
-        was captured before the overrun and raises the documented
-        AssertionError on a miss.
+        ONLY the scenario's own budget overrun is swallowed (W3 R4-W3-01):
+        the trigger is cancelled and ``within()`` falls through to its poll
+        loop, which checks whatever was captured before the overrun and
+        raises the documented AssertionError on a miss. A TimeoutError
+        raised BY the application — the trigger coroutine itself, or a
+        listener — is a real failure and propagates; swallowing it produced
+        false-green tests.
         """
-        from .sync import _get_or_create_loop, publish_sync
+        from .sync import PublishSyncTimeout, publish_sync
 
         if self._initial_event is not None:
             try:
                 publish_sync(self._initial_event, timeout=seconds)
-            except TimeoutError:
+            except PublishSyncTimeout:
                 # The trigger overran the shared budget; publish_sync already
-                # cancelled the abandoned dispatch.
+                # cancelled the abandoned dispatch. An application-raised
+                # TimeoutError is NOT this type and propagates.
                 pass
             return
 
         assert self._initial_call is not None
         result = self._initial_call(*self._initial_call_args, **self._initial_call_kwargs)
         if inspect.iscoroutine(result):
-            future: Future[Any] = asyncio.run_coroutine_threadsafe(result, _get_or_create_loop())
-            try:
-                future.result(timeout=max(0.0, deadline - time.monotonic()))
-            except TimeoutError:
-                # Cancel the overrunning trigger so it cannot outlive this
-                # test on the shared daemon loop and dispatch into a later
-                # test's runtime (concurrent.futures.TimeoutError is an
-                # alias of TimeoutError on Python >= 3.11).
-                future.cancel()
+            self._await_call_trigger(result, deadline)
+
+    @staticmethod
+    def _await_call_trigger(coro: Any, deadline: float) -> None:
+        """Block on a coroutine trigger, swallowing ONLY the budget overrun.
+
+        A budget overrun cancels the trigger so it cannot outlive this test
+        on the shared daemon loop and dispatch into a later test's runtime.
+        A TimeoutError raised by the coroutine itself is an application
+        failure and propagates (W3 R4-W3-01).
+        """
+        from .sync import _get_or_create_loop
+
+        future: Future[Any] = asyncio.run_coroutine_threadsafe(coro, _get_or_create_loop())
+        try:
+            future.result(timeout=max(0.0, deadline - time.monotonic()))
+        except TimeoutError:
+            if future.done() and future.exception() is not None:
+                # future.result() re-raised a TimeoutError from the app
+                # coroutine itself, not the budget mechanism
+                # (concurrent.futures.TimeoutError is an alias of
+                # TimeoutError on Python >= 3.11) — a real application
+                # failure; surface it.
+                raise
+            future.cancel()
 
 
 @pytest.fixture

@@ -98,7 +98,14 @@ class EventSerializer(Protocol):
     """
 
     def serialize(self, event: Any) -> bytes:
-        """Encode an event instance to bytes for storage and transport."""
+        """Encode an event instance to bytes for outbox storage.
+
+        The configured serializer governs STORAGE of publication records
+        only. Broker transport is not pluggable in v1: the wire format is
+        fixed JSON (``JsonEventSerializer``), spoken identically by the
+        direct publish path, the durable broker-route path, and the worker
+        consumer.
+        """
         ...
 
     def deserialize(self, data: bytes, event_type: str) -> Any:

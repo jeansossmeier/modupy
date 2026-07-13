@@ -65,17 +65,22 @@ class FakeConsumerBroker:
     (audit S3-r1-65) — and rejects ``block_ms <= 0`` loudly (real Redis BLOCK 0
     blocks forever; BrokerConsumer clamps to >=1ms — audit A7-r2-92);
     ``ack``/``dead_letter`` are recorded; ``reclaim`` serves entries staged in
-    ``pending``, honoring ``min_idle_ms`` and ``count`` like real XAUTOCLAIM
-    (audits S3-r2-120 / A7-r3-140). A staged pending entry defaults to
-    idle-forever (a crashed peer's message); set ``pending_idle_ms`` per
-    (target, mid) to model a freshly-delivered in-flight message. Ids staged
-    in ``lost`` are returned once via XAUTOCLAIM's third (deleted) element —
-    the trimmed-while-pending loss channel (audit S3-r3-160).
+    ``pending``, honoring ``min_idle_ms`` like real XAUTOCLAIM (audit
+    S3-r2-120) and — mirroring ``RedisStreamsBroker.reclaim`` post-RESIDUALS —
+    draining the FULL idle backlog per call (the real adapter follows the
+    XAUTOCLAIM cursor until ``0-0``; ``count`` is its internal page size, not
+    a result cap). A staged pending entry defaults to idle-forever (a crashed
+    peer's message); set ``pending_idle_ms`` per (target, mid) to model a
+    freshly-delivered in-flight message. A staged ``None`` entry models
+    Redis < 7.0 XAUTOCLAIM returning nil for a pending entry deleted from the
+    stream (W3 R2-01). Ids staged in ``lost`` are returned once via
+    XAUTOCLAIM's third (deleted) element — the trimmed-while-pending loss
+    channel (audit S3-r3-160).
     """
 
     def __init__(self) -> None:
         self.streams: dict[str, list[tuple[str, dict[bytes, bytes]]]] = {}
-        self.pending: dict[str, list[tuple[str, dict[bytes, bytes]]]] = {}
+        self.pending: dict[str, list[tuple[str, dict[bytes, bytes]] | None]] = {}
         # (target, mid) -> idle ms; absent = idle forever (crashed peer).
         self.pending_idle_ms: dict[tuple[str, str], float] = {}
         # target -> ids to report via reclaim's deleted element (once).
@@ -135,12 +140,20 @@ class FakeConsumerBroker:
         count: int = 100,
     ) -> Any:
         # Real XAUTOCLAIM only claims entries idle >= min_idle_time (audit
-        # S3-r2-120) and caps claims at COUNT (audit A7-r3-140).
-        claimed: list[tuple[str, dict[bytes, bytes]]] = []
-        kept: list[tuple[str, dict[bytes, bytes]]] = []
-        for mid, fields in self.pending.get(target, []):
+        # S3-r2-120). The real adapter pages at COUNT but follows the cursor
+        # until 0-0 — one reclaim() call drains the FULL idle backlog
+        # (RESIDUALS multi-page-drain contract), so the fake ignores ``count``
+        # as a result cap. Staged ``None`` entries (Redis < 7.0 nil rows) are
+        # handed back once, like real nil claim results.
+        claimed: list[tuple[str, dict[bytes, bytes]] | None] = []
+        kept: list[tuple[str, dict[bytes, bytes]] | None] = []
+        for entry in self.pending.get(target, []):
+            if entry is None:
+                claimed.append(None)
+                continue
+            mid, fields = entry
             idle = self.pending_idle_ms.get((target, mid), float("inf"))
-            if idle >= min_idle_ms and len(claimed) < count:
+            if idle >= min_idle_ms:
                 claimed.append((mid, fields))
             else:
                 kept.append((mid, fields))
@@ -471,15 +484,26 @@ async def test_reclaim_does_not_steal_fresh_in_flight_messages() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fake_reclaim_caps_at_count() -> None:
-    """Real XAUTOCLAIM caps claims at COUNT (audit A7-r3-140) — the old fake
-    handed back the entire staged backlog in one call."""
+async def test_fake_reclaim_drains_full_idle_backlog_per_call() -> None:
+    """W3 R2-02: the real adapter follows XAUTOCLAIM's cursor until ``0-0`` —
+    one ``reclaim()`` call recovers the FULL idle-pending backlog (``count``
+    is the adapter-internal page size, not a result cap). The fake mirrors
+    that multi-page-drain contract; only entries still fresh (idle below
+    ``min_idle_ms``) stay pending."""
     broker = FakeConsumerBroker()
     broker.pending["t"] = [(f"{i}-0", {b"data": b"{}"}) for i in range(1, 4)]
+    broker.pending_idle_ms[("t", "3-0")] = 0  # fresh in-flight — NOT claimable
 
-    _cursor, claimed, _deleted = await broker.reclaim("t", consumer="c", min_idle_ms=0, count=2)
-    assert [m for m, _ in claimed] == ["1-0", "2-0"]  # capped at count
-    assert [m for m, _ in broker.pending["t"]] == ["3-0"]  # remainder stays pending
+    _cursor, claimed, _deleted = await broker.reclaim("t", consumer="c", min_idle_ms=1_000, count=2)
+    # The whole idle backlog comes back in one call, beyond count=2 pages.
+    assert [m for m, _ in claimed] == ["1-0", "2-0"]
+    # min_idle_ms is still honored: the fresh entry stays pending.
+    assert broker.pending["t"] == [("3-0", {b"data": b"{}"})]
+
+    broker.pending["u"] = [(f"{i}-0", {b"data": b"{}"}) for i in range(1, 5)]
+    _cursor, claimed, _deleted = await broker.reclaim("u", consumer="c", min_idle_ms=0, count=2)
+    assert len(claimed) == 4  # full drain, not a count-capped single page
+    assert "u" not in broker.pending
 
 
 @pytest.mark.asyncio
@@ -502,6 +526,65 @@ async def test_reclaim_surfaces_trimmed_pending_ids_as_lost(caplog) -> None:
     assert ("t", "4-0") not in consumer._attempts  # bookkeeping cleared
     assert broker.acked == []  # a lost message is neither acked...
     assert broker.dead == []  # ...nor dead-lettered — it no longer exists
+
+
+@pytest.mark.asyncio
+async def test_reclaim_survives_nil_claimed_entries() -> None:
+    """W3 R2-01: XAUTOCLAIM on Redis < 7.0 returns nil for pending entries
+    deleted from the stream. A nil row must be skipped defensively — the
+    entries after it are still reclaimed and dispatched, and the consumer
+    does not crash."""
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    broker = FakeConsumerBroker()
+
+    fqn = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+    fields = {
+        b"data": JsonEventSerializer().serialize(CrossEvent(value=17)),
+        b"h:event_type": fqn.encode(),
+    }
+    broker.pending["t"] = [None, ("5-0", fields)]  # nil row FIRST, then real work
+
+    consumer = _make_consumer(broker, bus, targets=["t"])
+    await consumer._reclaim("t")  # must not raise
+
+    assert received == [17]  # the entry after the nil row was still dispatched
+    assert ("t", "5-0") in broker.acked
+
+
+@pytest.mark.asyncio
+async def test_consumer_loop_stays_alive_across_nil_claimed_entries() -> None:
+    """W3 R2-01: a nil claimed entry during the periodic reclaim must not kill
+    the consumer task — later messages are still consumed."""
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    broker = FakeConsumerBroker()
+    broker.pending["t"] = [None]  # startup reclaim hits the nil row
+
+    fqn = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+    payload = JsonEventSerializer().serialize(CrossEvent(value=23))
+
+    consumer = _make_consumer(broker, bus, targets=["t"])
+    await consumer.start()
+    try:
+        broker.deliver("t", payload, {"event_type": fqn})
+        await _until(lambda: received)
+        task = consumer._task
+        assert task is not None and not task.done()
+    finally:
+        await consumer.stop()
+
+    assert received == [23]
 
 
 # ---------------------------------------------------------------------------

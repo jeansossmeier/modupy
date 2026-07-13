@@ -46,16 +46,21 @@ def reset_manifests():
 
 
 # ---------------------------------------------------------------------------
-# A4-r5-207 — top-level package failures never propagate from the hook
+# W3 R3-F1 — the application package's OWN import failure fails loud
+# (supersedes A4-r5-207's return-[] contract, which made verify/doctor
+# exit 0 — CI-green — on an unimportable application package)
 # ---------------------------------------------------------------------------
 
 
-def test_discover_returns_empty_when_app_package_raises_non_import_error(
+def test_app_package_import_failure_raises_configuration_error(
     make_fake_app,
 ) -> None:
-    """A4-r5-207: the hook docstring promises 'never raises', but only
-    ImportError was caught around the top-level import — a NameError (a
-    real bug in the app's __init__) propagated out of the hook."""
+    """W3 R3-F1: a bug in the application package's own __init__ must fail
+    discovery loudly (ConfigurationError, original exception chained as the
+    cause) — not degrade to '0 modules discovered', which turned an
+    unimportable app into a green `modulith verify`. A4-r5-207's uniformity
+    still holds: NameError and ImportError get the SAME treatment; the raw
+    exception never propagates untyped out of the hook."""
     from modulith.builtin.discovery import modulith_discover_modules
 
     pkg = make_fake_app(
@@ -64,7 +69,19 @@ def test_discover_returns_empty_when_app_package_raises_non_import_error(
         extra_files={"__init__.py": "raise NameError('oops, a real bug in app init')\n"},
     )
 
-    assert modulith_discover_modules(pkg) == []
+    with pytest.raises(ConfigurationError, match="buggyrootapp") as excinfo:
+        modulith_discover_modules(pkg)
+    # The real traceback cause is preserved for diagnosis.
+    assert isinstance(excinfo.value.__cause__, NameError)
+
+
+def test_missing_app_package_raises_configuration_error() -> None:
+    """W3 R3-F1: a package that cannot be found at all (typo'd name, wrong
+    cwd) is the same fatal misconfiguration as a broken __init__."""
+    from modulith.builtin.discovery import modulith_discover_modules
+
+    with pytest.raises(ConfigurationError, match="w3_no_such_ghost_pkg"):
+        modulith_discover_modules("w3_no_such_ghost_pkg")
 
 
 # ---------------------------------------------------------------------------

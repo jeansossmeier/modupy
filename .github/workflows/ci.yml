@@ -67,8 +67,32 @@ jobs:
         # postgres:16 / redis:7 containers.
         run: uv pip install --system -e ".[integration]"
 
+      - name: Docker preflight
+        # tests/conftest.py pytest.skip's the ENTIRE integration suite when
+        # Docker is unreachable, and pytest exits 0 on all-skipped — without
+        # this preflight a runner-image Docker breakage turns the lane
+        # permanently green while proving nothing (W3 R5-01): the exact
+        # rubber-stamp the unit-lane comment above warns about.
+        run: docker info
+
       - name: Run integration suite
-        run: pytest -m integration -v
+        # Belt and braces with the preflight: ANY skip in this lane means the
+        # Docker/testcontainers path silently degraded mid-run. Fail the job
+        # when the pytest summary reports skipped tests or no passed tests
+        # (W3 R5-01).
+        run: |
+          set -o pipefail
+          pytest -m integration -v | tee pytest-integration.log
+          summary=$(tail -n 1 pytest-integration.log)
+          echo "summary line: $summary"
+          if ! echo "$summary" | grep -qE '[0-9]+ passed'; then
+            echo "::error::integration lane reported no passed tests — the suite did not run"
+            exit 1
+          fi
+          if echo "$summary" | grep -qE '[0-9]+ skipped'; then
+            echo "::error::integration lane skipped tests — Docker/testcontainers degraded"
+            exit 1
+          fi
 
   lint:
     name: ruff

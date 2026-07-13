@@ -97,6 +97,115 @@ def test_legacy_baseline_with_file_line_locations_still_matches(tmp_path: Path) 
 
 
 # ---------------------------------------------------------------------------
+# W3 R3-F2 — count-aware ratchet: a NEW violation identical to a
+# grandfathered one (same rule/module/file/message, different line) must
+# not slip through the baseline
+# ---------------------------------------------------------------------------
+
+
+def _ratchet_violation(location: str) -> Violation:
+    return Violation(
+        rule="no-internal-imports",
+        message="orders imports inventory._internal",
+        module="orders",
+        location=location,
+    )
+
+
+def test_new_identical_violation_fails_ratchet(tmp_path: Path) -> None:
+    """W3 R3-F2: with ONE grandfathered violation baselined, a SECOND
+    violation carrying the identical fingerprint (new line, same file/rule/
+    module/message) must be reported — the baseline grants an allowance of
+    one, not a blanket pass for the fingerprint."""
+    path = tmp_path / "baseline.json"
+    first = _ratchet_violation("fakeapp/orders/__init__.py:10")
+    write_baseline(path, [first])
+    baseline = load_baseline(path)
+
+    second = replace(first, location="fakeapp/orders/__init__.py:99")
+    reported = filter_against_baseline([first, second], baseline)
+
+    assert len(reported) == 1
+
+
+def test_ratchet_allows_up_to_baselined_count(tmp_path: Path) -> None:
+    """W3 R3-F2: a baseline recorded with two identical violations allows
+    two — and fewer than baselined stays green (the ratchet only tightens)."""
+    path = tmp_path / "baseline.json"
+    first = _ratchet_violation("fakeapp/orders/__init__.py:10")
+    second = replace(first, location="fakeapp/orders/__init__.py:99")
+    write_baseline(path, [first, second])
+    baseline = load_baseline(path)
+
+    assert filter_against_baseline([first, second], baseline) == []
+    assert filter_against_baseline([first], baseline) == []  # improvement passes
+    third = replace(first, location="fakeapp/orders/__init__.py:120")
+    assert len(filter_against_baseline([first, second, third], baseline)) == 1
+
+
+def test_write_baseline_records_fingerprint_counts(tmp_path: Path) -> None:
+    """W3 R3-F2: the baseline stores one entry per fingerprint with its
+    count, so --update-baseline captures the multiplicity."""
+    path = tmp_path / "baseline.json"
+    first = _ratchet_violation("fakeapp/orders/__init__.py:10")
+    second = replace(first, location="fakeapp/orders/__init__.py:99")
+    write_baseline(path, [first, second])
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert len(data) == 1
+    assert data[0]["count"] == 2
+
+
+def test_old_baseline_without_count_defaults_to_one(tmp_path: Path) -> None:
+    """W3 R3-F2 backward compat: entries written by older versions carry no
+    ``count`` — they read as an allowance of exactly one."""
+    message = "orders imports inventory._internal"
+    digest = hashlib.sha256(message.encode("utf-8")).hexdigest()[:8]
+    path = tmp_path / "baseline.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "rule": "no-internal-imports",
+                    "module": "orders",
+                    "location": "fakeapp/orders/__init__.py",
+                    "message_hash": digest,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    baseline = load_baseline(path)
+
+    first = _ratchet_violation("fakeapp/orders/__init__.py:10")
+    second = replace(first, location="fakeapp/orders/__init__.py:99")
+    assert filter_against_baseline([first], baseline) == []
+    assert len(filter_against_baseline([first, second], baseline)) == 1
+
+
+def test_load_baseline_invalid_count_raises_configuration_error(tmp_path: Path) -> None:
+    """W3 R3-F2: a malformed ``count`` is a schema error with the same clean
+    ConfigurationError treatment as the other fields (A10-r5-219)."""
+    path = tmp_path / "baseline.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "rule": "r",
+                    "module": "m",
+                    "location": "f.py",
+                    "message_hash": "00000000",
+                    "count": "two",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigurationError, match="count"):
+        load_baseline(path)
+
+
+# ---------------------------------------------------------------------------
 # A10-r1-34 / A10-r3-146 — TYPE_CHECKING imports visible to rules 1, 3, 4;
 # still exempt from cycle detection (rule 2)
 # ---------------------------------------------------------------------------

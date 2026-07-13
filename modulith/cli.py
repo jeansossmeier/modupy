@@ -16,6 +16,12 @@ through the plugin hooks and the outbox maintenance API.
 
 Distribution: shipped via [project.scripts] in pyproject.toml so
 `pip install modulith[cli]` makes `modulith` available on PATH.
+
+Exit-code scheme (uniform across commands; see ``main``): 0 = success,
+1 = violations or user error within a recognized command line, 2 =
+unexpected internal errors AND CLI usage errors (missing required
+argument, unknown option) — the latter is click's convention, which
+modulith follows rather than fighting the framework (W3 R3-F3).
 """
 
 from __future__ import annotations
@@ -262,6 +268,25 @@ def _print_violations(violations: list[Violation]) -> None:
     errors = sum(1 for v in violations if v.severity is ViolationSeverity.ERROR)
     warnings = len(violations) - errors
     typer.echo(f"\n{errors} error(s), {warnings} warning(s)")
+
+
+def _write_baseline_or_exit(baseline: Path, violations: list[Violation]) -> None:
+    """Record the current violation set as the accepted ratchet baseline.
+
+    A --baseline path in a nonexistent directory (or otherwise unwritable)
+    is a user error per the documented exit codes — exit 1 with guidance,
+    never the raw traceback + exit 2 reserved for internal bugs (W3 R3-F4).
+    """
+    try:
+        verifier.write_baseline(baseline, violations)
+    except OSError as exc:
+        typer.echo(
+            f"error: could not write baseline file {baseline} ({exc}). "
+            "Create the directory or pass a writable --baseline path.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
+    typer.echo(f"baseline updated: {len(violations)} violation(s) recorded in {baseline}")
 
 
 def _collect_violations(rt: Runtime) -> list[Violation]:
@@ -567,8 +592,7 @@ def verify(
     violations = _collect_violations(rt)
 
     if update_baseline:
-        verifier.write_baseline(baseline, violations)
-        typer.echo(f"baseline updated: {len(violations)} violation(s) recorded in {baseline}")
+        _write_baseline_or_exit(baseline, violations)
         return
 
     if mode == "ratchet":
@@ -868,8 +892,11 @@ def main() -> None:
     """Console-script entry point.
 
     Exit codes: 0 = success (warnings may still be reported), 1 = violations
-    or user error (commands raise ``typer.Exit(1)``), 2 = unexpected internal
-    error (traceback printed to stderr).
+    or user error within a recognized command line (commands raise
+    ``typer.Exit(1)``), 2 = unexpected internal errors (traceback printed to
+    stderr) and CLI usage errors — a missing required argument or unknown
+    option exits 2 per click's convention, which the CLI deliberately
+    follows (W3 R3-F3).
     """
     try:
         app()

@@ -111,8 +111,15 @@ class TestManifestDiscovery:
 
         import asyncio
 
-        # Should succeed: manifest reality matches declaration.
-        asyncio.get_event_loop().run_until_complete(publish(object()))
+        # Should succeed: manifest reality matches declaration. Driven on a
+        # private loop: get_event_loop() raises RuntimeError whenever ANY
+        # earlier test in the session used asyncio.run (which leaves the
+        # thread's loop slot set to None) — an order-dependent flake.
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(publish(object()))
+        finally:
+            loop.close()
 
         # Manifest IS in registry.
         assert "fakeapp.orders" in manifest_module.all_manifests()
