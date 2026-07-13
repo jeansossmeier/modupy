@@ -166,16 +166,23 @@ def publish_sync(event: Any, *, timeout: float | None = 30.0) -> None:
     try:
         future.result(timeout=timeout)
     except FuturesTimeoutError as exc:
-        if future.done():
-            # The dispatch COMPLETED by raising — on 3.11+ FuturesTimeoutError
-            # is TimeoutError, so a listener's own TimeoutError lands in this
-            # handler too. That is an application failure, not a budget
-            # overrun: surface it unchanged (W3 R4-W3-01).
+        if future.done() and not future.cancelled() and future.exception() is exc:
+            # The dispatch COMPLETED by raising this very exception — on 3.11+
+            # FuturesTimeoutError is TimeoutError, so a listener's own
+            # TimeoutError lands in this handler too. That is an application
+            # failure, not a budget overrun: surface it unchanged
+            # (W3 R4-W3-01). Identity — not ``done()`` alone — is the
+            # discriminator: an expired wait raises a FRESH bare TimeoutError
+            # that is never the future's stored exception, so even when the
+            # dispatch completes inside the race window between budget expiry
+            # and this check, a genuine overrun still converts to
+            # PublishSyncTimeout below instead of leaking the bare error.
             raise
-        # Cancel the dispatch: without this, a hung listener kept running
-        # (or hanging) invisibly on the process-lifetime daemon loop after
-        # the caller was already told it failed — one abandoned task per
-        # timed-out call, forever.
+        # Budget overrun. Cancel the dispatch: without this, a hung listener
+        # kept running (or hanging) invisibly on the process-lifetime daemon
+        # loop after the caller was already told it failed — one abandoned
+        # task per timed-out call, forever. (A no-op when the dispatch
+        # completed inside the race window above.)
         future.cancel()
         logger.warning(
             "publish_sync timeout after %s s for %s",
@@ -219,9 +226,14 @@ def _run_nested_dispatch(
     try:
         done.result(timeout=timeout)
     except FuturesTimeoutError as exc:
-        if done.done():
-            # The nested dispatch completed by raising a TimeoutError of its
-            # own — an application failure, not the budget (W3 R4-W3-01).
+        if done.done() and not done.cancelled() and done.exception() is exc:
+            # The nested dispatch completed by raising this very TimeoutError
+            # — an application failure, not the budget (W3 R4-W3-01). Same
+            # identity discrimination as publish_sync's own wait: the bare
+            # TimeoutError an expired wait raises is never the future's stored
+            # exception, so a genuine overrun converts to PublishSyncTimeout
+            # even when the dispatch completes inside the race window between
+            # wait expiry and this check.
             raise
         logger.warning(
             "publish_sync timeout after %s s for %s (nested dispatch)",

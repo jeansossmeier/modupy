@@ -18,9 +18,14 @@ the default test lane instead of surfacing as a broken CI run months later.
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 import tomllib
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
@@ -96,7 +101,59 @@ def test_mypy_job_type_checks_tests() -> None:
     )
 
 
-def test_integration_job_cannot_go_green_without_docker() -> None:
+def _integration_job_steps() -> list[dict[str, Any]]:
+    """The integration job's steps, located structurally via yaml.safe_load."""
+    workflow = yaml.safe_load(_ci_text())
+    assert isinstance(workflow, dict)
+    jobs = workflow.get("jobs")
+    assert isinstance(jobs, dict), "ci.yml must define jobs"
+    integration = jobs.get("integration")
+    assert isinstance(integration, dict), "ci.yml must define an `integration` job"
+    steps = integration.get("steps")
+    assert isinstance(steps, list) and steps, "integration job must define steps"
+    for step in steps:
+        assert isinstance(step, dict)
+    return steps
+
+
+def _run_guard_script(
+    script: str, workdir: Path, pytest_output: str, pytest_exit: int = 0
+) -> subprocess.CompletedProcess[str]:
+    """Execute the integration job's guard script against a synthetic run.
+
+    A fake ``pytest`` executable (first on PATH) emits ``pytest_output`` and
+    exits ``pytest_exit``, so the guard's summary logic runs against a
+    controlled outcome. The script is executed with ``bash -e -c`` because
+    that mirrors how GitHub Actions runs a ``run:`` block without an explicit
+    ``shell:`` key on Linux (default shell ``bash -e {0}``) — the guard's
+    fail-on-pytest-failure behavior depends on those exact semantics.
+    """
+    bin_dir = workdir / "bin"
+    bin_dir.mkdir(parents=True)
+    fake_pytest = bin_dir / "pytest"
+    fake_pytest.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<'MODULITH_FAKE_PYTEST_OUTPUT'\n"
+        f"{pytest_output}\n"
+        "MODULITH_FAKE_PYTEST_OUTPUT\n"
+        f"exit {pytest_exit}\n",
+        encoding="utf-8",
+    )
+    fake_pytest.chmod(0o755)
+    run_dir = workdir / "cwd"
+    run_dir.mkdir()
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    return subprocess.run(
+        ["bash", "-e", "-c", script],
+        cwd=run_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_integration_job_cannot_go_green_without_docker(tmp_path: Path) -> None:
     """W3 R5-01: the integration lane must FAIL when Docker is unreachable.
 
     tests/conftest.py ``pytest.skip``s the entire integration suite when the
@@ -105,21 +162,88 @@ def test_integration_job_cannot_go_green_without_docker() -> None:
     nothing (the exact rubber-stamp the unit-lane comment in the same file
     warns about). Two independent guards are required:
 
-      * a ``docker info`` preflight step, and
-      * a post-run summary assertion: the integration selection must report
-        at least one passed test and no skipped tests.
+      * a ``docker info`` preflight step ordered before the pytest step, and
+      * summary guard logic in the pytest step that fails the job on skipped
+        tests, on no passed tests, and on a failing pytest exit.
+
+    This test pins the guard's SEMANTICS, not its wording: it locates the
+    steps structurally in the parsed workflow and EXECUTES the pytest step's
+    script against synthetic pytest outcomes (a string-presence pin survived
+    refactors that kept the words but broke the behavior).
     """
-    ci = _ci_text()
-    assert re.search(r"\bdocker info\b", ci), (
-        "integration lane must run a `docker info` preflight step so an "
+    steps = _integration_job_steps()
+    run_steps = [
+        (index, step["run"]) for index, step in enumerate(steps) if isinstance(step.get("run"), str)
+    ]
+
+    preflight_indexes = [
+        index for index, run in run_steps if re.search(r"(?m)^\s*docker info\b", run)
+    ]
+    assert preflight_indexes, (
+        "integration job must run a `docker info` preflight step so an "
         "unreachable Docker daemon fails the job instead of skipping the suite"
     )
-    assert re.search(r"[0-9$(){}\[\]+]* passed", ci) or "passed" in ci, (
-        "integration lane must assert its pytest summary reports passed tests"
+
+    pytest_steps = [
+        (index, run)
+        for index, run in run_steps
+        if re.search(r"(?m)^\s*pytest\b[^\n]*-m integration\b", run)
+    ]
+    assert len(pytest_steps) == 1, (
+        "integration job must have exactly one step running `pytest -m integration`"
     )
-    assert "skipped" in ci, (
-        "integration lane must fail when its pytest summary reports skipped "
-        "tests (an all-skip exits 0 and rubber-stamps the lane)"
+    pytest_index, guard_script = pytest_steps[0]
+    assert min(preflight_indexes) < pytest_index, (
+        "the `docker info` preflight must run BEFORE the pytest step"
+    )
+
+    verbose_noise = "tests/test_postgres_integration.py::test_outbox_roundtrip PASSED"
+
+    # A clean, fully-passed run must leave the job green.
+    clean = _run_guard_script(
+        guard_script,
+        tmp_path / "clean",
+        f"{verbose_noise}\n============ 42 passed in 12.34s ============",
+    )
+    assert clean.returncode == 0, (
+        f"guard must exit 0 on an all-passed summary; got {clean.returncode}:\n"
+        f"{clean.stdout}\n{clean.stderr}"
+    )
+
+    # ANY skipped test means the Docker/testcontainers path silently degraded
+    # mid-run — the guard must fail the job even though pytest exited 0.
+    with_skips = _run_guard_script(
+        guard_script,
+        tmp_path / "with_skips",
+        f"{verbose_noise}\n======= 37 passed, 5 skipped in 10.42s =======",
+    )
+    assert with_skips.returncode != 0, (
+        "guard must exit non-zero when the pytest summary reports skipped tests"
+    )
+
+    # The all-skipped rubber-stamp: pytest exits 0 having proven nothing.
+    all_skipped = _run_guard_script(
+        guard_script,
+        tmp_path / "all_skipped",
+        "============ 42 skipped in 0.51s ============",
+    )
+    assert all_skipped.returncode != 0, (
+        "guard must exit non-zero when the summary reports no passed tests "
+        "(an all-skip exits 0 and rubber-stamps the lane)"
+    )
+
+    # Real test failures must still fail the job: the summary reports passed
+    # tests and no skips, so only pytest's own exit status (propagated through
+    # the tee pipeline — pipefail semantics) can fail the guard here.
+    failing = _run_guard_script(
+        guard_script,
+        tmp_path / "failing",
+        f"{verbose_noise}\n======= 1 failed, 41 passed in 12.00s =======",
+        pytest_exit=1,
+    )
+    assert failing.returncode != 0, (
+        "guard must exit non-zero when pytest itself fails — dropping pipefail "
+        "would let `pytest | tee` swallow the failure exit"
     )
 
 

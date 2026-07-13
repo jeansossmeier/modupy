@@ -119,6 +119,10 @@ test = [
     "sqlalchemy>=2.0,<3.0",
     "alembic>=1.13,<2.0",
     "aiosqlite>=0.19,<1.0",
+    # tests/test_ci_config.py parses .github/workflows/ci.yml structurally
+    # (yaml.safe_load) to execute the integration lane's guard logic against
+    # synthetic pytest summaries — the CI-drift guards run in the default lane.
+    "pyyaml>=6.0,<7.0",
     "modulith[redis,otel,fastapi,cli]",
 ]
 
@@ -298,8 +302,11 @@ disable_error_code = [
 [[tool.mypy.overrides]]
 # Synthetic app packages that tests generate on disk at runtime (fixture
 # factories write `fakeapp/`, the demo app installs as `shop`); they don't
-# exist at type-check time. testcontainers and docker ship no py.typed.
-module = ["fakeapp", "fakeapp.*", "shop", "shop.*", "testcontainers.*", "docker", "docker.*"]
+# exist at type-check time. testcontainers, docker, and pyyaml ship no
+# py.typed (pyyaml's stubs live in the separate types-PyYAML package, which
+# the suite doesn't need — test code consumes safe_load output behind
+# isinstance narrowing).
+module = ["fakeapp", "fakeapp.*", "shop", "shop.*", "testcontainers.*", "docker", "docker.*", "yaml", "yaml.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
