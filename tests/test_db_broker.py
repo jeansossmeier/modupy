@@ -153,6 +153,58 @@ async def _all_ids(engine: Any) -> set[str]:
         return {row[0] for row in result}
 
 
+async def _insert_ex(
+    engine: Any,
+    *,
+    id: str,
+    status: str,
+    attempts: int = 0,
+    claimed_by: str | None = None,
+    target: str = "A",
+    group: str = "g",
+) -> str:
+    """Insert one row with full control over status / attempts / claimed_by —
+    the fixture the owner-guard regression tests need (they assert late writes
+    from a non-owning consumer are no-ops)."""
+    from sqlalchemy import insert
+
+    _, _, message = broker_schema()
+    now = datetime.now(UTC)
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(message).values(
+                id=id,
+                target=target,
+                consumer_group=group,
+                event_type="fakeapp.orders.WidgetCreated",
+                payload=b"{}",
+                headers=None,
+                status=status,
+                attempts=attempts,
+                available_at=now,
+                claimed_at=now if claimed_by is not None else None,
+                claimed_by=claimed_by,
+                created_at=now,
+                last_error=None,
+            )
+        )
+    return id
+
+
+async def _fetch_row(engine: Any, row_id: str) -> Any:
+    """Return ``(status, attempts, claimed_by)`` for one row, or None if gone."""
+    from sqlalchemy import select
+
+    _, _, message = broker_schema()
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            select(message.c.status, message.c.attempts, message.c.claimed_by).where(
+                message.c.id == row_id
+            )
+        )
+        return result.first()
+
+
 # ---------------------------------------------------------------------------
 # Fan-out on write
 # ---------------------------------------------------------------------------
@@ -873,7 +925,12 @@ def test_make_db_consumer_uses_defaults_when_unconfigured(make_fake_app: Any) ->
     """No cadence/retention keys -> library defaults, prune off."""
     make_fake_app({"orders": ""})
     from modulith import configure
-    from modulith.adapters.db_broker import _DEFAULT_BATCH_SIZE, _DEFAULT_POLL_INTERVAL_S
+    from modulith.adapters.db_broker import (
+        _DEFAULT_BATCH_SIZE,
+        _DEFAULT_POLL_INTERVAL_S,
+        _DEFAULT_RECLAIM_STALE_S,
+        _MAX_DELIVERY_ATTEMPTS,
+    )
 
     configure(
         package="fakeapp",
@@ -898,6 +955,8 @@ def test_make_db_consumer_uses_defaults_when_unconfigured(make_fake_app: Any) ->
     assert isinstance(consumer, DatabaseConsumer)
     assert consumer._poll_interval_s == _DEFAULT_POLL_INTERVAL_S
     assert consumer._batch_size == _DEFAULT_BATCH_SIZE
+    assert consumer._reclaim_stale_seconds == _DEFAULT_RECLAIM_STALE_S
+    assert consumer._max_attempts == _MAX_DELIVERY_ATTEMPTS
     assert consumer._prune_enabled() is False
 
 
@@ -1144,3 +1203,161 @@ async def test_write_does_not_retry_non_lock_errors() -> None:
     with pytest.raises(OperationalError):
         await broker._write(op)
     assert broker._engine.begins == 1  # non-lock error propagates on first try
+
+
+# ---------------------------------------------------------------------------
+# HIGH-1: owner/status guard on ack / fail / dead_letter
+#
+# Without the guard, a late write from a healthy-but-slow consumer whose row
+# was already reclaimed (and possibly dead-lettered) by a peer can resurrect a
+# terminal row or steal another owner's row. Every completion path must be a
+# compare-and-swap on ``status='claimed' AND claimed_by=:consumer_name``.
+# ---------------------------------------------------------------------------
+
+
+async def test_fail_on_terminal_dead_row_is_noop(engine: Any) -> None:
+    """A late fail() on an already-dead row (a peer reclaimed it, hit the cap,
+    and dead-lettered it) must NOT resurrect it to 'pending'."""
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="r1", status="dead", attempts=5, claimed_by=None)
+
+    await broker.fail("r1", "late failure", consumer_name="c1", max_attempts=5)
+
+    assert await _fetch_row(engine, "r1") == ("dead", 5, None)  # unchanged
+
+
+async def test_fail_on_row_owned_by_peer_is_noop(engine: Any) -> None:
+    """A late fail() from c1 on a row currently claimed by c2 must not touch
+    c2's in-flight row."""
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="r1", status="claimed", attempts=0, claimed_by="c2")
+
+    await broker.fail("r1", "late failure", consumer_name="c1", max_attempts=5)
+
+    assert await _fetch_row(engine, "r1") == ("claimed", 0, "c2")  # still c2's
+
+
+async def test_fail_derives_attempts_from_db_not_caller(engine: Any) -> None:
+    """The new attempt count is read from the row inside the txn, not from a
+    caller snapshot — so it is correct even after a reclaim changed it."""
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="below", status="claimed", attempts=3, claimed_by="c1")
+    await _insert_ex(engine, id="atcap", status="claimed", attempts=4, claimed_by="c1")
+
+    await broker.fail("below", "boom", consumer_name="c1", max_attempts=5)
+    await broker.fail("atcap", "boom", consumer_name="c1", max_attempts=5)
+
+    below = await _fetch_row(engine, "below")
+    atcap = await _fetch_row(engine, "atcap")
+    assert below[0] == "pending" and below[1] == 4 and below[2] is None
+    assert atcap[0] == "dead" and atcap[1] == 5 and atcap[2] is None  # 4+1 hits cap
+
+
+async def test_ack_on_terminal_dead_row_is_noop_delete_mode(engine: Any) -> None:
+    """A late ack() (delete mode) on an already-dead row must NOT delete it —
+    the peer that dead-lettered it owns its terminal state."""
+    broker = DatabaseBroker(engine=engine)  # completion_mode="delete"
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="r1", status="dead", attempts=5, claimed_by=None)
+
+    await broker.ack("r1", consumer_name="c1")
+
+    assert await _fetch_row(engine, "r1") == ("dead", 5, None)  # not deleted
+
+
+async def test_ack_on_row_owned_by_peer_is_noop(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="r1", status="claimed", attempts=0, claimed_by="c2")
+
+    await broker.ack("r1", consumer_name="c1")
+
+    assert await _fetch_row(engine, "r1") == ("claimed", 0, "c2")  # untouched
+
+
+async def test_ack_completes_owned_row_delete_and_mark(engine: Any) -> None:
+    """The owner's ack still works in both completion modes."""
+    delete_broker = DatabaseBroker(engine=engine)  # delete
+    await delete_broker._ensure_schema()
+    await _insert_ex(engine, id="d1", status="claimed", claimed_by="c1")
+    await delete_broker.ack("d1", consumer_name="c1")
+    assert await _fetch_row(engine, "d1") is None  # deleted
+
+    mark_broker = DatabaseBroker(engine=engine, completion_mode="mark")
+    await _insert_ex(engine, id="m1", status="claimed", claimed_by="c1")
+    await mark_broker.ack("m1", consumer_name="c1")
+    assert (await _fetch_row(engine, "m1"))[0] == "done"
+
+
+async def test_dead_letter_on_row_owned_by_peer_is_noop(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="r1", status="claimed", attempts=0, claimed_by="c2")
+
+    await broker.dead_letter("r1", "poison", consumer_name="c1")
+
+    assert await _fetch_row(engine, "r1") == ("claimed", 0, "c2")  # not dead-lettered
+
+
+async def test_dead_letter_marks_owned_row_dead(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="r1", status="claimed", claimed_by="c1")
+
+    await broker.dead_letter("r1", "poison", consumer_name="c1")
+
+    assert (await _fetch_row(engine, "r1"))[0] == "dead"
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-4: completion_mode is validated at construction
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_completion_mode_raises() -> None:
+    from modulith import ConfigurationError
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=NullPool)
+    with pytest.raises(ConfigurationError, match="completion_mode"):
+        DatabaseBroker(engine=engine, completion_mode="bogus")
+
+
+# ---------------------------------------------------------------------------
+# HIGH-2: _make_db_consumer wires reclaim_stale_seconds + max_delivery_attempts
+# ---------------------------------------------------------------------------
+
+
+def test_make_db_consumer_reads_reclaim_and_max_attempts(make_fake_app: Any) -> None:
+    make_fake_app({"orders": ""})
+    from modulith import configure
+
+    configure(
+        package="fakeapp",
+        broker="database",
+        broker_options={
+            "url": "sqlite+aiosqlite:///:memory:",
+            "reclaim_stale_seconds": 12.5,
+            "max_delivery_attempts": 9,
+        },
+    )
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.broker_registry is not None
+    spec = ConsumerSpec(
+        scheme="database",
+        module_name="inventory",
+        group="modulith-inventory",
+        consumer_name="inventory:1",
+        targets=("fakeapp.orders.WidgetCreated",),
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        broker_registry=_runtime.broker_registry,
+    )
+    consumer = _make_db_consumer(spec)
+
+    assert isinstance(consumer, DatabaseConsumer)
+    assert consumer._reclaim_stale_seconds == 12.5
+    assert consumer._max_attempts == 9

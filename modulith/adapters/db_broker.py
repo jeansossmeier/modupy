@@ -32,6 +32,11 @@ Configuration resolves ``MODULITH_BROKER_<KEY>`` env var (blank == unset) >
                                the lock before SQLITE_BUSY (default 5000)
   poll_interval_ms            consumer poll cadence (default 1000)
   batch_size                  claim LIMIT per poll (default 10)
+  reclaim_stale_seconds       a row claimed but not ack'd/failed within this many
+                               seconds is treated as orphaned (crashed consumer)
+                               and reclaimed by the next claim (default 60)
+  max_delivery_attempts       a message that fails to dispatch this many times is
+                               dead-lettered instead of retried forever (default 5)
   retention_age_seconds       prune deletes terminal ('done'/'dead') rows older
                                than this many seconds
   retention_count             prune keeps only the newest N terminal rows per
@@ -109,6 +114,9 @@ logger = logging.getLogger("modulith.adapters.db")
 
 _DB_SCHEME = "database"
 _DEFAULT_COMPLETION_MODE = "delete"
+# Valid completion modes: 'delete' removes the row on ack (small table);
+# 'mark' keeps it as 'done' for the prune job. Validated in DatabaseBroker.
+_COMPLETION_MODES = frozenset({"delete", "mark"})
 _DEFAULT_BATCH_SIZE = 10
 _DEFAULT_POLL_INTERVAL_S = 1.0
 
@@ -179,6 +187,22 @@ def _backoff_delay(attempt: int) -> float:
     # float at runtime), which would otherwise leak Any through this
     # function's declared ``-> float`` return.
     return min(_BACKOFF_BASE_S * (2.0**exponent), _BACKOFF_CAP_S)
+
+
+def _owned(message: Any, row_id: str, consumer_name: str) -> tuple[Any, ...]:
+    """WHERE predicate identifying a row THIS consumer currently owns:
+    matching id AND still 'claimed' AND still claimed by ``consumer_name``.
+
+    Every completion path (ack/fail/dead_letter) filters on this so a late
+    write from a healthy-but-slow consumer whose row was already reclaimed —
+    and possibly moved to a terminal state — by a peer is a no-op (a
+    compare-and-swap), never resurrecting a terminal row or clobbering the row
+    another consumer now owns."""
+    return (
+        message.c.id == row_id,
+        message.c.status == "claimed",
+        message.c.claimed_by == consumer_name,
+    )
 
 
 def _rowcount(result: Any) -> int:
@@ -425,6 +449,12 @@ class DatabaseBroker:
             # Lazy engine build (SQLAlchemy stays a soft dependency): applies
             # pooling / SQLite hardening from broker_options — see _create_engine.
             self._engine = _create_engine(url, engine_options or {})
+        if completion_mode not in _COMPLETION_MODES:
+            raise ConfigurationError(
+                f"completion_mode must be one of {sorted(_COMPLETION_MODES)}, "
+                f"got {completion_mode!r} (broker_options completion_mode / "
+                "MODULITH_BROKER_COMPLETION_MODE)"
+            )
         self._completion_mode = completion_mode
         self._schema_ready = False
         self._schema_lock = asyncio.Lock()
@@ -672,41 +702,66 @@ class DatabaseBroker:
         rows: list[dict[str, Any]] = await self._write(op)
         return rows
 
-    async def ack(self, row_id: str) -> None:
-        """Complete a row: delete it (default) or mark it 'done' (mark mode,
-        which keeps the row for the prune job — see ``prune``)."""
+    async def ack(self, row_id: str, *, consumer_name: str) -> None:
+        """Complete a row THIS consumer still owns: delete it (default) or mark
+        it 'done' (mark mode, which keeps the row for the prune job — see
+        ``prune``).
+
+        Guarded by ``status='claimed' AND claimed_by=:consumer_name`` (a
+        compare-and-swap): a late ack from a consumer whose row was already
+        reclaimed — and possibly dead-lettered — by a peer is a no-op, never
+        deleting or completing a row the caller no longer owns.
+        """
         from sqlalchemy import delete, update
 
         _, _, message = broker_schema()
 
         async def op(conn: Any) -> None:
             if self._completion_mode == "delete":
-                await conn.execute(delete(message).where(message.c.id == row_id))
+                await conn.execute(delete(message).where(*_owned(message, row_id, consumer_name)))
             else:
                 await conn.execute(
-                    update(message).where(message.c.id == row_id).values(status="done")
+                    update(message)
+                    .where(*_owned(message, row_id, consumer_name))
+                    .values(status="done")
                 )
 
         await self._write(op)
 
-    async def fail(self, row_id: str, error: str, *, attempts: int, max_attempts: int) -> None:
-        """Record a dispatch failure: attempts++ with backoff, staying
-        'pending' until ``max_attempts`` is reached, then 'dead'."""
-        from sqlalchemy import update
+    async def fail(self, row_id: str, error: str, *, consumer_name: str, max_attempts: int) -> None:
+        """Record a dispatch failure for a row THIS consumer still owns:
+        attempts++ with backoff, staying 'pending' until ``max_attempts`` is
+        reached, then 'dead'.
+
+        Guarded by ``status='claimed' AND claimed_by=:consumer_name`` and the
+        attempt count is read from the row INSIDE the same transaction (not a
+        caller snapshot), so a late failure from a consumer whose row was
+        already reclaimed by a peer — or already moved to a terminal state — is
+        a no-op instead of resurrecting a dead row or writing a stale attempt
+        count.
+        """
+        from sqlalchemy import select, update
 
         _, _, message = broker_schema()
-        new_attempts = attempts + 1
-        if new_attempts >= max_attempts:
-            status = "dead"
-            available_at = datetime.now(UTC)
-        else:
-            status = "pending"
-            available_at = datetime.now(UTC) + timedelta(seconds=_backoff_delay(new_attempts))
 
         async def op(conn: Any) -> None:
+            current = (
+                await conn.execute(
+                    select(message.c.attempts).where(*_owned(message, row_id, consumer_name))
+                )
+            ).scalar_one_or_none()
+            if current is None:
+                return  # reclaimed by a peer or already terminal — late write is a no-op
+            new_attempts = current + 1
+            if new_attempts >= max_attempts:
+                status = "dead"
+                available_at = datetime.now(UTC)
+            else:
+                status = "pending"
+                available_at = datetime.now(UTC) + timedelta(seconds=_backoff_delay(new_attempts))
             await conn.execute(
                 update(message)
-                .where(message.c.id == row_id)
+                .where(*_owned(message, row_id, consumer_name))
                 .values(
                     status=status,
                     attempts=new_attempts,
@@ -719,9 +774,15 @@ class DatabaseBroker:
 
         await self._write(op)
 
-    async def dead_letter(self, row_id: str, error: str) -> None:
-        """Mark a poison row 'dead' immediately (undeserializable payload or
-        missing ``event_type`` — retrying can never succeed)."""
+    async def dead_letter(self, row_id: str, error: str, *, consumer_name: str) -> None:
+        """Mark a poison row THIS consumer still owns 'dead' immediately
+        (undeserializable payload or missing ``event_type`` — retrying can never
+        succeed).
+
+        Guarded by ``status='claimed' AND claimed_by=:consumer_name`` for the
+        same reason as ``ack``/``fail``: a late call after a peer reclaimed the
+        row is a no-op.
+        """
         from sqlalchemy import update
 
         _, _, message = broker_schema()
@@ -729,7 +790,7 @@ class DatabaseBroker:
         async def op(conn: Any) -> None:
             await conn.execute(
                 update(message)
-                .where(message.c.id == row_id)
+                .where(*_owned(message, row_id, consumer_name))
                 .values(status="dead", last_error=error)
             )
 
@@ -994,14 +1055,18 @@ class DatabaseConsumer:
             logger.warning(
                 "message %s on %s missing event_type — dead-lettering", row_id, row.get("target")
             )
-            await self._broker.dead_letter(row_id, "missing event_type")
+            await self._broker.dead_letter(
+                row_id, "missing event_type", consumer_name=self._consumer_name
+            )
             return
 
         try:
             event = self._serializer.deserialize(payload, event_type)
         except Exception as exc:
             logger.exception("undeserializable message %s — dead-lettering", row_id)
-            await self._broker.dead_letter(row_id, f"deserialize failed: {exc}")
+            await self._broker.dead_letter(
+                row_id, f"deserialize failed: {exc}", consumer_name=self._consumer_name
+            )
             return
 
         try:
@@ -1010,12 +1075,12 @@ class DatabaseConsumer:
             attempts = cast(int, row.get("attempts", 0))
             logger.warning("dispatch failed for %s (attempt %d) — %s", row_id, attempts + 1, exc)
             await self._broker.fail(
-                row_id, str(exc), attempts=attempts, max_attempts=self._max_attempts
+                row_id, str(exc), consumer_name=self._consumer_name, max_attempts=self._max_attempts
             )
             return
 
         try:
-            await self._broker.ack(row_id)
+            await self._broker.ack(row_id, consumer_name=self._consumer_name)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1094,6 +1159,12 @@ def _make_db_consumer(spec: ConsumerSpec) -> Consumer:
     opts = (cfg.broker_options if cfg is not None else None) or {}
     poll_interval_ms = _opt_float(_broker_opt(opts, "poll_interval_ms", "POLL_INTERVAL_MS"))
     batch_size = _opt_int(_broker_opt(opts, "batch_size", "BATCH_SIZE"))
+    reclaim_stale_seconds = _opt_float(
+        _broker_opt(opts, "reclaim_stale_seconds", "RECLAIM_STALE_SECONDS")
+    )
+    max_delivery_attempts = _opt_int(
+        _broker_opt(opts, "max_delivery_attempts", "MAX_DELIVERY_ATTEMPTS")
+    )
     return DatabaseConsumer(
         broker=broker,
         bus=spec.bus,
@@ -1105,6 +1176,12 @@ def _make_db_consumer(spec: ConsumerSpec) -> Consumer:
             poll_interval_ms / 1000.0 if poll_interval_ms is not None else _DEFAULT_POLL_INTERVAL_S
         ),
         batch_size=batch_size if batch_size is not None else _DEFAULT_BATCH_SIZE,
+        reclaim_stale_seconds=(
+            reclaim_stale_seconds if reclaim_stale_seconds is not None else _DEFAULT_RECLAIM_STALE_S
+        ),
+        max_attempts=(
+            max_delivery_attempts if max_delivery_attempts is not None else _MAX_DELIVERY_ATTEMPTS
+        ),
         prune_interval_s=_opt_float(
             _broker_opt(opts, "prune_interval_seconds", "PRUNE_INTERVAL_SECONDS")
         ),
