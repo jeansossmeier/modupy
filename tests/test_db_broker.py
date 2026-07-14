@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +100,52 @@ async def _until_async(predicate: Any, *, timeout: float = 5.0, interval: float 
         await asyncio.sleep(interval)
     if not await predicate():
         raise AssertionError("condition not met within timeout")
+
+
+async def _insert(
+    engine: Any,
+    *,
+    id: str,
+    target: str,
+    group: str,
+    status: str,
+    age_seconds: float,
+) -> str:
+    """Insert one ``broker_message`` row directly with a chosen status and a
+    ``created_at`` ``age_seconds`` in the past — the fixture the prune tests
+    need (fine-grained control over status/age that publish() can't give)."""
+    from sqlalchemy import insert
+
+    _, _, message = broker_schema()
+    created = datetime.now(UTC) - timedelta(seconds=age_seconds)
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(message).values(
+                id=id,
+                target=target,
+                consumer_group=group,
+                event_type="fakeapp.orders.WidgetCreated",
+                payload=b"{}",
+                headers=None,
+                status=status,
+                attempts=0,
+                available_at=created,
+                claimed_at=created if status == "claimed" else None,
+                claimed_by="c0" if status == "claimed" else None,
+                created_at=created,
+                last_error=None,
+            )
+        )
+    return id
+
+
+async def _all_ids(engine: Any) -> set[str]:
+    from sqlalchemy import select
+
+    _, _, message = broker_schema()
+    async with engine.connect() as conn:
+        result = await conn.execute(select(message.c.id))
+        return {row[0] for row in result}
 
 
 # ---------------------------------------------------------------------------
@@ -608,3 +655,206 @@ def test_skip_locked_gate_selects_postgres_and_mysql_only() -> None:
     assert _supports_skip_locked(_FakeEngine("postgresql")) is True
     assert _supports_skip_locked(_FakeEngine("mysql")) is True
     assert _supports_skip_locked(_FakeEngine("sqlite")) is False
+
+
+# ---------------------------------------------------------------------------
+# Prune: by age, by count, and the never-touch-undelivered-rows guarantee
+# ---------------------------------------------------------------------------
+
+
+async def test_prune_no_retention_is_noop(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert(engine, id="d", target="A", group="g", status="dead", age_seconds=99999)
+
+    assert await broker.prune() == 0  # neither knob set -> deletes nothing
+    assert await _all_ids(engine) == {"d"}
+
+
+async def test_prune_by_age_deletes_old_terminal_rows_only(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert(engine, id="old_done", target="A", group="g", status="done", age_seconds=100)
+    await _insert(engine, id="old_dead", target="A", group="g", status="dead", age_seconds=100)
+    # Undelivered rows must survive regardless of age — pruning them is loss.
+    await _insert(
+        engine, id="old_pending", target="A", group="g", status="pending", age_seconds=100
+    )
+    await _insert(
+        engine, id="old_claimed", target="A", group="g", status="claimed", age_seconds=100
+    )
+    # A recent terminal row is younger than the cutoff -> kept.
+    await _insert(engine, id="new_done", target="A", group="g", status="done", age_seconds=1)
+
+    deleted = await broker.prune(retention_age_seconds=50)
+
+    assert deleted == 2
+    assert await _all_ids(engine) == {"old_pending", "old_claimed", "new_done"}
+
+
+async def test_prune_by_count_keeps_newest_per_partition(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    # Partition (A, g): 4 terminal rows, oldest -> newest.
+    for i, age in enumerate((40, 30, 20, 10)):
+        await _insert(engine, id=f"a{i}", target="A", group="g", status="done", age_seconds=age)
+    # A different partition (B, g): 3 terminal rows — counted independently.
+    for i, age in enumerate((25, 15, 5)):
+        await _insert(engine, id=f"b{i}", target="B", group="g", status="dead", age_seconds=age)
+    # A pending row in partition (A, g): not terminal -> never counted or pruned.
+    await _insert(engine, id="pending", target="A", group="g", status="pending", age_seconds=99)
+
+    deleted = await broker.prune(retention_count=2)
+
+    assert deleted == 3  # A: 4 -> 2 (drop a0,a1); B: 3 -> 2 (drop b0)
+    assert await _all_ids(engine) == {"a2", "a3", "b1", "b2", "pending"}
+
+
+async def test_prune_age_then_count_compose(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    # Three rows older than the age cutoff (age-pruned), three younger (survive
+    # age; then count keeps the newest 2 of them).
+    for i, age in enumerate((300, 290, 280)):
+        await _insert(engine, id=f"old{i}", target="A", group="g", status="done", age_seconds=age)
+    for i, age in enumerate((30, 20, 10)):
+        await _insert(engine, id=f"new{i}", target="A", group="g", status="done", age_seconds=age)
+
+    deleted = await broker.prune(retention_age_seconds=100, retention_count=2)
+
+    # age drops old0/old1/old2 (3); count then drops new0 (oldest of the 3 left).
+    assert deleted == 4
+    assert await _all_ids(engine) == {"new1", "new2"}
+
+
+async def test_prune_count_zero_deletes_all_terminal_but_keeps_undelivered(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert(engine, id="done", target="A", group="g", status="done", age_seconds=5)
+    await _insert(engine, id="dead", target="A", group="g", status="dead", age_seconds=5)
+    await _insert(engine, id="pending", target="A", group="g", status="pending", age_seconds=5)
+    await _insert(engine, id="claimed", target="A", group="g", status="claimed", age_seconds=5)
+
+    deleted = await broker.prune(retention_count=0)  # keep zero terminal rows
+
+    assert deleted == 2
+    assert await _all_ids(engine) == {"pending", "claimed"}
+
+
+# ---------------------------------------------------------------------------
+# Consumer background prune loop
+# ---------------------------------------------------------------------------
+
+
+async def test_consumer_prune_loop_deletes_old_terminal_rows(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert(
+        engine, id="stale", target="A", group="modulith-inventory", status="dead", age_seconds=100
+    )
+
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=["A"],
+        poll_interval_s=0.01,
+        prune_interval_s=0.01,
+        retention_age_seconds=1.0,
+    )
+    await consumer.start()
+    try:
+        assert consumer._prune_task is not None  # retention set -> loop running
+
+        async def _pruned() -> bool:
+            return "stale" not in await _all_ids(engine)
+
+        await _until_async(_pruned)
+    finally:
+        await consumer.stop()
+    assert consumer._prune_task is None  # cancelled and cleared by stop()
+
+
+async def test_consumer_has_no_prune_task_without_retention(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=["A"],
+        poll_interval_s=0.01,
+    )
+    await consumer.start()
+    try:
+        assert consumer._prune_task is None  # no retention -> no prune loop
+    finally:
+        await consumer.stop()
+
+
+def test_prune_interval_zero_disables_even_with_retention() -> None:
+    consumer = DatabaseConsumer(
+        broker=DatabaseBroker(engine=object()),
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="c",
+        group="g",
+        targets=["A"],
+        prune_interval_s=0.0,
+        retention_age_seconds=60.0,
+    )
+    assert consumer._prune_enabled() is False
+
+
+def test_prune_enabled_when_a_retention_knob_is_set() -> None:
+    consumer = DatabaseConsumer(
+        broker=DatabaseBroker(engine=object()),
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="c",
+        group="g",
+        targets=["A"],
+        retention_count=100,
+    )
+    assert consumer._prune_enabled() is True
+
+
+def test_make_db_consumer_reads_prune_config_from_broker_options(make_fake_app: Any) -> None:
+    """I4 config wiring: the factory lifts retention settings out of
+    ``[tool.modulith.broker_options]`` onto the consumer."""
+    make_fake_app({"orders": ""})
+    from modulith import configure
+
+    configure(
+        package="fakeapp",
+        broker="database",
+        broker_options={
+            "url": "sqlite+aiosqlite:///:memory:",
+            "retention_age_seconds": 3600,
+            "retention_count": 100,
+            "prune_interval_seconds": 30,
+        },
+    )
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.broker_registry is not None
+    spec = ConsumerSpec(
+        scheme="database",
+        module_name="inventory",
+        group="modulith-inventory",
+        consumer_name="inventory:1",
+        targets=("fakeapp.orders.WidgetCreated",),
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        broker_registry=_runtime.broker_registry,
+    )
+    consumer = _make_db_consumer(spec)
+
+    assert isinstance(consumer, DatabaseConsumer)
+    assert consumer._retention_age_seconds == 3600.0
+    assert consumer._retention_count == 100
+    assert consumer._prune_interval_s == 30.0
+    assert consumer._prune_enabled() is True

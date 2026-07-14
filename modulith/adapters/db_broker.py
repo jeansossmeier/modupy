@@ -23,7 +23,14 @@ Configuration resolves env > ``[tool.modulith.broker_options]`` subtable:
   MODULITH_BROKER_URL / url   SQLAlchemy URL (required — no universal default)
   completion_mode             'delete' (default, keeps the table small) |
                                'mark' (sets status='done', row stays for the
-                               later prune job)
+                               prune job)
+  retention_age_seconds       prune deletes terminal ('done'/'dead') rows older
+                               than this many seconds
+  retention_count             prune keeps only the newest N terminal rows per
+                               (target, consumer_group)
+  prune_interval_seconds      how often the consumer's background prune runs
+                               (defaults to 300s when either retention_* is set;
+                               set to 0 to disable)
 
 Fan-out mechanism (how the producer learns the consumer groups): the
 producer process (module-isolated) never imports consumer modules, so
@@ -43,8 +50,15 @@ all and rejects the clause, so it degrades to a plain claim inside one
 transaction — correct for sequential consumption in tests, but not a
 substitute for the Postgres/MySQL concurrency guarantee. Full SQLite
 hardening (``BEGIN IMMEDIATE`` + ``busy_timeout``) and the rest of the config
-surface (pooling, prune, LISTEN/NOTIFY) are later increments (I3/I4/I5) —
-this adapter takes only a minimal ``url`` to construct the engine.
+surface (pooling, LISTEN/NOTIFY) are a later increment (I5) — this adapter
+takes only a minimal ``url`` to construct the engine.
+
+Retention: terminal rows ('done' left by ``completion_mode='mark'``, and
+'dead' letters) accumulate unless pruned. ``DatabaseBroker.prune()`` deletes
+them by age (``retention_age_seconds``) and/or by count (``retention_count``,
+newest-N per ``(target, consumer_group)``); pending/claimed rows are never
+touched, so prune can never drop an undelivered message. ``DatabaseConsumer``
+runs it on a background interval when either retention knob is configured.
 
 Resilience posture mirrors ``modulith._consumer.BrokerConsumer``: a
 background poll loop with capped exponential backoff on backend errors,
@@ -84,6 +98,16 @@ _DEFAULT_COMPLETION_MODE = "delete"
 _DEFAULT_BATCH_SIZE = 10
 _DEFAULT_POLL_INTERVAL_S = 1.0
 
+# How often the consumer's background prune runs when retention is configured
+# but ``prune_interval_seconds`` was not set explicitly. Deliberately coarse:
+# prune is table maintenance, not on the delivery hot path.
+_DEFAULT_PRUNE_INTERVAL_S = 300.0
+
+# The two terminal statuses prune is allowed to delete. 'pending'/'claimed'
+# rows are undelivered work and must NEVER be pruned (that would be message
+# loss), so every prune query is filtered to exactly these.
+_TERMINAL_STATUSES = ("done", "dead")
+
 # A row claimed but not ACK'd/failed within this many seconds is treated as
 # orphaned (the claiming consumer crashed between claim and ack) and reclaimed
 # by the next claim. The DB equivalent of the Redis adapter's
@@ -118,6 +142,18 @@ def _backoff_delay(attempt: int) -> float:
     # float at runtime), which would otherwise leak Any through this
     # function's declared ``-> float`` return.
     return min(_BACKOFF_BASE_S * (2.0**exponent), _BACKOFF_CAP_S)
+
+
+def _rowcount(result: Any) -> int:
+    """Best-effort affected-row count from a DELETE/UPDATE ``CursorResult``.
+
+    ``rowcount`` is well-defined for DML on the drivers this adapter targets
+    (asyncpg / aiomysql / aiosqlite), but can be ``-1`` ("unknown") on some
+    backends — clamp that to 0 so the prune tally stays a non-negative count
+    (it is informational / logged, never load-bearing).
+    """
+    rc = result.rowcount
+    return rc if isinstance(rc, int) and rc > 0 else 0
 
 
 def _supports_skip_locked(engine: Any) -> bool:
@@ -431,7 +467,7 @@ class DatabaseBroker:
 
     async def ack(self, row_id: str) -> None:
         """Complete a row: delete it (default) or mark it 'done' (mark mode,
-        which keeps the row for the later prune job — I4 scope)."""
+        which keeps the row for the prune job — see ``prune``)."""
         from sqlalchemy import delete, update
 
         _, _, message = broker_schema()
@@ -483,6 +519,65 @@ class DatabaseBroker:
                 .values(status="dead", last_error=error)
             )
 
+    async def prune(
+        self,
+        *,
+        retention_age_seconds: float | None = None,
+        retention_count: int | None = None,
+    ) -> int:
+        """Delete terminal ('done'/'dead') rows by age and/or by count.
+
+        - ``retention_age_seconds``: delete terminal rows whose ``created_at``
+          is older than ``now - retention_age_seconds``.
+        - ``retention_count``: keep only the newest ``retention_count`` terminal
+          rows per ``(target, consumer_group)``; delete the rest.
+
+        Both are optional; with neither set this is a no-op returning 0. When
+        both are set the age prune runs first and the count prune then applies
+        to what remains — both in one transaction. **Only terminal rows are
+        ever deleted** — 'pending'/'claimed' rows are undelivered work and are
+        never touched, so prune can never cause message loss. Returns the total
+        number of rows deleted (best-effort per ``_rowcount``).
+        """
+        if retention_age_seconds is None and retention_count is None:
+            return 0
+        await self._ensure_schema()
+        from sqlalchemy import delete, func, select
+
+        _, _, message = broker_schema()
+        terminal = message.c.status.in_(_TERMINAL_STATUSES)
+        deleted = 0
+        async with self._engine.begin() as conn:
+            if retention_age_seconds is not None:
+                cutoff = datetime.now(UTC) - timedelta(seconds=retention_age_seconds)
+                result = await conn.execute(
+                    delete(message).where(terminal, message.c.created_at < cutoff)
+                )
+                deleted += _rowcount(result)
+            if retention_count is not None:
+                # Rank terminal rows newest-first within each logical queue and
+                # delete everything past the keep-count. The window subquery is
+                # wrapped in a derived table (``.subquery()``) so the DELETE's
+                # IN-subquery reads FROM that derived table, not from
+                # ``broker_message`` directly — MySQL rejects a subquery that
+                # references the delete target directly (error 1093); Postgres
+                # and SQLite accept the derived-table form too.
+                rank = (
+                    func.row_number()
+                    .over(
+                        partition_by=(message.c.target, message.c.consumer_group),
+                        order_by=message.c.created_at.desc(),
+                    )
+                    .label("rn")
+                )
+                ranked = select(message.c.id, rank).where(terminal).subquery()
+                doomed = select(ranked.c.id).where(ranked.c.rn > retention_count)
+                result = await conn.execute(delete(message).where(message.c.id.in_(doomed)))
+                deleted += _rowcount(result)
+        if deleted:
+            logger.debug("prune deleted %d terminal row(s)", deleted)
+        return deleted
+
 
 # ---------------------------------------------------------------------------
 # Consumer implementation
@@ -512,6 +607,9 @@ class DatabaseConsumer:
         batch_size: int = _DEFAULT_BATCH_SIZE,
         max_attempts: int = _MAX_DELIVERY_ATTEMPTS,
         reclaim_stale_seconds: float = _DEFAULT_RECLAIM_STALE_S,
+        prune_interval_s: float | None = None,
+        retention_age_seconds: float | None = None,
+        retention_count: int | None = None,
     ) -> None:
         self._broker = broker
         self._bus = bus
@@ -523,7 +621,11 @@ class DatabaseConsumer:
         self._batch_size = batch_size
         self._max_attempts = max_attempts
         self._reclaim_stale_seconds = reclaim_stale_seconds
+        self._prune_interval_s = prune_interval_s
+        self._retention_age_seconds = retention_age_seconds
+        self._retention_count = retention_count
         self._task: asyncio.Task[None] | None = None
+        self._prune_task: asyncio.Task[None] | None = None
         self._stopping = False
         self._consecutive_failures = 0
 
@@ -540,12 +642,22 @@ class DatabaseConsumer:
             return
         await self._broker.subscribe(self._targets, self._group)
         self._task = asyncio.create_task(self._run())
+        if self._prune_enabled():
+            self._prune_task = asyncio.create_task(self._prune_loop())
         logger.info(
-            "db consumer %r (group %r) subscribed to %d target(s)",
+            "db consumer %r (group %r) subscribed to %d target(s)%s",
             self._consumer_name,
             self._group,
             len(self._targets),
+            " (prune on)" if self._prune_enabled() else "",
         )
+
+    def _prune_enabled(self) -> bool:
+        """Prune runs when a retention knob is set and the interval is not
+        explicitly disabled (``prune_interval_s == 0``)."""
+        if self._prune_interval_s is not None and self._prune_interval_s <= 0:
+            return False
+        return self._retention_age_seconds is not None or self._retention_count is not None
 
     def _should_stop(self) -> bool:
         """Indirection over ``self._stopping`` so the in-loop re-check isn't
@@ -557,20 +669,29 @@ class DatabaseConsumer:
         return self._stopping
 
     async def stop(self) -> None:
-        """Cancel the loop and wait for it to unwind. Never raises."""
+        """Cancel the poll loop (and the prune loop, if running) and wait for
+        both to unwind. Never raises."""
         self._stopping = True
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception(
-                    "consumer %r task had already died with an unexpected error",
-                    self._consumer_name,
-                )
-            self._task = None
+        await self._cancel(self._task, "poll")
+        self._task = None
+        await self._cancel(self._prune_task, "prune")
+        self._prune_task = None
+
+    async def _cancel(self, task: asyncio.Task[None] | None, label: str) -> None:
+        """Cancel one background task and swallow its unwind. Never raises."""
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception(
+                "consumer %r %s task had already died with an unexpected error",
+                self._consumer_name,
+                label,
+            )
 
     async def _run(self) -> None:
         while True:
@@ -610,6 +731,32 @@ class DatabaseConsumer:
     async def _backoff_after_failure(self) -> None:
         self._consecutive_failures += 1
         await asyncio.sleep(_backoff_delay(self._consecutive_failures))
+
+    async def _prune_loop(self) -> None:
+        """Background retention sweep: every ``prune_interval_s`` (default
+        ``_DEFAULT_PRUNE_INTERVAL_S`` when unset), delete terminal rows past the
+        configured retention. Sleeps FIRST so many workers starting at once
+        don't all prune simultaneously. A prune failure is logged and the loop
+        continues — retention is best-effort maintenance, never fatal.
+
+        Redundant-but-idempotent across replicas: every consuming worker runs
+        this, and ``prune`` deletes globally, so extra runs are cheap no-ops
+        rather than duplicated deletes.
+        """
+        interval = self._prune_interval_s or _DEFAULT_PRUNE_INTERVAL_S
+        while True:
+            await asyncio.sleep(interval)
+            if self._should_stop():
+                return
+            try:
+                await self._broker.prune(
+                    retention_age_seconds=self._retention_age_seconds,
+                    retention_count=self._retention_count,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("prune failed for group %s — loop continues", self._group)
 
     async def _dispatch_one(self, row: dict[str, Any]) -> None:
         """Deserialize one claimed row and dispatch it to local listeners.
@@ -684,6 +831,17 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
     logger.info("registered database broker (completion_mode=%s)", completion_mode)
 
 
+def _opt_float(value: Any) -> float | None:
+    """Coerce a ``broker_options`` value (typed ``Any`` from TOML) to a float,
+    or None when absent."""
+    return None if value is None else float(value)
+
+
+def _opt_int(value: Any) -> int | None:
+    """Coerce a ``broker_options`` value to an int, or None when absent."""
+    return None if value is None else int(value)
+
+
 def _make_db_consumer(spec: ConsumerSpec) -> Consumer:
     """Build a database consumer for one worker module from ``spec``.
 
@@ -691,8 +849,16 @@ def _make_db_consumer(spec: ConsumerSpec) -> Consumer:
     registered on the producer side (pulled from ``spec.broker_registry`` by
     scheme), whose consumer-side methods the loop drives. One engine serves
     both halves — no second engine is opened here.
+
+    Prune retention is read from ``[tool.modulith.broker_options]`` here so the
+    background sweep is opt-in per deployment (the full pooling/engine config
+    surface lands in I5).
     """
+    from ..runtime import _runtime
+
     broker = cast(DatabaseBroker, spec.broker_registry.get(spec.scheme))
+    cfg = _runtime.config
+    opts = (cfg.broker_options if cfg is not None else None) or {}
     return DatabaseConsumer(
         broker=broker,
         bus=spec.bus,
@@ -700,6 +866,9 @@ def _make_db_consumer(spec: ConsumerSpec) -> Consumer:
         consumer_name=spec.consumer_name,
         group=spec.group,
         targets=list(spec.targets),
+        prune_interval_s=_opt_float(opts.get("prune_interval_seconds")),
+        retention_age_seconds=_opt_float(opts.get("retention_age_seconds")),
+        retention_count=_opt_int(opts.get("retention_count")),
     )
 
 
