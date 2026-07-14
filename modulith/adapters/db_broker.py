@@ -77,6 +77,11 @@ them by age (``retention_age_seconds``) and/or by count (``retention_count``,
 newest-N per ``(target, consumer_group)``); pending/claimed rows are never
 touched, so prune can never drop an undelivered message. ``DatabaseConsumer``
 runs it on a background interval when either retention knob is configured.
+Corollary: a consumer group that stops consuming permanently (a module
+retired without dropping its ``broker_subscription`` rows) keeps accumulating
+'pending' rows that prune will never delete — undelivered work is never
+pruned by design. Delete that group's subscription rows (or the stale
+messages) out of band when decommissioning a module.
 
 Resilience posture mirrors ``modulith._consumer.BrokerConsumer``: a
 background poll loop with capped exponential backoff on backend errors,
@@ -162,7 +167,11 @@ _BACKOFF_MAX_EXPONENT = 7
 
 # Dialects that support ``FOR UPDATE SKIP LOCKED``. SQLite has no row
 # locking and rejects the clause outright, so it must never be issued there.
-_SKIP_LOCKED_DIALECTS = frozenset({"postgresql", "mysql"})
+# MariaDB reports its own dialect name ("mariadb", not "mysql") and has
+# supported SKIP LOCKED since 10.6 (2021) — without it here a ``mariadb://``
+# URL silently degraded to the SQLite-style plain claim, losing the
+# competing-consumer partitioning it is fully capable of.
+_SKIP_LOCKED_DIALECTS = frozenset({"postgresql", "mysql", "mariadb"})
 
 # SQLite ``busy_timeout`` (ms) applied to every connection when none is
 # configured: how long a blocked writer waits for the lock before raising
@@ -231,6 +240,24 @@ def _is_sqlite_locked(exc: BaseException) -> bool:
     return "database is locked" in message or "database table is locked" in message
 
 
+def _is_already_exists(exc: BaseException) -> bool:
+    """True for a 'relation/table already exists' DDL error across the three
+    supported dialects — the benign loser of a cross-process CREATE TABLE race.
+
+    ``metadata.create_all`` runs a SELECT-then-CREATE per table (checkfirst),
+    so two workers bootstrapping the same fresh DB can both pass the existence
+    check and both issue CREATE; the loser gets Postgres 'already exists',
+    MySQL 1050 'Table ... already exists', or SQLite 'table ... already
+    exists' — all of which carry the 'already exists' substring."""
+    from sqlalchemy.exc import OperationalError, ProgrammingError
+
+    if not isinstance(exc, OperationalError | ProgrammingError):
+        return False
+    orig = getattr(exc, "orig", None)
+    message = (str(orig) if orig is not None else str(exc)).lower()
+    return "already exists" in message
+
+
 def _supports_skip_locked(engine: Any) -> bool:
     """True when ``engine``'s dialect supports ``FOR UPDATE SKIP LOCKED``.
 
@@ -292,7 +319,18 @@ def _create_engine(url: str, opts: dict[str, Any]) -> Any:
     - SQLite: pool-sizing kwargs are NOT passed (SQLite's pool rejects them);
       instead WAL + ``busy_timeout`` are installed per connection.
     """
-    from sqlalchemy.ext.asyncio import create_async_engine
+    try:
+        from sqlalchemy.ext.asyncio import create_async_engine
+    except ImportError as exc:  # pragma: no cover — exercised via an import shim
+        # The adapter is a BUILTIN plugin (lazy imports, module docstring), so a
+        # missing extra only surfaces here — when an app actually selects
+        # ``broker='database'`` and builds an engine from a URL. Replace the
+        # opaque bare ``ModuleNotFoundError: No module named 'sqlalchemy'`` with
+        # the same guided message the postgres_outbox adapter uses.
+        raise ImportError(
+            "The 'database' broker requires SQLAlchemy (async) plus a DB driver. "
+            "Install the extra: pip install 'modulith[database]'"
+        ) from exc
 
     kwargs: dict[str, Any] = {}
     sqlite = _is_sqlite_url(url)
@@ -473,15 +511,28 @@ class DatabaseBroker:
 
     async def _ensure_schema(self) -> None:
         """Create the broker tables if absent — idempotent, cheap after the
-        first call (short-circuits on the in-process flag)."""
+        first call (short-circuits on the in-process flag), and safe across
+        processes.
+
+        ``create_all`` does a SELECT-then-CREATE per table, so two workers
+        bootstrapping the same fresh DB at once can race: both see the table
+        missing, both CREATE, and the loser fails with 'already exists'. The
+        schema IS present either way, so that specific failure is swallowed
+        (the row is created by the winner); any other DDL error propagates.
+        """
         if self._schema_is_ready():
             return
         async with self._schema_lock:
             if self._schema_is_ready():
                 return
             metadata, _, _ = broker_schema()
-            async with self._engine.begin() as conn:
-                await conn.run_sync(metadata.create_all)
+            try:
+                async with self._engine.begin() as conn:
+                    await conn.run_sync(metadata.create_all)
+            except Exception as exc:
+                if not _is_already_exists(exc):
+                    raise
+                logger.debug("broker schema already created by a peer — continuing")
             self._schema_ready = True
 
     async def _write(self, operation: Callable[[Any], Awaitable[Any]]) -> Any:
@@ -846,6 +897,14 @@ class DatabaseBroker:
         ever deleted** — 'pending'/'claimed' rows are undelivered work and are
         never touched, so prune can never cause message loss. Returns the total
         number of rows deleted (best-effort per ``_rowcount``).
+
+        Note: the age prune measures from ``created_at`` (publish time), not
+        from when the row became terminal. A message that only dead-lettered
+        after exhausting its retries is aged from when it was first published,
+        so a slow-to-die message can be eligible for age-prune shortly after it
+        turns terminal. This is intentional (``created_at`` is the stable,
+        indexed column) and harmless — terminal rows are, by definition, no
+        longer deliverable.
         """
         if retention_age_seconds is None and retention_count is None:
             return 0
@@ -881,7 +940,14 @@ class DatabaseBroker:
                 )
                 ranked = select(message.c.id, rank).where(terminal).subquery()
                 doomed = select(ranked.c.id).where(ranked.c.rn > retention_count)
-                result = await conn.execute(delete(message).where(message.c.id.in_(doomed)))
+                # Re-assert ``terminal`` on the outer DELETE too: the doomed ids
+                # already come from a terminal-only ranking, but this makes the
+                # never-touch-undelivered-rows guarantee independent of the
+                # subquery — a pending/claimed row can never be deleted even if
+                # the ranking logic later regresses.
+                result = await conn.execute(
+                    delete(message).where(message.c.id.in_(doomed), terminal)
+                )
                 deleted_local += _rowcount(result)
             return deleted_local
 
@@ -945,8 +1011,13 @@ class DatabaseConsumer:
         """Upsert subscriptions, then launch the poll loop.
 
         No-op (no background task) when the worker consumes nothing — a leaf
-        module with no @listener has no targets to claim for.
+        module with no @listener has no targets to claim for. Idempotent: a
+        second ``start()`` while the poll loop is already running is ignored
+        (starting twice would orphan the first task and double every claim).
         """
+        if self._task is not None:
+            logger.debug("db consumer %r already started — ignoring re-start", self._consumer_name)
+            return
         if not self._targets:
             logger.debug(
                 "consumer %r has no subscribed targets — not starting", self._consumer_name
@@ -1162,13 +1233,27 @@ def _broker_opt(opts: dict[str, Any], key: str, env_suffix: str) -> Any:
 
 def _opt_float(value: Any) -> float | None:
     """Coerce a broker-option value (typed ``Any`` from TOML/env) to a float,
-    or None when absent."""
-    return None if value is None else float(value)
+    or None when absent. A non-numeric value (e.g. a typo'd env var) raises
+    ``ConfigurationError`` rather than a bare ``ValueError`` so the operator
+    sees a broker-config error, not an opaque traceback."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError(f"broker option expected a number, got {value!r}") from exc
 
 
 def _opt_int(value: Any) -> int | None:
-    """Coerce a broker-option value to an int, or None when absent."""
-    return None if value is None else int(value)
+    """Coerce a broker-option value to an int, or None when absent. Same
+    ``ConfigurationError``-on-bad-value contract as ``_opt_float`` (note
+    ``'10.0'`` is rejected — use a bare integer)."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError(f"broker option expected an integer, got {value!r}") from exc
 
 
 def _make_db_consumer(spec: ConsumerSpec) -> Consumer:

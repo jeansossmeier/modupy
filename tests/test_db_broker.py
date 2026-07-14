@@ -40,9 +40,12 @@ from modulith.adapters.db_broker import (
     DatabaseConsumer,
     _broker_opt,
     _create_engine,
+    _is_already_exists,
     _is_sqlite_locked,
     _is_sqlite_url,
     _make_db_consumer,
+    _opt_float,
+    _opt_int,
     _supports_skip_locked,
     broker_schema,
 )
@@ -708,9 +711,10 @@ class _FakeEngine:
         self.dialect = _FakeDialect(name)
 
 
-def test_skip_locked_gate_selects_postgres_and_mysql_only() -> None:
+def test_skip_locked_gate_selects_lockable_dialects_only() -> None:
     assert _supports_skip_locked(_FakeEngine("postgresql")) is True
     assert _supports_skip_locked(_FakeEngine("mysql")) is True
+    assert _supports_skip_locked(_FakeEngine("mariadb")) is True  # 10.6+ supports it
     assert _supports_skip_locked(_FakeEngine("sqlite")) is False
 
 
@@ -1361,3 +1365,124 @@ def test_make_db_consumer_reads_reclaim_and_max_attempts(make_fake_app: Any) -> 
     assert isinstance(consumer, DatabaseConsumer)
     assert consumer._reclaim_stale_seconds == 12.5
     assert consumer._max_attempts == 9
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-3: _ensure_schema tolerates a cross-process CREATE TABLE race
+# ---------------------------------------------------------------------------
+
+
+class _RaceConn:
+    def __init__(self, error_text: str | None) -> None:
+        self._error_text = error_text
+
+    async def run_sync(self, _fn: Any) -> None:
+        if self._error_text is not None:
+            from sqlalchemy.exc import OperationalError
+
+            raise OperationalError("CREATE TABLE ...", {}, Exception(self._error_text))
+
+
+class _RaceBegin:
+    def __init__(self, conn: _RaceConn) -> None:
+        self._conn = conn
+
+    async def __aenter__(self) -> _RaceConn:
+        return self._conn
+
+    async def __aexit__(self, *_: Any) -> bool:
+        return False
+
+
+class _SchemaRaceEngine:
+    """Minimal async-engine stand-in whose create_all (run_sync) raises a
+    chosen DDL error — for deterministically exercising the schema-race path."""
+
+    def __init__(self, *, error_text: str | None) -> None:
+        self._conn = _RaceConn(error_text)
+
+    def begin(self) -> _RaceBegin:
+        return _RaceBegin(self._conn)
+
+
+def test_is_already_exists_matches_concurrent_create_errors() -> None:
+    from sqlalchemy.exc import OperationalError, ProgrammingError
+
+    assert _is_already_exists(
+        OperationalError("s", {}, Exception("table broker_message already exists"))
+    )
+    assert _is_already_exists(
+        ProgrammingError("s", {}, Exception('relation "broker_message" already exists'))
+    )
+    assert not _is_already_exists(OperationalError("s", {}, Exception("no such table: x")))
+    assert not _is_already_exists(ValueError("unrelated"))
+
+
+async def test_ensure_schema_tolerates_concurrent_create() -> None:
+    """A peer that wins the CREATE race leaves us an 'already exists' error;
+    the schema IS present, so _ensure_schema swallows it and marks ready."""
+    broker = DatabaseBroker(
+        engine=_SchemaRaceEngine(error_text="table broker_message already exists")
+    )
+    await broker._ensure_schema()  # must not raise
+    assert broker._schema_ready is True
+
+
+async def test_ensure_schema_propagates_other_ddl_errors() -> None:
+    from sqlalchemy.exc import OperationalError
+
+    broker = DatabaseBroker(engine=_SchemaRaceEngine(error_text="disk I/O error"))
+    with pytest.raises(OperationalError):
+        await broker._ensure_schema()
+    assert broker._schema_ready is False  # genuine failure is not masked
+
+
+# ---------------------------------------------------------------------------
+# LOW: _opt_float / _opt_int raise ConfigurationError on a non-numeric value
+# ---------------------------------------------------------------------------
+
+
+def test_opt_float_rejects_non_numeric() -> None:
+    from modulith import ConfigurationError
+
+    assert _opt_float(None) is None
+    assert _opt_float("2.5") == 2.5
+    with pytest.raises(ConfigurationError):
+        _opt_float("not-a-number")
+
+
+def test_opt_int_rejects_non_integer() -> None:
+    from modulith import ConfigurationError
+
+    assert _opt_int(None) is None
+    assert _opt_int("7") == 7
+    with pytest.raises(ConfigurationError):
+        _opt_int("10.0")  # a float string is not a valid int — loud, not silent
+    with pytest.raises(ConfigurationError):
+        _opt_int("abc")
+
+
+# ---------------------------------------------------------------------------
+# LOW: DatabaseConsumer.start() is idempotent (no orphaned second poll loop)
+# ---------------------------------------------------------------------------
+
+
+async def test_start_is_idempotent(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="c1",
+        group="g",
+        targets=["t"],
+        poll_interval_s=0.01,
+    )
+    await consumer.start()
+    try:
+        first_task = consumer._task
+        assert first_task is not None
+        await consumer.start()  # second start must be a no-op
+        assert consumer._task is first_task  # same task — the first was not orphaned
+    finally:
+        await consumer.stop()

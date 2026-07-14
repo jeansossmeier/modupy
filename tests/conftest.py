@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from textwrap import dedent
 
@@ -186,7 +186,7 @@ def _docker_available() -> bool:
 
 
 @pytest.fixture(scope="session")
-def postgres_url() -> Callable[..., str]:
+def postgres_url() -> Iterator[str]:
     """A reachable Postgres URL (asyncpg driver) for integration tests.
 
     Yields ``MODULITH_TEST_POSTGRES_URL`` when set, else a throwaway
@@ -208,7 +208,7 @@ def postgres_url() -> Callable[..., str]:
 
 
 @pytest.fixture(scope="session")
-def mysql_url() -> Callable[..., str]:
+def mysql_url() -> Iterator[str]:
     """A reachable MySQL URL (aiomysql driver) for integration tests.
 
     Yields ``MODULITH_TEST_MYSQL_URL`` when set, else a throwaway
@@ -233,7 +233,7 @@ def mysql_url() -> Callable[..., str]:
 
 
 @pytest.fixture(scope="session")
-def redis_url() -> Callable[..., str]:
+def redis_url() -> Iterator[str]:
     """A reachable Redis URL for integration tests.
 
     Yields ``MODULITH_TEST_REDIS_URL`` when set, else a throwaway
