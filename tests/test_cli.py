@@ -223,6 +223,44 @@ def test_dev_processes_topology_uses_app_module_package_and_worker_env(make_fake
     assert spec.env["MODULITH_BROKER"] == "testbroker"
 
 
+def test_dev_processes_topology_forwards_broker_options_to_workers(
+    make_fake_app, monkeypatch, tmp_path
+):
+    """MEDIUM-6: broker_options the parent resolved (here from pyproject) must
+    reach each worker as MODULITH_BROKER_<KEY> env vars — a re-bootstrapping
+    worker can't otherwise get e.g. the database broker's URL, so it would fail
+    to build an engine."""
+    make_fake_app(
+        {"orders": ""},
+        extra_files={
+            "main.py": "from fastapi import FastAPI\napp = FastAPI()\n",
+        },
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.modulith]\n"
+        'broker = "database"\n'
+        "[tool.modulith.broker_options]\n"
+        'url = "sqlite+aiosqlite:///wf.db"\n'
+        "poll_interval_ms = 250\n"
+    )
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["dev", "fakeapp.main:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    (spec,) = captured["specs"]
+    assert spec.env["MODULITH_BROKER"] == "database"
+    assert spec.env["MODULITH_BROKER_URL"] == "sqlite+aiosqlite:///wf.db"
+    assert spec.env["MODULITH_BROKER_POLL_INTERVAL_MS"] == "250"
+
+
 def test_run_processes_topology_runs_supervisor(make_fake_app, monkeypatch):
     make_fake_app({"orders": "", "inventory": ""})
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")

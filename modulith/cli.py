@@ -437,12 +437,26 @@ def _run_process_topology(
     cfg = rt.config
     assert cfg is not None  # ensure_bootstrapped guarantees this
 
+    # Forward the resolved broker config to every worker as MODULITH_BROKER_*
+    # env vars. A worker re-bootstraps from scratch (auto_discover=False,
+    # explicit package/topology kwargs) and cannot reliably re-derive the
+    # broker_options the parent resolved — its CWD/pyproject discovery may
+    # differ, and its own configure() call doesn't read them — so without this
+    # a URL/DSN (or any tuning key) set in pyproject or resolved at the parent
+    # never reaches the worker's broker/consumer, and e.g. the database broker
+    # fails to build an engine. Env takes precedence over the subtable per
+    # _broker_opt, which is the documented resolution order.
+    worker_env: dict[str, str] = {"MODULITH_BROKER": cfg.broker}
+    for key, value in (cfg.broker_options or {}).items():
+        if value is not None:
+            worker_env[f"MODULITH_BROKER_{key.upper()}"] = str(value)
+
     config: dict[str, Any] = {
         "package": cfg.package,
         # --workers replaces the pyproject [tool.modulith.workers] table
         # entirely — a full override, not a per-module patch (A9-r5-216).
         "workers": workers_map if workers_map is not None else dict(cfg.workers),
-        "env": {"MODULITH_BROKER": cfg.broker},
+        "env": worker_env,
     }
     if isolate:
         config["isolate"] = [isolate]
