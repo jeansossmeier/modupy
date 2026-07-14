@@ -513,6 +513,36 @@ class DatabaseBroker:
                 )
                 await asyncio.sleep(_backoff_delay(attempt))
 
+    async def _now(self, conn: Any) -> datetime:
+        """Current time from the DATABASE server clock (not the app host's).
+
+        Every skew-sensitive timestamp — a message's claim visibility
+        (``available_at``), the reclaim cutoff (``claimed_at``), the retry
+        backoff, and the prune age — is both STAMPED and COMPARED against this
+        one clock, so cross-host clock skew can't make one consumer reclaim a
+        peer's fresh claim early, delay a message's visibility, or prune by the
+        wrong wall clock (competing consumers and the producer commonly run on
+        different hosts).
+
+        SQLite is single-host (the file *is* the host — there is no second
+        clock to skew against) and its ``CURRENT_TIMESTAMP`` is only
+        second-resolution, so it keeps the finer-grained Python
+        ``datetime.now(UTC)``, which is equally correct there.
+        """
+        from sqlalchemy import text
+
+        dialect = self._engine.dialect.name
+        if dialect == "postgresql":
+            result = await conn.execute(text("SELECT now()"))
+            return cast(datetime, result.scalar_one())
+        if dialect == "mysql":
+            # UTC_TIMESTAMP(6) (not NOW(), which is session-timezone dependent)
+            # returns microsecond-precision naive UTC; tag it UTC so it
+            # round-trips like the app-clock path did (columns are tz-aware).
+            result = await conn.execute(text("SELECT UTC_TIMESTAMP(6)"))
+            return cast(datetime, result.scalar_one()).replace(tzinfo=UTC)
+        return datetime.now(UTC)
+
     # ----- producer side -----------------------------------------------
 
     async def publish(
@@ -534,7 +564,6 @@ class DatabaseBroker:
         _, subscription, message = broker_schema()
         event_type = (headers or {}).get("event_type", "")
         headers_blob = json.dumps(headers) if headers else None
-        now = datetime.now(UTC)
 
         async def op(conn: Any) -> int:
             result = await conn.execute(
@@ -543,6 +572,7 @@ class DatabaseBroker:
             groups = [row[0] for row in result]
             if not groups:
                 return 0
+            now = await self._now(conn)
             rows = [
                 {
                     "id": str(uuid4()),
@@ -666,10 +696,10 @@ class DatabaseBroker:
         from sqlalchemy import and_, or_, select, update
 
         _, _, message = broker_schema()
-        now = datetime.now(UTC)
-        stale_cutoff = now - timedelta(seconds=reclaim_stale_seconds)
 
         async def op(conn: Any) -> list[dict[str, Any]]:
+            now = await self._now(conn)
+            stale_cutoff = now - timedelta(seconds=reclaim_stale_seconds)
             stmt = (
                 select(message)
                 .where(
@@ -753,12 +783,13 @@ class DatabaseBroker:
             if current is None:
                 return  # reclaimed by a peer or already terminal — late write is a no-op
             new_attempts = current + 1
+            now = await self._now(conn)
             if new_attempts >= max_attempts:
                 status = "dead"
-                available_at = datetime.now(UTC)
+                available_at = now
             else:
                 status = "pending"
-                available_at = datetime.now(UTC) + timedelta(seconds=_backoff_delay(new_attempts))
+                available_at = now + timedelta(seconds=_backoff_delay(new_attempts))
             await conn.execute(
                 update(message)
                 .where(*_owned(message, row_id, consumer_name))
@@ -827,7 +858,7 @@ class DatabaseBroker:
         async def op(conn: Any) -> int:
             deleted_local = 0
             if retention_age_seconds is not None:
-                cutoff = datetime.now(UTC) - timedelta(seconds=retention_age_seconds)
+                cutoff = (await self._now(conn)) - timedelta(seconds=retention_age_seconds)
                 result = await conn.execute(
                     delete(message).where(terminal, message.c.created_at < cutoff)
                 )

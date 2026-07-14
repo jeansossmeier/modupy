@@ -301,3 +301,65 @@ async def test_reclaim_after_visibility_timeout(broker_engine: Any) -> None:
     )
     assert len(reclaimed) == 1
     assert reclaimed[0]["id"] == first[0]["id"]
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-5: skew-sensitive timestamps come from the DB server clock
+# ---------------------------------------------------------------------------
+
+
+def _aware(dt: datetime) -> datetime:
+    """Read-back timestamps are tz-aware on Postgres (timestamptz) but naive on
+    MySQL (DATETIME); normalize to UTC-aware for comparison."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
+async def test_now_uses_db_server_clock_and_is_tz_aware(broker_engine: Any) -> None:
+    """``_now`` must execute the dialect-correct query (``now()`` on Postgres,
+    ``UTC_TIMESTAMP(6)`` on MySQL) against the real driver and return a
+    tz-aware instant on the DB's own clock — the foundation of skew immunity."""
+    from sqlalchemy import text
+
+    broker = DatabaseBroker(engine=broker_engine)
+    dialect = broker_engine.dialect.name
+    db_now_sql = "SELECT now()" if dialect == "postgresql" else "SELECT UTC_TIMESTAMP(6)"
+
+    async with broker_engine.connect() as conn:
+        got = await broker._now(conn)
+        raw = (await conn.execute(text(db_now_sql))).scalar_one()
+
+    assert got.tzinfo is not None  # tz-aware on BOTH dialects
+    assert abs((got - _aware(raw)).total_seconds()) < 5.0  # the DB's clock, not the app's
+
+
+async def test_publish_and_claim_stamp_from_server_clock(broker_engine: Any) -> None:
+    """The producer (``created_at``/``available_at``) and the claim
+    (``claimed_at``) stamp from the DB clock — assert each lands within a small
+    window of the DB's own ``_now``, proving server-clock sourcing is wired
+    through ``publish`` and ``claim_batch``, not just the helper."""
+    from sqlalchemy import select
+
+    broker = DatabaseBroker(engine=broker_engine)
+    await broker.subscribe([_TARGET], "g")
+    serializer = JsonEventSerializer()
+    await broker.publish(
+        _TARGET, serializer.serialize(WidgetCreated(name="w1")), {"event_type": _TARGET}
+    )
+    rows = await broker.claim_batch("g", batch_size=10, consumer_name="c1")
+    assert len(rows) == 1
+
+    _, _, message = broker_schema()
+    async with broker_engine.connect() as conn:
+        ref = await broker._now(conn)
+        row = (
+            await conn.execute(
+                select(message.c.created_at, message.c.available_at, message.c.claimed_at).where(
+                    message.c.id == rows[0]["id"]
+                )
+            )
+        ).first()
+
+    assert row is not None
+    assert abs((_aware(row.created_at) - ref).total_seconds()) < 10.0
+    assert abs((_aware(row.available_at) - ref).total_seconds()) < 10.0
+    assert abs((_aware(row.claimed_at) - ref).total_seconds()) < 10.0
