@@ -257,8 +257,11 @@ def _install_sqlite_pragmas(engine: Any, busy_timeout_ms: int) -> None:
 
 
 def _create_engine(url: str, opts: dict[str, Any]) -> Any:
-    """Build the async engine, applying dialect-appropriate options from
-    ``opts`` (the ``[tool.modulith.broker_options]`` subtable).
+    """Build the async engine, applying dialect-appropriate options resolved
+    ``MODULITH_BROKER_<KEY>`` env var > ``[tool.modulith.broker_options]``
+    subtable (via ``_broker_opt``, exactly like the URL and consumer options),
+    so pool sizing is a per-deployment value operators can set from the
+    environment without editing pyproject.
 
     - Postgres / MySQL: ``pool_size`` / ``max_overflow`` size the connection
       pool (both optional; omitted -> SQLAlchemy's QueuePool defaults).
@@ -270,15 +273,18 @@ def _create_engine(url: str, opts: dict[str, Any]) -> Any:
     kwargs: dict[str, Any] = {}
     sqlite = _is_sqlite_url(url)
     if not sqlite:
-        pool_size = _opt_int(opts.get("pool_size"))
+        pool_size = _opt_int(_broker_opt(opts, "pool_size", "POOL_SIZE"))
         if pool_size is not None:
             kwargs["pool_size"] = pool_size
-        max_overflow = _opt_int(opts.get("max_overflow"))
+        max_overflow = _opt_int(_broker_opt(opts, "max_overflow", "MAX_OVERFLOW"))
         if max_overflow is not None:
             kwargs["max_overflow"] = max_overflow
     engine = create_async_engine(url, **kwargs)
     if sqlite:
-        busy_timeout_ms = _opt_int(opts.get("busy_timeout_ms")) or _DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+        busy_timeout_ms = (
+            _opt_int(_broker_opt(opts, "busy_timeout_ms", "BUSY_TIMEOUT_MS"))
+            or _DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+        )
         _install_sqlite_pragmas(engine, busy_timeout_ms)
     return engine
 

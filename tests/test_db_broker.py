@@ -991,6 +991,46 @@ def test_broker_opt_falls_back_to_none(monkeypatch: Any) -> None:
     assert _broker_opt({}, "pool_size", "POOL_SIZE") is None
 
 
+async def test_pool_size_env_override_reaches_engine(monkeypatch: Any) -> None:
+    """``MODULITH_BROKER_POOL_SIZE`` sizes the pool with no subtable value — the
+    engine factory must resolve pool options env>subtable like every other
+    broker option (the module docstring documents these as env-resolvable, and
+    pool sizing is a per-deployment value operators tune without editing
+    pyproject)."""
+    monkeypatch.setenv("MODULITH_BROKER_POOL_SIZE", "9")
+    engine = _create_engine("postgresql+asyncpg://user:pass@localhost/db", {})
+    try:
+        assert engine.sync_engine.pool.size() == 9
+    finally:
+        await engine.dispose()
+
+
+async def test_max_overflow_env_override_reaches_engine(monkeypatch: Any) -> None:
+    """``MODULITH_BROKER_MAX_OVERFLOW`` overrides overflow with no subtable value."""
+    monkeypatch.setenv("MODULITH_BROKER_MAX_OVERFLOW", "4")
+    engine = _create_engine("postgresql+asyncpg://user:pass@localhost/db", {})
+    try:
+        assert engine.sync_engine.pool._max_overflow == 4
+    finally:
+        await engine.dispose()
+
+
+async def test_busy_timeout_env_override_reaches_sqlite(tmp_path: Path, monkeypatch: Any) -> None:
+    """``MODULITH_BROKER_BUSY_TIMEOUT_MS`` overrides the SQLite busy_timeout with
+    no subtable value."""
+    from sqlalchemy import text
+
+    monkeypatch.setenv("MODULITH_BROKER_BUSY_TIMEOUT_MS", "2222")
+    url = f"sqlite+aiosqlite:///{tmp_path / 'envbusy.db'}"
+    engine = _create_engine(url, {})
+    try:
+        async with engine.connect() as conn:
+            busy = (await conn.execute(text("PRAGMA busy_timeout"))).scalar_one()
+        assert int(busy) == 2222
+    finally:
+        await engine.dispose()
+
+
 # ---------------------------------------------------------------------------
 # I5c: subscribe upsert refreshes updated_at (proves ON CONFLICT DO UPDATE ran)
 # ---------------------------------------------------------------------------
