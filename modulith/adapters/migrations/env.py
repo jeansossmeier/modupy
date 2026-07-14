@@ -1,9 +1,13 @@
-"""Alembic environment for the modulith outbox schema.
+"""Alembic environment for the modulith schemas.
 
-Targets ``modulith.adapters.postgres_outbox.Base`` (the ``event_publications``
-and ``event_publications_archive`` tables). The database URL is resolved from,
-in order: an ``-x url=...`` argument, the ``MODULITH_DB_URL`` environment
-variable, or the ``sqlalchemy.url`` config option. This keeps the migration
+Targets both packaged schemas: ``modulith.adapters.postgres_outbox.Base`` (the
+``event_publications`` / ``event_publications_archive`` outbox tables) and the
+database-broker Core tables from ``modulith.adapters.db_broker.broker_schema``
+(``broker_subscription`` / ``broker_message``). Both are listed so
+``--autogenerate`` sees the full schema and never proposes dropping the other
+half; the hand-written revisions run regardless. The database URL is resolved
+from, in order: an ``-x url=...`` argument, the ``MODULITH_DB_URL`` environment
+variable, or the ``sqlalchemy.url`` config option. This keeps the migrations
 runnable against Postgres in production and SQLite in tests without editing
 ``alembic.ini``.
 """
@@ -15,10 +19,12 @@ import os
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from modulith.adapters.db_broker import broker_schema
 from modulith.adapters.postgres_outbox import Base
 
 config = context.config
-target_metadata = Base.metadata
+# A list of MetaData (alembic multi-metadata autogenerate) — outbox + broker.
+target_metadata = [Base.metadata, broker_schema()[0]]
 
 
 def _resolve_url() -> str:

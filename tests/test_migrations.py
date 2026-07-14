@@ -43,6 +43,22 @@ def test_alembic_upgrade_creates_schema(tmp_path: Path) -> None:
     assert "idx_pending" in _objects(db, "index")
 
 
+def test_alembic_upgrade_creates_broker_schema(tmp_path: Path) -> None:
+    # 0002: the database-broker tables + their indexes. `upgrade head` runs the
+    # full 0001 -> 0002 chain (the first migration to exercise more than one
+    # revision — the chain the audit flagged as previously unverifiable).
+    db = tmp_path / "broker.db"
+    command.upgrade(_cfg(db), "head")
+
+    tables = _objects(db, "table")
+    assert "broker_subscription" in tables
+    assert "broker_message" in tables
+    indexes = _objects(db, "index")
+    assert "ix_broker_message_claim" in indexes
+    assert "ix_broker_message_prune" in indexes
+    assert "ix_broker_message_target" in indexes
+
+
 def test_migration_columns_match_orm(tmp_path: Path) -> None:
     # Guards against ORM/migration drift: a column added to the model but not
     # the migration (or vice versa) would silently diverge the production
@@ -74,6 +90,10 @@ def test_alembic_downgrade_removes_schema(tmp_path: Path) -> None:
     tables = _objects(db, "table")
     assert "event_publications" not in tables
     assert "event_publications_archive" not in tables
+    # The full chain unwinds: 0002's broker tables go too (downgrade to base
+    # runs 0002.downgrade then 0001.downgrade).
+    assert "broker_subscription" not in tables
+    assert "broker_message" not in tables
 
 
 def test_migration_column_metadata_matches_orm(tmp_path: Path) -> None:
@@ -118,6 +138,41 @@ def test_migration_column_metadata_matches_orm(tmp_path: Path) -> None:
         assert migrated == orm, f"{table}: migration {migrated} != ORM {orm}"
 
 
+def test_broker_migration_column_metadata_matches_schema(tmp_path: Path) -> None:
+    """Same drift guard as the outbox test, for the database-broker tables:
+    the 0002 migration must render byte-for-byte the same schema as
+    ``db_broker.broker_schema()`` (type/nullable/default/pk), inspector to
+    inspector so both sides go through the SQLite dialect identically."""
+    from sqlalchemy import create_engine
+
+    from modulith.adapters.db_broker import broker_schema
+
+    migrated_db = tmp_path / "migrated.db"
+    command.upgrade(_cfg(migrated_db), "head")
+
+    metadata, _, _ = broker_schema()
+    schema_db = tmp_path / "schema.db"
+    engine = create_engine(f"sqlite:///{schema_db}")
+    try:
+        metadata.create_all(engine)
+    finally:
+        engine.dispose()
+
+    def snapshot(db_path: Path, table: str) -> dict[str, tuple[str, int, object, int]]:
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        finally:
+            conn.close()
+        # name -> (type, notnull, dflt_value, pk); declaration order may differ.
+        return {r[1]: (r[2], r[3], r[4], r[5]) for r in rows}
+
+    for table in ("broker_subscription", "broker_message"):
+        migrated = snapshot(migrated_db, table)
+        from_schema = snapshot(schema_db, table)
+        assert migrated == from_schema, f"{table}: migration {migrated} != schema {from_schema}"
+
+
 def test_alembic_offline_mode_emits_full_ddl(tmp_path: Path, capsys) -> None:
     """A6-r2-89: offline/--sql mode (env.py's run_migrations_offline) must
     render the complete DDL — both tables and the pending partial index —
@@ -129,5 +184,9 @@ def test_alembic_offline_mode_emits_full_ddl(tmp_path: Path, capsys) -> None:
     assert "CREATE TABLE event_publications (" in ddl
     assert "CREATE TABLE event_publications_archive (" in ddl
     assert "idx_pending" in ddl
+    # 0002 also renders offline (full chain), tables + indexes.
+    assert "CREATE TABLE broker_subscription (" in ddl
+    assert "CREATE TABLE broker_message (" in ddl
+    assert "ix_broker_message_claim" in ddl
     # Offline mode renders SQL only — the database file is never created.
     assert not db.exists()
