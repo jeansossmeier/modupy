@@ -180,11 +180,12 @@ Adapters implement a protocol by **duck typing**; they don't need to subclass
 it (`runtime_checkable` is there so apps can `isinstance`-check for
 diagnostics).
 
-Brokers are the exception: many can be active at once, routed by scheme (§7.3).
+Brokers are the exception: many can be active at once, routed by scheme (§8.2).
 `Consumer` is the broker's cross-process consumer half — the process-per-module
 worker runs one per module, built by a factory registered via
 `modulith_register_consumers`. Like brokers, exactly one consumer adapter wins
-per scheme; the redis-streams adapter registers both halves (§7.3).
+per scheme; the redis-streams adapter registers both halves (§8.3), as does the
+database adapter (§8.4).
 
 ### 5.3 The plugin manager and the observe-shield
 
@@ -359,6 +360,55 @@ handling, go to a bounded dead-letter stream. (The audit hardened several
 CRITICALs here: `XAUTOCLAIM` deleted-id handling, `NOGROUP` recovery, and
 never `XACK`-ing without a successful dispatch.)
 
+### 8.4 The database broker and consumer
+
+**`modulith/adapters/db_broker.py`, migration `0002_broker_message`.** A
+Redis-free cross-process transport that uses a relational database as the
+message queue — one `database` scheme whose dialect (Postgres / MySQL / SQLite)
+is inferred from the SQLAlchemy URL, mirroring how the "postgres" outbox adapter
+is itself dialect-aware. Distributed via `modulith[database]` (async SQLAlchemy +
+`asyncpg`/`aiomysql`/`aiosqlite`); SQLAlchemy is lazy-imported so an app that
+never selects it pays nothing. SQLite doubles as a zero-infrastructure bootstrap
+broker — an embedded file (or `:memory:`) that needs no server at all.
+
+*Fan-out on write.* The producer process is module-isolated and never imports
+consumer modules, so it can't know the consumer groups statically. Instead each
+`DatabaseConsumer` self-registers its `(target, group)` subscriptions in a
+persistent `broker_subscription` table at `start()` (an idempotent,
+concurrency-safe dialect-native upsert). `DatabaseBroker.publish()` looks up
+every group subscribed to the target and inserts one `broker_message` row per
+group in a single transaction. Zero subscribers → zero rows (no consumer has
+registered interest yet) — an at-least-once nuance that's safe because listeners
+are idempotent, the same posture as the Redis adapter's startup-race gap.
+
+*Competing consumers.* `DatabaseConsumer` polls, claiming a batch of due rows
+with `FOR UPDATE SKIP LOCKED` so concurrent workers of a replicated module
+partition the backlog instead of blocking or double-claiming. It deserializes
+each row by its `event_type` header, dispatches to the local listeners, then
+removes the row (`completion_mode="delete"`, the default) or marks it `done`
+(`"mark"`, leaving it for the prune job). Poison rows (missing `event_type` /
+undeserializable payload) are dead-lettered immediately; dispatch failures
+increment `attempts` with capped backoff and dead-letter after the attempt cap.
+A worker that crashes between claim and ack leaves its row `claimed`; the next
+claim reclaims it once `claimed_at` is older than the reclaim window — the DB
+analogue of the Redis `XAUTOCLAIM` recovery, and what keeps delivery
+at-least-once across a crash.
+
+*Retention.* Terminal rows (`done`/`dead`) accumulate, so the consumer runs a
+background prune when a retention knob is set: by age (`retention_age_seconds`)
+and/or by count (`retention_count`, newest-N per `(target, consumer_group)`).
+Pending/claimed rows are never touched, so prune can't drop undelivered work.
+
+*SQLite specifics.* SQLite has no row locking and rejects `SKIP LOCKED`, so it
+degrades to a plain single-transaction claim — correct for sequential
+consumption but not the concurrency guarantee Postgres/MySQL give. For
+best-effort multi-process use it is hardened with WAL journaling + `busy_timeout`
+on every connection, plus a bounded application-level retry on a transient
+"database is locked" (SQLite raises `SQLITE_BUSY` immediately, ignoring
+`busy_timeout`, when a read lock upgrades to a write lock — exactly what a claim
+does). Postgres `LISTEN`/`NOTIFY` (a low-latency alternative to polling) is a
+planned opt-in; today the transport polls on every dialect.
+
 ---
 
 ## 9. Boundary verification
@@ -449,7 +499,7 @@ for the full contract.
 | Plugin system | `hooks.py`, `markers.py`, `manager.py`, `protocols.py`, `types.py` |
 | Event bus | `event_bus.py` |
 | Outbox | `builtin/outbox.py`, `adapters/postgres_outbox.py` |
-| Brokers | `brokers.py`, `adapters/redis_broker.py`, `_consumer.py` |
+| Brokers | `brokers.py`, `adapters/redis_broker.py`, `adapters/db_broker.py`, `_consumer.py` |
 | Process topology | `_worker.py`, `supervisor.py`, `proxy.py` |
 | Verification & tooling | `builtin/verifier.py`, `builtin/audit.py`, `builtin/docs.py`, `cli.py` |
 | Observability & testing | `builtin/observability.py`, `testing.py` |

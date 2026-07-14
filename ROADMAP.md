@@ -158,6 +158,10 @@ The differentiator. Makes "modulith now, microservices later" credible.
 
 ## Phase 4 — Ecosystem Adapters (ongoing, post-v1)
 
+- [x] Database broker (`modulith[database]`) — Postgres / MySQL / SQLite as the
+      cross-module transport (no Redis required); fan-out subscriptions, `FOR
+      UPDATE SKIP LOCKED` claims, age/count prune, and an embedded-SQLite-file
+      bootstrap. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §8.4.
 - [ ] Kafka broker (`modulith[kafka]`)
 - [ ] RabbitMQ broker (`modulith[rabbitmq]`)
 - [ ] MongoDB outbox store (`modulith[mongo]`)

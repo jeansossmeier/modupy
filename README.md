@@ -19,8 +19,9 @@ green):
   (with ratcheting baselines), transactional outbox (Postgres adapter +
   alembic migrations), the CLI, and the documentation generator.
 - **Phase 2 — polish:** the pytest plugin, codebase audit + `doctor`
-  diagnostics, OpenTelemetry auto-instrumentation, and the production Redis
-  Streams broker.
+  diagnostics, OpenTelemetry auto-instrumentation, and two cross-process
+  brokers — the production Redis Streams broker and a database-backed broker
+  (Postgres / MySQL / SQLite) for a Redis-free deployment.
 - **Phase 3 — process-per-module:** the worker factory, process supervisor
   with crash recovery, reverse proxy, and cross-process event delivery through
   the broker (publishing *and* consuming — each worker subscribes to the
@@ -123,6 +124,7 @@ configures itself.
 ```bash
 pip install modulith                 # just the framework
 pip install 'modulith[postgres]'     # adds Postgres outbox
+pip install 'modulith[database]'     # adds the database broker (Postgres/MySQL/SQLite)
 pip install 'modulith[all]'          # everything
 ```
 
@@ -183,13 +185,24 @@ completion mode (`update` | `delete` | `archive`) where the outbox is
 wired, via `outbox.configure(completion_mode=...)` — see
 [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md), Step 5.
 
+The database broker reads `[tool.modulith.broker_options]` too: `url`/`dsn`
+(the SQLAlchemy URL — its dialect selects Postgres, MySQL, or SQLite),
+`pool_size`/`max_overflow` (server pooling), `busy_timeout_ms` (SQLite),
+`poll_interval_ms`/`batch_size` (consumer cadence), and
+`retention_age_seconds`/`retention_count`/`prune_interval_seconds` (the
+background prune). Every one is env-overridable via `MODULITH_BROKER_<KEY>`.
+See [ARCHITECTURE.md](docs/ARCHITECTURE.md) §8.4.
+
 Any *scalar* key has a `MODULITH_*` env var equivalent for production
 overrides (e.g. `MODULITH_OUTBOX`, `MODULITH_BROKER`, `MODULITH_PRODUCTION`).
 The table-valued keys (`outbox_options`, `broker_options`, `workers`) are
-pyproject-only — no env var. Two adapter-specific env vars exist on top:
-the Redis Streams broker honors `REDIS_URL` (plus
+pyproject-only — but a couple of adapters lift their own subtable from the
+environment on top. The Redis Streams broker honors `REDIS_URL` (plus
 `MODULITH_CONSUMER_GROUP` / `MODULITH_STREAM_PREFIX` /
-`MODULITH_STREAM_MAXLEN`), and the packaged alembic migration runner reads
+`MODULITH_STREAM_MAXLEN`); the database broker reads every `broker_options`
+key from `MODULITH_BROKER_<KEY>` (e.g. `MODULITH_BROKER_URL`,
+`MODULITH_BROKER_POLL_INTERVAL_MS`) — this is how a process-per-module worker
+receives its connection URL; and the packaged alembic migration runner reads
 `MODULITH_DB_URL` (see [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md), Step 5).
 
 For `topology = "processes"` a real cross-process broker is required:
@@ -286,10 +299,13 @@ pytest                     # ~400 tests, no external services
 The **integration suite** exercises the real adapters end-to-end — a real
 Postgres (the outbox, its Alembic migration, `FOR UPDATE SKIP LOCKED`), a real
 Redis (Streams broker, consumer groups, `XAUTOCLAIM` reclaim, dead-lettering),
-real cross-process event delivery, and real `uvicorn` worker subprocesses behind
-the reverse proxy. It uses [testcontainers](https://testcontainers.com) to spin
-up disposable `postgres:16` and `redis:7` containers, so it needs a running
-Docker daemon:
+the database broker against real Postgres **and** MySQL (fan-out subscriptions,
+SKIP LOCKED claims, prune, dialect-native upsert — plus a full two-worker
+cross-process delivery over both, and an embedded-SQLite-file variant that needs
+no container), real cross-process event delivery, and real `uvicorn` worker
+subprocesses behind the reverse proxy. It uses
+[testcontainers](https://testcontainers.com) to spin up disposable `postgres:16`,
+`mysql:8.0`, and `redis:7` containers, so it needs a running Docker daemon:
 
 ```bash
 pip install -e '.[integration]'
@@ -303,6 +319,7 @@ testcontainers manage them, point the suite at them:
 
 ```bash
 export MODULITH_TEST_POSTGRES_URL='postgresql+asyncpg://user:pass@localhost:5432/test'
+export MODULITH_TEST_MYSQL_URL='mysql+aiomysql://user:pass@localhost:3306/test'
 export MODULITH_TEST_REDIS_URL='redis://localhost:6379'
 pytest -m integration
 ```

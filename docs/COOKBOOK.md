@@ -16,6 +16,7 @@ end-to-end version of recipes 1–5 lives in
 6. [Enable the durable Postgres outbox](#6-enable-the-durable-postgres-outbox)
 7. [Choose an outbox completion mode](#7-choose-an-outbox-completion-mode)
 8. [Go process-per-module and externalize an event](#8-go-process-per-module-and-externalize-an-event)
+    - [Without Redis: a database as the broker](#without-redis-a-database-as-the-broker)
 9. [Test an event flow with the pytest plugin](#9-test-an-event-flow-with-the-pytest-plugin)
 10. [Enforce boundaries in CI](#10-enforce-boundaries-in-ci)
 11. [Extend modulith with a plugin](#11-extend-modulith-with-a-plugin)
@@ -357,6 +358,58 @@ The supervisor spawns one uvicorn subprocess per module (restarting crashes with
 backoff), and the reverse proxy routes each request to the right worker by URL
 prefix. In single-process topology `@externalized` is an inert marker, so you can
 add it before you need multi-process and it costs nothing until then.
+
+### Without Redis: a database as the broker
+
+The setup above uses Redis, but the same process-per-module topology runs over a
+relational database instead — and with SQLite, no server at all. Only the
+configuration changes; the module code (the `@externalized` events above) is
+identical, because the broker is chosen at bootstrap.
+
+```bash
+pip install 'modulith[database]'
+```
+
+The zero-infrastructure bootstrap is an embedded SQLite *file* shared by the
+worker processes — nothing to run, ideal for getting started or a small
+single-host deployment:
+
+```toml
+# pyproject.toml
+[tool.modulith]
+topology = "processes"
+broker = "database"
+
+[tool.modulith.broker_options]
+url = "sqlite+aiosqlite:///./modulith-broker.db"
+```
+
+For production, point the same `url` at Postgres or MySQL — the dialect is
+inferred from the URL, and Postgres/MySQL get real `FOR UPDATE SKIP LOCKED`
+competing-consumer claims (SQLite is best-effort multi-process, not
+high-throughput):
+
+```toml
+[tool.modulith.broker_options]
+url = "postgresql+asyncpg://user:pass@db/app"   # or mysql+aiomysql://...
+pool_size = 10                                   # server connection pool
+poll_interval_ms = 250                           # consumer poll cadence
+retention_age_seconds = 604800                   # prune terminal rows after 7 days
+```
+
+With `broker = "database"`, a bare `@externalized` event's default target is
+`database:{event-fqn}`; pin one explicitly with
+`@externalized(target="database:orders.placed")` exactly as with Redis. Every
+`broker_options` key is env-overridable via `MODULITH_BROKER_<KEY>` (e.g.
+`MODULITH_BROKER_URL`) — which is how each worker process receives its
+connection URL.
+
+The broker creates its `broker_message` / `broker_subscription` tables
+automatically on first use; to manage the schema explicitly instead, they ship
+in the packaged alembic migration — see
+[MIGRATION_GUIDE.md](../MIGRATION_GUIDE.md), Step 5. Delivery is at-least-once
+with the same crash-recovery and dead-lettering as the Redis broker; see
+[ARCHITECTURE.md](ARCHITECTURE.md) §8.4 for the design.
 
 ---
 
