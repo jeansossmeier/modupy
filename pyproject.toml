@@ -228,6 +228,18 @@ markers = [
     "integration: requires an external service (Redis, Postgres); skipped unless reachable",
     "modulith_isolated: run this test in a subprocess for full module isolation",
 ]
+filterwarnings = [
+    # aiosqlite runs one daemon worker thread per connection. Under
+    # pytest-asyncio's per-test event loop, an operation cancelled in flight
+    # (e.g. a DatabaseConsumer poll loop stopped mid-claim) can post its result
+    # back AFTER that loop has already closed, so the worker thread raises
+    # "Event loop is closed". It is a benign teardown race — every assertion has
+    # already passed — that lives upstream in aiosqlite, not in modulith. Ignore
+    # ONLY this exact artifact (scoped to _connection_worker_thread) so the
+    # default suite stays deterministic under `-W error` without masking other
+    # thread exceptions or warnings.
+    "ignore:Exception in thread .*_connection_worker_thread:pytest.PytestUnhandledThreadExceptionWarning",
+]
 
 [tool.ruff]
 line-length = 100

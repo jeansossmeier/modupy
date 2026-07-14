@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -124,6 +124,33 @@ async def _insert(
                 last_error=None,
             )
         )
+
+
+async def _message_row(engine: Any, row_id: str) -> Any:
+    """Return ``(status, attempts, available_at)`` for one message row."""
+    from sqlalchemy import select
+
+    _, _, message = broker_schema()
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            select(message.c.status, message.c.attempts, message.c.available_at).where(
+                message.c.id == row_id
+            )
+        )
+        return result.first()
+
+
+async def _subscription_updated_at(engine: Any, target: str, group: str) -> datetime:
+    from sqlalchemy import select
+
+    _, subscription, _ = broker_schema()
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            select(subscription.c.updated_at).where(
+                subscription.c.target == target, subscription.c.consumer_group == group
+            )
+        )
+        return cast(datetime, result.scalar_one())
 
 
 async def _until(predicate: Any, *, timeout: float = 10.0, interval: float = 0.05) -> None:
@@ -301,6 +328,97 @@ async def test_reclaim_after_visibility_timeout(broker_engine: Any) -> None:
     )
     assert len(reclaimed) == 1
     assert reclaimed[0]["id"] == first[0]["id"]
+
+
+# ---------------------------------------------------------------------------
+# HIGH-8: the subscription upsert's DO UPDATE refreshes updated_at (real DDL)
+# ---------------------------------------------------------------------------
+
+
+async def test_subscribe_upsert_refreshes_updated_at(broker_engine: Any) -> None:
+    """A re-subscribe must take the ON CONFLICT DO UPDATE / ON DUPLICATE KEY
+    UPDATE branch and refresh ``updated_at`` (not silently DO NOTHING) — proven
+    on the real dialect, where the unit suite's SQLite can't exercise the
+    MySQL ``ON DUPLICATE KEY`` form."""
+    broker = DatabaseBroker(engine=broker_engine)
+    _, subscription, _ = broker_schema()
+
+    await broker.subscribe([_TARGET], "g")
+    first = await _subscription_updated_at(broker_engine, _TARGET, "g")
+
+    await asyncio.sleep(0.01)  # guarantee a strictly later microsecond stamp
+    await broker.subscribe([_TARGET], "g")  # re-subscribe -> DO UPDATE
+    second = await _subscription_updated_at(broker_engine, _TARGET, "g")
+
+    assert await _row_count(broker_engine, subscription) == 1  # not duplicated
+    # timestamps are tz-aware on Postgres, naive on MySQL — normalize.
+    first_aware = first if first.tzinfo is not None else first.replace(tzinfo=UTC)
+    second_aware = second if second.tzinfo is not None else second.replace(tzinfo=UTC)
+    assert second_aware > first_aware  # DO UPDATE fired, updated_at refreshed
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-9: mark completion / dead-letter / fail+backoff on the real dialect
+# ---------------------------------------------------------------------------
+
+
+async def _publish_and_claim(broker: Any, consumer_name: str = "c1") -> str:
+    """Publish one message and claim it, returning its row id."""
+    await broker.subscribe([_TARGET], "g")
+    serializer = JsonEventSerializer()
+    await broker.publish(
+        _TARGET, serializer.serialize(WidgetCreated(name="w1")), {"event_type": _TARGET}
+    )
+    rows = await broker.claim_batch("g", batch_size=10, consumer_name=consumer_name)
+    assert len(rows) == 1
+    return cast(str, rows[0]["id"])
+
+
+async def test_completion_mode_mark_keeps_row_done(broker_engine: Any) -> None:
+    broker = DatabaseBroker(engine=broker_engine, completion_mode="mark")
+    rid = await _publish_and_claim(broker)
+
+    await broker.ack(rid, consumer_name="c1")
+
+    row = await _message_row(broker_engine, rid)
+    assert row is not None and row.status == "done"  # kept, marked done (not deleted)
+
+
+async def test_dead_letter_marks_row_dead(broker_engine: Any) -> None:
+    broker = DatabaseBroker(engine=broker_engine)
+    rid = await _publish_and_claim(broker)
+
+    await broker.dead_letter(rid, "poison", consumer_name="c1")
+
+    row = await _message_row(broker_engine, rid)
+    assert row is not None and row.status == "dead"
+
+
+async def test_fail_increments_attempts_backs_off_then_dead(broker_engine: Any) -> None:
+    broker = DatabaseBroker(engine=broker_engine)
+    rid = await _publish_and_claim(broker)
+
+    # First failure: below the cap -> pending, attempts=1, redelivery delayed.
+    await broker.fail(rid, "boom", consumer_name="c1", max_attempts=2)
+    async with broker_engine.connect() as conn:
+        ref = await broker._now(conn)
+    row = await _message_row(broker_engine, rid)
+    assert row is not None and row.status == "pending" and row.attempts == 1
+    avail = (
+        row.available_at
+        if row.available_at.tzinfo is not None
+        else row.available_at.replace(tzinfo=UTC)
+    )
+    assert avail > ref  # backoff (server-clock) pushed redelivery into the future
+
+    # After the backoff window, reclaim and fail again -> hits the cap -> dead.
+    await asyncio.sleep(0.2)
+    again = await broker.claim_batch("g", batch_size=10, consumer_name="c1")
+    assert len(again) == 1 and again[0]["id"] == rid
+    await broker.fail(rid, "boom again", consumer_name="c1", max_attempts=2)
+
+    row = await _message_row(broker_engine, rid)
+    assert row is not None and row.status == "dead" and row.attempts == 2
 
 
 # ---------------------------------------------------------------------------

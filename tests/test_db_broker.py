@@ -387,8 +387,11 @@ async def test_orphaned_claim_is_reclaimed_after_visibility_timeout(engine: Any)
     )
     assert within == []
 
-    # Past the window: the orphaned row is reclaimed (same id) by another consumer.
-    await asyncio.sleep(0.1)
+    # Past the window: the orphaned row is reclaimed (same id) by another
+    # consumer. Generous margin (0.2s slept vs a 0.02s stale window = 10x) so a
+    # slow/loaded runner can't make this race — there is no upper bound on the
+    # elapsed time, only a lower one.
+    await asyncio.sleep(0.2)
     reclaimed = await broker.claim_batch(
         "modulith-inventory", batch_size=10, consumer_name="c2", reclaim_stale_seconds=0.02
     )
@@ -1484,5 +1487,101 @@ async def test_start_is_idempotent(engine: Any) -> None:
         assert first_task is not None
         await consumer.start()  # second start must be a no-op
         assert consumer._task is first_task  # same task — the first was not orphaned
+    finally:
+        await consumer.stop()
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL-7: the poll loop survives a transient claim_batch failure
+# MEDIUM-10:  the prune loop survives a transient prune failure
+# ---------------------------------------------------------------------------
+
+
+class _ClaimFlakyBroker(DatabaseBroker):
+    """DatabaseBroker whose first ``fail_claims`` claim_batch calls raise, then
+    delegate to the real implementation — to prove the poll loop backs off and
+    retries rather than dying on a transient backend error."""
+
+    fail_claims = 1
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.claim_calls = 0
+
+    async def claim_batch(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        self.claim_calls += 1
+        if self.claim_calls <= self.fail_claims:
+            raise RuntimeError("transient claim failure")
+        return await super().claim_batch(*args, **kwargs)
+
+
+async def test_run_survives_claim_failure_and_retries(engine: Any) -> None:
+    delivered: list[str] = []
+
+    async def handler(evt: WidgetCreated) -> None:
+        delivered.append(evt.name)
+
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+    broker = _ClaimFlakyBroker(engine=engine)
+    target = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="c1",
+        group="modulith-inventory",
+        targets=[target],
+        poll_interval_s=0.01,
+    )
+    await consumer.start()
+    try:
+        await broker.publish(
+            target, serializer.serialize(WidgetCreated(name="w1")), {"event_type": target}
+        )
+        await _until_async(lambda: _delivered(delivered))
+        assert delivered == ["w1"]
+        assert broker.claim_calls >= 2  # failed once, retried, then delivered
+    finally:
+        await consumer.stop()
+
+
+class _PruneFlakyBroker(DatabaseBroker):
+    """DatabaseBroker whose first prune call raises, then no-ops — to prove the
+    background prune loop logs and continues rather than dying."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.prune_calls = 0
+
+    async def prune(self, **kwargs: Any) -> int:
+        self.prune_calls += 1
+        if self.prune_calls == 1:
+            raise RuntimeError("transient prune failure")
+        return 0
+
+
+async def test_prune_loop_survives_prune_failure(engine: Any) -> None:
+    broker = _PruneFlakyBroker(engine=engine)
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="c1",
+        group="g",
+        targets=["t"],
+        poll_interval_s=0.01,
+        prune_interval_s=0.01,
+        retention_count=100,  # a retention knob so the prune loop starts
+    )
+    await consumer.start()
+    try:
+        assert consumer._prune_task is not None  # prune loop is running
+
+        async def _pruned_twice() -> bool:
+            return broker.prune_calls >= 2
+
+        await _until_async(_pruned_twice)  # survived the first failure, kept pruning
     finally:
         await consumer.stop()
