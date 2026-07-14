@@ -20,6 +20,7 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects.mysql import DATETIME as MySQLDateTime
 
 # revision identifiers, used by Alembic.
 revision: str = "0002_broker_message"
@@ -28,31 +29,50 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+# VARCHAR lengths — kept IN LOCKSTEP with db_broker.broker_schema()
+# (_ID_LEN / _TARGET_LEN / _GROUP_LEN / _EVENT_TYPE_LEN / _STATUS_LEN /
+# _CLAIMED_BY_LEN). MySQL rejects an unbounded VARCHAR, so every String column
+# is bounded; the broker column-metadata drift tests diff this against the
+# adapter's Core schema on both SQLite and real Postgres.
+_ID_LEN = 64
+_TARGET_LEN = 255
+_GROUP_LEN = 255
+_EVENT_TYPE_LEN = 255
+_STATUS_LEN = 32
+_CLAIMED_BY_LEN = 255
+
+# Microsecond-precision timestamp on every dialect — MySQL's DATETIME defaults
+# to whole-second precision (fsp=0) and rounds, corrupting the broker's
+# sub-second timing; fsp=6 fixes it. Inert on Postgres/SQLite. Mirrors
+# db_broker.broker_schema()'s `ts` type exactly (drift tests enforce it).
+_TS = sa.DateTime(timezone=True).with_variant(MySQLDateTime(fsp=6), "mysql")
+
+
 def upgrade() -> None:
     op.create_table(
         "broker_subscription",
-        sa.Column("target", sa.String(), nullable=False),
-        sa.Column("consumer_group", sa.String(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("target", sa.String(_TARGET_LEN), nullable=False),
+        sa.Column("consumer_group", sa.String(_GROUP_LEN), nullable=False),
+        sa.Column("updated_at", _TS, nullable=False),
         sa.PrimaryKeyConstraint("target", "consumer_group"),
     )
 
     op.create_table(
         "broker_message",
-        sa.Column("id", sa.String(), nullable=False),
-        sa.Column("target", sa.String(), nullable=False),
-        sa.Column("consumer_group", sa.String(), nullable=False),
+        sa.Column("id", sa.String(_ID_LEN), nullable=False),
+        sa.Column("target", sa.String(_TARGET_LEN), nullable=False),
+        sa.Column("consumer_group", sa.String(_GROUP_LEN), nullable=False),
         # Nullable so a publish with no event_type header (or a poison row)
         # dead-letters at the consumer rather than failing at INSERT.
-        sa.Column("event_type", sa.String(), nullable=True),
+        sa.Column("event_type", sa.String(_EVENT_TYPE_LEN), nullable=True),
         sa.Column("payload", sa.LargeBinary(), nullable=False),
         sa.Column("headers", sa.Text(), nullable=True),
-        sa.Column("status", sa.String(), nullable=False, server_default="pending"),
+        sa.Column("status", sa.String(_STATUS_LEN), nullable=False, server_default="pending"),
         sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("available_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("claimed_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("claimed_by", sa.String(), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("available_at", _TS, nullable=False),
+        sa.Column("claimed_at", _TS, nullable=True),
+        sa.Column("claimed_by", sa.String(_CLAIMED_BY_LEN), nullable=True),
+        sa.Column("created_at", _TS, nullable=False),
         sa.Column("last_error", sa.Text(), nullable=True),
         sa.PrimaryKeyConstraint("id"),
     )

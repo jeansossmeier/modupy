@@ -163,6 +163,7 @@ def fake_app(make_fake_app: Callable[..., str]) -> str:
 
 _PG_IMAGE = os.environ.get("MODULITH_TEST_POSTGRES_IMAGE", "postgres:16-alpine")
 _REDIS_IMAGE = os.environ.get("MODULITH_TEST_REDIS_IMAGE", "redis:7-alpine")
+_MYSQL_IMAGE = os.environ.get("MODULITH_TEST_MYSQL_IMAGE", "mysql:8.0")
 
 # Deterministic teardown happens at session end via the context managers below,
 # so the Ryuk resource-reaper (an extra image pull) is unnecessary. Opt back in
@@ -204,6 +205,31 @@ def postgres_url() -> Callable[..., str]:
         pytest.skip("Docker unavailable and MODULITH_TEST_POSTGRES_URL unset")
     with PostgresContainer(_PG_IMAGE, driver="asyncpg") as pg:
         yield pg.get_connection_url()
+
+
+@pytest.fixture(scope="session")
+def mysql_url() -> Callable[..., str]:
+    """A reachable MySQL URL (aiomysql driver) for integration tests.
+
+    Yields ``MODULITH_TEST_MYSQL_URL`` when set, else a throwaway
+    testcontainers MySQL 8, else skips. Session-scoped: one container serves
+    every MySQL integration test in the run. The ``dialect="aiomysql"`` arg
+    makes ``get_connection_url()`` return a ``mysql+aiomysql://`` URL (the
+    async driver the DB broker uses), matching how ``postgres_url`` selects
+    asyncpg.
+    """
+    env_url = os.environ.get("MODULITH_TEST_MYSQL_URL")
+    if env_url:
+        yield env_url
+        return
+    try:
+        from testcontainers.mysql import MySqlContainer
+    except ImportError:
+        pytest.skip("testcontainers not installed and MODULITH_TEST_MYSQL_URL unset")
+    if not _docker_available():
+        pytest.skip("Docker unavailable and MODULITH_TEST_MYSQL_URL unset")
+    with MySqlContainer(_MYSQL_IMAGE, dialect="aiomysql") as mysql:
+        yield mysql.get_connection_url()
 
 
 @pytest.fixture(scope="session")

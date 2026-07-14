@@ -5,9 +5,10 @@ Lets process-per-module topology use a relational database (Postgres / MySQL
 SQLite doubles as a zero-dependency bootstrap broker (embedded file or
 ``:memory:``).
 
-Distributed via the ``modulith[postgres]`` / ``modulith[test]`` extras.
-Optional dependency: SQLAlchemy (async) plus a driver (asyncpg / aiomysql /
-aiosqlite). Because this adapter is registered as a BUILTIN plugin (loaded at
+Distributed via the ``modulith[database]`` extra (async SQLAlchemy + the
+asyncpg / aiomysql / aiosqlite drivers, plus ``cryptography`` for MySQL 8
+caching_sha2_password auth). Because this adapter is registered as a BUILTIN
+plugin (loaded at
 every bootstrap, see ``modulith.manager.BUILTIN_PLUGINS``), **SQLAlchemy is
 never imported at module scope** — every import is lazy, inside a function,
 exactly like ``redis_broker`` lazy-imports ``redis``. An application that
@@ -120,6 +121,16 @@ _DEFAULT_PRUNE_INTERVAL_S = 300.0
 # rows are undelivered work and must NEVER be pruned (that would be message
 # loss), so every prune query is filtered to exactly these.
 _TERMINAL_STATUSES = ("done", "dead")
+
+# VARCHAR lengths for the broker tables. MySQL rejects an unbounded VARCHAR, so
+# every String column carries an explicit length. Mirror these EXACTLY in
+# migrations/versions/0002_broker_message.py (the drift tests diff the two).
+_ID_LEN = 64  # UUID hex (36) + headroom for alternative id schemes
+_TARGET_LEN = 255  # event FQN routing key (PK/indexed -> must be bounded)
+_GROUP_LEN = 255  # "modulith-<module>" consumer group (PK/indexed)
+_EVENT_TYPE_LEN = 255  # event FQN for deserialize
+_STATUS_LEN = 32  # 'pending' | 'claimed' | 'done' | 'dead' (indexed)
+_CLAIMED_BY_LEN = 255  # "<module>:<pid>" claimant id
 
 # A row claimed but not ACK'd/failed within this many seconds is treated as
 # orphaned (the claiming consumer crashed between claim and ack) and reclaimed
@@ -304,36 +315,60 @@ def broker_schema() -> tuple[Any, Any, Any]:
         Table,
         Text,
     )
+    from sqlalchemy.dialects.mysql import DATETIME as MySQLDateTime
+
+    # Timestamp type with microsecond precision on EVERY dialect. MySQL's
+    # DATETIME defaults to whole-second precision (fsp=0) and ROUNDS on insert,
+    # which corrupts the broker's sub-second timing — available_at with a
+    # 0.05-0.2s backoff, the claimed_at reclaim window — making an immediate
+    # claim see available_at > now and return nothing. fsp=6 fixes it on MySQL;
+    # Postgres/SQLite already keep microseconds so the variant is inert there
+    # (the migration mirrors this exactly). One shared instance is fine —
+    # SQLAlchemy type objects are reusable across columns.
+    ts = DateTime(timezone=True).with_variant(MySQLDateTime(fsp=6), "mysql")
 
     metadata = MetaData()
 
+    # Explicit VARCHAR lengths: MySQL rejects an unbounded VARCHAR (Postgres and
+    # SQLite accept it, but this adapter supports all three). PK/indexed string
+    # columns MUST be bounded so MySQL can index them; the lengths are generous
+    # for the values they hold (UUID id, FQN target/event_type, modulith-<mod>
+    # group, short status enum, <mod>:<pid> claimant). Keep these IN LOCKSTEP
+    # with migrations/versions/0002_broker_message.py (the drift tests diff the
+    # two schemas column-for-column).
     subscription = Table(
         "broker_subscription",
         metadata,
-        Column("target", String, primary_key=True),
-        Column("consumer_group", String, primary_key=True),
-        Column("updated_at", DateTime(timezone=True), nullable=False),
+        Column("target", String(_TARGET_LEN), primary_key=True),
+        Column("consumer_group", String(_GROUP_LEN), primary_key=True),
+        Column("updated_at", ts, nullable=False),
     )
 
     message = Table(
         "broker_message",
         metadata,
-        Column("id", String, primary_key=True),
-        Column("target", String, nullable=False),
-        Column("consumer_group", String, nullable=False),
+        Column("id", String(_ID_LEN), primary_key=True),
+        Column("target", String(_TARGET_LEN), nullable=False),
+        Column("consumer_group", String(_GROUP_LEN), nullable=False),
         # Nullable at the DB level: a publish() call with no "event_type"
         # header (or a directly-inserted test row) produces a poison message
         # that the consumer dead-letters on first claim, rather than a schema
         # violation at insert time.
-        Column("event_type", String, nullable=True),
+        Column("event_type", String(_EVENT_TYPE_LEN), nullable=True),
         Column("payload", LargeBinary, nullable=False),
         Column("headers", Text, nullable=True),
-        Column("status", String, nullable=False, default="pending", server_default="pending"),
+        Column(
+            "status",
+            String(_STATUS_LEN),
+            nullable=False,
+            default="pending",
+            server_default="pending",
+        ),
         Column("attempts", Integer, nullable=False, default=0, server_default="0"),
-        Column("available_at", DateTime(timezone=True), nullable=False),
-        Column("claimed_at", DateTime(timezone=True), nullable=True),
-        Column("claimed_by", String, nullable=True),
-        Column("created_at", DateTime(timezone=True), nullable=False),
+        Column("available_at", ts, nullable=False),
+        Column("claimed_at", ts, nullable=True),
+        Column("claimed_by", String(_CLAIMED_BY_LEN), nullable=True),
+        Column("created_at", ts, nullable=False),
         Column("last_error", Text, nullable=True),
         Index("ix_broker_message_claim", "consumer_group", "status", "available_at"),
         Index("ix_broker_message_prune", "status", "created_at"),

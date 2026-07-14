@@ -77,6 +77,22 @@ redis = [
     "redis>=5.0,<8.0",
 ]
 
+# Database broker (relational DB as cross-module transport — Redis-free
+# process-per-module). One adapter, three dialects inferred from the URL:
+# Postgres/MySQL for a real server broker, SQLite for zero-dependency
+# bootstrap. Pulls in async SQLAlchemy plus a driver per dialect the app uses
+# (asyncpg / aiomysql / aiosqlite). asyncpg + aiosqlite already ship via the
+# postgres/test extras; aiomysql is the only MySQL-specific addition.
+database = [
+    "sqlalchemy>=2.0,<3.0",
+    "asyncpg>=0.29,<1.0",
+    "aiomysql>=0.2,<1.0",
+    # MySQL 8 defaults to caching_sha2_password auth, which aiomysql can only
+    # perform when `cryptography` is present — required in practice for MySQL 8.
+    "cryptography>=41.0",
+    "aiosqlite>=0.19,<1.0",
+]
+
 # NOTE: a Kafka broker is on the roadmap (SPEC §10.3) but no adapter ships yet,
 # so there is intentionally no `kafka` extra — we don't advertise a dependency
 # for a feature that does not exist. It will return when the adapter lands.
@@ -128,10 +144,11 @@ test = [
 
 # Integration test suite — the testcontainers-backed end-to-end tests
 # (tests/test_*_e2e.py, test_*_integration.py, test_migration_postgres.py,
-# test_process_topology_e2e.py). These spin up real Postgres + Redis via
-# Docker, so they need the REAL drivers, not the sqlite stand-in:
-#   - testcontainers: starts disposable postgres:16 / redis:7 containers
-#   - asyncpg: the async Postgres driver the outbox runs on in production
+# test_process_topology_e2e.py). These spin up real Postgres + MySQL + Redis
+# via Docker, so they need the REAL drivers, not the sqlite stand-in:
+#   - testcontainers: starts disposable postgres:16 / mysql:8 / redis:7 containers
+#   - asyncpg: the async Postgres driver the outbox + DB broker run on in prod
+#   - aiomysql: the async MySQL driver the DB broker runs on against MySQL 8
 #   - psycopg[binary]: the SYNC driver Alembic uses for the migration test
 #     (postgresql+psycopg://) — asyncpg can't drive Alembic's sync engine
 # Layered on `test` so it also gets pytest, redis, fastapi, etc. Run with
@@ -141,12 +158,15 @@ integration = [
     "modulith[test]",
     "testcontainers>=4.0,<5.0",
     "asyncpg>=0.29,<1.0",
+    "aiomysql>=0.2,<1.0",
+    # aiomysql needs cryptography to auth against MySQL 8 (caching_sha2_password).
+    "cryptography>=41.0",
     "psycopg[binary]>=3.1,<4.0",
 ]
 
 # Everything. For "I want all the features" users.
 all = [
-    "modulith[postgres,redis,otel,fastapi,cli,test]",
+    "modulith[postgres,redis,database,otel,fastapi,cli,test]",
 ]
 
 # Development dependencies — for working ON modulith, not WITH it.
