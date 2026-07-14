@@ -57,7 +57,13 @@ import logging
 import os
 from typing import Any
 
-from modulith import BrokerRegistry, hookimpl
+from modulith import (
+    BrokerRegistry,
+    Consumer,
+    ConsumerRegistry,
+    ConsumerSpec,
+    hookimpl,
+)
 
 logger = logging.getLogger("modulith.adapters.redis")
 
@@ -319,4 +325,52 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
     logger.info("registered redis-streams broker (prefix=%s)", broker._stream_prefix)
 
 
-__all__ = ["RedisStreamsBroker", "modulith_register_brokers"]
+# ---------------------------------------------------------------------------
+# Consumer registration hook
+# ---------------------------------------------------------------------------
+
+
+def _make_redis_consumer(spec: ConsumerSpec) -> Consumer:
+    """Build a Redis-Streams consumer for one worker module from ``spec``.
+
+    Wraps the generic ``BrokerConsumer`` poll/claim/ack loop around the
+    ``RedisStreamsBroker`` already registered on the producer side (pulled from
+    ``spec.broker_registry`` by scheme), whose consumer-side methods
+    (ensure_group / read / ack / reclaim / dead_letter) the loop drives. One
+    Redis client serves both halves — no second connection is opened here.
+    """
+    from .._consumer import BrokerConsumer
+
+    broker = spec.broker_registry.get(spec.scheme)
+    return BrokerConsumer(
+        broker=broker,
+        bus=spec.bus,
+        serializer=spec.serializer,
+        consumer_name=spec.consumer_name,
+        group=spec.group,
+        targets=list(spec.targets),
+    )
+
+
+@hookimpl
+def modulith_register_consumers(registry: ConsumerRegistry) -> None:
+    """Register the redis-streams consumer factory when the app selects it.
+
+    The consumer-side mirror of ``modulith_register_brokers``: no-op unless
+    ``broker == "redis-streams"``. The factory reuses the broker object that
+    hook registered (fetched from the broker registry at build time), so no
+    second Redis client is created.
+    """
+    from ..runtime import _runtime
+
+    cfg = _runtime.config
+    if cfg is None or cfg.broker != _REDIS_SCHEME:
+        return
+    registry.register(_REDIS_SCHEME, _make_redis_consumer)
+
+
+__all__ = [
+    "RedisStreamsBroker",
+    "modulith_register_brokers",
+    "modulith_register_consumers",
+]

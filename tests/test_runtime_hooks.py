@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from modulith import BrokerRegistry, hookimpl
+from modulith import BrokerRegistry, ConsumerRegistry, hookimpl
 from modulith.runtime import _runtime
 
 
@@ -47,6 +47,10 @@ class Recorder:
     @hookimpl
     def modulith_register_brokers(self, registry) -> None:
         self.calls.append(("register_brokers", type(registry).__name__))
+
+    @hookimpl
+    def modulith_register_consumers(self, registry) -> None:
+        self.calls.append(("register_consumers", type(registry).__name__))
 
     @hookimpl
     def modulith_after_module_load(self, module) -> None:
@@ -168,6 +172,21 @@ def test_bootstrap_creates_broker_registry_and_calls_register_brokers(
 
     assert isinstance(_runtime.broker_registry, BrokerRegistry)
     assert ("register_brokers", "BrokerRegistry") in recorder.calls
+
+
+def test_bootstrap_creates_consumer_registry_and_calls_register_consumers(
+    fake_app, monkeypatch
+) -> None:
+    recorder = _install_recorder(monkeypatch)
+
+    _runtime.ensure_bootstrapped()
+
+    assert isinstance(_runtime.consumer_registry, ConsumerRegistry)
+    assert ("register_consumers", "ConsumerRegistry") in recorder.calls
+    # Consumers register right AFTER brokers so a factory can reuse the
+    # backend object its broker just registered.
+    names = [c[0] for c in recorder.calls]
+    assert names.index("register_brokers") < names.index("register_consumers")
 
 
 def test_bootstrap_fires_after_module_load_once_per_module(make_fake_app, monkeypatch) -> None:

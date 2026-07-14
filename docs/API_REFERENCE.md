@@ -38,10 +38,16 @@ The package also exports `__version__` (the installed package version).
   - [`PublicationStore`](#publicationstore)
   - [`EventSerializer`](#eventserializer)
   - [`Broker`](#broker)
+  - [`Consumer`](#consumer)
 - [Broker registry](#broker-registry)
   - [`BrokerRegistry`](#brokerregistry)
   - [`DuplicateBrokerError`](#duplicatebrokererror)
   - [`UnknownBrokerError`](#unknownbrokererror)
+- [Consumer registry](#consumer-registry)
+  - [`ConsumerRegistry`](#consumerregistry)
+  - [`ConsumerSpec`](#consumerspec)
+  - [`DuplicateConsumerError`](#duplicateconsumererror)
+  - [`UnknownConsumerError`](#unknownconsumererror)
 - [Plugin authoring](#plugin-authoring)
   - [`hookimpl`](#hookimpl)
 - [Plugin manager (advanced)](#plugin-manager-advanced)
@@ -432,6 +438,33 @@ so consumers must be idempotent.
 - `async close(self) -> None`
   — Release broker resources during application shutdown.
 
+### `Consumer`
+
+*Protocol — implement by duck typing; no need to subclass.*
+
+Cross-process consumer half of a broker adapter.
+
+The Broker protocol above is the *producer* — it sends. This is the
+*consumer*: in process-per-module topology each worker runs one Consumer
+that pulls the externalized events its module listens for and dispatches
+them to the local in-memory bus. Like brokers, exactly one Consumer wins
+per URI scheme; adapters register a factory via
+``modulith_register_consumers`` and the worker builds one per module from
+a ``ConsumerSpec`` (see modulith.brokers).
+
+A Consumer owns its own poll/claim/ack loop internally — the worker only
+starts and stops it. Delivery is at-least-once (the loop redelivers on
+failure or reclaim), so the local listeners it feeds must be idempotent.
+Implementations must be async and tolerate ``stop()`` before ``start()``
+and repeated ``stop()`` (shutdown paths are not always ordered).
+
+**Methods:**
+
+- `async start(self) -> None`
+  — Begin consuming: set up any server-side state, recover pending
+- `async stop(self) -> None`
+  — Stop the poll loop and release resources. Must never raise — a
+
 ## Broker registry
 
 Scheme-based dispatch for cross-process brokers and its error types.
@@ -477,6 +510,74 @@ Raised when an event targets a scheme with no registered broker.
 
 Subclass of KeyError so existing ``except KeyError`` handlers catch
 it, but with a clearer name when raised explicitly.
+
+## Consumer registry
+
+Scheme-based factories for the cross-process consumer half, plus the per-module spec and error types.
+
+### `ConsumerRegistry`
+
+Routes per-module consumer construction to registered factories by scheme.
+
+The consumer-side mirror of ``BrokerRegistry``. Brokers publish; consumers
+subscribe. A worker in process-per-module topology looks up the factory for
+the configured scheme and calls ``build`` to get a Consumer for its module.
+Config-free, exactly like BrokerRegistry — each adapter reads its own config
+when its factory runs.
+
+**Methods:**
+
+- `register(self, scheme: str, factory: ConsumerFactory) -> None`
+  — Register a consumer factory for a URI scheme.
+- `unregister(self, scheme: str) -> None`
+  — Remove a registered factory. No-op if scheme isn't registered.
+- `get(self, scheme: str) -> ConsumerFactory`
+  — Look up a consumer factory by scheme.
+- `build(self, scheme: str, spec: ConsumerSpec) -> Consumer`
+  — Build a Consumer for ``scheme`` from ``spec`` via its factory.
+- `schemes(self) -> list[str]`
+  — Return sorted list of registered schemes — useful for diagnostics.
+
+### `ConsumerSpec`
+
+Everything a consumer factory needs to build a worker's consumer.
+
+The worker assembles this per module at startup and hands it to
+``ConsumerRegistry.build``. The factory pulls its concrete backend object
+(the one holding the connection/engine/pool) out of ``broker_registry`` by
+``scheme`` — the same object registered on the producer side by
+``modulith_register_brokers`` — so one backend serves both halves.
+
+**Fields:**
+
+- `scheme: str` (required)
+- `module_name: str` (required)
+- `group: str` (required)
+- `consumer_name: str` (required)
+- `targets: tuple[str, ...]` (required)
+- `bus: Any` (required)
+- `serializer: Any` (required)
+- `broker_registry: BrokerRegistry` (required)
+
+### `DuplicateConsumerError`
+
+*Exception — subclasses `ValueError`.*
+
+Raised when two plugins register a consumer factory for one scheme.
+
+Silent overwrites would mask plugin conflicts; we fail loudly. Mirrors
+``DuplicateBrokerError``. Plugins that genuinely want to replace an
+existing factory call ``unregister`` first.
+
+### `UnknownConsumerError`
+
+*Exception — subclasses `KeyError`.*
+
+Raised when a scheme has no registered consumer factory.
+
+Subclass of KeyError so existing ``except KeyError`` handlers catch it,
+but with a clearer name when raised explicitly. Mirrors
+``UnknownBrokerError`` on the producer side.
 
 ## Plugin authoring
 

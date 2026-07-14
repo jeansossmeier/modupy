@@ -147,7 +147,7 @@ The single most important framing principle: **we don't lie about our limitation
 
 The plugin contract is the most stable part of modulith. Once published, every plugin ever written depends on it. Additions are fine; signature changes are major-version events.
 
-### 4.1 The Eleven Hookspecs
+### 4.1 The Twelve Hookspecs
 
 Defined in `modulith/hooks.py`. Each is a stable, versioned contract.
 
@@ -173,17 +173,19 @@ Defined in `modulith/hooks.py`. Each is a stable, versioned contract.
 
 8. `modulith_on_listener_error(event: Any, listener_name: str, publication: EventPublication, exception: BaseException) -> None` — listener failure handling.
 
-**Externalization (2):**
+**Externalization (3):**
 
 9. `modulith_resolve_event_target(event: Any) -> str | None` — `firstresult=True`. Dynamic routing override; first non-None wins.
 
-10. `modulith_register_brokers(registry: BrokerRegistry) -> None` — broker adapters register at startup.
+10. `modulith_register_brokers(registry: BrokerRegistry) -> None` — broker (producer) adapters register at startup.
+
+11. `modulith_register_consumers(registry: ConsumerRegistry) -> None` — cross-process consumer factories register at startup, right after brokers. The consumer-side mirror of `modulith_register_brokers`; the process-per-module worker builds one `Consumer` per module from the registered factory.
 
 **Documentation (1):**
 
-11. `modulith_render_documentation(modules: list[ModuleInfo], output_dir: str) -> list[str]` — aggregate. Plugins write artifacts and return paths.
+12. `modulith_render_documentation(modules: list[ModuleInfo], output_dir: str) -> list[str]` — aggregate. Plugins write artifacts and return paths.
 
-### 4.2 The Three Driver Protocols
+### 4.2 The Four Driver Protocols
 
 Defined in `modulith/protocols.py`. Marked `runtime_checkable` for diagnostics; adapters use duck typing, no inheritance required.
 
@@ -217,11 +219,22 @@ rejects any other `event_type` with `ValueError` before resolving the
 class. The cross-process worker applies this automatically, allowlisting
 exactly the event types its listeners consume.
 
-**`Broker`** — external message broker:
+**`Broker`** — external message broker (producer side):
 ```
 async publish(target: str, payload: bytes, headers: dict[str, str] | None) -> None
 async close() -> None
 ```
+
+**`Consumer`** — cross-process consumer (the broker's consumer half):
+```
+async start() -> None
+async stop() -> None
+```
+One `Consumer` wins per scheme, mirroring `Broker`. In process-per-module
+topology each worker builds one from a `ConsumerSpec` (via the factory
+registered by `modulith_register_consumers`) and only start()/stop()s it — the
+consumer owns its own poll/claim/ack loop and dispatches to the local bus.
+Delivery is at-least-once, so the listeners it feeds must be idempotent.
 
 ### 4.3 The Broker Dispatch Registry
 
@@ -1041,7 +1054,7 @@ Time-boxed phases. Each has explicit kill criteria.
 
 ### Phase 0: Foundation ✅ DONE
 
-- Plugin contract (11 hookspecs, 3 protocols)
+- Plugin contract (12 hookspecs, 4 protocols)
 - Auto-discovery + lazy bootstrap
 - Configuration system
 - In-memory event bus

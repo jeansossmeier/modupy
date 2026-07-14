@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
-from .protocols import Broker
+from .protocols import Broker, Consumer
 
 logger = logging.getLogger(__name__)
 
@@ -129,3 +132,107 @@ class BrokerRegistry:
     def schemes(self) -> list[str]:
         """Return sorted list of registered schemes — useful for diagnostics."""
         return sorted(self._brokers)
+
+
+# ---------------------------------------------------------------------------
+# Consumer side (process-per-module cross-process delivery)
+# ---------------------------------------------------------------------------
+
+
+class UnknownConsumerError(KeyError):
+    """Raised when a scheme has no registered consumer factory.
+
+    Subclass of KeyError so existing ``except KeyError`` handlers catch it,
+    but with a clearer name when raised explicitly. Mirrors
+    ``UnknownBrokerError`` on the producer side.
+    """
+
+
+class DuplicateConsumerError(ValueError):
+    """Raised when two plugins register a consumer factory for one scheme.
+
+    Silent overwrites would mask plugin conflicts; we fail loudly. Mirrors
+    ``DuplicateBrokerError``. Plugins that genuinely want to replace an
+    existing factory call ``unregister`` first.
+    """
+
+
+@dataclass(frozen=True)
+class ConsumerSpec:
+    """Everything a consumer factory needs to build a worker's consumer.
+
+    The worker assembles this per module at startup and hands it to
+    ``ConsumerRegistry.build``. The factory pulls its concrete backend object
+    (the one holding the connection/engine/pool) out of ``broker_registry`` by
+    ``scheme`` — the same object registered on the producer side by
+    ``modulith_register_brokers`` — so one backend serves both halves.
+    """
+
+    scheme: str
+    module_name: str
+    group: str
+    consumer_name: str
+    targets: tuple[str, ...]
+    bus: Any
+    serializer: Any
+    broker_registry: BrokerRegistry
+
+
+# A consumer factory turns a ConsumerSpec into a ready (not-yet-started)
+# Consumer. Adapters register one per scheme via modulith_register_consumers.
+ConsumerFactory = Callable[[ConsumerSpec], Consumer]
+
+
+class ConsumerRegistry:
+    """Routes per-module consumer construction to registered factories by scheme.
+
+    The consumer-side mirror of ``BrokerRegistry``. Brokers publish; consumers
+    subscribe. A worker in process-per-module topology looks up the factory for
+    the configured scheme and calls ``build`` to get a Consumer for its module.
+    Config-free, exactly like BrokerRegistry — each adapter reads its own config
+    when its factory runs.
+    """
+
+    def __init__(self) -> None:
+        # Plain dict, not defaultdict — explicit registration so duplicates
+        # fail loudly rather than silently overwrite.
+        self._factories: dict[str, ConsumerFactory] = {}
+
+    def register(self, scheme: str, factory: ConsumerFactory) -> None:
+        """Register a consumer factory for a URI scheme.
+
+        Raises DuplicateConsumerError if the scheme is already taken.
+        """
+        if scheme in self._factories:
+            raise DuplicateConsumerError(
+                f"scheme {scheme!r} already has a consumer factory; "
+                f"call unregister({scheme!r}) first to replace it"
+            )
+        self._factories[scheme] = factory
+        logger.debug("registered consumer factory for scheme %r", scheme)
+
+    def unregister(self, scheme: str) -> None:
+        """Remove a registered factory. No-op if scheme isn't registered."""
+        self._factories.pop(scheme, None)
+
+    def get(self, scheme: str) -> ConsumerFactory:
+        """Look up a consumer factory by scheme.
+
+        Raises UnknownConsumerError with the registered schemes if the lookup
+        fails.
+        """
+        try:
+            return self._factories[scheme]
+        except KeyError:
+            raise UnknownConsumerError(
+                f"no consumer registered for scheme {scheme!r}; "
+                f"known schemes: {sorted(self._factories)}"
+            ) from None
+
+    def build(self, scheme: str, spec: ConsumerSpec) -> Consumer:
+        """Build a Consumer for ``scheme`` from ``spec`` via its factory."""
+        return self.get(scheme)(spec)
+
+    def schemes(self) -> list[str]:
+        """Return sorted list of registered schemes — useful for diagnostics."""
+        return sorted(self._factories)

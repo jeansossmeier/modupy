@@ -107,40 +107,49 @@ def create_app() -> FastAPI:
 
 
 def _build_consumer(module_name: str) -> Any:
-    """Build this worker's broker consumer, or None when there's nothing to do.
+    """Build this worker's cross-process consumer, or None when there's nothing to do.
 
     Returns None — and the worker runs HTTP-only — when topology is not
-    ``processes``, no broker is registered for the configured scheme, or the
-    module's listeners consume no events. This keeps single-process and
+    ``processes``, no consumer adapter is registered for the configured scheme,
+    or the module's listeners consume no events. This keeps single-process and
     HTTP-only test setups free of any broker connection.
+
+    The concrete consumer is built by the scheme's registered factory
+    (``modulith_register_consumers``), not hardcoded here — the redis-streams
+    factory wraps ``BrokerConsumer``; a DB broker registers its own polling
+    consumer.
     """
-    from ._consumer import BrokerConsumer, consumer_targets
+    from ._consumer import consumer_targets
+    from .brokers import ConsumerSpec
     from .runtime import _runtime
     from .serializers import JsonEventSerializer
 
     cfg = _runtime.config
     bus = _runtime.event_bus
-    registry = _runtime.broker_registry
-    if cfg is None or bus is None or registry is None:
+    broker_registry = _runtime.broker_registry
+    consumer_registry = _runtime.consumer_registry
+    if cfg is None or bus is None or broker_registry is None or consumer_registry is None:
         return None
-    if cfg.topology == "single" or cfg.broker not in registry.schemes():
+    if cfg.topology == "single" or cfg.broker not in consumer_registry.schemes():
         return None
 
     targets = consumer_targets(bus)
     if not targets:
         return None
 
-    broker = registry.get(cfg.broker)
-    return BrokerConsumer(
-        broker=broker,
-        bus=bus,
-        serializer=JsonEventSerializer(allowed_event_types=bus.registered_event_types()),
+    spec = ConsumerSpec(
+        scheme=cfg.broker,
+        module_name=module_name,
         # Unique per worker process so replicas of a module are distinct
         # consumers within the shared per-module group.
         consumer_name=f"{module_name}:{os.getpid()}",
         group=f"modulith-{module_name}",
-        targets=targets,
+        targets=tuple(targets),
+        bus=bus,
+        serializer=JsonEventSerializer(allowed_event_types=bus.registered_event_types()),
+        broker_registry=broker_registry,
     )
+    return consumer_registry.build(cfg.broker, spec)
 
 
 def _import_contracts(app_package: str, contracts_module: str = "contracts") -> None:

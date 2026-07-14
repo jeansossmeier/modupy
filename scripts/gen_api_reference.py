@@ -62,12 +62,18 @@ SECTIONS: list[tuple[str, str, list[str]]] = [
     (
         "Driver protocols",
         'The "one wins" adapter contracts — implement by duck typing.',
-        ["PublicationStore", "EventSerializer", "Broker"],
+        ["PublicationStore", "EventSerializer", "Broker", "Consumer"],
     ),
     (
         "Broker registry",
         "Scheme-based dispatch for cross-process brokers and its error types.",
         ["BrokerRegistry", "DuplicateBrokerError", "UnknownBrokerError"],
+    ),
+    (
+        "Consumer registry",
+        "Scheme-based factories for the cross-process consumer half, plus the "
+        "per-module spec and error types.",
+        ["ConsumerRegistry", "ConsumerSpec", "DuplicateConsumerError", "UnknownConsumerError"],
     ),
     (
         "Plugin authoring",

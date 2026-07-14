@@ -8,10 +8,12 @@ entry-point auto-discovery for drivers — only hook plugins are
 discovered via entry points (the ``modulith`` group).
 
 Brokers are different: multiple can be active simultaneously, routed by
-URI scheme. The Broker protocol defines the contract; the BrokerRegistry
-in modulith.brokers handles dispatch.
+URI scheme. The Broker protocol defines the producer contract; the
+BrokerRegistry in modulith.brokers handles dispatch. Its consumer-side
+mirror is the Consumer protocol (one wins per scheme), built per module
+by a factory in the ConsumerRegistry — see modulith.brokers.
 
-All three protocols use ``runtime_checkable`` so applications can do
+All four protocols use ``runtime_checkable`` so applications can do
 ``isinstance(thing, PublicationStore)`` for diagnostics, but adapters
 do **not** need to inherit from these — duck typing via Protocol is the
 intended pattern.
@@ -162,5 +164,38 @@ class Broker(Protocol):
 
         Called once by the BrokerRegistry. Implementations should be
         idempotent — close-after-close should not raise.
+        """
+        ...
+
+
+@runtime_checkable
+class Consumer(Protocol):
+    """Cross-process consumer half of a broker adapter.
+
+    The Broker protocol above is the *producer* — it sends. This is the
+    *consumer*: in process-per-module topology each worker runs one Consumer
+    that pulls the externalized events its module listens for and dispatches
+    them to the local in-memory bus. Like brokers, exactly one Consumer wins
+    per URI scheme; adapters register a factory via
+    ``modulith_register_consumers`` and the worker builds one per module from
+    a ``ConsumerSpec`` (see modulith.brokers).
+
+    A Consumer owns its own poll/claim/ack loop internally — the worker only
+    starts and stops it. Delivery is at-least-once (the loop redelivers on
+    failure or reclaim), so the local listeners it feeds must be idempotent.
+    Implementations must be async and tolerate ``stop()`` before ``start()``
+    and repeated ``stop()`` (shutdown paths are not always ordered).
+    """
+
+    async def start(self) -> None:
+        """Begin consuming: set up any server-side state, recover pending
+        work, and launch the background poll loop. No-op safe when the module
+        subscribes to nothing.
+        """
+        ...
+
+    async def stop(self) -> None:
+        """Stop the poll loop and release resources. Must never raise — a
+        consumer that already died is logged, not re-raised, at shutdown.
         """
         ...

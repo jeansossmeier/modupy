@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from .brokers import BrokerRegistry
+from .brokers import BrokerRegistry, ConsumerRegistry
 from .config import Configuration, ConfigurationError, load_configuration
 from .discovery import detect_application_package
 from .event_bus import InMemoryEventBus, _require_async_handler
@@ -63,6 +63,7 @@ class Runtime:
         self._plugin_manager: Any = None
         self._event_bus: InMemoryEventBus | None = None
         self._broker_registry: BrokerRegistry | None = None
+        self._consumer_registry: ConsumerRegistry | None = None
         self._modules: list[ModuleInfo] = []
 
         # Listeners registered before bootstrap go here, then flush
@@ -88,6 +89,11 @@ class Runtime:
     def broker_registry(self) -> BrokerRegistry | None:
         """The broker dispatch registry, or None before bootstrap."""
         return self._broker_registry
+
+    @property
+    def consumer_registry(self) -> ConsumerRegistry | None:
+        """The consumer factory registry, or None before bootstrap."""
+        return self._consumer_registry
 
     @property
     def plugin_manager(self) -> Any:
@@ -629,9 +635,15 @@ class Runtime:
         # early; the except-block rolls it back so a failed bootstrap still
         # leaves the runtime pristine for a clean retry.
         broker_registry = BrokerRegistry()
+        consumer_registry = ConsumerRegistry()
         self._config = config
         try:
             plugin_manager.hook.modulith_register_brokers(registry=broker_registry)
+            # Consumer factories register right after brokers: a consumer
+            # factory typically reuses the backend object its broker just
+            # registered (pulled from broker_registry by scheme), so brokers
+            # must land first. Config-free like the broker hook.
+            plugin_manager.hook.modulith_register_consumers(registry=consumer_registry)
 
             # 5. Trigger module discovery via the plugin hook. This imports
             # each discovered module; the @listener decorators they contain
@@ -693,6 +705,7 @@ class Runtime:
         self._plugin_manager = plugin_manager
         self._event_bus = event_bus
         self._broker_registry = broker_registry
+        self._consumer_registry = consumer_registry
         self._modules = modules
         self._pending_listeners.clear()
 
@@ -804,6 +817,7 @@ class Runtime:
         self._plugin_manager = None
         self._event_bus = None
         self._broker_registry = None
+        self._consumer_registry = None
         self._modules = []
         self._pending_listeners = []
         self._extra_plugins = []

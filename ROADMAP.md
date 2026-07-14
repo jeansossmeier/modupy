@@ -16,7 +16,7 @@ event bus. The minimum that proves the architecture works.
 - [x] `modulith/__init__.py` — public API exports
 - [x] `modulith/types.py` — `ModuleInfo`, `EventPublication`, `Violation`
 - [x] `modulith/protocols.py` — driver protocols
-- [x] `modulith/hooks.py` — the 11 hookspecs
+- [x] `modulith/hooks.py` — the hookspecs (12 as of the DB-broker consumer contract)
 - [x] `modulith/markers.py` — `@hookimpl` re-export
 - [x] `modulith/brokers.py` — `BrokerRegistry`
 - [x] `modulith/manager.py` — plugin manager factory

@@ -24,8 +24,12 @@ except PackageNotFoundError:  # running from a source checkout that isn't instal
 # ----- Broker dispatch registry --------------------------------------------
 from .brokers import (
     BrokerRegistry,
+    ConsumerRegistry,
+    ConsumerSpec,
     DuplicateBrokerError,
+    DuplicateConsumerError,
     UnknownBrokerError,
+    UnknownConsumerError,
 )
 
 # ----- Configuration ------------------------------------------------------
@@ -44,6 +48,7 @@ from .markers import hookimpl
 # ----- Driver protocols ----------------------------------------------------
 from .protocols import (
     Broker,
+    Consumer,
     EventSerializer,
     PublicationStore,
 )
@@ -67,7 +72,12 @@ __all__ = [
     # Configuration
     "Configuration",
     "ConfigurationError",
+    # Consumer contract (cross-process, process-per-module)
+    "Consumer",
+    "ConsumerRegistry",
+    "ConsumerSpec",
     "DuplicateBrokerError",
+    "DuplicateConsumerError",
     # Contract types
     "EventPublication",
     "EventSerializer",
@@ -75,6 +85,7 @@ __all__ = [
     "ModuleInfo",
     "PublicationStore",
     "UnknownBrokerError",
+    "UnknownConsumerError",
     "Violation",
     "ViolationSeverity",
     "__version__",

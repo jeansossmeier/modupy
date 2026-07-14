@@ -25,7 +25,7 @@ from .types import EventPublication, ModuleInfo, Violation
 # Avoid a circular import: BrokerRegistry imports from .protocols which
 # imports from .types, and we only need the type for annotations here.
 if TYPE_CHECKING:
-    from .brokers import BrokerRegistry
+    from .brokers import BrokerRegistry, ConsumerRegistry
 
 
 # The hookspec marker. Plugin authors use the matching hookimpl marker
@@ -207,6 +207,22 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
     Called once during application bootstrap, before any events flow.
     Plugins should read configuration from environment variables or a
     plugin-specific config object — the registry itself is config-free.
+    """
+
+
+@hookspec
+def modulith_register_consumers(registry: ConsumerRegistry) -> None:
+    """Register cross-process consumer factories at startup.
+
+    The consumer-side counterpart to ``modulith_register_brokers``. A broker
+    adapter that also supports process-per-module consumption registers a
+    factory here against the same URI scheme it uses for publishing. In
+    process-per-module topology the worker looks up the factory for the
+    configured scheme and builds one Consumer per module. Called once during
+    bootstrap, right after ``modulith_register_brokers`` (so the producer
+    backend the factory reuses is already registered). No-op for schemes that
+    only produce. Like the broker registry, this one is config-free — the
+    factory reads its own configuration when it runs.
     """
 
 

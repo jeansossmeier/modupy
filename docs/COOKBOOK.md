@@ -491,6 +491,6 @@ Events targeting `my-scheme:destination` (via `@externalized`) now route to your
 broker. Full worked examples ship in
 [`examples/naming_convention_verifier.py`](../examples/naming_convention_verifier.py)
 and [`examples/redis_streams_broker.py`](../examples/redis_streams_broker.py).
-The complete extension contract — all 11 hookspecs and 3 protocols — is in
+The complete extension contract — all 12 hookspecs and 4 protocols — is in
 [ARCHITECTURE.md §5](ARCHITECTURE.md#5-the-plugin-contract) and
 [SPEC.md Part IV](../SPEC.md).

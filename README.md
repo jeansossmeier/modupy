@@ -268,7 +268,7 @@ The project is currently in single-author development with the goal of
 shipping v1 in 3 months. Contributions are welcome but the design is
 opinionated; please read [SPEC.md](SPEC.md) before opening large PRs.
 
-The plugin contract (11 hookspecs, 3 protocols) is the most stable
+The plugin contract (12 hookspecs, 4 protocols) is the most stable
 part of the project — additions are easy, signature changes require
 strong justification.
 

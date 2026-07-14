@@ -151,7 +151,7 @@ plugin. There are three distinct extension mechanisms, chosen by shape (SPEC
 
 ### 5.1 Hookspecs (many plugins, results combined)
 
-`modulith/hooks.py` declares **11 hookspecs** — the stable, versioned contract.
+`modulith/hooks.py` declares **12 hookspecs** — the stable, versioned contract.
 Adding a hook is fine; changing an existing signature breaks every published
 plugin. Three shapes:
 
@@ -163,23 +163,28 @@ plugin. Three shapes:
   `modulith_after_module_load`, `modulith_before_event_published`,
   `modulith_after_event_published`, `modulith_on_listener_dispatch`,
   `modulith_on_listener_complete`, `modulith_on_listener_error`,
-  `modulith_register_brokers`.
+  `modulith_register_brokers`, `modulith_register_consumers`.
 
 Plugins implement a hook with `@hookimpl` (from `modulith.markers`) and are
 discovered via the `modulith` entry-point group in their `pyproject.toml`.
 
 ### 5.2 Driver protocols (exactly one wins)
 
-`modulith/protocols.py` defines three `runtime_checkable` protocols —
-`PublicationStore`, `EventSerializer`, `Broker`. Stores and serializers are
-"one wins" drivers: exactly one is active per app, wired **explicitly** at
-startup via `modulith.builtin.outbox.configure(store, serializer)`. There is no
+`modulith/protocols.py` defines four `runtime_checkable` protocols —
+`PublicationStore`, `EventSerializer`, `Broker`, `Consumer`. Stores and
+serializers are "one wins" drivers: exactly one is active per app, wired
+**explicitly** at startup via
+`modulith.builtin.outbox.configure(store, serializer)`. There is no
 entry-point auto-discovery for drivers — only hook plugins are discovered.
 Adapters implement a protocol by **duck typing**; they don't need to subclass
 it (`runtime_checkable` is there so apps can `isinstance`-check for
 diagnostics).
 
 Brokers are the exception: many can be active at once, routed by scheme (§7.3).
+`Consumer` is the broker's cross-process consumer half — the process-per-module
+worker runs one per module, built by a factory registered via
+`modulith_register_consumers`. Like brokers, exactly one consumer adapter wins
+per scheme; the redis-streams adapter registers both halves (§7.3).
 
 ### 5.3 The plugin manager and the observe-shield
 
