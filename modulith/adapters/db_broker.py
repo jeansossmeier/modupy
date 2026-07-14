@@ -19,11 +19,18 @@ SQLite) is inferred from the SQLAlchemy URL, mirroring how
 ``modulith.adapters.postgres_outbox`` is dialect-aware despite being named
 for Postgres.
 
-Configuration resolves env > ``[tool.modulith.broker_options]`` subtable:
-  MODULITH_BROKER_URL / url   SQLAlchemy URL (required — no universal default)
+Configuration resolves ``MODULITH_BROKER_<KEY>`` env var (blank == unset) >
+``[tool.modulith.broker_options]`` subtable, per key:
+  url / dsn                   SQLAlchemy URL (required — no universal default)
   completion_mode             'delete' (default, keeps the table small) |
                                'mark' (sets status='done', row stays for the
                                prune job)
+  pool_size / max_overflow    connection-pool sizing (Postgres / MySQL; ignored
+                               for SQLite, whose pool rejects them)
+  busy_timeout_ms             SQLite only: how long a blocked writer waits for
+                               the lock before SQLITE_BUSY (default 5000)
+  poll_interval_ms            consumer poll cadence (default 1000)
+  batch_size                  claim LIMIT per poll (default 10)
   retention_age_seconds       prune deletes terminal ('done'/'dead') rows older
                                than this many seconds
   retention_count             prune keeps only the newest N terminal rows per
@@ -31,6 +38,9 @@ Configuration resolves env > ``[tool.modulith.broker_options]`` subtable:
   prune_interval_seconds      how often the consumer's background prune runs
                                (defaults to 300s when either retention_* is set;
                                set to 0 to disable)
+
+Postgres LISTEN/NOTIFY (a low-latency alternative to polling) is a planned
+opt-in and not yet implemented — the transport polls on every dialect.
 
 Fan-out mechanism (how the producer learns the consumer groups): the
 producer process (module-isolated) never imports consumer modules, so
@@ -48,10 +58,12 @@ MySQL lets concurrent consumers partition the backlog instead of blocking or
 double-claiming (see ``_supports_skip_locked``). SQLite has no row locking at
 all and rejects the clause, so it degrades to a plain claim inside one
 transaction — correct for sequential consumption in tests, but not a
-substitute for the Postgres/MySQL concurrency guarantee. Full SQLite
-hardening (``BEGIN IMMEDIATE`` + ``busy_timeout``) and the rest of the config
-surface (pooling, LISTEN/NOTIFY) are a later increment (I5) — this adapter
-takes only a minimal ``url`` to construct the engine.
+substitute for the Postgres/MySQL concurrency guarantee. SQLite is hardened
+for best-effort multi-process use: WAL journaling + ``busy_timeout`` on every
+connection (``_install_sqlite_pragmas``) plus a bounded application retry on a
+transient "database is locked" (``_write`` / ``_SQLITE_BUSY_MAX_RETRIES``,
+needed because SQLite raises SQLITE_BUSY immediately — ignoring busy_timeout —
+when a read lock upgrades to a write lock, exactly what the claim does).
 
 Retention: terminal rows ('done' left by ``completion_mode='mark'``, and
 'dead' letters) accumulate unless pruned. ``DatabaseBroker.prune()`` deletes
@@ -78,6 +90,7 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import uuid4
@@ -132,6 +145,19 @@ _BACKOFF_MAX_EXPONENT = 7
 # locking and rejects the clause outright, so it must never be issued there.
 _SKIP_LOCKED_DIALECTS = frozenset({"postgresql", "mysql"})
 
+# SQLite ``busy_timeout`` (ms) applied to every connection when none is
+# configured: how long a blocked writer waits for the lock before raising
+# SQLITE_BUSY. Makes file-backed SQLite usable as a best-effort multi-process
+# broker instead of erroring on the first contended write.
+_DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 5000
+
+# App-level retry budget for a transient SQLite "database is locked" error.
+# ``busy_timeout`` handles the common wait-for-lock case, but SQLite returns
+# SQLITE_BUSY *immediately* (ignoring busy_timeout) when a transaction upgrades
+# a read lock to a write lock under contention — exactly what claim_batch's
+# SELECT-then-UPDATE does — so a bounded application retry is still needed.
+_SQLITE_BUSY_MAX_RETRIES = 4
+
 
 def _backoff_delay(attempt: int) -> float:
     """Capped exponential backoff for the ``attempt``'th consecutive failure
@@ -156,6 +182,20 @@ def _rowcount(result: Any) -> int:
     return rc if isinstance(rc, int) and rc > 0 else 0
 
 
+def _is_sqlite_locked(exc: BaseException) -> bool:
+    """True for a transient SQLite lock (``OperationalError`` whose message is
+    'database is locked' / 'database table is locked') — the retryable
+    contention signal. Schema / integrity / programming errors are never
+    retried (they can't succeed on a re-run)."""
+    from sqlalchemy.exc import OperationalError
+
+    if not isinstance(exc, OperationalError):
+        return False
+    orig = getattr(exc, "orig", None)
+    message = (str(orig) if orig is not None else str(exc)).lower()
+    return "database is locked" in message or "database table is locked" in message
+
+
 def _supports_skip_locked(engine: Any) -> bool:
     """True when ``engine``'s dialect supports ``FOR UPDATE SKIP LOCKED``.
 
@@ -166,6 +206,70 @@ def _supports_skip_locked(engine: Any) -> bool:
     uses, generalized to the two lockable dialects instead of one).
     """
     return engine.dialect.name in _SKIP_LOCKED_DIALECTS
+
+
+def _is_sqlite_url(url: str) -> bool:
+    """True when ``url`` names the SQLite backend (any driver), resolved via
+    ``make_url`` rather than string-matching so ``sqlite+aiosqlite://`` and a
+    bare ``sqlite://`` both classify correctly."""
+    from sqlalchemy.engine import make_url
+
+    return make_url(url).get_backend_name() == "sqlite"
+
+
+def _install_sqlite_pragmas(engine: Any, busy_timeout_ms: int) -> None:
+    """Set WAL + ``busy_timeout`` on every new SQLite connection.
+
+    WAL lets one writer and concurrent readers coexist (a plain rollback
+    journal serializes them); ``busy_timeout`` makes a blocked writer wait
+    rather than erroring immediately — together they make file-backed SQLite a
+    workable best-effort multi-process broker. No-op-safe on ``:memory:`` (WAL
+    silently downgrades to 'memory'). Installed on the ``sync_engine``'s
+    'connect' event — the documented way to run PRAGMAs on an aiosqlite async
+    engine (the event fires with the raw DBAPI connection, whose cursor runs
+    synchronously by bridging to aiosqlite's connection thread).
+    """
+    from sqlalchemy import event
+
+    timeout = int(busy_timeout_ms)
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection: Any, _record: Any) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            # ``timeout`` is an int -> safe to interpolate (PRAGMA takes no bind
+            # params); never a user string.
+            cursor.execute(f"PRAGMA busy_timeout={timeout}")
+        finally:
+            cursor.close()
+
+
+def _create_engine(url: str, opts: dict[str, Any]) -> Any:
+    """Build the async engine, applying dialect-appropriate options from
+    ``opts`` (the ``[tool.modulith.broker_options]`` subtable).
+
+    - Postgres / MySQL: ``pool_size`` / ``max_overflow`` size the connection
+      pool (both optional; omitted -> SQLAlchemy's QueuePool defaults).
+    - SQLite: pool-sizing kwargs are NOT passed (SQLite's pool rejects them);
+      instead WAL + ``busy_timeout`` are installed per connection.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    kwargs: dict[str, Any] = {}
+    sqlite = _is_sqlite_url(url)
+    if not sqlite:
+        pool_size = _opt_int(opts.get("pool_size"))
+        if pool_size is not None:
+            kwargs["pool_size"] = pool_size
+        max_overflow = _opt_int(opts.get("max_overflow"))
+        if max_overflow is not None:
+            kwargs["max_overflow"] = max_overflow
+    engine = create_async_engine(url, **kwargs)
+    if sqlite:
+        busy_timeout_ms = _opt_int(opts.get("busy_timeout_ms")) or _DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+        _install_sqlite_pragmas(engine, busy_timeout_ms)
+    return engine
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +370,7 @@ class DatabaseBroker:
         *,
         engine: Any | None = None,
         completion_mode: str = _DEFAULT_COMPLETION_MODE,
+        engine_options: dict[str, Any] | None = None,
     ) -> None:
         if engine is not None:
             self._engine = engine
@@ -276,10 +381,9 @@ class DatabaseBroker:
                     "(or broker_options={'url': ...} / MODULITH_BROKER_URL) "
                     "or inject a pre-built engine=... for tests."
                 )
-            # Lazy import keeps SQLAlchemy a soft dependency.
-            from sqlalchemy.ext.asyncio import create_async_engine
-
-            self._engine = create_async_engine(url)
+            # Lazy engine build (SQLAlchemy stays a soft dependency): applies
+            # pooling / SQLite hardening from broker_options — see _create_engine.
+            self._engine = _create_engine(url, engine_options or {})
         self._completion_mode = completion_mode
         self._schema_ready = False
         self._schema_lock = asyncio.Lock()
@@ -309,6 +413,35 @@ class DatabaseBroker:
                 await conn.run_sync(metadata.create_all)
             self._schema_ready = True
 
+    async def _write(self, operation: Callable[[Any], Awaitable[Any]]) -> Any:
+        """Run ``operation(conn)`` inside one transaction, retrying a transient
+        SQLite lock up to ``_SQLITE_BUSY_MAX_RETRIES`` times with backoff.
+
+        Each attempt is a fresh transaction (``engine.begin()`` rolls back on
+        the raised lock error), so a retry re-runs the whole operation from a
+        clean state — safe for the SELECT-then-write claim path. Non-lock
+        errors propagate immediately; ``CancelledError`` is never swallowed.
+        On Postgres / MySQL ``_is_sqlite_locked`` never matches, so this is a
+        plain single-attempt transaction there.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                async with self._engine.begin() as conn:
+                    return await operation(conn)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if attempt >= _SQLITE_BUSY_MAX_RETRIES or not _is_sqlite_locked(exc):
+                    raise
+                logger.warning(
+                    "SQLite busy on write (attempt %d/%d) — retrying",
+                    attempt,
+                    _SQLITE_BUSY_MAX_RETRIES,
+                )
+                await asyncio.sleep(_backoff_delay(attempt))
+
     # ----- producer side -----------------------------------------------
 
     async def publish(
@@ -331,14 +464,14 @@ class DatabaseBroker:
         event_type = (headers or {}).get("event_type", "")
         headers_blob = json.dumps(headers) if headers else None
         now = datetime.now(UTC)
-        async with self._engine.begin() as conn:
+
+        async def op(conn: Any) -> int:
             result = await conn.execute(
                 select(subscription.c.consumer_group).where(subscription.c.target == target)
             )
             groups = [row[0] for row in result]
             if not groups:
-                logger.debug("publish target=%s has no subscribers — 0 rows written", target)
-                return
+                return 0
             rows = [
                 {
                     "id": str(uuid4()),
@@ -358,7 +491,13 @@ class DatabaseBroker:
                 for group in groups
             ]
             await conn.execute(message.insert(), rows)
-        logger.debug("publish target=%s fanned out to %d group(s)", target, len(groups))
+            return len(groups)
+
+        count = await self._write(op)
+        if count:
+            logger.debug("publish target=%s fanned out to %d group(s)", target, count)
+        else:
+            logger.debug("publish target=%s has no subscribers — 0 rows written", target)
 
     async def close(self) -> None:
         """Dispose the engine (and its connection pool). Idempotent-friendly
@@ -369,40 +508,63 @@ class DatabaseBroker:
     # ----- consumer side -------------------------------------------------
 
     async def subscribe(self, targets: list[str] | tuple[str, ...], group: str) -> None:
-        """Upsert ``(target, group)`` subscription rows — idempotent.
+        """Upsert ``(target, group)`` subscription rows — idempotent AND
+        concurrency-safe.
 
-        A plain insert would raise on the ``(target, consumer_group)`` PK for
-        a re-registering consumer (e.g. worker restart), so each target is
-        checked and either inserted or has its ``updated_at`` refreshed.
+        Uses the dialect-native upsert (Postgres/SQLite ``ON CONFLICT DO
+        UPDATE``, MySQL ``ON DUPLICATE KEY UPDATE``) so two workers of the same
+        replicated module registering the same ``(target, consumer_group)`` at
+        once can't collide on the PK. A check-then-insert races here: both
+        workers see no row, both insert, and one dies with IntegrityError —
+        exactly the first-deploy hazard for a replicated module. Refreshes
+        ``updated_at`` on conflict so the row doubles as a liveness marker.
         """
+        if not targets:
+            return
         await self._ensure_schema()
-        from sqlalchemy import select
-
         _, subscription, _ = broker_schema()
         now = datetime.now(UTC)
-        async with self._engine.begin() as conn:
-            for target in targets:
-                existing = await conn.execute(
-                    select(subscription.c.target).where(
-                        subscription.c.target == target,
-                        subscription.c.consumer_group == group,
-                    )
-                )
-                if existing.first() is None:
-                    await conn.execute(
-                        subscription.insert().values(
-                            target=target, consumer_group=group, updated_at=now
-                        )
-                    )
-                else:
-                    await conn.execute(
-                        subscription.update()
-                        .where(
-                            subscription.c.target == target,
-                            subscription.c.consumer_group == group,
-                        )
-                        .values(updated_at=now)
-                    )
+        rows = [{"target": t, "consumer_group": group, "updated_at": now} for t in targets]
+        stmt = self._upsert_subscription(subscription, rows)
+
+        async def op(conn: Any) -> None:
+            await conn.execute(stmt)
+
+        await self._write(op)
+
+    def _upsert_subscription(self, subscription: Any, rows: list[dict[str, Any]]) -> Any:
+        """Build the dialect-native subscription upsert statement.
+
+        Postgres/SQLite: ``INSERT ... ON CONFLICT (target, consumer_group) DO
+        UPDATE SET updated_at=excluded.updated_at``. MySQL: ``INSERT ... ON
+        DUPLICATE KEY UPDATE``. Any other dialect (unreachable for the three
+        supported backends) falls back to a plain insert.
+        """
+        name = self._engine.dialect.name
+        if name == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+            pg_stmt = pg_insert(subscription).values(rows)
+            return pg_stmt.on_conflict_do_update(
+                index_elements=["target", "consumer_group"],
+                set_={"updated_at": pg_stmt.excluded.updated_at},
+            )
+        if name == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+            sqlite_stmt = sqlite_insert(subscription).values(rows)
+            return sqlite_stmt.on_conflict_do_update(
+                index_elements=["target", "consumer_group"],
+                set_={"updated_at": sqlite_stmt.excluded.updated_at},
+            )
+        if name == "mysql":
+            from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+            mysql_stmt = mysql_insert(subscription).values(rows)
+            return mysql_stmt.on_duplicate_key_update(updated_at=mysql_stmt.inserted.updated_at)
+        from sqlalchemy import insert
+
+        return insert(subscription).values(rows)
 
     async def claim_batch(
         self,
@@ -435,7 +597,8 @@ class DatabaseBroker:
         _, _, message = broker_schema()
         now = datetime.now(UTC)
         stale_cutoff = now - timedelta(seconds=reclaim_stale_seconds)
-        async with self._engine.begin() as conn:
+
+        async def op(conn: Any) -> list[dict[str, Any]]:
             stmt = (
                 select(message)
                 .where(
@@ -455,14 +618,17 @@ class DatabaseBroker:
             if _supports_skip_locked(self._engine):
                 stmt = stmt.with_for_update(skip_locked=True)
             result = await conn.execute(stmt)
-            rows = [dict(row._mapping) for row in result]
-            ids = [row["id"] for row in rows]
+            claimed_rows = [dict(row._mapping) for row in result]
+            ids = [row["id"] for row in claimed_rows]
             if ids:
                 await conn.execute(
                     update(message)
                     .where(message.c.id.in_(ids))
                     .values(status="claimed", claimed_at=now, claimed_by=consumer_name)
                 )
+            return claimed_rows
+
+        rows: list[dict[str, Any]] = await self._write(op)
         return rows
 
     async def ack(self, row_id: str) -> None:
@@ -471,13 +637,16 @@ class DatabaseBroker:
         from sqlalchemy import delete, update
 
         _, _, message = broker_schema()
-        async with self._engine.begin() as conn:
+
+        async def op(conn: Any) -> None:
             if self._completion_mode == "delete":
                 await conn.execute(delete(message).where(message.c.id == row_id))
             else:
                 await conn.execute(
                     update(message).where(message.c.id == row_id).values(status="done")
                 )
+
+        await self._write(op)
 
     async def fail(self, row_id: str, error: str, *, attempts: int, max_attempts: int) -> None:
         """Record a dispatch failure: attempts++ with backoff, staying
@@ -492,7 +661,8 @@ class DatabaseBroker:
         else:
             status = "pending"
             available_at = datetime.now(UTC) + timedelta(seconds=_backoff_delay(new_attempts))
-        async with self._engine.begin() as conn:
+
+        async def op(conn: Any) -> None:
             await conn.execute(
                 update(message)
                 .where(message.c.id == row_id)
@@ -506,18 +676,23 @@ class DatabaseBroker:
                 )
             )
 
+        await self._write(op)
+
     async def dead_letter(self, row_id: str, error: str) -> None:
         """Mark a poison row 'dead' immediately (undeserializable payload or
         missing ``event_type`` — retrying can never succeed)."""
         from sqlalchemy import update
 
         _, _, message = broker_schema()
-        async with self._engine.begin() as conn:
+
+        async def op(conn: Any) -> None:
             await conn.execute(
                 update(message)
                 .where(message.c.id == row_id)
                 .values(status="dead", last_error=error)
             )
+
+        await self._write(op)
 
     async def prune(
         self,
@@ -546,14 +721,15 @@ class DatabaseBroker:
 
         _, _, message = broker_schema()
         terminal = message.c.status.in_(_TERMINAL_STATUSES)
-        deleted = 0
-        async with self._engine.begin() as conn:
+
+        async def op(conn: Any) -> int:
+            deleted_local = 0
             if retention_age_seconds is not None:
                 cutoff = datetime.now(UTC) - timedelta(seconds=retention_age_seconds)
                 result = await conn.execute(
                     delete(message).where(terminal, message.c.created_at < cutoff)
                 )
-                deleted += _rowcount(result)
+                deleted_local += _rowcount(result)
             if retention_count is not None:
                 # Rank terminal rows newest-first within each logical queue and
                 # delete everything past the keep-count. The window subquery is
@@ -573,7 +749,10 @@ class DatabaseBroker:
                 ranked = select(message.c.id, rank).where(terminal).subquery()
                 doomed = select(ranked.c.id).where(ranked.c.rn > retention_count)
                 result = await conn.execute(delete(message).where(message.c.id.in_(doomed)))
-                deleted += _rowcount(result)
+                deleted_local += _rowcount(result)
+            return deleted_local
+
+        deleted: int = await self._write(op)
         if deleted:
             logger.debug("prune deleted %d terminal row(s)", deleted)
         return deleted
@@ -824,21 +1003,34 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
         return
 
     opts = cfg.broker_options or {}
-    url = os.environ.get("MODULITH_BROKER_URL") or opts.get("url")
-    completion_mode = opts.get("completion_mode", _DEFAULT_COMPLETION_MODE)
-    broker = DatabaseBroker(url=url, completion_mode=completion_mode)
+    url = _broker_opt(opts, "url", "URL") or _broker_opt(opts, "dsn", "DSN")
+    completion_mode = (
+        _broker_opt(opts, "completion_mode", "COMPLETION_MODE") or _DEFAULT_COMPLETION_MODE
+    )
+    broker = DatabaseBroker(url=url, completion_mode=completion_mode, engine_options=opts)
     registry.register(_DB_SCHEME, broker)
     logger.info("registered database broker (completion_mode=%s)", completion_mode)
 
 
+def _broker_opt(opts: dict[str, Any], key: str, env_suffix: str) -> Any:
+    """Resolve one broker setting: ``MODULITH_BROKER_<ENV_SUFFIX>`` env var
+    (highest priority — for deployment-time values like the URL/DSN) else the
+    ``broker_options`` subtable value else None. A blank env var ('') counts as
+    unset (templated deployments commonly render ``MODULITH_X=``)."""
+    env_value = os.environ.get(f"MODULITH_BROKER_{env_suffix}")
+    if env_value:
+        return env_value
+    return opts.get(key)
+
+
 def _opt_float(value: Any) -> float | None:
-    """Coerce a ``broker_options`` value (typed ``Any`` from TOML) to a float,
+    """Coerce a broker-option value (typed ``Any`` from TOML/env) to a float,
     or None when absent."""
     return None if value is None else float(value)
 
 
 def _opt_int(value: Any) -> int | None:
-    """Coerce a ``broker_options`` value to an int, or None when absent."""
+    """Coerce a broker-option value to an int, or None when absent."""
     return None if value is None else int(value)
 
 
@@ -850,15 +1042,17 @@ def _make_db_consumer(spec: ConsumerSpec) -> Consumer:
     scheme), whose consumer-side methods the loop drives. One engine serves
     both halves — no second engine is opened here.
 
-    Prune retention is read from ``[tool.modulith.broker_options]`` here so the
-    background sweep is opt-in per deployment (the full pooling/engine config
-    surface lands in I5).
+    Consumer-loop cadence (``poll_interval_ms`` / ``batch_size``) and prune
+    retention are read from ``[tool.modulith.broker_options]`` (env-overridable
+    via ``MODULITH_BROKER_*``) so they are configurable per deployment.
     """
     from ..runtime import _runtime
 
     broker = cast(DatabaseBroker, spec.broker_registry.get(spec.scheme))
     cfg = _runtime.config
     opts = (cfg.broker_options if cfg is not None else None) or {}
+    poll_interval_ms = _opt_float(_broker_opt(opts, "poll_interval_ms", "POLL_INTERVAL_MS"))
+    batch_size = _opt_int(_broker_opt(opts, "batch_size", "BATCH_SIZE"))
     return DatabaseConsumer(
         broker=broker,
         bus=spec.bus,
@@ -866,9 +1060,17 @@ def _make_db_consumer(spec: ConsumerSpec) -> Consumer:
         consumer_name=spec.consumer_name,
         group=spec.group,
         targets=list(spec.targets),
-        prune_interval_s=_opt_float(opts.get("prune_interval_seconds")),
-        retention_age_seconds=_opt_float(opts.get("retention_age_seconds")),
-        retention_count=_opt_int(opts.get("retention_count")),
+        poll_interval_s=(
+            poll_interval_ms / 1000.0 if poll_interval_ms is not None else _DEFAULT_POLL_INTERVAL_S
+        ),
+        batch_size=batch_size if batch_size is not None else _DEFAULT_BATCH_SIZE,
+        prune_interval_s=_opt_float(
+            _broker_opt(opts, "prune_interval_seconds", "PRUNE_INTERVAL_SECONDS")
+        ),
+        retention_age_seconds=_opt_float(
+            _broker_opt(opts, "retention_age_seconds", "RETENTION_AGE_SECONDS")
+        ),
+        retention_count=_opt_int(_broker_opt(opts, "retention_count", "RETENTION_COUNT")),
     )
 
 

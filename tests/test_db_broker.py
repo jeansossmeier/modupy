@@ -35,8 +35,13 @@ from sqlalchemy.pool import NullPool
 
 from modulith import Broker, BrokerRegistry, Consumer, ConsumerRegistry, ConsumerSpec, event
 from modulith.adapters.db_broker import (
+    _SQLITE_BUSY_MAX_RETRIES,
     DatabaseBroker,
     DatabaseConsumer,
+    _broker_opt,
+    _create_engine,
+    _is_sqlite_locked,
+    _is_sqlite_url,
     _make_db_consumer,
     _supports_skip_locked,
     broker_schema,
@@ -833,6 +838,8 @@ def test_make_db_consumer_reads_prune_config_from_broker_options(make_fake_app: 
         broker="database",
         broker_options={
             "url": "sqlite+aiosqlite:///:memory:",
+            "poll_interval_ms": 250,
+            "batch_size": 42,
             "retention_age_seconds": 3600,
             "retention_count": 100,
             "prune_interval_seconds": 30,
@@ -854,7 +861,246 @@ def test_make_db_consumer_reads_prune_config_from_broker_options(make_fake_app: 
     consumer = _make_db_consumer(spec)
 
     assert isinstance(consumer, DatabaseConsumer)
+    assert consumer._poll_interval_s == 0.25  # 250 ms -> seconds
+    assert consumer._batch_size == 42
     assert consumer._retention_age_seconds == 3600.0
     assert consumer._retention_count == 100
     assert consumer._prune_interval_s == 30.0
     assert consumer._prune_enabled() is True
+
+
+def test_make_db_consumer_uses_defaults_when_unconfigured(make_fake_app: Any) -> None:
+    """No cadence/retention keys -> library defaults, prune off."""
+    make_fake_app({"orders": ""})
+    from modulith import configure
+    from modulith.adapters.db_broker import _DEFAULT_BATCH_SIZE, _DEFAULT_POLL_INTERVAL_S
+
+    configure(
+        package="fakeapp",
+        broker="database",
+        broker_options={"url": "sqlite+aiosqlite:///:memory:"},
+    )
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.broker_registry is not None
+    spec = ConsumerSpec(
+        scheme="database",
+        module_name="inventory",
+        group="modulith-inventory",
+        consumer_name="inventory:1",
+        targets=("fakeapp.orders.WidgetCreated",),
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        broker_registry=_runtime.broker_registry,
+    )
+    consumer = _make_db_consumer(spec)
+
+    assert isinstance(consumer, DatabaseConsumer)
+    assert consumer._poll_interval_s == _DEFAULT_POLL_INTERVAL_S
+    assert consumer._batch_size == _DEFAULT_BATCH_SIZE
+    assert consumer._prune_enabled() is False
+
+
+# ---------------------------------------------------------------------------
+# I5a: engine factory — pooling (pg/mysql) + SQLite WAL/busy_timeout
+# ---------------------------------------------------------------------------
+
+
+def test_is_sqlite_url_classifies_backends() -> None:
+    assert _is_sqlite_url("sqlite+aiosqlite:///x.db") is True
+    assert _is_sqlite_url("sqlite:///:memory:") is True
+    assert _is_sqlite_url("postgresql+asyncpg://u:p@h/db") is False
+    assert _is_sqlite_url("mysql+aiomysql://u:p@h/db") is False
+
+
+async def test_sqlite_engine_enables_wal_and_busy_timeout(tmp_path: Path) -> None:
+    from sqlalchemy import text
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'wal.db'}"
+    engine = _create_engine(url, {"busy_timeout_ms": 1234})
+    try:
+        async with engine.connect() as conn:
+            journal = (await conn.execute(text("PRAGMA journal_mode"))).scalar_one()
+            busy = (await conn.execute(text("PRAGMA busy_timeout"))).scalar_one()
+        assert str(journal).lower() == "wal"
+        assert int(busy) == 1234
+    finally:
+        await engine.dispose()
+
+
+async def test_sqlite_busy_timeout_defaults_when_unset(tmp_path: Path) -> None:
+    from sqlalchemy import text
+
+    from modulith.adapters.db_broker import _DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'wal2.db'}"
+    engine = _create_engine(url, {})
+    try:
+        async with engine.connect() as conn:
+            busy = (await conn.execute(text("PRAGMA busy_timeout"))).scalar_one()
+        assert int(busy) == _DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+    finally:
+        await engine.dispose()
+
+
+async def test_pool_options_applied_for_non_sqlite() -> None:
+    # No connection is opened (create_async_engine is lazy) — inspect the pool.
+    engine = _create_engine(
+        "postgresql+asyncpg://user:pass@localhost/db", {"pool_size": 7, "max_overflow": 3}
+    )
+    try:
+        assert engine.sync_engine.pool.size() == 7
+    finally:
+        await engine.dispose()
+
+
+async def test_pool_options_ignored_for_sqlite(tmp_path: Path) -> None:
+    """pool_size given but SQLite's pool rejects it — _create_engine must drop
+    it rather than raise, and still produce a working engine."""
+    from sqlalchemy import text
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'nopool.db'}"
+    engine = _create_engine(url, {"pool_size": 5, "max_overflow": 2})
+    try:
+        async with engine.connect() as conn:
+            assert (await conn.execute(text("SELECT 1"))).scalar_one() == 1
+    finally:
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# I5b: env-override resolution
+# ---------------------------------------------------------------------------
+
+
+def test_broker_opt_prefers_env_over_options(monkeypatch: Any) -> None:
+    monkeypatch.setenv("MODULITH_BROKER_URL", "sqlite+aiosqlite:///env.db")
+    assert (
+        _broker_opt({"url": "sqlite+aiosqlite:///file.db"}, "url", "URL")
+        == "sqlite+aiosqlite:///env.db"
+    )
+
+
+def test_broker_opt_blank_env_is_treated_as_unset(monkeypatch: Any) -> None:
+    monkeypatch.setenv("MODULITH_BROKER_URL", "")
+    assert _broker_opt({"url": "from-options"}, "url", "URL") == "from-options"
+
+
+def test_broker_opt_falls_back_to_none(monkeypatch: Any) -> None:
+    monkeypatch.delenv("MODULITH_BROKER_POOL_SIZE", raising=False)
+    assert _broker_opt({}, "pool_size", "POOL_SIZE") is None
+
+
+# ---------------------------------------------------------------------------
+# I5c: subscribe upsert refreshes updated_at (proves ON CONFLICT DO UPDATE ran)
+# ---------------------------------------------------------------------------
+
+
+async def test_subscribe_upsert_refreshes_updated_at(engine: Any) -> None:
+    from sqlalchemy import select
+
+    broker = DatabaseBroker(engine=engine)
+    _, subscription, _ = broker_schema()
+
+    async def _updated_at() -> Any:
+        async with engine.connect() as conn:
+            result = await conn.execute(select(subscription.c.updated_at))
+            return result.scalar_one()
+
+    await broker.subscribe(["A"], "g")
+    first = await _updated_at()
+    await asyncio.sleep(0.01)
+    await broker.subscribe(["A"], "g")  # conflict -> DO UPDATE, not a crash
+    second = await _updated_at()
+
+    assert await _row_count(engine, table=subscription) == 1  # still one row
+    assert second > first  # updated_at advanced -> the update branch ran
+
+
+# ---------------------------------------------------------------------------
+# I5d: SQLITE_BUSY retry wrapper
+# ---------------------------------------------------------------------------
+
+
+def test_is_sqlite_locked_detects_locked_operational_error() -> None:
+    from sqlalchemy.exc import IntegrityError, OperationalError
+
+    locked = OperationalError("stmt", {}, Exception("database is locked"))
+    other = OperationalError("stmt", {}, Exception("no such table: x"))
+    integrity = IntegrityError("stmt", {}, Exception("database is locked"))
+
+    assert _is_sqlite_locked(locked) is True
+    assert _is_sqlite_locked(other) is False
+    # Only OperationalError is retryable, even if the text mentions a lock.
+    assert _is_sqlite_locked(integrity) is False
+    assert _is_sqlite_locked(RuntimeError("database is locked")) is False
+
+
+class _FlakyBegin:
+    def __init__(self, engine: _FlakyEngine) -> None:
+        self._engine = engine
+
+    async def __aenter__(self) -> object:
+        self._engine.begins += 1
+        if self._engine.begins <= self._engine.fail_times:
+            from sqlalchemy.exc import OperationalError
+
+            raise OperationalError("stmt", {}, Exception(self._engine.error_text))
+        return object()  # a stand-in "connection" the op never touches
+
+    async def __aexit__(self, *_: Any) -> bool:
+        return False
+
+
+class _FlakyEngine:
+    """Minimal async-engine stand-in whose begin() raises a chosen error the
+    first ``fail_times`` calls, then succeeds — for deterministic retry tests."""
+
+    def __init__(self, *, fail_times: int, error_text: str = "database is locked") -> None:
+        self.fail_times = fail_times
+        self.error_text = error_text
+        self.begins = 0
+
+    def begin(self) -> _FlakyBegin:
+        return _FlakyBegin(self)
+
+
+async def test_write_retries_transient_sqlite_lock_then_succeeds() -> None:
+    broker = DatabaseBroker(engine=_FlakyEngine(fail_times=2))
+    ran = {"n": 0}
+
+    async def op(_conn: Any) -> str:
+        ran["n"] += 1
+        return "ok"
+
+    result = await broker._write(op)
+
+    assert result == "ok"
+    assert ran["n"] == 1  # op ran exactly once, after two failed begins
+    assert broker._engine.begins == 3  # two lock failures + one success
+
+
+async def test_write_gives_up_after_max_retries() -> None:
+    from sqlalchemy.exc import OperationalError
+
+    broker = DatabaseBroker(engine=_FlakyEngine(fail_times=99))
+
+    async def op(_conn: Any) -> None:
+        pass
+
+    with pytest.raises(OperationalError):
+        await broker._write(op)
+    assert broker._engine.begins == _SQLITE_BUSY_MAX_RETRIES  # bounded, not infinite
+
+
+async def test_write_does_not_retry_non_lock_errors() -> None:
+    from sqlalchemy.exc import OperationalError
+
+    broker = DatabaseBroker(engine=_FlakyEngine(fail_times=99, error_text="no such table: x"))
+
+    async def op(_conn: Any) -> None:
+        pass
+
+    with pytest.raises(OperationalError):
+        await broker._write(op)
+    assert broker._engine.begins == 1  # non-lock error propagates on first try
