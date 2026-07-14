@@ -34,7 +34,7 @@ from .brokers import (
 
 # ----- Configuration ------------------------------------------------------
 from .config import Configuration, ConfigurationError
-from .decorators import configure, event, externalized, listener, publish
+from .decorators import bootstrap, configure, event, externalized, listener, publish
 
 # ----- Plugin manager (advanced — most users don't need this) -------------
 from .manager import create_plugin_manager
@@ -89,6 +89,7 @@ __all__ = [
     "Violation",
     "ViolationSeverity",
     "__version__",
+    "bootstrap",
     "configure",
     # Manager (advanced)
     "create_plugin_manager",

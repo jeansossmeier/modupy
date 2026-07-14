@@ -146,6 +146,37 @@ async def test_schema_creates_cleanly(engine) -> None:
 
 
 # ---------------------------------------------------------------------------
+# T59 — bind_session / unbind_session round trip
+# ---------------------------------------------------------------------------
+
+
+async def test_bind_unbind_session_round_trip_restores_previous_binding(engine) -> None:
+    """T59: unbind_session(token) is the public counterpart to bind_session —
+    it restores whatever was bound before, including a nested binding (e.g.
+    an inner request-scoped session shadowing an outer one), mirroring the
+    ``_current_session.reset(token)`` semantics callers previously had to
+    reach for directly (the private contextvar) per bind_session's own
+    docstring example."""
+    from modulith.adapters.postgres_outbox import unbind_session
+
+    assert outbox._current_session.get() is None
+
+    sessionmaker = async_sessionmaker(engine)
+    async with sessionmaker() as outer, sessionmaker() as inner:
+        outer_token = bind_session(outer)
+        assert outbox._current_session.get() is outer
+
+        inner_token = bind_session(inner)
+        assert outbox._current_session.get() is inner
+
+        unbind_session(inner_token)
+        assert outbox._current_session.get() is outer
+
+        unbind_session(outer_token)
+        assert outbox._current_session.get() is None
+
+
+# ---------------------------------------------------------------------------
 # save() inside a transaction + after-commit dispatch
 # ---------------------------------------------------------------------------
 

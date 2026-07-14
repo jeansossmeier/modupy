@@ -42,7 +42,7 @@ SECTIONS: list[tuple[str, str, list[str]]] = [
     (
         "Application API",
         "The everyday surface — the names most applications import.",
-        ["event", "listener", "publish", "publish_sync", "configure", "externalized"],
+        ["event", "listener", "publish", "publish_sync", "configure", "bootstrap", "externalized"],
     ),
     (
         "Manifests",

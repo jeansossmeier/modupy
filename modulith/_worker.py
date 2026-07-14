@@ -63,13 +63,13 @@ def create_app() -> FastAPI:
 
     from fastapi import FastAPI
 
-    from . import configure
+    from . import bootstrap, configure
     from .runtime import _runtime
 
     # auto_discover=False: bootstrap must NOT walk and import sibling modules —
     # selective import is the whole point of an isolated worker.
     configure(package=app_package, auto_discover=False, topology="processes")
-    _runtime.ensure_bootstrapped()
+    bootstrap()
 
     contracts_module = _runtime.config.contracts_module if _runtime.config else "contracts"
     _import_contracts(app_package, contracts_module)

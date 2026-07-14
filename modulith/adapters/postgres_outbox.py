@@ -566,8 +566,8 @@ def bind_session(session: Any) -> Any:
     """Bind a SQLAlchemy session to the current context.
 
     Call at the start of a request/transaction so publish() finds the session
-    via ``_current_session``. Returns the contextvar token; reset it when the
-    request ends::
+    via ``_current_session``. Returns the contextvar token; pass it to
+    ``unbind_session`` when the request ends::
 
         async def get_db_with_outbox():
             async with async_session_maker() as session:
@@ -575,9 +575,21 @@ def bind_session(session: Any) -> Any:
                 try:
                     yield session
                 finally:
-                    _current_session.reset(token)
+                    unbind_session(token)
     """
     return _current_session.set(session)
+
+
+def unbind_session(token: Any) -> None:
+    """Undo a ``bind_session`` call, restoring whatever was bound before it.
+
+    Call with the token ``bind_session`` returned, once the request/
+    transaction it was bound for ends. Restores the *previous* binding
+    (``None`` at the outermost scope, or an outer session if this bind was
+    nested inside one) rather than unconditionally clearing it — the same
+    guarantee ``contextvars.ContextVar.reset()`` gives, which this wraps.
+    """
+    _current_session.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -634,4 +646,5 @@ __all__ = [
     "EventPublicationRow",
     "PostgresPublicationStore",
     "bind_session",
+    "unbind_session",
 ]

@@ -194,6 +194,34 @@ def listener(func: F) -> F:
     return func
 
 
+def bootstrap() -> None:
+    """Eagerly run the runtime's one-time bootstrap. Idempotent.
+
+    Normally bootstrap is *lazy* — the first ``@listener`` registration or
+    ``publish()`` call triggers it. Most applications never need to call
+    this directly. Call it explicitly at startup when something depends on
+    bootstrap having already happened before the first publish — most
+    notably the outbox's crash-recovery sweep, which skips every pending
+    row for the cycle while ``event_bus`` is still ``None`` (an
+    un-bootstrapped runtime has no bus to resolve listeners against). An
+    embedding app that configures a durable outbox and wants stranded
+    publications from a previous crash retried immediately at startup,
+    rather than waiting for the first publish(), should call
+    ``bootstrap()`` right after ``configure()``.
+
+    Safe to call any number of times — after the first call, subsequent
+    calls are a no-op fast path (same guarantee as ``publish()``'s implicit
+    bootstrap).
+
+    Example:
+        from modulith import bootstrap, configure
+
+        configure(package="myapp", outbox="postgres")
+        bootstrap()  # crash-recovery sweep can dispatch immediately
+    """
+    _runtime.ensure_bootstrapped()
+
+
 async def publish(event: Any) -> None:
     """Publish an event to all registered listeners.
 
