@@ -222,7 +222,11 @@ packages = ["modulith"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+# examples/demo_app/tests exercises the modulith.testing scenario/modulith_app
+# fixtures against a real (non-synthetic) app; without it here, CI's default
+# `pytest` (no path argument) never collects it — testpaths is the only path
+# pytest scans absent an explicit CLI path.
+testpaths = ["tests", "examples/demo_app/tests"]
 python_files = "test_*.py"
 markers = [
     "integration: requires an external service (Redis, Postgres); skipped unless reachable",

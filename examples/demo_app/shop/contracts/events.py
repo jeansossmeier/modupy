@@ -9,13 +9,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from modulith import event
+from modulith import event, externalized
 
 
 @event
+@externalized
 @dataclass(frozen=True)
 class OrderPlaced:
-    """A customer placed an order. Published by the ``orders`` module."""
+    """A customer placed an order. Published by the ``orders`` module.
+
+    Marked ``@externalized`` so process-per-module topology routes it through
+    the configured broker to the ``inventory`` worker. Inert in single-process
+    topology (``modulith/runtime.py`` skips broker routing when
+    ``topology == "single"``).
+    """
 
     order_id: str
     customer_id: str
@@ -23,8 +30,13 @@ class OrderPlaced:
 
 
 @event
+@externalized
 @dataclass(frozen=True)
 class StockReserved:
-    """Stock was reserved for an order. Published by the ``inventory`` module."""
+    """Stock was reserved for an order. Published by the ``inventory`` module.
+
+    Marked ``@externalized`` so process-per-module topology routes it through
+    the configured broker to the ``notifications`` worker.
+    """
 
     order_id: str

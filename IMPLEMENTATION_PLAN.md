@@ -126,7 +126,7 @@ SPEC.md actually work, with:
    API reference, cookbook with 5+ recipes.
 5. **CI gates**: pytest, ruff, mypy --strict, modulith verify (self-applied), build wheel.
 6. **No NotImplementedError reachable from any documented public API**.
-7. **One real reference application** (`examples/demo_app/`) using all features end-to-end.
+7. **One real reference application** (`examples/demo_app/`) demonstrating all features across documented deployment modes (in-memory, durable outbox, process-per-module) with runnable recipes per mode.
 
 ### 1.5 Risk register
 

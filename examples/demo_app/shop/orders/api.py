@@ -1,14 +1,18 @@
 """FastAPI router for the orders module.
 
-Mounted by ``shop.main``. A module owns its own HTTP surface; the app just
-includes the routers. In process-per-module topology this same router is
-served by the orders worker and reached through the reverse proxy at
-``/orders``.
+Mounted by ``shop.main`` with ``prefix="/orders"`` in single-process mode, and
+by ``modulith._worker`` under the same ``/orders`` prefix in process-per-module
+mode (it mounts every module's ``router`` under ``/<module_name>``). The route
+below is declared at the router root (``""``) precisely so both mounts produce
+the same final URL: ``POST /orders``.
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from collections.abc import AsyncIterator
+from typing import Any
+
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 
 from shop.orders import place_order
@@ -21,8 +25,45 @@ class PlaceOrderRequest(BaseModel):
     total: float
 
 
-@router.post("/orders")
-async def post_order(req: PlaceOrderRequest) -> dict[str, str]:
+async def get_session(request: Request) -> AsyncIterator[Any]:
+    """Provide a bound outbox session, or ``None`` in the zero-config default.
+
+    ``request.app.state.sessionmaker`` is ``None`` unless ``shop.main``'s
+    lifespan wired the durable outbox (``MODULITH_OUTBOX`` != "memory" or
+    ``MODULITH_DB_URL`` set). When it's set, this dependency binds a session
+    to the outbox's context var for the lifetime of the request, commits after
+    the handler runs, and always resets the binding.
+
+    Typed ``Any`` (rather than ``AsyncSession | None``) deliberately: FastAPI
+    resolves this callable's annotations via forward-ref evaluation against its
+    own module globals at route-registration time, so a ``TYPE_CHECKING``-only
+    import would raise ``NameError`` there — not just on the default in-memory
+    path this dependency exists to keep sqlalchemy off of.
+    """
+    sessionmaker = getattr(request.app.state, "sessionmaker", None)
+    if sessionmaker is None:
+        yield None
+        return
+
+    from modulith.adapters.postgres_outbox import bind_session, unbind_session
+
+    async with sessionmaker() as session:
+        token = bind_session(session)
+        try:
+            yield session
+            await session.commit()
+        finally:
+            unbind_session(token)
+
+
+# Module-level singleton so the dependency is constructed once, not on every
+# request (and so ruff's B008 — "no function calls in argument defaults" —
+# doesn't fire on Depends(get_session) below).
+_session_dependency = Depends(get_session)
+
+
+@router.post("")
+async def post_order(req: PlaceOrderRequest, session: Any = _session_dependency) -> dict[str, str]:
     """Place an order; the event chain fans out to the other modules."""
-    order_id = await place_order(customer_id=req.customer_id, total=req.total)
+    order_id = await place_order(customer_id=req.customer_id, total=req.total, session=session)
     return {"order_id": order_id}

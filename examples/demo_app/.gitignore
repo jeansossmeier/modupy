@@ -1,0 +1,5 @@
+# SQLite artifacts produced by the durable-outbox and database-broker demo
+# modes (README modes B and D tell users to create these right here).
+*.db
+*.db-wal
+*.db-shm

@@ -1,0 +1,48 @@
+# Docker Compose services for modulith demo (OPTIONAL).
+#
+# These services are only needed for the "real" (non-SQLite) variants:
+# - Postgres for durable outbox or database broker
+# - Redis for redis-streams broker
+#
+# By default, the demo runs zero-infra with SQLite files (no services needed).
+# The durable outbox and database-broker profiles use SQLite by default;
+# this compose file is only for Postgres outbox or Redis broker modes.
+#
+# Usage:
+#   docker-compose up -d
+#   Set MODULITH_DB_URL or REDIS_URL in .env, then run the app.
+
+
+services:
+  postgres:
+    # Pinned 2026-07-14: re-pinning after testing is the deliberate update path.
+    image: postgres:16-alpine@sha256:e013e867e712fec275706a6c51c966f0bb0c93cfa8f51000f85a15f9865a28cb
+    environment:
+      POSTGRES_USER: modulith
+      POSTGRES_PASSWORD: modulith
+      POSTGRES_DB: modulith
+    ports:
+      - "5432:5432"
+    volumes:
+      # Named volume so `docker compose down` doesn't wipe the durable outbox
+      # data mode C is demonstrating — see the README's down-vs-stop note.
+      - modulith-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U modulith"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    # Pinned 2026-07-14: re-pinning after testing is the deliberate update path.
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  modulith-postgres-data:
