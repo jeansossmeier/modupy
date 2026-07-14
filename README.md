@@ -187,8 +187,10 @@ wired, via `outbox.configure(completion_mode=...)` — see
 
 The database broker reads `[tool.modulith.broker_options]` too: `url`/`dsn`
 (the SQLAlchemy URL — its dialect selects Postgres, MySQL, or SQLite),
-`pool_size`/`max_overflow` (server pooling), `busy_timeout_ms` (SQLite),
-`poll_interval_ms`/`batch_size` (consumer cadence), and
+`completion_mode` (`delete`/`mark`), `pool_size`/`max_overflow` (server
+pooling), `busy_timeout_ms` (SQLite), `poll_interval_ms`/`batch_size` (consumer
+cadence), `reclaim_stale_seconds` (crash-reclaim window) and
+`max_delivery_attempts` (dead-letter cap), and
 `retention_age_seconds`/`retention_count`/`prune_interval_seconds` (the
 background prune). Every one is env-overridable via `MODULITH_BROKER_<KEY>`.
 See [ARCHITECTURE.md](docs/ARCHITECTURE.md) §8.4.

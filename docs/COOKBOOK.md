@@ -394,8 +394,14 @@ high-throughput):
 url = "postgresql+asyncpg://user:pass@db/app"   # or mysql+aiomysql://...
 pool_size = 10                                   # server connection pool
 poll_interval_ms = 250                           # consumer poll cadence
+reclaim_stale_seconds = 60                        # reclaim a crashed consumer's claim after 60s
+max_delivery_attempts = 5                         # dead-letter after 5 failed dispatches
 retention_age_seconds = 604800                   # prune terminal rows after 7 days
 ```
+
+Timing (claim visibility, the reclaim window, retry backoff, prune age) is
+gated on the **database server clock**, so producers and competing consumers on
+different hosts stay consistent without a synchronized wall clock.
 
 With `broker = "database"`, a bare `@externalized` event's default target is
 `database:{event-fqn}`; pin one explicitly with

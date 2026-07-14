@@ -382,22 +382,48 @@ registered interest yet) — an at-least-once nuance that's safe because listene
 are idempotent, the same posture as the Redis adapter's startup-race gap.
 
 *Competing consumers.* `DatabaseConsumer` polls, claiming a batch of due rows
-with `FOR UPDATE SKIP LOCKED` so concurrent workers of a replicated module
-partition the backlog instead of blocking or double-claiming. It deserializes
-each row by its `event_type` header, dispatches to the local listeners, then
-removes the row (`completion_mode="delete"`, the default) or marks it `done`
-(`"mark"`, leaving it for the prune job). Poison rows (missing `event_type` /
-undeserializable payload) are dead-lettered immediately; dispatch failures
-increment `attempts` with capped backoff and dead-letter after the attempt cap.
-A worker that crashes between claim and ack leaves its row `claimed`; the next
-claim reclaims it once `claimed_at` is older than the reclaim window — the DB
-analogue of the Redis `XAUTOCLAIM` recovery, and what keeps delivery
-at-least-once across a crash.
+with `FOR UPDATE SKIP LOCKED` (Postgres / MySQL / MariaDB 10.6+) so concurrent
+workers of a replicated module partition the backlog instead of blocking or
+double-claiming. It deserializes each row by its `event_type` header, dispatches
+to the local listeners, then removes the row (`completion_mode="delete"`, the
+default) or marks it `done` (`"mark"`, leaving it for the prune job). Poison rows
+(missing `event_type` / undeserializable payload) are dead-lettered immediately;
+dispatch failures increment `attempts` with capped backoff and dead-letter after
+`max_delivery_attempts` (default 5). A worker that crashes between claim and ack
+leaves its row `claimed`; the next claim reclaims it once `claimed_at` is older
+than `reclaim_stale_seconds` (default 60) — the DB analogue of the Redis
+`XAUTOCLAIM` recovery, and what keeps delivery at-least-once across a crash.
+
+*Completions are owner-guarded.* `ack` / `fail` / `dead_letter` are each a
+compare-and-swap on `status='claimed' AND claimed_by=<this consumer>`: a late
+write from a healthy-but-slow consumer whose row a peer has already reclaimed
+(and possibly dead-lettered) is a no-op, never resurrecting a terminal row or
+clobbering the row the peer now owns. `fail` also reads the attempt count from
+the row inside the same transaction rather than trusting a caller snapshot.
+
+*Cross-host clock skew.* Every timing-sensitive value — a message's claim
+visibility (`available_at`), the reclaim cutoff (`claimed_at`), the retry
+backoff, and the prune age — is both stamped and compared against the **database
+server clock** (`now()` on Postgres, `UTC_TIMESTAMP(6)` on MySQL), so producers
+and competing consumers on different hosts can't skew each other's reclaim or
+visibility windows. SQLite stays on the process clock (single-host — the file is
+the host — and finer-grained than its second-resolution `CURRENT_TIMESTAMP`).
 
 *Retention.* Terminal rows (`done`/`dead`) accumulate, so the consumer runs a
-background prune when a retention knob is set: by age (`retention_age_seconds`)
-and/or by count (`retention_count`, newest-N per `(target, consumer_group)`).
-Pending/claimed rows are never touched, so prune can't drop undelivered work.
+background prune when a retention knob is set: by age (`retention_age_seconds`,
+measured from `created_at`) and/or by count (`retention_count`, newest-N per
+`(target, consumer_group)`). Pending/claimed rows are never touched, so prune
+can't drop undelivered work. A permanently-defunct consumer group's pending
+rows are, by that same rule, never pruned — drop its `broker_subscription` rows
+out of band when retiring a module.
+
+*Schema & config.* The tables are auto-created on first use, tolerant of the
+cross-process race where two workers `CREATE` the same fresh schema at once (the
+loser's "already exists" is swallowed). `completion_mode` is validated at
+construction (anything but `delete`/`mark` raises `ConfigurationError`), and the
+numeric `broker_options` (pool sizing, cadence, retention, reclaim/attempts) are
+coerced with a `ConfigurationError` on a non-numeric value rather than an opaque
+traceback.
 
 *SQLite specifics.* SQLite has no row locking and rejects `SKIP LOCKED`, so it
 degrades to a plain single-transaction claim — correct for sequential
