@@ -1,4 +1,4 @@
-"""W2 G02_runtime — behavioral regression tests for the Runtime singleton.
+"""Behavioral regression tests for the Runtime singleton.
 
 Each test cites the audit finding id it reproduces. Written failing-first
 against the pre-fix code (strict TDD; verified red on the base revision).

@@ -352,7 +352,7 @@ ignore_missing_imports = true
 # worker process. It must never resolve — silence import-not-found so the
 # CI tests-lane `mypy --strict modulith/ tests/` stays green (DX, W2
 # RESIDUALS item 12b).
-module = ["w2_g03_nonexistent_debug_module"]
+module = ["nonexistent_debug_module"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------

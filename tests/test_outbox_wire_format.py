@@ -1,4 +1,4 @@
-"""W3 R1 — outbox durable-path fixes.
+"""Outbox durable-path wire-format and unbootstrapped-sweep fixes.
 
 R1-F2: broker WIRE format is fixed JSON in v1. The outbox STORAGE serializer
 is an extension point (binary Avro/Protobuf/pickle payloads), but the wire

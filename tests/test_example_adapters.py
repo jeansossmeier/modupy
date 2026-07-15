@@ -1,4 +1,4 @@
-"""Regression tests for the W2 G10 examples-group audit findings.
+"""Regression tests for examples/ adapter-authoring samples.
 
 Covers examples/ adapter-authoring samples: they must compose with the
 shipped built-ins rather than colliding with them.

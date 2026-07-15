@@ -1,4 +1,4 @@
-"""W2 G08 regression tests for the modulith pytest plugin (``modulith.testing``).
+"""Regression tests for the modulith pytest plugin (``modulith.testing``).
 
 Covers audit findings on ``Scenario.within()``'s timeout contract and on the
 ``@pytest.mark.modulith_isolated`` subprocess re-invocation.

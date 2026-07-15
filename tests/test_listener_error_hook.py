@@ -1,4 +1,4 @@
-"""W2 G02_runtime — A1-r1-1: a raising modulith_on_listener_error hookimpl
+"""A raising modulith_on_listener_error hookimpl (A1-r1-1)
 must never mask the listener's own exception or skip the paired
 modulith_on_listener_complete call.
 

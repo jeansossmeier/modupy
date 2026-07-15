@@ -1,4 +1,4 @@
-"""W2 G07 regression tests — proxy + supervisor audit findings.
+"""Regression tests for proxy + supervisor audit findings.
 
 Each test cites the audit finding id it reproduces. The proxy tests drive the
 real ASGI app through ``httpx.ASGITransport`` (no sockets, no mocks of the

@@ -1,4 +1,4 @@
-"""W2 G05_redis regression tests — BrokerConsumer resilience + Redis broker docs.
+"""BrokerConsumer resilience and Redis broker documentation contracts.
 
 Each test cites the audit finding id it reproduces. All tests are deterministic:
 no wall-clock sleeps as synchronization — loops are driven by injected fakes and
@@ -21,16 +21,16 @@ from modulith.serializers import JsonEventSerializer
 
 @event
 @dataclass(frozen=True)
-class G05Event:
+class ConsumerEvent:
     value: int
 
 
-_FQN = f"{G05Event.__module__}.{G05Event.__qualname__}"
+_FQN = f"{ConsumerEvent.__module__}.{ConsumerEvent.__qualname__}"
 
 
 def _fields_for(value: int) -> dict[bytes, bytes]:
     return {
-        b"data": JsonEventSerializer().serialize(G05Event(value=value)),
+        b"data": JsonEventSerializer().serialize(ConsumerEvent(value=value)),
         b"h:event_type": _FQN.encode(),
     }
 
@@ -192,11 +192,11 @@ async def test_attempt_counters_do_not_leak_across_targets() -> None:
     target t2 — previously the shared mid-only key dead-lettered t2's message
     on its FIRST failure."""
 
-    async def boom(evt: G05Event) -> None:
+    async def boom(evt: ConsumerEvent) -> None:
         raise ValueError("listener down")
 
     bus = InMemoryEventBus()
-    bus.register(G05Event, boom)
+    bus.register(ConsumerEvent, boom)
     broker = InjectableBroker()
     consumer = _make_consumer(broker, bus, targets=["t1", "t2"])
 
@@ -227,11 +227,11 @@ async def test_ack_failure_does_not_kill_consumer_loop() -> None:
     logged and degrade to 'message stays pending, retried later'."""
     received: list[int] = []
 
-    async def handler(evt: G05Event) -> None:
+    async def handler(evt: ConsumerEvent) -> None:
         received.append(evt.value)
 
     bus = InMemoryEventBus()
-    bus.register(G05Event, handler)
+    bus.register(ConsumerEvent, handler)
     broker = InjectableBroker()
     broker.fail_ack.append(ConnectionError("redis briefly down at ack time"))
     consumer = _make_consumer(broker, bus, targets=["t"])
@@ -258,11 +258,11 @@ async def test_dead_letter_failure_does_not_kill_consumer_loop() -> None:
     consuming subsequent messages."""
     received: list[int] = []
 
-    async def handler(evt: G05Event) -> None:
+    async def handler(evt: ConsumerEvent) -> None:
         received.append(evt.value)
 
     bus = InMemoryEventBus()
-    bus.register(G05Event, handler)
+    bus.register(ConsumerEvent, handler)
     broker = InjectableBroker()
     broker.fail_dead_letter.append(ConnectionError("redis briefly down at DLQ-write time"))
     consumer = _make_consumer(broker, bus, targets=["t"])
@@ -312,11 +312,11 @@ async def test_nogroup_triggers_group_recreation_and_recovery() -> None:
     must re-issue ensure_group and resume consuming."""
     received: list[int] = []
 
-    async def handler(evt: G05Event) -> None:
+    async def handler(evt: ConsumerEvent) -> None:
         received.append(evt.value)
 
     bus = InMemoryEventBus()
-    bus.register(G05Event, handler)
+    bus.register(ConsumerEvent, handler)
     broker = InjectableBroker()
     consumer = _make_consumer(broker, bus, targets=["t"])
 
@@ -380,11 +380,11 @@ async def test_nonpositive_poll_block_ms_is_clamped() -> None:
     reaches the broker so a real worker can never hang indefinitely."""
     received: list[int] = []
 
-    async def handler(evt: G05Event) -> None:
+    async def handler(evt: ConsumerEvent) -> None:
         received.append(evt.value)
 
     bus = InMemoryEventBus()
-    bus.register(G05Event, handler)
+    bus.register(ConsumerEvent, handler)
     broker = InjectableBroker()
     consumer = _make_consumer(broker, bus, targets=["t"], poll_block_ms=0)
 

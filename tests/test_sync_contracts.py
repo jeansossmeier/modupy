@@ -1,4 +1,4 @@
-"""W2 G02_runtime — behavioral regression tests for modulith/sync.py.
+"""Behavioral regression tests for modulith/sync.py.
 
 Each test cites the audit finding id it reproduces. Written failing-first
 against the pre-fix code (strict TDD; verified red on the base revision).

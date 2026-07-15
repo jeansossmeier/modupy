@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     # Deliberately unimportable at runtime — mirrors an event module whose
     # annotation-only dependency isn't installed in the worker process
     # (regression scaffolding for audit A6-r5-210).
-    from w2_g03_nonexistent_debug_module import DebugInfo
+    from nonexistent_debug_module import DebugInfo
 
 # ---------------------------------------------------------------------------
 # Test event types — defined at module scope so they're importable by their

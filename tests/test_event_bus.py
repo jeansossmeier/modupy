@@ -1,4 +1,4 @@
-"""W2 G02_runtime — behavioral regression tests for InMemoryEventBus + BrokerRegistry.
+"""Behavioral regression tests for InMemoryEventBus + BrokerRegistry.
 
 Each test cites the audit finding id it reproduces. These tests were written
 failing-first against the pre-fix code (strict TDD).

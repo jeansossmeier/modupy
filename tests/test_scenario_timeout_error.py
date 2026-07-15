@@ -1,4 +1,4 @@
-"""W3 R4-W3-01: application-raised TimeoutError must fail scenario tests.
+"""Application-raised TimeoutError must fail scenario tests.
 
 ``Scenario._fire_trigger`` may swallow ONLY its own budget timeout (the
 ``within(seconds=...)`` window). A TimeoutError raised BY the application —

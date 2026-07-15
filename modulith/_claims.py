@@ -1,0 +1,128 @@
+"""Internal claim abstraction for outbox delivery concurrency control.
+
+Three ``claim_strategy`` values govern how concurrent outbox sweepers —
+multiple processes/workers each running the retry loop against the same
+durable store — avoid dispatching the same publication twice:
+
+  * ``"lease"`` (default) — a sweeper atomically claims a batch of rows
+    (writes ``claim_owner``/``claim_token``/``claim_until``, committing
+    before dispatch), renews the lease at one-third of ``claim_lease_seconds``
+    while dispatch is in flight, and fences its completion/failure write by
+    ``claim_token`` so a sweeper whose lease already expired cannot silently
+    clobber a newer claimant's row.
+  * ``"advisory_lock"`` — a sweeper holds a PostgreSQL advisory lock (one
+    exclusive per-connection lock keyed by the publication id) for the
+    duration of dispatch. Postgres-only: a store backed by a non-Postgres
+    engine must reject this strategy at construction time.
+  * ``"none"`` — no claim coordination at all. Two sweepers CAN dispatch the
+    same row concurrently. This is a documented, intentional tradeoff
+    (lower coordination overhead) — logged once at configure() time so
+    operators see it.
+
+This module is intentionally storage- and runtime-agnostic (no SQLAlchemy,
+no import of ``modulith.builtin.outbox`` or ``modulith.config``) so it can be
+imported cheaply from both the config-validation path and any adapter.
+
+``modulith.builtin.outbox`` (the storage-agnostic plugin) checks a store for
+the ``ClaimingStore``/``AdvisoryLockingStore`` capability via
+``isinstance``/``getattr`` duck typing before using any of this — third-party
+stores (or the in-memory test double) that omit these methods simply keep
+the original non-claiming dispatch path.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Protocol, runtime_checkable
+from uuid import UUID
+
+from .types import EventPublication
+
+VALID_CLAIM_STRATEGIES = ("lease", "advisory_lock", "none")
+DEFAULT_CLAIM_STRATEGY = "lease"
+DEFAULT_CLAIM_LEASE_SECONDS = 60.0
+DEFAULT_CLAIM_BATCH_SIZE = 100
+
+
+@dataclass(frozen=True)
+class Claim:
+    """A granted claim on one publication row (lease-mode bookkeeping).
+
+    ``token`` fences completion/failure writes: a write is only honored if
+    the row's current ``claim_token`` still matches. ``until`` is the lease
+    expiry, renewed by the dispatcher at one-third of the lease interval.
+    """
+
+    publication_id: UUID
+    owner: str
+    token: str
+    until: datetime
+
+
+@runtime_checkable
+class ClaimingStore(Protocol):
+    """Optional lease-mode capability a PublicationStore may implement.
+
+    Stores without this get the outbox plugin's original non-claiming
+    dispatch path (``find_incomplete`` + direct dispatch).
+    """
+
+    async def claim_batch(
+        self, *, owner: str, batch_size: int, lease_seconds: float, older_than: timedelta
+    ) -> list[EventPublication]:
+        """Atomically claim up to ``batch_size`` unclaimed/expired-lease rows.
+
+        Returned publications carry ``claim_owner``/``claim_token``/
+        ``claim_until`` populated so the caller can renew and fence on them.
+        """
+        ...
+
+    async def renew_claim(self, publication_id: UUID, token: str, lease_seconds: float) -> bool:
+        """Extend a still-held claim's lease. Returns False if ``token`` is
+        stale (the lease already expired and/or another owner re-claimed the
+        row) — the caller must stop dispatching and abandon it."""
+        ...
+
+    async def complete_claim(self, publication_id: UUID, token: str, mode: str) -> bool:
+        """Fenced completion write (update/delete/archive per ``mode``).
+        Returns False without applying anything if ``token`` is stale."""
+        ...
+
+    async def fail_claim(self, publication: EventPublication, token: str) -> bool:
+        """Fenced failure-record write (persists attempt_count/last_error).
+        Returns False without applying anything if ``token`` is stale."""
+        ...
+
+
+@runtime_checkable
+class AdvisoryLockingStore(Protocol):
+    """Optional advisory-lock-mode capability a PublicationStore may implement.
+
+    Postgres-only in practice (backed by ``pg_try_advisory_lock``); a store
+    should refuse to be constructed with ``claim_strategy="advisory_lock"``
+    on a non-Postgres engine rather than expose this capability unusably.
+    """
+
+    async def try_lock_publication(self, publication_id: UUID) -> object | None:
+        """Attempt to acquire the advisory lock for one publication.
+
+        Returns an opaque handle (truthy) on success, or ``None`` if another
+        connection already holds it. The caller must pass the SAME handle to
+        ``unlock_publication`` when done, win or lose."""
+        ...
+
+    async def unlock_publication(self, handle: object, publication_id: UUID) -> None:
+        """Release a lock handle returned by ``try_lock_publication``."""
+        ...
+
+
+__all__ = [
+    "VALID_CLAIM_STRATEGIES",
+    "DEFAULT_CLAIM_STRATEGY",
+    "DEFAULT_CLAIM_LEASE_SECONDS",
+    "DEFAULT_CLAIM_BATCH_SIZE",
+    "AdvisoryLockingStore",
+    "Claim",
+    "ClaimingStore",
+]

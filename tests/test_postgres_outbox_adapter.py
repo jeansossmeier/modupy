@@ -1,4 +1,4 @@
-"""Regression tests for the W2 G04 Postgres-adapter audit findings.
+"""Regression tests for Postgres outbox-adapter audit findings.
 
 Each test cites the audit finding id it reproduces in its docstring. The
 adapter is portable SQLAlchemy 2.0, so these run against aiosqlite (no Docker)

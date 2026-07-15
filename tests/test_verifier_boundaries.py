@@ -1,4 +1,4 @@
-"""W2 G11_verify: regression tests for audit findings on the boundary
+"""Regression tests for audit findings on the boundary
 verifier (``modulith/builtin/verifier.py``), manifests (``modulith/manifest.py``)
 and the audit tool (``modulith/audit.py``).
 

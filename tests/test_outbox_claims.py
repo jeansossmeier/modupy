@@ -1,4 +1,4 @@
-"""Regression tests for the W2 G03 outbox audit findings.
+"""Regression tests for outbox claim / concurrency audit findings.
 
 Each test cites the audit finding id it reproduces in its docstring. These
 exercise the storage-agnostic plugin logic against in-memory stub stores —
@@ -102,7 +102,7 @@ def _reset() -> Any:
 
 
 def _bootstrap_with_listener(handler: Any) -> None:
-    _runtime.configure(package="g03test", auto_discover=False)
+    _runtime.configure(package="outbox_claims_test", auto_discover=False)
     _runtime.ensure_bootstrapped()
     assert _runtime.event_bus is not None
     _runtime.event_bus.register(G03Event, handler)

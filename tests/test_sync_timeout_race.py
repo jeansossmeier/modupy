@@ -17,7 +17,8 @@ while ``done()`` already reports True (the dispatch completed inside the
 window). Every budget-overrun exit must surface ``PublishSyncTimeout``; an
 exception raised BY the dispatch itself — identified by identity, i.e. the
 caught error IS ``future.exception()`` — must keep propagating unchanged
-(W3 R4-W3-01; end-to-end pin in tests/test_w3_r4_testing.py).
+(application TimeoutError must propagate; end-to-end pin in
+tests/test_scenario_timeout_error.py).
 
 NOTE: the faked dispatch never runs, so no runtime configuration or listener
 registration is needed here — these tests target the wait-site semantics only.

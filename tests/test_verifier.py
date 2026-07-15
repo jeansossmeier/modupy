@@ -59,7 +59,7 @@ def test_collect_imports(make_fake_app) -> None:
     assert ("fakeapp.orders.helpers", ("util",)) in targets
     # TYPE_CHECKING-only imports are collected but tagged type_only, so the
     # boundary rules (1, 3, 4) still see them while cycle detection skips
-    # them (W2 G11: A10-r1-34 / A10-r3-146 — the guard must not be an
+    # them (A10-r1-34 / A10-r3-146 — the guard must not be an
     # encapsulation escape hatch).
     guarded = [r for r in records if r.target_module == "fakeapp.secret"]
     assert len(guarded) == 1

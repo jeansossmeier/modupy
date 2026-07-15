@@ -1,4 +1,4 @@
-"""W2 G02_runtime — A2-r4-168: durable-path broker sends must be commit-gated.
+"""Durable-path broker sends must be commit-gated (A2-r4-168).
 
 `publish()` on the durable path (outbox store configured + session bound) used
 to hand @externalized / cross-module events to the broker *synchronously,

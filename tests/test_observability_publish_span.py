@@ -1,4 +1,4 @@
-"""W3 R4-W3-02: a failed publish must not leak the publish span.
+"""A failed publish must not leak the OpenTelemetry publish span.
 
 ``modulith_before_event_published`` starts the publish span unconditionally;
 ``modulith_after_event_published`` — the only place that ended it — is
