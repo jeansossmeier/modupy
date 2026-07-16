@@ -34,25 +34,44 @@ jobs:
           enable-cache: true
 
       - name: Install project
-        run: uv pip install --system -e ".[all]"
+        # `.[dev]` pulls pytest-cov once so the 3.11 coverage cell can enforce
+        # fail_under without a second ad-hoc pin that could drift from pyproject.
+        run: uv pip install --system -e ".[dev]"
 
       - name: Run pytest
+        if: matrix.python-version != '3.11'
         # Deselect the integration suite explicitly: in this job the
-        # testcontainers drivers are absent, so `-m integration` tests would
+        # testcontainers drivers may be absent, so `-m integration` tests would
         # silently skip — a permanently-green lane proving nothing. The real
         # integration lane below runs them against Docker.
         run: pytest -m "not integration" -v --tb=short
 
+      - name: Run pytest with coverage (3.11 only)
+        if: matrix.python-version == '3.11'
+        # Coverage is collected once on 3.11 (plan Task 9): 90% package-wide,
+        # 100% on the outbox plugin. Thresholds live in pyproject.toml
+        # [tool.coverage.report] so local and CI agree.
+        run: |
+          pytest -m "not integration" -v --tb=short \
+            --cov=modulith --cov-report=term-missing
+          coverage report --fail-under=90
+          coverage report --include='modulith/builtin/outbox.py' --fail-under=100
+
   integration:
-    name: pytest -m integration (testcontainers)
+    name: pytest -m integration (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Exercise both ends of the supported range (Task 9).
+        python-version: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
@@ -114,12 +133,13 @@ jobs:
         run: uv pip install --system "ruff>=0.4,<1.0"
 
       - name: Lint
-        run: ruff check modulith tests
+        # Task 9: include packaged tooling and examples, not just the library.
+        run: ruff check modulith tests scripts examples
 
       - name: Format check
         # Once the codebase is consistently formatted, fail on any drift.
         # `ruff format --check` exits non-zero if any file would be reformatted.
-        run: ruff format --check modulith tests
+        run: ruff format --check modulith tests scripts examples
 
   typecheck:
     name: mypy --strict
@@ -145,7 +165,8 @@ jobs:
       - name: Type check
         # tests/ is type-checked too; per-module strictness relaxations for
         # tests live in pyproject.toml [[tool.mypy.overrides]].
-        run: mypy --strict modulith/ tests/
+        # Task 9: also type-check scripts/ and examples/.
+        run: mypy --strict modulith/ tests/ scripts/ examples/
 
   build:
     name: build wheel + sdist
@@ -167,10 +188,36 @@ jobs:
       - name: Smoke-test wheel installs
         # The wheel must install cleanly into a fresh interpreter so users
         # who pip-install from PyPI don't hit packaging surprises in prod.
+        # Task 9: install with all extras, verify entry points/assets, run a
+        # packaged SQLite migration, and check API-reference drift.
         run: |
           python -m venv /tmp/smoke
-          /tmp/smoke/bin/pip install dist/*.whl
+          WHL=$(ls dist/*.whl)
+          /tmp/smoke/bin/pip install "${WHL}[all]"
           /tmp/smoke/bin/python -c "import modulith; print(modulith.__name__)"
+          /tmp/smoke/bin/modulith --help
+          /tmp/smoke/bin/python -c "from importlib.metadata import entry_points; eps = entry_points(group='console_scripts'); assert any(e.name == 'modulith' for e in eps)"
+          /tmp/smoke/bin/python - <<'PY'
+          from pathlib import Path
+          import tempfile
+          from alembic import command
+          from alembic.config import Config
+          import modulith.adapters as adapters_pkg
+          migrations = Path(adapters_pkg.__file__).parent / "migrations"
+          with tempfile.TemporaryDirectory() as td:
+              db = Path(td) / "smoke.db"
+              cfg = Config()
+              cfg.set_main_option("script_location", str(migrations))
+              cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db}")
+              command.upgrade(cfg, "head")
+              print("sqlite migration ok", db.exists())
+          PY
+
+      - name: API-reference drift check
+        run: |
+          python -m venv /tmp/api-ref
+          /tmp/api-ref/bin/pip install -e ".[dev]"
+          /tmp/api-ref/bin/python scripts/gen_api_reference.py --check
 
       - name: Upload distributions
         uses: actions/upload-artifact@v4

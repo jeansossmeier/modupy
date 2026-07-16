@@ -94,9 +94,11 @@ def modulith_verify_module(
     duplication across per-module calls.
     """
     violations: list[Violation] = []
-    imports = _collect_imports(module)
+    parse_errors: list[tuple[Path, str]] = []
+    imports = _collect_imports(module, parse_errors)
     contracts_module = _configured_contracts_module()
 
+    violations.extend(_check_parse_errors(module, parse_errors))
     violations.extend(_check_no_internal_imports(module, imports, all_modules))
     violations.extend(_check_uses_contracts_module(module, imports, all_modules, contracts_module))
     violations.extend(_check_declared_dependencies(module, imports, all_modules, contracts_module))
@@ -242,8 +244,17 @@ class _ImportCollector(ast.NodeVisitor):
         return f"{base}.{node.module}" if node.module else base
 
 
-def _collect_imports(module: ModuleInfo) -> list[ImportRecord]:
-    """Parse every ``.py`` file under the module's package; return imports."""
+def _collect_imports(
+    module: ModuleInfo, parse_errors: list[tuple[Path, str]] | None = None
+) -> list[ImportRecord]:
+    """Parse every ``.py`` file under the module's package; return imports.
+
+    A file that fails to parse contributes no imports and is skipped — but
+    that silently blinds every rule to whatever it would have imported,
+    so verification could pass while missing real violations. When
+    *parse_errors* is given, each failure is appended as ``(path, message)``
+    so the caller can surface it as its own violation (``_check_parse_errors``).
+    """
     root = _package_dir(module.package)
     if root is None:
         logger.debug("could not resolve package dir for %s", module.package)
@@ -255,11 +266,31 @@ def _collect_imports(module: ModuleInfo) -> list[ImportRecord]:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         except (SyntaxError, UnicodeDecodeError) as exc:
             logger.warning("skipping unparseable file %s: %s", path, exc)
+            if parse_errors is not None:
+                parse_errors.append((path, str(exc)))
             continue
         collector = _ImportCollector(path, _file_package(root, module.package, path))
         collector.visit(tree)
         records.extend(collector.records)
     return records
+
+
+def _check_parse_errors(
+    module: ModuleInfo, parse_errors: list[tuple[Path, str]]
+) -> list[Violation]:
+    """A file that fails to parse must surface as an ERROR, not be silently
+    skipped — a syntax/encoding error hides that file's imports from every
+    other rule, so verification could pass while blind to real violations."""
+    return [
+        Violation(
+            rule="parse-error",
+            message=f"{path} could not be parsed: {message}",
+            module=module.name,
+            location=_portable_path(path, module),
+            severity=ViolationSeverity.ERROR,
+        )
+        for path, message in parse_errors
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -278,8 +309,33 @@ def _owning_module(target: str, all_modules: list[ModuleInfo]) -> ModuleInfo | N
     return best
 
 
-def _location(record: ImportRecord) -> str:
-    return f"{record.source_file}:{record.line}"
+def _project_root(module: ModuleInfo) -> Path | None:
+    """The directory containing the top-level application package.
+
+    Ratchet-baseline locations must be relative to this directory, not
+    absolute — an absolute path like ``/home/alice/proj/...`` never matches
+    a teammate's checkout or a CI runner's (``/home/runner/...``), silently
+    reopening every grandfathered violation the moment the baseline is
+    regenerated on a different machine.
+    """
+    top_level = module.package.split(".", 1)[0]
+    root = _package_dir(top_level)
+    return root.parent if root is not None else None
+
+
+def _portable_path(path: Path, module: ModuleInfo) -> str:
+    """*path* relative to the application's source root when resolvable."""
+    project_root = _project_root(module)
+    if project_root is not None:
+        try:
+            return path.relative_to(project_root).as_posix()
+        except ValueError:
+            pass
+    return str(path)
+
+
+def _location(record: ImportRecord, module: ModuleInfo) -> str:
+    return f"{_portable_path(record.source_file, module)}:{record.line}"
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +366,34 @@ def _check_no_internal_imports(
                         f"through {owner.name}'s public API."
                     ),
                     module=module.name,
-                    location=_location(record),
+                    location=_location(record, module),
+                )
+            )
+            continue
+        if remainder:
+            # Already resolved to a deeper (non-private) path under the
+            # owner — the shorthand check below only applies when
+            # target_module IS the owner package itself (see below).
+            continue
+        # Shorthand `from <owner-package> import <name>` — including the
+        # relative `from . import <name>` spelling from inside the owner's
+        # own root __init__ — resolves target_module to the owner package
+        # itself, so `remainder` above is empty and the leading-underscore
+        # check never sees it. But `<name>` may itself be a private
+        # submodule rather than a public attribute of the owner package, so
+        # the same convention must apply to it directly.
+        private_names = sorted(n for n in record.imported_names if n.startswith("_"))
+        if private_names:
+            violations.append(
+                Violation(
+                    rule="no-internal-imports",
+                    message=(
+                        f"{module.name} imports {', '.join(private_names)} from "
+                        f"{owner.name}, reaching into {owner.name}'s private package. "
+                        f"Cross-module access must go through {owner.name}'s public API."
+                    ),
+                    module=module.name,
+                    location=_location(record, module),
                 )
             )
     return violations
@@ -369,12 +452,19 @@ class _NameUsageCollector(ast.NodeVisitor):
             self.runtime_names.add(node.id)
 
 
-def _runtime_loaded_names(module: ModuleInfo) -> set[str]:
-    """Names a module loads at runtime, outside type-annotation positions."""
+def _runtime_loaded_names_by_file(module: ModuleInfo) -> dict[Path, set[str]]:
+    """Names each file in the module loads at runtime, outside type-annotation
+    positions — keyed per file, not aggregated across the whole module.
+
+    Rule 4 must check a candidate import against runtime usage in the *same
+    file* that imports it. Aggregating across the module let an unrelated
+    file's runtime use of a same-named local binding falsely exempt a real
+    annotation-only import elsewhere in the module.
+    """
     root = _package_dir(module.package)
     if root is None:
-        return set()
-    names: set[str] = set()
+        return {}
+    names_by_file: dict[Path, set[str]] = {}
     for path in sorted(root.rglob("*.py")):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -383,8 +473,8 @@ def _runtime_loaded_names(module: ModuleInfo) -> set[str]:
         # Fresh collector per file: TYPE_CHECKING aliases are file-scoped.
         collector = _NameUsageCollector()
         collector.visit(tree)
-        names |= collector.runtime_names
-    return names
+        names_by_file[path] = collector.runtime_names
+    return names_by_file
 
 
 def _check_uses_contracts_module(
@@ -408,7 +498,10 @@ def _check_uses_contracts_module(
     so the ``import *`` itself is flagged (A10-r3-147).
     """
     violations: list[Violation] = []
-    runtime_names: set[str] | None = None  # computed lazily on first candidate
+    # Computed lazily on first candidate, keyed per file (not aggregated
+    # across the module) so runtime usage is checked against the file that
+    # actually imports the candidate.
+    names_by_file: dict[Path, set[str]] | None = None
     for record in imports:
         owner = _owning_module(record.target_module, all_modules)
         if owner is None or owner.package == module.package or owner.name == contracts_module:
@@ -424,7 +517,7 @@ def _check_uses_contracts_module(
                         f"{contracts_module!r} module."
                     ),
                     module=module.name,
-                    location=_location(record),
+                    location=_location(record, module),
                 )
             )
             continue
@@ -436,8 +529,9 @@ def _check_uses_contracts_module(
         candidates = [(orig, local) for orig, local in pairs if orig[:1].isupper()]
         if not candidates:
             continue
-        if runtime_names is None:
-            runtime_names = _runtime_loaded_names(module)
+        if names_by_file is None:
+            names_by_file = _runtime_loaded_names_by_file(module)
+        runtime_names = names_by_file.get(record.source_file, set())
         type_names = [orig for orig, local in candidates if local not in runtime_names]
         if type_names:
             violations.append(
@@ -450,7 +544,7 @@ def _check_uses_contracts_module(
                         f"not each other's internals."
                     ),
                     module=module.name,
-                    location=_location(record),
+                    location=_location(record, module),
                 )
             )
     return violations
@@ -464,10 +558,9 @@ def _check_declared_dependencies(
 ) -> list[Violation]:
     """Rule 3: imports must match the manifest's declared_dependencies.
 
-    The rule only applies when the manifest *declared* the field: None (the
-    default — e.g. a manifest added just for ``owns_tables``) leaves the
-    rule off, while an explicit empty tuple means "depends on nothing" and
-    enforces deny-all, contracts excepted (A10-r1-36, adjudicated).
+    The rule only applies when the manifest *declared* the field. The separate
+    ``dependencies_declared`` flag keeps the public dependency tuple iterable
+    while preserving omitted versus explicit-empty semantics.
 
     The violation message deliberately does NOT embed the module's current
     declared_dependencies list: the ratchet baseline hashes the message, so
@@ -477,7 +570,7 @@ def _check_declared_dependencies(
     from modulith.manifest import get_manifest
 
     manifest = get_manifest(module.package)
-    if manifest is None or manifest.declared_dependencies is None:
+    if manifest is None or not manifest.dependencies_declared:
         return []
 
     allowed = set(manifest.declared_dependencies) | {contracts_module}
@@ -496,7 +589,7 @@ def _check_declared_dependencies(
                         f"remove the import."
                     ),
                     module=module.name,
-                    location=_location(record),
+                    location=_location(record, module),
                 )
             )
     return violations
@@ -536,7 +629,7 @@ def _collect_table_refs(module: ModuleInfo) -> list[tuple[str, str]]:
                 if name == "Table" and node.args:
                     first = node.args[0]
                     if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                        refs.append((first.value, f"{path}:{node.lineno}"))
+                        refs.append((first.value, f"{_portable_path(path, module)}:{node.lineno}"))
             elif isinstance(node, ast.Assign):
                 for target in node.targets:
                     if (
@@ -545,7 +638,9 @@ def _collect_table_refs(module: ModuleInfo) -> list[tuple[str, str]]:
                         and isinstance(node.value, ast.Constant)
                         and isinstance(node.value.value, str)
                     ):
-                        refs.append((node.value.value, f"{path}:{node.lineno}"))
+                        refs.append(
+                            (node.value.value, f"{_portable_path(path, module)}:{node.lineno}")
+                        )
     return refs
 
 
@@ -652,7 +747,7 @@ def _check_contracts_is_sink(
                     f"shared code into {contracts_module!r} or invert the dependency."
                 ),
                 module=module.name,
-                location=_location(record),
+                location=_location(record, module),
             )
         )
     return violations

@@ -62,11 +62,15 @@ dependencies = [
 # resolve to it. We loosen these per release as compatibility is verified.
 [project.optional-dependencies]
 # Postgres outbox adapter. Pulls in async SQLAlchemy + asyncpg, plus
-# Alembic for the outbox schema migrations in adapters/migrations/.
+# Alembic for the outbox schema migrations in adapters/migrations/. Alembic's
+# command API is synchronous, so it can't drive asyncpg directly — psycopg is
+# the sync driver Alembic actually connects with (postgresql+psycopg://) to
+# run `alembic upgrade head` against a real Postgres.
 postgres = [
     "sqlalchemy>=2.0,<3.0",
     "asyncpg>=0.29,<1.0",
     "alembic>=1.13,<2.0",
+    "psycopg[binary]>=3.1,<4.0",
 ]
 
 # Redis Streams broker. The default broker for process-per-module mode.
@@ -81,16 +85,21 @@ redis = [
 # process-per-module). One adapter, three dialects inferred from the URL:
 # Postgres/MySQL for a real server broker, SQLite for zero-dependency
 # bootstrap. Pulls in async SQLAlchemy plus a driver per dialect the app uses
-# (asyncpg / aiomysql / aiosqlite). asyncpg + aiosqlite already ship via the
-# postgres/test extras; aiomysql is the only MySQL-specific addition.
+# (asyncpg / aiomysql / aiosqlite), plus Alembic (+ its sync MySQL driver,
+# PyMySQL — Alembic's command API is synchronous, so it can't drive aiomysql
+# directly) to run the broker schema migrations in adapters/migrations/.
 database = [
     "sqlalchemy>=2.0,<3.0",
     "asyncpg>=0.29,<1.0",
     "aiomysql>=0.2,<1.0",
     # MySQL 8 defaults to caching_sha2_password auth, which aiomysql can only
     # perform when `cryptography` is present — required in practice for MySQL 8.
-    "cryptography>=41.0",
+    # cryptography verified through 49.x (its installed test version); bound
+    # tracks the next unverified release like every other extra here.
+    "cryptography>=41.0,<50.0",
     "aiosqlite>=0.19,<1.0",
+    "alembic>=1.13,<2.0",
+    "pymysql>=1.1,<2.0",
 ]
 
 # NOTE: a Kafka broker is on the roadmap (SPEC §10.3) but no adapter ships yet,
@@ -144,13 +153,16 @@ test = [
 
 # Integration test suite — the testcontainers-backed end-to-end tests
 # (tests/test_*_e2e.py, test_*_integration.py, test_migration_postgres.py,
-# test_process_topology_e2e.py). These spin up real Postgres + MySQL + Redis
-# via Docker, so they need the REAL drivers, not the sqlite stand-in:
+# test_migration_mysql.py, test_process_topology_e2e.py). These spin up real
+# Postgres + MySQL + Redis via Docker, so they need the REAL drivers, not the
+# sqlite stand-in:
 #   - testcontainers: starts disposable postgres:16 / mysql:8 / redis:7 containers
 #   - asyncpg: the async Postgres driver the outbox + DB broker run on in prod
 #   - aiomysql: the async MySQL driver the DB broker runs on against MySQL 8
-#   - psycopg[binary]: the SYNC driver Alembic uses for the migration test
-#     (postgresql+psycopg://) — asyncpg can't drive Alembic's sync engine
+#   - psycopg[binary]: the SYNC driver Alembic uses for the Postgres migration
+#     test (postgresql+psycopg://) — asyncpg can't drive Alembic's sync engine
+#   - pymysql: the SYNC driver Alembic uses for the MySQL migration test
+#     (mysql+pymysql://), same reason — aiomysql can't drive it either
 # Layered on `test` so it also gets pytest, redis, fastapi, etc. Run with
 # `pip install modulith[integration] && pytest -m integration`; the suite
 # auto-skips these when Docker is unreachable (see tests/conftest.py).
@@ -160,8 +172,9 @@ integration = [
     "asyncpg>=0.29,<1.0",
     "aiomysql>=0.2,<1.0",
     # aiomysql needs cryptography to auth against MySQL 8 (caching_sha2_password).
-    "cryptography>=41.0",
+    "cryptography>=41.0,<50.0",
     "psycopg[binary]>=3.1,<4.0",
+    "pymysql>=1.1,<2.0",
 ]
 
 # Everything. For "I want all the features" users.
@@ -248,6 +261,17 @@ filterwarnings = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.coverage.run]
+source = ["modulith"]
+branch = true
+
+[tool.coverage.report]
+# Task 9: package-wide floor. Outbox is gated separately at 100% in CI
+# (`coverage report --include='modulith/builtin/outbox.py' --fail-under=100`).
+fail_under = 90
+show_missing = true
+skip_covered = false
 
 [tool.ruff.lint]
 select = [
@@ -368,6 +392,8 @@ ignore_missing_imports = true
 # broker = "memory"          # default — switch to "redis-streams" for IPC
 # topology = "single"        # "single" | "processes" ("subinterpreters" reserved, not yet implemented)
 # contracts_module = "contracts"  # name of the shared-events subpackage (default: "contracts")
+# subscription_source = "manifest"  # "manifest" | "config" | "listener"
+# actuator_mode = "auto"     # "auto" | "token" | "open" | "disabled"
 
 [tool.modulith.verify]
 # mode = "strict"            # "strict" for new projects, "ratchet" for migration
@@ -378,10 +404,19 @@ ignore_missing_imports = true
 # spelling is the top-level string key selecting the adapter, and a legacy
 # `[tool.modulith.outbox]` subtable is rejected with a ConfigurationError).
 [tool.modulith.outbox_options]
-# completion_mode = "update" # "update" | "delete" | "archive"
+# completion_mode = "update" # "update" | "delete" | "archive" — pass to outbox.configure()
+# claim_strategy = "lease"   # "lease" | "advisory_lock" | "none" — pass to outbox.configure()
+# claim_lease_seconds = 60.0
+# claim_batch_size = 100
 # retry_interval_seconds = 30
 # max_attempts = 10
 # max_retry_backoff_seconds = 300
+
+# Database-broker policies (read by the database broker adapter):
+# [tool.modulith.broker_options]
+# no_subscriber_policy = "error"   # "error" | "wait" | "store"
+# orphan_replay_policy = "ttl_all_groups"  # "ttl_all_groups" | "first_groups" | "expected_groups"
+# orphan_retention_seconds = 86400
 
 [tool.modulith.workers]
 # default = 1                # workers per module

@@ -98,6 +98,41 @@ class EventPublication:
     # retried on every sweep once the record ages past the (capped) backoff.
     last_attempt_at: datetime | None = None
 
+    # Task 4 (outbox-claims): set ONLY by a claim-aware store's claim_batch()
+    # when ``claim_strategy="lease"`` — fences the completion/failure write
+    # that follows dispatch to this exact claim (see
+    # modulith._claims.ClaimingStore). None for every other path: direct
+    # after-commit dispatch, force_retry, retry_all_dead_lettered, the
+    # "none"/"advisory_lock" strategies, and any pre-Task-4 store — all of
+    # those use the original unfenced save()/mark_complete()/delete()/
+    # archive() calls unchanged.
+    claim_token: str | None = None
+
+
+@dataclass(frozen=True)
+class EventPublishReceipt:
+    """The real outcome of a durable (outbox) publish.
+
+    Handed to ``modulith_after_event_published`` on the durable path INSTEAD
+    of a fabricated ``EventPublication``. The runtime used to synthesize a
+    brand-new record — a random ``uuid4()`` id, a payload re-serialized with
+    the default JSON serializer — that matched neither the row(s) actually
+    persisted nor the configured storage serializer's bytes. ``records``
+    holds every ``EventPublication`` this publish actually saved: one per
+    registered listener, plus one more when the event also routes to a
+    broker (see ``modulith.builtin.outbox.persist`` /
+    ``persist_broker_route``). Empty when the event has neither a local
+    listener nor a broker route — nothing was persisted, so the receipt
+    carries nothing rather than a placeholder standing in for it.
+
+    Not part of the top-level ``modulith`` package's public API — plugin
+    authors reach it via ``isinstance(publication, EventPublishReceipt)``
+    when they need the real persisted record(s); everyone else can keep
+    treating ``publication`` as observational.
+    """
+
+    records: tuple[EventPublication, ...]
+
 
 class ViolationSeverity(Enum):
     """Severity level for verification findings."""

@@ -423,7 +423,9 @@ loser's "already exists" is swallowed). `completion_mode` is validated at
 construction (anything but `delete`/`mark` raises `ConfigurationError`), and the
 numeric `broker_options` (pool sizing, cadence, retention, reclaim/attempts) are
 coerced with a `ConfigurationError` on a non-numeric value rather than an opaque
-traceback.
+traceback. Policy knobs: `no_subscriber_policy` (`error`/`wait`/`store`, default
+`error`) and `orphan_replay_policy` (`ttl_all_groups`/`first_groups`/
+`expected_groups`) control publish-before-subscribe behavior; see COOKBOOK.
 
 *SQLite specifics.* SQLite has no row locking and rejects `SKIP LOCKED`, so it
 degrades to a plain single-transaction claim — correct for sequential

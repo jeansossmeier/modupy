@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -345,6 +345,26 @@ class Priority(IntEnum):
 
 
 @dataclass(frozen=True)
+class PriorityKeyed:
+    counts: dict[Priority, int]
+
+
+@dataclass(frozen=True)
+class IntOrStringEvent:
+    value: int | str
+
+
+@dataclass(frozen=True)
+class StringOrIntEvent:
+    value: str | int
+
+
+@dataclass(frozen=True)
+class NestedUnionEvent:
+    values: list[int | str]
+
+
+@dataclass(frozen=True)
 class EnumEvent:
     color: Color
     priority: Priority
@@ -379,3 +399,57 @@ def test_int_enum_field_round_trips_to_member_identity() -> None:
     assert restored == original
     assert isinstance(restored.priority, Priority)
     assert restored.priority is Priority.LOW
+
+
+def test_numeric_enum_dict_keys_round_trip() -> None:
+    """Numeric enum keys become JSON strings, then must restore their members."""
+    serializer = JsonEventSerializer()
+    original = PriorityKeyed(counts={Priority.LOW: 2, Priority.HIGH: 9})
+
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(PriorityKeyed))
+
+    assert restored == original
+    assert set(restored.counts) == {Priority.LOW, Priority.HIGH}
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        IntOrStringEvent(value=7),
+        IntOrStringEvent(value="7"),
+        StringOrIntEvent(value=7),
+        StringOrIntEvent(value="7"),
+    ],
+)
+def test_non_optional_union_round_trips_independently_of_member_order(
+    event: IntOrStringEvent | StringOrIntEvent,
+) -> None:
+    """A tagged union payload keeps the original member when coercions overlap."""
+    serializer = JsonEventSerializer()
+
+    restored = serializer.deserialize(serializer.serialize(event), _fqcn(type(event)))
+
+    assert restored == event
+    typed = cast(IntOrStringEvent | StringOrIntEvent, restored)
+    assert type(typed.value) is type(event.value)
+
+
+def test_nested_non_optional_union_round_trips() -> None:
+    """Union tags apply recursively inside containers, not just top-level fields."""
+    serializer = JsonEventSerializer()
+    original = NestedUnionEvent(values=[1, "1"])
+
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(NestedUnionEvent))
+
+    assert restored == original
+    assert [type(value) for value in restored.values] == [int, str]
+
+
+def test_legacy_untagged_union_payload_still_decodes() -> None:
+    """Existing payloads predate union tags and remain readable."""
+    serializer = JsonEventSerializer()
+
+    restored = serializer.deserialize(b'{"value":7}', _fqcn(StringOrIntEvent))
+
+    # Legacy payloads retain the historic first-member coercion behavior.
+    assert restored == StringOrIntEvent(value=7)

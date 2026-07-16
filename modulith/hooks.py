@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 import pluggy
 
-from .types import EventPublication, ModuleInfo, Violation
+from .types import EventPublication, EventPublishReceipt, ModuleInfo, Violation
 
 # Avoid a circular import: BrokerRegistry imports from .protocols which
 # imports from .types, and we only need the type for annotations here.
@@ -112,7 +112,7 @@ def modulith_before_event_published(event: Any) -> None:
 @hookspec
 def modulith_after_event_published(
     event: Any,
-    publication: EventPublication,
+    publication: EventPublication | EventPublishReceipt,
 ) -> None:
     """Run after an event has been persisted to the outbox.
 
@@ -121,6 +121,34 @@ def modulith_after_event_published(
     modulith_on_listener_error. This is the right hook for metrics
     counting events produced, distributed tracing of publish spans,
     and structured audit logs.
+
+    ``publication`` is an ``EventPublication`` on the in-memory dispatch
+    path (no persistence happened; it carries the event's real serialized
+    payload for hook consumers). On the durable outbox path it is an
+    ``EventPublishReceipt`` wrapping the actual persisted record(s) for
+    this publish — never a fabricated placeholder.
+    """
+
+
+@hookspec
+def modulith_on_publish_error(event: Any, exception: BaseException) -> None:
+    """Run when publish() fails between the before/after event hooks.
+
+    ``modulith_after_event_published`` is contractually scoped to a
+    successful publish — persisted on the durable path, dispatched
+    in-memory otherwise — so it never fires when persistence, event
+    serialization, or an inline broker route raises. Without a dedicated
+    failure signal, any cleanup a plugin started in
+    ``modulith_before_event_published`` (the built-in observability
+    plugin's publish span, most notably) had no paired hook to run in —
+    leaking whatever it was holding open until the next lucky GC pass or
+    process exit.
+
+    Purely observational, like the listener lifecycle's error hook: it does
+    not gate, and exceptions raised by implementations are logged and
+    swallowed (the observe-shield enforces this) so a failing hookimpl can
+    never mask the original publish failure, which always propagates to the
+    caller unchanged.
     """
 
 

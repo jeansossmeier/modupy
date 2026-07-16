@@ -21,11 +21,32 @@ intended pattern.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 from uuid import UUID
 
 from .types import EventPublication
+
+ConsumerStatus = Literal["starting", "ready", "degraded", "failed", "stopped", "unknown"]
+
+
+@dataclass(frozen=True, slots=True)
+class ConsumerHealth:
+    """Immutable readiness snapshot returned by health-aware consumers."""
+
+    ready: bool
+    status: ConsumerStatus
+    detail: str | None = None
+
+
+@runtime_checkable
+class HealthAwareConsumer(Protocol):
+    """Optional consumer capability used by worker readiness checks."""
+
+    def health(self) -> ConsumerHealth:
+        """Return the consumer's current readiness state."""
+        ...
 
 
 @runtime_checkable

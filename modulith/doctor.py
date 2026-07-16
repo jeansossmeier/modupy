@@ -41,6 +41,11 @@ _SCHEMA_CACHE_PATH = Path(".modulith-schemas.json")
 _DEAD_LETTER_ERROR_THRESHOLD = 100
 _INCOMPLETE_BACKLOG_THRESHOLD = 1000
 
+# An unresponsive store (network partition, stalled connection pool) must
+# not hang `modulith doctor` forever — bound the query and report the
+# timeout as an error instead.
+_OUTBOX_HEALTH_TIMEOUT = 10.0
+
 
 # ---------------------------------------------------------------------------
 # Health report aggregation
@@ -312,18 +317,33 @@ def _check_schema_drift(rt: Runtime) -> HealthCheck:
 
     try:
         cached = json.loads(_SCHEMA_CACHE_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        cached = {}
+    except (OSError, json.JSONDecodeError) as exc:
+        # A corrupt cache is itself a finding, not silent noise — surface it
+        # and leave the file untouched so it can be inspected. Overwriting it
+        # here would destroy the evidence of whatever corrupted it.
+        return HealthCheck(
+            "schema drift",
+            "error",
+            f"cache at {_SCHEMA_CACHE_PATH} is corrupt and was left untouched",
+            [str(exc)],
+        )
 
     drifted = sorted(k for k, digest in current.items() if k in cached and cached[k] != digest)
+    removed = sorted(k for k in cached if k not in current)
     _SCHEMA_CACHE_PATH.write_text(json.dumps(current, indent=2, sort_keys=True), encoding="utf-8")
 
-    if drifted:
+    if drifted or removed:
+        details = [f"{k} changed" for k in drifted[:5]] + [f"{k} removed" for k in removed[:5]]
+        summary_parts = []
+        if drifted:
+            summary_parts.append(f"{len(drifted)} event schema(s) changed")
+        if removed:
+            summary_parts.append(f"{len(removed)} event schema(s) removed")
         return HealthCheck(
             "schema drift",
             "warn",
-            f"{len(drifted)} event schema(s) changed since last check",
-            drifted[:5],
+            " and ".join(summary_parts) + " since last check",
+            details,
         )
     return HealthCheck("schema drift", "ok", f"{len(current)} event schema(s) stable")
 
@@ -348,7 +368,16 @@ def _check_outbox_health(rt: Runtime) -> HealthCheck:
     # status() now reports UNBOUNDED counts (via the store's count_open /
     # count_dead_lettered), not a sample capped at find_incomplete's LIMIT 100 —
     # so a real backlog (50k stuck rows) is visible here instead of reading 100.
-    counts = asyncio.run(outbox.status())
+    # Bounded by a timeout: an unresponsive store (network partition, stalled
+    # connection pool) must not hang `doctor` forever.
+    try:
+        counts = asyncio.run(asyncio.wait_for(outbox.status(), timeout=_OUTBOX_HEALTH_TIMEOUT))
+    except TimeoutError:
+        return HealthCheck(
+            "outbox health",
+            "error",
+            f"outbox status query timed out after {_OUTBOX_HEALTH_TIMEOUT}s",
+        )
     dead = counts["dead_lettered"]
     incomplete = counts["incomplete"]
     summary = f"{incomplete} incomplete, {counts['completed']} completed, {dead} dead-lettered"

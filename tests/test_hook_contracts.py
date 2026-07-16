@@ -167,6 +167,48 @@ async def test_raising_error_hookimpl_does_not_mask_listener_error(make_fake_app
 
 
 # ---------------------------------------------------------------------------
+# Observe-only publish-error hook (Task 6 runtime-sync)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_publish_error_fires_observe_only_hook_without_masking_failure(
+    make_fake_app, monkeypatch
+):
+    """A publish that fails between the before/after event hooks (a durable
+    persist failure, an inline broker-route failure) must fire the new
+    ``modulith_on_publish_error`` hook — and a raising hookimpl must not
+    mask the original failure, matching every other observe-only hook's
+    contract."""
+    from modulith import ConfigurationError
+
+    seen: list[tuple[str, str]] = []
+
+    class _RaisingPublishErrorObserver:
+        @hookimpl
+        def modulith_on_publish_error(self, event, exception) -> None:
+            seen.append((type(event).__name__, type(exception).__name__))
+            raise RuntimeError("observer's own bug must not surface")
+
+    _register_via_bootstrap(monkeypatch, _RaisingPublishErrorObserver(), "raising-publish-error")
+    make_fake_app({"orders": ""})
+    _runtime.configure(
+        package="fakeapp", topology="processes", broker="ghost-scheme", auto_discover=False
+    )
+
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class Ghost:
+        x: int
+
+    with pytest.raises(ConfigurationError, match="ghost-scheme"):
+        await _runtime.publish(Ghost(x=1))
+
+    assert seen == [("Ghost", "ConfigurationError")]
+
+
+# ---------------------------------------------------------------------------
 # Entry-point plugin loading: disable must skip during loading (A1-r2-72)
 # ---------------------------------------------------------------------------
 

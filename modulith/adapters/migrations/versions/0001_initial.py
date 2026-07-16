@@ -27,13 +27,17 @@ def upgrade() -> None:
     op.create_table(
         "event_publications",
         sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("event_type", sa.String(), nullable=False),
+        # Text, not an unbounded String — MySQL's VARCHAR requires an explicit
+        # length, so this column type must render as TEXT/LONGTEXT there (a
+        # no-op on Postgres/SQLite, which treat Text and unbounded String
+        # identically). Mirrors postgres_outbox.EventPublicationRow.
+        sa.Column("event_type", sa.Text(), nullable=False),
         sa.Column("payload", sa.LargeBinary(), nullable=False),
-        sa.Column("listener", sa.String(), nullable=False),
+        sa.Column("listener", sa.Text(), nullable=False),
         sa.Column("published_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("attempt_count", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("last_error", sa.String(), nullable=True),
+        sa.Column("last_error", sa.Text(), nullable=True),
         sa.Column("last_attempt_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("is_dead_lettered", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.PrimaryKeyConstraint("id"),
@@ -50,13 +54,13 @@ def upgrade() -> None:
     op.create_table(
         "event_publications_archive",
         sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("event_type", sa.String(), nullable=False),
+        sa.Column("event_type", sa.Text(), nullable=False),
         sa.Column("payload", sa.LargeBinary(), nullable=False),
-        sa.Column("listener", sa.String(), nullable=False),
+        sa.Column("listener", sa.Text(), nullable=False),
         sa.Column("published_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("attempt_count", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("last_error", sa.String(), nullable=True),
+        sa.Column("last_error", sa.Text(), nullable=True),
         sa.Column("last_attempt_at", sa.DateTime(timezone=True), nullable=True),
         sa.PrimaryKeyConstraint("id"),
     )

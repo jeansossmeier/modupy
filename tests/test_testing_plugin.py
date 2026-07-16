@@ -143,6 +143,37 @@ def test_modulith_module_mocks_named_siblings(make_fake_app, modulith_module) ->
     assert sys.modules["fakeapp.inventory"].VALUE == "real-inv"
 
 
+def test_modulith_module_reimports_target_after_mocking_siblings(
+    make_fake_app, modulith_module
+) -> None:
+    """A target already imported BEFORE entering isolation keeps bindings
+    resolved against its REAL siblings (``from fakeapp.inventory import
+    VALUE`` snapshots the name at import time). Leaving the target cached
+    while its sibling is swapped for a MagicMock silently defeats the mock —
+    ``modulith_module`` must re-import the target itself after installing the
+    mocks, so it is already correctly bound by the time the ``with`` body
+    runs (no manual reimport needed by the caller)."""
+    import importlib
+    import sys
+
+    make_fake_app(
+        {
+            "orders": "from fakeapp.inventory import VALUE\n",
+            "inventory": "VALUE = 'real-inv'",
+        }
+    )
+    importlib.import_module("fakeapp.inventory")
+    real_orders = importlib.import_module("fakeapp.orders")
+    assert real_orders.VALUE == "real-inv"
+
+    with modulith_module("fakeapp.orders", mock_modules=["fakeapp.inventory"]):
+        assert not isinstance(sys.modules["fakeapp.orders"].VALUE, str)  # bound to the mock now
+
+    # Restored to the original module object untouched after exit.
+    assert sys.modules["fakeapp.orders"] is real_orders
+    assert sys.modules["fakeapp.orders"].VALUE == "real-inv"
+
+
 # ---------------------------------------------------------------------------
 # @pytest.mark.modulith_isolated — subprocess-per-test isolation
 # ---------------------------------------------------------------------------

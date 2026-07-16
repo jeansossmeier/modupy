@@ -16,6 +16,7 @@ from uuid import UUID
 import pytest
 
 from modulith import EventPublication, configure
+from modulith._consumer import consumer_targets
 from modulith.builtin import outbox
 from modulith.runtime import _runtime
 from modulith.serializers import JsonEventSerializer
@@ -320,6 +321,51 @@ async def test_externalized_explicit_target_overrides_default(make_fake_app) -> 
     assert len(fake.published) == 1
     destination, _, _ = fake.published[0]
     assert destination == "custom.stream"  # registry strips the "testbroker:" scheme
+
+
+@pytest.mark.parametrize("subscription_source", ["manifest", "config", "listener"])
+async def test_static_event_target_is_consumed_under_every_subscription_source(
+    make_fake_app,
+    subscription_source: str,
+) -> None:
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event, externalized, listener, publish
+
+                @externalized(target="testbroker:custom.stream")
+                @event
+                @dataclass(frozen=True)
+                class OrderPlaced:
+                    order_id: str
+
+                @listener
+                async def on_placed(event: OrderPlaced) -> None:
+                    pass
+
+                async def place(order_id: str) -> None:
+                    await publish(OrderPlaced(order_id=order_id))
+            """
+        }
+    )
+    configure(
+        package="fakeapp",
+        topology="processes",
+        broker="testbroker",
+        subscription_source=subscription_source,
+    )
+    _runtime.ensure_bootstrapped()
+    fake = _register_fake_broker("testbroker")
+
+    import fakeapp.orders as orders
+
+    await orders.place("o-static")
+
+    assert _runtime.event_bus is not None
+    assert _runtime.config is not None
+    assert consumer_targets(_runtime.event_bus, _runtime.config, "orders") == ["custom.stream"]
+    assert [destination for destination, _, _ in fake.published] == ["custom.stream"]
 
 
 async def test_resolve_event_target_hook_overrides_routing(make_fake_app) -> None:

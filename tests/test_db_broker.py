@@ -8,8 +8,8 @@ tests/test_postgres_adapter.py's ``engine`` fixture docstring for the
 deterministic repro this avoids).
 
 Covered:
-  * publish() fans out one row per SUBSCRIBED consumer group only; zero
-    subscribers -> zero rows.
+  * publish() fans out one row per SUBSCRIBED consumer group only; the default
+    policy rejects zero subscribers without writing a row.
   * subscription upsert is idempotent (re-start doesn't duplicate rows).
   * claim -> dispatch -> ack removes/marks the row; the event reaches the bus.
   * a claimed row is not re-delivered to a second claim in the same group.
@@ -24,6 +24,7 @@ Covered:
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -40,6 +41,7 @@ from modulith.adapters.db_broker import (
     DatabaseConsumer,
     _broker_opt,
     _create_engine,
+    _delivery_message_id,
     _is_already_exists,
     _is_sqlite_locked,
     _is_sqlite_url,
@@ -50,6 +52,7 @@ from modulith.adapters.db_broker import (
     broker_schema,
 )
 from modulith.event_bus import InMemoryEventBus
+from modulith.protocols import ConsumerHealth
 from modulith.runtime import _runtime
 from modulith.serializers import JsonEventSerializer
 
@@ -233,16 +236,423 @@ async def test_publish_fans_out_one_row_per_subscribed_group_only(engine: Any) -
     assert rows_b[0]["consumer_group"] == "modulith-billing"
 
 
-async def test_publish_zero_subscribers_writes_zero_rows(engine: Any) -> None:
+async def test_publish_zero_subscribers_raises_without_writing_rows(engine: Any) -> None:
+    from modulith.adapters.db_broker import NoSubscribersError
+
     broker = DatabaseBroker(engine=engine)
     serializer = JsonEventSerializer()
     payload = serializer.serialize(WidgetCreated(name="w1"))
-    await broker.publish(
-        "fakeapp.orders.WidgetCreated",
-        payload,
-        {"event_type": f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"},
-    )
+    target = "fakeapp.orders.WidgetCreated"
+
+    with pytest.raises(NoSubscribersError, match=target):
+        await broker.publish(
+            target,
+            payload,
+            {"event_type": f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"},
+        )
+
     assert await _row_count(engine) == 0
+
+
+async def test_publish_waits_until_a_subscriber_exists(engine: Any) -> None:
+    broker = DatabaseBroker(
+        engine=engine,
+        no_subscriber_policy="wait",
+        no_subscriber_wait_timeout_seconds=1.0,
+        no_subscriber_wait_poll_interval_ms=10.0,
+    )
+    target = "fakeapp.orders.WidgetCreated"
+    payload = JsonEventSerializer().serialize(WidgetCreated(name="w1"))
+
+    publish_task = asyncio.create_task(broker.publish(target, payload, {"event_type": target}))
+    await asyncio.sleep(0.03)
+    assert publish_task.done() is False
+
+    await broker.subscribe([target], "modulith-inventory")
+    await publish_task
+
+    assert await _row_count(engine) == 1
+
+
+async def test_publish_wait_timeout_raises_without_writing_rows(engine: Any) -> None:
+    from modulith.adapters.db_broker import NoSubscribersError
+
+    broker = DatabaseBroker(
+        engine=engine,
+        no_subscriber_policy="wait",
+        no_subscriber_wait_timeout_seconds=0.03,
+        no_subscriber_wait_poll_interval_ms=5.0,
+    )
+    target = "fakeapp.orders.WidgetCreated"
+
+    with pytest.raises(NoSubscribersError, match="timed out"):
+        await broker.publish(target, b"{}", {"event_type": target})
+
+    assert await _row_count(engine) == 0
+
+
+async def test_publish_wait_does_not_hold_transaction_while_sleeping(engine: Any) -> None:
+    from sqlalchemy import event as sqlalchemy_event
+
+    broker = DatabaseBroker(
+        engine=engine,
+        no_subscriber_policy="wait",
+        no_subscriber_wait_timeout_seconds=1.0,
+        no_subscriber_wait_poll_interval_ms=100.0,
+    )
+    await broker._ensure_schema()
+
+    active_transactions = 0
+    first_attempt_finished = asyncio.Event()
+
+    def transaction_started(*_: Any) -> None:
+        nonlocal active_transactions
+        active_transactions += 1
+
+    def transaction_finished(*_: Any) -> None:
+        nonlocal active_transactions
+        active_transactions -= 1
+        first_attempt_finished.set()
+
+    sqlalchemy_event.listen(engine.sync_engine, "begin", transaction_started)
+    sqlalchemy_event.listen(engine.sync_engine, "commit", transaction_finished)
+    sqlalchemy_event.listen(engine.sync_engine, "rollback", transaction_finished)
+
+    target = "fakeapp.orders.WidgetCreated"
+    publish_task = asyncio.create_task(broker.publish(target, b"{}", {"event_type": target}))
+    try:
+        await asyncio.wait_for(first_attempt_finished.wait(), timeout=1.0)
+        assert publish_task.done() is False
+        assert active_transactions == 0
+
+        await broker.subscribe([target], "modulith-inventory")
+        await publish_task
+    finally:
+        sqlalchemy_event.remove(engine.sync_engine, "begin", transaction_started)
+        sqlalchemy_event.remove(engine.sync_engine, "commit", transaction_finished)
+        sqlalchemy_event.remove(engine.sync_engine, "rollback", transaction_finished)
+
+
+async def test_store_ttl_all_groups_delivers_current_and_late_groups_once(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine, no_subscriber_policy="store")
+    target = "fakeapp.orders.WidgetCreated"
+    headers = {"event_type": target, "trace_id": "trace-1"}
+    payload = b'{"name":"w1"}'
+    metadata, _, message = broker_schema()
+    retained = metadata.tables["broker_retained_message"]
+    delivery = metadata.tables["broker_retained_delivery"]
+
+    await broker.subscribe([target], "current")
+    await broker.publish(target, payload, headers)
+
+    from sqlalchemy import select
+
+    async with engine.connect() as conn:
+        ledger_row = (
+            await conn.execute(
+                select(
+                    delivery.c.retained_message_id,
+                    delivery.c.consumer_group,
+                    delivery.c.broker_message_id,
+                )
+            )
+        ).one()
+    assert ledger_row.broker_message_id == _delivery_message_id(
+        ledger_row.retained_message_id,
+        ledger_row.consumer_group,
+    )
+
+    current = await broker.claim_batch("current", batch_size=10, consumer_name="c1")
+    assert len(current) == 1
+    assert current[0]["payload"] == payload
+    assert json.loads(current[0]["headers"]) == headers
+    assert await _row_count(engine, table=retained) == 1
+    assert await _row_count(engine, table=delivery) == 1
+
+    await broker.subscribe([target], "late")
+    late = await broker.claim_batch("late", batch_size=10, consumer_name="c2")
+    assert len(late) == 1
+    assert late[0]["payload"] == payload
+    assert json.loads(late[0]["headers"]) == headers
+    assert current[0]["id"] != late[0]["id"]
+    assert await _row_count(engine, table=message) == 2
+    assert await _row_count(engine, table=delivery) == 2
+
+    await broker.subscribe([target], "late")
+    assert await broker.claim_batch("late", batch_size=10, consumer_name="c3") == []
+    assert await _row_count(engine, table=message) == 2
+
+
+async def test_store_first_groups_with_current_groups_removes_retained_source(engine: Any) -> None:
+    broker = DatabaseBroker(
+        engine=engine,
+        no_subscriber_policy="store",
+        orphan_replay_policy="first_groups",
+    )
+    target = "fakeapp.orders.WidgetCreated"
+    metadata, _, _ = broker_schema()
+    retained = metadata.tables["broker_retained_message"]
+    delivery = metadata.tables["broker_retained_delivery"]
+
+    await broker.subscribe([target], "inventory")
+    await broker.subscribe([target], "billing")
+    await broker.publish(target, b"payload", {"event_type": target})
+
+    assert len(await broker.claim_batch("inventory", batch_size=10, consumer_name="c1")) == 1
+    assert len(await broker.claim_batch("billing", batch_size=10, consumer_name="c2")) == 1
+    assert await _row_count(engine, table=retained) == 0
+    assert await _row_count(engine, table=delivery) == 0
+
+
+async def test_store_first_groups_replays_on_first_registration_only(engine: Any) -> None:
+    broker = DatabaseBroker(
+        engine=engine,
+        no_subscriber_policy="store",
+        orphan_replay_policy="first_groups",
+    )
+    target = "fakeapp.orders.WidgetCreated"
+    metadata, _, message = broker_schema()
+    retained = metadata.tables["broker_retained_message"]
+    delivery = metadata.tables["broker_retained_delivery"]
+
+    await broker.publish(target, b"payload", {"event_type": target})
+    assert await _row_count(engine, table=retained) == 1
+
+    await broker.subscribe([target], "inventory")
+    first = await broker.claim_batch("inventory", batch_size=10, consumer_name="c1")
+    assert len(first) == 1
+    assert await _row_count(engine, table=retained) == 0
+    assert await _row_count(engine, table=delivery) == 0
+
+    await broker.subscribe([target], "inventory")
+    assert await broker.claim_batch("inventory", batch_size=10, consumer_name="c2") == []
+    assert await _row_count(engine, table=message) == 1
+
+
+async def test_store_expected_groups_materializes_before_subscription(engine: Any) -> None:
+    target = "fakeapp.orders.WidgetCreated"
+    broker = DatabaseBroker(
+        engine=engine,
+        no_subscriber_policy="store",
+        orphan_replay_policy="expected_groups",
+        expected_consumer_groups={target: ["inventory", "billing"]},
+    )
+    metadata, _, _ = broker_schema()
+    retained = metadata.tables["broker_retained_message"]
+    delivery = metadata.tables["broker_retained_delivery"]
+
+    await broker.publish(target, b"payload", {"event_type": target})
+
+    assert len(await broker.claim_batch("inventory", batch_size=10, consumer_name="c1")) == 1
+    assert len(await broker.claim_batch("billing", batch_size=10, consumer_name="c2")) == 1
+    assert await _row_count(engine, table=retained) == 0
+    assert await _row_count(engine, table=delivery) == 0
+
+
+async def test_store_expected_groups_requires_target_configuration(engine: Any) -> None:
+    from modulith import ConfigurationError
+
+    broker = DatabaseBroker(
+        engine=engine,
+        no_subscriber_policy="store",
+        orphan_replay_policy="expected_groups",
+        expected_consumer_groups={"another.target": ["inventory"]},
+    )
+
+    with pytest.raises(ConfigurationError, match="expected_consumer_groups"):
+        await broker.publish("missing.target", b"payload")
+
+    assert await _row_count(engine) == 0
+
+
+async def test_prune_removes_expired_retained_messages_and_ledgers(engine: Any) -> None:
+    broker = DatabaseBroker(
+        engine=engine,
+        no_subscriber_policy="store",
+        orphan_retention_seconds=0.02,
+    )
+    target = "fakeapp.orders.WidgetCreated"
+    metadata, _, _ = broker_schema()
+    retained = metadata.tables["broker_retained_message"]
+    delivery = metadata.tables["broker_retained_delivery"]
+
+    await broker.subscribe([target], "inventory")
+    await broker.publish(target, b"payload", {"event_type": target})
+    await asyncio.sleep(0.05)
+
+    assert await broker.prune() == 1
+    assert await _row_count(engine, table=retained) == 0
+    assert await _row_count(engine, table=delivery) == 0
+
+
+async def test_retained_expiry_uses_database_clock(
+    engine: Any,
+    monkeypatch: Any,
+) -> None:
+    import modulith.adapters.db_broker as db_broker_module
+
+    broker = DatabaseBroker(
+        engine=engine,
+        no_subscriber_policy="store",
+        orphan_retention_seconds=60,
+    )
+    target = "fakeapp.orders.WidgetCreated"
+    await broker.publish(target, b"payload", {"event_type": target})
+
+    real_datetime = datetime
+
+    class SkewedDateTime:
+        fromisoformat = staticmethod(real_datetime.fromisoformat)
+
+        @staticmethod
+        def now(tz: Any = None) -> datetime:
+            return real_datetime.now(tz) + timedelta(days=365)
+
+    monkeypatch.setattr(db_broker_module, "datetime", SkewedDateTime)
+    await broker.subscribe([target], "late")
+
+    assert len(await broker.claim_batch("late", batch_size=10, consumer_name="c1")) == 1
+
+
+def test_no_subscriber_and_orphan_policy_defaults() -> None:
+    broker = DatabaseBroker(engine=object())
+
+    assert broker._no_subscriber_policy == "error"
+    assert broker._no_subscriber_wait_timeout_s == 30.0
+    assert broker._no_subscriber_wait_poll_interval_s == 0.1
+    assert broker._orphan_replay_policy == "ttl_all_groups"
+    assert broker._orphan_retention_seconds == 86400.0
+    assert broker._expected_consumer_groups == {}
+
+
+def test_broker_schema_keeps_public_shape_and_adds_replay_tables() -> None:
+    schema = broker_schema()
+
+    assert len(schema) == 3
+    metadata, _, _ = schema
+    retained_message = metadata.tables["broker_retained_message"]
+    retained_delivery = metadata.tables["broker_retained_delivery"]
+
+    assert set(retained_message.c.keys()) == {
+        "id",
+        "target",
+        "event_type",
+        "payload",
+        "headers",
+        "created_at",
+        "expires_at",
+    }
+    assert set(retained_delivery.c.keys()) == {
+        "retained_message_id",
+        "consumer_group",
+        "broker_message_id",
+        "delivered_at",
+    }
+    assert [column.name for column in retained_delivery.primary_key.columns] == [
+        "retained_message_id",
+        "consumer_group",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "option_name"),
+    [
+        ({"no_subscriber_policy": "drop"}, "no_subscriber_policy"),
+        ({"orphan_replay_policy": "all"}, "orphan_replay_policy"),
+        ({"no_subscriber_wait_timeout_seconds": 0}, "no_subscriber_wait_timeout_seconds"),
+        (
+            {"no_subscriber_wait_timeout_seconds": float("inf")},
+            "no_subscriber_wait_timeout_seconds",
+        ),
+        (
+            {"no_subscriber_wait_poll_interval_ms": float("nan")},
+            "no_subscriber_wait_poll_interval_ms",
+        ),
+        ({"no_subscriber_wait_poll_interval_ms": -1}, "no_subscriber_wait_poll_interval_ms"),
+        ({"orphan_retention_seconds": True}, "orphan_retention_seconds"),
+        ({"orphan_retention_seconds": 0}, "orphan_retention_seconds"),
+    ],
+)
+def test_broker_rejects_invalid_policy_options(kwargs: dict[str, Any], option_name: str) -> None:
+    from modulith import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match=option_name):
+        DatabaseBroker(engine=object(), **kwargs)
+
+
+@pytest.mark.parametrize(
+    "expected_groups",
+    [
+        [],
+        {"": ["group-a"]},
+        {"target-a": []},
+        {"target-a": [""]},
+        {"target-a": ["group-a", 3]},
+    ],
+)
+def test_broker_rejects_invalid_expected_consumer_groups(expected_groups: Any) -> None:
+    from modulith import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="expected_consumer_groups"):
+        DatabaseBroker(engine=object(), expected_consumer_groups=expected_groups)
+
+
+def _consumer_with_options(**options: Any) -> DatabaseConsumer:
+    return DatabaseConsumer(
+        broker=DatabaseBroker(engine=object()),
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=["fakeapp.orders.WidgetCreated"],
+        **options,
+    )
+
+
+@pytest.mark.parametrize(
+    ("options", "option_name"),
+    [
+        ({"poll_interval_s": 0}, "poll_interval_s"),
+        ({"poll_interval_s": float("inf")}, "poll_interval_s"),
+        ({"poll_interval_s": True}, "poll_interval_s"),
+        ({"reclaim_stale_seconds": 0}, "reclaim_stale_seconds"),
+        ({"reclaim_stale_seconds": float("nan")}, "reclaim_stale_seconds"),
+        ({"batch_size": 0}, "batch_size"),
+        ({"batch_size": True}, "batch_size"),
+        ({"batch_size": 1.0}, "batch_size"),
+        ({"max_attempts": 0}, "max_attempts"),
+        ({"max_attempts": True}, "max_attempts"),
+        ({"max_attempts": 1.0}, "max_attempts"),
+        ({"retention_age_seconds": 0}, "retention_age_seconds"),
+        ({"retention_age_seconds": float("inf")}, "retention_age_seconds"),
+        ({"retention_count": -1}, "retention_count"),
+        ({"retention_count": True}, "retention_count"),
+        ({"prune_interval_s": -1}, "prune_interval_s"),
+        ({"prune_interval_s": float("nan")}, "prune_interval_s"),
+        ({"prune_interval_s": True}, "prune_interval_s"),
+    ],
+)
+def test_consumer_rejects_invalid_numeric_options(
+    options: dict[str, Any], option_name: str
+) -> None:
+    from modulith import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match=option_name):
+        _consumer_with_options(**options)
+
+
+def test_consumer_accepts_documented_numeric_boundaries() -> None:
+    consumer = _consumer_with_options(
+        batch_size=1,
+        max_attempts=1,
+        retention_count=0,
+        prune_interval_s=0,
+    )
+
+    assert consumer._batch_size == 1
+    assert consumer._max_attempts == 1
+    assert consumer._retention_count == 0
+    assert consumer._prune_interval_s == 0
 
 
 # ---------------------------------------------------------------------------
@@ -560,7 +970,281 @@ async def test_no_targets_start_is_noop(engine: Any) -> None:
     )
     await consumer.start()
     assert consumer._task is None
+    assert consumer.health() == ConsumerHealth(ready=True, status="ready")
     await consumer.stop()
+
+
+# ---------------------------------------------------------------------------
+# Consumer health
+# ---------------------------------------------------------------------------
+
+
+async def test_database_consumer_health_tracks_start_ready_and_stop(engine: Any) -> None:
+    class BlockingSubscribeBroker(DatabaseBroker):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.starting = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def subscribe(self, targets: Any, consumer_group: str) -> None:
+            self.starting.set()
+            await self.release.wait()
+            await super().subscribe(targets, consumer_group)
+
+    broker = BlockingSubscribeBroker(engine=engine)
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=["fakeapp.orders.WidgetCreated"],
+        poll_interval_s=0.01,
+    )
+    assert consumer.health() == ConsumerHealth(ready=False, status="stopped")
+
+    start_task = asyncio.create_task(consumer.start())
+    await broker.starting.wait()
+    assert consumer.health() == ConsumerHealth(ready=False, status="starting")
+
+    broker.release.set()
+    await start_task
+    assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+
+    await consumer.stop()
+    assert consumer.health() == ConsumerHealth(ready=False, status="stopped")
+
+
+async def test_database_consumer_health_reports_startup_failure(engine: Any) -> None:
+    class FailingSubscribeBroker(DatabaseBroker):
+        async def subscribe(self, targets: Any, consumer_group: str) -> None:
+            raise RuntimeError("subscription setup failed")
+
+    consumer = DatabaseConsumer(
+        broker=FailingSubscribeBroker(engine=engine),
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=["fakeapp.orders.WidgetCreated"],
+    )
+
+    with pytest.raises(RuntimeError, match="subscription setup failed"):
+        await consumer.start()
+
+    health = consumer.health()
+    assert health.ready is False
+    assert health.status == "failed"
+    assert health.detail == "subscription setup failed"
+
+
+async def test_database_consumer_health_reports_unexpected_task_exit(engine: Any) -> None:
+    consumer = DatabaseConsumer(
+        broker=DatabaseBroker(engine=engine),
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=["fakeapp.orders.WidgetCreated"],
+    )
+
+    async def crash() -> None:
+        raise RuntimeError("database poll loop crashed")
+
+    consumer._run = crash  # type: ignore[method-assign]
+    await consumer.start()
+
+    async def _failed() -> bool:
+        return consumer.health().status == "failed"
+
+    await _until_async(_failed)
+    health = consumer.health()
+    assert health.ready is False
+    assert health.detail == "database poll loop crashed"
+    await consumer.stop()
+
+
+async def test_database_consumer_write_failures_recover_independently(engine: Any) -> None:
+    class CompletionFlakyBroker(DatabaseBroker):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.failures = {"ack", "fail", "dead_letter"}
+            self.claim_started = asyncio.Event()
+            self.allow_claim = asyncio.Event()
+
+        async def claim_batch(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            self.claim_started.set()
+            await self.allow_claim.wait()
+            return await super().claim_batch(*args, **kwargs)
+
+        async def ack(self, row_id: str, *, consumer_name: str) -> None:
+            if "ack" in self.failures:
+                raise RuntimeError("ack unavailable")
+            await super().ack(row_id, consumer_name=consumer_name)
+
+        async def fail(
+            self,
+            row_id: str,
+            error: str,
+            *,
+            consumer_name: str,
+            max_attempts: int,
+        ) -> None:
+            if "fail" in self.failures:
+                raise RuntimeError("fail unavailable")
+            await super().fail(
+                row_id,
+                error,
+                consumer_name=consumer_name,
+                max_attempts=max_attempts,
+            )
+
+        async def dead_letter(
+            self,
+            row_id: str,
+            reason: str,
+            *,
+            consumer_name: str,
+        ) -> None:
+            if "dead_letter" in self.failures:
+                raise RuntimeError("dead-letter unavailable")
+            await super().dead_letter(row_id, reason, consumer_name=consumer_name)
+
+    class ObservedConsumer(DatabaseConsumer):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.claim_recovered = asyncio.Event()
+
+        def _mark_broker_recovered(self, operation: str, target: str) -> None:
+            super()._mark_broker_recovered(operation, target)
+            if operation == "claim":
+                self.claim_recovered.set()
+
+    listener_fails = False
+
+    async def handler(_event: WidgetCreated) -> None:
+        if listener_fails:
+            raise RuntimeError("listener unavailable")
+
+    broker = CompletionFlakyBroker(engine=engine)
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+    target = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    consumer = ObservedConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=[target],
+    )
+    valid_row = {
+        "id": "ack-row",
+        "target": target,
+        "event_type": target,
+        "payload": serializer.serialize(WidgetCreated(name="w1")),
+        "attempts": 0,
+    }
+    poison_row = {
+        "id": "dead-row",
+        "target": target,
+        "event_type": None,
+        "payload": b"{}",
+        "attempts": 0,
+    }
+
+    await consumer.start()
+    try:
+        await broker.claim_started.wait()
+        await consumer._dispatch_one(valid_row)
+
+        listener_fails = True
+        with pytest.raises(RuntimeError, match="fail unavailable"):
+            await consumer._dispatch_one({**valid_row, "id": "fail-row"})
+        with pytest.raises(RuntimeError, match="dead-letter unavailable"):
+            await consumer._dispatch_one(poison_row)
+        assert consumer.health().status == "degraded"
+
+        # A healthy claim is unrelated to the failed completion writes.
+        broker.allow_claim.set()
+        await consumer.claim_recovered.wait()
+        assert consumer.health().status == "degraded"
+
+        broker.failures.remove("ack")
+        listener_fails = False
+        await consumer._dispatch_one({**valid_row, "id": "ack-recovery"})
+        assert consumer.health().status == "degraded"
+
+        broker.failures.remove("fail")
+        listener_fails = True
+        await consumer._dispatch_one({**valid_row, "id": "fail-recovery"})
+        assert consumer.health().status == "degraded"
+
+        broker.failures.remove("dead_letter")
+        await consumer._dispatch_one({**poison_row, "id": "dead-recovery"})
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+    finally:
+        await consumer.stop()
+
+
+async def test_database_consumer_health_recovery_is_scoped_to_target(engine: Any) -> None:
+    class TargetFlakyBroker(DatabaseBroker):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.fail_acks = True
+
+        async def ack(self, row_id: str, *, consumer_name: str) -> None:
+            if self.fail_acks:
+                raise RuntimeError("ack unavailable")
+            await super().ack(row_id, consumer_name=consumer_name)
+
+    async def handler(_event: WidgetCreated) -> None:
+        pass
+
+    broker = TargetFlakyBroker(engine=engine)
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+    event_type = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=["target-a", "target-b"],
+    )
+    run_blocker = asyncio.Event()
+
+    async def blocked_run() -> None:
+        await run_blocker.wait()
+
+    consumer._run = blocked_run  # type: ignore[method-assign]
+
+    def row(row_id: str, target: str) -> dict[str, Any]:
+        return {
+            "id": row_id,
+            "target": target,
+            "event_type": event_type,
+            "payload": serializer.serialize(WidgetCreated(name=row_id)),
+            "attempts": 0,
+        }
+
+    await consumer.start()
+    try:
+        await consumer._dispatch_one(row("a-failure", "target-a"))
+        assert consumer.health().status == "degraded"
+
+        # A successful ACK for target B must not hide target A's failure.
+        broker.fail_acks = False
+        await consumer._dispatch_one(row("b-success", "target-b"))
+        assert consumer.health().status == "degraded"
+
+        await consumer._dispatch_one(row("a-recovery", "target-a"))
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+    finally:
+        await consumer.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +1362,202 @@ def test_register_brokers_registers_when_configured(make_fake_app: Any) -> None:
     registry = BrokerRegistry()
     modulith_register_brokers(registry=registry)
     assert "database" in registry.schemes()
+
+
+def test_register_broker_reads_policy_options(make_fake_app: Any) -> None:
+    make_fake_app({"orders": ""})
+    from modulith import configure
+
+    expected_groups = {"fakeapp.orders.WidgetCreated": ["inventory", "billing"]}
+    configure(
+        package="fakeapp",
+        broker="database",
+        broker_options={
+            "url": "sqlite+aiosqlite:///:memory:",
+            "no_subscriber_policy": "wait",
+            "no_subscriber_wait_timeout_seconds": 2.5,
+            "no_subscriber_wait_poll_interval_ms": 25,
+            "orphan_replay_policy": "first_groups",
+            "orphan_retention_seconds": 90,
+            "expected_consumer_groups": expected_groups,
+        },
+    )
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.broker_registry is not None
+    broker = _runtime.broker_registry.get("database")
+    assert isinstance(broker, DatabaseBroker)
+    assert broker._no_subscriber_policy == "wait"
+    assert broker._no_subscriber_wait_timeout_s == 2.5
+    assert broker._no_subscriber_wait_poll_interval_s == 0.025
+    assert broker._orphan_replay_policy == "first_groups"
+    assert broker._orphan_retention_seconds == 90.0
+    assert broker._expected_consumer_groups == expected_groups
+
+
+def test_policy_env_options_override_broker_options(make_fake_app: Any, monkeypatch: Any) -> None:
+    make_fake_app({"orders": ""})
+    from modulith import configure
+
+    monkeypatch.setenv("MODULITH_BROKER_NO_SUBSCRIBER_POLICY", "wait")
+    monkeypatch.setenv("MODULITH_BROKER_NO_SUBSCRIBER_WAIT_TIMEOUT_SECONDS", "3.5")
+    monkeypatch.setenv("MODULITH_BROKER_NO_SUBSCRIBER_WAIT_POLL_INTERVAL_MS", "40")
+    monkeypatch.setenv("MODULITH_BROKER_ORPHAN_REPLAY_POLICY", "expected_groups")
+    monkeypatch.setenv("MODULITH_BROKER_ORPHAN_RETENTION_SECONDS", "120")
+    monkeypatch.setenv(
+        "MODULITH_BROKER_EXPECTED_CONSUMER_GROUPS",
+        '{"fakeapp.orders.WidgetCreated":["inventory"]}',
+    )
+    configure(
+        package="fakeapp",
+        broker="database",
+        broker_options={
+            "url": "sqlite+aiosqlite:///:memory:",
+            "no_subscriber_policy": "error",
+            "no_subscriber_wait_timeout_seconds": 30,
+            "no_subscriber_wait_poll_interval_ms": 100,
+            "orphan_replay_policy": "ttl_all_groups",
+            "orphan_retention_seconds": 86400,
+            "expected_consumer_groups": {"ignored": ["ignored"]},
+        },
+    )
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.broker_registry is not None
+    broker = _runtime.broker_registry.get("database")
+    assert isinstance(broker, DatabaseBroker)
+    assert broker._no_subscriber_policy == "wait"
+    assert broker._no_subscriber_wait_timeout_s == 3.5
+    assert broker._no_subscriber_wait_poll_interval_s == 0.04
+    assert broker._orphan_replay_policy == "expected_groups"
+    assert broker._orphan_retention_seconds == 120.0
+    assert broker._expected_consumer_groups == {"fakeapp.orders.WidgetCreated": ["inventory"]}
+
+
+@pytest.mark.parametrize(
+    "invalid_option",
+    [
+        {"no_subscriber_policy": "drop"},
+        {"no_subscriber_wait_timeout_seconds": 0},
+        {"no_subscriber_wait_poll_interval_ms": 0},
+        {"orphan_replay_policy": "all"},
+        {"orphan_retention_seconds": 0},
+        {"expected_consumer_groups": {"target": []}},
+    ],
+)
+def test_register_broker_rejects_invalid_policy_config(
+    make_fake_app: Any, invalid_option: dict[str, Any]
+) -> None:
+    make_fake_app({"orders": ""})
+    from modulith import ConfigurationError, configure
+
+    configure(
+        package="fakeapp",
+        broker="database",
+        broker_options={
+            "url": "sqlite+aiosqlite:///:memory:",
+            **invalid_option,
+        },
+    )
+
+    with pytest.raises(ConfigurationError):
+        _runtime.ensure_bootstrapped()
+
+
+def test_expected_consumer_groups_env_requires_valid_json(
+    make_fake_app: Any, monkeypatch: Any
+) -> None:
+    make_fake_app({"orders": ""})
+    from modulith import ConfigurationError, configure
+
+    monkeypatch.setenv("MODULITH_BROKER_EXPECTED_CONSUMER_GROUPS", "not-json")
+    configure(
+        package="fakeapp",
+        broker="database",
+        broker_options={"url": "sqlite+aiosqlite:///:memory:"},
+    )
+
+    with pytest.raises(ConfigurationError, match="EXPECTED_CONSUMER_GROUPS"):
+        _runtime.ensure_bootstrapped()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "sqlite+aiosqlite://",
+        "sqlite://",
+        "sqlite+aiosqlite:///:memory:",
+        "sqlite+aiosqlite:///file::memory:?cache=shared&uri=true",
+        "sqlite+aiosqlite:///file:shared_mem?mode=memory&cache=shared&uri=true",
+    ],
+)
+def test_process_topology_rejects_all_in_memory_sqlite_urls(make_fake_app: Any, url: str) -> None:
+    make_fake_app({"orders": ""})
+    from modulith import ConfigurationError, configure
+
+    configure(
+        package="fakeapp",
+        topology="processes",
+        broker="database",
+        broker_options={"url": url},
+    )
+
+    with pytest.raises(
+        ConfigurationError,
+        match=r"in-memory SQLite.*topology='processes'",
+    ):
+        _runtime.ensure_bootstrapped()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "sqlite+aiosqlite:///./broker.db",
+        "sqlite+aiosqlite:////tmp/modulith-broker.db",
+        "sqlite+aiosqlite:///file:broker.db?mode=rwc&uri=true",
+    ],
+)
+def test_process_topology_allows_file_backed_sqlite_urls(make_fake_app: Any, url: str) -> None:
+    make_fake_app({"orders": ""})
+    from modulith import configure
+
+    configure(
+        package="fakeapp",
+        topology="processes",
+        broker="database",
+        broker_options={"url": url},
+    )
+
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.broker_registry is not None
+    assert "database" in _runtime.broker_registry.schemes()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "sqlite+aiosqlite://",
+        "sqlite+aiosqlite:///:memory:",
+        "sqlite+aiosqlite:///file::memory:?cache=shared&uri=true",
+        "sqlite+aiosqlite:///file:shared_mem?mode=memory&cache=shared&uri=true",
+    ],
+)
+def test_single_topology_allows_in_memory_sqlite_urls(make_fake_app: Any, url: str) -> None:
+    make_fake_app({"orders": ""})
+    from modulith import configure
+
+    configure(
+        package="fakeapp",
+        topology="single",
+        broker="database",
+        broker_options={"url": url},
+    )
+
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.broker_registry is not None
+    assert "database" in _runtime.broker_registry.schemes()
 
 
 def test_runtime_bootstrap_registers_db_consumer_factory(make_fake_app: Any) -> None:
@@ -965,6 +1845,55 @@ def test_make_db_consumer_uses_defaults_when_unconfigured(make_fake_app: Any) ->
     assert consumer._reclaim_stale_seconds == _DEFAULT_RECLAIM_STALE_S
     assert consumer._max_attempts == _MAX_DELIVERY_ATTEMPTS
     assert consumer._prune_enabled() is False
+
+
+@pytest.mark.parametrize(
+    "invalid_option",
+    [
+        {"poll_interval_ms": 0},
+        {"poll_interval_ms": True},
+        {"reclaim_stale_seconds": float("inf")},
+        {"reclaim_stale_seconds": True},
+        {"batch_size": True},
+        {"batch_size": 1.5},
+        {"max_delivery_attempts": True},
+        {"retention_age_seconds": 0},
+        {"retention_age_seconds": True},
+        {"retention_count": True},
+        {"prune_interval_seconds": -1},
+        {"prune_interval_seconds": True},
+    ],
+)
+def test_make_db_consumer_rejects_invalid_numeric_config(
+    make_fake_app: Any, invalid_option: dict[str, Any]
+) -> None:
+    make_fake_app({"orders": ""})
+    from modulith import ConfigurationError, configure
+
+    configure(
+        package="fakeapp",
+        broker="database",
+        broker_options={
+            "url": "sqlite+aiosqlite:///:memory:",
+            **invalid_option,
+        },
+    )
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.broker_registry is not None
+    spec = ConsumerSpec(
+        scheme="database",
+        module_name="inventory",
+        group="modulith-inventory",
+        consumer_name="inventory:1",
+        targets=("fakeapp.orders.WidgetCreated",),
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        broker_registry=_runtime.broker_registry,
+    )
+
+    with pytest.raises(ConfigurationError):
+        _make_db_consumer(spec)
 
 
 # ---------------------------------------------------------------------------
@@ -1376,11 +2305,14 @@ def test_make_db_consumer_reads_reclaim_and_max_attempts(make_fake_app: Any) -> 
 
 
 class _RaceConn:
-    def __init__(self, error_text: str | None) -> None:
+    def __init__(self, error_text: str | None, *, persistent: bool = False) -> None:
         self._error_text = error_text
+        self._persistent = persistent
+        self.run_sync_calls = 0
 
     async def run_sync(self, _fn: Any) -> None:
-        if self._error_text is not None:
+        self.run_sync_calls += 1
+        if self._error_text is not None and (self._persistent or self.run_sync_calls == 1):
             from sqlalchemy.exc import OperationalError
 
             raise OperationalError("CREATE TABLE ...", {}, Exception(self._error_text))
@@ -1401,8 +2333,8 @@ class _SchemaRaceEngine:
     """Minimal async-engine stand-in whose create_all (run_sync) raises a
     chosen DDL error — for deterministically exercising the schema-race path."""
 
-    def __init__(self, *, error_text: str | None) -> None:
-        self._conn = _RaceConn(error_text)
+    def __init__(self, *, error_text: str | None, persistent: bool = False) -> None:
+        self._conn = _RaceConn(error_text, persistent=persistent)
 
     def begin(self) -> _RaceBegin:
         return _RaceBegin(self._conn)
@@ -1423,12 +2355,30 @@ def test_is_already_exists_matches_concurrent_create_errors() -> None:
 
 async def test_ensure_schema_tolerates_concurrent_create() -> None:
     """A peer that wins the CREATE race leaves us an 'already exists' error;
-    the schema IS present, so _ensure_schema swallows it and marks ready."""
+    a second create_all pass verifies every required table before marking ready."""
     broker = DatabaseBroker(
         engine=_SchemaRaceEngine(error_text="table broker_message already exists")
     )
     await broker._ensure_schema()  # must not raise
+    assert broker._engine._conn.run_sync_calls == 2
     assert broker._schema_ready is True
+
+
+async def test_ensure_schema_never_marks_ready_when_reconciliation_fails() -> None:
+    from sqlalchemy.exc import OperationalError
+
+    broker = DatabaseBroker(
+        engine=_SchemaRaceEngine(
+            error_text="table broker_message already exists",
+            persistent=True,
+        )
+    )
+
+    with pytest.raises(OperationalError):
+        await broker._ensure_schema()
+
+    assert broker._engine._conn.run_sync_calls == 2
+    assert broker._schema_ready is False
 
 
 async def test_ensure_schema_propagates_other_ddl_errors() -> None:
@@ -1537,12 +2487,20 @@ async def test_run_survives_claim_failure_and_retries(engine: Any) -> None:
     )
     await consumer.start()
     try:
+
+        async def _degraded() -> bool:
+            return consumer.health().status == "degraded"
+
+        await _until_async(_degraded)
+        assert consumer.health().detail == "transient claim failure"
+
         await broker.publish(
             target, serializer.serialize(WidgetCreated(name="w1")), {"event_type": target}
         )
         await _until_async(lambda: _delivered(delivered))
         assert delivered == ["w1"]
         assert broker.claim_calls >= 2  # failed once, retried, then delivered
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
     finally:
         await consumer.stop()
 

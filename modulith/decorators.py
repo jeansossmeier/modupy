@@ -19,6 +19,7 @@ Everything else (plugins, hooks, protocols) is for adapter authors.
 
 from __future__ import annotations
 
+import functools
 import inspect
 from collections.abc import Callable
 from typing import Any, TypeVar
@@ -141,7 +142,32 @@ def _resolve_event_type(func: Callable[..., Any], target: Callable[..., Any]) ->
     return annotation
 
 
-def listener(func: F) -> F:
+def _normalize_listener_targets(targets: object) -> tuple[str, ...]:
+    """Validate static broker targets attached to a listener."""
+    if isinstance(targets, str) or not isinstance(targets, list | tuple):
+        raise TypeError("broker_targets must be a list or tuple of 'scheme:destination' strings")
+
+    normalized: list[str] = []
+    for target in targets:
+        if type(target) is not str:
+            raise TypeError(
+                f"broker_targets must contain only 'scheme:destination' strings; got {target!r}"
+            )
+        scheme, separator, destination = target.partition(":")
+        if not separator or not scheme.strip() or not destination.strip():
+            raise TypeError(
+                "broker_targets must contain non-empty 'scheme:destination' "
+                f"strings; got {target!r}"
+            )
+        normalized.append(f"{scheme.strip()}:{destination.strip()}")
+    return tuple(normalized)
+
+
+def listener(
+    func: F | None = None,
+    *,
+    broker_targets: list[str] | tuple[str, ...] = (),
+) -> Any:
     """Register a listener for a specific event type.
 
     The event type is inferred from the function's first argument
@@ -164,34 +190,40 @@ def listener(func: F) -> F:
     Errors in registration (missing annotation, etc.) raise TypeError
     with a message explaining what to fix.
     """
-    # Peel through functools.wraps chains so a @listener applied on top of
-    # another decorator (e.g. timing, logging, cache wrappers) still detects
-    # the underlying coroutine correctly. inspect.iscoroutinefunction does
-    # NOT follow __wrapped__ in stdlib; doing it explicitly avoids false
-    # rejection of legitimately-async listeners.
-    unwrapped = inspect.unwrap(func)
-    is_async = inspect.iscoroutinefunction(unwrapped)
+    normalized_targets = _normalize_listener_targets(broker_targets)
 
-    # Pull the event type from the first positional parameter's annotation,
-    # resolving PEP 563 string annotations. Use the unwrapped function for sync
-    # handlers so functools.wraps chains don't hide the parameter list.
-    event_type = _resolve_event_type(func, func if is_async else unwrapped)
+    def register(handler: F) -> F:
+        # functools.wraps chains can hide an async target behind a sync wrapper.
+        unwrapped = inspect.unwrap(handler)
+        target_is_async = inspect.iscoroutinefunction(unwrapped)
+        event_type = _resolve_event_type(handler, unwrapped)
+        registered: Callable[..., Any]
 
-    if is_async:
-        # Async handler: register as-is.
-        _runtime.register_listener(event_type, func)
-    else:
-        # Sync handler: wrap for executor dispatch and register the wrapper.
-        # We return the original func so the user's variable stays sync and
-        # is directly testable without going through the async machinery.
-        from .sync import wrap_sync_listener
+        if target_is_async and inspect.iscoroutinefunction(handler):
+            registered = handler
+        elif target_is_async:
 
-        wrapped = wrap_sync_listener(func)
-        _runtime.register_listener(event_type, wrapped)
+            @functools.wraps(handler)
+            async def async_adapter(*args: Any, **kwargs: Any) -> Any:
+                result = handler(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    return await result
+                return result
 
-    # The runtime queues this if bootstrap hasn't happened yet, registers
-    # it directly otherwise. Either way, the listener is wired correctly.
-    return func
+            async_adapter.__modulith_sync_wrapped__ = handler  # type: ignore[attr-defined]
+            registered = async_adapter
+        else:
+            from .sync import wrap_sync_listener
+
+            registered = wrap_sync_listener(handler)
+
+        registered.__modulith_broker_targets__ = normalized_targets  # type: ignore[union-attr]
+        _runtime.register_listener(event_type, registered)
+        return handler
+
+    if func is None:
+        return register
+    return register(func)
 
 
 def bootstrap() -> None:

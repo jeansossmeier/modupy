@@ -31,7 +31,6 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.background import BackgroundTask
 
 logger = logging.getLogger("modulith.proxy")
 DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
@@ -65,12 +64,18 @@ def create_proxy_app(
     client: Any | None = None,
     max_request_body_bytes: int | None = DEFAULT_MAX_REQUEST_BODY_BYTES,
     actuator_token: str | None = None,
+    actuator_enabled: bool = True,
 ) -> FastAPI:
     """Build the reverse-proxy ASGI app.
 
     ``client`` (an ``httpx.AsyncClient``) may be injected — for tests, or to
     share a connection pool. When omitted, one is created and closed with the
     app's lifespan.
+
+    ``actuator_enabled=False`` (``actuator_mode="disabled"``, resolved by
+    ``run_supervised``) unmounts ``/_modulith/*`` entirely — those paths fall
+    through to the catch-all proxy handler and answer the same 404 as any
+    other unmatched path, so the actuator's existence isn't even revealed.
     """
     owns_client = client is None
     http_client: Any = client if client is not None else httpx.AsyncClient()
@@ -96,32 +101,57 @@ def create_proxy_app(
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
 
     # Actuator routes are registered before the catch-all so they win for
-    # /_modulith/* paths.
-    @app.get("/_modulith/topology", response_model=None)
-    async def topology(request: Request) -> dict[str, Any] | JSONResponse:
-        denied = _actuator_auth_response(request)
-        if denied is not None:
-            return denied
-        return {"routes": [{"prefix": r.prefix, "backend": r.backend_url} for r in rules]}
+    # /_modulith/* paths. Skipped entirely when disabled — see docstring.
+    if actuator_enabled:
 
-    @app.get("/_modulith/health", response_model=None)
-    async def health(request: Request) -> dict[str, Any] | JSONResponse:
-        denied = _actuator_auth_response(request)
-        if denied is not None:
-            return denied
+        @app.get("/_modulith/topology", response_model=None)
+        async def topology(request: Request) -> dict[str, Any] | JSONResponse:
+            denied = _actuator_auth_response(request)
+            if denied is not None:
+                return denied
+            return {"routes": [{"prefix": r.prefix, "backend": r.backend_url} for r in rules]}
 
-        async def check_one(rule: RoutingRule) -> tuple[str, str]:
-            try:
-                resp = await http_client.get(rule.backend_url + "/health", timeout=2.0)
-                return rule.prefix, "ok" if resp.status_code == 200 else "unhealthy"
-            except Exception:
-                return rule.prefix, "unreachable"
+        @app.get("/_modulith/live", response_model=None)
+        async def live(request: Request) -> dict[str, Any] | JSONResponse:
+            """Liveness: this proxy process is up and serving requests.
 
-        # Concurrent fan-out: total latency ~max(per-backend latency), not
-        # the sum — a sequential loop scales O(N * per-backend timeout).
-        backends = dict(await asyncio.gather(*(check_one(rule) for rule in rules)))
-        overall = "ok" if all(state == "ok" for state in backends.values()) else "degraded"
-        return {"status": overall, "backends": backends}
+            Deliberately independent of backend reachability — an
+            orchestrator must not restart the healthy proxy process just
+            because one worker is degraded; that's what readiness
+            (``/_modulith/health``) is for.
+            """
+            denied = _actuator_auth_response(request)
+            if denied is not None:
+                return denied
+            return {"status": "ok"}
+
+        @app.get("/_modulith/health", response_model=None)
+        async def health(request: Request) -> dict[str, Any] | JSONResponse:
+            """Readiness: aggregates every worker's own ``/health``.
+
+            Returns 503 when any backend is unhealthy/unreachable — a
+            standard readiness contract (orchestrators stop routing traffic
+            to a 503 instance) that a constant 200 could never express.
+            """
+            denied = _actuator_auth_response(request)
+            if denied is not None:
+                return denied
+
+            async def check_one(rule: RoutingRule) -> tuple[str, str]:
+                try:
+                    resp = await http_client.get(rule.backend_url + "/health", timeout=2.0)
+                    return rule.prefix, "ok" if resp.status_code == 200 else "unhealthy"
+                except Exception:
+                    return rule.prefix, "unreachable"
+
+            # Concurrent fan-out: total latency ~max(per-backend latency), not
+            # the sum — a sequential loop scales O(N * per-backend timeout).
+            backends = dict(await asyncio.gather(*(check_one(rule) for rule in rules)))
+            overall = "ok" if all(state == "ok" for state in backends.values()) else "degraded"
+            body = {"status": overall, "backends": backends}
+            if overall != "ok":
+                return JSONResponse(body, status_code=503)
+            return body
 
     @app.api_route(
         "/{path:path}",
@@ -134,9 +164,18 @@ def create_proxy_app(
                 {"detail": f"no worker route for {request.url.path!r}"}, status_code=404
             )
 
-        upstream = rule.backend_url + request.url.path
-        if request.url.query:
-            upstream += "?" + request.url.query
+        # scope["raw_path"]/["query_string"] carry the exact bytes the client
+        # sent, still percent-encoded. request.url.path/.query are built from
+        # scope["path"] — already percent-*decoded* per the ASGI spec — so an
+        # encoded separator inside a segment (e.g. "%2F" meaning a literal
+        # slash within one segment, not a path boundary) would be silently
+        # turned into a real "/" and change how many segments the upstream
+        # sees. Forwarding the raw bytes preserves the client's exact request.
+        raw_path = request.scope.get("raw_path") or request.url.path.encode("utf-8")
+        upstream = rule.backend_url + raw_path.decode("latin-1")
+        query_string = request.scope.get("query_string", b"")
+        if query_string:
+            upstream += "?" + query_string.decode("latin-1")
 
         too_large = _body_too_large(request, max_request_body_bytes)
         if too_large is not None:
@@ -154,12 +193,16 @@ def create_proxy_app(
                 return JSONResponse({"detail": "request body too large"}, status_code=413)
             chunks.append(chunk)
         body = b"".join(chunks)
-        fwd_headers = _filter_headers(dict(request.headers))
+        # Build from .raw (a list, not a dict) so a client sending the same
+        # header twice (e.g. two Cookie lines, or multi-valued
+        # X-Forwarded-For) forwards both — dict(request.headers) keeps only
+        # one of any repeated name and silently drops the rest.
+        fwd_headers = _filter_headers(_header_pairs(request.headers.raw))
         # Drop the client's Host so httpx sets it to the loopback worker's
         # authority. Forwarding the external Host (e.g. api.example.com) makes
         # workers behave as if internet-facing for URL generation / vhost /
         # Host-allowlist logic — a reverse-proxy correctness/security smell.
-        fwd_headers.pop("host", None)
+        fwd_headers = [(k, v) for k, v in fwd_headers if k.lower() != "host"]
         try:
             upstream_req = http_client.build_request(
                 method=request.method,
@@ -211,12 +254,19 @@ def create_proxy_app(
             )
             return JSONResponse({"detail": "backend error"}, status_code=502)
 
-        return StreamingResponse(
+        response = StreamingResponse(
             _safe_stream(upstream_resp, _without_query(upstream)),
             status_code=upstream_resp.status_code,
-            headers=_filter_headers(dict(upstream_resp.headers)),
-            background=BackgroundTask(upstream_resp.aclose),
         )
+        # Passing headers= to StreamingResponse builds a plain dict internally
+        # (Response.init_headers), which loses duplicates the same way as on
+        # the request side (e.g. multiple Set-Cookie). Setting raw_headers
+        # directly after construction preserves every occurrence.
+        response.raw_headers = [
+            (k.lower().encode("latin-1"), v.encode("latin-1"))
+            for k, v in _filter_headers(_header_pairs(upstream_resp.headers.raw))
+        ]
+        return response
 
     return app
 
@@ -240,9 +290,32 @@ HOP_BY_HOP_HEADERS = frozenset(
 )
 
 
-def _filter_headers(headers: dict[str, str]) -> dict[str, str]:
-    """Strip hop-by-hop headers before forwarding."""
-    return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
+def _header_pairs(raw: list[tuple[bytes, bytes]]) -> list[tuple[str, str]]:
+    """Decode a raw ASGI/httpx header list into (name, value) pairs.
+
+    Kept as a list (not a dict) so repeated header names survive — building
+    a dict from an iterable of pairs keeps only one occurrence per key.
+    """
+    return [(k.decode("latin-1"), v.decode("latin-1")) for k, v in raw]
+
+
+def _filter_headers(headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Strip hop-by-hop headers (RFC 7230 §6.1) before forwarding.
+
+    Beyond the fixed well-known set, RFC 7230 requires treating any header
+    *named inside a Connection header's value* as connection-specific for
+    that hop too (e.g. ``Connection: X-Custom-Header``) — those names are
+    only meaningful to this hop and must not be forwarded either.
+    """
+    connection_named = {
+        token.strip().lower()
+        for name, value in headers
+        if name.lower() == "connection"
+        for token in value.split(",")
+        if token.strip()
+    }
+    drop = HOP_BY_HOP_HEADERS | connection_named
+    return [(k, v) for k, v in headers if k.lower() not in drop]
 
 
 def _body_too_large(request: Request, limit: int | None) -> JSONResponse | None:
@@ -267,18 +340,27 @@ def _without_query(url: str) -> str:
 
 
 async def _safe_stream(resp: Any, upstream: str) -> AsyncIterator[bytes]:
-    """Stream the upstream body, swallowing a mid-response transport failure.
+    """Stream the upstream body; abort rather than fake a complete response.
 
-    Once headers are sent the status can't change, so a worker dying mid-stream
-    can't become a 502 — but it must not surface as an unhandled ASGI error
-    either. Log it and end the stream cleanly; the BackgroundTask still closes
-    the response.
+    Once headers are sent the status code can't change, so a worker dying
+    mid-stream can't become a 502 — but ending the stream "cleanly" here
+    would let the client believe it received a complete, successful 200 when
+    bytes are silently missing. Re-raising aborts the ASGI response instead
+    (the connection drops without a valid terminator), which is the only way
+    an HTTP client can detect the truncation.
+
+    Closes ``resp`` itself (not via a background task) — a re-raised
+    exception unwinds straight out of StreamingResponse.__call__, which only
+    runs its background task after the body iterator finishes normally.
     """
     try:
         async for chunk in resp.aiter_raw():
             yield chunk
     except httpx.TransportError as exc:
         logger.warning("backend stream interrupted for %s: %s", upstream, exc)
+        raise
+    finally:
+        await resp.aclose()
 
 
 __all__ = [

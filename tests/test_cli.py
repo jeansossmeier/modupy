@@ -561,6 +561,70 @@ def test_outbox_retry_dispatches_to_listener(make_fake_app, monkeypatch):
     assert store.pubs[pub.id].completed_at is not None
 
 
+class CappedScanStore(StubStore):
+    """A store with ``find_by_id`` whose ``find_incomplete`` always misses.
+
+    Simulates a real durable store's capped scan window (LIMIT 100): the
+    targeted publication sits further back in a large backlog, so
+    ``find_incomplete``/``list_dead_lettered`` return nothing for it, but the
+    dedicated ``find_by_id`` point lookup still finds it directly.
+    """
+
+    async def find_incomplete(self, older_than: timedelta) -> list[EventPublication]:
+        return []
+
+    async def find_by_id(self, publication_id: UUID) -> EventPublication | None:
+        return self.pubs.get(publication_id)
+
+
+def test_outbox_retry_uses_direct_lookup_outside_capped_scan_window(make_fake_app, monkeypatch):
+    """A9-r3-143 follow-through: `outbox retry` must use the store's
+    ``find_by_id`` direct point lookup — mirroring ``force_retry`` — rather
+    than only the capped ``find_incomplete``/``list_dead_lettered`` scan,
+    which can miss a targeted row further back in a large backlog."""
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event, listener
+
+                @event
+                @dataclass(frozen=True)
+                class Ping:
+                    value: str
+
+                seen = []
+
+                @listener
+                async def on_ping(evt: Ping) -> None:
+                    seen.append(evt)
+            """
+        }
+    )
+    from modulith.runtime import _runtime
+
+    _runtime.ensure_bootstrapped()
+    import fakeapp.orders as orders
+
+    store = CappedScanStore()
+    outbox.configure(store=store, serializer=JsonEventSerializer(), start_loop=False)
+    pub = EventPublication(
+        id=uuid4(),
+        payload=JsonEventSerializer().serialize(orders.Ping(value="x")),
+        event_type="fakeapp.orders.Ping",
+        listener=outbox._listener_id(orders.on_ping),
+        published_at=datetime.now(UTC),
+    )
+    store.pubs[pub.id] = pub
+
+    result = runner.invoke(app, ["outbox", "retry", str(pub.id)])
+
+    assert result.exit_code == 0, result.output
+    assert len(orders.seen) == 1
+    assert store.pubs[pub.id].completed_at is not None
+
+
 def test_outbox_dead_letter_lists_dead_publications(make_fake_app, monkeypatch):
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app({"orders": ""})
@@ -1099,4 +1163,56 @@ def test_docs_command_config_error_from_render_hook_is_clean_user_error(
     captured = capsys.readouterr()
     assert excinfo.value.code == 1  # user error, not internal (2)
     assert "duplicate module name" in captured.err
+
+
+def test_docs_output_dir_collides_with_file_is_clean_user_error(
+    make_fake_app, monkeypatch, capsys, tmp_path
+) -> None:
+    """`--output-dir` colliding with an existing file raises FileExistsError
+    from the generator's own ``mkdir`` — a filesystem/user error per the
+    documented exit codes, never the exit-2 traceback reserved for internal
+    bugs."""
+    import sys as _sys
+
+    import modulith.cli as cli
+
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    blocking_file = tmp_path / "gen-docs"
+    blocking_file.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setattr(_sys, "argv", ["modulith", "docs", "--output-dir", str(blocking_file)])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 1  # user/filesystem error, not internal (2)
+    assert "Traceback" not in captured.err
+
+
+def test_audit_unwritable_output_path_is_clean_user_error(
+    make_fake_app, monkeypatch, capsys, tmp_path
+) -> None:
+    """`audit --output` in a nonexistent directory raises FileNotFoundError
+    from ``Path.write_text`` — a filesystem/user error per the documented
+    exit codes, never the exit-2 traceback reserved for internal bugs."""
+    import sys as _sys
+
+    import modulith.cli as cli
+
+    app_dir = tmp_path / "myapp"
+    (app_dir / "orders").mkdir(parents=True)
+    (app_dir / "__init__.py").write_text("", encoding="utf-8")
+    (app_dir / "orders" / "__init__.py").write_text("", encoding="utf-8")
+    bad_output = tmp_path / "no_such_dir" / "report.md"
+    monkeypatch.setattr(
+        _sys, "argv", ["modulith", "audit", str(app_dir), "--output", str(bad_output)]
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 1  # user/filesystem error, not internal (2)
+    assert "Traceback" not in captured.err
     assert "Traceback" not in captured.err

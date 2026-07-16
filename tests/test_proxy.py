@@ -336,18 +336,19 @@ class _DiesMidStreamClient:
         pass
 
 
-def test_proxy_ends_stream_cleanly_when_backend_dies_mid_response(caplog) -> None:
-    """S3-r2-123: once headers are sent, a mid-stream TransportError cannot
-    become a 502 — the client must receive the 200 with the partial body and
-    no unhandled ASGI error, and the interruption must be logged."""
+def test_proxy_aborts_stream_when_backend_dies_mid_response(caplog) -> None:
+    """Task 7 (supersedes S3-r2-123): once headers are sent, a mid-stream
+    TransportError can't become a 502 — but silently ending the stream and
+    answering 200 with a partial body (the old behavior) fabricates a
+    successful response the client has no way to know is truncated. It must
+    instead abort the ASGI response so the connection drops without a valid
+    terminator — the only way an HTTP client can detect the truncation."""
     caplog.set_level("WARNING", logger="modulith.proxy")
     app = create_proxy_app(
         [RoutingRule("/orders", "http://orders-worker")], client=_DiesMidStreamClient()
     )
 
-    with TestClient(app) as client:
-        resp = client.get("/orders/ping")
+    with TestClient(app) as client, pytest.raises(httpx.RemoteProtocolError):
+        client.get("/orders/ping")
 
-    assert resp.status_code == 200
-    assert resp.content == b"partial-"
     assert "backend stream interrupted" in caplog.text

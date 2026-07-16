@@ -109,6 +109,26 @@ def _validate_module_names(modules: list[ModuleInfo]) -> None:
             "Canvas files are keyed by module name, so duplicates would "
             "silently overwrite each other — give each module a unique name."
         )
+
+    # Exact-match duplicates are caught above, but names differing only by
+    # case still collide on case-insensitive filesystems (macOS default,
+    # Windows) — <output_dir>/modules/Orders.md and modules/orders.md are
+    # the SAME file there, so one would silently overwrite the other.
+    names_by_casefold: dict[str, set[str]] = defaultdict(set)
+    for name in by_name:
+        names_by_casefold[name.casefold()].add(name)
+    colliding_groups = [names for names in names_by_casefold.values() if len(names) > 1]
+    if colliding_groups:
+        details = "; ".join(
+            f"{sorted(names)!r} (packages: "
+            f"{', '.join(pkg for name in sorted(names) for pkg in by_name[name])})"
+            for names in colliding_groups
+        )
+        raise ConfigurationError(
+            f"module name(s) differing only by case in documentation render: {details}. "
+            "Canvas file paths collide on case-insensitive filesystems — "
+            "give each module a name that is unique ignoring case."
+        )
     for module in modules:
         name = module.name
         if not name or name in (".", "..") or Path(name).name != name or "\\" in name:

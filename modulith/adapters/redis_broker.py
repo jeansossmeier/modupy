@@ -72,6 +72,7 @@ _DEFAULT_URL = "redis://localhost:6379"
 _DEFAULT_PREFIX = "modulith.events"
 _DEFAULT_GROUP = "modulith"
 _DEFAULT_MAXLEN = 10000
+_DLQ_DEDUP_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
 def _cursor_str(raw: Any) -> str:
@@ -253,6 +254,26 @@ class RedisStreamsBroker:
             cursor = next_cursor
         return (b"0-0", claimed, deleted)
 
+    async def delivery_attempts(
+        self, target: str, message_id: str, group: str | None = None
+    ) -> int | None:
+        """Read Redis's durable delivery count from the consumer-group PEL."""
+        stream = self._stream_name(target)
+        group_name = group or self._consumer_group
+        entries = await self._client.xpending_range(
+            stream, group_name, min=message_id, max=message_id, count=1
+        )
+        if not entries:
+            return None
+        entry = entries[0]
+        if isinstance(entry, dict):
+            entry_id = _cursor_str(entry["message_id"])
+            attempts = entry["times_delivered"]
+        else:
+            entry_id, _consumer, _idle, attempts = entry
+            entry_id = _cursor_str(entry_id)
+        return int(attempts) if entry_id == message_id else None
+
     async def dead_letter(
         self,
         target: str,
@@ -272,13 +293,38 @@ class RedisStreamsBroker:
         """
         stream = self._stream_name(target)
         group_name = group or self._consumer_group
-        # Bound the DLQ too (MAXLEN ~) — the adapter advertises bounded
-        # retention as a hardening property, and the .dead stream is the most
-        # likely to fill with unacked poison messages.
-        await self._client.xadd(
-            f"{stream}.dead", fields, maxlen=self._dlq_max_stream_len, approximate=True
+        # The append and ACK must be atomic: a client timeout between XADD and
+        # XACK used to produce a duplicate DLQ record on retry. The NX key uses
+        # the original stream/group/message identity and expires with the
+        # bounded forensic retention window.
+        dedup_key = f"{stream}.dead.dedup.{group_name}.{message_id}"
+        arguments: list[str | bytes | int] = [
+            group_name,
+            message_id,
+            self._dlq_max_stream_len,
+            "h:source_message_id",
+            message_id,
+            "h:source_group",
+            group_name,
+        ]
+        for key, value in fields.items():
+            arguments.extend((key, value))
+        await self._client.eval(
+            f"""
+            local created = redis.call('SET', KEYS[3], ARGV[2], 'NX', 'EX', {_DLQ_DEDUP_TTL_SECONDS})
+            if created then
+              local command = {{KEYS[2], 'MAXLEN', '~', ARGV[3], '*'}}
+              for index = 4, #ARGV do table.insert(command, ARGV[index]) end
+              redis.call('XADD', unpack(command))
+            end
+            return redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
+            """,
+            3,
+            stream,
+            f"{stream}.dead",
+            dedup_key,
+            *arguments,
         )
-        await self._client.xack(stream, group_name, message_id)
         logger.warning("dead-lettered message %s from stream %s", message_id, stream)
 
     async def close(self) -> None:
@@ -340,8 +386,10 @@ def _make_redis_consumer(spec: ConsumerSpec) -> Consumer:
     Redis client serves both halves — no second connection is opened here.
     """
     from .._consumer import BrokerConsumer
+    from ..runtime import _runtime
 
     broker = spec.broker_registry.get(spec.scheme)
+    options = _runtime.config.broker_options if _runtime.config is not None else {}
     return BrokerConsumer(
         broker=broker,
         bus=spec.bus,
@@ -349,6 +397,9 @@ def _make_redis_consumer(spec: ConsumerSpec) -> Consumer:
         consumer_name=spec.consumer_name,
         group=spec.group,
         targets=list(spec.targets),
+        poll_block_ms=options.get("poll_block_ms", 1000),
+        reclaim_min_idle_ms=options.get("reclaim_min_idle_ms", 60_000),
+        max_delivery_attempts=options.get("max_delivery_attempts", 5),
     )
 
 

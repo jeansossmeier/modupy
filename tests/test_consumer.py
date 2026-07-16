@@ -16,14 +16,16 @@ These tests drive the consumer half end-to-end:
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass
 from typing import Any
 
 import pytest
 
-from modulith import configure, event
+import modulith.manifest as manifest_module
+from modulith import Configuration, ConfigurationError, Manifest, configure, event
 from modulith._consumer import BrokerConsumer, consumer_targets
 from modulith.event_bus import InMemoryEventBus
+from modulith.protocols import Consumer, ConsumerHealth, HealthAwareConsumer
 from modulith.runtime import _runtime
 from modulith.serializers import JsonEventSerializer
 
@@ -193,6 +195,244 @@ def _make_consumer(broker: Any, bus: InMemoryEventBus, *, targets: list[str]) ->
 
 
 # ---------------------------------------------------------------------------
+# Consumer health
+# ---------------------------------------------------------------------------
+
+
+def test_consumer_health_is_immutable() -> None:
+    health = ConsumerHealth(ready=False, status="stopped")
+
+    with pytest.raises(FrozenInstanceError):
+        setattr(health, "status", "ready")  # noqa: B010
+
+
+def test_health_is_optional_for_consumer_protocol() -> None:
+    class LegacyConsumer:
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    consumer = LegacyConsumer()
+
+    assert isinstance(consumer, Consumer)
+    assert not isinstance(consumer, HealthAwareConsumer)
+
+
+@pytest.mark.asyncio
+async def test_broker_consumer_health_tracks_start_ready_and_stop() -> None:
+    class BlockingGroupBroker(FakeConsumerBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.starting = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def ensure_group(self, target: str, group: str | None = None) -> None:
+            self.starting.set()
+            await self.release.wait()
+            await super().ensure_group(target, group)
+
+    broker = BlockingGroupBroker()
+    consumer = _make_consumer(broker, InMemoryEventBus(), targets=["t"])
+    assert consumer.health() == ConsumerHealth(ready=False, status="stopped")
+
+    start_task = asyncio.create_task(consumer.start())
+    await broker.starting.wait()
+    assert consumer.health() == ConsumerHealth(ready=False, status="starting")
+
+    broker.release.set()
+    await start_task
+    assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+
+    await consumer.stop()
+    assert consumer.health() == ConsumerHealth(ready=False, status="stopped")
+
+
+@pytest.mark.asyncio
+async def test_broker_consumer_health_reports_startup_failure() -> None:
+    class FailingGroupBroker(FakeConsumerBroker):
+        async def ensure_group(self, target: str, group: str | None = None) -> None:
+            raise RuntimeError("group setup failed")
+
+    consumer = _make_consumer(FailingGroupBroker(), InMemoryEventBus(), targets=["t"])
+
+    with pytest.raises(RuntimeError, match="group setup failed"):
+        await consumer.start()
+
+    health = consumer.health()
+    assert health.ready is False
+    assert health.status == "failed"
+    assert health.detail == "group setup failed"
+
+
+@pytest.mark.asyncio
+async def test_broker_consumer_health_degrades_and_recovers_with_broker() -> None:
+    class FlakyReadBroker(FakeConsumerBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.read_calls = 0
+
+        async def read(self, *args: Any, **kwargs: Any) -> Any:
+            self.read_calls += 1
+            if self.read_calls == 1:
+                raise RuntimeError("broker unavailable")
+            return await super().read(*args, **kwargs)
+
+    broker = FlakyReadBroker()
+    consumer = _make_consumer(broker, InMemoryEventBus(), targets=["t"])
+    await consumer.start()
+    try:
+        await _until(lambda: consumer.health().status == "degraded")
+        degraded = consumer.health()
+        assert degraded.ready is False
+        assert degraded.detail == "broker unavailable"
+
+        await _until(lambda: broker.read_calls >= 2 and consumer.health().ready)
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+    finally:
+        await consumer.stop()
+
+
+@pytest.mark.asyncio
+async def test_broker_consumer_health_reports_unexpected_task_exit() -> None:
+    consumer = _make_consumer(FakeConsumerBroker(), InMemoryEventBus(), targets=["t"])
+
+    async def crash() -> None:
+        raise RuntimeError("poll loop crashed")
+
+    consumer._run = crash  # type: ignore[method-assign]
+    await consumer.start()
+    await _until(lambda: consumer.health().status == "failed")
+
+    health = consumer.health()
+    assert health.ready is False
+    assert health.detail == "poll loop crashed"
+    await consumer.stop()
+
+
+@pytest.mark.asyncio
+async def test_broker_consumer_completion_failures_recover_independently() -> None:
+    class CompletionFlakyBroker(FakeConsumerBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failures = {"ack", "dead_letter"}
+
+        async def ack(
+            self,
+            target: str,
+            message_id: str,
+            group: str | None = None,
+        ) -> None:
+            if "ack" in self.failures:
+                raise RuntimeError("ack unavailable")
+            await super().ack(target, message_id, group)
+
+        async def dead_letter(
+            self,
+            target: str,
+            message_id: str,
+            fields: dict[bytes, bytes],
+            group: str | None = None,
+        ) -> None:
+            if "dead_letter" in self.failures:
+                raise RuntimeError("dead-letter unavailable")
+            await super().dead_letter(target, message_id, fields, group)
+
+    async def handler(_event: CrossEvent) -> None:
+        pass
+
+    broker = CompletionFlakyBroker()
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    consumer = _make_consumer(broker, bus, targets=["t"])
+    run_blocker = asyncio.Event()
+
+    async def blocked_run() -> None:
+        await run_blocker.wait()
+
+    consumer._run = blocked_run  # type: ignore[method-assign]
+    event_type = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+    valid_fields = {
+        b"data": JsonEventSerializer().serialize(CrossEvent(value=1)),
+        b"h:event_type": event_type.encode(),
+    }
+    poison_fields = {b"data": b"{}"}
+
+    await consumer.start()
+    try:
+        await consumer._dispatch_one("t", b"1-0", valid_fields)
+        await consumer._dispatch_one("t", b"2-0", poison_fields)
+        assert consumer.health().status == "degraded"
+
+        # A healthy reclaim is unrelated to the failed completion writes.
+        await consumer._reclaim("t")
+        assert consumer.health().status == "degraded"
+
+        broker.failures.remove("ack")
+        await consumer._dispatch_one("t", b"3-0", valid_fields)
+        assert consumer.health().status == "degraded"
+
+        broker.failures.remove("dead_letter")
+        await consumer._dispatch_one("t", b"4-0", poison_fields)
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+    finally:
+        await consumer.stop()
+
+
+@pytest.mark.asyncio
+async def test_broker_consumer_health_recovery_is_scoped_to_target() -> None:
+    class TargetFlakyBroker(FakeConsumerBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failing_targets = {"target-a"}
+
+        async def ack(
+            self,
+            target: str,
+            message_id: str,
+            group: str | None = None,
+        ) -> None:
+            if target in self.failing_targets:
+                raise RuntimeError(f"ack unavailable for {target}")
+            await super().ack(target, message_id, group)
+
+    async def handler(_event: CrossEvent) -> None:
+        pass
+
+    broker = TargetFlakyBroker()
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    consumer = _make_consumer(broker, bus, targets=["target-a", "target-b"])
+    run_blocker = asyncio.Event()
+
+    async def blocked_run() -> None:
+        await run_blocker.wait()
+
+    consumer._run = blocked_run  # type: ignore[method-assign]
+    event_type = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+    fields = {
+        b"data": JsonEventSerializer().serialize(CrossEvent(value=1)),
+        b"h:event_type": event_type.encode(),
+    }
+
+    await consumer.start()
+    try:
+        await consumer._dispatch_one("target-a", b"1-0", fields)
+        assert consumer.health().status == "degraded"
+
+        # A successful ACK for target B must not hide target A's failure.
+        await consumer._dispatch_one("target-b", b"2-0", fields)
+        assert consumer.health().status == "degraded"
+
+        broker.failing_targets.remove("target-a")
+        await consumer._dispatch_one("target-a", b"3-0", fields)
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+    finally:
+        await consumer.stop()
+
+
+# ---------------------------------------------------------------------------
 # Headline: full producer → consumer round-trip, no Redis
 # ---------------------------------------------------------------------------
 
@@ -345,10 +585,41 @@ async def test_repeated_dispatch_failure_eventually_dead_letters() -> None:
 
 
 @pytest.mark.asyncio
+async def test_durable_delivery_attempts_survive_consumer_handoff() -> None:
+    """Redis delivery metadata, not a worker-local counter, owns the retry budget."""
+
+    class DurableAttemptsBroker(FakeConsumerBroker):
+        async def delivery_attempts(
+            self, target: str, message_id: str, group: str | None = None
+        ) -> int | None:
+            assert (target, message_id, group) == ("t", "7-0", "modulith-orders")
+            return 5
+
+    async def boom(evt: CrossEvent) -> None:
+        raise ValueError("listener down")
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, boom)
+    broker = DurableAttemptsBroker()
+    # This simulates the replacement worker after the original worker has
+    # already exhausted Redis's durable delivery count.
+    replacement = _make_consumer(broker, bus, targets=["t"])
+    fields = {
+        b"data": JsonEventSerializer().serialize(CrossEvent(value=1)),
+        b"h:event_type": f"{CrossEvent.__module__}.{CrossEvent.__qualname__}".encode(),
+    }
+
+    await replacement._dispatch_one("t", b"7-0", fields)
+
+    assert broker.dead == [("t", "7-0", fields)]
+
+
+@pytest.mark.asyncio
 async def test_start_is_noop_without_targets() -> None:
     broker = FakeConsumerBroker()
     consumer = _make_consumer(broker, InMemoryEventBus(), targets=[])
     await consumer.start()
+    assert consumer.health() == ConsumerHealth(ready=True, status="ready")
     await consumer.stop()
     # No groups created, no background task.
     assert broker.groups == []
@@ -360,8 +631,144 @@ def test_consumer_targets_are_fully_qualified_event_names() -> None:
     async def handler(evt: CrossEvent) -> None: ...
 
     bus.register(CrossEvent, handler)
-    targets = consumer_targets(bus)
+    cfg = Configuration(package="fakeapp", broker="redis-streams")
+    targets = consumer_targets(bus, cfg, "orders")
     assert targets == [f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"]
+
+
+@pytest.mark.parametrize(
+    ("subscription_source", "declared_target"),
+    [
+        ("manifest", "from.manifest"),
+        ("config", "from.config"),
+        ("listener", "from.listener"),
+    ],
+)
+def test_consumer_targets_use_only_configured_declaration_source(
+    subscription_source: str,
+    declared_target: str,
+) -> None:
+    class TargetedEvent:
+        __modulith_broker_target__ = "redis-streams:events.custom"
+
+    async def handler(evt: TargetedEvent) -> None: ...
+
+    handler.__modulith_broker_targets__ = ("redis-streams:from.listener",)  # type: ignore[attr-defined]
+    bus = InMemoryEventBus()
+    bus.register(TargetedEvent, handler)
+    manifest_module._manifests["fakeapp.orders"] = Manifest(  # type: ignore[attr-defined]
+        package="fakeapp.orders",
+        broker_targets=("redis-streams:from.manifest",),
+    )
+    cfg = Configuration(
+        package="fakeapp",
+        broker="redis-streams",
+        subscription_source=subscription_source,
+        subscriptions={"orders": ["redis-streams:from.config"]},
+    )
+
+    assert consumer_targets(bus, cfg, "orders") == [
+        "events.custom",
+        declared_target,
+    ]
+
+
+def test_consumer_targets_deduplicate_without_changing_order() -> None:
+    class FirstEvent:
+        __modulith_broker_target__ = "redis-streams:events.shared"
+
+    class SecondEvent:
+        pass
+
+    async def first_handler(evt: FirstEvent) -> None: ...
+
+    async def second_handler(evt: SecondEvent) -> None: ...
+
+    bus = InMemoryEventBus()
+    bus.register(FirstEvent, first_handler)
+    bus.register(SecondEvent, second_handler)
+    second_fqn = f"{SecondEvent.__module__}.{SecondEvent.__qualname__}"
+    cfg = Configuration(
+        package="fakeapp",
+        broker="redis-streams",
+        subscription_source="config",
+        subscriptions={
+            "orders": [
+                f"redis-streams:{second_fqn}",
+                "redis-streams:declared",
+                "redis-streams:events.shared",
+                "redis-streams:declared",
+            ]
+        },
+    )
+
+    assert consumer_targets(bus, cfg, "orders") == [
+        "events.shared",
+        second_fqn,
+        "declared",
+    ]
+
+
+def test_consumer_targets_strip_scheme_and_destination_whitespace() -> None:
+    manifest = Manifest(
+        package="fakeapp.orders",
+        broker_targets=(" redis-streams : events.orders ",),
+    )
+    manifest_module._manifests["fakeapp.orders"] = manifest  # type: ignore[attr-defined]
+    cfg = Configuration(
+        package="fakeapp",
+        broker="redis-streams",
+        subscription_source="manifest",
+    )
+
+    assert manifest.broker_targets == ("redis-streams:events.orders",)
+    assert consumer_targets(InMemoryEventBus(), cfg, "orders") == ["events.orders"]
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "kafka:orders",
+        "redis-streams:",
+        ":orders",
+        "orders",
+    ],
+)
+def test_consumer_targets_reject_wrong_or_malformed_static_target(target: str) -> None:
+    class TargetedEvent:
+        pass
+
+    TargetedEvent.__modulith_broker_target__ = target  # type: ignore[attr-defined]
+
+    async def handler(evt: TargetedEvent) -> None: ...
+
+    bus = InMemoryEventBus()
+    bus.register(TargetedEvent, handler)
+    cfg = Configuration(package="fakeapp", broker="redis-streams")
+
+    with pytest.raises(ConfigurationError, match="broker target"):
+        consumer_targets(bus, cfg, "orders")
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "kafka:orders",
+        "redis-streams:",
+        ":orders",
+        "orders",
+    ],
+)
+def test_consumer_targets_reject_wrong_or_malformed_declaration(target: str) -> None:
+    cfg = Configuration(
+        package="fakeapp",
+        broker="redis-streams",
+        subscription_source="config",
+        subscriptions={"orders": [target]},
+    )
+
+    with pytest.raises(ConfigurationError, match="broker target"):
+        consumer_targets(InMemoryEventBus(), cfg, "orders")
 
 
 @pytest.mark.asyncio

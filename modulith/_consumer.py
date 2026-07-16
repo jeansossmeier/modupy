@@ -42,6 +42,10 @@ import asyncio
 import logging
 from typing import Any
 
+from .config import ConfigurationError
+from .manifest import get_manifest
+from .protocols import ConsumerHealth
+
 logger = logging.getLogger("modulith.consumer")
 
 # A message that fails to dispatch this many times is dead-lettered rather than
@@ -80,6 +84,7 @@ class BrokerConsumer:
         targets: list[str],
         poll_block_ms: int = 1000,
         reclaim_min_idle_ms: int = 60_000,
+        max_delivery_attempts: int = _MAX_DELIVERY_ATTEMPTS,
     ) -> None:
         self._broker = broker
         self._bus = bus
@@ -99,16 +104,17 @@ class BrokerConsumer:
             poll_block_ms = 1
         self._poll_block_ms = poll_block_ms
         self._reclaim_min_idle_ms = reclaim_min_idle_ms
+        self._max_delivery_attempts = max_delivery_attempts
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
+        self._health = ConsumerHealth(ready=False, status="stopped")
+        self._health_failures: dict[tuple[str, str], str] = {}
         # Consecutive broker read()/reclaim() failures — drives the capped
         # exponential backoff (audit A7-r1-23). Reset on any broker success.
         self._consecutive_failures = 0
-        # (target, message id) -> failed dispatch attempts, so a transiently-
-        # failing message dead-letters after _MAX_DELIVERY_ATTEMPTS rather than
-        # looping. Keyed by target TOO because Redis stream ids are stream-local
-        # — two different streams can carry the identical id, and a mid-only key
-        # let them contaminate each other's counters (audit A7-r3-138).
+        # Fallback for third-party brokers without durable delivery metadata.
+        # Redis Streams provides the authoritative count in its PEL, which
+        # survives restarts and XAUTOCLAIM ownership handoffs.
         self._attempts: dict[tuple[str, str], int] = {}
 
     async def start(self) -> None:
@@ -118,14 +124,27 @@ class BrokerConsumer:
         module with no @listener has no streams to read.
         """
         if not self._targets:
+            self._stopping = False
+            self._health_failures.clear()
+            self._health = ConsumerHealth(ready=True, status="ready")
             logger.debug(
                 "consumer %r has no subscribed streams — not starting", self._consumer_name
             )
             return
-        for target in self._targets:
-            await self._broker.ensure_group(target, self._group)
-            await self._reclaim(target)
-        self._task = asyncio.create_task(self._run())
+        self._stopping = False
+        self._health_failures.clear()
+        self._health = ConsumerHealth(ready=False, status="starting")
+        try:
+            for target in self._targets:
+                await self._broker.ensure_group(target, self._group)
+                await self._reclaim(target)
+            self._task = asyncio.create_task(self._run())
+            self._task.add_done_callback(self._on_task_done)
+        except Exception as exc:
+            self._health = ConsumerHealth(ready=False, status="failed", detail=str(exc))
+            raise
+        if self._health.status == "starting":
+            self._health = ConsumerHealth(ready=True, status="ready")
         logger.info(
             "consumer %r (group %r) subscribed to %d stream(s)",
             self._consumer_name,
@@ -153,6 +172,51 @@ class BrokerConsumer:
                     self._consumer_name,
                 )
             self._task = None
+        self._health = ConsumerHealth(ready=False, status="stopped")
+
+    def health(self) -> ConsumerHealth:
+        """Return an immutable snapshot of the consumer's readiness."""
+        if self._health.status != "ready":
+            return self._health
+        if self._targets and (self._task is None or self._task.done()):
+            return ConsumerHealth(
+                ready=False,
+                status="failed",
+                detail="poll loop is not running",
+            )
+        if self._health_failures:
+            details = list(self._health_failures.items())
+            detail = (
+                details[0][1]
+                if len(details) == 1
+                else "; ".join(
+                    f"{operation} ({target}): {error}" for (operation, target), error in details
+                )
+            )
+            return ConsumerHealth(ready=False, status="degraded", detail=detail)
+        return self._health
+
+    def _on_task_done(self, task: asyncio.Task[None]) -> None:
+        """Record an unexpected poll-loop exit without changing shutdown."""
+        if self._stopping or task.cancelled():
+            return
+        error = task.exception()
+        detail = str(error) if error is not None else "poll loop exited unexpectedly"
+        self._health = ConsumerHealth(ready=False, status="failed", detail=detail)
+        if error is None:
+            logger.error("consumer %r task exited unexpectedly", self._consumer_name)
+        else:
+            logger.error(
+                "consumer %r task exited with an unexpected error",
+                self._consumer_name,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    def _mark_broker_failure(self, operation: str, target: str, exc: Exception) -> None:
+        self._health_failures[(operation, target)] = str(exc)
+
+    def _mark_broker_recovered(self, operation: str, target: str) -> None:
+        self._health_failures.pop((operation, target), None)
 
     async def _run(self) -> None:
         """Read → dispatch each subscribed stream until stopped.
@@ -181,10 +245,12 @@ class BrokerConsumer:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # a transient broker read error must not kill the loop
+                    self._mark_broker_failure("read", target, exc)
                     logger.exception("broker read failed for %s", target)
                     await self._recover_after_broker_failure(target, exc)
                     continue
                 self._consecutive_failures = 0
+                self._mark_broker_recovered("read", target)
                 try:
                     await self._handle(target, messages)
                 except asyncio.CancelledError:
@@ -206,10 +272,12 @@ class BrokerConsumer:
                 min_idle_ms=self._reclaim_min_idle_ms,
             )
         except Exception as exc:
+            self._mark_broker_failure("reclaim", target, exc)
             logger.exception("reclaim failed for %s", target)
             await self._recover_after_broker_failure(target, exc)
             return
         self._consecutive_failures = 0
+        self._mark_broker_recovered("reclaim", target)
         # XAUTOCLAIM returns (cursor, [(id, fields), ...], deleted_ids).
         # ``deleted_ids`` are messages that were still pending (delivered but
         # never ACK'd) yet no longer exist in the stream — MAXLEN trimmed them
@@ -330,9 +398,10 @@ class BrokerConsumer:
         try:
             await self._bus.publish(event)
         except Exception:
-            attempts = self._attempts.get(key, 0) + 1
-            self._attempts[key] = attempts
-            if attempts >= _MAX_DELIVERY_ATTEMPTS:
+            attempts = await self._failed_delivery_attempts(target, mid, key)
+            if attempts is None:
+                return
+            if attempts >= self._max_delivery_attempts:
                 logger.exception(
                     "message %s on %s failed %d dispatch attempts — dead-lettering",
                     mid,
@@ -347,7 +416,7 @@ class BrokerConsumer:
                     mid,
                     target,
                     attempts,
-                    _MAX_DELIVERY_ATTEMPTS,
+                    self._max_delivery_attempts,
                 )
             return
 
@@ -355,16 +424,46 @@ class BrokerConsumer:
             await self._broker.ack(target, mid, self._group)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             # Broker-side blip must not kill the loop (audit A7-r1-22). The
             # un-ACK'd message stays pending → redelivered via reclaim; the
             # listener side must be idempotent anyway (at-least-once contract).
+            self._mark_broker_failure("ack", target, exc)
             logger.exception(
                 "ack failed for %s on %s — message stays pending and will be redelivered",
                 mid,
                 target,
             )
+        else:
+            self._mark_broker_recovered("ack", target)
         self._attempts.pop(key, None)
+
+    async def _failed_delivery_attempts(
+        self, target: str, message_id: str, key: tuple[str, str]
+    ) -> int | None:
+        """Get the retry budget from durable metadata, or a local fallback."""
+        delivery_attempts = getattr(self._broker, "delivery_attempts", None)
+        if not callable(delivery_attempts):
+            attempts = self._attempts.get(key, 0) + 1
+            self._attempts[key] = attempts
+            return attempts
+        try:
+            attempts = await delivery_attempts(target, message_id, self._group)
+        except Exception:
+            logger.exception(
+                "could not read durable delivery attempts for %s on %s — leaving pending",
+                message_id,
+                target,
+            )
+            return None
+        if attempts is None:
+            logger.warning(
+                "durable delivery metadata vanished for %s on %s — leaving pending",
+                message_id,
+                target,
+            )
+            return None
+        return int(attempts)
 
     async def _dead_letter(self, target: str, mid: str, fields: dict[bytes, bytes]) -> None:
         """dead_letter via the broker, never letting a broker blip escape.
@@ -380,18 +479,75 @@ class BrokerConsumer:
             await self._broker.dead_letter(target, mid, fields, self._group)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            self._mark_broker_failure("dead_letter", target, exc)
             logger.exception(
                 "dead-letter failed for %s on %s — message stays pending for retry",
                 mid,
                 target,
             )
             return
+        self._mark_broker_recovered("dead_letter", target)
         self._attempts.pop((target, mid), None)
 
 
-def consumer_targets(bus: Any) -> list[str]:
-    """Broker stream targets a worker must consume — the FQN of each event type
-    that has a local listener. Matches the producer's destination (module +
-    qualname), so producer and consumer key the same stream."""
-    return [f"{et.__module__}.{et.__qualname__}" for et in bus.registered_event_types()]
+def _broker_destination(target: object, broker_scheme: str) -> str:
+    """Validate a full broker target and return its backend destination."""
+    if type(target) is not str:
+        raise ConfigurationError(
+            f"invalid broker target {target!r}; expected non-empty 'scheme:destination'"
+        )
+    scheme, separator, destination = target.partition(":")
+    scheme = scheme.strip()
+    destination = destination.strip()
+    if not separator or not scheme or not destination:
+        raise ConfigurationError(
+            f"invalid broker target {target!r}; expected non-empty 'scheme:destination'"
+        )
+    if scheme != broker_scheme:
+        raise ConfigurationError(
+            f"broker target {target!r} uses scheme {scheme!r}, "
+            f"but the configured broker is {broker_scheme!r}"
+        )
+    return destination
+
+
+def consumer_targets(bus: Any, cfg: Any, module_name: str) -> list[str]:
+    """Resolve one worker's ordered backend subscription destinations."""
+    event_types = bus.registered_event_types()
+    full_targets = [
+        getattr(
+            event_type,
+            "__modulith_broker_target__",
+            f"{cfg.broker}:{event_type.__module__}.{event_type.__qualname__}",
+        )
+        for event_type in event_types
+    ]
+
+    if cfg.subscription_source == "manifest":
+        package = f"{cfg.package}.{module_name}" if cfg.package else module_name
+        manifest = get_manifest(package)
+        declarations = manifest.broker_targets if manifest is not None else ()
+    elif cfg.subscription_source == "config":
+        declarations = cfg.subscriptions.get(module_name, ())
+    elif cfg.subscription_source == "listener":
+        declarations = tuple(
+            target
+            for event_type in event_types
+            for handler in bus.listeners_for(event_type)
+            for target in getattr(handler, "__modulith_broker_targets__", ())
+        )
+    else:
+        raise ConfigurationError(
+            f"invalid subscription_source {cfg.subscription_source!r}; "
+            "expected one of: manifest, config, listener"
+        )
+
+    destinations: list[str] = []
+    seen: set[str] = set()
+    for target in (*full_targets, *declarations):
+        destination = _broker_destination(target, cfg.broker)
+        if destination not in seen:
+            seen.add(destination)
+            destinations.append(destination)
+    return destinations

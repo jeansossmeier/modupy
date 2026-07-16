@@ -34,6 +34,8 @@ from uuid import UUID
 
 __all__ = ["JsonEventSerializer"]
 
+_UNION_TAG = "__modulith_union_type__"
+
 
 def _to_jsonable(obj: Any) -> Any:
     """Recursively convert an event's value graph to JSON-encodable values.
@@ -91,6 +93,57 @@ def _encode_dict_key(key: Any) -> Any:
     if isinstance(key, Enum):
         return _encode_dict_key(key.value)
     raise TypeError(f"cannot JSON-serialize dict key of type {type(key).__name__} in event payload")
+
+
+def _hint_tag(hint: Any) -> str:
+    """Return a stable wire tag for a union member annotation."""
+    if isinstance(hint, type):
+        return f"{hint.__module__}.{hint.__qualname__}"
+    return repr(hint)
+
+
+def _to_jsonable_typed(obj: Any, hint: Any) -> Any:
+    """Encode values using their annotations where JSON loses union identity."""
+    origin = typing.get_origin(hint)
+    if origin is Union or origin is types.UnionType:
+        members = [member for member in typing.get_args(hint) if member is not type(None)]
+        if len(members) > 1:
+            member = next(
+                (
+                    candidate
+                    for candidate in members
+                    if isinstance(candidate, type) and type(obj) is candidate
+                ),
+                members[0],
+            )
+            return {
+                _UNION_TAG: _hint_tag(member),
+                "value": _to_jsonable_typed(obj, member),
+            }
+        if members:
+            return _to_jsonable_typed(obj, members[0])
+    if origin in (list, set, frozenset, tuple):
+        args = typing.get_args(hint)
+        item_hint = args[0] if args else None
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            return [_to_jsonable_typed(value, item_hint) for value in obj]
+    if origin is dict:
+        args = typing.get_args(hint)
+        if len(args) == 2 and isinstance(obj, dict):
+            return {
+                _encode_dict_key(key): _to_jsonable_typed(value, args[1])
+                for key, value in obj.items()
+            }
+    if isinstance(hint, type) and isinstance(obj, dict):
+        hints = _safe_type_hints(hint)
+        return {key: _to_jsonable_typed(value, hints.get(key)) for key, value in obj.items()}
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        hints = _safe_type_hints(type(obj))
+        return {
+            field.name: _to_jsonable_typed(getattr(obj, field.name), hints.get(field.name))
+            for field in dataclasses.fields(obj)
+        }
+    return _to_jsonable(obj)
 
 
 def _resolve_class(fqcn: str) -> type:
@@ -190,6 +243,17 @@ def _coerce(value: Any, hint: Any) -> Any:
     origin = typing.get_origin(hint)
     if origin is Union or origin is types.UnionType:
         members = [a for a in typing.get_args(hint) if a is not type(None)]
+        if (
+            isinstance(value, dict)
+            and set(value) == {_UNION_TAG, "value"}
+            and isinstance(value[_UNION_TAG], str)
+        ):
+            tagged_member = next(
+                (member for member in members if _hint_tag(member) == value[_UNION_TAG]),
+                None,
+            )
+            if tagged_member is not None:
+                return _coerce(value["value"], tagged_member)
         for member in members:
             try:
                 return _coerce(value, member)
@@ -248,6 +312,10 @@ def _coerce(value: Any, hint: Any) -> Any:
     if hint is float:
         return float(value)
     if isinstance(hint, type) and issubclass(hint, Enum):
+        if isinstance(value, str):
+            values = [member.value for member in hint]
+            if values and type(values[0]) is int:
+                value = int(value)
         return hint(value)
     # Nested dataclass field: reconstruct recursively from the decoded dict.
     if dataclasses.is_dataclass(hint) and isinstance(hint, type) and isinstance(value, dict):
@@ -319,7 +387,7 @@ class JsonEventSerializer:
         else:
             raw = _instance_attrs(event)
         return json.dumps(
-            _to_jsonable(raw),
+            _to_jsonable_typed(raw, type(event)),
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")

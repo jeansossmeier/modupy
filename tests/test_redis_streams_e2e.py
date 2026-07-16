@@ -193,6 +193,31 @@ async def test_poison_message_missing_header_is_dead_lettered(redis_url, redis_c
         await broker.close()
 
 
+async def test_dead_letter_retry_after_interruption_is_idempotent(redis_url, redis_client) -> None:
+    """Replaying a completed transfer cannot append a second original message."""
+    broker = _broker(redis_url)
+    group = "modulith-mod"
+    try:
+        await broker.ensure_group(_TARGET, group)
+        await broker.publish(_TARGET, b"poison")
+        [(_stream, [(message_id, fields)])] = await broker.read(
+            _TARGET, consumer="c:1", group=group, block_ms=50
+        )
+        message_id = message_id.decode() if isinstance(message_id, bytes) else message_id
+
+        # This represents a client retry after Redis completed the first Lua
+        # transfer but the client lost its response before observing success.
+        await broker.dead_letter(_TARGET, message_id, fields, group)
+        await broker.dead_letter(_TARGET, message_id, fields, group)
+
+        assert await redis_client.xlen(_DLQ) == 1
+        [(_dead_id, dead_fields)] = await redis_client.xrange(_DLQ)
+        assert dead_fields[b"h:source_message_id"] == message_id.encode()
+        assert dead_fields[b"h:source_group"] == group.encode()
+    finally:
+        await broker.close()
+
+
 async def test_repeated_dispatch_failures_dead_letter_on_real_redis(
     redis_url, redis_client
 ) -> None:

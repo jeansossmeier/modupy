@@ -612,6 +612,107 @@ def test_split_readiness_names_microservice_tier_at_95_percent(make_fake_app) ->
     assert "microservice-ready" in check.summary
 
 
+def test_corrupt_schema_cache_is_detected_and_not_overwritten(make_fake_app) -> None:
+    """A corrupt (malformed JSON) schema cache was silently treated as empty
+    and immediately overwritten — the corruption evidence vanished and the
+    check reported 'ok'. It must surface the corruption and leave the file
+    untouched so it can be inspected."""
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event
+
+                @event
+                @dataclass(frozen=True)
+                class OrderPlaced:
+                    order_id: str
+            """
+        }
+    )
+    configure(package="fakeapp")
+    cache_path = Path(".modulith-schemas.json")
+    cache_path.write_text("{not valid json", encoding="utf-8")
+
+    report = run_doctor()
+
+    check = _check(report, "schema drift")
+    assert check.status != "ok"
+    assert cache_path.read_text(encoding="utf-8") == "{not valid json"
+
+
+def test_removed_event_is_flagged_by_schema_drift(make_fake_app, tmp_path) -> None:
+    """An event that existed in the cached baseline but no longer exists in
+    the code is a schema-drift signal too (e.g. a consumer still deployed
+    against the old schema) — dropping it from the current scan must not
+    silently drop it from the report."""
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event
+
+                @event
+                @dataclass(frozen=True)
+                class OrderPlaced:
+                    order_id: str
+            """
+        }
+    )
+    configure(package="fakeapp")
+    first = run_doctor()
+    assert _check(first, "schema drift").status == "ok"
+
+    # The event is removed entirely from the source.
+    (tmp_path / "fakeapp" / "orders" / "__init__.py").write_text("", encoding="utf-8")
+
+    second = run_doctor()
+    drift = _check(second, "schema drift")
+    assert drift.status == "warn"
+    assert any("OrderPlaced" in d for d in drift.details)
+
+
+def test_outbox_health_check_is_bounded_by_a_timeout(make_fake_app, monkeypatch) -> None:
+    """An unresponsive outbox store (network partition, stalled connection
+    pool) must not hang the whole ``doctor`` command forever — the query
+    needs an explicit timeout that turns into a reported error."""
+    import modulith.doctor as doctor_module
+
+    class _HangingStore:
+        async def save(self, publication):  # pragma: no cover - unused
+            pass
+
+        async def mark_complete(self, publication_id):  # pragma: no cover - unused
+            pass
+
+        async def find_incomplete(self, older_than):  # pragma: no cover - unused
+            return []
+
+        async def archive(self, publication_id):  # pragma: no cover - unused
+            pass
+
+        async def delete(self, publication_id):  # pragma: no cover - unused
+            pass
+
+        async def count_open(self) -> int:
+            await asyncio.sleep(10)
+            return 0
+
+        async def count_dead_lettered(self) -> int:
+            return 0
+
+    monkeypatch.setattr(doctor_module, "_OUTBOX_HEALTH_TIMEOUT", 0.05)
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", outbox="postgres")
+    outbox.configure(store=_HangingStore(), serializer=JsonEventSerializer(), start_loop=False)
+
+    report = run_doctor()
+
+    check = _check(report, "outbox health")
+    assert check.status == "error"
+    assert "timed out" in check.summary.lower()
+
+
 def test_doctor_cli_passes_with_low_readiness_score(make_fake_app, monkeypatch) -> None:
     """A9-r4-183: a low readiness score is an informational maturity signal —
     it renders as 'warn' and must not fail the doctor CI gate on its own."""

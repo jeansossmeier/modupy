@@ -46,6 +46,7 @@ from modulith.adapters.postgres_outbox import (
     bind_session,
 )
 from modulith.builtin import outbox
+from modulith.config import ConfigurationError
 from modulith.runtime import _runtime
 from modulith.serializers import JsonEventSerializer
 
@@ -73,7 +74,7 @@ async def engine(tmp_path: Path) -> Any:
     test_after_commit_and_sweep_race_is_bounded) one session's close (ROLLBACK)
     can clobber another session's in-flight INSERT->COMMIT, a topology
     impossible on per-connection Postgres. Same hazard fixed in
-    tests/test_w2_g04_postgres.py; see its
+    tests/test_postgres_outbox_adapter.py; see its
     test_concurrent_reader_close_does_not_roll_back_inflight_save for the
     deterministic repro. A tmp-file DB also survives connection invalidation
     (a StaticPool reconnect produced a brand-new empty :memory: database
@@ -441,6 +442,31 @@ async def test_status_distinguishes_open_completed_dead_via_store_counts(engine)
     assert await outbox.status() == {"incomplete": 3, "completed": 1, "dead_lettered": 2}
 
 
+async def test_configure_rejects_conflicting_dead_letter_thresholds(engine) -> None:
+    """Task 4: unify dead-letter thresholds — constructing the store with an
+    explicit threshold that disagrees with the one passed to
+    outbox.configure() must fail loudly instead of leaving the store's
+    is_dead_lettered flag (written from ITS OWN threshold in save()) out of
+    sync with the plugin's own skip-check."""
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=3)
+
+    with pytest.raises(ConfigurationError, match="dead_letter_after_attempts"):
+        outbox.configure(
+            store, JsonEventSerializer(), dead_letter_after_attempts=5, start_loop=False
+        )
+
+
+async def test_configure_unifies_store_threshold_with_matching_value(engine) -> None:
+    """Matching explicit values on both sides are not a conflict — the
+    long-standing pattern every other adapter test in this file already uses."""
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=2)
+
+    outbox.configure(store, JsonEventSerializer(), dead_letter_after_attempts=2, start_loop=False)
+
+    assert outbox._dead_letter_after_attempts == 2
+    assert store.dead_letter_after_attempts == 2
+
+
 async def test_force_retry_reaches_dead_lettered_publication(engine) -> None:
     # find_incomplete excludes dead-letters, so force_retry must reach a
     # dead-lettered row via the dedicated dead-letter lookup instead.
@@ -455,6 +481,43 @@ async def test_force_retry_reaches_dead_lettered_publication(engine) -> None:
     await outbox.force_retry(dead.id)
 
     assert received == [7]  # delivered despite being dead-lettered
+
+
+async def test_find_by_id_reaches_publication_outside_capped_windows(engine) -> None:
+    """Task 4: force_retry must not depend on the capped find_incomplete
+    (LIMIT 100) / find_dead_lettered (LIMIT 100, pre-Task-4) scans to locate a
+    target row — a direct point lookup reaches it regardless of backlog size."""
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=2)
+    outbox.configure(store, JsonEventSerializer(), dead_letter_after_attempts=2, start_loop=False)
+    _bootstrap_with_listener()
+
+    target = _pub(42, attempt_count=2)  # dead-lettered
+    await store.save(target)
+
+    found = await store.find_by_id(target.id)
+    assert found is not None
+    assert found.id == target.id
+
+    assert await store.find_by_id(uuid4()) is None  # unknown id
+
+
+async def test_find_dead_lettered_keyset_pagination_reaches_101_plus(engine) -> None:
+    """Task 4: 101+ dead-lettered rows must all be reachable — the old
+    find_dead_lettered() (LIMIT 100, no cursor) silently hid every row past
+    the 100th from list_dead_lettered() / retry_all_dead_lettered()."""
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=1)
+    outbox.configure(store, JsonEventSerializer(), dead_letter_after_attempts=1, start_loop=False)
+
+    total = 105
+    for i in range(total):
+        await store.save(_pub(i, attempt_count=1))  # >= threshold(1) → dead-lettered
+
+    first_page = await store.find_dead_lettered()
+    assert len(first_page) == 100  # single-page call keeps its old capped contract
+
+    all_dead = await outbox.list_dead_lettered()
+    assert len(all_dead) == total  # the plugin pages through every row
+    assert len({p.id for p in all_dead}) == total  # no duplicates across pages
 
 
 async def test_last_attempt_at_persists_and_round_trips(engine) -> None:
@@ -580,3 +643,138 @@ async def test_after_commit_and_sweep_race_is_bounded(engine) -> None:
     # an unbounded storm.
     counts = Counter(received)
     assert max(counts.values()) <= 2, f"unbounded re-delivery: {counts}"
+
+
+# ---------------------------------------------------------------------------
+# Task 4: outbox-claims — lease-mode claim_batch/renew_claim/complete_claim/
+# fail_claim, and advisory-lock capability gating
+# ---------------------------------------------------------------------------
+
+
+async def test_claim_batch_atomically_claims_and_commits(engine) -> None:
+    """claim_batch must commit the claim BEFORE the caller dispatches: a crash
+    between claim and dispatch must leave a durable, independently-visible
+    claim (that simply expires and gets reclaimed), never an uncommitted one."""
+    store = PostgresPublicationStore(engine=engine)
+    await store.save(_pub(1))
+    await store.save(_pub(2))
+
+    claimed = await store.claim_batch(
+        owner="worker-a", batch_size=10, lease_seconds=30.0, older_than=timedelta(0)
+    )
+
+    assert len(claimed) == 2
+    assert all(p.claim_token for p in claimed)
+    # Committed independently of any dispatch — a fresh session sees the claim.
+    sessionmaker = async_sessionmaker(engine)
+    async with sessionmaker() as s:
+        for p in claimed:
+            row = await s.get(EventPublicationRow, p.id)
+            assert row.claim_owner == "worker-a"
+            assert row.claim_token == p.claim_token
+            assert row.claim_until is not None
+
+
+async def test_claim_batch_excludes_rows_with_an_active_lease(engine) -> None:
+    """A row claimed by one sweeper with a not-yet-expired lease must not be
+    handed to a second sweeper's claim_batch — this is the mechanism that
+    prevents two concurrent sweepers from double-dispatching under lease mode."""
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1)
+    await store.save(pub)
+
+    first = await store.claim_batch(
+        owner="worker-a", batch_size=10, lease_seconds=60.0, older_than=timedelta(0)
+    )
+    assert [p.id for p in first] == [pub.id]
+
+    second = await store.claim_batch(
+        owner="worker-b", batch_size=10, lease_seconds=60.0, older_than=timedelta(0)
+    )
+    assert second == []  # worker-a's lease is still active
+
+
+async def test_claim_batch_reclaims_expired_lease(engine) -> None:
+    """A lease that already expired (the claiming sweeper crashed, or its
+    renewal loop starved) must be reclaimable by the next sweeper — otherwise
+    a crashed sweeper's claims block the row forever."""
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1)
+    await store.save(pub)
+
+    await store.claim_batch(
+        owner="worker-a", batch_size=10, lease_seconds=-1.0, older_than=timedelta(0)
+    )  # already-expired lease (negative seconds)
+
+    reclaimed = await store.claim_batch(
+        owner="worker-b", batch_size=10, lease_seconds=60.0, older_than=timedelta(0)
+    )
+    assert [p.id for p in reclaimed] == [pub.id]
+    assert reclaimed[0].claim_token != None  # noqa: E711 — new token, not worker-a's
+
+
+async def test_renew_claim_extends_lease_and_rejects_stale_token(engine) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    await store.save(_pub(1))
+    (claim,) = await store.claim_batch(
+        owner="worker-a", batch_size=10, lease_seconds=5.0, older_than=timedelta(0)
+    )
+
+    assert await store.renew_claim(claim.id, claim.claim_token, 60.0) is True
+    assert await store.renew_claim(claim.id, "not-the-real-token", 60.0) is False
+
+    sessionmaker = async_sessionmaker(engine)
+    async with sessionmaker() as s:
+        row = await s.get(EventPublicationRow, claim.id)
+        claim_until = row.claim_until.replace(tzinfo=UTC)  # SQLite drops tz on read
+        assert claim_until > datetime.now(UTC) + timedelta(seconds=30)  # the real renewal applied
+
+
+async def test_complete_claim_is_fenced_by_token(engine) -> None:
+    """A stale/mismatched token must not be able to complete a row that a
+    different (newer) claimant now owns."""
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1)
+    await store.save(pub)
+    (claim,) = await store.claim_batch(
+        owner="worker-a", batch_size=10, lease_seconds=60.0, older_than=timedelta(0)
+    )
+
+    assert await store.complete_claim(claim.id, "stale-token", "update") is False
+    assert await store.find_incomplete(
+        timedelta(0)
+    )  # still incomplete — rejected write applied nothing
+
+    assert await store.complete_claim(claim.id, claim.claim_token, "update") is True
+    assert await store.find_incomplete(timedelta(0)) == []
+
+
+async def test_fail_claim_is_fenced_by_token(engine) -> None:
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=5)
+    pub = _pub(1)
+    await store.save(pub)
+    (claim,) = await store.claim_batch(
+        owner="worker-a", batch_size=10, lease_seconds=60.0, older_than=timedelta(0)
+    )
+    claim.attempt_count = 1
+    claim.last_error = "boom"
+
+    assert await store.fail_claim(claim, "stale-token") is False
+
+    assert await store.fail_claim(claim, claim.claim_token) is True
+    sessionmaker = async_sessionmaker(engine)
+    async with sessionmaker() as s:
+        row = await s.get(EventPublicationRow, claim.id)
+        assert row.attempt_count == 1
+        assert row.last_error == "boom"
+        assert row.claim_token is None  # released so the next sweep can reclaim immediately
+
+
+async def test_try_lock_publication_requires_postgres_engine(engine) -> None:
+    """advisory_lock mode is Postgres-only (pg_try_advisory_lock); a
+    SQLite-backed store must refuse rather than silently no-op."""
+    store = PostgresPublicationStore(engine=engine)
+    assert store.supports_advisory_lock is False
+
+    with pytest.raises(ConfigurationError, match=r"[Pp]ostgres"):
+        await store.try_lock_publication(uuid4())

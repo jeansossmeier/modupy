@@ -11,6 +11,7 @@ constraint as tests/test_sync.py).
 import asyncio
 import os
 import threading
+import time
 from dataclasses import dataclass
 
 import pytest
@@ -144,6 +145,98 @@ _IMPORT_TIME_PUBLISH_MODULE = """
     except Exception as exc:
         captured.append((type(exc).__name__, str(exc)))
 """
+
+
+# ---------------------------------------------------------------------------
+# Task 6 (runtime-sync) — nested dispatch: ContextVar propagation, cancellation,
+# timeout typing, and bounded thread lifetime
+# ---------------------------------------------------------------------------
+
+
+def test_nested_dispatch_propagates_callers_contextvars() -> None:
+    """ContextVar: _run_nested_dispatch spawns a bare native thread for the
+    fresh loop it gives the nested coroutine. Threads start with an empty
+    top-level contextvars.Context — without explicitly copying the calling
+    (outer-listener executor) thread's context into it, every ContextVar the
+    caller had bound (a request-scoped value, an app-level session) was
+    silently invisible to the nested publish's dispatch."""
+    import contextvars
+
+    from modulith.sync import _run_nested_dispatch
+
+    cv: contextvars.ContextVar[str] = contextvars.ContextVar("cv", default="unset")
+    cv.set("bound-by-outer-listener")
+
+    seen: dict[str, str] = {}
+
+    async def coro() -> None:
+        seen["value"] = cv.get()
+
+    _run_nested_dispatch(coro(), object(), timeout=5.0)
+
+    assert seen["value"] == "bound-by-outer-listener"
+
+
+def test_nested_dispatch_timeout_cancels_underlying_task() -> None:
+    """cancellation: a nested dispatch that overruns its budget must request
+    cancellation of the coroutine on its own fresh loop — not abandon it to
+    run (or hang) unobserved forever."""
+    from modulith.sync import PublishSyncTimeout, _run_nested_dispatch
+
+    cancelled = threading.Event()
+
+    async def hang_forever() -> None:
+        try:
+            await asyncio.Event().wait()  # never set — hangs until cancelled
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    with pytest.raises(PublishSyncTimeout):
+        _run_nested_dispatch(hang_forever(), object(), timeout=0.2)
+
+    assert cancelled.wait(5), "nested dispatch kept running after the caller timed out"
+
+
+def test_nested_dispatch_timeout_raises_publish_sync_timeout_not_bare_timeout() -> None:
+    """timeout: a genuine nested-dispatch budget overrun must surface as
+    PublishSyncTimeout (a distinct type from an application TimeoutError),
+    exactly like the top-level publish_sync() budget contract."""
+    from modulith.sync import PublishSyncTimeout, _run_nested_dispatch
+
+    async def hang_forever() -> None:
+        await asyncio.Event().wait()
+
+    with pytest.raises(PublishSyncTimeout, match="did not complete within"):
+        _run_nested_dispatch(hang_forever(), object(), timeout=0.05)
+
+
+def test_nested_dispatch_threads_do_not_linger_after_repeated_timeouts() -> None:
+    """bounded-thread: repeated timed-out nested dispatches must not
+    accumulate live 'modulith-sync-nested' threads. Cancelling the
+    underlying task (see the cancellation regression above) bounds each
+    thread's lifetime instead of leaving it running unobserved for as long
+    as its hung coroutine happens to take — which, for a permanently-hung
+    listener, was forever."""
+    from modulith.sync import PublishSyncTimeout, _run_nested_dispatch
+
+    async def hang_forever() -> None:
+        await asyncio.Event().wait()
+
+    for _ in range(5):
+        with pytest.raises(PublishSyncTimeout):
+            _run_nested_dispatch(hang_forever(), object(), timeout=0.05)
+
+    def _live_nested_threads() -> list[threading.Thread]:
+        return [
+            t for t in threading.enumerate() if t.name == "modulith-sync-nested" and t.is_alive()
+        ]
+
+    deadline = time.monotonic() + 5.0
+    while _live_nested_threads() and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    assert _live_nested_threads() == [], "timed-out nested dispatch threads never terminated"
 
 
 def test_publish_sync_at_import_time_during_bootstrap_fails_fast(make_fake_app) -> None:

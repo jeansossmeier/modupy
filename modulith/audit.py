@@ -27,7 +27,7 @@ import ast
 import logging
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .builtin.verifier import CONTRACTS_MODULE, _file_package, _ImportCollector
@@ -70,25 +70,38 @@ class AuditResult:
     # Files containing functions that look like they could become listeners
     listener_candidates: list[Path]
 
-    # How many .py files the audit actually parsed. Zero means the audited
-    # path contained no Python at all (wrong path, docs-only dir, empty
+    # How many .py files the audit successfully parsed (excludes files that
+    # failed to parse — see parse_failures). Zero means the audited path
+    # contained no Python at all (wrong path, docs-only dir, empty
     # scaffold) — the readiness score is meaningless then and the report
     # must say so instead of a confident 100/100 (A10-r4-186).
     files_scanned: int = 0
 
+    # Files that failed to parse (syntax/encoding errors) and were excluded
+    # from every analysis stage. Disclosed so a confident-looking report
+    # doesn't silently hide that some of the codebase was never analyzed.
+    parse_failures: list[Path] = field(default_factory=list)
 
-def audit_codebase(root: Path) -> AuditResult:
+
+def audit_codebase(root: Path, contracts_module: str = CONTRACTS_MODULE) -> AuditResult:
     """Run the full audit pipeline over a directory tree.
 
     Walks ``root`` for ``.py`` files, parses each with ``ast``, and derives
     the proposed module structure, cross-module imports, shared tables,
-    listener candidates, and a readiness score.
+    listener candidates, and a readiness score. Files that fail to parse
+    are excluded from analysis and reported separately in
+    ``parse_failures`` rather than silently counted as scanned.
+
+    *contracts_module* is the name exempted from cross-module coupling —
+    honor a codebase's already-configured ``[tool.modulith].contracts_module``
+    (mid-migration) instead of always assuming the default ``"contracts"``.
     """
     files = _iter_py_files(root)
-    proposed = _propose_module_structure(root, files)
-    cross = _find_cross_module_imports(root, files, proposed)
-    shared = _find_shared_tables(root, files)
-    listeners = _find_listener_candidates(files)
+    parsed, failures = _split_by_parseability(files)
+    proposed = _propose_module_structure(root, parsed)
+    cross = _find_cross_module_imports(root, parsed, proposed, contracts_module)
+    shared = _find_shared_tables(root, parsed)
+    listeners = _find_listener_candidates(parsed)
     score = _compute_readiness_score(cross, listeners)
     return AuditResult(
         readiness_score=score,
@@ -96,8 +109,26 @@ def audit_codebase(root: Path) -> AuditResult:
         cross_module_imports=cross,
         shared_tables=shared,
         listener_candidates=listeners,
-        files_scanned=len(files),
+        files_scanned=len(parsed),
+        parse_failures=failures,
     )
+
+
+def _split_by_parseability(files: list[Path]) -> tuple[list[Path], list[Path]]:
+    """Partition files into (successfully parseable, failed).
+
+    Computed once up front so ``files_scanned``/``parse_failures`` reflect
+    reality — every downstream stage already skips unparseable files on its
+    own independent parse attempt, but silently, with no accounting.
+    """
+    parsed: list[Path] = []
+    failures: list[Path] = []
+    for path in files:
+        if _parse(path) is None:
+            failures.append(path)
+        else:
+            parsed.append(path)
+    return parsed, failures
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +208,10 @@ def _target_module(
 
 
 def _find_cross_module_imports(
-    root: Path, files: list[Path], modules: dict[str, list[Path]]
+    root: Path,
+    files: list[Path],
+    modules: dict[str, list[Path]],
+    contracts_module: str = CONTRACTS_MODULE,
 ) -> list[tuple[str, str, int, Path]]:
     """Find imports that cross proposed module boundaries.
 
@@ -200,11 +234,13 @@ def _find_cross_module_imports(
             target = _target_module(record.target_module, root.name, module_names, root_is_package)
             if target is None or target == source_module:
                 continue
-            # The conventional ``contracts`` module is the sanctioned shared
+            # The conventional contracts module is the sanctioned shared
             # dependency that survives a process split — importing it is the
             # prescribed pattern, so it must not count as coupling (mirrors the
             # verifier's rule-4 exemption and the doctor readiness metric).
-            if target == CONTRACTS_MODULE:
+            # Honors a codebase's already-configured contracts_module name
+            # instead of always assuming the "contracts" default.
+            if target == contracts_module:
                 continue
             key = (source_module, target)
             counts[key] += 1
@@ -362,6 +398,15 @@ def render_report(result: AuditResult) -> str:
             "in the score.",
             "",
         ]
+    if result.parse_failures:
+        lines += [
+            f"**Warning: {len(result.parse_failures)} file(s) could not be parsed** "
+            "and were excluded from this report (fix the syntax error and re-run "
+            "for full coverage):",
+            "",
+        ]
+        lines += [f"  - `{path}`" for path in result.parse_failures]
+        lines.append("")
 
     # Proposed module structure
     lines += ["## Proposed Module Structure", ""]

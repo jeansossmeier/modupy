@@ -61,10 +61,12 @@ class _ObserveContractShield:
     """Enforces the observe-only contract of the listener lifecycle hooks.
 
     The hookspecs for ``modulith_on_listener_dispatch``,
-    ``modulith_on_listener_complete``, and ``modulith_on_listener_error``
-    promise that they observe, they don't gate: a plugin's failure must
-    never prevent a listener from running, mask the listener's own
-    exception, or suppress the runtime's re-raise. Enforcing that promise
+    ``modulith_on_listener_complete``, ``modulith_on_listener_error``, and
+    ``modulith_on_publish_error`` promise that they observe, they don't
+    gate: a plugin's failure must never prevent a listener from running,
+    mask the listener's own exception, or suppress the runtime's re-raise
+    (for the publish-error hook: never mask the original publish failure).
+    Enforcing that promise
     here — as pluggy wrappers around each hook — covers every call site
     (in-memory dispatch, the durable outbox path, and any future one)
     instead of requiring each caller to remember a try/except.
@@ -77,12 +79,12 @@ class _ObserveContractShield:
     """
 
     @staticmethod
-    def _swallow(hook_name: str, listener_name: str, exc: Exception) -> None:
+    def _swallow(hook_name: str, label: str, exc: Exception) -> None:
         logger.exception(
-            "%s hookimpl raised for listener %r — swallowed to honor the "
-            "observe-only hook contract (the listener outcome is unaffected)",
+            "%s hookimpl raised for %r — swallowed to honor the "
+            "observe-only hook contract (the original outcome is unaffected)",
             hook_name,
-            listener_name,
+            label,
             exc_info=exc,
         )
 
@@ -114,6 +116,14 @@ class _ObserveContractShield:
             return (yield)
         except Exception as exc:
             self._swallow("modulith_on_listener_error", listener_name, exc)
+            return []
+
+    @hookimpl(wrapper=True)
+    def modulith_on_publish_error(self, event: Any) -> Generator[None, list[object], list[object]]:
+        try:
+            return (yield)
+        except Exception as exc:
+            self._swallow("modulith_on_publish_error", type(event).__name__, exc)
             return []
 
 

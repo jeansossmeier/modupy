@@ -481,3 +481,99 @@ async def test_reset_for_testing_clears_outbox_state_and_cancels_retry_task() ->
     with contextlib.suppress(asyncio.CancelledError):
         await task
     assert task.cancelled() or task.done()
+
+
+# ---------------------------------------------------------------------------
+# Task 6 (runtime-sync) — a failed bootstrap must close provisional brokers
+# ---------------------------------------------------------------------------
+
+
+def test_failed_bootstrap_closes_provisional_brokers(make_fake_app) -> None:
+    """bootstrap-leak: brokers registered at step 4.5 (modulith_register_brokers)
+    are provisional until bootstrap commits — a LATER step failing (discovery,
+    manifest verification, modulith_after_module_load) must not leave those
+    already-registered brokers' connections open. The old bootstrap only
+    rolled back ``self._config``, never closing the local ``broker_registry``
+    it had already built and populated."""
+
+    class RegisterThenFail:
+        def __init__(self, broker: FakeBroker) -> None:
+            self._broker = broker
+
+        @hookimpl
+        def modulith_register_brokers(self, registry: Any) -> None:
+            registry.register("provisional", self._broker)
+
+        @hookimpl
+        def modulith_after_module_load(self, module: Any) -> None:
+            raise RuntimeError("boom after brokers were registered")
+
+    make_fake_app({"orders": ""})
+    broker = FakeBroker()
+    configure(package="fakeapp")
+    _runtime._extra_plugins.append(RegisterThenFail(broker))
+
+    with pytest.raises(RuntimeError, match="boom after brokers were registered"):
+        _runtime.ensure_bootstrapped()
+
+    assert _runtime._bootstrapped is False
+    assert broker.closed is True, "provisionally-registered broker leaked past the failed bootstrap"
+
+
+# ---------------------------------------------------------------------------
+# Task 6 (runtime-sync) — shutdown() processes local/broker failures
+# independently, raising an ExceptionGroup only when BOTH fail
+# ---------------------------------------------------------------------------
+
+
+class _FailingWaitStore(StubStore):
+    """A store whose wait_for_dispatch() fails — the 'local' shutdown step."""
+
+    async def wait_for_dispatch(self) -> None:
+        raise ConnectionError("store connection dropped during drain")
+
+
+class _FailingCloseRegistry(BrokerRegistry):
+    """A broker registry whose close_all() fails — the 'broker' shutdown step."""
+
+    async def close_all(self) -> None:
+        raise RuntimeError("broker transport refused to close")
+
+
+async def test_shutdown_closes_brokers_even_when_local_drain_fails() -> None:
+    """simultaneous-error (local half): a failing store.wait_for_dispatch()
+    must not skip broker close — local and broker cleanup are independent
+    steps, mirroring the same guarantee _worker.py's lifespan teardown owes
+    consumer.stop() vs runtime.shutdown()."""
+    from modulith.builtin import outbox
+
+    outbox.configure(_FailingWaitStore(), JsonEventSerializer(), start_loop=False)
+    registry = BrokerRegistry()
+    fake = FakeBroker()
+    registry.register("fake", fake)
+    _runtime._broker_registry = registry
+    try:
+        with pytest.raises(ConnectionError, match="store connection dropped"):
+            await _runtime.shutdown()
+    finally:
+        outbox._reset_for_testing()
+
+    assert fake.closed is True, "broker close was skipped because the local drain failed"
+
+
+async def test_shutdown_raises_exception_group_when_local_and_broker_both_fail() -> None:
+    """simultaneous-error (both halves): when BOTH the local drain and the
+    broker close fail, shutdown() must surface both errors — not silently
+    drop one in favor of the other."""
+    from modulith.builtin import outbox
+
+    outbox.configure(_FailingWaitStore(), JsonEventSerializer(), start_loop=False)
+    _runtime._broker_registry = _FailingCloseRegistry()
+    try:
+        with pytest.raises(ExceptionGroup) as excinfo:
+            await _runtime.shutdown()
+    finally:
+        outbox._reset_for_testing()
+
+    causes = {type(exc) for exc in excinfo.value.exceptions}
+    assert causes == {ConnectionError, RuntimeError}

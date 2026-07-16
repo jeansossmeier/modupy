@@ -407,6 +407,30 @@ With `broker = "database"`, a bare `@externalized` event's default target is
 `database:{event-fqn}`; pin one explicitly with
 `@externalized(target="database:orders.placed")` exactly as with Redis. Every
 `broker_options` key is env-overridable via `MODULITH_BROKER_<KEY>` (e.g.
+`MODULITH_BROKER_URL`, `MODULITH_BROKER_POLL_INTERVAL_MS`).
+
+### No-subscriber and orphan-replay policies
+
+When a message is published to a database-broker target that has no consumer
+group yet, `no_subscriber_policy` decides what happens:
+
+| Policy | Behavior |
+|--------|----------|
+| `error` (default) | Raise `NoSubscribersError` immediately; readiness stays degraded until subscriptions exist |
+| `wait` | Poll for subscribers until `no_subscriber_wait_timeout_seconds` |
+| `store` | Persist a retained source message and replay per `orphan_replay_policy` |
+
+`orphan_replay_policy` (store mode only): `ttl_all_groups` (default — every
+group that registers before expiry gets a copy), `first_groups` (fan out to
+the first registration set then delete), or `expected_groups` (pre-create
+delivery rows for configured groups).
+
+### Declaring broker destinations
+
+`subscription_source` (default `manifest`) controls where dynamic broker
+targets are declared: `declare_module(broker_targets=...)`,
+`[tool.modulith.subscriptions]`, or `@listener(broker_targets=...)`. Static
+`@externalized(target=...)` destinations are always inferred.
 `MODULITH_BROKER_URL`) — which is how each worker process receives its
 connection URL.
 

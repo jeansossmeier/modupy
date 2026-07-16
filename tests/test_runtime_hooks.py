@@ -272,6 +272,93 @@ async def test_durable_publish_fires_after_event_published(make_fake_app, monkey
     assert ("after", "Durable") in recorder.calls
 
 
+async def test_durable_publish_hook_receives_receipt_with_real_persisted_ids(
+    make_fake_app, monkeypatch
+) -> None:
+    """receipt-ID (Task 6): the durable path used to fabricate a brand-new
+    EventPublication (a random uuid4() id, separately-serialized payload)
+    for the after-publish hook — matching neither the actual persisted row
+    nor the configured storage serializer's bytes. It must instead receive
+    an EventPublishReceipt wrapping the REAL EventPublication record(s) this
+    publish actually saved."""
+    from modulith.builtin import outbox
+    from modulith.serializers import JsonEventSerializer
+    from modulith.types import EventPublishReceipt
+
+    class _StubStore:
+        def __init__(self) -> None:
+            self.saved: list = []
+
+        async def save(self, publication) -> None:
+            self.saved.append(publication)
+
+        async def mark_complete(self, publication_id) -> None: ...
+        async def find_incomplete(self, older_than):
+            return []
+
+        async def archive(self, publication_id) -> None: ...
+        async def delete(self, publication_id) -> None: ...
+
+    captured: list[object] = []
+
+    class _Capture:
+        @hookimpl
+        def modulith_after_event_published(self, event, publication) -> None:
+            captured.append(publication)
+
+    import modulith.runtime as rt
+    from modulith.manager import create_plugin_manager as original
+
+    def patched(**kwargs):
+        pm = original(**kwargs)
+        pm.register(_Capture(), name="receipt-capture")
+        return pm
+
+    monkeypatch.setattr(rt, "create_plugin_manager", patched)
+
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event, listener
+
+                @event
+                @dataclass(frozen=True)
+                class Durable:
+                    x: int
+
+                @listener
+                async def on_durable(evt: Durable) -> None:
+                    pass
+            """,
+        }
+    )
+    _runtime.configure(package="fakeapp")
+
+    store = _StubStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    try:
+        from fakeapp.orders import Durable  # type: ignore[import-not-found]
+
+        session = type("S", (), {"info": {}})()
+        token = outbox._current_session.set(session)
+        try:
+            await _runtime.publish(Durable(x=1))
+        finally:
+            outbox._current_session.reset(token)
+    finally:
+        await outbox.shutdown()
+        outbox._reset_for_testing()
+
+    assert len(store.saved) == 1
+    receipt = captured[-1]
+    assert isinstance(receipt, EventPublishReceipt)
+    assert len(receipt.records) == 1
+    assert receipt.records[0].id == store.saved[0].id, (
+        "receipt carried a fabricated id, not the real persisted record"
+    )
+
+
 async def test_shutdown_closes_registered_brokers(fake_app) -> None:
     """Runtime.shutdown() closes every registered broker (#21).
 

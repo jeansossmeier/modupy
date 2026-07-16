@@ -176,14 +176,20 @@ default = 1
 reports = 4                     # this module gets 4 workers
 ```
 
-Outbox tuning has a reserved home: `[tool.modulith.outbox_options]`. The
-subtable is parsed and validated (it is the *only* outbox options
-subtable — a legacy `[tool.modulith.outbox]` subtable is a loud
-`ConfigurationError`), but the runtime does not read its keys yet, so a
-`completion_mode` set there does not change the active mode. Set the
-completion mode (`update` | `delete` | `archive`) where the outbox is
-wired, via `outbox.configure(completion_mode=...)` — see
-[MIGRATION_GUIDE.md](MIGRATION_GUIDE.md), Step 5.
+Outbox tuning has a reserved home: `[tool.modulith.outbox_options]`. Keys
+are validated at config load (`claim_strategy`, `claim_lease_seconds`,
+`claim_batch_size`, …). Pass them through to
+`outbox.configure(claim_strategy=..., completion_mode=...)` when wiring the
+store — see [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md), Step 5. Defaults are
+`claim_strategy="lease"` (atomic claim + token fencing for concurrent
+sweepers), with `"advisory_lock"` (Postgres) and `"none"` as alternatives.
+
+Broker destinations for process-per-module topology are declared via
+`subscription_source` (`manifest` by default, or `config` /
+`listener`) plus static `@externalized(target=...)` inference. The database
+broker's `no_subscriber_policy` defaults to `"error"` (also `"wait"` /
+`"store"` with configurable orphan replay). Actuator protection is
+`actuator_mode="auto"` (token required in production / non-loopback).
 
 The database broker reads `[tool.modulith.broker_options]` too: `url`/`dsn`
 (the SQLAlchemy URL — its dialect selects Postgres, MySQL, or SQLite),

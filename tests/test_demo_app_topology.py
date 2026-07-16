@@ -227,6 +227,79 @@ async def test_demo_app_two_hop_cross_process_delivery_over_sqlite_broker(
         await _drop_broker_schema(broker_url)
 
 
+async def test_demo_app_worker_routes_are_isolated_per_module(tmp_path: Path) -> None:
+    """Each worker mounts ONLY its own module's router under its own prefix.
+
+    ``modulith._worker.create_app`` imports a single module and mounts its
+    ``router`` under ``/<module_name>`` — it must not accidentally expose
+    another module's routes (e.g. the orders worker serving
+    ``/inventory/reserved``). This asserts that isolation directly against
+    each real worker process, plus the ``/health`` readiness fields
+    (``ready``/``status``) that ``_wait_healthy`` above doesn't inspect.
+    """
+    db_path = tmp_path / "demo-broker-isolation.db"
+    broker_url = f"sqlite+aiosqlite:///{db_path}"
+
+    await _create_broker_schema(broker_url)
+    specs = _demo_specs(
+        {
+            "MODULITH_BROKER": "database",
+            "MODULITH_BROKER_URL": broker_url,
+            "MODULITH_BROKER_POLL_INTERVAL_MS": "100",
+        }
+    )
+    orders_port, inventory_port, notifications_port = (s.port for s in specs)
+
+    supervisor = Supervisor(specs)
+    await supervisor.start()
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as direct:
+            await _wait_healthy(direct, orders_port, "orders")
+            await _wait_healthy(direct, inventory_port, "inventory")
+            await _wait_healthy(direct, notifications_port, "notifications")
+
+            # Health readiness fields: orders has no listeners (no consumer),
+            # so it reports the no-consumer shape; inventory/notifications have
+            # listeners, so their consumer must report ready=True once healthy.
+            orders_health = await direct.get(f"http://127.0.0.1:{orders_port}/health")
+            assert orders_health.json() == {"status": "ok", "module": "orders"}
+
+            for port, module in (
+                (inventory_port, "inventory"),
+                (notifications_port, "notifications"),
+            ):
+                health = (await direct.get(f"http://127.0.0.1:{port}/health")).json()
+                assert health["module"] == module
+                assert health["ready"] is True
+
+            # Route isolation: the orders worker must not serve inventory's or
+            # notifications' routes, and vice versa — each process hosts only
+            # the router of the single module it imported.
+            assert (
+                await direct.get(f"http://127.0.0.1:{orders_port}/inventory/reserved")
+            ).status_code == 404
+            assert (
+                await direct.get(f"http://127.0.0.1:{orders_port}/notifications/sent")
+            ).status_code == 404
+            assert (
+                await direct.get(f"http://127.0.0.1:{inventory_port}/orders")
+            ).status_code == 404
+            assert (
+                await direct.get(f"http://127.0.0.1:{notifications_port}/inventory/reserved")
+            ).status_code == 404
+
+            # Each worker's own route responds correctly on its own process.
+            assert (
+                await direct.get(f"http://127.0.0.1:{inventory_port}/inventory/reserved")
+            ).json() == {"reserved": []}
+            assert (
+                await direct.get(f"http://127.0.0.1:{notifications_port}/notifications/sent")
+            ).json() == {"sent": []}
+    finally:
+        await supervisor.stop()
+        await _drop_broker_schema(broker_url)
+
+
 async def test_demo_app_two_hop_cross_process_delivery_over_redis_broker(
     redis_url: str,
     redis_client: object,

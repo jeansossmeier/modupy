@@ -74,7 +74,7 @@ class TestManifestDiscovery:
 
         assert manifest_module.all_manifests() == {}
 
-    def test_full_e2e_discovery_verification_bootstrap(self, make_fake_app):
+    async def test_full_e2e_discovery_verification_bootstrap(self, make_fake_app):
         """End-to-end: _manifest.py discovered, listener registered, verification passes."""
         make_fake_app(
             {
@@ -109,17 +109,12 @@ class TestManifestDiscovery:
 
         configure(package="fakeapp")
 
-        import asyncio
-
-        # Should succeed: manifest reality matches declaration. Driven on a
-        # private loop: get_event_loop() raises RuntimeError whenever ANY
-        # earlier test in the session used asyncio.run (which leaves the
-        # thread's loop slot set to None) — an order-dependent flake.
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(publish(object()))
-        finally:
-            loop.close()
+        # Should succeed: manifest reality matches declaration. An async test
+        # runs on pytest-asyncio's own per-test loop, so this no longer needs
+        # a hand-rolled loop to dodge the get_event_loop() order-dependent
+        # flake (an earlier test's asyncio.run() leaves the thread's loop slot
+        # set to None).
+        await publish(object())
 
         # Manifest IS in registry.
         assert "fakeapp.orders" in manifest_module.all_manifests()

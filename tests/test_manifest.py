@@ -10,6 +10,7 @@ from __future__ import annotations
 import sys
 import types
 from collections.abc import Callable
+from dataclasses import replace
 
 import pytest
 
@@ -90,6 +91,7 @@ class TestDeclareModule:
             listeners=[handler],
             owns_tables=["payments", "refunds"],
             declared_dependencies=["orders"],
+            broker_targets=["redis-streams:payments", "amqp:events:payments"],
         )
         m = manifest_module.get_manifest("fakeapp.payments")
         assert m is not None
@@ -99,6 +101,11 @@ class TestDeclareModule:
         assert m.listeners == (handler,)
         assert m.owns_tables == ("payments", "refunds")
         assert m.declared_dependencies == ("orders",)
+        assert m.dependencies_declared is True
+        assert m.broker_targets == (
+            "redis-streams:payments",
+            "amqp:events:payments",
+        )
 
     def test_double_call_raises_configuration_error(self):
         """Second declare_module() for the same package raises ConfigurationError."""
@@ -126,13 +133,7 @@ class TestDeclareModule:
         assert m.listeners[0] is on_order_created
 
     def test_empty_defaults_produce_empty_tuples(self):
-        """Calling with no kwargs gives all-empty tuple fields.
-
-        Exception: ``declared_dependencies`` defaults to None ("not
-        declared" — the verifier's rule 3 stays off), distinct from an
-        explicit empty tuple ("depends on nothing" — deny-all). W2 G11:
-        A10-r1-36 (adjudicated design change).
-        """
+        """Omitted dependencies stay iterable without enabling enforcement."""
         _run_declare_in_fake_module("fakeapp.billing._manifest")
         m = manifest_module.get_manifest("fakeapp.billing")
         assert m is not None
@@ -140,7 +141,73 @@ class TestDeclareModule:
         assert m.consumes == ()
         assert m.listeners == ()
         assert m.owns_tables == ()
-        assert m.declared_dependencies is None
+        assert m.declared_dependencies == ()
+        assert isinstance(m.declared_dependencies, tuple)
+        assert m.dependencies_declared is False
+        assert m.broker_targets == ()
+
+    @pytest.mark.parametrize("dependencies", [[], ()])
+    def test_explicit_empty_dependencies_preserve_declared_state(
+        self, dependencies: list[str] | tuple[str, ...]
+    ) -> None:
+        _run_declare_in_fake_module(
+            "fakeapp.shipping._manifest",
+            declared_dependencies=dependencies,
+        )
+
+        m = manifest_module.get_manifest("fakeapp.shipping")
+
+        assert m is not None
+        assert m.declared_dependencies == ()
+        assert m.dependencies_declared is True
+
+    def test_direct_manifest_explicit_empty_dependencies_are_declared(self) -> None:
+        m = Manifest(package="fakeapp.shipping", declared_dependencies=())
+
+        assert m.declared_dependencies == ()
+        assert m.dependencies_declared is True
+
+    def test_direct_manifest_none_dependencies_remain_iterable(self) -> None:
+        m = Manifest(package="fakeapp.shipping", declared_dependencies=None)  # type: ignore[arg-type]
+
+        assert m.declared_dependencies == ()
+        assert m.dependencies_declared is False
+
+    def test_dependency_declaration_state_cannot_be_set_by_caller(self) -> None:
+        with pytest.raises(TypeError, match="dependencies_declared"):
+            Manifest(package="fakeapp.shipping", dependencies_declared=True)  # type: ignore[call-arg]
+
+    @pytest.mark.parametrize("explicit_none", [False, True])
+    def test_replace_preserves_omitted_dependency_state(self, explicit_none: bool) -> None:
+        kwargs = {"declared_dependencies": None} if explicit_none else {}
+        original = Manifest(package="fakeapp.shipping", **kwargs)  # type: ignore[arg-type]
+
+        copied = replace(original, package="fakeapp.shipping_copy")
+
+        assert copied.declared_dependencies == ()
+        assert isinstance(copied.declared_dependencies, tuple)
+        assert copied.dependencies_declared is False
+
+    @pytest.mark.parametrize(
+        "broker_targets",
+        [
+            "redis-streams:orders",
+            1,
+            [""],
+            ["redis-streams"],
+            [":orders"],
+            ["redis-streams:"],
+            [1],
+        ],
+    )
+    def test_broker_targets_require_non_empty_scheme_and_destination(
+        self, broker_targets: object
+    ) -> None:
+        with pytest.raises(ConfigurationError, match="broker_targets"):
+            _run_declare_in_fake_module(
+                "fakeapp.orders._manifest",
+                broker_targets=broker_targets,
+            )
 
     def test_manifest_is_frozen_dataclass(self):
         """Manifest instances must be immutable (frozen=True)."""

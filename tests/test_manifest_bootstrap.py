@@ -26,7 +26,7 @@ def reset_manifests():
 
 
 class TestManifestBootstrap:
-    def test_unregistered_listener_fails_bootstrap(self, make_fake_app):
+    async def test_unregistered_listener_fails_bootstrap(self, make_fake_app):
         """An app whose manifest declares a listener that never registered → ConfigurationError."""
         make_fake_app(
             {
@@ -58,13 +58,9 @@ class TestManifestBootstrap:
         configure(package="fakeapp")
 
         with pytest.raises(ConfigurationError, match="Manifest verification failed"):
-            import asyncio
+            await publish(object())  # triggers bootstrap
 
-            asyncio.get_event_loop().run_until_complete(
-                publish(object())  # triggers bootstrap
-            )
-
-    def test_matching_manifest_passes_bootstrap(self, make_fake_app):
+    async def test_matching_manifest_passes_bootstrap(self, make_fake_app):
         """An app whose manifest matches reality → bootstrap succeeds."""
         make_fake_app(
             {
@@ -100,11 +96,9 @@ class TestManifestBootstrap:
         configure(package="fakeapp")
 
         # Should not raise.
-        import asyncio
+        await publish(object())
 
-        asyncio.get_event_loop().run_until_complete(publish(object()))
-
-    def test_sync_listener_in_manifest_passes_bootstrap(self, make_fake_app):
+    async def test_sync_listener_in_manifest_passes_bootstrap(self, make_fake_app):
         """Regression (D1): a SYNC listener declared in a manifest must verify.
 
         Sync listeners register as async wrappers (see sync.wrap_sync_listener); the
@@ -146,11 +140,9 @@ class TestManifestBootstrap:
         configure(package="fakeapp")
 
         # Should not raise — the sync listener IS registered (as an async wrapper).
-        import asyncio
+        await publish(object())
 
-        asyncio.get_event_loop().run_until_complete(publish(object()))
-
-    def test_verify_manifests_false_bypasses_check(self, make_fake_app):
+    async def test_verify_manifests_false_bypasses_check(self, make_fake_app):
         """Setting verify_manifests=False skips verification even with a bad manifest."""
         make_fake_app(
             {
@@ -181,11 +173,9 @@ class TestManifestBootstrap:
         configure(package="fakeapp", verify_manifests=False)
 
         # Should not raise — verification is disabled.
-        import asyncio
+        await publish(object())
 
-        asyncio.get_event_loop().run_until_complete(publish(object()))
-
-    def test_error_message_includes_package_prefix(self, make_fake_app):
+    async def test_error_message_includes_package_prefix(self, make_fake_app):
         """ConfigurationError message includes the [package] prefix from the violating module."""
         make_fake_app(
             {
@@ -216,9 +206,7 @@ class TestManifestBootstrap:
         configure(package="fakeapp")
 
         with pytest.raises(ConfigurationError, match=r"\[fakeapp\.payments\]"):
-            import asyncio
-
-            asyncio.get_event_loop().run_until_complete(publish(object()))
+            await publish(object())
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +216,7 @@ class TestManifestBootstrap:
 
 
 class TestManifestVerifyScope:
-    def test_bogus_dependencies_and_tables_do_not_fail_bootstrap(self, make_fake_app):
+    async def test_bogus_dependencies_and_tables_do_not_fail_bootstrap(self, make_fake_app):
         """Bootstrap verifies only listeners + publishes.
 
         `declared_dependencies` and `owns_tables` need static source analysis
@@ -273,9 +261,7 @@ class TestManifestVerifyScope:
         configure(package="fakeapp")
 
         # Should NOT raise: bogus deps/tables are out of bootstrap's scope.
-        import asyncio
-
-        asyncio.get_event_loop().run_until_complete(publish(object()))
+        await publish(object())
 
 
 # ---------------------------------------------------------------------------

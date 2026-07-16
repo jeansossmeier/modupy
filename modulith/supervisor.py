@@ -51,6 +51,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("modulith.supervisor")
 
+# Bound on how long stop() waits for log forwarders to drain naturally (pipe
+# EOF) after their process is confirmed dead, before cancelling stragglers.
+# Draining is expected to be near-instant — this is a safety backstop, not a
+# tunable, so it isn't threaded through Supervisor.__init__.
+_LOG_DRAIN_TIMEOUT = 5.0
+
 # Parent-death signal support (Linux only). libc is resolved in the *parent*
 # at import time so the child-side preexec_fn — which runs between fork() and
 # exec(), where imports/allocations can deadlock — only makes one
@@ -99,6 +105,43 @@ class WorkerSpec:
 # A command builder maps (spec, port) -> argv. Injectable so tests can spawn
 # trivial processes instead of a full uvicorn worker.
 CommandBuilder = Callable[[WorkerSpec, int], list[str]]
+
+# redis_broker.py predates the generic MODULITH_BROKER_<KEY> convention that
+# cli.py uses to forward a resolved broker_options table (matching
+# db_broker.py's _broker_opt) — it only reads these specific historical
+# names. Mirror the generic form onto them so a broker_options.url etc.
+# resolved by the parent and forwarded as MODULITH_BROKER_URL actually
+# reaches a re-bootstrapping redis-streams worker, instead of silently never
+# arriving because the adapter looks for a different env var name.
+_REDIS_BROKER_ENV_ALIASES = {
+    "MODULITH_BROKER_URL": "REDIS_URL",
+    "MODULITH_BROKER_STREAM_PREFIX": "MODULITH_STREAM_PREFIX",
+    "MODULITH_BROKER_CONSUMER_GROUP": "MODULITH_CONSUMER_GROUP",
+    "MODULITH_BROKER_MAX_STREAM_LEN": "MODULITH_STREAM_MAXLEN",
+}
+
+
+def _build_worker_env(spec: WorkerSpec) -> dict[str, str]:
+    """Build one worker's subprocess environment.
+
+    Precedence (lowest to highest): the supervisor's own inherited
+    ``os.environ``, then the module's configured ``spec.env`` (e.g. broker
+    settings forwarded by the CLI), then the three reserved identity vars —
+    so nothing in ``spec.env`` can ever misroute a worker to the wrong
+    module/package/topology.
+    """
+    env = dict(os.environ)
+    if spec.env:
+        env.update(spec.env)
+    env["MODULITH_MODULE"] = spec.module_name
+    env["MODULITH_APP_PACKAGE"] = spec.package
+    env["MODULITH_TOPOLOGY"] = "processes"
+
+    if env.get("MODULITH_BROKER") == "redis-streams":
+        for generic, specific in _REDIS_BROKER_ENV_ALIASES.items():
+            if generic in env and specific not in env:
+                env[specific] = env[generic]
+    return env
 
 
 def _default_command(spec: WorkerSpec, port: int) -> list[str]:
@@ -228,6 +271,10 @@ class Supervisor:
         # Instances the breaker has given up on — surfaced for health reporting.
         self._failed_instances: set[str] = set()
         self._stopping = False
+        # Set by stop() so a monitor mid-backoff (asyncio.sleep(delay), which
+        # can be up to restart_max_delay) wakes immediately instead of
+        # blocking stop() until the shutdown_timeout cancellation backstop.
+        self._stop_event = asyncio.Event()
 
     def _instance_plan(self) -> list[tuple[str, WorkerSpec, int]]:
         """Expand specs into one (instance_name, spec, port) per replica."""
@@ -241,6 +288,7 @@ class Supervisor:
     async def start(self) -> None:
         """Spawn all workers and start monitoring them."""
         self._stopping = False
+        self._stop_event.clear()
         for name, spec, port in self._instance_plan():
             proc = await self._spawn(name, spec, port)
             self._monitor_tasks.append(
@@ -262,14 +310,7 @@ class Supervisor:
         exists — there, a hard-killed supervisor can still orphan workers.
         """
         cmd = self._command_builder(spec, port)
-        env = {
-            **os.environ,
-            "MODULITH_MODULE": spec.module_name,
-            "MODULITH_APP_PACKAGE": spec.package,
-            "MODULITH_TOPOLOGY": "processes",
-        }
-        if spec.env:
-            env.update(spec.env)
+        env = _build_worker_env(spec)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             env=env,
@@ -345,7 +386,18 @@ class Supervisor:
                 return_code,
                 delay,
             )
-            await asyncio.sleep(delay)
+            # Interruptible backoff: waiting on _stop_event (vs. plain
+            # asyncio.sleep(delay)) means stop() wakes this immediately —
+            # without it, a crash-looping worker backed off near
+            # restart_max_delay (up to 60s) would block stop() until the
+            # shutdown_timeout cancellation backstop instead of returning
+            # right away.
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+            except TimeoutError:
+                pass
+            else:
+                return  # stop() interrupted the backoff; do not respawn
             if self._stopping:
                 # Reachable: stop() may flip _stopping during the sleep above.
                 # mypy narrows it to False from the earlier check and can't
@@ -363,9 +415,25 @@ class Supervisor:
                 proc.terminate()  # type: ignore[unreachable]
 
     async def _forward_logs(self, prefix: str, stream: asyncio.StreamReader) -> None:
-        """Read a worker's output line-by-line and re-log it with its name."""
+        """Read a worker's output line-by-line and re-log it with its name.
+
+        ``readline()`` raises ``ValueError`` when a single line exceeds the
+        stream's buffer limit (e.g. an unbounded stack trace or a bulk debug
+        dump) — it already discards the offending bytes from its internal
+        buffer before raising, so the next ``readline()`` call cleanly picks
+        up at the following line. Using ``async for line in stream`` instead
+        would let that ValueError escape the loop and permanently silence
+        this worker's log forwarding after just one oversized line.
+        """
         try:
-            async for line in stream:
+            while True:
+                try:
+                    line = await stream.readline()
+                except ValueError:
+                    logger.warning("[%s] <log line exceeded the buffer limit; truncated>", prefix)
+                    continue
+                if not line:
+                    return  # EOF
                 logger.info("[%s] %s", prefix, line.decode(errors="replace").rstrip())
         except asyncio.CancelledError:
             raise
@@ -382,6 +450,7 @@ class Supervisor:
         subprocess transport is left to be garbage-collected after the loop.
         """
         self._stopping = True
+        self._stop_event.set()  # wakes any monitor mid-restart-backoff
 
         for proc in self._processes.values():
             if proc.returncode is None:
@@ -410,12 +479,26 @@ class Supervisor:
             *(proc.wait() for proc in self._processes.values()), return_exceptions=True
         )
 
-        # Snapshot: done-callbacks discard from the set as tasks finish
-        # cancelling, so iterate and await over a stable copy.
+        # Snapshot: done-callbacks discard from the set as tasks finish, so
+        # iterate and await over a stable copy. Every process is dead by now
+        # (killed + waited above), so its pipes are at EOF and the
+        # forwarders should drain and finish on their own almost
+        # immediately — give them a bounded grace period to do that first.
+        # Cancelling unconditionally (the old behavior) could cut off log
+        # lines the worker wrote just before dying but that were still
+        # sitting unread in the OS pipe buffer, silently dropping a
+        # crashing worker's last, most diagnostically useful output.
         log_tasks = list(self._log_tasks)
-        for task in log_tasks:
-            task.cancel()
-        await asyncio.gather(*log_tasks, return_exceptions=True)
+        if log_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*log_tasks, return_exceptions=True),
+                    timeout=_LOG_DRAIN_TIMEOUT,
+                )
+            except TimeoutError:
+                for task in log_tasks:
+                    task.cancel()
+                await asyncio.gather(*log_tasks, return_exceptions=True)
         self._monitor_tasks.clear()
         self._log_tasks.clear()
         logger.info("supervisor stopped")
@@ -459,6 +542,58 @@ async def _serve_uvicorn(app: Any, host: str, port: int) -> None:
     await uvicorn.Server(config).serve()
 
 
+def _is_loopback_host(host: str) -> bool:
+    """Whether ``host`` only accepts connections from this machine."""
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def _env_flag(name: str) -> bool:
+    """Loose boolean env-var read: 1/true/yes (case-insensitive) is True."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def _resolve_actuator(
+    *, mode: str, production: bool, host: str, token: str | None
+) -> tuple[bool, str | None]:
+    """Resolve ``actuator_mode`` into ``(enabled, token)`` for create_proxy_app.
+
+    - ``"disabled"``: actuator unmounted; token is moot.
+    - ``"open"``: explicit opt-out — always open, even if a token happens to
+      be configured (e.g. for other, unrelated purposes).
+    - ``"token"``: token-guarded is mandatory; refuse to start without one.
+    - ``"auto"`` (default): a loopback-only, non-production proxy stays open
+      for dev convenience (today's behavior). Otherwise — production, or
+      bound to a host reachable from outside this machine — a token becomes
+      mandatory too: leaving actuator metadata (topology, health) open on a
+      network-reachable production proxy is a real information disclosure,
+      not a convenience worth defaulting to.
+    """
+    from .config import ConfigurationError
+
+    if mode == "disabled":
+        return False, None
+    if mode == "open":
+        return True, None
+    if mode == "token":
+        if not token:
+            raise ConfigurationError(
+                "actuator_mode='token' requires a bearer token: set "
+                "MODULITH_ACTUATOR_TOKEN or pass actuator_token=... to "
+                "run_supervised()."
+            )
+        return True, token
+    # "auto"
+    if (production or not _is_loopback_host(host)) and not token:
+        raise ConfigurationError(
+            "actuator_mode='auto' requires MODULITH_ACTUATOR_TOKEN (or "
+            "actuator_token=...) when production=True or the proxy binds a "
+            f"non-loopback host ({host!r}) — refusing to start with an "
+            "unauthenticated actuator reachable from outside this machine. "
+            "Set actuator_mode='open' to explicitly opt out of this guard."
+        )
+    return True, token
+
+
 async def run_supervised(
     specs: list[WorkerSpec],
     proxy_host: str,
@@ -467,6 +602,8 @@ async def run_supervised(
     supervisor: Supervisor | None = None,
     serve: Callable[[Any, str, int], Awaitable[None]] | None = None,
     actuator_token: str | None = None,
+    actuator_mode: str | None = None,
+    production: bool | None = None,
 ) -> None:
     """Run the supervisor + reverse proxy together.
 
@@ -477,10 +614,13 @@ async def run_supervised(
     the workers are always stopped so none are orphaned.
 
     ``actuator_token`` guards the proxy's ``/_modulith/*`` actuator endpoints
-    with a bearer token. When not passed explicitly it falls back to the
-    ``MODULITH_ACTUATOR_TOKEN`` environment variable (empty string = unset),
-    so production deployments can enable the guard without code changes.
-    ``None``/unset leaves the actuator open (the documented default).
+    with a bearer token. ``actuator_mode`` (``"auto"`` | ``"token"`` |
+    ``"open"`` | ``"disabled"``) governs when that token is required — see
+    ``_resolve_actuator``. Neither passed explicitly falls back to the
+    ``MODULITH_ACTUATOR_TOKEN`` / ``MODULITH_ACTUATOR_MODE`` /
+    ``MODULITH_PRODUCTION`` environment variables (mirroring
+    ``Configuration``'s own env resolution), so production deployments can
+    enable the guard without code changes.
 
     ``supervisor`` and ``serve`` are injection seams for testing; production
     callers pass neither and get a real Supervisor plus a uvicorn server.
@@ -489,9 +629,19 @@ async def run_supervised(
 
     if actuator_token is None:
         actuator_token = os.environ.get("MODULITH_ACTUATOR_TOKEN") or None
+    if actuator_mode is None:
+        actuator_mode = os.environ.get("MODULITH_ACTUATOR_MODE") or "auto"
+    if production is None:
+        production = _env_flag("MODULITH_PRODUCTION")
+
+    actuator_enabled, actuator_token = _resolve_actuator(
+        mode=actuator_mode, production=production, host=proxy_host, token=actuator_token
+    )
 
     rules = _rules_from_specs(specs)
-    proxy_app = create_proxy_app(rules, actuator_token=actuator_token)
+    proxy_app = create_proxy_app(
+        rules, actuator_token=actuator_token, actuator_enabled=actuator_enabled
+    )
     sup = supervisor if supervisor is not None else Supervisor(specs)
     serve_fn = serve if serve is not None else _serve_uvicorn
 

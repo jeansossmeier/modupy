@@ -39,11 +39,21 @@ class FakeRedis:
         self.xreadgroup_calls: list[dict] = []
         self.xacks: list[tuple[str, str, tuple]] = []
         self.xautoclaim_calls: list[dict] = []
+        self.xpending_range_calls: list[dict] = []
+        self.eval_calls: list[tuple[str, int, tuple[Any, ...]]] = []
         # Canned XAUTOCLAIM reply — (cursor, claimed, deleted). Tests may
         # override it (e.g. to stage a non-empty deleted list, the
         # trimmed-while-pending loss channel real Redis reports; audit
         # S3-r3-160 — the old hardcoded return made that path unmodelable).
         self.xautoclaim_result: Any = (b"0-0", [(b"1-0", {b"data": b"{}"})], [])
+        self.xpending_range_result: Any = [
+            {
+                "message_id": b"1-0",
+                "consumer": b"c1",
+                "time_since_delivered": 0,
+                "times_delivered": 1,
+            }
+        ]
         self.closed = False
         self._existing_groups: set[tuple[str, str]] = set()
 
@@ -108,6 +118,23 @@ class FakeRedis:
             }
         )
         return self.xautoclaim_result
+
+    async def xpending_range(
+        self,
+        name: str,
+        groupname: str,
+        min: str,
+        max: str,
+        count: int,
+    ) -> Any:
+        self.xpending_range_calls.append(
+            {"name": name, "group": groupname, "min": min, "max": max, "count": count}
+        )
+        return self.xpending_range_result
+
+    async def eval(self, script: str, numkeys: int, *keys_and_args: Any) -> int:
+        self.eval_calls.append((script, numkeys, keys_and_args))
+        return 1
 
     async def aclose(self) -> None:
         self.closed = True
@@ -200,6 +227,23 @@ async def test_reclaim_uses_xautoclaim_for_pending_recovery(broker, fake) -> Non
     assert call["min_idle_time"] == 30000
 
 
+async def test_delivery_attempts_reads_redis_pending_metadata(broker, fake) -> None:
+    fake.xpending_range_result[0]["times_delivered"] = 4
+
+    attempts = await broker.delivery_attempts("orders", "1-0")
+
+    assert attempts == 4
+    assert fake.xpending_range_calls == [
+        {
+            "name": "modulith.events.orders",
+            "group": "g",
+            "min": "1-0",
+            "max": "1-0",
+            "count": 1,
+        }
+    ]
+
+
 # ---------------------------------------------------------------------------
 # dead-letter + close
 # ---------------------------------------------------------------------------
@@ -207,10 +251,22 @@ async def test_reclaim_uses_xautoclaim_for_pending_recovery(broker, fake) -> Non
 
 async def test_dead_letter_xadds_to_dead_stream_and_acks(broker, fake) -> None:
     await broker.dead_letter("orders", "1-0", {b"data": b"{}"})
-    # routed to the DLQ stream
-    assert any(name == "modulith.events.orders.dead" for name, _f, _m in fake.xadds)
-    # and acknowledged on the source stream so it stops being redelivered
-    assert ("modulith.events.orders", "g", ("1-0",)) in fake.xacks
+    # The atomic Lua transfer receives both source and DLQ stream names.
+    _script, _key_count, keys_and_args = fake.eval_calls[0]
+    assert keys_and_args[:2] == ("modulith.events.orders", "modulith.events.orders.dead")
+
+
+async def test_dead_letter_is_atomic_and_uses_original_message_identity(broker, fake) -> None:
+    """A retry after an interrupted transfer must not create another DLQ record."""
+    await broker.dead_letter("orders", "1-0", {b"data": b"{}"})
+
+    assert len(fake.eval_calls) == 1
+    script, key_count, keys_and_args = fake.eval_calls[0]
+    assert "SET" in script and "NX" in script and "XACK" in script
+    assert key_count == 3
+    assert keys_and_args[0] == "modulith.events.orders"
+    assert keys_and_args[1] == "modulith.events.orders.dead"
+    assert "1-0" in keys_and_args
 
 
 async def test_dead_letter_stream_is_bounded(broker, fake) -> None:
@@ -219,8 +275,8 @@ async def test_dead_letter_stream_is_bounded(broker, fake) -> None:
     Default DLQ cap is 10x the main stream cap (max_stream_len=500 here).
     """
     await broker.dead_letter("orders", "1-0", {b"data": b"{}"})
-    dead = [(name, maxlen) for name, _f, maxlen in fake.xadds if name.endswith(".dead")]
-    assert dead == [("modulith.events.orders.dead", 5000)]
+    _script, _key_count, keys_and_args = fake.eval_calls[0]
+    assert 5000 in keys_and_args
 
 
 async def test_dead_letter_cap_is_configurable() -> None:
@@ -229,8 +285,8 @@ async def test_dead_letter_cap_is_configurable() -> None:
         client=fake, stream_prefix="modulith.events", consumer_group="g", dlq_max_stream_len=42
     )
     await broker.dead_letter("orders", "1-0", {b"data": b"{}"})
-    dead_maxlens = [maxlen for name, _f, maxlen in fake.xadds if name.endswith(".dead")]
-    assert dead_maxlens == [42]
+    _script, _key_count, keys_and_args = fake.eval_calls[0]
+    assert 42 in keys_and_args
 
 
 async def test_close_calls_aclose(broker, fake) -> None:

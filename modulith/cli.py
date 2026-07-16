@@ -471,7 +471,11 @@ def _run_process_topology(
         f"modulith → process-per-module: {len(specs)} worker(s) [{layout}], "
         f"reverse proxy on http://{host}:{port}"
     )
-    asyncio.run(run_supervised(specs, host, port))
+    asyncio.run(
+        run_supervised(
+            specs, host, port, actuator_mode=cfg.actuator_mode, production=cfg.production
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +667,18 @@ def docs(
         # codes, not the exit-2 traceback reserved for internal bugs.
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from None
+    except OSError as exc:
+        # An --output-dir that collides with an existing file, or is
+        # otherwise unwritable (permissions, read-only filesystem), is a
+        # user/filesystem error per the documented exit codes — exit 1 with
+        # guidance, never the raw traceback + exit 2 reserved for internal
+        # bugs.
+        typer.echo(
+            f"error: could not write documentation to {output_dir} ({exc}). "
+            "Pass a writable --output-dir that is not an existing file.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
 
     if not produced:
         typer.echo("no documentation artifacts produced")
@@ -695,8 +711,26 @@ def audit(
         typer.echo(f"path does not exist: {path}", err=True)
         raise typer.Exit(code=1)
 
-    result = audit_codebase(path)
-    output.write_text(render_report(result), encoding="utf-8")
+    try:
+        cfg = load_configuration()
+    except ConfigurationError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+
+    result = audit_codebase(path, contracts_module=cfg.contracts_module)
+    try:
+        output.write_text(render_report(result), encoding="utf-8")
+    except OSError as exc:
+        # An --output path in a nonexistent directory (or otherwise
+        # unwritable) is a user/filesystem error per the documented exit
+        # codes — exit 1 with guidance, never the raw traceback + exit 2
+        # reserved for internal bugs (mirrors _write_baseline_or_exit).
+        typer.echo(
+            f"error: could not write audit report to {output} ({exc}). "
+            "Create the directory or pass a writable --output path.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
     typer.echo(f"readiness score: {result.readiness_score}/100")
     typer.echo(
         f"{len(result.cross_module_imports)} cross-module import pattern(s), "
@@ -752,11 +786,22 @@ async def _force_retry_known(pub_id: UUID) -> bool:
 
     ``outbox.force_retry`` only *logs* a warning on the not-found path —
     invisible whenever the application configures its own logging — so the
-    CLI checks existence against the same candidate set force_retry scans
-    (retryable + dead-lettered) and reports honestly (A9-r3-143).
+    CLI checks existence itself and reports honestly (A9-r3-143). Mirrors
+    ``force_retry``'s own lookup strategy: prefer the store's ``find_by_id``
+    direct point lookup when available, since ``find_incomplete``/
+    ``list_dead_lettered`` are both capped windows (LIMIT 100) that can miss
+    a targeted row sitting further back in a large backlog. Stores without
+    ``find_by_id`` fall back to the bounded scan.
     """
     store = outbox._store
     assert store is not None  # _require_outbox_store already ran
+    finder = getattr(store, "find_by_id", None)
+    if finder is not None:
+        pub = await finder(pub_id)
+        if pub is None or pub.completed_at is not None:
+            return False
+        await outbox.force_retry(pub_id)
+        return True
     candidates = list(await store.find_incomplete(timedelta(0)))
     candidates += await outbox.list_dead_lettered()
     if not any(pub.id == pub_id for pub in candidates):

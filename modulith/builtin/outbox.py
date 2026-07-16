@@ -17,10 +17,12 @@ Critical correctness properties:
      crash-recovery sweep never run two concurrent attempts for the same row
      in one process (the ``_inflight_ids`` guard below). Across processes
      (the process-per-module topology), delivery is at-least-once and two
-     workers' retry loops CAN dispatch the same row concurrently. The SQL
-     store's ``SELECT ... FOR UPDATE SKIP LOCKED`` narrows that window but does
-     not close it — which is exactly why property #3 holds and listeners must
-     be idempotent.
+     workers' retry loops CAN dispatch the same row concurrently. With
+     ``claim_strategy="lease"`` (default) or ``"advisory_lock"``, the store's
+     claim/lock fencing closes that cross-process window for the retry sweep.
+     ``claim_strategy="none"`` keeps the pre-Task-4 behavior (SKIP LOCKED
+     narrows but does not close it) — which is why property #3 still holds
+     and listeners must be idempotent under that mode.
 
 Reference implementation: Spring Modulith's Event Publication Registry. We
 mirror its semantics, including completion modes (update / delete / archive).
@@ -57,6 +59,13 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from modulith import EventPublication, PublicationStore, hookimpl
+from modulith._claims import (
+    DEFAULT_CLAIM_BATCH_SIZE,
+    DEFAULT_CLAIM_LEASE_SECONDS,
+    DEFAULT_CLAIM_STRATEGY,
+    VALID_CLAIM_STRATEGIES,
+)
+from modulith.config import ConfigurationError
 from modulith.serializers import JsonEventSerializer
 
 logger = logging.getLogger("modulith.outbox")
@@ -85,6 +94,14 @@ _max_retry_backoff_seconds: float = 300.0
 _retry_stale_seconds: float = 30.0
 _retry_loop_enabled: bool = True
 _retry_task: asyncio.Task[None] | None = None
+
+# Task 4 claim coordination (see modulith._claims). Bound in configure().
+# Default ``"lease"``; third-party stores without ClaimingStore fall back to
+# the original find_incomplete path at sweep time (capability duck-typing).
+_claim_strategy: str = DEFAULT_CLAIM_STRATEGY
+_claim_lease_seconds: float = DEFAULT_CLAIM_LEASE_SECONDS
+_claim_batch_size: int = DEFAULT_CLAIM_BATCH_SIZE
+_claim_owner: str = ""
 
 # Guards check-then-set access to ``_retry_task``. The module slot is
 # process-global while event loops are not: the main loop and sync.py's
@@ -139,16 +156,60 @@ def _listener_id(handler: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_dead_letter_threshold(store: Any, configured: int | None) -> int:
+    """Unify the plugin's dead-letter threshold with the store's own.
+
+    A store MAY duck-type expose ``dead_letter_after_attempts`` (e.g.
+    ``PostgresPublicationStore`` writes an ``is_dead_lettered`` flag from ITS
+    OWN threshold at ``save()`` time) plus a ``dead_letter_after_attempts_
+    explicit`` marker. Stores without either attribute (the in-memory test
+    double, pre-Task-4 third-party stores) simply defer entirely to this
+    plugin's value — unchanged behavior for them.
+
+    Precedence: if BOTH sides were explicitly set and disagree, that is a
+    genuine misconfiguration — fail loudly here rather than silently picking
+    one and leaving the store's ``is_dead_lettered`` flag and the plugin's own
+    skip-check disagreeing on which rows are dead. If only one side is
+    explicit, that value wins and is pushed onto the store so both agree.
+    """
+    store_value = getattr(store, "dead_letter_after_attempts", None)
+    store_explicit = getattr(store, "dead_letter_after_attempts_explicit", False)
+    if configured is not None and store_explicit and store_value != configured:
+        raise ConfigurationError(
+            "conflicting dead_letter_after_attempts: outbox.configure() got "
+            f"{configured!r} but the store was constructed with {store_value!r}. "
+            "Set it in exactly one place and let the other default, or set the "
+            "same value in both."
+        )
+    if configured is not None:
+        resolved = configured
+    elif store_explicit and isinstance(store_value, int) and not isinstance(store_value, bool):
+        resolved = store_value
+    else:
+        resolved = 10
+    if resolved < 1:
+        # 0 or negative would make every record — including never-attempted
+        # crash-recovered ones — count as already dead-lettered: the sweep
+        # would skip them all forever, silently blackholing publications.
+        raise ValueError(f"dead_letter_after_attempts must be >= 1, got {resolved!r}")
+    if hasattr(store, "dead_letter_after_attempts"):
+        store.dead_letter_after_attempts = resolved
+    return resolved
+
+
 def configure(
     store: PublicationStore,
     serializer: Any,
     *,
     completion_mode: str = "update",
-    dead_letter_after_attempts: int = 10,
+    dead_letter_after_attempts: int | None = None,
     retry_interval_seconds: float = 30.0,
     max_retry_backoff_seconds: float = 300.0,
     retry_stale_seconds: float = 30.0,
     start_loop: bool = True,
+    claim_strategy: str = DEFAULT_CLAIM_STRATEGY,
+    claim_lease_seconds: float = DEFAULT_CLAIM_LEASE_SECONDS,
+    claim_batch_size: int = DEFAULT_CLAIM_BATCH_SIZE,
 ) -> None:
     """Wire up the outbox at startup.
 
@@ -159,7 +220,14 @@ def configure(
     ``completion_mode`` is one of ``"update"`` (set ``completed_at``),
     ``"delete"`` (remove the row), or ``"archive"`` (move to archive). A
     record is dead-lettered once ``attempt_count`` reaches
-    ``dead_letter_after_attempts``.
+    ``dead_letter_after_attempts``. ``None`` (the default) means "unset here";
+    the effective value is unified with the store's own setting if it has one
+    (see ``_resolve_dead_letter_threshold``), else defaults to 10.
+
+    ``claim_strategy`` coordinates concurrent sweepers (see
+    ``modulith._claims``): ``"lease"`` (default), ``"advisory_lock"``, or
+    ``"none"``. Stores without the matching capability fall back to the
+    original unclaimed ``find_incomplete`` path at sweep time.
 
     ``start_loop=False`` binds state without starting the loop — used by
     tests that drive ``_dispatch_publication`` directly, and by callers that
@@ -173,29 +241,59 @@ def configure(
     global _store, _serializer, _completion_mode
     global _dead_letter_after_attempts, _retry_interval_seconds
     global _max_retry_backoff_seconds, _retry_stale_seconds, _retry_loop_enabled
+    global _claim_strategy, _claim_lease_seconds, _claim_batch_size, _claim_owner
 
     if completion_mode not in ("update", "delete", "archive"):
         raise ValueError(
             f"completion_mode must be 'update', 'delete', or 'archive', got {completion_mode!r}"
         )
-    if dead_letter_after_attempts < 1:
-        # 0 or negative would make every record — including never-attempted
-        # crash-recovered ones — count as already dead-lettered: the sweep
-        # would skip them all forever, silently blackholing publications.
+    if claim_strategy not in VALID_CLAIM_STRATEGIES:
         raise ValueError(
-            f"dead_letter_after_attempts must be >= 1, got {dead_letter_after_attempts!r}"
+            f"claim_strategy must be one of {VALID_CLAIM_STRATEGIES}, got {claim_strategy!r}"
         )
+    if not isinstance(claim_lease_seconds, (int, float)) or not (
+        claim_lease_seconds == claim_lease_seconds and claim_lease_seconds > 0
+    ):
+        # NaN != NaN; reject non-finite / non-positive leases.
+        raise ValueError(
+            f"claim_lease_seconds must be a positive finite number, got {claim_lease_seconds!r}"
+        )
+    if (
+        not isinstance(claim_batch_size, int)
+        or isinstance(claim_batch_size, bool)
+        or claim_batch_size < 1
+    ):
+        raise ValueError(f"claim_batch_size must be a positive integer, got {claim_batch_size!r}")
+    if claim_strategy == "advisory_lock" and not getattr(store, "supports_advisory_lock", False):
+        raise ConfigurationError(
+            "claim_strategy='advisory_lock' requires a store with "
+            "supports_advisory_lock=True (Postgres pg_try_advisory_lock)"
+        )
+    if claim_strategy == "none":
+        # Intentional contract: concurrent sweepers MAY double-dispatch.
+        # Log once per configure so operators see the tradeoff.
+        logger.warning(
+            "outbox claim_strategy='none': concurrent sweepers may double-dispatch "
+            "the same publication; listeners must be idempotent"
+        )
+
+    resolved_dead_letter = _resolve_dead_letter_threshold(store, dead_letter_after_attempts)
 
     _cancel_retry_task()
 
     _store = store
     _serializer = serializer
     _completion_mode = completion_mode
-    _dead_letter_after_attempts = dead_letter_after_attempts
+    _dead_letter_after_attempts = resolved_dead_letter
     _retry_interval_seconds = retry_interval_seconds
     _max_retry_backoff_seconds = max_retry_backoff_seconds
     _retry_stale_seconds = retry_stale_seconds
     _retry_loop_enabled = start_loop
+    _claim_strategy = claim_strategy
+    _claim_lease_seconds = float(claim_lease_seconds)
+    _claim_batch_size = claim_batch_size
+    # Unique per configure() so two processes / reconfigs don't share an owner id.
+    _claim_owner = uuid4().hex
 
     if start_loop:
         _ensure_retry_loop()
@@ -271,13 +369,18 @@ def modulith_after_event_published(event: Any, publication: EventPublication) ->
     """Observability hook — the outbox itself does nothing here."""
 
 
-async def persist(event: Any) -> None:
+async def persist(event: Any) -> list[EventPublication]:
     """Persist one publication per registered listener, inside the txn.
 
     Called by ``Runtime.publish`` when the outbox owns dispatch (a store is
     configured AND a session is bound). Each ``_store.save`` enlists the
     record in the bound session so it commits atomically with the business
     work; after commit the adapter's after-commit hook fires dispatch.
+
+    Returns the actual persisted records (empty when the event has no
+    registered listener) — the runtime wraps these in an
+    ``EventPublishReceipt`` for ``modulith_after_event_published`` instead
+    of fabricating a placeholder unrelated to what was really saved.
     """
     from .. import runtime as _rt
 
@@ -286,14 +389,15 @@ async def persist(event: Any) -> None:
         _ensure_retry_loop()
     bus = _rt._runtime.event_bus
     if bus is None:
-        return
+        return []
     handlers = bus.listeners_for(type(event))
     if not handlers:
-        return
+        return []
 
     fqcn = f"{type(event).__module__}.{type(event).__qualname__}"
     payload = _serializer.serialize(event)
     now = datetime.now(UTC)
+    saved: list[EventPublication] = []
     for handler in handlers:
         pub = EventPublication(
             id=uuid4(),
@@ -303,9 +407,11 @@ async def persist(event: Any) -> None:
             published_at=now,
         )
         await _store.save(pub)
+        saved.append(pub)
+    return saved
 
 
-async def persist_broker_route(event: Any, target: str) -> None:
+async def persist_broker_route(event: Any, target: str) -> EventPublication:
     """Persist a deferred broker send for this transaction's publish.
 
     Called by ``Runtime.publish`` on the durable path when the event resolves
@@ -320,6 +426,10 @@ async def persist_broker_route(event: Any, target: str) -> None:
     not the configured storage serializer — the row's payload goes to the
     broker verbatim, and the worker consumer decodes the wire format (see
     ``_WIRE_SERIALIZER``).
+
+    Returns the persisted record — folded into the runtime's
+    ``EventPublishReceipt`` alongside any per-listener records ``persist()``
+    saved for the same publish.
     """
     assert _store is not None  # owns-dispatch guarantees this
     if _retry_loop_enabled:
@@ -333,6 +443,7 @@ async def persist_broker_route(event: Any, target: str) -> None:
         published_at=datetime.now(UTC),
     )
     await _store.save(pub)
+    return pub
 
 
 # ---------------------------------------------------------------------------
@@ -354,24 +465,74 @@ def _resolve_listener(publication: EventPublication, event: Any) -> Any:
 
 
 async def _complete(publication: EventPublication) -> None:
-    """Apply the configured completion mode to a delivered publication."""
+    """Apply the configured completion mode to a delivered publication.
+
+    ``completed_at`` is stamped only AFTER the store call returns — not
+    before. Setting it optimistically first (then having the store call
+    fail) left the in-memory record looking completed while _record_failure
+    went on to persist attempt_count/last_error on it: an inconsistent row
+    that is simultaneously "completed" and "failed". If the store call below
+    raises, the caller (_dispatch_publication) routes to _record_failure,
+    which must see completed_at still None.
+
+    Lease mode: when ``publication.claim_token`` is set and the store
+    exposes ``complete_claim``, fence the write by token. A stale token
+    means another sweeper already owns the row — abandon quietly without
+    burning retry attempts (do not raise).
+    """
     assert _store is not None
-    publication.completed_at = datetime.now(UTC)
+    token = publication.claim_token
+    complete_claim = getattr(_store, "complete_claim", None) if token else None
+    if token is not None and complete_claim is not None:
+        ok = await complete_claim(publication.id, token, _completion_mode)
+        if not ok:
+            logger.warning(
+                "stale claim token on complete for publication %s — abandoning "
+                "(another sweeper owns this row)",
+                publication.id,
+            )
+            return
+        publication.completed_at = datetime.now(UTC)
+        return
+
     if _completion_mode == "delete":
         await _store.delete(publication.id)
     elif _completion_mode == "archive":
         await _store.archive(publication.id)
     else:
         await _store.mark_complete(publication.id)
+    publication.completed_at = datetime.now(UTC)
 
 
 async def _record_failure(publication: EventPublication, exc: Exception) -> None:
-    """Persist one failed delivery attempt without hiding the publication."""
+    """Persist one failed delivery attempt without hiding the publication.
+
+    Lease mode: fence the failure write with ``fail_claim`` when a claim
+    token is present. A stale token means we lost the lease mid-dispatch —
+    revert the in-memory attempt bump so we don't pretend the failure was
+    recorded, and leave the peer claimant alone.
+    """
     assert _store is not None
     publication.attempt_count += 1
     publication.last_error = str(exc)[:500]
     publication.last_attempt_at = datetime.now(UTC)
-    await _store.save(publication)
+
+    token = publication.claim_token
+    fail_claim = getattr(_store, "fail_claim", None) if token else None
+    if token is not None and fail_claim is not None:
+        ok = await fail_claim(publication, token)
+        if not ok:
+            # Revert optimistic bump — the failure was not persisted.
+            publication.attempt_count -= 1
+            logger.warning(
+                "stale claim token on fail for publication %s — abandoning "
+                "(another sweeper owns this row)",
+                publication.id,
+            )
+            return
+    else:
+        await _store.save(publication)
+
     if publication.attempt_count >= _dead_letter_after_attempts:
         logger.error(
             "publication %s dead-lettered after %d attempt(s): %s",
@@ -581,12 +742,30 @@ async def _sweep(older_than: timedelta) -> None:
     dead-letter threshold while the outage lasts. Genuine dispatch failures
     (listener raised, broker rejected) still record attempts and can
     dead-letter.
+
+    Claim strategy (Task 4) selects the concurrency path:
+      * lease + ClaimingStore → claim_batch, renew during dispatch, fence
+      * advisory_lock + AdvisoryLockingStore → try_lock around dispatch
+      * none, or missing capability → original find_incomplete path
     """
     from .. import runtime as _rt
 
     assert _store is not None
+
+    if _claim_strategy == "lease" and hasattr(_store, "claim_batch"):
+        await _sweep_lease(older_than, runtime_ready=_rt._runtime.event_bus is not None)
+        return
+    if _claim_strategy == "advisory_lock" and hasattr(_store, "try_lock_publication"):
+        await _sweep_advisory(older_than, runtime_ready=_rt._runtime.event_bus is not None)
+        return
+    await _sweep_unclaimed(older_than, runtime_ready=_rt._runtime.event_bus is not None)
+
+
+async def _sweep_unclaimed(older_than: timedelta, *, runtime_ready: bool) -> None:
+    """Original find_incomplete path (claim_strategy=none or no capability)."""
+    assert _store is not None
     pending = await _store.find_incomplete(older_than)
-    if pending and _rt._runtime.event_bus is None:
+    if pending and not runtime_ready:
         logger.info(
             "outbox sweep: runtime is not bootstrapped — skipping %d pending "
             "publication(s) this cycle without burning retry attempts",
@@ -599,6 +778,109 @@ async def _sweep(older_than: timedelta) -> None:
         if not _backoff_elapsed(pub):
             continue
         await _dispatch_publication(pub)
+
+
+async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
+    """Lease mode: claim a batch, renew during dispatch, fence complete/fail."""
+    assert _store is not None
+    claimed = await _store.claim_batch(  # type: ignore[attr-defined]
+        owner=_claim_owner,
+        batch_size=_claim_batch_size,
+        lease_seconds=_claim_lease_seconds,
+        older_than=older_than,
+    )
+    if claimed and not runtime_ready:
+        logger.info(
+            "outbox sweep: runtime is not bootstrapped — releasing %d claimed "
+            "publication(s) this cycle without burning retry attempts",
+            len(claimed),
+        )
+        # Release immediately so another process can reclaim once ready.
+        for pub in claimed:
+            if pub.claim_token:
+                await _store.renew_claim(pub.id, pub.claim_token, 0.0)  # type: ignore[attr-defined]
+        return
+    for pub in claimed:
+        if pub.attempt_count >= _dead_letter_after_attempts:
+            if pub.claim_token:
+                await _store.renew_claim(pub.id, pub.claim_token, 0.0)  # type: ignore[attr-defined]
+            continue
+        if not _backoff_elapsed(pub):
+            # Release early: holding a full lease on a not-yet-due row would
+            # block every other sweeper from picking it up sooner.
+            if pub.claim_token:
+                await _store.renew_claim(pub.id, pub.claim_token, 0.0)  # type: ignore[attr-defined]
+            continue
+        await _dispatch_with_lease_renewal(pub)
+
+
+async def _sweep_advisory(older_than: timedelta, *, runtime_ready: bool) -> None:
+    """Advisory-lock mode: hold a PG advisory lock through each dispatch."""
+    assert _store is not None
+    pending = await _store.find_incomplete(older_than)
+    if pending and not runtime_ready:
+        logger.info(
+            "outbox sweep: runtime is not bootstrapped — skipping %d pending "
+            "publication(s) this cycle without burning retry attempts",
+            len(pending),
+        )
+        return
+    for pub in pending:
+        if pub.attempt_count >= _dead_letter_after_attempts:
+            continue
+        if not _backoff_elapsed(pub):
+            continue
+        handle = await _store.try_lock_publication(pub.id)  # type: ignore[attr-defined]
+        if handle is None:
+            continue  # another sweeper holds the lock — skip this cycle
+        try:
+            await _dispatch_publication(pub)
+        finally:
+            await _store.unlock_publication(handle, pub.id)  # type: ignore[attr-defined]
+
+
+async def _dispatch_with_lease_renewal(publication: EventPublication) -> None:
+    """Dispatch under an active lease, renewing at one-third of the lease.
+
+    Renewal failures (stale token) stop the renew loop but do not cancel
+    dispatch — fencing happens in ``_complete`` / ``_record_failure``.
+    """
+    token = publication.claim_token
+    if not token or not hasattr(_store, "renew_claim"):
+        await _dispatch_publication(publication)
+        return
+
+    stop = asyncio.Event()
+    renew_interval = _claim_lease_seconds / 3.0
+
+    async def _renew_loop() -> None:
+        assert _store is not None and token is not None
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=renew_interval)
+                return
+            except TimeoutError:
+                # ClaimingStore capability — not on the base PublicationStore Protocol.
+                store_any: Any = _store
+                ok = await store_any.renew_claim(publication.id, token, _claim_lease_seconds)
+                if not ok:
+                    logger.warning(
+                        "lost lease on publication %s during dispatch — "
+                        "stopping renewals; completion will be fenced",
+                        publication.id,
+                    )
+                    return
+
+    renew_task = asyncio.create_task(_renew_loop())
+    try:
+        await _dispatch_publication(publication)
+    finally:
+        stop.set()
+        renew_task.cancel()
+        try:
+            await renew_task
+        except asyncio.CancelledError:
+            pass
 
 
 async def _guarded_sweep(older_than: timedelta) -> None:
@@ -650,17 +932,31 @@ async def shutdown() -> None:
     *requests*; the task needs another loop turn to unwind) where a
     concurrent transactional publish's ``_ensure_retry_loop()`` saw "no
     loop" and spawned a second retry task that survived shutdown entirely.
+
+    Cross-loop safe: the retry task may live on a DIFFERENT event loop than
+    the one ``shutdown()`` is awaited from — sync.py's persistent
+    daemon-thread loop runs the retry task while the application's main loop
+    awaits ``shutdown()`` during teardown. Cancelling directly (``task.
+    cancel()``) is only safe from the task's own loop; from any other loop it
+    must go through ``call_soon_threadsafe``. Likewise ``await task`` on a
+    foreign-loop task raises ("Task got Future attached to a different
+    loop"), so completion is observed by polling ``task.done()`` instead.
     """
     global _retry_task
     task = _retry_task
     if task is None:
         return
     if not task.done():
-        task.cancel()
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if task.get_loop() is running:
+            task.cancel()
+        else:
+            task.get_loop().call_soon_threadsafe(task.cancel)
+        while not task.done():
+            await asyncio.sleep(0.01)
     with _retry_task_lock:
         # Clear the slot only if no concurrent configure()/_ensure_retry_loop()
         # installed a fresh task while we awaited the cancellation.
@@ -705,12 +1001,23 @@ async def status() -> dict[str, int]:
 async def force_retry(publication_id: UUID) -> None:
     """Immediately retry a specific publication, bypassing backoff.
 
-    Searches both the retryable set and the dead-letter set: now that the SQL
-    store excludes dead-letters from ``find_incomplete``, an operator forcing a
-    retry of an exhausted publication (e.g. after fixing the listener) must
-    still be able to reach it.
+    Uses the store's ``find_by_id`` capability (a direct point lookup) when
+    available: ``find_incomplete``/``find_dead_lettered`` are both capped
+    windows (LIMIT 100), so scanning them could never reach a targeted row
+    sitting further back in a large backlog. Stores without ``find_by_id``
+    (pre-Task-4 third-party stores) fall back to the bounded scan.
     """
     assert _store is not None
+    finder = getattr(_store, "find_by_id", None)
+    if finder is not None:
+        pub = await finder(publication_id)
+        if pub is None or pub.completed_at is not None:
+            logger.warning(
+                "force_retry: publication %s not found or already complete", publication_id
+            )
+            return
+        await _dispatch_publication(pub)
+        return
     candidates = list(await _store.find_incomplete(timedelta(0)))
     candidates += await list_dead_lettered()
     for pub in candidates:
@@ -735,19 +1042,42 @@ async def purge_completed(older_than: timedelta) -> int:
 
 
 async def list_dead_lettered() -> list[EventPublication]:
-    """Return publications that have exhausted their retry budget.
+    """Return ALL publications that have exhausted their retry budget.
 
     Uses the store's dedicated ``find_dead_lettered`` capability when available
     (the SQL store excludes dead-letters from ``find_incomplete`` so its capped
     retry window isn't starved). Stores without it fall back to partitioning the
     incomplete set by the attempt threshold.
+
+    Pages through the store's keyset-pagination capability (Task 4:
+    ``find_dead_lettered(after=..., limit=...)``) so a backlog past a single
+    100-row page is fully returned rather than silently truncated — a
+    pre-Task-4 third-party store whose ``find_dead_lettered()`` takes no
+    arguments raises ``TypeError`` on the first paginated call, which is
+    caught to fall back to its single unbounded/capped result unchanged.
     """
     assert _store is not None
     finder = getattr(_store, "find_dead_lettered", None)
-    if finder is not None:
-        return list(await finder())
-    pubs = await _store.find_incomplete(timedelta(0))
-    return [p for p in pubs if p.attempt_count >= _dead_letter_after_attempts]
+    if finder is None:
+        pubs = await _store.find_incomplete(timedelta(0))
+        return [p for p in pubs if p.attempt_count >= _dead_letter_after_attempts]
+    results: list[EventPublication] = []
+    after: tuple[datetime, UUID] | None = None
+    page_size = 100
+    while True:
+        try:
+            page = await finder(after=after, limit=page_size)
+        except TypeError:
+            return list(await finder())
+        if not page:
+            break
+        results.extend(page)
+        if len(page) < page_size:
+            break
+        last = page[-1]
+        assert last.published_at is not None
+        after = (last.published_at, last.id)
+    return results
 
 
 async def retry_all_dead_lettered() -> int:
@@ -784,6 +1114,7 @@ def _reset_for_testing() -> None:
     global _store, _serializer, _completion_mode
     global _dead_letter_after_attempts, _retry_interval_seconds
     global _max_retry_backoff_seconds, _retry_stale_seconds, _retry_loop_enabled
+    global _claim_strategy, _claim_lease_seconds, _claim_batch_size, _claim_owner
     _cancel_retry_task()
     _store = None
     _serializer = None
@@ -793,6 +1124,10 @@ def _reset_for_testing() -> None:
     _max_retry_backoff_seconds = 300.0
     _retry_stale_seconds = 30.0
     _retry_loop_enabled = True
+    _claim_strategy = DEFAULT_CLAIM_STRATEGY
+    _claim_lease_seconds = DEFAULT_CLAIM_LEASE_SECONDS
+    _claim_batch_size = DEFAULT_CLAIM_BATCH_SIZE
+    _claim_owner = ""
     with _inflight_lock:
         _inflight_ids.clear()
 

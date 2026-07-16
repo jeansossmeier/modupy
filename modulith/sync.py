@@ -200,29 +200,61 @@ def _run_nested_dispatch(
     """Run a nested publish coroutine on a fresh thread with its own loop.
 
     Used when publish_sync() is called from inside a sync listener (see
-    detection case 2). ``asyncio.run`` gives the nested dispatch its own
+    detection case 2). The fresh loop gives the nested dispatch its own
     event loop AND its own default executor, so nested sync listeners never
     queue behind — or deadlock against — the bounded pool slot occupied by
-    their caller. asyncio.run tears the loop and its executor down when the
-    dispatch finishes. On timeout the thread is abandoned (daemon; it cannot
-    be cancelled from outside its loop) — bounded to one short-lived thread
-    per timed-out nested call.
+    their caller.
+
+    Two properties a bare ``asyncio.run(coro)`` on a fresh thread doesn't
+    give us, both needed here:
+
+      * ContextVar propagation. A brand-new OS thread starts with an empty
+        top-level ``contextvars.Context`` — any ContextVar the calling
+        (outer-listener executor) thread had bound was silently invisible to
+        the nested dispatch. Captured via ``contextvars.copy_context()``
+        before the thread starts and run inside that copy.
+      * Cross-thread cancellation on timeout. ``asyncio.run`` hands back no
+        handle once it's running, so a timed-out nested call used to abandon
+        the coroutine to run (or hang) unobserved for as long as it liked —
+        forever, for a permanently-hung listener. Creating the task
+        ourselves keeps a reference this function can cancel via
+        ``call_soon_threadsafe`` from the calling thread, bounding the
+        nested thread's lifetime to "until cancellation lands" instead of
+        "until the hung coroutine finishes."
     """
     from concurrent.futures import Future
     from concurrent.futures import TimeoutError as FuturesTimeoutError
 
     done: Future[None] = Future()
+    loop_ready = threading.Event()
+    state: dict[str, Any] = {}
+    ctx = contextvars.copy_context()
 
-    def _target() -> None:
+    def _run_on_fresh_loop() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        state["loop"] = loop
         try:
-            asyncio.run(coro)
-        except BaseException as exc:
-            done.set_exception(exc)
-        else:
-            done.set_result(None)
+            task = loop.create_task(coro)
+            state["task"] = task
+            loop_ready.set()
+            try:
+                loop.run_until_complete(task)
+            except BaseException as exc:
+                done.set_exception(exc)
+            else:
+                done.set_result(None)
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            finally:
+                loop.close()
 
-    thread = threading.Thread(target=_target, name="modulith-sync-nested", daemon=True)
+    thread = threading.Thread(
+        target=ctx.run, args=(_run_on_fresh_loop,), name="modulith-sync-nested", daemon=True
+    )
     thread.start()
+    loop_ready.wait()
     try:
         done.result(timeout=timeout)
     except FuturesTimeoutError as exc:
@@ -235,6 +267,9 @@ def _run_nested_dispatch(
             # even when the dispatch completes inside the race window between
             # wait expiry and this check.
             raise
+        loop = state["loop"]
+        task = state["task"]
+        loop.call_soon_threadsafe(task.cancel)
         logger.warning(
             "publish_sync timeout after %s s for %s (nested dispatch)",
             timeout,

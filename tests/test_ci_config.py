@@ -265,3 +265,99 @@ def test_standalone_tool_pins_mirror_pyproject() -> None:
             f"ci.yml installs {pin!r} but pyproject.toml declares no identical "
             "requirement — the two constraints have drifted (S4-r3-164/S4-r2-125)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 9: coverage, integration matrix, scripts/examples lint, wheel smoke,
+# API-reference drift check
+# ---------------------------------------------------------------------------
+
+
+def _jobs() -> dict[str, Any]:
+    workflow = yaml.safe_load(_ci_text())
+    assert isinstance(workflow, dict)
+    jobs = workflow.get("jobs")
+    assert isinstance(jobs, dict)
+    return jobs
+
+
+def test_unit_matrix_collects_coverage_once_on_311() -> None:
+    """Coverage is collected once on 3.11 and fails the job under threshold."""
+    ci = _ci_text()
+    assert "coverage" in ci or "pytest-cov" in ci or "--cov" in ci, (
+        "CI must collect coverage (pytest --cov / coverage report)"
+    )
+    assert re.search(r"--cov(=modulith|\s+modulith)", ci), (
+        "unit lane must run pytest with --cov=modulith on at least one matrix cell"
+    )
+    # Thresholds live in pyproject so local and CI agree.
+    tool = _pyproject().get("tool", {})
+    assert isinstance(tool, dict)
+    coverage = tool.get("coverage", {})
+    assert isinstance(coverage, dict)
+    report = coverage.get("report", {})
+    assert isinstance(report, dict)
+    assert report.get("fail_under") == 90, (
+        "tool.coverage.report.fail_under must be 90 for the package threshold"
+    )
+
+
+def test_integration_matrix_covers_311_and_313() -> None:
+    """Integration lane must exercise both ends of the supported Python range."""
+    jobs = _jobs()
+    integration = jobs.get("integration")
+    assert isinstance(integration, dict)
+    strategy = integration.get("strategy")
+    assert isinstance(strategy, dict), "integration job must define a matrix strategy"
+    matrix = strategy.get("matrix")
+    assert isinstance(matrix, dict)
+    versions = matrix.get("python-version")
+    assert isinstance(versions, list)
+    assert "3.11" in versions and "3.13" in versions, (
+        f"integration matrix must include 3.11 and 3.13, got {versions!r}"
+    )
+
+
+def test_lint_and_typecheck_include_scripts_and_examples() -> None:
+    """Lint/format/typecheck must cover packaged tooling and examples."""
+    ci = _ci_text()
+    assert re.search(r"ruff check\b[^\n]*scripts", ci), "ruff check must include scripts/"
+    assert re.search(r"ruff check\b[^\n]*examples", ci), "ruff check must include examples/"
+    assert re.search(r"ruff format --check\b[^\n]*scripts", ci), (
+        "ruff format --check must include scripts/"
+    )
+    assert re.search(r"ruff format --check\b[^\n]*examples", ci), (
+        "ruff format --check must include examples/"
+    )
+    assert re.search(r"mypy\s+--strict\b[^\n]*scripts", ci), "mypy --strict must include scripts/"
+    assert re.search(r"mypy\s+--strict\b[^\n]*examples", ci), "mypy --strict must include examples/"
+
+
+def test_build_smoke_installs_all_extras_and_runs_migration() -> None:
+    """Wheel smoke must install with all extras and exercise a SQLite migration."""
+    ci = _ci_text()
+    assert re.search(r"pip install[^\n]*\[all\]|pip install[^\n]*\.\[all\]", ci) or (
+        "dist/*.whl" in ci and "[all]" in ci
+    ), "build smoke must install the wheel with the [all] extra"
+    assert "modulith" in ci and ("migrate" in ci or "alembic" in ci), (
+        "build smoke must run a packaged SQLite migration"
+    )
+    assert "gen_api_reference" in ci or "API_REFERENCE" in ci, (
+        "CI must run the API-reference drift check"
+    )
+
+
+def test_coverage_outbox_path_is_fully_covered() -> None:
+    """Outbox plugin must stay at 100% coverage (fail_under via omit/paths)."""
+    tool = _pyproject().get("tool", {})
+    assert isinstance(tool, dict)
+    coverage = tool.get("coverage", {})
+    assert isinstance(coverage, dict)
+    # Either a dedicated paths/fail_under for outbox, or an explicit CI step.
+    ci = _ci_text()
+    has_outbox_gate = (
+        "builtin/outbox" in ci or "modulith/builtin/outbox" in ci or "outbox.py" in str(coverage)
+    )
+    assert has_outbox_gate, (
+        "CI or coverage config must enforce 100% coverage on modulith/builtin/outbox.py"
+    )

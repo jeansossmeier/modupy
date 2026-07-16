@@ -136,7 +136,12 @@ async def test_run_supervised_starts_serves_then_stops() -> None:
 
     specs = [WorkerSpec("orders", "app", 9001), WorkerSpec("inventory", "app", 9002)]
 
-    await run_supervised(specs, "0.0.0.0", 8000, supervisor=sup, serve=fake_serve)
+    # actuator_mode="open": this test's concern is the start/serve/stop
+    # orchestration, not actuator security — "0.0.0.0" would otherwise trip
+    # the auto-mode non-loopback guard (Task 7) and raise ConfigurationError.
+    await run_supervised(
+        specs, "0.0.0.0", 8000, supervisor=sup, serve=fake_serve, actuator_mode="open"
+    )
 
     assert sup.events == ["start", "serve", "stop"]
     assert captured["host"] == "0.0.0.0"

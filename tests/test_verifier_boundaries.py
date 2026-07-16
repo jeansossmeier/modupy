@@ -31,6 +31,7 @@ from modulith.builtin.verifier import (
 )
 from modulith.config import ConfigurationError
 from modulith.manifest import Manifest, verify_manifest
+from modulith.types import ViolationSeverity
 
 
 def _module(name: str) -> ModuleInfo:
@@ -555,9 +556,8 @@ def test_explicit_empty_declared_dependencies_means_deny_all(make_fake_app) -> N
         manifest_module._reset_for_testing()
 
 
-def test_declare_module_default_declared_dependencies_is_none() -> None:
-    """A10-r1-36 (adjudicated): declare_module() without declared_dependencies
-    stores None ('not declared'), not an empty tuple."""
+def test_declare_module_default_dependencies_remain_iterable_but_undeclared() -> None:
+    """Omitted dependencies remain distinguishable without returning None."""
     from modulith import declare_module
     from modulith import manifest as manifest_module
 
@@ -566,7 +566,8 @@ def test_declare_module_default_declared_dependencies_is_none() -> None:
         declare_module(publishes=["SomethingHappened"])
         m = manifest_module.get_manifest(__name__)
         assert m is not None
-        assert m.declared_dependencies is None
+        assert m.declared_dependencies == ()
+        assert m.dependencies_declared is False
     finally:
         manifest_module._reset_for_testing()
 
@@ -853,3 +854,129 @@ def test_flat_layout_bare_local_import_still_detected(tmp_path: Path) -> None:
     result = audit_codebase(root)
     pairs = {(src, tgt) for src, tgt, _c, _s in result.cross_module_imports}
     assert ("billing", "inventory") in pairs
+
+
+# ---------------------------------------------------------------------------
+# Task 8 (tooling) — shorthand ImportFrom resolution
+# ---------------------------------------------------------------------------
+
+
+def test_shorthand_private_import_is_flagged(make_fake_app) -> None:
+    """``from <owner> import _name`` resolves target_module to the owner
+    package itself (remainder empty), so the existing first-segment check
+    never sees the leading underscore. ``_name`` may be a private submodule
+    rather than a public attribute — the leading-underscore convention must
+    apply to the imported name too, not only to target_module's remainder."""
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.inventory import _internal
+            """,
+            "inventory": "",
+        }
+    )
+    mods = [_module("orders"), _module("inventory")]
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    assert any(v.rule == "no-internal-imports" for v in violations)
+
+
+def test_shorthand_public_import_is_not_flagged(make_fake_app) -> None:
+    """Guard against over-fix: a shorthand import of a public (non-``_``)
+    name from another module's top-level package must stay clean."""
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.inventory import StockItem
+            """,
+            "inventory": "",
+        }
+    )
+    mods = [_module("orders"), _module("inventory")]
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    assert all(v.rule != "no-internal-imports" for v in violations)
+
+
+# ---------------------------------------------------------------------------
+# Task 8 (tooling) — parse failures must surface as violations
+# ---------------------------------------------------------------------------
+
+
+def test_unparseable_file_is_surfaced_as_error(make_fake_app, tmp_path: Path) -> None:
+    """A file that fails to parse is currently logged and silently skipped —
+    every import it would have contributed is invisible to every rule, so
+    verification can pass while blind to real violations. It must surface
+    as its own ERROR-severity violation instead."""
+    make_fake_app({"orders": ""})
+    (tmp_path / "fakeapp" / "orders" / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+
+    violations = verifier.modulith_verify_module(_module("orders"), [_module("orders")])
+    parse_errors = [v for v in violations if v.rule == "parse-error"]
+    assert len(parse_errors) == 1
+    assert parse_errors[0].severity is ViolationSeverity.ERROR
+    assert "broken.py" in parse_errors[0].message
+
+
+# ---------------------------------------------------------------------------
+# Task 8 (tooling) — rule 4 runtime-name analysis must be per file
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_name_in_other_file_does_not_exempt_annotation_only_import(
+    make_fake_app,
+) -> None:
+    """``_runtime_loaded_names`` aggregated runtime names across every file
+    in the module — so a runtime use of ``PaymentStatus`` in one file wrongly
+    exempted an unrelated annotation-only import of a *different* name that
+    merely collides on local binding in another file. Runtime usage must be
+    checked against the file that actually imports the candidate."""
+    make_fake_app(
+        {
+            "orders": "",
+        },
+        extra_files={
+            "orders/receipts.py": """
+                from fakeapp.payments import PaymentStatus
+
+                def describe(status: PaymentStatus) -> str:
+                    return str(status)
+            """,
+            "orders/runtime_user.py": """
+                PaymentStatus = "unrelated local binding, not the import above"
+
+                def touch() -> str:
+                    return PaymentStatus
+            """,
+        },
+    )
+    mods = [_module("orders"), _module("payments")]
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    assert any(v.rule == "use-contracts" for v in violations)
+
+
+# ---------------------------------------------------------------------------
+# Task 8 (tooling) — ratchet baseline locations must be portable
+# ---------------------------------------------------------------------------
+
+
+def test_violation_location_is_package_relative_not_absolute(make_fake_app, tmp_path) -> None:
+    """A baseline checked into version control must match on every
+    checkout/CI runner — an absolute path like the pytest tmp_path below
+    never matches on a teammate's machine. Locations must be relative to
+    the application's source root."""
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.inventory import _internal
+            """,
+            "inventory": "",
+        }
+    )
+    mods = [_module("orders"), _module("inventory")]
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    located = [v for v in violations if v.location]
+    assert located, "expected at least one violation with a location"
+    for v in located:
+        assert v.location is not None
+        assert str(tmp_path) not in v.location
+        assert not Path(v.location.rsplit(":", 1)[0]).is_absolute()
+        assert v.location.startswith("fakeapp/orders")

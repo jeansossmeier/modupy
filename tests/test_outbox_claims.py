@@ -152,6 +152,64 @@ async def test_completion_failure_records_failed_attempt() -> None:
     assert not outbox._backoff_elapsed(pub)  # backoff now gates immediate retry
 
 
+async def test_completion_failure_does_not_set_completed_at() -> None:
+    """Task 4: ``completed_at`` must be set only AFTER the store's completion
+    write actually succeeds. Setting it beforehand (then failing the store
+    call) leaves the in-memory record looking completed while the resave in
+    _record_failure persists an inconsistent row: attempt_count incremented
+    on a record that also claims to be completed."""
+    store = FailingCompletionStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+
+    pub = _make_pub(record, value=22)
+    await store.save(pub)
+
+    await outbox._dispatch_publication(pub)
+
+    assert pub.completed_at is None
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — retry-task shutdown must be safe across event loops
+# ---------------------------------------------------------------------------
+
+
+async def test_shutdown_stops_retry_task_running_on_a_foreign_loop() -> None:
+    """shutdown() must work when the retry task lives on a DIFFERENT event
+    loop than the one shutdown() is awaited from (e.g. sync.py's persistent
+    daemon-thread loop runs the retry task while the app's main loop awaits
+    outbox.shutdown() during teardown). Directly ``await``-ing a task bound
+    to another loop raises ("Task got Future attached to a different
+    loop") — shutdown() must request cancellation thread-safely and poll for
+    completion instead of awaiting the foreign task object."""
+    store = StubStore()
+    foreign_loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=foreign_loop.run_forever, daemon=True)
+    thread.start()
+    try:
+
+        async def _configure_on_foreign_loop() -> None:
+            outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
+
+        asyncio.run_coroutine_threadsafe(_configure_on_foreign_loop(), foreign_loop).result(
+            timeout=5
+        )
+
+        task = outbox._retry_task
+        assert task is not None
+        assert task.get_loop() is foreign_loop
+
+        await asyncio.wait_for(outbox.shutdown(), timeout=5)
+
+        assert outbox._retry_task is None
+        assert task.done()
+    finally:
+        foreign_loop.call_soon_threadsafe(foreign_loop.stop)
+        thread.join(timeout=2)
+        foreign_loop.close()
+
+
 # ---------------------------------------------------------------------------
 # A5-r2-84 / A5-r4-176 — observe-only hookimpls must never gate outbox dispatch
 # (fixed at the plugin-manager level by the G09 observe shield; these lock the

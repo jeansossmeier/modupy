@@ -351,6 +351,22 @@ def test_render_documentation_rejects_duplicate_module_names(tmp_path: Path) -> 
     assert not out.exists()  # nothing written for an ambiguous module set
 
 
+def test_render_documentation_rejects_casefold_colliding_module_names(tmp_path: Path) -> None:
+    """Module names differing only by case pass the exact-duplicate check
+    but collide on case-insensitive filesystems (macOS default, Windows) —
+    <output_dir>/modules/Orders.md and modules/orders.md are the SAME file
+    there, so one would silently overwrite the other while `produced`
+    claims both were written. Must raise like an exact duplicate."""
+    out = tmp_path / "docs"
+    v1 = ModuleInfo(name="Orders", package="fakeapp.orders_v1")
+    v2 = ModuleInfo(name="orders", package="fakeapp.orders_v2")
+
+    with pytest.raises(ConfigurationError, match="orders_v1"):
+        docs.modulith_render_documentation([v1, v2], str(out))
+
+    assert not out.exists()  # nothing written for an ambiguous module set
+
+
 def test_introspect_events_skips_unreadable_file_with_warning(
     make_fake_app, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

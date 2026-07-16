@@ -56,6 +56,7 @@ from contextvars import ContextVar
 from typing import Any
 
 from modulith import EventPublication, hookimpl
+from modulith.types import EventPublishReceipt
 
 logger = logging.getLogger("modulith.observability")
 
@@ -120,8 +121,15 @@ def modulith_before_event_published(event: Any) -> None:
 
 
 @hookimpl
-def modulith_after_event_published(event: Any, publication: EventPublication) -> None:
-    """End the publication span, recording its wall-clock duration."""
+def modulith_after_event_published(
+    event: Any, publication: EventPublication | EventPublishReceipt
+) -> None:
+    """End the publication span, recording its wall-clock duration.
+
+    ``publication`` may be an ``EventPublication`` (in-memory path) or an
+    ``EventPublishReceipt`` (durable path) — this hookimpl never reads
+    either's fields; it only ends the span held in the ContextVar.
+    """
     if not _OTEL_AVAILABLE:
         return
     span = _publish_span.get()
@@ -133,7 +141,8 @@ def modulith_after_event_published(event: Any, publication: EventPublication) ->
     _publish_span.set(None)
 
 
-def abort_publish_span(exception: BaseException) -> None:
+@hookimpl
+def modulith_on_publish_error(event: Any, exception: BaseException) -> None:
     """End the publish span for a publish that FAILED between the hooks.
 
     ``modulith_after_event_published`` is contractually scoped to successful
@@ -143,12 +152,12 @@ def abort_publish_span(exception: BaseException) -> None:
     ``modulith_before_event_published`` leaked: never ended (so never
     exported — tracing went blind exactly during the outages the outbox
     exists for) and left stale in the ContextVar, mis-parenting the next
-    dispatch span in the same context. Called directly by the runtime's
-    publish failure path (a first-party seam, mirroring the runtime's
-    direct knowledge of the outbox plugin); records the exception, sets
-    ERROR status, ends the span, and resets the ContextVar. No-op when
-    OTel is absent or no span is active (e.g. this plugin is disabled).
+    dispatch span in the same context. This observe-only hook is the runtime's
+    paired signal for that failure; records the exception, sets ERROR status,
+    ends the span, and resets the ContextVar. No-op when OTel is absent or no
+    span is active (e.g. this plugin is disabled).
     """
+    del event  # unused: the active span already carries the event's attributes
     if not _OTEL_AVAILABLE:
         return
     span = _publish_span.get()
@@ -250,9 +259,9 @@ def _detect_calling_module() -> str:
 
 
 __all__ = [
-    "abort_publish_span",
     "modulith_after_event_published",
     "modulith_before_event_published",
     "modulith_on_listener_complete",
     "modulith_on_listener_dispatch",
+    "modulith_on_publish_error",
 ]

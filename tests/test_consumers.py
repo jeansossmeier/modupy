@@ -96,6 +96,22 @@ def test_build_unknown_scheme_raises() -> None:
         registry.build("nope", _spec("nope"))
 
 
+def test_build_rejects_spec_for_a_different_scheme() -> None:
+    registry = ConsumerRegistry()
+    seen: list[ConsumerSpec] = []
+
+    def factory(spec: ConsumerSpec) -> Consumer:
+        seen.append(spec)
+        return _FakeConsumer()
+
+    registry.register("database", factory)
+
+    with pytest.raises(ValueError, match="does not match"):
+        registry.build("database", _spec("redis-streams"))
+
+    assert seen == []
+
+
 def test_unregister_removes_and_is_noop_when_absent() -> None:
     registry = ConsumerRegistry()
     registry.register("database", lambda spec: _FakeConsumer())

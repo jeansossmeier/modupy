@@ -40,7 +40,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 try:
     # Module-level (not lazy like the broker adapters' in-__init__ imports):
@@ -54,12 +54,16 @@ try:
         Integer,
         LargeBinary,
         String,
+        Text,
         Uuid,
+        and_,
         delete,
         false,
         func,
+        or_,
         select,
         text,
+        update,
     )
     from sqlalchemy import event as sa_event
     from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
@@ -73,6 +77,7 @@ except ImportError as exc:  # pragma: no cover — exercised in a subprocess tes
 from modulith import EventPublication
 from modulith.builtin import outbox
 from modulith.builtin.outbox import _current_session
+from modulith.config import ConfigurationError
 
 logger = logging.getLogger("modulith.adapters.postgres")
 
@@ -92,20 +97,30 @@ class EventPublicationRow(Base):
     __tablename__ = "event_publications"
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
-    event_type: Mapped[str] = mapped_column(String, nullable=False)
+    # Text, not an unbounded String — MySQL's VARCHAR requires an explicit
+    # length, so a plain String() column fails to even compile the CREATE
+    # TABLE on that dialect. Text renders as TEXT/LONGTEXT there (and
+    # PostgreSQL/SQLite treat Text and unbounded String identically), so this
+    # keeps the "arbitrarily long dotted path" semantics portable everywhere.
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
     # BYTEA, not JSONB — payload is bytes (binary-serializer support).
     payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    listener: Mapped[str] = mapped_column(String, nullable=False)
+    listener: Mapped[str] = mapped_column(Text, nullable=False)
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     attempt_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
-    last_error: Mapped[str | None] = mapped_column(String, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_dead_lettered: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
+    # Reserved for Task 4's lease-based claim protocol. Keeping these nullable
+    # makes this revision behavior-neutral for the current outbox dispatcher.
+    claim_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    claim_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         # Partial index keeps the pending-rows scan small even with millions
@@ -121,9 +136,9 @@ class EventPublicationArchiveRow(Base):
     __tablename__ = "event_publications_archive"
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
-    event_type: Mapped[str] = mapped_column(String, nullable=False)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    listener: Mapped[str] = mapped_column(String, nullable=False)
+    listener: Mapped[str] = mapped_column(Text, nullable=False)
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # server_default mirrors the migration and the primary table exactly so the
@@ -131,7 +146,7 @@ class EventPublicationArchiveRow(Base):
     attempt_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
-    last_error: Mapped[str | None] = mapped_column(String, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
@@ -270,15 +285,32 @@ class PostgresPublicationStore:
         configure(outbox="postgres")
     """
 
-    def __init__(self, engine: AsyncEngine, *, dead_letter_after_attempts: int = 10) -> None:
+    def __init__(
+        self, engine: AsyncEngine, *, dead_letter_after_attempts: int | None = None
+    ) -> None:
         global _active_store
         self._engine = engine
         self._sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-        self._dead_letter_after_attempts = dead_letter_after_attempts
+        # Public (no leading underscore) and paired with an explicit-ness
+        # marker: outbox.configure() duck-types both to unify this store's
+        # threshold with the plugin's own (see _resolve_dead_letter_threshold
+        # in modulith/builtin/outbox.py) and to detect conflicting explicit
+        # settings instead of silently letting the store's is_dead_lettered
+        # flag disagree with the plugin's skip-check.
+        self.dead_letter_after_attempts_explicit = dead_letter_after_attempts is not None
+        self.dead_letter_after_attempts = (
+            dead_letter_after_attempts if dead_letter_after_attempts is not None else 10
+        )
         self._inflight: set[asyncio.Task[None]] = set()
         # FOR UPDATE SKIP LOCKED is a Postgres row-claim optimization; SQLite
         # (tests) has no row locking and would reject the clause, so gate on it.
         self._supports_skip_locked = engine.dialect.name == "postgresql"
+        # Task 4: advisory_lock claim mode needs pg_try_advisory_lock, which
+        # only exists on Postgres. Public (no leading underscore) so
+        # outbox.configure() can check it via getattr without reaching into
+        # this store's SQLAlchemy engine directly (keeps the storage-agnostic
+        # plugin from depending on dialect internals).
+        self.supports_advisory_lock = engine.dialect.name == "postgresql"
         # Push onto the live-store stack so dispose() can restore whichever
         # live store remains, rather than blanking dispatch routing — and warn
         # loudly instead of silently hijacking a still-live store's
@@ -314,7 +346,7 @@ class PostgresPublicationStore:
         publication by blanking ``completed_at``.
         """
         session = _current_session.get()
-        dead = publication.attempt_count >= self._dead_letter_after_attempts
+        dead = publication.attempt_count >= self.dead_letter_after_attempts
 
         if session is not None:
             session.add(_pub_to_row(publication, dead=dead))
@@ -464,24 +496,235 @@ class PostgresPublicationStore:
             )
             return int((await s.execute(stmt)).scalar_one())
 
-    async def find_dead_lettered(self) -> list[EventPublication]:
-        """Return dead-lettered publications (oldest first, capped at 100).
+    async def find_dead_lettered(
+        self, *, after: tuple[datetime, UUID] | None = None, limit: int = 100
+    ) -> list[EventPublication]:
+        """Return dead-lettered publications, oldest first, one page at a time.
 
-        ``find_incomplete`` now excludes dead-letters, so this is the dedicated
-        source for ``list_dead_lettered`` / ``retry_all_dead_lettered``.
+        ``find_incomplete`` excludes dead-letters, so this is the dedicated
+        source for ``list_dead_lettered`` / ``retry_all_dead_lettered``. A
+        single unbounded call (the pre-Task-4 contract every existing caller
+        relies on) is just the first page: ``after=None, limit=100``.
+
+        Task 4 adds keyset pagination so a backlog past the 100-row page
+        doesn't silently hide from those callers: ``after`` is the
+        ``(published_at, id)`` of the last row of the previous page, and rows
+        are ordered by that same pair so an exact tie on ``published_at``
+        still produces a stable, gap-free, duplicate-free cursor (a plain
+        OFFSET would double up or skip rows if a dead-letter table changes
+        between pages; keyset pagination does not).
         """
+        async with self._sessionmaker() as s:
+            stmt = select(EventPublicationRow).where(
+                EventPublicationRow.completed_at.is_(None),
+                EventPublicationRow.is_dead_lettered.is_(True),
+            )
+            if after is not None:
+                after_at, after_id = after
+                # after_at is required in the keyset cursor; _to_utc preserves non-None.
+                normalized = _to_utc(after_at)
+                assert normalized is not None
+                after_at = normalized
+                stmt = stmt.where(
+                    or_(
+                        EventPublicationRow.published_at > after_at,
+                        and_(
+                            EventPublicationRow.published_at == after_at,
+                            EventPublicationRow.id > after_id,
+                        ),
+                    )
+                )
+            stmt = stmt.order_by(EventPublicationRow.published_at, EventPublicationRow.id).limit(
+                limit
+            )
+            rows = (await s.execute(stmt)).scalars().all()
+            return [_row_to_pub(r) for r in rows]
+
+    async def find_by_id(self, publication_id: UUID) -> EventPublication | None:
+        """Direct point lookup by id, used by ``force_retry``.
+
+        ``find_incomplete``/``find_dead_lettered`` are both capped windows —
+        a manually-targeted retry must reach a row regardless of how far back
+        in a large backlog it sits, rather than only the rows that happen to
+        fall in the current page.
+        """
+        async with self._sessionmaker() as s:
+            row = await s.get(EventPublicationRow, publication_id)
+            return _row_to_pub(row) if row is not None else None
+
+    # ----- Task 4: claim_strategy="lease" — atomic claim + token fencing ---
+
+    async def claim_batch(
+        self, *, owner: str, batch_size: int, lease_seconds: float, older_than: timedelta
+    ) -> list[EventPublication]:
+        """Atomically claim up to ``batch_size`` claimable rows and COMMIT
+        before returning — the caller (the outbox retry loop) dispatches only
+        after this transaction lands, so a crash between claim and dispatch
+        just leaves the lease to expire and be reclaimed by the next sweeper,
+        never an uncommitted phantom claim.
+
+        A row is claimable when it is incomplete, not dead-lettered, past
+        ``older_than``, AND its current lease (if any) has already expired
+        (``claim_until IS NULL OR claim_until <= now``) — this last predicate
+        is what stops two concurrent sweepers from both claiming the same row
+        while a lease is still active. Ordering and ``FOR UPDATE SKIP LOCKED``
+        mirror ``find_incomplete`` for the same reasons documented there.
+
+        Returned publications carry a fresh ``claim_token`` (bearer for
+        ``renew_claim``/``complete_claim``/``fail_claim``); ``claim_owner`` is
+        stored for operator diagnostics only — fencing is always by token.
+        """
+        now = datetime.now(UTC)
+        cutoff = now - older_than
+        until = now + timedelta(seconds=lease_seconds)
         async with self._sessionmaker() as s:
             stmt = (
                 select(EventPublicationRow)
                 .where(
                     EventPublicationRow.completed_at.is_(None),
-                    EventPublicationRow.is_dead_lettered.is_(True),
+                    EventPublicationRow.is_dead_lettered.is_(False),
+                    EventPublicationRow.published_at <= cutoff,
+                    or_(
+                        EventPublicationRow.claim_until.is_(None),
+                        EventPublicationRow.claim_until <= now,
+                    ),
                 )
-                .order_by(EventPublicationRow.published_at)
-                .limit(100)
+                .order_by(
+                    func.coalesce(
+                        EventPublicationRow.last_attempt_at,
+                        EventPublicationRow.published_at,
+                    )
+                )
+                .limit(batch_size)
             )
+            if self._supports_skip_locked:
+                stmt = stmt.with_for_update(skip_locked=True)
             rows = (await s.execute(stmt)).scalars().all()
-            return [_row_to_pub(r) for r in rows]
+            claimed: list[EventPublication] = []
+            for row in rows:
+                token = uuid4().hex
+                row.claim_owner = owner
+                row.claim_token = token
+                row.claim_until = until
+                pub = _row_to_pub(row)
+                pub.claim_token = token
+                claimed.append(pub)
+            await s.commit()
+            return claimed
+
+    async def renew_claim(self, publication_id: UUID, token: str, lease_seconds: float) -> bool:
+        """Extend a still-held claim's lease. Returns False (no write applied)
+        if ``token`` no longer matches the row's current claim — the lease
+        already expired and/or a peer sweeper reclaimed it; the caller must
+        stop dispatching and let the new claimant own it.
+
+        Also used by the outbox retry loop to voluntarily release a claim
+        early (``lease_seconds=0.0``) when a claimed row turns out not to be
+        due for retry yet (backoff), instead of holding it idle for the full
+        lease and blocking every other sweeper from picking it up sooner.
+        """
+        until = datetime.now(UTC) + timedelta(seconds=lease_seconds)
+        async with self._sessionmaker() as s:
+            stmt = (
+                update(EventPublicationRow)
+                .where(
+                    EventPublicationRow.id == publication_id,
+                    EventPublicationRow.claim_token == token,
+                )
+                .values(claim_until=until)
+            )
+            result = await s.execute(stmt)
+            await s.commit()
+            return bool(cast(CursorResult[Any], result).rowcount)
+
+    async def complete_claim(self, publication_id: UUID, token: str, mode: str) -> bool:
+        """Fenced completion write: applies ``mode`` (update/delete/archive)
+        ONLY if ``token`` still matches the row's claim. Returns False without
+        touching the row if it doesn't — a stale claimant must never complete
+        a row a newer claimant now owns."""
+        async with self._sessionmaker() as s:
+            row = await s.get(EventPublicationRow, publication_id)
+            if row is None or row.claim_token != token:
+                return False
+            if mode == "delete":
+                await s.delete(row)
+            elif mode == "archive":
+                s.add(
+                    EventPublicationArchiveRow(
+                        id=row.id,
+                        event_type=row.event_type,
+                        payload=row.payload,
+                        listener=row.listener,
+                        published_at=row.published_at,
+                        completed_at=datetime.now(UTC),
+                        attempt_count=row.attempt_count,
+                        last_error=row.last_error,
+                        last_attempt_at=row.last_attempt_at,
+                    )
+                )
+                await s.delete(row)
+            else:
+                row.completed_at = datetime.now(UTC)
+            await s.commit()
+            return True
+
+    async def fail_claim(self, publication: EventPublication, token: str) -> bool:
+        """Fenced failure-record write: persists ``attempt_count``/
+        ``last_error`` ONLY if ``token`` still matches. On success, the claim
+        is released (``claim_owner``/``claim_token``/``claim_until`` cleared)
+        so the row is immediately reclaimable on the next sweep rather than
+        sitting idle for the remainder of the lease."""
+        dead = publication.attempt_count >= self.dead_letter_after_attempts
+        async with self._sessionmaker() as s:
+            row = await s.get(EventPublicationRow, publication.id)
+            if row is None or row.claim_token != token:
+                return False
+            row.attempt_count = publication.attempt_count
+            row.last_error = publication.last_error
+            row.last_attempt_at = _to_utc(publication.last_attempt_at)
+            row.is_dead_lettered = dead
+            row.claim_owner = None
+            row.claim_token = None
+            row.claim_until = None
+            await s.commit()
+            return True
+
+    # ----- Task 4: claim_strategy="advisory_lock" — Postgres-only ---------
+
+    async def try_lock_publication(self, publication_id: UUID) -> object | None:
+        """Attempt to acquire a session-level Postgres advisory lock keyed by
+        ``publication_id``, held on a DEDICATED connection for the duration
+        of dispatch (advisory locks are per-session, not per-row/transaction).
+
+        Returns the open connection (the handle ``unlock_publication`` needs)
+        on success, or None if another connection already holds it — the
+        caller's contract is try-lock-and-skip, never block-and-wait.
+        """
+        if not self.supports_advisory_lock:
+            raise ConfigurationError(
+                "claim_strategy='advisory_lock' requires a Postgres engine "
+                "(pg_try_advisory_lock); this store is backed by "
+                f"{self._engine.dialect.name!r}"
+            )
+        lock_key = publication_id.int & 0x7FFFFFFFFFFFFFFF  # fit signed bigint
+        conn = await self._engine.connect()
+        got = (
+            await conn.execute(text("SELECT pg_try_advisory_lock(:key)"), {"key": lock_key})
+        ).scalar()
+        if not got:
+            await conn.close()
+            return None
+        return conn
+
+    async def unlock_publication(self, handle: object, publication_id: UUID) -> None:
+        """Release a lock handle returned by ``try_lock_publication`` and
+        close its dedicated connection."""
+        lock_key = publication_id.int & 0x7FFFFFFFFFFFFFFF
+        conn = cast(Any, handle)
+        try:
+            await conn.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": lock_key})
+        finally:
+            await conn.close()
 
     async def purge_completed(self, older_than: timedelta) -> int:
         cutoff = datetime.now(UTC) - older_than

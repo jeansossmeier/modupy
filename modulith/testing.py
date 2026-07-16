@@ -28,10 +28,13 @@ Plus markers:
 from __future__ import annotations
 
 import asyncio
+import importlib
 import inspect
+import math
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
@@ -143,11 +146,20 @@ def _module_isolation(
 ) -> Iterator[None]:
     """Context manager: only ``target_module`` is loaded; others are mocked.
 
-    Within the block, every sibling under the application package (the top
-    segment of ``target_module``) is removed from ``sys.modules`` except the
-    target, its submodules, and its ancestors; each name in ``mock_modules``
-    is replaced with a ``MagicMock`` so importers get a stand-in. On exit the
-    original ``sys.modules`` is restored exactly.
+    Within the block, every module under the application package (the top
+    segment of ``target_module``) except its ancestors is removed from
+    ``sys.modules`` — including ``target_module`` and its submodules. Each
+    name in ``mock_modules`` is then replaced with a ``MagicMock`` so
+    importers get a stand-in. On exit the original ``sys.modules`` is
+    restored exactly.
+
+    The target must be dropped and re-imported too, not just its siblings:
+    if it was already imported before entering this block, the cached module
+    would otherwise sit there untouched, its names resolved via ``from
+    <sibling> import x`` snapshotted against the REAL sibling at that
+    earlier import time — silently defeating the mock. Re-importing it here
+    (after the mocks are installed) re-resolves those names fresh, so it is
+    already correctly bound by the time the caller's test body runs.
     """
     mocks = mock_modules or []
     app_package = target_module.split(".")[0]
@@ -159,14 +171,14 @@ def _module_isolation(
     for name in list(sys.modules):
         if not (name == app_package or name.startswith(app_package + ".")):
             continue
-        if name == target_module or name.startswith(target_module + "."):
-            continue
         if name in ancestors:
             continue
         del sys.modules[name]
 
     for name in mocks:
         sys.modules[name] = MagicMock(name=name)
+
+    importlib.import_module(target_module)
 
     try:
         yield
@@ -272,6 +284,12 @@ class Scenario:
             raise ValueError("call expect_event(...) before within(...)")
         if self._initial_event is None and self._initial_call is None:
             raise ValueError("call publish(...) or call(...) before within(...)")
+        if not math.isfinite(seconds) or seconds < 0:
+            # A NaN budget makes every `>=` comparison against the deadline
+            # False, so the poll loop's break condition never fires — the
+            # test hangs forever instead of failing. +/-inf and negative
+            # budgets are equally nonsensical. Reject before firing anything.
+            raise ValueError(f"seconds must be a finite, non-negative number, got {seconds!r}")
 
         mark = len(self._app.published_events)
         deadline = time.monotonic() + seconds
@@ -315,7 +333,31 @@ class Scenario:
             return
 
         assert self._initial_call is not None
-        result = self._initial_call(*self._initial_call_args, **self._initial_call_kwargs)
+        result_box: dict[str, Any] = {}
+
+        def _invoke() -> None:
+            try:
+                result_box["result"] = self._initial_call(  # type: ignore[misc]
+                    *self._initial_call_args, **self._initial_call_kwargs
+                )
+            except BaseException as exc:  # re-raised on the calling thread below
+                result_box["error"] = exc
+
+        # A plain synchronous trigger runs on a background thread so it is
+        # bounded by the shared budget like every other trigger kind — called
+        # directly on this thread, a stalled trigger hung within() forever.
+        # Python threads can't be force-killed, so an overrun is swallowed
+        # (best-effort, matching the coroutine trigger's cancellation) and the
+        # thread is left to finish in the background as a daemon.
+        thread = threading.Thread(target=_invoke, daemon=True)
+        thread.start()
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        if thread.is_alive():
+            return
+        if "error" in result_box:
+            raise result_box["error"]
+        result = result_box.get("result")
         if inspect.iscoroutine(result):
             self._await_call_trigger(result, deadline)
 

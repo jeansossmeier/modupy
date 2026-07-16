@@ -52,10 +52,42 @@ import inspect
 import logging
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger("modulith.manifest")
+
+
+class _UndeclaredDependencies(tuple[str, ...]):
+    """Tuple-shaped sentinel for an omitted dependency declaration."""
+
+
+_UNDECLARED_DEPENDENCIES = _UndeclaredDependencies()
+
+
+def _normalize_broker_targets(targets: object) -> tuple[str, ...]:
+    """Validate and normalize broker targets declared by a module."""
+    from .config import ConfigurationError
+
+    if isinstance(targets, str) or not isinstance(targets, list | tuple):
+        raise ConfigurationError(
+            "broker_targets must be a list or tuple of 'scheme:destination' strings"
+        )
+
+    normalized: list[str] = []
+    for target in targets:
+        if type(target) is not str:
+            raise ConfigurationError(
+                f"broker_targets must contain only 'scheme:destination' strings; got {target!r}"
+            )
+        scheme, separator, destination = target.partition(":")
+        if not separator or not scheme.strip() or not destination.strip():
+            raise ConfigurationError(
+                "broker_targets must contain non-empty 'scheme:destination' "
+                f"strings; got {target!r}"
+            )
+        normalized.append(f"{scheme.strip()}:{destination.strip()}")
+    return tuple(normalized)
 
 
 @dataclass(frozen=True)
@@ -83,13 +115,29 @@ class Manifest:
     # Database tables owned by this module. Other modules cannot query.
     owns_tables: tuple[str, ...] = ()
 
-    # Modules this module is allowed to import from. Verifier uses this.
-    # None means "not declared" — the verifier's declared-dependencies rule
-    # is skipped, so a manifest added for an unrelated field (e.g. just
-    # owns_tables) doesn't silently switch on deny-all import enforcement.
-    # An explicit empty tuple means "depends on nothing" (deny-all,
-    # contracts excepted).
-    declared_dependencies: tuple[str, ...] | None = None
+    # Modules this module is allowed to import from. Always a tuple so callers
+    # can iterate it; dependencies_declared preserves omitted vs explicit empty.
+    declared_dependencies: tuple[str, ...] = _UNDECLARED_DEPENDENCIES
+    dependencies_declared: bool = field(init=False, default=False)
+
+    # Static broker destinations this module consumes from.
+    broker_targets: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        dependencies: tuple[str, ...]
+        if self.declared_dependencies is None or isinstance(
+            self.declared_dependencies, _UndeclaredDependencies
+        ):
+            dependencies = _UNDECLARED_DEPENDENCIES
+        else:
+            dependencies = tuple(self.declared_dependencies)
+        object.__setattr__(self, "declared_dependencies", dependencies)
+        object.__setattr__(
+            self,
+            "dependencies_declared",
+            not isinstance(dependencies, _UndeclaredDependencies),
+        )
+        object.__setattr__(self, "broker_targets", _normalize_broker_targets(self.broker_targets))
 
 
 # Module-level registry. Keyed by package name. Populated by declare_module
@@ -104,16 +152,15 @@ def declare_module(
     listeners: list[Callable[..., Any]] | tuple[Callable[..., Any], ...] = (),
     owns_tables: list[str] | tuple[str, ...] = (),
     declared_dependencies: list[str] | tuple[str, ...] | None = None,
+    broker_targets: list[str] | tuple[str, ...] = (),
 ) -> None:
     """Register a manifest for the calling module.
 
     Call this at module scope in `_manifest.py`. The package name is
     auto-detected from the calling frame.
 
-    ``declared_dependencies`` distinguishes "not declared" (None, the
-    default — the verifier's rule 3 stays off) from an explicit empty
-    sequence ("this module depends on nothing" — deny-all enforcement,
-    contracts excepted).
+    ``declared_dependencies=None`` leaves dependency enforcement off. An
+    explicit empty sequence means "this module depends on nothing".
     """
     from .config import ConfigurationError
 
@@ -140,16 +187,18 @@ def declare_module(
             "Each module must declare exactly once."
         )
 
-    _manifests[package] = Manifest(
-        package=package,
-        publishes=tuple(publishes),
-        consumes=tuple(consumes),
-        listeners=tuple(listeners),
-        owns_tables=tuple(owns_tables),
-        declared_dependencies=(
-            tuple(declared_dependencies) if declared_dependencies is not None else None
-        ),
-    )
+    manifest_kwargs: dict[str, Any] = {
+        "package": package,
+        "publishes": tuple(publishes),
+        "consumes": tuple(consumes),
+        "listeners": tuple(listeners),
+        "owns_tables": tuple(owns_tables),
+        "broker_targets": _normalize_broker_targets(broker_targets),
+    }
+    if declared_dependencies is not None:
+        manifest_kwargs["declared_dependencies"] = tuple(declared_dependencies)
+
+    _manifests[package] = Manifest(**manifest_kwargs)
 
 
 def get_manifest(package: str) -> Manifest | None:
@@ -201,11 +250,9 @@ def verify_manifest(manifest: Manifest, registered_listeners: set[Callable[..., 
     """
     errors: list[str] = []
 
-    # Sync listeners register as async wrappers (see sync.wrap_sync_listener),
-    # but a manifest references the *original* sync function. Each wrapper carries
-    # a __modulith_sync_wrapped__ marker pointing back at that original, so fold the
-    # originals into the set we test against — otherwise a declared sync listener is
-    # falsely reported as "not registered" and bootstrap aborts.
+    # Listener adapters register async wrappers, while manifests reference the
+    # original returned handlers. Fold the established origin marker into the
+    # identity set so adapted listeners still verify.
     effective_listeners: set[Callable[..., Any]] = set(registered_listeners)
     for registered in registered_listeners:
         original = getattr(registered, "__modulith_sync_wrapped__", None)

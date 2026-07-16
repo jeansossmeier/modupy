@@ -299,6 +299,44 @@ async def test_subscribe_upsert_concurrent_no_collision(broker_engine: Any) -> N
     assert await _row_count(broker_engine, subscription) == 1
 
 
+async def test_store_concurrent_reregistration_replays_once(broker_engine: Any) -> None:
+    broker = DatabaseBroker(
+        engine=broker_engine,
+        no_subscriber_policy="store",
+    )
+    target = f"{_TARGET}.reregister"
+    await broker.publish(target, b"payload", {"event_type": _EVENT_TYPE})
+
+    await asyncio.gather(
+        broker.subscribe([target], "g"),
+        broker.subscribe([target], "g"),
+        broker.subscribe([target], "g"),
+    )
+
+    rows = await broker.claim_batch("g", batch_size=10, consumer_name="c1")
+    assert len(rows) == 1
+
+
+async def test_store_publish_subscribe_race_never_misses_delivery(
+    broker_engine: Any,
+) -> None:
+    broker = DatabaseBroker(
+        engine=broker_engine,
+        no_subscriber_policy="store",
+    )
+
+    for index in range(12):
+        target = f"{_TARGET}.race-{index}"
+        group = f"g-{index}"
+        await asyncio.gather(
+            broker.publish(target, b"payload", {"event_type": _EVENT_TYPE}),
+            broker.subscribe([target], group),
+        )
+
+        rows = await broker.claim_batch(group, batch_size=10, consumer_name="c1")
+        assert len(rows) == 1, f"publish/subscribe race lost {target}"
+
+
 # ---------------------------------------------------------------------------
 # Crash recovery — an orphaned claim is reclaimed after the visibility timeout
 # ---------------------------------------------------------------------------

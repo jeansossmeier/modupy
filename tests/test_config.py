@@ -33,6 +33,9 @@ def test_defaults_when_no_config_present() -> None:
     assert cfg.outbox == "memory"
     assert cfg.topology == "single"
     assert cfg.broker == "memory"
+    assert cfg.subscription_source == "manifest"
+    assert cfg.subscriptions == {}
+    assert cfg.actuator_mode == "auto"
     assert cfg.auto_discover is True
     assert cfg.production is False
     assert cfg.explicit_keys == frozenset()
@@ -397,6 +400,24 @@ def test_scalar_broker_options_kwarg_raises() -> None:
         load_configuration(broker_options="redis://x")
 
 
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("max_stream_len", 0),
+        ("dlq_max_stream_len", True),
+        ("poll_block_ms", 0),
+        ("reclaim_min_idle_ms", -1),
+        ("max_delivery_attempts", 0),
+    ],
+)
+def test_redis_broker_delivery_options_must_be_positive_integers(
+    option: str, value: object
+) -> None:
+    """Safety-critical Redis delivery settings fail before worker startup."""
+    with pytest.raises(ConfigurationError, match=option):
+        load_configuration(broker="redis-streams", broker_options={option: value})
+
+
 # ----- W2 audit fixes: env var handling (A4-r4-174, A4-r2-80 adjudicated) -----
 
 
@@ -458,3 +479,212 @@ def test_subinterpreters_topology_is_rejected_as_unimplemented() -> None:
     supervisor. It must fail loudly even with a valid cross-process broker."""
     with pytest.raises(ConfigurationError, match="not yet implemented"):
         load_configuration(topology="subinterpreters", broker="redis-streams")
+
+
+# ----- Task 1: validated public configuration contracts ---------------------
+
+
+def test_reads_subscription_and_actuator_configuration(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith]\nsubscription_source = "config"\nactuator_mode = "token"\n'
+        "[tool.modulith.subscriptions]\n"
+        'orders = ["redis-streams:orders", "amqp:events:orders"]\n'
+        "[tool.modulith.broker_options]\n"
+        'future_broker_key = "preserved"\n'
+        "[tool.modulith.outbox_options]\n"
+        "future_outbox_key = 42\n"
+    )
+
+    cfg = load_configuration()
+
+    assert cfg.subscription_source == "config"
+    assert cfg.subscriptions == {"orders": ["redis-streams:orders", "amqp:events:orders"]}
+    assert cfg.actuator_mode == "token"
+    assert cfg.broker_options == {"future_broker_key": "preserved"}
+    assert cfg.outbox_options == {"future_outbox_key": 42}
+
+
+def test_subscription_and_actuator_environment_variables(monkeypatch) -> None:
+    monkeypatch.setenv("MODULITH_SUBSCRIPTION_SOURCE", "listener")
+    monkeypatch.setenv("MODULITH_ACTUATOR_MODE", "disabled")
+
+    cfg = load_configuration()
+
+    assert cfg.subscription_source == "listener"
+    assert cfg.actuator_mode == "disabled"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("subscription_source", "database"),
+        ("actuator_mode", "private"),
+    ],
+)
+def test_enum_configuration_rejects_unknown_values(field_name: str, value: str) -> None:
+    with pytest.raises(ConfigurationError, match=field_name):
+        load_configuration(**{field_name: value})
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("package", 1),
+        ("contracts_module", False),
+        ("outbox", 1),
+        ("topology", True),
+        ("broker", False),
+        ("subscription_source", False),
+        ("actuator_mode", 1),
+        ("auto_discover", 1),
+        ("production", 0),
+        ("observability", "auto"),
+        ("verify_manifests", 1),
+    ],
+)
+def test_scalar_configuration_requires_declared_types(field_name: str, value: object) -> None:
+    with pytest.raises(ConfigurationError, match=field_name):
+        load_configuration(**{field_name: value})
+
+
+@pytest.mark.parametrize(
+    ("toml_text", "expected"),
+    [
+        ('tool = "not-a-table"\n', "tool"),
+        ('[tool]\nmodulith = "not-a-table"\n', "tool.modulith"),
+    ],
+)
+def test_pyproject_parent_sections_must_be_tables(
+    tmp_path: Path, toml_text: str, expected: str
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(toml_text)
+
+    with pytest.raises(ConfigurationError, match=expected):
+        load_configuration()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("outbox_options", []),
+        ("broker_options", "redis://cache"),
+        ("workers", []),
+        ("subscriptions", []),
+    ],
+)
+def test_table_configuration_requires_mappings(field_name: str, value: object) -> None:
+    with pytest.raises(ConfigurationError, match=field_name):
+        load_configuration(**{field_name: value})
+
+
+@pytest.mark.parametrize(
+    "workers",
+    [
+        {1: 1},
+        {"orders": 0},
+        {"orders": -1},
+        {"orders": 1.5},
+        {"orders": True},
+    ],
+)
+def test_workers_require_string_keys_and_positive_integer_counts(
+    workers: dict[object, object],
+) -> None:
+    with pytest.raises(ConfigurationError, match="workers"):
+        load_configuration(workers=workers)
+
+
+@pytest.mark.parametrize(
+    "subscriptions",
+    [
+        {1: ["redis-streams:orders"]},
+        {"orders": ("redis-streams:orders",)},
+        {"orders": [1]},
+        {"orders": [""]},
+        {"orders": ["redis-streams"]},
+        {"orders": [":orders"]},
+        {"orders": ["redis-streams:"]},
+    ],
+)
+def test_subscriptions_require_string_keys_and_broker_target_lists(
+    subscriptions: dict[object, object],
+) -> None:
+    with pytest.raises(ConfigurationError, match="subscriptions"):
+        load_configuration(subscriptions=subscriptions)
+
+
+def test_scalar_typo_includes_suggestion() -> None:
+    with pytest.raises(ConfigurationError, match="subscription_source"):
+        load_configuration(subscription_sorce="manifest")
+
+
+def test_subtable_typo_includes_suggestion(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith.subscription]\norders = ["redis-streams:orders"]\n'
+    )
+
+    with pytest.raises(ConfigurationError, match="subscriptions"):
+        load_configuration()
+
+
+def test_subtable_typo_of_scalar_includes_suggestion(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text('[tool.modulith.actuator_mod]\nvalue = "disabled"\n')
+
+    with pytest.raises(ConfigurationError, match="actuator_mode"):
+        load_configuration()
+
+
+# ----- Task 4: outbox_options claim-strategy validation ----------------------
+
+
+def test_pyproject_outbox_options_claim_defaults(tmp_path: Path) -> None:
+    """An empty (or claim-silent) [tool.modulith.outbox_options] is valid —
+    claim_strategy/claim_lease_seconds/claim_batch_size are optional; the
+    runtime default (lease / 60.0 / 100) applies where they consume it."""
+    (tmp_path / "pyproject.toml").write_text("[tool.modulith.outbox_options]\n")
+    cfg = load_configuration()
+    assert cfg.outbox_options == {}
+
+
+@pytest.mark.parametrize("strategy", ["lease", "advisory_lock", "none"])
+def test_pyproject_outbox_options_accepts_valid_claim_strategy(
+    tmp_path: Path, strategy: str
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        f'[tool.modulith.outbox_options]\nclaim_strategy = "{strategy}"\n'
+    )
+    cfg = load_configuration()
+    assert cfg.outbox_options == {"claim_strategy": strategy}
+
+
+def test_pyproject_outbox_options_rejects_invalid_claim_strategy(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith.outbox_options]\nclaim_strategy = "optimistic"\n'
+    )
+    with pytest.raises(ConfigurationError, match="claim_strategy"):
+        load_configuration()
+
+
+@pytest.mark.parametrize("value", [0, -1.0, float("inf"), float("nan"), "60", True])
+def test_pyproject_outbox_options_rejects_invalid_claim_lease_seconds(
+    tmp_path: Path, value: object
+) -> None:
+    (tmp_path / "pyproject.toml").write_text("[tool.modulith.outbox_options]\n")
+    with pytest.raises(ConfigurationError, match="claim_lease_seconds"):
+        load_configuration(outbox_options={"claim_lease_seconds": value})
+
+
+def test_pyproject_outbox_options_accepts_valid_claim_lease_seconds() -> None:
+    cfg = load_configuration(outbox_options={"claim_lease_seconds": 45.5})
+    assert cfg.outbox_options == {"claim_lease_seconds": 45.5}
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, "100", True])
+def test_pyproject_outbox_options_rejects_invalid_claim_batch_size(value: object) -> None:
+    with pytest.raises(ConfigurationError, match="claim_batch_size"):
+        load_configuration(outbox_options={"claim_batch_size": value})
+
+
+def test_pyproject_outbox_options_accepts_valid_claim_batch_size() -> None:
+    cfg = load_configuration(outbox_options={"claim_batch_size": 250})
+    assert cfg.outbox_options == {"claim_batch_size": 250}

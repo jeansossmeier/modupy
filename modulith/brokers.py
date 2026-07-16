@@ -231,6 +231,10 @@ class ConsumerRegistry:
 
     def build(self, scheme: str, spec: ConsumerSpec) -> Consumer:
         """Build a Consumer for ``scheme`` from ``spec`` via its factory."""
+        if scheme != spec.scheme:
+            raise ValueError(
+                f"requested consumer scheme {scheme!r} does not match spec.scheme {spec.scheme!r}"
+            )
         return self.get(scheme)(spec)
 
     def schemes(self) -> list[str]:

@@ -195,3 +195,93 @@ def test_audit_cli_writes_report(tmp_path: Path) -> None:
     assert out.exists()
     assert "Modulith Audit Report" in out.read_text(encoding="utf-8")
     assert "readiness score" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# Task 8 (tooling) — parse-failure counting and disclosure
+# ---------------------------------------------------------------------------
+
+
+def test_files_scanned_counts_only_successful_parses(tmp_path: Path) -> None:
+    """A file that fails to parse is dropped by every analysis stage — but
+    ``files_scanned`` counted every discovered file regardless, silently
+    implying a broken file was actually analyzed."""
+    root = tmp_path / "myapp"
+    _write(root, "__init__.py", "")
+    _write(root, "orders/__init__.py", "")
+    _write(root, "orders/service.py", "def create(): ...\n")
+    (root / "orders" / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+
+    result = audit_codebase(root)
+
+    assert result.files_scanned == 3
+    assert result.parse_failures == [root / "orders" / "broken.py"]
+
+
+def test_render_report_discloses_parse_failures(tmp_path: Path) -> None:
+    """A broken file must be disclosed in the report, not silently excluded
+    as if the codebase were fully analyzable."""
+    root = tmp_path / "myapp"
+    _write(root, "__init__.py", "")
+    _write(root, "orders/__init__.py", "")
+    (root / "orders" / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+
+    result = audit_codebase(root)
+    report = render_report(result)
+
+    assert "broken.py" in report
+    assert "could not be parsed" in report
+
+
+def test_no_parse_failures_omits_disclosure(tmp_path: Path) -> None:
+    """Guard against over-fix: a fully-parseable codebase gets no failure
+    disclosure noise."""
+    root = _make_codebase(tmp_path)
+    result = audit_codebase(root)
+    assert result.parse_failures == []
+    assert "could not be parsed" not in render_report(result)
+
+
+# ---------------------------------------------------------------------------
+# Task 8 (tooling) — audit must honor a configured contracts-module name
+# ---------------------------------------------------------------------------
+
+
+def test_audit_codebase_accepts_contracts_module_override(tmp_path: Path) -> None:
+    """``audit_codebase`` hardcoded the default ``contracts`` name — a
+    codebase mid-migration with a custom ``[tool.modulith].contracts_module``
+    must exempt imports of *that* module from cross-module coupling, the
+    same way the verifier does."""
+    root = tmp_path / "myapp"
+    _write(root, "__init__.py", "")
+    _write(root, "orders/__init__.py", "")
+    _write(root, "orders/service.py", "from myapp.shared_kernel import Money\n")
+    _write(root, "shared_kernel/__init__.py", "")
+
+    default = audit_codebase(root)
+    pairs_default = {(src, tgt) for src, tgt, _c, _s in default.cross_module_imports}
+    assert ("orders", "shared_kernel") in pairs_default
+
+    configured = audit_codebase(root, contracts_module="shared_kernel")
+    pairs_configured = {(src, tgt) for src, tgt, _c, _s in configured.cross_module_imports}
+    assert ("orders", "shared_kernel") not in pairs_configured
+
+
+def test_audit_cli_honors_configured_contracts_module(monkeypatch, tmp_path: Path) -> None:
+    """The CLI must read ``[tool.modulith].contracts_module`` from the
+    project the audit is run in, not the ``audit_codebase`` default."""
+    root = tmp_path / "myapp"
+    _write(root, "__init__.py", "")
+    _write(root, "orders/__init__.py", "")
+    _write(root, "orders/service.py", "from myapp.shared_kernel import Money\n")
+    _write(root, "shared_kernel/__init__.py", "")
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith]\ncontracts_module = "shared_kernel"\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    out = tmp_path / "MIGRATION.md"
+
+    result = runner.invoke(app, ["audit", str(root), "--output", str(out)])
+
+    assert result.exit_code == 0, result.output
+    assert "0 cross-module import pattern(s)" in result.output

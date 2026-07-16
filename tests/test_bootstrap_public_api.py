@@ -8,7 +8,7 @@ sweep to actually dispatch at startup has no public trigger: the sweep
 skips every row for the cycle while the runtime is un-bootstrapped
 (``event_bus`` is ``None`` — see ``modulith/builtin/outbox.py``'s
 ``_sweep`` guard, pinned by
-``tests/test_w3_r1_outbox.py::test_sweep_skips_rows_without_attempt_bookkeeping_when_unbootstrapped``).
+``tests/test_outbox_wire_format.py::test_sweep_skips_rows_without_attempt_bookkeeping_when_unbootstrapped``).
 """
 
 from __future__ import annotations
@@ -45,6 +45,15 @@ class RecoveredEvent:
 
 
 received: list[int] = []
+
+
+def test_publish_sync_timeout_is_exported_without_future_receipt_type() -> None:
+    import modulith
+    from modulith.sync import PublishSyncTimeout
+
+    assert modulith.PublishSyncTimeout is PublishSyncTimeout
+    assert "PublishSyncTimeout" in modulith.__all__
+    assert "EventPublishReceipt" not in modulith.__all__
 
 
 async def record(recovered: RecoveredEvent) -> None:
@@ -130,7 +139,7 @@ async def test_bootstrap_eagerly_unblocks_crash_recovery_sweep_before_any_publis
     any publish() — gets a live event_bus immediately, so a publication a
     PREVIOUS (crashed) process left incomplete is actually retried by the
     crash-recovery sweep instead of being skipped for the whole cycle (the
-    un-bootstrapped counterpart is pinned by test_w3_r1_outbox.py's
+    un-bootstrapped counterpart is pinned by test_outbox_wire_format.py's
     test_sweep_skips_rows_without_attempt_bookkeeping_when_unbootstrapped)."""
     from modulith import bootstrap
 

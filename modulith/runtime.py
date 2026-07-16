@@ -24,9 +24,15 @@ from .config import Configuration, ConfigurationError, load_configuration
 from .discovery import detect_application_package
 from .event_bus import InMemoryEventBus, _require_async_handler
 from .manager import create_plugin_manager
-from .types import EventPublication, ModuleInfo
+from .types import EventPublication, EventPublishReceipt, ModuleInfo
 
 logger = logging.getLogger("modulith")
+
+# Strong references for fire-and-forget background tasks (currently just the
+# best-effort provisional-broker close below). asyncio only holds a weak
+# reference to a scheduled task — without this, the task can be garbage
+# collected before it runs.
+_background_tasks: set[asyncio.Task[Any]] = set()
 
 
 class Runtime:
@@ -250,32 +256,30 @@ class Runtime:
             assert self._event_bus is not None
             handlers = self._event_bus.listeners_for(type(event))
             try:
-                await outbox.persist(event)
+                records = list(await outbox.persist(event))
                 target = self._broker_route_target(event, has_local_handler=bool(handlers))
                 if target is not None:
-                    await outbox.persist_broker_route(event, target)
+                    records.append(await outbox.persist_broker_route(event, target))
             except BaseException as exc:
                 # The publish failed BETWEEN the paired publish hooks.
                 # modulith_after_event_published is contractually scoped to
                 # successful persistence, so it must NOT fire — but the
                 # observability publish span started in the before hook would
                 # then leak (never ended, stale ContextVar — W3 R4-W3-02).
-                # Close it explicitly with the failure recorded.
-                self._abort_publish_observability(exc)
+                # modulith_on_publish_error gives plugins (observability
+                # included) a paired hook to close out whatever they opened.
+                self._fire_publish_error(event, exc)
                 raise
             # Fire the post-publish hook on the durable path too: the event is
             # now persisted, which is exactly what the hookspec documents
             # ("after an event has been persisted to the outbox"). Omitting it
             # here made metrics/tracing plugins miss every transactional
-            # publish — the production path the outbox exists for.
-            event_type = f"{type(event).__module__}.{type(event).__qualname__}"
-            publish_pub = EventPublication(
-                id=uuid4(),
-                payload=self._serialized_payload(event),
-                event_type=event_type,
-                published_at=datetime.now(UTC),
-            )
-            pm.hook.modulith_after_event_published(event=event, publication=publish_pub)
+            # publish — the production path the outbox exists for. Hand hook
+            # consumers the records actually saved (EventPublishReceipt)
+            # instead of a fabricated EventPublication matching neither the
+            # persisted id nor the configured storage serializer's bytes.
+            receipt = EventPublishReceipt(records=tuple(records))
+            pm.hook.modulith_after_event_published(event=event, publication=receipt)
             return
 
         await self._dispatch_with_hooks(event)
@@ -302,26 +306,27 @@ class Runtime:
         try:
             await self._maybe_route_to_broker(event, has_local_handler=has_local_handler)
         except BaseException as exc:
-            self._abort_publish_observability(exc)
+            self._fire_publish_error(event, exc)
             raise
 
-    @staticmethod
-    def _abort_publish_observability(exc: BaseException) -> None:
-        """Close the built-in observability publish span on a failed publish.
+    def _fire_publish_error(self, event: Any, exc: BaseException) -> None:
+        """Fire the observe-only publish-error hook for a failed publish.
 
         A publish that raises between ``modulith_before_event_published`` and
         ``modulith_after_event_published`` (outbox persist/serialize, inline
         broker route) fires no further hook — the hookspec scopes the after
-        hook to success — so the built-in plugin's publish span leaked:
-        never ended (never exported) with a stale ContextVar mis-parenting
-        the next dispatch span in the same context (W3 R4-W3-02). This is a
-        first-party seam, mirroring ``_outbox_owns_dispatch``'s direct
-        knowledge of the outbox plugin; it is a no-op when OTel is absent or
-        the plugin is disabled (no span was started).
+        hook to success — so any cleanup a plugin started in the before hook
+        (the built-in observability plugin's publish span, most notably)
+        leaked: never ended, with a stale ContextVar mis-parenting the next
+        dispatch span in the same context (W3 R4-W3-02). Purely observational
+        — the ``_ObserveContractShield`` in ``manager.py`` guarantees a
+        raising hookimpl is logged and swallowed rather than masking the
+        original publish failure, which the caller always re-raises
+        unchanged right after this call.
         """
-        from .builtin import observability
-
-        observability.abort_publish_span(exc)
+        if self._plugin_manager is None:
+            return
+        self._plugin_manager.hook.modulith_on_publish_error(event=event, exception=exc)
 
     def _serialized_payload(self, event: Any) -> bytes:
         """Best-effort serialized bytes for hook-facing EventPublications.
@@ -695,8 +700,14 @@ class Runtime:
                 plugin_manager.hook.modulith_after_module_load(module=module)
         except BaseException:
             # Roll back the early config install (see step 4.5) — a failed
-            # bootstrap must leave the runtime exactly as it was.
+            # bootstrap must leave the runtime exactly as it was. The local
+            # broker_registry is never installed on self, but any adapter
+            # that registered into it during step 4.5 (e.g. a redis client)
+            # is live and must still be closed — otherwise a LATER step
+            # failing (discovery, manifests, modulith_after_module_load)
+            # leaked it for the process lifetime.
             self._config = None
+            self._close_provisional_brokers(broker_registry)
             raise
 
         # 7. Commit point — install all state on self. Nothing above mutated
@@ -714,6 +725,37 @@ class Runtime:
 
         # 8. Mark complete. Future calls take the fast path.
         self._bootstrapped = True
+
+    @staticmethod
+    def _close_provisional_brokers(registry: BrokerRegistry) -> None:
+        """Best-effort close for a broker_registry orphaned by a failed bootstrap.
+
+        Mirrors ``_teardown_test_resources``'s loop detection: with no loop
+        running (the common case — bootstrap failing from a sync caller)
+        ``close_all()`` is awaited directly via ``asyncio.run()``. Inside a
+        running loop (bootstrap failing from the async ``publish()`` path,
+        which calls ``ensure_bootstrapped()`` synchronously) a sync method
+        can't await, so the close is scheduled as a background task instead —
+        best-effort, but ``close_all()`` already logs-and-swallows adapter
+        errors internally, so this never risks masking the original bootstrap
+        failure that's about to propagate.
+        """
+        if not registry.schemes():
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                asyncio.run(registry.close_all())
+            except RuntimeError:  # pragma: no cover - loop-policy edge cases
+                logger.debug(
+                    "could not close provisional brokers after failed bootstrap",
+                    exc_info=True,
+                )
+        else:
+            task = asyncio.ensure_future(registry.close_all())
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
 
     def _log_banner(self) -> None:
         """Log active configuration so users see what modulith is doing."""
@@ -781,17 +823,49 @@ class Runtime:
         closed broker raises that adapter's own error, not a modulith error.
         Restart the process to get a working runtime (tests use
         ``_reset_for_testing`` instead).
+
+        The local step (outbox stop + store drain) and the broker step
+        (``registry.close_all()``) run INDEPENDENTLY: a failure in one no
+        longer skips the other — a store whose ``wait_for_dispatch()`` raises
+        used to abort before brokers ever got a chance to close, leaking
+        their connections on every failed drain. When only one step fails,
+        that single exception propagates unchanged (no behavior change for
+        the common case); when BOTH fail, they're combined into an
+        ``ExceptionGroup`` so neither failure silently displaces the other.
         """
         from .builtin import outbox
 
-        await outbox.shutdown()
-        store = outbox._store
-        waiter = getattr(store, "wait_for_dispatch", None) if store is not None else None
-        if waiter is not None:
-            await waiter()
+        local_error: BaseException | None = None
+        try:
+            await outbox.shutdown()
+            store = outbox._store
+            waiter = getattr(store, "wait_for_dispatch", None) if store is not None else None
+            if waiter is not None:
+                await waiter()
+        except BaseException as exc:
+            local_error = exc
+
+        broker_error: BaseException | None = None
         registry = self._broker_registry
         if registry is not None:
-            await registry.close_all()
+            try:
+                await registry.close_all()
+            except BaseException as exc:
+                broker_error = exc
+
+        if local_error is not None and broker_error is not None:
+            # ExceptionGroup requires Exception instances; BaseException
+            # (CancelledError / KeyboardInterrupt) must propagate unwrapped.
+            if isinstance(local_error, Exception) and isinstance(broker_error, Exception):
+                raise ExceptionGroup(
+                    "runtime shutdown failed: local drain and broker close both failed",
+                    [local_error, broker_error],
+                )
+            raise local_error if not isinstance(local_error, Exception) else broker_error
+        if local_error is not None:
+            raise local_error
+        if broker_error is not None:
+            raise broker_error
 
     # ----- Test support -----------------------------------------------------
 

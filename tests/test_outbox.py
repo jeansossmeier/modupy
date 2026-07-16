@@ -23,7 +23,8 @@ dispatches before commit" property is observable.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -31,6 +32,7 @@ import pytest
 
 from modulith import EventPublication, event
 from modulith.builtin import outbox
+from modulith.config import ConfigurationError
 from modulith.runtime import _runtime
 from modulith.serializers import JsonEventSerializer
 
@@ -405,6 +407,81 @@ async def test_dispatch_dead_letters_at_threshold() -> None:
     assert counts["incomplete"] == 0
 
 
+class _StoreWithOwnDeadLetterThreshold(StubStore):
+    """Mimics PostgresPublicationStore's duck-typed dead-letter capability:
+    a store MAY expose its own ``dead_letter_after_attempts`` (used to flag
+    ``is_dead_lettered`` at save() time) plus an ``_explicit`` marker so
+    outbox.configure() can detect conflicting settings vs. silently pick one
+    and leave the two out of sync."""
+
+    def __init__(self, *, dead_letter_after_attempts: int | None = None) -> None:
+        super().__init__()
+        self.dead_letter_after_attempts_explicit = dead_letter_after_attempts is not None
+        self.dead_letter_after_attempts = (
+            dead_letter_after_attempts if dead_letter_after_attempts is not None else 10
+        )
+
+
+def test_configure_rejects_conflicting_dead_letter_thresholds() -> None:
+    """Task 4: unify dead-letter thresholds — a store constructed with its OWN
+    explicit dead_letter_after_attempts that disagrees with the value passed
+    to outbox.configure() must fail loudly during configuration instead of
+    silently leaving the store's is_dead_lettered flag and the plugin's own
+    skip-check disagreeing on which rows are dead."""
+    store = _StoreWithOwnDeadLetterThreshold(dead_letter_after_attempts=3)
+
+    with pytest.raises(ConfigurationError, match="dead_letter_after_attempts"):
+        outbox.configure(
+            store, JsonEventSerializer(), dead_letter_after_attempts=5, start_loop=False
+        )
+
+
+def test_configure_unifies_dead_letter_threshold_from_explicit_store_setting() -> None:
+    """When only the STORE sets an explicit threshold (configure() doesn't),
+    the plugin adopts the store's value rather than silently keeping its own
+    unrelated default of 10."""
+    store = _StoreWithOwnDeadLetterThreshold(dead_letter_after_attempts=4)
+
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+
+    assert outbox._dead_letter_after_attempts == 4
+
+
+def test_configure_pushes_its_threshold_down_to_the_store() -> None:
+    """When only outbox.configure() sets an explicit threshold (the store
+    doesn't), the plugin's value is pushed onto the store so a subsequent
+    save() flags is_dead_lettered consistently with the plugin's own
+    skip-check."""
+    store = _StoreWithOwnDeadLetterThreshold()
+
+    outbox.configure(store, JsonEventSerializer(), dead_letter_after_attempts=7, start_loop=False)
+
+    assert store.dead_letter_after_attempts == 7
+
+
+class _LegacyDeadLetterStore(StubStore):
+    """A pre-Task-4 third-party store: exposes ``find_dead_lettered()`` with
+    NO pagination kwargs. ``list_dead_lettered()`` must fall back to its
+    single unbounded/capped call rather than raising TypeError."""
+
+    async def find_dead_lettered(self) -> list[EventPublication]:
+        return [p for p in self.rows.values() if p.attempt_count >= 10]
+
+
+@pytest.mark.asyncio
+async def test_list_dead_lettered_falls_back_for_store_without_pagination_kwargs() -> None:
+    """Task 4 keyset pagination must retain fallback behavior for third-party
+    stores whose find_dead_lettered() predates the after/limit kwargs."""
+    store = _LegacyDeadLetterStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    pub = _make_pub(record, value=1, attempt_count=10)
+    store.rows[pub.id] = pub
+
+    result = await outbox.list_dead_lettered()
+
+    assert [p.id for p in result] == [pub.id]
+
+
 # ---------------------------------------------------------------------------
 # retry loop
 # ---------------------------------------------------------------------------
@@ -582,3 +659,309 @@ def test_backoff_measured_from_last_attempt_not_published_at() -> None:
     # Age the last attempt past the 4s window → eligible again.
     pub.last_attempt_at = datetime.now(UTC) - timedelta(seconds=10)
     assert outbox._backoff_elapsed(pub) is True
+
+
+# ---------------------------------------------------------------------------
+# Task 4: claim_strategy wiring in the outbox plugin
+# ---------------------------------------------------------------------------
+
+
+class ClaimingStubStore(StubStore):
+    """In-memory ClaimingStore + AdvisoryLockingStore for plugin-level tests.
+
+    Mirrors the real adapter's contract: claim_batch returns copies carrying
+    claim_token, complete_claim/fail_claim fence on that token, and
+    try_lock_publication is an exclusive in-process lock.
+    """
+
+    def __init__(self, *, supports_advisory_lock: bool = True) -> None:
+        super().__init__()
+        self.supports_advisory_lock = supports_advisory_lock
+        self.claims: dict[UUID, tuple[str, str, datetime]] = {}  # id -> owner,token,until
+        self.locks: dict[UUID, object] = {}
+        self.claim_batch_calls: list[str] = []
+        self.renew_calls: list[tuple[UUID, str, float]] = []
+        self.complete_claim_calls: list[tuple[UUID, str, str]] = []
+        self.fail_claim_calls: list[tuple[UUID, str]] = []
+        self.lock_calls: list[UUID] = []
+
+    async def claim_batch(
+        self, *, owner: str, batch_size: int, lease_seconds: float, older_than: timedelta
+    ) -> list[EventPublication]:
+        self.claim_batch_calls.append(owner)
+        now = datetime.now(UTC)
+        cutoff = now - older_than
+        claimed: list[EventPublication] = []
+        for pub in sorted(self.rows.values(), key=lambda p: p.published_at or now):
+            if pub.completed_at is not None:
+                continue
+            if pub.published_at is not None and pub.published_at > cutoff:
+                continue
+            existing = self.claims.get(pub.id)
+            if existing is not None and existing[2] > now:
+                continue  # active lease held by someone else
+            token = uuid4().hex
+            until = now + timedelta(seconds=lease_seconds)
+            self.claims[pub.id] = (owner, token, until)
+            copy_pub = replace(pub, claim_token=token)
+            claimed.append(copy_pub)
+            if len(claimed) >= batch_size:
+                break
+        return claimed
+
+    async def renew_claim(self, publication_id: UUID, token: str, lease_seconds: float) -> bool:
+        self.renew_calls.append((publication_id, token, lease_seconds))
+        entry = self.claims.get(publication_id)
+        if entry is None or entry[1] != token:
+            return False
+        self.claims[publication_id] = (
+            entry[0],
+            entry[1],
+            datetime.now(UTC) + timedelta(seconds=lease_seconds),
+        )
+        return True
+
+    async def complete_claim(self, publication_id: UUID, token: str, mode: str) -> bool:
+        self.complete_claim_calls.append((publication_id, token, mode))
+        entry = self.claims.get(publication_id)
+        if entry is None or entry[1] != token:
+            return False
+        if mode == "delete":
+            self.deleted.append(publication_id)
+            self.rows.pop(publication_id, None)
+        elif mode == "archive":
+            self.archived.append(publication_id)
+            self.rows.pop(publication_id, None)
+        else:
+            row = self.rows.get(publication_id)
+            if row is not None:
+                row.completed_at = datetime.now(UTC)
+            self.completed.append(publication_id)
+        self.claims.pop(publication_id, None)
+        return True
+
+    async def fail_claim(self, publication: EventPublication, token: str) -> bool:
+        self.fail_claim_calls.append((publication.id, token))
+        entry = self.claims.get(publication.id)
+        if entry is None or entry[1] != token:
+            return False
+        self.rows[publication.id] = publication
+        self.saved.append(publication.id)
+        self.claims.pop(publication.id, None)
+        return True
+
+    async def try_lock_publication(self, publication_id: UUID) -> object | None:
+        self.lock_calls.append(publication_id)
+        if publication_id in self.locks:
+            return None
+        handle = object()
+        self.locks[publication_id] = handle
+        return handle
+
+    async def unlock_publication(self, handle: object, publication_id: UUID) -> None:
+        if self.locks.get(publication_id) is handle:
+            self.locks.pop(publication_id, None)
+
+
+def test_configure_rejects_invalid_claim_strategy() -> None:
+    with pytest.raises(ValueError, match="claim_strategy"):
+        outbox.configure(
+            StubStore(), JsonEventSerializer(), claim_strategy="optimistic", start_loop=False
+        )
+
+
+def test_configure_none_strategy_warns_about_duplicates(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
+        outbox.configure(
+            StubStore(), JsonEventSerializer(), claim_strategy="none", start_loop=False
+        )
+    assert any("claim_strategy='none'" in r.message for r in caplog.records)
+
+
+def test_configure_advisory_lock_requires_store_capability() -> None:
+    store = ClaimingStubStore(supports_advisory_lock=False)
+    with pytest.raises(ConfigurationError, match="advisory_lock"):
+        outbox.configure(
+            store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False
+        )
+
+
+@pytest.mark.asyncio
+async def test_lease_sweep_uses_claim_batch_not_find_incomplete() -> None:
+    store = ClaimingStubStore()
+    outbox.configure(
+        store, JsonEventSerializer(), claim_strategy="lease", claim_batch_size=10, start_loop=False
+    )
+    _bootstrap_with_listener(record)
+    pub = _make_pub(record, value=7)
+    await store.save(pub)
+
+    await outbox._sweep(timedelta(0))
+
+    assert store.claim_batch_calls, "lease sweep must call claim_batch"
+    assert store.find_incomplete_calls == []
+    assert received == [7]
+    assert store.complete_claim_calls  # fenced completion, not mark_complete
+    assert store.completed == [pub.id]
+    # Direct mark_complete must NOT be used when a claim_token is present.
+    assert store.completed == [c[0] for c in store.complete_claim_calls]
+
+
+@pytest.mark.asyncio
+async def test_lease_excludes_second_owner_while_first_holds_claim() -> None:
+    store = ClaimingStubStore()
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        claim_lease_seconds=60.0,
+        start_loop=False,
+    )
+    pub = _make_pub(record, value=1)
+    await store.save(pub)
+
+    first = await store.claim_batch(
+        owner="worker-a", batch_size=10, lease_seconds=60.0, older_than=timedelta(0)
+    )
+    second = await store.claim_batch(
+        owner="worker-b", batch_size=10, lease_seconds=60.0, older_than=timedelta(0)
+    )
+    assert [p.id for p in first] == [pub.id]
+    assert second == []
+
+
+@pytest.mark.asyncio
+async def test_lease_stale_token_does_not_complete_or_burn_attempts() -> None:
+    store = ClaimingStubStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _make_pub(record, value=1)
+    await store.save(pub)
+    (claimed,) = await store.claim_batch(
+        owner="worker-a", batch_size=1, lease_seconds=60.0, older_than=timedelta(0)
+    )
+    # Simulate a peer reclaiming the row with a new token before we finish.
+    store.claims[claimed.id] = ("worker-b", "peer-token", datetime.now(UTC) + timedelta(hours=1))
+    claimed.claim_token = "stale-token"
+
+    await outbox._dispatch_publication(claimed)
+
+    assert claimed.completed_at is None
+    assert store.rows[claimed.id].attempt_count == 0
+    assert store.complete_claim_calls == [(claimed.id, "stale-token", "update")]
+
+
+@pytest.mark.asyncio
+async def test_lease_renews_during_slow_dispatch() -> None:
+    store = ClaimingStubStore()
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        claim_lease_seconds=0.3,
+        start_loop=False,
+    )
+
+    async def slow(event: OutboxEvent) -> None:
+        await asyncio.sleep(0.2)
+        received.append(event.value)
+
+    _bootstrap_with_listener(slow)
+    pub = _make_pub(slow, value=3)
+    await store.save(pub)
+
+    await outbox._sweep(timedelta(0))
+
+    renewals = [c for c in store.renew_calls if c[2] > 0]
+    assert renewals, "lease renewal must run at ~lease/3 during slow dispatch"
+    assert received == [3]
+
+
+@pytest.mark.asyncio
+async def test_lease_releases_claim_when_backoff_not_elapsed() -> None:
+    store = ClaimingStubStore()
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        claim_lease_seconds=60.0,
+        start_loop=False,
+    )
+    pub = _make_pub(
+        record,
+        value=1,
+        attempt_count=3,
+        last_attempt_at=datetime.now(UTC),  # backoff not elapsed
+    )
+    await store.save(pub)
+
+    await outbox._sweep(timedelta(0))
+
+    # Early release: renew_claim(..., 0.0) so another sweeper can pick it up.
+    assert any(c[2] == 0.0 for c in store.renew_calls)
+    assert received == []
+    assert store.complete_claim_calls == []
+
+
+@pytest.mark.asyncio
+async def test_advisory_lock_skips_when_lock_held() -> None:
+    store = ClaimingStubStore(supports_advisory_lock=True)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _make_pub(record, value=9)
+    await store.save(pub)
+    # Pre-hold the lock as if another sweeper owns dispatch.
+    store.locks[pub.id] = object()
+
+    await outbox._sweep(timedelta(0))
+
+    assert pub.id in store.lock_calls
+    assert received == []
+    assert store.completed == []
+
+
+@pytest.mark.asyncio
+async def test_advisory_lock_holds_through_dispatch() -> None:
+    store = ClaimingStubStore(supports_advisory_lock=True)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _make_pub(record, value=4)
+    await store.save(pub)
+
+    await outbox._sweep(timedelta(0))
+
+    assert store.lock_calls == [pub.id]
+    assert pub.id not in store.locks  # unlocked after dispatch
+    assert received == [4]
+    assert store.completed == [pub.id]
+
+
+@pytest.mark.asyncio
+async def test_legacy_store_falls_back_to_find_incomplete_under_default_lease() -> None:
+    """Third-party stores without ClaimingStore keep the original path."""
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)  # default lease
+    _bootstrap_with_listener(record)
+    pub = _make_pub(record, value=5)
+    await store.save(pub)
+
+    await outbox._sweep(timedelta(0))
+
+    assert store.find_incomplete_calls == [timedelta(0)]
+    assert received == [5]
+    assert store.completed == [pub.id]
+
+
+@pytest.mark.asyncio
+async def test_none_strategy_uses_find_incomplete_even_with_claiming_store() -> None:
+    store = ClaimingStubStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="none", start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _make_pub(record, value=6)
+    await store.save(pub)
+
+    await outbox._sweep(timedelta(0))
+
+    assert store.claim_batch_calls == []
+    assert store.find_incomplete_calls == [timedelta(0)]
+    assert received == [6]

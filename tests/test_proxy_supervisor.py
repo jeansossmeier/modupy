@@ -9,10 +9,13 @@ marked ``integration`` like the rest of the lifecycle suite.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
+import socket
 import sys
 import textwrap
+import time
 from collections.abc import AsyncIterator, MutableMapping
 from pathlib import Path
 from typing import Any
@@ -26,6 +29,8 @@ from modulith.proxy import RoutingRule, create_proxy_app
 from modulith.supervisor import (
     Supervisor,
     WorkerSpec,
+    _build_worker_env,
+    _resolve_actuator,
     derive_specs_from_config,
     run_supervised,
 )
@@ -89,11 +94,14 @@ def _echo_upstream() -> FastAPI:
 
 
 @pytest.mark.parametrize("encoded", ["%00", "%7f"])
-async def test_proxy_maps_percent_encoded_control_bytes_to_clean_400(encoded: str) -> None:
-    """A8-r2-93: a path with a percent-encoded non-printable ASCII byte makes
-    httpx.build_request raise InvalidURL (not a TransportError) outside the
-    proxy's try/except — an uncaught 500, violating the code's own
-    "never an uncaught 500" contract. It must be a clean 4xx/5xx response."""
+async def test_proxy_forwards_percent_encoded_control_bytes_upstream(encoded: str) -> None:
+    """Task 7 (supersedes A8-r2-93): building the upstream URL from
+    ``request.url.path`` (already percent-*decoded*) made httpx.build_request
+    raise InvalidURL for a decoded non-printable byte — an uncaught 500.
+    Task 7 forwards the client's exact raw, still-encoded bytes
+    (``scope["raw_path"]``) instead, so httpx never sees a decoded control
+    byte and the request reaches the upstream intact — which is the correct
+    reverse-proxy behavior (let the backend decide), not a 400 rejection."""
     proxy_app = create_proxy_app(
         [RoutingRule(prefix="/orders", backend_url="http://orders-worker")],
         client=httpx.AsyncClient(transport=httpx.ASGITransport(app=_echo_upstream())),
@@ -101,12 +109,13 @@ async def test_proxy_maps_percent_encoded_control_bytes_to_clean_400(encoded: st
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
     ) as client:
-        # No exception may escape the app; the malformed URL is the client's
-        # fault, so the proxy answers 400 itself.
+        # No exception may escape the app either way; the request is
+        # genuinely forwarded, so the upstream's own 404 (no such route)
+        # comes back — not the proxy's build-time 400.
         resp = await client.get(f"/orders/{encoded}")
         control = await client.get("/orders/ping")
 
-    assert resp.status_code == 400
+    assert resp.status_code == 404
     assert control.status_code == 200  # the app keeps serving normally
 
 
@@ -483,3 +492,305 @@ async def test_workers_die_when_supervisor_is_sigkilled(tmp_path: Path) -> None:
                 os.kill(worker_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Task 7 — socket-level proxy tests
+#
+# Every other proxy test drives the ASGI app in-process via ASGITransport,
+# which never exercises a real HTTP/1.1 wire parser. These tests run the
+# proxy AND its upstream as real uvicorn servers talking over real loopback
+# TCP sockets, so header duplication and raw path encoding survive an actual
+# wire round-trip (h11's request parsing), not just Starlette's in-process
+# Request object.
+# ---------------------------------------------------------------------------
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port: int = sock.getsockname()[1]
+    return port
+
+
+async def _serve_app_over_socket(app: Any, port: int) -> asyncio.Task[None]:
+    """Bind ``app`` to a real loopback socket via uvicorn; block until reachable."""
+    import uvicorn
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    task = asyncio.create_task(server.serve())
+
+    deadline = time.monotonic() + 15.0
+    async with httpx.AsyncClient() as probe:
+        while True:
+            try:
+                await probe.get(f"http://127.0.0.1:{port}/", timeout=1.0)
+                break
+            except httpx.TransportError:
+                assert not task.done(), f"server on port {port} died: {task.exception()!r}"
+                assert time.monotonic() < deadline, f"server on port {port} never came up"
+                await asyncio.sleep(0.05)
+    return task
+
+
+async def _stop_socket_server(task: asyncio.Task[None]) -> None:
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+def _raw_echo_upstream() -> Any:
+    """A raw ASGI app (no FastAPI routing) that echoes exactly what it received.
+
+    Bypassing FastAPI/Starlette's own request parsing on the upstream side
+    means the response reports precisely the bytes h11 handed to the ASGI
+    scope — the ground truth for what actually crossed the wire.
+    """
+
+    async def app(scope: MutableMapping[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            return
+        body_chunks: list[bytes] = []
+        while True:
+            message = await receive()
+            body_chunks.append(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+        import json
+
+        payload = json.dumps(
+            {
+                "raw_path": scope["raw_path"].decode("latin-1"),
+                "query_string": scope["query_string"].decode("latin-1"),
+                "headers": [
+                    [k.decode("latin-1"), v.decode("latin-1")] for k, v in scope["headers"]
+                ],
+            }
+        ).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": payload})
+
+    return app
+
+
+@pytest.mark.integration
+async def test_proxy_preserves_duplicate_headers_and_raw_path_over_real_sockets() -> None:
+    """Task 7: real end-to-end proof (not ASGITransport) that the proxy (a)
+    preserves every occurrence of a repeated header name and (b) forwards an
+    encoded-slash path segment (``%2F``) as the exact bytes the client sent,
+    rather than the decoded (and therefore re-segmented) path."""
+    upstream_port = _free_port()
+    proxy_port = _free_port()
+
+    upstream_task = await _serve_app_over_socket(_raw_echo_upstream(), upstream_port)
+    try:
+        proxy_app = create_proxy_app(
+            [RoutingRule(prefix="/orders", backend_url=f"http://127.0.0.1:{upstream_port}")],
+        )
+        proxy_task = await _serve_app_over_socket(proxy_app, proxy_port)
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"http://127.0.0.1:{proxy_port}/orders/a%2Fb?x=1",
+                    headers=[("cookie", "a=1"), ("cookie", "b=2")],
+                )
+        finally:
+            await _stop_socket_server(proxy_task)
+    finally:
+        await _stop_socket_server(upstream_task)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    # The encoded slash must survive as one segment ("a%2Fb"), not be
+    # decoded into "a/b" (which would look like two path segments upstream).
+    assert body["raw_path"] == "/orders/a%2Fb"
+    assert body["query_string"] == "x=1"
+    cookie_values = [v for k, v in body["headers"] if k.lower() == "cookie"]
+    assert cookie_values == ["a=1", "b=2"]  # both occurrences forwarded, not just one
+
+
+@pytest.mark.integration
+async def test_proxy_actuator_reachable_over_real_sockets() -> None:
+    """Task 7: sanity check that the actuator endpoints themselves — not just
+    the catch-all proxy route — work over a genuine TCP round trip."""
+    proxy_port = _free_port()
+    proxy_app = create_proxy_app([RoutingRule(prefix="/orders", backend_url="http://127.0.0.1:1")])
+    task = await _serve_app_over_socket(proxy_app, proxy_port)
+    try:
+        async with httpx.AsyncClient() as client:
+            live = await client.get(f"http://127.0.0.1:{proxy_port}/_modulith/live")
+    finally:
+        await _stop_socket_server(task)
+
+    assert live.status_code == 200
+    assert live.json() == {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Task 7 — liveness vs readiness must be genuinely distinct
+# ---------------------------------------------------------------------------
+
+
+async def test_liveness_stays_ok_while_readiness_reports_degraded() -> None:
+    """Task 7: /_modulith/live must answer 200 regardless of backend health —
+    it only asserts "this proxy process is up" — while /_modulith/health (the
+    readiness contract) reports 503 for the exact same unreachable backend.
+    A single combined endpoint could never express both contracts at once."""
+    rules = [RoutingRule(prefix="/orders", backend_url="http://127.0.0.1:59999")]
+    proxy_app = create_proxy_app(rules, client=httpx.AsyncClient())
+
+    with TestClient(proxy_app) as client:
+        live = client.get("/_modulith/live")
+        health = client.get("/_modulith/health")
+
+    assert live.status_code == 200
+    assert live.json() == {"status": "ok"}
+    assert health.status_code == 503
+    assert health.json()["status"] == "degraded"
+
+
+# ---------------------------------------------------------------------------
+# Task 7 — _resolve_actuator: every actuator_mode branch
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_actuator_disabled_ignores_token() -> None:
+    enabled, token = _resolve_actuator(mode="disabled", production=True, host="0.0.0.0", token="t")
+    assert (enabled, token) == (False, None)
+
+
+def test_resolve_actuator_open_ignores_missing_token() -> None:
+    enabled, token = _resolve_actuator(mode="open", production=True, host="0.0.0.0", token=None)
+    assert (enabled, token) == (True, None)
+
+
+def test_resolve_actuator_token_mode_requires_token() -> None:
+    from modulith.config import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="requires a bearer token"):
+        _resolve_actuator(mode="token", production=False, host="127.0.0.1", token=None)
+
+
+def test_resolve_actuator_token_mode_accepts_token_even_on_loopback() -> None:
+    enabled, token = _resolve_actuator(
+        mode="token", production=False, host="127.0.0.1", token="secret"
+    )
+    assert (enabled, token) == (True, "secret")
+
+
+def test_resolve_actuator_auto_stays_open_on_loopback_dev() -> None:
+    enabled, token = _resolve_actuator(mode="auto", production=False, host="127.0.0.1", token=None)
+    assert (enabled, token) == (True, None)
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "10.0.0.5"])
+def test_resolve_actuator_auto_requires_token_on_non_loopback_host(host: str) -> None:
+    from modulith.config import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="non-loopback host"):
+        _resolve_actuator(mode="auto", production=False, host=host, token=None)
+
+
+def test_resolve_actuator_auto_requires_token_in_production_even_on_loopback() -> None:
+    from modulith.config import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="production=True"):
+        _resolve_actuator(mode="auto", production=True, host="127.0.0.1", token=None)
+
+
+def test_resolve_actuator_auto_accepts_token_in_production() -> None:
+    enabled, token = _resolve_actuator(mode="auto", production=True, host="0.0.0.0", token="secret")
+    assert (enabled, token) == (True, "secret")
+
+
+# ---------------------------------------------------------------------------
+# Task 7 — oversized worker log lines must not silence log forwarding
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_forward_logs_drains_oversized_line_without_dying(caplog: Any) -> None:
+    """Task 7: a single log line longer than StreamReader's buffer limit
+    raises ValueError from readline() — _forward_logs must log a truncation
+    notice and keep forwarding subsequent lines, not silently stop forwarding
+    forever after the first oversized line."""
+    caplog.set_level("INFO", logger="modulith.supervisor")
+    spec = WorkerSpec("orders", "fakeapp", 9001)
+    # A line far past the default 64 KiB StreamReader limit, followed by a
+    # normal line — proves the loop resumes cleanly at the next line. The
+    # sleep+flush between writes forces two separate pipe reads: StreamReader
+    # clears its *entire* buffer on overrun (not just up to the oversized
+    # line), so the second line must arrive in a later read to be preserved —
+    # exactly how real streaming log output behaves, unlike a single burst
+    # write that lands both lines in the same buffer fill.
+    command = [
+        sys.executable,
+        "-c",
+        "import sys, time; sys.stdout.write('x' * 200_000 + '\\n'); sys.stdout.flush(); "
+        "time.sleep(0.2); sys.stdout.write('after-oversized-line\\n'); sys.stdout.flush()",
+    ]
+    sup = Supervisor([spec], command_builder=lambda s, p: command)
+
+    proc = await sup._spawn("orders", spec, 9001)
+    await proc.wait()
+    await asyncio.gather(*list(sup._log_tasks), return_exceptions=True)
+
+    assert "buffer limit" in caplog.text
+    assert "after-oversized-line" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Task 7 — worker environment precedence
+# ---------------------------------------------------------------------------
+
+
+def test_build_worker_env_spec_env_overrides_inherited_but_not_identity_vars(
+    monkeypatch,
+) -> None:
+    """Task 7: precedence must be inherited os.environ < spec.env < the three
+    reserved identity vars — spec.env can override an inherited var, but can
+    never override MODULITH_MODULE/MODULITH_APP_PACKAGE/MODULITH_TOPOLOGY."""
+    monkeypatch.setenv("SHARED_VAR", "from-os-environ")
+    spec = WorkerSpec(
+        module_name="orders",
+        package="myapp",
+        port=9001,
+        env={
+            "SHARED_VAR": "from-spec-env",
+            "MODULITH_MODULE": "attempted-override",
+        },
+    )
+
+    env = _build_worker_env(spec)
+
+    assert env["SHARED_VAR"] == "from-spec-env"  # spec.env beats inherited os.environ
+    assert env["MODULITH_MODULE"] == "orders"  # identity vars always win
+    assert env["MODULITH_APP_PACKAGE"] == "myapp"
+    assert env["MODULITH_TOPOLOGY"] == "processes"
+
+
+def test_build_worker_env_redis_aliases_do_not_override_explicit_specific_names() -> None:
+    """Companion to the alias-forwarding behavior: an explicitly-set specific
+    name (e.g. REDIS_URL) is the user's deliberate override and must not be
+    clobbered by the generic MODULITH_BROKER_URL alias."""
+    spec = WorkerSpec(
+        module_name="orders",
+        package="myapp",
+        port=9001,
+        env={
+            "MODULITH_BROKER": "redis-streams",
+            "MODULITH_BROKER_URL": "redis://generic:6379",
+            "REDIS_URL": "redis://explicit-override:6379",
+        },
+    )
+
+    env = _build_worker_env(spec)
+
+    assert env["REDIS_URL"] == "redis://explicit-override:6379"

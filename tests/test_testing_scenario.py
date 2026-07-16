@@ -74,6 +74,30 @@ def test_within_call_coroutine_timeout_raises_assertion_error():
         loop.call_soon_threadsafe(blocker.set)
 
 
+def test_within_call_sync_trigger_respects_seconds_budget():
+    """A ``.call()`` trigger that is a plain (non-coroutine) synchronous
+    function must also be bounded by the shared budget — previously it was
+    invoked directly on the calling thread with no timeout at all, so a
+    stalled sync trigger hung ``within()`` forever instead of raising the
+    documented AssertionError."""
+    import threading
+
+    release = threading.Event()
+
+    def stalls_forever() -> None:
+        release.wait()
+
+    scenario = Scenario(ModulithTestApp())
+    start = time.monotonic()
+    try:
+        with pytest.raises(AssertionError, match="not seen within"):
+            scenario.call(stalls_forever).expect_event(NeverSeen).within(seconds=0.2)
+    finally:
+        release.set()
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.0, f"within(seconds=0.2) blocked for {elapsed:.2f}s on the sync trigger"
+
+
 def test_within_timeout_cancels_call_coroutine_trigger():
     """A11-r5-221: a ``.call()`` coroutine trigger that times out must be
     cancelled — not left running on the shared daemon-loop, where it can
@@ -120,6 +144,20 @@ def test_within_call_coroutine_shares_single_time_budget():
         f"within(seconds=1.0) took {elapsed:.2f}s — trigger and poll phases "
         "each consumed their own full budget window"
     )
+
+
+def test_within_rejects_non_finite_or_negative_seconds():
+    """``within(seconds=...)`` computes ``time.monotonic() + seconds`` as its
+    deadline. A NaN budget makes every ``>=`` comparison against it False,
+    so the poll loop's own break condition never fires and the test hangs
+    forever instead of failing; +/-inf and negative budgets are similarly
+    nonsensical. All must be rejected up front, before any trigger fires."""
+    scenario = Scenario(ModulithTestApp())
+    scenario.publish(NeverSeen(n=1)).expect_event(NeverSeen)
+
+    for bad in (float("nan"), float("inf"), float("-inf"), -1.0):
+        with pytest.raises(ValueError, match="seconds"):
+            scenario.within(bad)
 
 
 def test_within_publish_trigger_respects_seconds_budget(scenario):

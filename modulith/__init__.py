@@ -54,7 +54,7 @@ from .protocols import (
 )
 
 # ----- Sync entrypoint (sync views, scripts, sync DB code) -----------------
-from .sync import publish_sync
+from .sync import PublishSyncTimeout, publish_sync
 
 # ----- Plugin contract types -----------------------------------------------
 from .types import (
@@ -84,6 +84,7 @@ __all__ = [
     "Manifest",
     "ModuleInfo",
     "PublicationStore",
+    "PublishSyncTimeout",
     "UnknownBrokerError",
     "UnknownConsumerError",
     "Violation",

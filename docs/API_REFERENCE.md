@@ -20,6 +20,7 @@ The package also exports `__version__` (the installed package version).
   - [`listener`](#listener)
   - [`publish`](#publish)
   - [`publish_sync`](#publishsync)
+  - [`PublishSyncTimeout`](#publishsynctimeout)
   - [`configure`](#configure)
   - [`bootstrap`](#bootstrap)
   - [`externalized`](#externalized)
@@ -28,7 +29,7 @@ The package also exports `__version__` (the installed package version).
   - [`get_manifest`](#getmanifest)
   - [`Manifest`](#manifest)
 - [Configuration](#configuration)
-  - [`Configuration`](#configuration)
+  - [`Configuration`](#configuration-1)
   - [`ConfigurationError`](#configurationerror)
 - [Contract types](#contract-types)
   - [`EventPublication`](#eventpublication)
@@ -61,7 +62,7 @@ The everyday surface — the names most applications import.
 ### `event`
 
 ```python
-event(cls: type[T]) -> type[T]
+def event(cls: type[T]) -> type[T]:
 ```
 
 Mark a class as a domain event.
@@ -79,7 +80,7 @@ Example:
 ### `listener`
 
 ```python
-listener(func: F) -> F
+def listener(func: F | None = None, *, broker_targets: list[str] | tuple[str, ...] = ()) -> Any:
 ```
 
 Register a listener for a specific event type.
@@ -107,7 +108,7 @@ with a message explaining what to fix.
 ### `publish`
 
 ```python
-publish(event: Any) -> None
+async def publish(event: Any) -> None:
 ```
 
 Publish an event to all registered listeners.
@@ -121,7 +122,7 @@ The user's code is identical in both modes — only configuration changes.
 ### `publish_sync`
 
 ```python
-publish_sync(event: Any, *, timeout: float | None = 30.0) -> None
+def publish_sync(event: Any, *, timeout: float | None = 30.0) -> None:
 ```
 
 Publish an event from synchronous code.
@@ -158,10 +159,25 @@ thread (module code imported by discovery) raises RuntimeError
 immediately instead of deadlocking against the bootstrap lock until the
 timeout expires.
 
+### `PublishSyncTimeout`
+
+*Exception — subclasses `TimeoutError`.*
+
+publish_sync's OWN budget timeout: the dispatch did not complete
+within ``timeout`` seconds and was cancelled.
+
+Distinct by type from a TimeoutError raised BY application code (a
+listener), which propagates out of publish_sync unchanged — on Python
+3.11+ ``concurrent.futures.TimeoutError`` IS ``TimeoutError``, so
+without the dedicated type the two were indistinguishable and the
+testing plugin's scenario runner swallowed real application failures
+as budget overruns (W3 R4-W3-01). Subclasses TimeoutError, so existing
+``except TimeoutError`` handlers keep working.
+
 ### `configure`
 
 ```python
-configure(**overrides: Any) -> None
+def configure(**overrides: Any) -> None:
 ```
 
 Override default configuration before modulith bootstraps.
@@ -191,7 +207,7 @@ yet. Outbox tuning (e.g. ``completion_mode``) is passed to
 ### `bootstrap`
 
 ```python
-bootstrap() -> None
+def bootstrap() -> None:
 ```
 
 Eagerly run the runtime's one-time bootstrap. Idempotent.
@@ -221,7 +237,7 @@ Example:
 ### `externalized`
 
 ```python
-externalized(cls: type[T] | None = None, *, target: str | None = None) -> Any
+def externalized(cls: type[T] | None = None, *, target: str | None = None) -> Any:
 ```
 
 Mark an event as *externalized* — routed to the configured broker so
@@ -251,7 +267,7 @@ Declare and read a module's contract (what it publishes, consumes, owns).
 ### `declare_module`
 
 ```python
-declare_module(*, publishes: list[str] | tuple[str, ...] = (), consumes: list[str] | tuple[str, ...] = (), listeners: list[Callable[..., Any]] | tuple[Callable[..., Any], ...] = (), owns_tables: list[str] | tuple[str, ...] = (), declared_dependencies: list[str] | tuple[str, ...] | None = None) -> None
+def declare_module(*, publishes: list[str] | tuple[str, ...] = (), consumes: list[str] | tuple[str, ...] = (), listeners: list[Callable[..., Any]] | tuple[Callable[..., Any], ...] = (), owns_tables: list[str] | tuple[str, ...] = (), declared_dependencies: list[str] | tuple[str, ...] | None = None, broker_targets: list[str] | tuple[str, ...] = ()) -> None:
 ```
 
 Register a manifest for the calling module.
@@ -259,15 +275,13 @@ Register a manifest for the calling module.
 Call this at module scope in `_manifest.py`. The package name is
 auto-detected from the calling frame.
 
-``declared_dependencies`` distinguishes "not declared" (None, the
-default — the verifier's rule 3 stays off) from an explicit empty
-sequence ("this module depends on nothing" — deny-all enforcement,
-contracts excepted).
+``declared_dependencies=None`` leaves dependency enforcement off. An
+explicit empty sequence means "this module depends on nothing".
 
 ### `get_manifest`
 
 ```python
-get_manifest(package: str) -> Manifest | None
+def get_manifest(package: str) -> Manifest | None:
 ```
 
 Return the manifest for a module, or None if none was declared.
@@ -287,7 +301,9 @@ bootstrap to validate against observed reality.
 - `consumes: tuple[str, ...]` = `()`
 - `listeners: tuple[Callable[..., Any], ...]` = `()`
 - `owns_tables: tuple[str, ...]` = `()`
-- `declared_dependencies: tuple[str, ...] | None` = `None`
+- `declared_dependencies: tuple[str, ...]` = `()`
+- `dependencies_declared: bool` = `False`
+- `broker_targets: tuple[str, ...]` = `()`
 
 ## Configuration
 
@@ -307,18 +323,21 @@ Mutating it after the runtime starts would create inconsistent state.
 - `outbox: str` = `'memory'`
 - `topology: str` = `'single'`
 - `broker: str` = `'memory'`
+- `subscription_source: str` = `'manifest'`
+- `actuator_mode: str` = `'auto'`
 - `auto_discover: bool` = `True`
 - `production: bool` = `False`
 - `outbox_options: dict[str, Any]` (default factory)
 - `broker_options: dict[str, Any]` (default factory)
 - `workers: dict[str, int]` (default factory)
+- `subscriptions: dict[str, list[str]]` (default factory)
 - `observability: bool | None` = `None`
 - `verify_manifests: bool` = `True`
 - `explicit_keys: frozenset[str]` (default factory)
 
 **Methods:**
 
-- `is_explicit(self, key: str) -> bool`
+- `def is_explicit(self, key: str) -> bool:`
   — True if the user explicitly set this key (vs accepting default).
 
 ### `ConfigurationError`
@@ -359,6 +378,7 @@ transformations) don't need to know them upfront.
 - `attempt_count: int` = `0`
 - `last_error: str | None` = `None`
 - `last_attempt_at: datetime | None` = `None`
+- `claim_token: str | None` = `None`
 
 ### `ModuleInfo`
 
@@ -421,15 +441,15 @@ Implementations may use any async DB driver (asyncpg, motor, aioredis).
 
 **Methods:**
 
-- `async save(self, publication: EventPublication) -> None`
+- `async def save(self, publication: EventPublication) -> None:`
   — Persist a new publication record.
-- `async mark_complete(self, publication_id: UUID) -> None`
+- `async def mark_complete(self, publication_id: UUID) -> None:`
   — Mark a publication as successfully delivered.
-- `async find_incomplete(self, older_than: timedelta) -> list[EventPublication]`
+- `async def find_incomplete(self, older_than: timedelta) -> list[EventPublication]:`
   — Find publications still pending past the staleness threshold.
-- `async archive(self, publication_id: UUID) -> None`
+- `async def archive(self, publication_id: UUID) -> None:`
   — Move a completed publication to archive storage.
-- `async delete(self, publication_id: UUID) -> None`
+- `async def delete(self, publication_id: UUID) -> None:`
   — Hard-delete a publication record.
 
 ### `EventSerializer`
@@ -445,9 +465,9 @@ swap it once, all events use the new format.
 
 **Methods:**
 
-- `serialize(self, event: Any) -> bytes`
+- `def serialize(self, event: Any) -> bytes:`
   — Encode an event instance to bytes for outbox storage.
-- `deserialize(self, data: bytes, event_type: str) -> Any`
+- `def deserialize(self, data: bytes, event_type: str) -> Any:`
   — Decode bytes back to an event instance.
 
 ### `Broker`
@@ -464,9 +484,9 @@ so consumers must be idempotent.
 
 **Methods:**
 
-- `async publish(self, target: str, payload: bytes, headers: dict[str, str] | None = None) -> None`
+- `async def publish(self, target: str, payload: bytes, headers: dict[str, str] | None = None) -> None:`
   — Send a serialized message to the broker.
-- `async close(self) -> None`
+- `async def close(self) -> None:`
   — Release broker resources during application shutdown.
 
 ### `Consumer`
@@ -491,9 +511,9 @@ and repeated ``stop()`` (shutdown paths are not always ordered).
 
 **Methods:**
 
-- `async start(self) -> None`
+- `async def start(self) -> None:`
   — Begin consuming: set up any server-side state, recover pending
-- `async stop(self) -> None`
+- `async def stop(self) -> None:`
   — Stop the poll loop and release resources. Must never raise — a
 
 ## Broker registry
@@ -510,17 +530,17 @@ the broker needs (topic, queue, exchange + routing key).
 
 **Methods:**
 
-- `register(self, scheme: str, broker: Broker) -> None`
+- `def register(self, scheme: str, broker: Broker) -> None:`
   — Register a broker for a URI scheme.
-- `unregister(self, scheme: str) -> None`
+- `def unregister(self, scheme: str) -> None:`
   — Remove a registered broker. No-op if scheme isn't registered.
-- `get(self, scheme: str) -> Broker`
+- `def get(self, scheme: str) -> Broker:`
   — Look up a broker by scheme.
-- `async publish(self, target: str, payload: bytes, headers: dict[str, str] | None = None) -> None`
+- `async def publish(self, target: str, payload: bytes, headers: dict[str, str] | None = None) -> None:`
   — Dispatch a payload via the broker selected by the target's scheme.
-- `async close_all(self) -> None`
+- `async def close_all(self) -> None:`
   — Release resources for every registered broker on shutdown.
-- `schemes(self) -> list[str]`
+- `def schemes(self) -> list[str]:`
   — Return sorted list of registered schemes — useful for diagnostics.
 
 ### `DuplicateBrokerError`
@@ -558,15 +578,15 @@ when its factory runs.
 
 **Methods:**
 
-- `register(self, scheme: str, factory: ConsumerFactory) -> None`
+- `def register(self, scheme: str, factory: ConsumerFactory) -> None:`
   — Register a consumer factory for a URI scheme.
-- `unregister(self, scheme: str) -> None`
+- `def unregister(self, scheme: str) -> None:`
   — Remove a registered factory. No-op if scheme isn't registered.
-- `get(self, scheme: str) -> ConsumerFactory`
+- `def get(self, scheme: str) -> ConsumerFactory:`
   — Look up a consumer factory by scheme.
-- `build(self, scheme: str, spec: ConsumerSpec) -> Consumer`
+- `def build(self, scheme: str, spec: ConsumerSpec) -> Consumer:`
   — Build a Consumer for ``scheme`` from ``spec`` via its factory.
-- `schemes(self) -> list[str]`
+- `def schemes(self) -> list[str]:`
   — Return sorted list of registered schemes — useful for diagnostics.
 
 ### `ConsumerSpec`
@@ -631,7 +651,7 @@ Constructing a configured plugin manager — most applications never need this.
 ### `create_plugin_manager`
 
 ```python
-create_plugin_manager(*, extra_plugins: list[Any] | tuple[Any, ...] = (), disable: list[str] | tuple[str, ...] = (), load_entrypoints: bool = True, load_builtins: bool = True) -> pluggy.PluginManager
+def create_plugin_manager(*, extra_plugins: list[Any] | tuple[Any, ...] = (), disable: list[str] | tuple[str, ...] = (), load_entrypoints: bool = True, load_builtins: bool = True) -> pluggy.PluginManager:
 ```
 
 Construct a configured PluginManager for a modulith application.

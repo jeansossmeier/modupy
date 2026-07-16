@@ -118,10 +118,10 @@ class AdvisoryLockingStore(Protocol):
 
 
 __all__ = [
-    "VALID_CLAIM_STRATEGIES",
-    "DEFAULT_CLAIM_STRATEGY",
-    "DEFAULT_CLAIM_LEASE_SECONDS",
     "DEFAULT_CLAIM_BATCH_SIZE",
+    "DEFAULT_CLAIM_LEASE_SECONDS",
+    "DEFAULT_CLAIM_STRATEGY",
+    "VALID_CLAIM_STRATEGIES",
     "AdvisoryLockingStore",
     "Claim",
     "ClaimingStore",

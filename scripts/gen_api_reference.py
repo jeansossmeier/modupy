@@ -42,7 +42,16 @@ SECTIONS: list[tuple[str, str, list[str]]] = [
     (
         "Application API",
         "The everyday surface — the names most applications import.",
-        ["event", "listener", "publish", "publish_sync", "configure", "bootstrap", "externalized"],
+        [
+            "event",
+            "listener",
+            "publish",
+            "publish_sync",
+            "PublishSyncTimeout",
+            "configure",
+            "bootstrap",
+            "externalized",
+        ],
     ),
     (
         "Manifests",
@@ -98,6 +107,24 @@ def _anchor(text: str) -> str:
     return slug.replace(" ", "-")
 
 
+def _unique_anchor(text: str, seen: dict[str, int]) -> str:
+    """Anchor slug disambiguated against every anchor already emitted.
+
+    Two DIFFERENT headings can render to the SAME slug — e.g. the
+    "Configuration" section and the "Configuration" class nested inside it.
+    GitHub itself resolves this by document order: the first heading with a
+    given slug keeps it bare, every later one gets it suffixed "-1", "-2",
+    etc. ``seen`` must be threaded through calls in the exact order headings
+    appear in the rendered document, or the computed anchor won't match the
+    one GitHub actually assigns — silently linking a TOC entry to the wrong
+    heading.
+    """
+    base = _anchor(text)
+    count = seen.get(base, 0)
+    seen[base] = count + 1
+    return base if count == 0 else f"{base}-{count}"
+
+
 def _docstring(obj: Any) -> str:
     """Cleaned docstring (dedented, trailing blanks stripped) or a placeholder."""
     doc = inspect.getdoc(obj)
@@ -119,10 +146,12 @@ def _annotation_str(annotation: Any) -> str:
 
 
 def _format_param(param: inspect.Parameter) -> str:
-    prefix = {
-        inspect.Parameter.VAR_POSITIONAL: "*",
-        inspect.Parameter.VAR_KEYWORD: "**",
-    }.get(param.kind, "")
+    if param.kind == inspect.Parameter.VAR_POSITIONAL:
+        prefix = "*"
+    elif param.kind == inspect.Parameter.VAR_KEYWORD:
+        prefix = "**"
+    else:
+        prefix = ""
     token = prefix + param.name
     if param.annotation is not inspect.Parameter.empty:
         token += f": {_annotation_str(param.annotation)}"
@@ -171,11 +200,12 @@ def _signature(obj: Callable[..., Any]) -> str:
 
 def _render_function(name: str, obj: Callable[..., Any]) -> list[str]:
     sig = _signature(obj)
+    keyword = "async def " if inspect.iscoroutinefunction(obj) else "def "
     return [
         f"### `{name}`",
         "",
         "```python",
-        f"{name}{sig}",
+        f"{keyword}{name}{sig}:",
         "```",
         "",
         _docstring(obj),
@@ -213,7 +243,7 @@ def _render_dataclass(name: str, obj: type) -> list[str]:
         annotation = f.type if isinstance(f.type, str) else getattr(f.type, "__name__", str(f.type))
         if f.default is not dataclasses.MISSING:
             lines.append(f"- `{f.name}: {annotation}` = `{f.default!r}`")
-        elif f.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
+        elif f.default_factory is not dataclasses.MISSING:
             lines.append(f"- `{f.name}: {annotation}` (default factory)")
         else:
             lines.append(f"- `{f.name}: {annotation}` (required)")
@@ -229,8 +259,8 @@ def _render_methods_block(obj: type) -> list[str]:
     lines = ["**Methods:**", ""]
     for method_name, method in methods:
         sig = _signature(method)
-        prefix = "async " if inspect.iscoroutinefunction(method) else ""
-        lines.append(f"- `{prefix}{method_name}{sig}`")
+        prefix = "async def " if inspect.iscoroutinefunction(method) else "def "
+        lines.append(f"- `{prefix}{method_name}{sig}:`")
         doc = inspect.getdoc(method)
         if doc:
             first = doc.strip().splitlines()[0]
@@ -313,10 +343,11 @@ def render_api_reference() -> str:
         "## Contents",
         "",
     ]
+    seen_anchors: dict[str, int] = {}
     for title, _, names in SECTIONS:
-        lines.append(f"- [{title}](#{_anchor(title)})")
+        lines.append(f"- [{title}](#{_unique_anchor(title, seen_anchors)})")
         for name in names:
-            lines.append(f"  - [`{name}`](#{_anchor(name)})")
+            lines.append(f"  - [`{name}`](#{_unique_anchor(name, seen_anchors)})")
     lines.append("")
 
     for title, blurb, names in SECTIONS:

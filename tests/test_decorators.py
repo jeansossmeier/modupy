@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import pytest
 
 from modulith import event, listener
+from modulith.manifest import Manifest, verify_manifest
 from modulith.runtime import _runtime
 
 
@@ -68,6 +69,26 @@ def test_listener_accepts_async_function() -> None:
         pass
 
     assert _runtime._pending_listeners or _runtime._event_bus is not None
+    registered = _runtime._pending_listeners[0][1]
+    assert registered.__modulith_broker_targets__ == ()
+
+
+def test_listener_accepts_parameterized_broker_targets() -> None:
+    @listener(
+        broker_targets=[
+            "redis-streams:orders",
+            "amqp:events:orders",
+        ]
+    )
+    async def handler(evt: E) -> None:
+        pass
+
+    registered = _runtime._pending_listeners[0][1]
+    assert registered is handler
+    assert registered.__modulith_broker_targets__ == (
+        "redis-streams:orders",
+        "amqp:events:orders",
+    )
 
 
 def test_listener_accepts_wrapped_async_function() -> None:
@@ -146,6 +167,70 @@ def test_listener_accepts_wrapped_sync_function() -> None:
     # Must not raise — sync listeners are now accepted.
     result = listener(naive_wrap(sync_target))
     assert callable(result)
+
+
+@pytest.mark.asyncio
+async def test_sync_wrapper_around_async_listener_registers_async_adapter() -> None:
+    received: list[E] = []
+
+    def sync_wrap(f):
+        @functools.wraps(f)
+        def wrapped(*args, **kwargs):
+            return f(*args, **kwargs)
+
+        return wrapped
+
+    @listener(broker_targets=("redis-streams:orders",))
+    @sync_wrap
+    async def handler(evt: E) -> None:
+        received.append(evt)
+
+    registered = _runtime._pending_listeners[0][1]
+    assert not inspect.iscoroutinefunction(handler)
+    assert inspect.iscoroutinefunction(registered)
+    assert registered.__modulith_broker_targets__ == ("redis-streams:orders",)
+
+    event_instance = E()
+    await registered(event_instance)
+    assert received == [event_instance]
+
+
+def test_sync_wrapper_around_async_listener_preserves_manifest_identity() -> None:
+    def sync_wrap(f):
+        @functools.wraps(f)
+        def wrapped(*args, **kwargs):
+            return f(*args, **kwargs)
+
+        return wrapped
+
+    @listener
+    @sync_wrap
+    async def handler(evt: E) -> None:
+        pass
+
+    registered = _runtime._pending_listeners[0][1]
+    manifest = Manifest(package="not.importable", listeners=(handler,))
+
+    assert verify_manifest(manifest, {registered}) == []
+
+
+@pytest.mark.parametrize(
+    "broker_targets",
+    [
+        "redis-streams:orders",
+        ("",),
+        ("redis-streams",),
+        (":orders",),
+        ("redis-streams:",),
+        (1,),
+    ],
+)
+def test_listener_rejects_invalid_broker_targets(broker_targets: object) -> None:
+    with pytest.raises(TypeError, match="broker_targets"):
+
+        @listener(broker_targets=broker_targets)  # type: ignore[arg-type]
+        async def handler(evt: E) -> None:
+            pass
 
 
 # ---------------------------------------------------------------------------

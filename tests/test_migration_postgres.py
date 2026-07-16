@@ -27,10 +27,15 @@ pytestmark = [pytest.mark.integration]
 
 MIGRATIONS = Path(adapters_pkg.__file__).parent / "migrations"
 _TABLES = ("event_publications", "event_publications_archive")
-# 0002's database-broker tables. Listed here so the fixture drops them too —
+# Database-broker tables. Listed here so the fixture drops them too —
 # otherwise the first `upgrade head` leaves them behind and every subsequent
 # one fails re-creating an already-existing table (alembic_version is dropped).
-_BROKER_TABLES = ("broker_message", "broker_subscription")
+_BROKER_TABLES = (
+    "broker_retained_delivery",
+    "broker_retained_message",
+    "broker_message",
+    "broker_subscription",
+)
 
 
 def _sync_url(async_url: str) -> str:
@@ -98,8 +103,7 @@ def test_migration_columns_match_orm_on_real_postgres(clean_pg) -> None:
 
 
 def test_alembic_upgrade_head_creates_broker_schema_on_real_postgres(clean_pg) -> None:
-    """0002 applies cleanly to Postgres over 0001 (the real multi-revision
-    chain) and creates the broker tables plus their claim/prune/target indexes."""
+    """The full chain creates queue and retained-replay tables plus indexes."""
     url, engine = clean_pg
     command.upgrade(_cfg(url), "head")
 
@@ -107,20 +111,30 @@ def test_alembic_upgrade_head_creates_broker_schema_on_real_postgres(clean_pg) -
     tables = set(insp.get_table_names())
     assert "broker_subscription" in tables
     assert "broker_message" in tables
+    assert "broker_retained_message" in tables
+    assert "broker_retained_delivery" in tables
     indexes = {ix["name"] for ix in insp.get_indexes("broker_message")}
     assert "ix_broker_message_claim" in indexes
     assert "ix_broker_message_prune" in indexes
     assert "ix_broker_message_target" in indexes
+    retained_indexes = {ix["name"] for ix in insp.get_indexes("broker_retained_message")}
+    assert "ix_broker_retained_message_expiry" in retained_indexes
+    assert "ix_broker_retained_message_target_expiry" in retained_indexes
 
 
 def test_broker_migration_column_metadata_matches_schema_on_real_postgres(clean_pg) -> None:
-    """Broker-side twin of the outbox drift guard: the 0002 migration renders
+    """Broker-side twin of the outbox drift guard: the migrations render
     the same Postgres schema (type/nullable/default) as db_broker.broker_schema()
     — inspector to inspector through pg_catalog, no hand-rolled normalization."""
     from modulith.adapters.db_broker import broker_schema
 
     url, engine = clean_pg
-    tables = ["broker_subscription", "broker_message"]
+    tables = [
+        "broker_subscription",
+        "broker_message",
+        "broker_retained_message",
+        "broker_retained_delivery",
+    ]
 
     def snapshot() -> dict[str, dict[str, tuple[str, bool, object]]]:
         insp = inspect(engine)
@@ -155,6 +169,8 @@ def test_alembic_downgrade_base_on_real_postgres(clean_pg) -> None:
     assert _TABLES[1] not in tables
     assert "broker_subscription" not in tables
     assert "broker_message" not in tables
+    assert "broker_retained_message" not in tables
+    assert "broker_retained_delivery" not in tables
 
 
 def test_migration_column_metadata_matches_orm_on_real_postgres(clean_pg) -> None:

@@ -21,6 +21,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from ._claims import VALID_CLAIM_STRATEGIES
+
 
 class ConfigurationError(Exception):
     """Raised when configuration is invalid.
@@ -36,6 +38,8 @@ class ConfigurationError(Exception):
 # so the error message can say "not yet implemented" instead of the generic
 # "invalid topology", but resolution rejects it (see _validate).
 _VALID_TOPOLOGIES = ("single", "processes", "subinterpreters")
+_VALID_SUBSCRIPTION_SOURCES = ("manifest", "config", "listener")
+_VALID_ACTUATOR_MODES = ("auto", "token", "open", "disabled")
 
 
 @dataclass(frozen=True)
@@ -66,6 +70,12 @@ class Configuration:
     # topology == "single"; other values name an adapter.
     broker: str = "memory"
 
+    # Source used to resolve cross-process listener subscriptions.
+    subscription_source: str = "manifest"
+
+    # Access policy for the optional actuator endpoints.
+    actuator_mode: str = "auto"
+
     # Whether to walk subpackages on bootstrap to discover modules.
     # Disable only if you want to register modules programmatically.
     auto_discover: bool = True
@@ -83,6 +93,7 @@ class Configuration:
     # selected broker adapter's registration hook; env vars still override.
     broker_options: dict[str, Any] = field(default_factory=dict)
     workers: dict[str, int] = field(default_factory=dict)
+    subscriptions: dict[str, list[str]] = field(default_factory=dict)
 
     # None = auto-detect from installed packages. True/False = force.
     observability: bool | None = None
@@ -122,7 +133,7 @@ def load_configuration(**overrides: Any) -> Configuration:
 # Configuration fields that hold tables of options rather than scalars.
 # They have no MODULITH_* env var (see _read_env_vars) and get a dedicated
 # type check in _validate.
-_DICT_FIELDS = frozenset({"outbox_options", "broker_options", "workers"})
+_DICT_FIELDS = frozenset({"outbox_options", "broker_options", "workers", "subscriptions"})
 
 # Mapping of subtable name -> Configuration dict-field name. The canonical
 # spellings are the field names themselves; "broker" is kept as an alias for
@@ -135,6 +146,7 @@ _SUBTABLE_FIELD = {
     "broker": "broker_options",
     "broker_options": "broker_options",
     "workers": "workers",
+    "subscriptions": "subscriptions",
 }
 
 # Subtables reserved for future modulith versions. These are the ONLY
@@ -149,12 +161,13 @@ def _read_pyproject() -> dict[str, Any]:
     The documented pyproject.toml convention uses subtables for compound
     options (``[tool.modulith.outbox_options]`` for outbox tuning,
     ``[tool.modulith.broker_options]`` for broker connection settings,
-    ``[tool.modulith.workers]`` for per-module worker counts). TOML parses
-    these as nested dicts under the ``modulith`` key. We separate scalar
-    keys (which map directly to Configuration fields) from subtables
-    (which map to dict-typed Configuration fields like outbox_options,
-    broker_options and workers) so users can write idiomatic TOML without
-    hitting the "unknown config key" guard.
+    ``[tool.modulith.workers]`` for per-module worker counts, and
+    ``[tool.modulith.subscriptions]`` for broker targets). TOML parses these
+    as nested dicts under the ``modulith`` key. We separate scalar keys (which
+    map directly to Configuration fields) from subtables (which map to
+    dict-typed fields like outbox_options, broker_options, workers, and
+    subscriptions) so users can write idiomatic TOML without hitting the
+    "unknown config key" guard.
 
     Loud-error contract (user decision, W2):
       * A pyproject.toml that fails to parse — including the duplicate-key
@@ -196,7 +209,14 @@ def _read_pyproject() -> dict[str, Any]:
             "production = true."
         ) from exc
 
-    raw = data.get("tool", {}).get("modulith", {})
+    tool = data.get("tool", {})
+    if not isinstance(tool, dict):
+        raise ConfigurationError(f"[tool] must be a table, got {type(tool).__name__}: {tool!r}")
+    raw = tool.get("modulith", {})
+    if not isinstance(raw, dict):
+        raise ConfigurationError(
+            f"[tool.modulith] must be a table, got {type(raw).__name__}: {raw!r}"
+        )
     if not raw:
         return {}
 
@@ -260,6 +280,13 @@ def _resolve_subtable(key: str, *, already_mapped: set[str]) -> str | None:
             f"Unknown config subtable [tool.modulith.{key}] — did you mean "
             f"[tool.modulith.{close[0]}]? Known subtables: {candidates}"
         )
+
+    close_scalar = difflib.get_close_matches(key, sorted(scalar_fields), n=1)
+    if close_scalar:
+        raise ConfigurationError(
+            f"Unknown config subtable [tool.modulith.{key}] — did you mean the "
+            f"scalar option {close_scalar[0]!r} under [tool.modulith]?"
+        )
     return None
 
 
@@ -276,6 +303,14 @@ def _find_pyproject() -> Path | None:
 # Accepted spellings for boolean env vars (case-insensitive, stripped).
 _ENV_TRUE = ("1", "true", "yes")
 _ENV_FALSE = ("0", "false", "no")
+
+
+def _is_broker_target(value: object) -> bool:
+    """Return whether value is a non-empty ``scheme:destination`` string."""
+    if type(value) is not str:
+        return False
+    scheme, separator, destination = value.partition(":")
+    return bool(separator and scheme.strip() and destination.strip())
 
 
 def _env_str(name: str) -> str | None:
@@ -328,8 +363,8 @@ def _read_env_vars() -> dict[str, Any]:
     unset (see _env_str). Booleans are parsed strictly: 1/true/yes and
     0/false/no (case-insensitive, stripped); any other non-empty value
     raises ConfigurationError (see _env_bool). The dict-typed fields
-    (outbox_options, broker_options, workers) have no env var — they come
-    from the [tool.modulith.*] subtables in pyproject.toml.
+    (outbox_options, broker_options, workers, subscriptions) have no env
+    var — they come from the [tool.modulith.*] subtables in pyproject.toml.
     """
     result: dict[str, Any] = {}
     string_vars = (
@@ -338,6 +373,8 @@ def _read_env_vars() -> dict[str, Any]:
         ("MODULITH_OUTBOX", "outbox"),
         ("MODULITH_TOPOLOGY", "topology"),
         ("MODULITH_BROKER", "broker"),
+        ("MODULITH_SUBSCRIPTION_SOURCE", "subscription_source"),
+        ("MODULITH_ACTUATOR_MODE", "actuator_mode"),
     )
     for env_name, field_name in string_vars:
         if (val := _env_str(env_name)) is not None:
@@ -354,15 +391,91 @@ def _read_env_vars() -> dict[str, Any]:
     return result
 
 
+def _validate_outbox_options(options: dict[str, Any]) -> None:
+    """Validate the Task-4 claim-strategy keys of [tool.modulith.outbox_options]
+    when present. Other keys in that table are intentionally NOT validated
+    here — outbox_options is a forward-compatible passthrough (see
+    _read_pyproject); only these three have runtime behavior gated on them
+    (the outbox claim abstraction in modulith/_claims.py).
+    """
+    if "claim_strategy" in options and options["claim_strategy"] not in VALID_CLAIM_STRATEGIES:
+        raise ConfigurationError(
+            "outbox_options.claim_strategy must be one of "
+            f"{VALID_CLAIM_STRATEGIES}, got {options['claim_strategy']!r}"
+        )
+    if "claim_lease_seconds" in options:
+        value = options["claim_lease_seconds"]
+        # bool is an int subclass; isinstance(True, (int, float)) is True, so
+        # it must be excluded explicitly or `claim_lease_seconds = true` would
+        # silently pass as 1.0.
+        valid = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if not valid or not (0 < value < float("inf")):
+            raise ConfigurationError(
+                "outbox_options.claim_lease_seconds must be a finite number "
+                f"greater than 0, got {value!r}"
+            )
+    if "claim_batch_size" in options:
+        value = options["claim_batch_size"]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ConfigurationError(
+                f"outbox_options.claim_batch_size must be a positive integer, got {value!r}"
+            )
+
+
+def _validate_redis_broker_options(options: dict[str, Any]) -> None:
+    """Reject Redis settings that would disable delivery safety guarantees."""
+    for name in (
+        "max_stream_len",
+        "dlq_max_stream_len",
+        "poll_block_ms",
+        "reclaim_min_idle_ms",
+        "max_delivery_attempts",
+    ):
+        if name not in options:
+            continue
+        value = options[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ConfigurationError(
+                f"broker_options.{name} must be a positive integer, got {value!r}"
+            )
+
+
 def _validate(data: dict[str, Any]) -> None:
     """Validate config values, raising ConfigurationError with guidance."""
     # Catch typos — unknown keys would silently fail otherwise.
     known = {f.name for f in fields(Configuration)} - {"explicit_keys"}
     unknown = set(data.keys()) - known
     if unknown:
+        suggestions = []
+        for key in sorted(unknown):
+            close = difflib.get_close_matches(key, sorted(known), n=1)
+            if close:
+                suggestions.append(f"{key!r} -> {close[0]!r}")
+        guidance = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
         raise ConfigurationError(
-            f"Unknown config keys: {sorted(unknown)}. Valid keys: {sorted(known)}"
+            f"Unknown config keys: {sorted(unknown)}. Valid keys: {sorted(known)}.{guidance}"
         )
+
+    scalar_types: dict[str, tuple[type, ...]] = {
+        "package": (str, type(None)),
+        "contracts_module": (str,),
+        "outbox": (str,),
+        "topology": (str,),
+        "broker": (str,),
+        "subscription_source": (str,),
+        "actuator_mode": (str,),
+        "auto_discover": (bool,),
+        "production": (bool,),
+        "observability": (bool, type(None)),
+        "verify_manifests": (bool,),
+    }
+    for field_name, expected_types in scalar_types.items():
+        if field_name in data and type(data[field_name]) not in expected_types:
+            expected = " or ".join(expected_type.__name__ for expected_type in expected_types)
+            raise ConfigurationError(
+                f"{field_name} must be {expected}, got "
+                f"{type(data[field_name]).__name__}: {data[field_name]!r}"
+            )
 
     # Dict-typed fields must actually be tables. A scalar here is a natural
     # typo (forgetting the [tool.modulith.outbox_options] table header) that
@@ -376,11 +489,57 @@ def _validate(data: dict[str, Any]) -> None:
                 f"{type(data[dict_field]).__name__}: {data[dict_field]!r}"
             )
 
+    outbox_options = data.get("outbox_options")
+    if outbox_options is not None:
+        _validate_outbox_options(outbox_options)
+
+    broker_options = data.get("broker_options")
+    if data.get("broker", "memory") == "redis-streams" and broker_options is not None:
+        _validate_redis_broker_options(broker_options)
+
+    workers = data.get("workers")
+    if workers is not None:
+        for module_name, count in workers.items():
+            if type(module_name) is not str or type(count) is not int or count <= 0:
+                raise ConfigurationError(
+                    "workers must map string module names to positive integer "
+                    f"counts; got {module_name!r}: {count!r}"
+                )
+
+    subscriptions = data.get("subscriptions")
+    if subscriptions is not None:
+        for module_name, targets in subscriptions.items():
+            if type(module_name) is not str or type(targets) is not list:
+                raise ConfigurationError(
+                    "subscriptions must map string module names to lists of "
+                    f"broker targets; got {module_name!r}: {targets!r}"
+                )
+            if any(not _is_broker_target(target) for target in targets):
+                raise ConfigurationError(
+                    "subscriptions targets must be non-empty "
+                    f"'scheme:destination' strings; got {module_name!r}: {targets!r}"
+                )
+
     # Topology must be one of the known modes.
     if "topology" in data and data["topology"] not in _VALID_TOPOLOGIES:
         raise ConfigurationError(
             f"invalid topology {data['topology']!r}; "
             f"expected one of: {', '.join(_VALID_TOPOLOGIES)}"
+        )
+
+    if (
+        "subscription_source" in data
+        and data["subscription_source"] not in _VALID_SUBSCRIPTION_SOURCES
+    ):
+        raise ConfigurationError(
+            f"invalid subscription_source {data['subscription_source']!r}; "
+            f"expected one of: {', '.join(_VALID_SUBSCRIPTION_SOURCES)}"
+        )
+
+    if "actuator_mode" in data and data["actuator_mode"] not in _VALID_ACTUATOR_MODES:
+        raise ConfigurationError(
+            f"invalid actuator_mode {data['actuator_mode']!r}; "
+            f"expected one of: {', '.join(_VALID_ACTUATOR_MODES)}"
         )
 
     # Cross-field: a multi-process topology needs a real cross-process broker.
