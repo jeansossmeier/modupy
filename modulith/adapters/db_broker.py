@@ -22,7 +22,9 @@ for Postgres.
 
 Configuration resolves ``MODULITH_BROKER_<KEY>`` env var (blank == unset) >
 ``[tool.modulith.broker_options]`` subtable, per key:
-  url / dsn                   SQLAlchemy URL (required — no universal default)
+  url / dsn                   SQLAlchemy URL (absent -> embedded SQLite file
+                               '.modulith-broker.db' in the process cwd, with
+                               a startup warning)
   completion_mode             'delete' (default, keeps the table small) |
                                'mark' (sets status='done', row stays for the
                                prune job)
@@ -30,26 +32,31 @@ Configuration resolves ``MODULITH_BROKER_<KEY>`` env var (blank == unset) >
                                for SQLite, whose pool rejects them)
   busy_timeout_ms             SQLite only: how long a blocked writer waits for
                                the lock before SQLITE_BUSY (default 5000)
+  sqlite_synchronous          SQLite only: PRAGMA synchronous mode (default
+                               NORMAL — the WAL pairing; set FULL for
+                               power-loss durability at ~2.5ms/commit fsync)
   no_subscriber_policy        'error' (default) | 'wait' | 'store'
   no_subscriber_wait_*        wait timeout (30s) and poll interval (100ms)
   orphan_replay_policy        'ttl_all_groups' (default) | 'first_groups' |
                                'expected_groups'
   orphan_retention_seconds    retained-source lifetime (default 86400s)
   expected_consumer_groups    target -> non-empty group list for expected mode
-  poll_interval_ms            consumer poll cadence (default 1000)
-  batch_size                  claim LIMIT per poll (default 10)
+  poll_interval_ms            consumer poll cadence when idle (default 20)
+  batch_size                  claim LIMIT per poll (default 100)
+  dispatch_concurrency        rows dispatched concurrently per claimed batch
+                               (default 10; 1 = sequential)
   reclaim_stale_seconds       a row claimed but not ack'd/failed within this many
                                seconds is treated as orphaned (crashed consumer)
                                and reclaimed by the next claim (default 60)
   max_delivery_attempts       a message that fails to dispatch this many times is
                                dead-lettered instead of retried forever (default 5)
   retention_age_seconds       prune deletes terminal ('done'/'dead') rows older
-                               than this many seconds
+                               than this many seconds (default 259200 = 3 days,
+                               so dead letters cannot grow unboundedly)
   retention_count             prune keeps only the newest N terminal rows per
                                (target, consumer_group)
   prune_interval_seconds      how often the consumer's background prune runs
-                               (defaults to 300s when either retention_* is set;
-                               set to 0 to disable)
+                               (default 300s; set to 0 to disable pruning)
 
 Postgres LISTEN/NOTIFY (a low-latency alternative to polling) is a planned
 opt-in and not yet implemented — the transport polls on every dialect.
@@ -102,6 +109,13 @@ the next claim reclaims it once ``claimed_at`` is older than the reclaim
 window (``_DEFAULT_RECLAIM_STALE_S``, default 60s), the DB analogue of the
 Redis adapter's XAUTOCLAIM reclaim — this is what keeps delivery at-least-once
 across a consumer crash.
+
+While a claimed batch is in flight, its owner re-stamps ``claimed_at`` every
+``reclaim_stale_seconds / 3`` (``renew_claims``, owner-guarded — the same
+one-third-lease cadence as the outbox claim renewal), so a batch whose total
+dispatch time exceeds the reclaim window is never reclaimed and
+double-dispatched mid-flight. Renewal stops the moment the process dies,
+which restores the crash-reclaim guarantee above.
 """
 
 from __future__ import annotations
@@ -112,8 +126,10 @@ import json
 import logging
 import math
 import os
+import random
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -126,6 +142,7 @@ from modulith import (
     hookimpl,
 )
 
+from ..config import DEFAULT_BROKER_DB_FILENAME
 from ..protocols import ConsumerHealth
 
 logger = logging.getLogger("modulith.adapters.db")
@@ -135,8 +152,9 @@ _DEFAULT_COMPLETION_MODE = "delete"
 # Valid completion modes: 'delete' removes the row on ack (small table);
 # 'mark' keeps it as 'done' for the prune job. Validated in DatabaseBroker.
 _COMPLETION_MODES = frozenset({"delete", "mark"})
-_DEFAULT_BATCH_SIZE = 10
-_DEFAULT_POLL_INTERVAL_S = 1.0
+_DEFAULT_BATCH_SIZE = 100
+_DEFAULT_DISPATCH_CONCURRENCY = 10
+_DEFAULT_POLL_INTERVAL_S = 0.02
 _DEFAULT_NO_SUBSCRIBER_POLICY = "error"
 _DEFAULT_NO_SUBSCRIBER_WAIT_TIMEOUT_S = 30.0
 _DEFAULT_NO_SUBSCRIBER_WAIT_POLL_INTERVAL_S = 0.1
@@ -144,6 +162,14 @@ _NO_SUBSCRIBER_POLICIES = frozenset({"error", "store", "wait"})
 _DEFAULT_ORPHAN_REPLAY_POLICY = "ttl_all_groups"
 _ORPHAN_REPLAY_POLICIES = frozenset({"ttl_all_groups", "first_groups", "expected_groups"})
 _DEFAULT_ORPHAN_RETENTION_S = 86400.0
+
+# Default terminal-row retention applied by the consumer factory when
+# ``retention_age_seconds`` is not configured: dead-lettered rows (and 'done'
+# rows in mark mode) are pruned after 3 days. Long enough to notice and
+# inspect a Friday-night poison message on Monday; short enough that a
+# chronic poison producer cannot grow the table unboundedly. Disable the
+# background prune entirely with ``prune_interval_seconds = 0``.
+_DEFAULT_RETENTION_AGE_S = 3 * 86400.0
 
 # How often the consumer's background prune runs when retention is configured
 # but ``prune_interval_seconds`` was not set explicitly. Deliberately coarse:
@@ -204,7 +230,17 @@ _DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 5000
 # SQLITE_BUSY *immediately* (ignoring busy_timeout) when a transaction upgrades
 # a read lock to a write lock under contention — exactly what claim_batch's
 # SELECT-then-UPDATE does — so a bounded application retry is still needed.
-_SQLITE_BUSY_MAX_RETRIES = 4
+# 8 attempts x _sqlite_busy_delay (geometric 2ms..50ms) ~= a 170ms total
+# budget: enough to ride out a 100-row claim commit or a prune sweep holding
+# the write lock, without the old 350ms+ of outage-scale sleeps.
+_SQLITE_BUSY_MAX_RETRIES = 8
+
+# Liveness backstop for the claim-renewal heartbeat: a wedged-but-alive
+# listener must not pin its claimed rows forever. After this many reclaim
+# windows of continuous renewal the heartbeat stops (with an ERROR log) so
+# the ordinary stale-claim reclaim reasserts at-least-once delivery; the
+# owner-guards turn any later ack/fail from the wedged worker into no-ops.
+_MAX_LEASE_EXTENSION_FACTOR = 10.0
 
 # MySQL named locks are connection-scoped, so the implementation holds them
 # until the replay transaction commits and then releases them explicitly.
@@ -313,6 +349,25 @@ def _backoff_delay(attempt: int) -> float:
     return min(_BACKOFF_BASE_S * (2.0**exponent), _BACKOFF_CAP_S)
 
 
+def _sqlite_busy_delay(attempt: int) -> float:
+    """Sleep before retrying a SQLITE_BUSY write: geometric from 2ms, capped
+    at 50ms, plus 0-3ms jitter.
+
+    Deliberately NOT ``_backoff_delay``: that scale (50ms..5s) is sized for
+    backend outages, while a busy collision on a local SQLite file usually
+    clears in single-digit milliseconds. Sleeping 50ms+ per collision was
+    measured to push steady-state delivery p50 from ~20ms to ~200ms under
+    concurrent publish + claim traffic (the claim's read->write lock upgrade
+    raises SQLITE_BUSY immediately, so collisions are routine, not
+    exceptional). Early attempts stay in the 2-11ms range for the common
+    fast-clear case; the geometric growth (capped at 50ms) restores a ~170ms
+    total budget across ``_SQLITE_BUSY_MAX_RETRIES`` for a writer holding the
+    lock longer — a 100-row claim commit or a prune sweep. Jitter
+    decorrelates the colliding writers.
+    """
+    return min(0.002 * (2.0 ** (attempt - 1)), 0.05) + random.uniform(0.0, 0.003)
+
+
 def _owned(message: Any, row_id: str, consumer_name: str) -> tuple[Any, ...]:
     """WHERE predicate identifying a row THIS consumer currently owns:
     matching id AND still 'claimed' AND still claimed by ``consumer_name``.
@@ -417,8 +472,12 @@ def _is_sqlite_memory_url(url: str) -> bool:
     )
 
 
-def _install_sqlite_pragmas(engine: Any, busy_timeout_ms: int) -> None:
-    """Set WAL + ``busy_timeout`` on every new SQLite connection.
+_SQLITE_SYNCHRONOUS_MODES = frozenset({"OFF", "NORMAL", "FULL", "EXTRA"})
+_DEFAULT_SQLITE_SYNCHRONOUS = "NORMAL"
+
+
+def _install_sqlite_pragmas(engine: Any, busy_timeout_ms: int, synchronous: str) -> None:
+    """Set WAL + ``busy_timeout`` + ``synchronous`` on every new SQLite connection.
 
     WAL lets one writer and concurrent readers coexist (a plain rollback
     journal serializes them); ``busy_timeout`` makes a blocked writer wait
@@ -428,19 +487,35 @@ def _install_sqlite_pragmas(engine: Any, busy_timeout_ms: int) -> None:
     'connect' event — the documented way to run PRAGMAs on an aiosqlite async
     engine (the event fires with the raw DBAPI connection, whose cursor runs
     synchronously by bridging to aiosqlite's connection thread).
+
+    ``synchronous`` defaults to NORMAL — the canonical WAL pairing: commits
+    skip the per-commit fsync (measured ~2.6ms each on the delivery path's
+    three commits: publish, claim, ack), fsyncing only at WAL checkpoints.
+    An application/process crash loses nothing (the WAL survives); only an
+    OS crash or power loss can drop the last commits. Deployments that need
+    power-loss durability set ``broker_options.sqlite_synchronous = "FULL"``.
     """
     from sqlalchemy import event
 
     timeout = int(busy_timeout_ms)
+    sync_mode = synchronous.upper()
+    if sync_mode not in _SQLITE_SYNCHRONOUS_MODES:
+        raise ConfigurationError(
+            f"sqlite_synchronous must be one of {sorted(_SQLITE_SYNCHRONOUS_MODES)}, "
+            f"got {synchronous!r} (broker_options sqlite_synchronous / "
+            "MODULITH_BROKER_SQLITE_SYNCHRONOUS)"
+        )
 
     @event.listens_for(engine.sync_engine, "connect")
     def _set_sqlite_pragmas(dbapi_connection: Any, _record: Any) -> None:
         cursor = dbapi_connection.cursor()
         try:
             cursor.execute("PRAGMA journal_mode=WAL")
-            # ``timeout`` is an int -> safe to interpolate (PRAGMA takes no bind
-            # params); never a user string.
+            # ``timeout`` is an int and ``sync_mode`` is vetted against the
+            # frozen set above -> safe to interpolate (PRAGMA takes no bind
+            # params); never a raw user string.
             cursor.execute(f"PRAGMA busy_timeout={timeout}")
+            cursor.execute(f"PRAGMA synchronous={sync_mode}")
         finally:
             cursor.close()
 
@@ -485,7 +560,11 @@ def _create_engine(url: str, opts: dict[str, Any]) -> Any:
             _opt_int(_broker_opt(opts, "busy_timeout_ms", "BUSY_TIMEOUT_MS"))
             or _DEFAULT_SQLITE_BUSY_TIMEOUT_MS
         )
-        _install_sqlite_pragmas(engine, busy_timeout_ms)
+        synchronous = _option_or_default(
+            _broker_opt(opts, "sqlite_synchronous", "SQLITE_SYNCHRONOUS"),
+            _DEFAULT_SQLITE_SYNCHRONOUS,
+        )
+        _install_sqlite_pragmas(engine, busy_timeout_ms, str(synchronous))
     return engine
 
 
@@ -798,7 +877,7 @@ class DatabaseBroker:
                     attempt,
                     _SQLITE_BUSY_MAX_RETRIES,
                 )
-                await asyncio.sleep(_backoff_delay(attempt))
+                await asyncio.sleep(_sqlite_busy_delay(attempt))
 
     async def _write_target_locked(
         self,
@@ -1289,6 +1368,40 @@ class DatabaseBroker:
         rows: list[dict[str, Any]] = await self._write(op)
         return rows
 
+    async def renew_claims(self, row_ids: list[str], *, consumer_name: str) -> int:
+        """Re-stamp ``claimed_at`` = server-now for rows THIS consumer still owns.
+
+        The consumer's in-flight heartbeat: called every
+        ``reclaim_stale_seconds / 3`` while a claimed batch dispatches, so rows
+        waiting behind slow listeners (or the concurrency gate) are never
+        reclaimed by a peer mid-dispatch — batch size stays decoupled from the
+        reclaim window. Owner-guarded like ``ack``/``fail``: rows already
+        reclaimed by a peer are skipped, and the returned count tells the
+        caller how many rows are still theirs. Renewal stops when the process
+        dies, so crash reclaim is unaffected.
+        """
+        if not row_ids:
+            return 0
+        from sqlalchemy import update
+
+        _, _, message = broker_schema()
+
+        async def op(conn: Any) -> int:
+            now = await self._now(conn)
+            result = await conn.execute(
+                update(message)
+                .where(
+                    message.c.id.in_(row_ids),
+                    message.c.status == "claimed",
+                    message.c.claimed_by == consumer_name,
+                )
+                .values(claimed_at=now)
+            )
+            return int(result.rowcount or 0)
+
+        count: int = await self._write(op)
+        return count
+
     async def ack(self, row_id: str, *, consumer_name: str) -> None:
         """Complete a row THIS consumer still owns: delete it (default) or mark
         it 'done' (mark mode, which keeps the row for the prune job — see
@@ -1488,6 +1601,7 @@ class DatabaseConsumer:
         targets: list[str] | tuple[str, ...],
         poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
         batch_size: int = _DEFAULT_BATCH_SIZE,
+        dispatch_concurrency: int = _DEFAULT_DISPATCH_CONCURRENCY,
         max_attempts: int = _MAX_DELIVERY_ATTEMPTS,
         reclaim_stale_seconds: float = _DEFAULT_RECLAIM_STALE_S,
         prune_interval_s: float | None = None,
@@ -1502,6 +1616,7 @@ class DatabaseConsumer:
         self._targets = list(targets)
         self._poll_interval_s = _positive_finite_float(poll_interval_s, "poll_interval_s")
         self._batch_size = _positive_int(batch_size, "batch_size")
+        self._dispatch_concurrency = _positive_int(dispatch_concurrency, "dispatch_concurrency")
         self._max_attempts = _positive_int(max_attempts, "max_attempts")
         self._reclaim_stale_seconds = _positive_finite_float(
             reclaim_stale_seconds, "reclaim_stale_seconds"
@@ -1678,23 +1793,119 @@ class DatabaseConsumer:
             if not rows:
                 await asyncio.sleep(self._poll_interval_s)
                 continue
-            for row in rows:
-                if self._should_stop():
-                    return
-                try:
-                    await self._dispatch_one(row)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    # Safety net mirroring BrokerConsumer._run: any escaped
-                    # per-row exception must not kill this task permanently.
-                    logger.exception(
-                        "dispatch_one crashed for row %s — loop continues", row.get("id")
-                    )
+            await self._dispatch_batch(rows)
 
     async def _backoff_after_failure(self) -> None:
         self._consecutive_failures += 1
         await asyncio.sleep(_backoff_delay(self._consecutive_failures))
+
+    async def _dispatch_batch(self, rows: list[dict[str, Any]]) -> None:
+        """Dispatch one claimed batch, renewing its claims while in flight.
+
+        Rows fan out through a semaphore bounded by ``dispatch_concurrency``
+        (default 10; configure ``dispatch_concurrency = 1`` for the historical
+        sequential order). A background
+        heartbeat re-stamps ``claimed_at`` for every not-yet-completed row at
+        one third of the reclaim window, so ``batch_size x listener_time`` may
+        exceed ``reclaim_stale_seconds`` without a peer reclaiming (and
+        double-dispatching) the tail of the batch. Per-row exceptions are
+        swallowed per row; cancellation propagates and stops both the row
+        tasks and the heartbeat.
+
+        With ``dispatch_concurrency > 1`` rows in one batch complete in
+        listener-speed order, not ``available_at`` order. Cross-process
+        ordering was never guaranteed (reclaim, competing consumers), so
+        listeners must already tolerate reordering.
+        """
+        in_flight = {cast(str, row["id"]) for row in rows}
+        renewer = asyncio.create_task(self._renew_loop(in_flight))
+        semaphore = asyncio.Semaphore(self._dispatch_concurrency)
+        try:
+            async with asyncio.TaskGroup() as tg:
+                for row in rows:
+                    tg.create_task(self._dispatch_guarded(row, semaphore, in_flight))
+        finally:
+            await self._cancel(renewer, "claim-renewal")
+
+    async def _dispatch_guarded(
+        self,
+        row: dict[str, Any],
+        semaphore: asyncio.Semaphore,
+        in_flight: set[str],
+    ) -> None:
+        """One row through the concurrency gate; never raises (except cancel)."""
+        row_id = cast(str, row["id"])
+        try:
+            async with semaphore:
+                if self._should_stop():
+                    return  # stays claimed; a peer reclaims it after the stale window
+                await self._dispatch_one(row)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Safety net mirroring BrokerConsumer._run: any escaped per-row
+            # exception must not kill the poll task permanently.
+            logger.exception("dispatch_one crashed for row %s — loop continues", row_id)
+        finally:
+            in_flight.discard(row_id)
+
+    async def _renew_loop(self, in_flight: set[str]) -> None:
+        """Heartbeat: extend this batch's claims while any row is in flight.
+
+        A renewal miss (DB hiccup) is logged and retried next tick; if a row
+        truly was reclaimed by a peer, the owner-guards on ack/fail make our
+        late writes no-ops — worst case is one duplicate dispatch, which is
+        the documented at-least-once contract, not a new failure mode.
+
+        Bounded: renewal stops with an ERROR log once the batch has been
+        extended for ``_MAX_LEASE_EXTENSION_FACTOR`` reclaim windows. A
+        wedged-but-alive listener must not pin its rows forever — after the
+        stale window then passes, peers reclaim the rows and this worker's
+        late completions are fenced into no-ops by the owner-guards.
+        """
+        interval = self._reclaim_stale_seconds / 3.0
+        deadline = (
+            asyncio.get_running_loop().time()
+            + self._reclaim_stale_seconds * _MAX_LEASE_EXTENSION_FACTOR
+        )
+        while True:
+            await asyncio.sleep(interval)
+            ids = list(in_flight)
+            if not ids:
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                logger.error(
+                    "claim renewal for group %s exceeded %.0fs with %d row(s) "
+                    "still in flight — a listener appears wedged; stopping "
+                    "renewal so peers can reclaim after the stale window",
+                    self._group,
+                    self._reclaim_stale_seconds * _MAX_LEASE_EXTENSION_FACTOR,
+                    len(ids),
+                )
+                return
+            try:
+                renewed = await self._broker.renew_claims(
+                    ids, consumer_name=self._consumer_name
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "claim renewal failed for group %s — retrying next tick", self._group
+                )
+                continue
+            # Rows acked/failed between the snapshot and the UPDATE commit
+            # legitimately miss the owner-guard (they are no longer 'claimed'),
+            # so only warn about rows we still believe are in flight.
+            still_ours = sum(1 for row_id in ids if row_id in in_flight)
+            if renewed < still_ours:
+                logger.warning(
+                    "renewed %d/%d claims for group %s — %d row(s) reclaimed by a peer",
+                    renewed,
+                    still_ours,
+                    self._group,
+                    still_ours - renewed,
+                )
 
     async def _prune_loop(self) -> None:
         """Background retention sweep: every ``prune_interval_s`` (default
@@ -1820,6 +2031,23 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
 
     opts = cfg.broker_options or {}
     url = _broker_opt(opts, "url", "URL") or _broker_opt(opts, "dsn", "DSN")
+    if not url:
+        from sqlalchemy.engine import URL
+
+        # URL.create escapes URL-special characters (?, #, %) in the cwd —
+        # a plain f-string would silently truncate the database path there.
+        url = str(
+            URL.create(
+                "sqlite+aiosqlite",
+                database=str(Path.cwd() / DEFAULT_BROKER_DB_FILENAME),
+            )
+        )
+        logger.warning(
+            "database broker has no url configured — defaulting to embedded "
+            "SQLite at %s (override with [tool.modulith.broker_options].url "
+            "or MODULITH_BROKER_URL)",
+            url,
+        )
     if cfg.topology == "processes" and isinstance(url, str) and _is_sqlite_memory_url(url):
         raise ConfigurationError(
             "the database broker cannot use in-memory SQLite with "
@@ -1945,7 +2173,8 @@ def _make_db_consumer(spec: ConsumerSpec) -> Consumer:
     scheme), whose consumer-side methods the loop drives. One engine serves
     both halves — no second engine is opened here.
 
-    Consumer-loop cadence (``poll_interval_ms`` / ``batch_size``) and prune
+    Consumer-loop cadence (``poll_interval_ms`` / ``batch_size`` /
+    ``dispatch_concurrency``) and prune
     retention are read from ``[tool.modulith.broker_options]`` (env-overridable
     via ``MODULITH_BROKER_*``) so they are configurable per deployment.
     """
@@ -1956,11 +2185,17 @@ def _make_db_consumer(spec: ConsumerSpec) -> Consumer:
     opts = (cfg.broker_options if cfg is not None else None) or {}
     poll_interval_ms = _opt_float(_broker_opt(opts, "poll_interval_ms", "POLL_INTERVAL_MS"))
     batch_size = _opt_int(_broker_opt(opts, "batch_size", "BATCH_SIZE"))
+    dispatch_concurrency = _opt_int(
+        _broker_opt(opts, "dispatch_concurrency", "DISPATCH_CONCURRENCY")
+    )
     reclaim_stale_seconds = _opt_float(
         _broker_opt(opts, "reclaim_stale_seconds", "RECLAIM_STALE_SECONDS")
     )
     max_delivery_attempts = _opt_int(
         _broker_opt(opts, "max_delivery_attempts", "MAX_DELIVERY_ATTEMPTS")
+    )
+    retention_age_seconds = _opt_float(
+        _broker_opt(opts, "retention_age_seconds", "RETENTION_AGE_SECONDS")
     )
     return DatabaseConsumer(
         broker=broker,
@@ -1973,6 +2208,11 @@ def _make_db_consumer(spec: ConsumerSpec) -> Consumer:
             poll_interval_ms / 1000.0 if poll_interval_ms is not None else _DEFAULT_POLL_INTERVAL_S
         ),
         batch_size=batch_size if batch_size is not None else _DEFAULT_BATCH_SIZE,
+        dispatch_concurrency=(
+            dispatch_concurrency
+            if dispatch_concurrency is not None
+            else _DEFAULT_DISPATCH_CONCURRENCY
+        ),
         reclaim_stale_seconds=(
             reclaim_stale_seconds if reclaim_stale_seconds is not None else _DEFAULT_RECLAIM_STALE_S
         ),
@@ -1982,8 +2222,10 @@ def _make_db_consumer(spec: ConsumerSpec) -> Consumer:
         prune_interval_s=_opt_float(
             _broker_opt(opts, "prune_interval_seconds", "PRUNE_INTERVAL_SECONDS")
         ),
-        retention_age_seconds=_opt_float(
-            _broker_opt(opts, "retention_age_seconds", "RETENTION_AGE_SECONDS")
+        retention_age_seconds=(
+            retention_age_seconds
+            if retention_age_seconds is not None
+            else _DEFAULT_RETENTION_AGE_S
         ),
         retention_count=_opt_int(_broker_opt(opts, "retention_count", "RETENTION_COUNT")),
     )

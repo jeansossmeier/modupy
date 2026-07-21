@@ -620,6 +620,9 @@ def _consumer_with_options(**options: Any) -> DatabaseConsumer:
         ({"batch_size": 0}, "batch_size"),
         ({"batch_size": True}, "batch_size"),
         ({"batch_size": 1.0}, "batch_size"),
+        ({"dispatch_concurrency": 0}, "dispatch_concurrency"),
+        ({"dispatch_concurrency": True}, "dispatch_concurrency"),
+        ({"dispatch_concurrency": 1.0}, "dispatch_concurrency"),
         ({"max_attempts": 0}, "max_attempts"),
         ({"max_attempts": True}, "max_attempts"),
         ({"max_attempts": 1.0}, "max_attempts"),
@@ -644,12 +647,14 @@ def test_consumer_rejects_invalid_numeric_options(
 def test_consumer_accepts_documented_numeric_boundaries() -> None:
     consumer = _consumer_with_options(
         batch_size=1,
+        dispatch_concurrency=1,
         max_attempts=1,
         retention_count=0,
         prune_interval_s=0,
     )
 
     assert consumer._batch_size == 1
+    assert consumer._dispatch_concurrency == 1
     assert consumer._max_attempts == 1
     assert consumer._retention_count == 0
     assert consumer._prune_interval_s == 0
@@ -771,6 +776,213 @@ async def test_claimed_row_not_redelivered_to_second_claim_same_group(engine: An
 
     assert len(first) == 1
     assert second == []  # already claimed — not pending anymore
+
+
+# ---------------------------------------------------------------------------
+# Claim renewal (in-flight heartbeat): batch size decoupled from the reclaim
+# window. Owner-guarded like ack/fail; renewal keeps a slow batch from being
+# reclaimed and double-dispatched by a peer.
+# ---------------------------------------------------------------------------
+
+
+async def test_renew_claims_is_owner_guarded(engine: Any) -> None:
+    """Only the claiming consumer can extend its own claims; a peer's renewal
+    is a no-op (returns 0), exactly like the ack/fail owner-guards."""
+    broker = DatabaseBroker(engine=engine)
+    target = "fakeapp.orders.WidgetCreated"
+    await broker.subscribe([target], "modulith-inventory")
+    await broker.publish(target, b"{}", {"event_type": target})
+
+    rows = await broker.claim_batch("modulith-inventory", batch_size=10, consumer_name="c1")
+    assert len(rows) == 1
+    ids = [rows[0]["id"]]
+
+    assert await broker.renew_claims(ids, consumer_name="c2") == 0  # not the owner
+    assert await broker.renew_claims(ids, consumer_name="c1") == 1  # owner extends
+    assert await broker.renew_claims([], consumer_name="c1") == 0  # empty = no-op
+
+
+async def test_renewed_claim_is_not_reclaimed_by_peer(engine: Any) -> None:
+    """A renewal re-stamps claimed_at to server-now, so a peer claiming with a
+    stale window that WOULD have reclaimed the original claim gets nothing."""
+    broker = DatabaseBroker(engine=engine)
+    target = "fakeapp.orders.WidgetCreated"
+    await broker.subscribe([target], "modulith-inventory")
+    await broker.publish(target, b"{}", {"event_type": target})
+
+    first = await broker.claim_batch(
+        "modulith-inventory", batch_size=10, consumer_name="c1", reclaim_stale_seconds=100.0
+    )
+    assert len(first) == 1
+
+    # Age the claim past the peer's stale window, then renew it. Generous
+    # margins (0.5s slept vs a 0.25s peer window = 2x, and the renewal stamp
+    # only gets FRESHER if the runner stalls) — no upper-bound race.
+    await asyncio.sleep(0.5)
+    assert await broker.renew_claims([first[0]["id"]], consumer_name="c1") == 1
+
+    # The peer's cutoff (now - 0.25s) predates the renewal stamp (~now), so the
+    # row is NOT handed out — without the renewal this claim would win (see
+    # test_orphaned_claim_is_reclaimed_after_visibility_timeout).
+    stolen = await broker.claim_batch(
+        "modulith-inventory", batch_size=10, consumer_name="c2", reclaim_stale_seconds=0.25
+    )
+    assert stolen == []
+
+
+async def test_heartbeat_keeps_slow_batch_from_peer_reclaim(engine: Any) -> None:
+    """End to end through the consumer loop: a listener slower than the
+    reclaim window does NOT get its row stolen (and double-dispatched),
+    because the batch heartbeat renews the claim at reclaim/3 cadence."""
+    delivered: list[str] = []
+    release = asyncio.Event()
+
+    async def slow_handler(evt: WidgetCreated) -> None:
+        await asyncio.wait_for(release.wait(), timeout=5.0)
+        delivered.append(evt.name)
+
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, slow_handler)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+
+    broker = DatabaseBroker(engine=engine)
+    target = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=[target],
+        poll_interval_s=0.01,
+        reclaim_stale_seconds=1.0,  # heartbeat ticks every ~0.33s
+    )
+    await consumer.start()
+    try:
+        payload = serializer.serialize(WidgetCreated(name="w1"))
+        await broker.publish(target, payload, {"event_type": target})
+
+        # Hold the listener well past the 1.0s reclaim window. The heartbeat
+        # (ticking ~every 0.33s) must keep the claim fresh the whole time; a
+        # runner stall would have to exceed ~0.67s between two renewals to
+        # produce a false steal.
+        await asyncio.sleep(1.5)
+        stolen = await broker.claim_batch(
+            "modulith-inventory",
+            batch_size=10,
+            consumer_name="peer",
+            reclaim_stale_seconds=1.0,
+        )
+        assert stolen == []  # never reclaimed mid-dispatch
+
+        release.set()
+        await _until_async(lambda: _delivered(delivered))
+        assert delivered == ["w1"]  # exactly once — no duplicate dispatch
+        await _until_async(lambda: _zero_rows(engine))  # acked + deleted
+    finally:
+        release.set()
+        await consumer.stop()
+
+
+async def test_lease_cap_releases_rows_of_wedged_listener(engine: Any) -> None:
+    """A listener that never returns must NOT pin its rows forever: after
+    ``_MAX_LEASE_EXTENSION_FACTOR`` reclaim windows the heartbeat stops, the
+    claim goes stale, and a peer reclaims the row (at-least-once liveness).
+    Lower-bound timing only — a slow runner just waits longer."""
+    wedged = asyncio.Event()  # never set — the listener hangs forever
+
+    async def wedged_handler(evt: WidgetCreated) -> None:
+        await wedged.wait()
+
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, wedged_handler)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+
+    broker = DatabaseBroker(engine=engine)
+    target = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=[target],
+        poll_interval_s=0.01,
+        reclaim_stale_seconds=0.1,  # cap = 10 x 0.1s = ~1s of renewal
+    )
+    await consumer.start()
+    try:
+        payload = serializer.serialize(WidgetCreated(name="w1"))
+        await broker.publish(target, payload, {"event_type": target})
+
+        async def _peer_reclaims() -> bool:
+            rows = await broker.claim_batch(
+                "modulith-inventory",
+                batch_size=10,
+                consumer_name="peer",
+                reclaim_stale_seconds=0.1,
+            )
+            return len(rows) == 1
+
+        # Renewal keeps the row for ~1s (the cap), then stops; once the claim
+        # ages past 0.1s the peer wins. 10s timeout >> 1.1s expected.
+        await _until_async(_peer_reclaims, timeout=10.0, interval=0.1)
+    finally:
+        wedged.set()
+        await consumer.stop()
+
+
+async def test_dispatch_concurrency_fans_out_within_batch(engine: Any) -> None:
+    """With dispatch_concurrency=4, four claimed rows dispatch concurrently:
+    every handler blocks until all four have STARTED — sequential dispatch
+    would deadlock here, so completion proves the fan-out."""
+    started = 0
+    all_started = asyncio.Event()
+    delivered: list[str] = []
+
+    async def rendezvous_handler(evt: WidgetCreated) -> None:
+        nonlocal started
+        started += 1
+        if started == 4:
+            all_started.set()
+        await asyncio.wait_for(all_started.wait(), timeout=5.0)
+        delivered.append(evt.name)
+
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, rendezvous_handler)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+
+    broker = DatabaseBroker(engine=engine)
+    target = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=[target],
+        poll_interval_s=0.01,
+        batch_size=10,
+        dispatch_concurrency=4,
+    )
+    # Publish all four rows BEFORE the loop starts: the first claim then takes
+    # them in ONE batch, which the rendezvous below requires (a row claimed in
+    # an earlier batch could never see the other three start).
+    await broker.subscribe([target], "modulith-inventory")
+    for i in range(4):
+        payload = serializer.serialize(WidgetCreated(name=f"w{i}"))
+        await broker.publish(target, payload, {"event_type": target})
+
+    await consumer.start()
+    try:
+
+        async def _all_delivered() -> bool:
+            return sorted(delivered) == ["w0", "w1", "w2", "w3"]
+
+        await _until_async(_all_delivered)
+        await _until_async(lambda: _zero_rows(engine))
+    finally:
+        await consumer.stop()
 
 
 async def test_orphaned_claim_is_reclaimed_after_visibility_timeout(engine: Any) -> None:
@@ -1809,13 +2021,15 @@ def test_make_db_consumer_reads_prune_config_from_broker_options(make_fake_app: 
 
 
 def test_make_db_consumer_uses_defaults_when_unconfigured(make_fake_app: Any) -> None:
-    """No cadence/retention keys -> library defaults, prune off."""
+    """No cadence/retention keys -> library defaults; prune ON via the 3-day
+    terminal-row retention default (dead letters must not grow unboundedly)."""
     make_fake_app({"orders": ""})
     from modulith import configure
     from modulith.adapters.db_broker import (
         _DEFAULT_BATCH_SIZE,
         _DEFAULT_POLL_INTERVAL_S,
         _DEFAULT_RECLAIM_STALE_S,
+        _DEFAULT_RETENTION_AGE_S,
         _MAX_DELIVERY_ATTEMPTS,
     )
 
@@ -1844,7 +2058,8 @@ def test_make_db_consumer_uses_defaults_when_unconfigured(make_fake_app: Any) ->
     assert consumer._batch_size == _DEFAULT_BATCH_SIZE
     assert consumer._reclaim_stale_seconds == _DEFAULT_RECLAIM_STALE_S
     assert consumer._max_attempts == _MAX_DELIVERY_ATTEMPTS
-    assert consumer._prune_enabled() is False
+    assert consumer._retention_age_seconds == _DEFAULT_RETENTION_AGE_S
+    assert consumer._prune_enabled() is True
 
 
 @pytest.mark.parametrize(
@@ -1856,6 +2071,8 @@ def test_make_db_consumer_uses_defaults_when_unconfigured(make_fake_app: Any) ->
         {"reclaim_stale_seconds": True},
         {"batch_size": True},
         {"batch_size": 1.5},
+        {"dispatch_concurrency": True},
+        {"dispatch_concurrency": 1.5},
         {"max_delivery_attempts": True},
         {"retention_age_seconds": 0},
         {"retention_age_seconds": True},
@@ -2277,6 +2494,7 @@ def test_make_db_consumer_reads_reclaim_and_max_attempts(make_fake_app: Any) -> 
             "url": "sqlite+aiosqlite:///:memory:",
             "reclaim_stale_seconds": 12.5,
             "max_delivery_attempts": 9,
+            "dispatch_concurrency": 7,
         },
     )
     _runtime.ensure_bootstrapped()
@@ -2297,6 +2515,33 @@ def test_make_db_consumer_reads_reclaim_and_max_attempts(make_fake_app: Any) -> 
     assert isinstance(consumer, DatabaseConsumer)
     assert consumer._reclaim_stale_seconds == 12.5
     assert consumer._max_attempts == 9
+    assert consumer._dispatch_concurrency == 7
+
+
+
+def test_registration_defaults_to_sqlite_file_url(
+    make_fake_app: Any, monkeypatch: Any, tmp_path: Any
+) -> None:
+    """When topology='processes' with no broker_options.url, the registration
+    hook auto-selects an embedded SQLite file ABSOLUTIZED from the process cwd
+    (supervisor and workers must converge on ONE file; a relative URL would
+    silently split the queue on a later chdir). The engine is lazy (no file
+    created at this point), so only the URL string is checked."""
+    monkeypatch.chdir(tmp_path)  # keep default broker file out of the repo
+    make_fake_app({"orders": ""})
+    from modulith import configure
+    from modulith.config import DEFAULT_BROKER_DB_FILENAME
+
+    configure(package="fakeapp", topology="processes")  # no broker, no url
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.broker_registry is not None
+    broker = _runtime.broker_registry.get("database")
+    assert isinstance(broker, DatabaseBroker)
+    assert (
+        str(broker.engine.url)
+        == f"sqlite+aiosqlite:///{tmp_path / DEFAULT_BROKER_DB_FILENAME}"
+    )
 
 
 # ---------------------------------------------------------------------------

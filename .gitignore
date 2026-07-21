@@ -198,6 +198,12 @@ cython_debug/
 # files from these directories into the tarball).
 graphify-out/
 
+# modulith embedded SQLite broker file (auto-created when topology='processes'
+# with no broker url configured; override with broker_options.url).
+.modulith-broker.db
+.modulith-broker.db-wal
+.modulith-broker.db-shm
+
 # Abstra
 #   Abstra is an AI-powered process automation framework.
 #   Ignore directories containing user credentials, local state, and settings.

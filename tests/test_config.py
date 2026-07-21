@@ -176,20 +176,82 @@ def test_production_with_durable_outbox_is_allowed() -> None:
     assert cfg.outbox == "postgres"
 
 
-def test_process_topology_with_default_memory_broker_refuses_to_start() -> None:
-    """topology=processes + the default memory broker can't deliver cross-process.
+def test_process_topology_defaults_to_database_broker() -> None:
+    """topology=processes with no broker configured auto-selects the database
+    broker (embedded SQLite) — the broker is NOT marked as explicitly set."""
+    cfg = load_configuration(topology="processes")
+    assert cfg.broker == "database"
+    assert cfg.is_explicit("broker") is False
 
-    Regression: this combination used to validate clean and then silently
-    no-op delivery deep in the runtime instead of failing fast.
-    """
-    with pytest.raises(ConfigurationError, match="requires a cross-process broker"):
+
+def test_env_driven_process_topology_also_defaults_broker(monkeypatch) -> None:
+    """MODULITH_TOPOLOGY=processes (no kwargs) takes the same defaulting path —
+    the injection keys off the merged explicit dict, not the call site."""
+    monkeypatch.setenv("MODULITH_TOPOLOGY", "processes")
+    cfg = load_configuration()
+    assert cfg.broker == "database"
+    assert cfg.is_explicit("broker") is False
+
+
+def test_default_broker_warning_fires_only_on_defaulted_path(caplog) -> None:
+    """The defaulting warning names the broker file; an explicit broker stays
+    silent — 'the warnings on startup tell users exactly which defaults are
+    active' (module docstring contract)."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="modulith.config"):
         load_configuration(topology="processes")
+    assert any(".modulith-broker.db" in r.getMessage() for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="modulith.config"):
+        load_configuration(topology="processes", broker="database")
+    assert caplog.records == []
+
+
+def test_subinterpreters_without_broker_raises_not_implemented() -> None:
+    """topology=subinterpreters with NO broker no longer hits the cross-process
+    broker guard (that now needs an explicit memory broker) — it falls through
+    to the 'not yet implemented' rejection. Pins the new error identity."""
+    with pytest.raises(ConfigurationError, match="not yet implemented"):
+        load_configuration(topology="subinterpreters")
+
+
+def test_process_topology_with_explicit_memory_broker_refuses_to_start() -> None:
+    """An explicit broker='memory' with processes topology still fails fast."""
+    with pytest.raises(ConfigurationError, match="requires a cross-process broker"):
+        load_configuration(topology="processes", broker="memory")
 
 
 def test_subinterpreters_topology_with_memory_broker_refuses_to_start() -> None:
     """Same coupling applies to the subinterpreters topology."""
     with pytest.raises(ConfigurationError, match="requires a cross-process broker"):
         load_configuration(topology="subinterpreters", broker="memory")
+
+
+def test_production_refuses_defaulted_process_broker() -> None:
+    """Production + topology=processes + no explicit broker raises — implicit
+    embedded SQLite is not suitable for production."""
+    with pytest.raises(ConfigurationError, match="defaulted broker"):
+        load_configuration(topology="processes", production=True)
+
+
+def test_production_with_explicit_database_broker_and_processes_is_allowed() -> None:
+    """Explicit broker='database' in production + processes is accepted."""
+    cfg = load_configuration(
+        topology="processes", production=True, broker="database", outbox="postgres"
+    )
+    assert cfg.broker == "database"
+    assert cfg.topology == "processes"
+
+
+def test_production_with_explicit_redis_broker_and_processes_is_allowed() -> None:
+    """The production guard keys on 'broker not explicit', not on the adapter:
+    any explicitly-named broker passes it."""
+    cfg = load_configuration(
+        topology="processes", production=True, broker="redis-streams", outbox="postgres"
+    )
+    assert cfg.broker == "redis-streams"
 
 
 def test_process_topology_with_real_broker_is_allowed() -> None:

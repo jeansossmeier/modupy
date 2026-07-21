@@ -15,6 +15,7 @@ which defaults are active.
 from __future__ import annotations
 
 import difflib
+import logging
 import os
 import tomllib
 from dataclasses import dataclass, field, fields
@@ -22,6 +23,8 @@ from pathlib import Path
 from typing import Any
 
 from ._claims import VALID_CLAIM_STRATEGIES
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigurationError(Exception):
@@ -40,6 +43,13 @@ class ConfigurationError(Exception):
 _VALID_TOPOLOGIES = ("single", "processes", "subinterpreters")
 _VALID_SUBSCRIPTION_SOURCES = ("manifest", "config", "listener")
 _VALID_ACTUATOR_MODES = ("auto", "token", "open", "disabled")
+
+# Filename of the embedded SQLite broker file that the database broker
+# adapter creates in the process cwd when topology='processes' defaults the
+# broker and no broker_options url is configured. Owned here (not in the
+# adapter) so the defaulting warning below, the adapter's path construction
+# (modulith/adapters/db_broker.py), and .gitignore all share one literal.
+DEFAULT_BROKER_DB_FILENAME = ".modulith-broker.db"
 
 
 @dataclass(frozen=True)
@@ -67,7 +77,8 @@ class Configuration:
     topology: str = "single"
 
     # Default broker for cross-process events. "memory" only valid when
-    # topology == "single"; other values name an adapter.
+    # topology == "single". When topology == "processes" and this is absent,
+    # load_configuration automatically defaults to "database" (embedded SQLite).
     broker: str = "memory"
 
     # Source used to resolve cross-process listener subscriptions.
@@ -126,8 +137,39 @@ def load_configuration(**overrides: Any) -> Configuration:
     # Validate before constructing — fail fast on typos and bad values.
     _validate(explicit)
 
-    # Build the dataclass. Keys absent from `explicit` get the default.
-    return Configuration(**explicit, explicit_keys=frozenset(explicit.keys()))
+    # Freeze explicit_keys BEFORE injecting the broker default so
+    # cfg.is_explicit("broker") stays False for the auto-default case.
+    explicit_keys = frozenset(explicit.keys())
+    if explicit.get("topology") == "processes" and "broker" not in explicit:
+        explicit["broker"] = "database"
+        broker_options = explicit.get("broker_options")
+        configured_url = (
+            broker_options.get("url") or broker_options.get("dsn")
+            if isinstance(broker_options, dict)
+            else None
+        )
+        if configured_url:
+            # A url without a scalar broker name: adopt the 'database' adapter
+            # for it rather than claiming an SQLite file that will never exist.
+            # A non-database url (e.g. redis://) will fail loudly at engine
+            # construction — the warning names the adapter so that error is
+            # traceable to this default.
+            logger.warning(
+                "topology='processes' with broker_options.url but no broker "
+                "name — defaulting to the 'database' adapter for %r. Set "
+                "[tool.modulith].broker explicitly if a different adapter "
+                "was intended.",
+                configured_url,
+            )
+        else:
+            logger.warning(
+                "topology='processes' with no broker configured — defaulting to "
+                "the embedded SQLite database broker (file '%s' in the working "
+                "directory). Set [tool.modulith].broker explicitly to silence "
+                "this warning.",
+                DEFAULT_BROKER_DB_FILENAME,
+            )
+    return Configuration(**explicit, explicit_keys=explicit_keys)
 
 
 # Configuration fields that hold tables of options rather than scalars.
@@ -543,20 +585,28 @@ def _validate(data: dict[str, Any]) -> None:
         )
 
     # Cross-field: a multi-process topology needs a real cross-process broker.
-    # The in-memory broker can't carry events between processes, so
-    # "topology=processes, broker=memory" would validate clean and then
-    # silently no-op delivery deep in the runtime. Fail fast with the
-    # documented constraint (config.py field docstring on `broker`). Effective
-    # values include defaults — a process topology left on the default memory
-    # broker is exactly the misconfiguration this guards.
+    # An absent broker is fine — load_configuration will default it to "database".
+    # An *explicit* memory broker is always wrong for cross-process topologies.
     effective_topology = data.get("topology", "single")
-    effective_broker = data.get("broker", "memory")
-    if effective_topology in ("processes", "subinterpreters") and effective_broker == "memory":
+    if (
+        effective_topology in ("processes", "subinterpreters")
+        and data.get("broker") == "memory"
+    ):
         raise ConfigurationError(
             f"topology={effective_topology!r} requires a cross-process broker, but "
-            "broker is the in-memory default. Set [tool.modulith].broker to a real "
-            "adapter (e.g. 'redis-streams'); broker='memory' is only valid for "
-            "topology='single'."
+            "broker='memory' was explicitly configured. Set [tool.modulith].broker "
+            "to a real adapter (e.g. 'database' or 'redis-streams'); "
+            "broker='memory' is only valid for topology='single'."
+        )
+
+    # Production mode + defaulted process broker = implicit embedded SQLite in
+    # production. Refuse unless the broker is explicit.
+    if data.get("production") and effective_topology == "processes" and "broker" not in data:
+        raise ConfigurationError(
+            "Cannot start in production mode with a defaulted broker for "
+            "topology='processes' — events would ride an implicit embedded SQLite "
+            "file. Set [tool.modulith].broker explicitly (e.g. 'database' or "
+            "'redis-streams')."
         )
 
     # "subinterpreters" is reserved but unshipped (SPEC §9.5 option C;
