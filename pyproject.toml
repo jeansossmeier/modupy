@@ -22,7 +22,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "modulith"
-version = "0.1.0"
+version = "1.0.0"
 description = "Modular monolith pattern for Python — module structure, event-driven boundaries, transactional outbox, optional process-per-module runtime."
 readme = "README.md"
 requires-python = ">=3.11"

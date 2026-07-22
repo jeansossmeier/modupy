@@ -62,7 +62,7 @@ logger = logging.getLogger("modulith.observability")
 
 # Instrumenting-library version recorded on the tracer. Passed positionally —
 # OTel >= 1.43 removed the ``version=`` keyword from get_tracer().
-_INSTRUMENTING_VERSION = "0.1.0"
+_INSTRUMENTING_VERSION = "1.0.0"
 
 
 # ---------------------------------------------------------------------------

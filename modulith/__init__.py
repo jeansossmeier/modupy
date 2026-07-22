@@ -18,7 +18,7 @@ from importlib.metadata import version as _pkg_version
 try:
     __version__ = _pkg_version("modulith")
 except PackageNotFoundError:  # running from a source checkout that isn't installed
-    __version__ = "0.1.0"
+    __version__ = "1.0.0"
 
 # ----- Application-facing API (what most users need) -----------------------
 # ----- Broker dispatch registry --------------------------------------------
