@@ -659,6 +659,34 @@ async def run_supervised(
     sup = supervisor if supervisor is not None else Supervisor(specs)
     serve_fn = serve if serve is not None else _serve_uvicorn
 
+    # A SIGTERM/SIGINT arriving after workers are spawned but before serve_fn
+    # (uvicorn) installs its own handlers would hit Python's default signal
+    # disposition (immediate process death), skipping the finally below and
+    # orphaning the just-spawned workers. Install a handler for that window
+    # that cancels this coroutine's own task so `finally: sup.stop()` still
+    # runs. uvicorn's `Server.install_signal_handlers()` overwrites these with
+    # its own the moment serve_fn actually starts serving, so there's no
+    # fight over the signal — ours only matters until uvicorn takes over.
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+    shutdown_signalled = False
+    installed_signals: list[signal.Signals] = []
+
+    def _handle_shutdown_signal() -> None:
+        nonlocal shutdown_signalled
+        shutdown_signalled = True
+        if main_task is not None:
+            main_task.cancel()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _handle_shutdown_signal)
+        except (NotImplementedError, RuntimeError):
+            # No signal support (Windows) or not the main thread — the
+            # pre-existing orphan risk on those platforms is unchanged.
+            continue
+        installed_signals.append(sig)
+
     # start() sits INSIDE the try: Supervisor.start() has no mid-loop
     # rollback, so a partial-spawn failure (e.g. the 3rd of 5 workers fails
     # to exec) would otherwise never reach stop() and the already-spawned
@@ -667,7 +695,12 @@ async def run_supervised(
     try:
         await sup.start()
         await serve_fn(proxy_app, proxy_host, proxy_port)
+    except asyncio.CancelledError:
+        if not shutdown_signalled:
+            raise
     finally:
+        for sig in installed_signals:
+            loop.remove_signal_handler(sig)
         await sup.stop()
 
 

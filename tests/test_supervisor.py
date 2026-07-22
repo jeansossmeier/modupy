@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
+import signal
 import socket
 import sys
 import time
@@ -228,6 +230,38 @@ async def test_run_supervised_reaps_partial_spawn_of_real_workers() -> None:
     assert all(p.returncode is not None for p in sup._processes.values())
 
 
+@pytest.mark.real_process
+async def test_run_supervised_reaps_workers_on_sigterm_during_start_window() -> None:
+    """A SIGTERM/SIGINT arriving after workers are spawned but before serve_fn
+    installs its own handlers must still reach ``finally: sup.stop()`` —
+    without a handler for that window, Python's default SIGTERM disposition
+    kills the process immediately, skipping the finally and orphaning the
+    just-spawned workers."""
+    sup = Supervisor([WorkerSpec("orders", "fakeapp", 9001)], command_builder=_sleep_builder)
+    served: list[str] = []
+
+    async def slow_serve(app: object, host: str, port: int) -> None:
+        # Stands in for the vulnerable window: sup.start() already returned
+        # (workers spawned) but serve_fn hasn't installed its own signal
+        # handlers yet. Send SIGTERM to ourselves right as "serving" begins.
+        served.append("serve")
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(10)  # would hang forever without the handler
+
+    await run_supervised(
+        [WorkerSpec("orders", "fakeapp", 9001)],
+        "127.0.0.1",
+        8000,
+        supervisor=sup,
+        serve=slow_serve,
+    )
+
+    assert served == ["serve"]
+    # Workers spawned during start() must be reaped, not orphaned.
+    assert sup._processes
+    assert all(p.returncode is not None for p in sup._processes.values())
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle (real subprocesses)
 # ---------------------------------------------------------------------------
@@ -352,6 +386,67 @@ def test_restart_policy_resets_crash_streak_after_recovery() -> None:
     # Recovers: stays up well past healthy_uptime, then crashes once. The
     # streak resets to 1 before this crash, so it must NOT trip.
     assert p.on_crash(uptime=10.0, now=20.0) is not None
+
+
+@pytest.mark.real_process
+async def test_stop_does_not_sigkill_worker_that_exits_within_grace_window() -> None:
+    """A worker that dies from SIGTERM (proc.terminate()) well within
+    shutdown_timeout must NOT also receive SIGKILL — escalating unconditionally
+    could cut a real worker off mid runtime.shutdown() (broker close / outbox
+    drain). Distinguish by exit signal: SIGTERM (-15) means only terminate()
+    fired; SIGKILL (-9) means stop() escalated on top of an already-dead proc."""
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", 9001)],
+        command_builder=_sleep_builder,
+        shutdown_timeout=5.0,  # comfortably longer than SIGTERM-default death
+    )
+    await sup.start()
+    proc = next(iter(sup._processes.values()))
+
+    await sup.stop()
+
+    assert proc.returncode == -signal.SIGTERM
+
+
+@pytest.mark.real_process
+async def test_stop_sigkills_only_the_worker_still_alive_at_timeout() -> None:
+    """With two workers — one that dies on SIGTERM, one that traps and ignores
+    it — only the still-alive one is escalated to SIGKILL at shutdown_timeout;
+    the one that already exited is left alone."""
+    import tempfile
+
+    marker = tempfile.mktemp()
+    stubborn_cmd = [
+        sys.executable,
+        "-c",
+        (
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, lambda *a: None)\n"
+            f"open({marker!r}, 'w').close()\n"
+            "time.sleep(30)\n"
+        ),
+    ]
+
+    def builder(spec: WorkerSpec, port: int) -> list[str]:
+        return _SLEEP if spec.module_name == "fast" else stubborn_cmd
+
+    specs = [WorkerSpec("fast", "fakeapp", 9001), WorkerSpec("stubborn", "fakeapp", 9002)]
+    sup = Supervisor(specs, command_builder=builder, shutdown_timeout=0.3)
+    await sup.start()
+    procs = dict(sup._processes)
+
+    # Wait for the stubborn worker's SIGTERM handler to actually be installed
+    # before stopping — otherwise stop()'s terminate() could race ahead of it
+    # and kill the process via default disposition, defeating the scenario.
+    deadline = time.monotonic() + 5.0
+    while not os.path.exists(marker) and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert os.path.exists(marker), "stubborn worker never installed its SIGTERM handler"
+
+    await sup.stop()
+
+    assert procs["fast"].returncode == -signal.SIGTERM  # died on the first signal
+    assert procs["stubborn"].returncode == -signal.SIGKILL  # still alive -> escalated
 
 
 @pytest.mark.real_process
