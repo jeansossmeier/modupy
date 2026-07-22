@@ -299,18 +299,14 @@ async def test_crashed_worker_is_restarted_with_backoff() -> None:
 
 def test_restart_policy_backoff_escalates_and_caps() -> None:
     """Delay doubles each crash, capped at max_delay."""
-    p = _RestartPolicy(
-        initial_delay=1.0, max_delay=10.0, healthy_uptime=100.0, max_restarts=100, window=1000.0
-    )
+    p = _RestartPolicy(initial_delay=1.0, max_delay=10.0, healthy_uptime=100.0, max_restarts=100)
     delays = [p.on_crash(uptime=0.0, now=float(i)) for i in range(5)]
     assert delays == [1.0, 2.0, 4.0, 8.0, 10.0]  # last is capped at max
 
 
 def test_restart_policy_resets_backoff_after_healthy_uptime() -> None:
     """A worker that ran past healthy_uptime resets backoff to initial (#50)."""
-    p = _RestartPolicy(
-        initial_delay=1.0, max_delay=10.0, healthy_uptime=5.0, max_restarts=100, window=1000.0
-    )
+    p = _RestartPolicy(initial_delay=1.0, max_delay=10.0, healthy_uptime=5.0, max_restarts=100)
     # Three quick crashes escalate the backoff.
     assert p.on_crash(uptime=0.0, now=0.0) == 1.0
     assert p.on_crash(uptime=0.0, now=1.0) == 2.0
@@ -320,28 +316,42 @@ def test_restart_policy_resets_backoff_after_healthy_uptime() -> None:
 
 
 def test_restart_policy_trips_breaker_after_max_restarts() -> None:
-    """More than max_restarts crashes inside the window → give up (None) (#33)."""
-    p = _RestartPolicy(
-        initial_delay=0.01, max_delay=0.01, healthy_uptime=100.0, max_restarts=3, window=1000.0
-    )
+    """More than max_restarts crashes in a row (rapid burst) → give up (None) (#33)."""
+    p = _RestartPolicy(initial_delay=0.01, max_delay=0.01, healthy_uptime=100.0, max_restarts=3)
     assert p.on_crash(uptime=0.0, now=0.0) is not None
     assert p.on_crash(uptime=0.0, now=1.0) is not None
     assert p.on_crash(uptime=0.0, now=2.0) is not None
-    # 4th crash within window exceeds the cap → breaker trips.
+    # 4th crash in a row exceeds the cap → breaker trips.
     assert p.on_crash(uptime=0.0, now=3.0) is None
 
 
-def test_restart_policy_window_prunes_old_crashes() -> None:
-    """Crashes older than the window don't count toward the cap."""
-    p = _RestartPolicy(
-        initial_delay=0.01, max_delay=0.01, healthy_uptime=100.0, max_restarts=3, window=10.0
-    )
-    p.on_crash(uptime=0.0, now=0.0)
-    p.on_crash(uptime=0.0, now=1.0)
-    p.on_crash(uptime=0.0, now=2.0)
-    # Far in the future: the three earlier crashes age out of the window, so
-    # this is the only crash in-window and the breaker does NOT trip.
-    assert p.on_crash(uptime=0.0, now=100.0) is not None
+def test_restart_policy_trips_on_slow_steady_crash_loop() -> None:
+    """A module crashing every 15s (never healthy) still trips eventually.
+
+    Root-cause regression test: the breaker previously counted crashes inside
+    a rolling time window, so a module crashing slower than roughly
+    max_restarts/window kept the in-window count at or below max_restarts
+    forever and was respawned indefinitely. Counting the crash streak instead
+    of wall-clock spacing means a steady 15s-interval loop trips exactly like
+    a rapid burst — cadence no longer matters, only the streak length.
+    """
+    p = _RestartPolicy(initial_delay=0.01, max_delay=0.01, healthy_uptime=60.0, max_restarts=5)
+    # 6 crashes, 15s apart, each run far too short to count as healthy.
+    results = [p.on_crash(uptime=1.0, now=float(i * 15)) for i in range(6)]
+    assert results[:5] == [0.01] * 5  # first 5 crashes still respawn
+    assert results[5] is None  # 6th crash (streak of 6) exceeds max_restarts=5
+
+
+def test_restart_policy_resets_crash_streak_after_recovery() -> None:
+    """A worker that recovers resets the streak; a later isolated crash doesn't trip."""
+    p = _RestartPolicy(initial_delay=0.01, max_delay=0.01, healthy_uptime=5.0, max_restarts=3)
+    # Three quick crashes (never healthy) bring the streak right to the cap.
+    assert p.on_crash(uptime=0.0, now=0.0) is not None
+    assert p.on_crash(uptime=0.0, now=1.0) is not None
+    assert p.on_crash(uptime=0.0, now=2.0) is not None
+    # Recovers: stays up well past healthy_uptime, then crashes once. The
+    # streak resets to 1 before this crash, so it must NOT trip.
+    assert p.on_crash(uptime=10.0, now=20.0) is not None
 
 
 @pytest.mark.integration
@@ -363,7 +373,9 @@ async def test_crash_loop_gives_up_after_max_restarts() -> None:
         restart_initial_delay=0.01,
         restart_max_delay=0.01,
         max_restarts=3,
-        restart_window=60.0,
+        # Comfortably longer than real subprocess spawn+exit latency so a
+        # rapid real crash loop is never mistaken for a healthy recovery.
+        restart_healthy_uptime=5.0,
     )
     try:
         await sup.start()

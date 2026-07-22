@@ -41,7 +41,6 @@ import os
 import signal
 import sys
 import time
-from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -183,9 +182,15 @@ class _RestartPolicy:
         ``healthy_uptime`` has effectively recovered, so its backoff resets to
         ``initial_delay`` — otherwise a flapping-then-stable worker stays pinned
         at ``max_delay`` for every later transient crash.
-      * Circuit breaker: more than ``max_restarts`` crashes inside a rolling
-        ``window`` means the module is deterministically broken; stop respawning
-        rather than fork-churn forever.
+      * Circuit breaker: more than ``max_restarts`` crashes IN A ROW since the
+        last healthy recovery means the module is deterministically broken;
+        stop respawning rather than fork-churn forever. Counting consecutive
+        crashes (rather than crashes inside a rolling time window) is
+        deliberate: a module crashing at a steady interval slower than
+        roughly max_restarts/window would keep a window's in-window count at
+        or below max_restarts forever, so it was respawned indefinitely
+        instead of ever tripping. Consecutive counting catches any steady
+        crash loop regardless of how far apart the crashes are.
     """
 
     def __init__(
@@ -195,32 +200,32 @@ class _RestartPolicy:
         max_delay: float,
         healthy_uptime: float,
         max_restarts: int,
-        window: float,
     ) -> None:
         self._initial = initial_delay
         self._max = max_delay
         self._healthy_uptime = healthy_uptime
         self._max_restarts = max_restarts
-        self._window = window
         self._delay = initial_delay
-        self._crashes: deque[float] = deque()
+        self._consecutive_crashes = 0
 
     def on_crash(self, *, uptime: float, now: float) -> float | None:
         """Record a crash; return the delay to wait before respawn.
 
         Returns ``None`` when the breaker has tripped (caller must give up and
-        not respawn). ``now`` is a monotonic timestamp; ``uptime`` is how long
-        the just-exited worker had been running.
+        not respawn). ``uptime`` is how long the just-exited worker had been
+        running. ``now`` (a monotonic timestamp) is accepted for call-site
+        symmetry but not used: the breaker's decision depends only on the
+        crash streak, never on wall-clock spacing between crashes.
         """
-        # Recovery → reset backoff before this crash's delay is read.
+        # Recovery: the previous run stayed up long enough to count as
+        # healthy, so both backoff and the consecutive-crash streak reset
+        # before this crash is counted.
         if uptime >= self._healthy_uptime:
             self._delay = self._initial
+            self._consecutive_crashes = 0
 
-        # Circuit breaker: prune crashes outside the window, then bound the rate.
-        self._crashes.append(now)
-        while self._crashes and now - self._crashes[0] > self._window:
-            self._crashes.popleft()
-        if len(self._crashes) > self._max_restarts:
+        self._consecutive_crashes += 1
+        if self._consecutive_crashes > self._max_restarts:
             return None
 
         delay = self._delay
@@ -251,7 +256,6 @@ class Supervisor:
         shutdown_timeout: float = 30.0,
         command_builder: CommandBuilder | None = None,
         max_restarts: int = 5,
-        restart_window: float = 60.0,
         restart_healthy_uptime: float | None = None,
     ) -> None:
         self._specs = specs
@@ -259,13 +263,15 @@ class Supervisor:
         self._restart_max_delay = restart_max_delay
         self._shutdown_timeout = shutdown_timeout
         self._command_builder: CommandBuilder = command_builder or _default_command
-        # Circuit-breaker bounds: more than `max_restarts` crashes within
-        # `restart_window` seconds → give up on that instance (a deterministic
-        # crash must not be respawned forever). A worker that stays up at least
-        # `restart_healthy_uptime` seconds is treated as recovered and its
-        # backoff resets; defaults to restart_max_delay.
+        # Circuit-breaker bound: more than `max_restarts` crashes IN A ROW,
+        # with no healthy run in between, means the module is deterministically
+        # broken → give up on that instance rather than respawn forever. A
+        # worker that stays up at least `restart_healthy_uptime` seconds counts
+        # as a healthy recovery: it resets both the backoff AND the crash
+        # streak. Defaults to restart_max_delay — comfortably longer than any
+        # steady crash-loop interval that should trip the breaker, while still
+        # being reachable by a module that's actually stabilized.
         self._max_restarts = max_restarts
-        self._restart_window = restart_window
         self._restart_healthy_uptime = (
             restart_healthy_uptime if restart_healthy_uptime is not None else restart_max_delay
         )
@@ -359,16 +365,16 @@ class Supervisor:
         termination guards, and ``stop()`` also cancels this task.
 
         Backoff and the give-up decision are delegated to ``_RestartPolicy``:
-        a worker that exceeds ``max_restarts`` crashes within ``restart_window``
-        is abandoned (logged + marked failed) instead of respawned forever, and
-        one that ran healthily long enough has its backoff reset.
+        a worker that crashes more than ``max_restarts`` times IN A ROW, with
+        no healthy run in between, is abandoned (logged + marked failed)
+        instead of respawned forever, and one that ran healthily long enough
+        has its backoff AND crash streak reset.
         """
         policy = _RestartPolicy(
             initial_delay=self._restart_initial_delay,
             max_delay=self._restart_max_delay,
             healthy_uptime=self._restart_healthy_uptime,
             max_restarts=self._max_restarts,
-            window=self._restart_window,
         )
         while True:
             started = time.monotonic()
@@ -379,11 +385,11 @@ class Supervisor:
             delay = policy.on_crash(uptime=uptime, now=time.monotonic())
             if delay is None:
                 logger.error(
-                    "worker %s exceeded %d restarts within %.0fs (last exit code %s) — "
-                    "giving up; not respawning. Fix the module and restart the supervisor.",
+                    "worker %s crashed %d times in a row with no healthy run in "
+                    "between (last exit code %s) — giving up; not respawning. "
+                    "Fix the module and restart the supervisor.",
                     name,
-                    self._max_restarts,
-                    self._restart_window,
+                    self._max_restarts + 1,
                     return_code,
                 )
                 self._failed_instances.add(name)
