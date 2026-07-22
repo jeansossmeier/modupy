@@ -66,7 +66,7 @@ from modulith._claims import (
     VALID_CLAIM_STRATEGIES,
 )
 from modulith.config import ConfigurationError
-from modulith.serializers import JsonEventSerializer
+from modulith.serializers import JsonEventSerializer, _event_type_name
 
 logger = logging.getLogger("modulith.outbox")
 
@@ -570,6 +570,27 @@ async def _dispatch_publication(publication: EventPublication) -> None:
             # A deferred broker send (see persist_broker_route) — no local
             # listener to resolve; the serialized payload goes to the wire.
             await _dispatch_broker_route(publication)
+            return
+
+        # Fail closed on unregistered event types — regardless of whether
+        # ``_serializer`` was itself constructed with an allowlist. Deserializing
+        # an attacker-controlled ``event_type`` (a forged outbox row) resolves and
+        # instantiates ANY importable class (see JsonEventSerializer.deserialize /
+        # _resolve_class), so this is the shared seam that must gate it, not
+        # something left to the caller's serializer configuration.
+        bus = _rt._runtime.event_bus
+        registered_type_names = (
+            {_event_type_name(t) for t in bus.registered_event_types()}
+            if bus is not None
+            else set()
+        )
+        if publication.event_type not in registered_type_names:
+            unregistered_err = ValueError(
+                f"event type {publication.event_type!r} is not a registered event type "
+                f"for publication {publication.id} — refusing to deserialize"
+            )
+            logger.warning("%s", unregistered_err)
+            await _record_failure(publication, unregistered_err)
             return
 
         try:

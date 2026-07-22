@@ -1145,10 +1145,58 @@ async def test_dispatch_without_bootstrapped_bus_records_missing_listener() -> N
 
     await outbox._dispatch_publication(publication)
 
+    # With no bootstrapped bus there are no registered event types either, so
+    # the unregistered-event-type guard now fires before listener resolution
+    # would have — still a safely-recorded failure, not a crash.
     assert publication.attempt_count == 1
     assert publication.last_error is not None
-    assert "no registered listener" in publication.last_error
+    assert "not a registered event type" in publication.last_error
     assert publication.completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rejects_unregistered_event_type_without_instantiating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forged outbox row naming an arbitrary importable class (the RCE
+    vector fixed here: e.g. ``subprocess.Popen``) must be rejected before
+    deserialization ever resolves or instantiates that class — regardless of
+    whether the configured serializer itself carries an allowlist.
+    """
+    import subprocess
+
+    spawned: list[tuple[Any, Any]] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: spawned.append((a, k)))
+
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+
+    forged = EventPublication(
+        id=uuid4(),
+        payload=b'{"args": ["/bin/echo", "pwned"]}',
+        event_type="subprocess.Popen",
+        listener=outbox._listener_id(record),
+        published_at=datetime.now(UTC),
+    )
+    await store.save(forged)
+
+    await outbox._dispatch_publication(forged)
+
+    assert spawned == []
+    assert forged.attempt_count == 1
+    assert forged.completed_at is None
+    assert forged.last_error is not None
+    assert "not a registered event type" in forged.last_error
+
+    # A legitimately-registered event must still round-trip and dispatch.
+    legit = _make_pub(record, value=55)
+    await store.save(legit)
+
+    await outbox._dispatch_publication(legit)
+
+    assert received == [55]
+    assert legit.completed_at is not None
 
 
 @pytest.mark.asyncio
