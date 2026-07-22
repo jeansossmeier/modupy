@@ -7,9 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [1.0.0] — 2026-07-22
+## [0.9.0] — 2026-07-22
 
-**First stable release.** Modulith is production-ready with all Phase 0–3 features complete.
+**Pre-1.0 feature-complete release.** Modulith is near-production-ready with all Phase 0–3 features implemented.
 
 ### Added
 
@@ -117,10 +117,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## v1.0.0 Statistics
+## v0.9.0 Statistics
 
 - **Lines of code (core):** ~4,500 (modulith/)
-- **Test suite:** 1,376 tests, 0 failures
+- **Test suite:** 1,383 tests, 0 failures
 - **Type safety:** 100% typed, mypy `--strict` passing
 - **Documentation:** 400+ pages (guides, API, cookbook, examples)
 - **Time to first event:** <50ms (in-memory), <100ms (database), <200ms (Redis)

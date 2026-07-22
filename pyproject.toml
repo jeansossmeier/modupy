@@ -22,7 +22,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "modulith"
-version = "1.0.0"
+version = "0.9.0"
 description = "Modular monolith pattern for Python — module structure, event-driven boundaries, transactional outbox, optional process-per-module runtime."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -142,6 +142,7 @@ cli = [
 test = [
     "pytest>=7.4,<10.0",
     "pytest-asyncio>=0.23,<2.0",
+    "pytest-timeout>=2.1,<3.0",
     "sqlalchemy>=2.0,<3.0",
     "alembic>=1.13,<2.0",
     "aiosqlite>=0.19,<1.0",
@@ -195,6 +196,7 @@ dev = [
     # line is the ONLY place the constraint lives.
     "mypy>=1.10,<3.0",
     "pytest-cov>=4.1,<8.0",
+    "pytest-timeout>=2.1,<3.0",
 ]
 
 [project.urls]
@@ -233,6 +235,9 @@ modulith = "modulith.testing"
 
 [tool.hatch.build.targets.wheel]
 packages = ["modulith"]
+include = [
+    "/modulith/py.typed",
+]
 
 [tool.hatch.build.targets.sdist]
 # Keep reproducible analysis output and private broker state out even when a
@@ -269,6 +274,7 @@ python_files = "test_*.py"
 markers = [
     "integration: requires an external service (Redis, Postgres); skipped unless reachable",
     "modulith_isolated: run this test in a subprocess for full module isolation",
+    "real_process: real subprocess/signal tests that need no Docker",
 ]
 filterwarnings = [
     # aiosqlite runs one daemon worker thread per connection. Under
