@@ -65,6 +65,7 @@ def create_proxy_app(
     max_request_body_bytes: int | None = DEFAULT_MAX_REQUEST_BODY_BYTES,
     actuator_token: str | None = None,
     actuator_enabled: bool = True,
+    timeout: httpx.Timeout | None = None,
 ) -> FastAPI:
     """Build the reverse-proxy ASGI app.
 
@@ -72,13 +73,22 @@ def create_proxy_app(
     share a connection pool. When omitted, one is created and closed with the
     app's lifespan.
 
+    ``timeout`` configures the httpx client's request timeout. Defaults to
+    ``httpx.Timeout(5.0, read=None)`` — finite connect/write/pool timeouts
+    prevent hanging on unreachable backends, while ``read=None`` disables the
+    read timeout to support long-polling, streaming responses, and slow
+    upstreams. Ignored if ``client`` is injected (the caller owns the client's
+    configuration).
+
     ``actuator_enabled=False`` (``actuator_mode="disabled"``, resolved by
     ``run_supervised``) unmounts ``/_modulith/*`` entirely — those paths fall
     through to the catch-all proxy handler and answer the same 404 as any
     other unmatched path, so the actuator's existence isn't even revealed.
     """
     owns_client = client is None
-    http_client: Any = client if client is not None else httpx.AsyncClient()
+    if timeout is None:
+        timeout = httpx.Timeout(5.0, read=None)
+    http_client: Any = client if client is not None else httpx.AsyncClient(timeout=timeout)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:

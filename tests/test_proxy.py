@@ -68,6 +68,14 @@ def _upstream_app() -> FastAPI:
     async def host_header(request: Request) -> dict[str, str]:
         return {"host": request.headers.get("host", "")}
 
+    @up.get("/orders/slow")
+    async def slow_response() -> dict[str, str]:
+        import asyncio
+        # Delay >5s to exercise the read=None timeout config:
+        # without read=None, httpx would kill this with ReadTimeout.
+        await asyncio.sleep(6)
+        return {"delayed": "response"}
+
     return up
 
 
@@ -254,6 +262,26 @@ def test_proxy_rejects_body_over_limit() -> None:
         resp = client.post("/orders/echo", content=b"too-large")
 
     assert resp.status_code == 413
+
+
+def test_proxy_succeeds_with_slow_upstream() -> None:
+    """Verify that upstreams taking >5s to produce the first byte succeed.
+
+    Before the fix, httpx applied its 5-second default read timeout, killing
+    slow upstreams with ReadTimeout → 502. The fix sets read=None so streaming
+    and slow backends work correctly.
+    """
+    app = create_proxy_app(
+        [RoutingRule("/orders", "http://orders-worker")],
+        client=httpx.AsyncClient(transport=httpx.ASGITransport(app=_upstream_app())),
+    )
+    with TestClient(app) as client:
+        # /orders/slow delays 6s before responding — would fail with default
+        # httpx 5s read timeout. With read=None in the timeout config, it should
+        # succeed.
+        resp = client.get("/orders/slow", timeout=10)  # client-side timeout for test
+    assert resp.status_code == 200
+    assert resp.json() == {"delayed": "response"}
 
 
 def test_proxy_maps_redirect_loop_to_502(caplog) -> None:
