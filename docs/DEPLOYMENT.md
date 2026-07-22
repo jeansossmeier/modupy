@@ -83,6 +83,8 @@ MODULITH_BROKER=database \
   modulith run myapp.main:app --topology processes
 ```
 
+> **Single-host only.** All workers must access the same SQLite file, so this mode works only on a single machine (or a shared filesystem volume). For multi-host deployments, use Postgres or Redis instead.
+
 **What changes:**
 - Each module runs in its own worker process.
 - A reverse proxy (`modulith/proxy.py`) routes HTTP requests to the correct worker.
@@ -93,7 +95,7 @@ MODULITH_BROKER=database \
 - No Redis or other external infrastructure needed
 - Single database (SQLite or Postgres) is the inter-process broker
 - Each module is independently restartable
-- Ideal for: small-to-medium deployments where splitting processes improves isolation but a full microservices split is overkill
+- Ideal for: single-host deployments where process isolation improves fault tolerance and independent restartability without requiring external infrastructure
 
 **Configuration:**
 
@@ -169,7 +171,7 @@ MODULITH_BROKER=database \
   modulith run myapp.main:app --topology processes
 ```
 
-Uses the same `modulith_broker_*` tables as the outbox, with `FOR UPDATE SKIP LOCKED` claims for lock-free fan-out.
+Uses the `broker_message` and `broker_subscription` tables with `FOR UPDATE SKIP LOCKED` claims for lock-free fan-out. Supports multi-host deployments.
 
 **Tuning:**
 
@@ -458,7 +460,7 @@ This path is why modulith exists: **every module is a potential microservice, bu
 1. Check that the listener is registered: `modulith info` → inspect `Listeners`
 2. Verify the manifest declares the event: `_manifest.py` → check `consumes`
 3. Inspect broker state:
-   - Database: `SELECT * FROM modulith_events WHERE status != 'delivered'`
+   - Database: `SELECT * FROM broker_message WHERE status != 'delivered'`
    - Redis: `xinfo groups myapp-events`
 
 ### Worker Crash Loop
@@ -480,9 +482,9 @@ This path is why modulith exists: **every module is a potential microservice, bu
 | Broker | Setup | Durability | Scale | Ideal For |
 |---|---|---|---|---|
 | `memory` | None | No | Single-process | Dev/test |
-| `database` (SQLite) | Local file | Yes (outbox only) | Single-process + durability | Small deployments, demo |
-| `database` (Postgres) | Existing DB | Yes | Medium, all hops durable | Production monolith |
-| `redis-streams` | Docker/Cloud | Yes | High throughput | High-load production |
+| `database` (SQLite) | Local file | Yes | Single-host process-per-module (shared filesystem required for multi-process) | Dev, single-host staging |
+| `database` (Postgres) | Existing DB | Yes | Multi-host process-per-module | Production monolith and distributed |
+| `redis-streams` | Docker/Cloud | Yes | High throughput, multi-host | High-load production |
 
 ---
 

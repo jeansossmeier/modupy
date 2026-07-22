@@ -120,7 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## v1.0.0 Statistics
 
 - **Lines of code (core):** ~4,500 (modulith/)
-- **Test coverage:** 1,376 tests, 0 failures
+- **Test suite:** 1,376 tests, 0 failures
 - **Type safety:** 100% typed, mypy `--strict` passing
 - **Documentation:** 400+ pages (guides, API, cookbook, examples)
 - **Time to first event:** <50ms (in-memory), <100ms (database), <200ms (Redis)
