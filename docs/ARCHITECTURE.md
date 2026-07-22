@@ -26,7 +26,7 @@ runtime tiers. Only configuration does.
 |---|---|---|---|
 | **In-process** | `single`, `outbox=memory` | one process, in-memory event bus | dev, small apps |
 | **Durable in-process** | `single`, `outbox=postgres` | one process, events survive crashes via the outbox | production single-process |
-| **Process-per-module** | `processes` + a real broker | one subprocess per module behind a reverse proxy, events routed through the broker | when a module needs its own resource budget |
+| **Process-per-module** | `processes` (defaults to `shm`) | one subprocess per module behind a reverse proxy, events routed through the broker | when a module needs its own resource budget |
 
 The whole architecture exists to make that promise true: the same `publish()`
 call dispatches in-memory, or writes to a durable outbox, or fans out across
@@ -95,7 +95,8 @@ silently guess:
   `[tool.modulith.*]` subtables only. An empty-string env var is treated as
   *unset* (templated deploys commonly render `MODULITH_X=""`), and booleans are
   parsed strictly (`1/true/yes` · `0/false/no`) — any other value raises rather
-  than coercing garbage to `False`.
+  than coercing garbage to `False`. Broker adapters additionally layer their
+  own `MODULITH_BROKER_<KEY>` environment contract over `broker_options`.
 - **Subtable spellings are policed.** `[tool.modulith.outbox_options]` is the
   *only* outbox-options subtable; the legacy `[tool.modulith.outbox]` subtable
   raises (pointing at the new spelling — `outbox` is the scalar adapter name).
@@ -113,10 +114,10 @@ Two cross-field safety checks run in `_validate()`:
 - **`production` + defaulted memory outbox → error.** Starting production on the
   in-memory outbox would lose events on restart; you must set a durable outbox
   or explicitly opt into `outbox = "memory"`.
-- **`topology = "processes"` + memory broker → error.** The in-memory broker
-  can't carry events between processes, so this would validate clean and then
-  silently no-op delivery. (`topology = "subinterpreters"` parses but is
-  reserved/unshipped — it raises a clear "not yet implemented".)
+- **`topology = "processes"` chooses a durable broker.** With no broker or
+  URL/DSN it defaults to local `shm`; a configured URL/DSN instead infers
+  `database`. An explicit memory broker raises because it cannot carry events
+  between processes. (`topology = "subinterpreters"` remains reserved.)
 
 `Configuration.explicit_keys` records which keys the user set versus which took
 a default; the safety checks key on it (e.g. "defaulted memory outbox" is
@@ -185,7 +186,7 @@ Brokers are the exception: many can be active at once, routed by scheme (§8.2).
 worker runs one per module, built by a factory registered via
 `modulith_register_consumers`. Like brokers, exactly one consumer adapter wins
 per scheme; the redis-streams adapter registers both halves (§8.3), as does the
-database adapter (§8.4).
+database adapter (§8.4), and the local durable SHM adapter (§8.5).
 
 ### 5.3 The plugin manager and the observe-shield
 
@@ -350,7 +351,7 @@ partial cleanup beats aborting on the first failure.
 ### 8.3 The Redis Streams broker and consumer
 
 **SPEC §10.2; `modulith/adapters/redis_broker.py`, `modulith/_consumer.py`.**
-The default cross-process broker. Producing side: `XADD` to the target stream
+An explicit networked broker. Producing side: `XADD` to the target stream
 with a bounded `MAXLEN`. Consuming side (`BrokerConsumer`, one per worker):
 creates the consumer group (`XGROUP CREATE`, idempotent), reads new messages
 with `XREADGROUP`, `XACK`s on success, and reclaims messages a crashed consumer
@@ -371,15 +372,14 @@ is itself dialect-aware. Distributed via `modulith[database]` (async SQLAlchemy 
 never selects it pays nothing. SQLite doubles as a zero-infrastructure bootstrap
 broker — an embedded file (or `:memory:`) that needs no server at all.
 
-*Fan-out on write.* The producer process is module-isolated and never imports
-consumer modules, so it can't know the consumer groups statically. Instead each
-`DatabaseConsumer` self-registers its `(target, group)` subscriptions in a
+*Fan-out on write.* Each `DatabaseConsumer` self-registers its `(target, group)`
+subscriptions in a
 persistent `broker_subscription` table at `start()` (an idempotent,
 concurrency-safe dialect-native upsert). `DatabaseBroker.publish()` looks up
 every group subscribed to the target and inserts one `broker_message` row per
-group in a single transaction. Zero subscribers → zero rows (no consumer has
-registered interest yet) — an at-least-once nuance that's safe because listeners
-are idempotent, the same posture as the Redis adapter's startup-race gap.
+group in a single transaction. With no group it fails by default, waits when
+configured, or stores a retained source for replay; it never silently reports
+success after writing zero delivery rows.
 
 *Competing consumers.* `DatabaseConsumer` polls, claiming a batch of due rows
 with `FOR UPDATE SKIP LOCKED` (Postgres / MySQL / MariaDB 10.6+) so concurrent
@@ -436,6 +436,39 @@ on every connection, plus a bounded application-level retry on a transient
 `busy_timeout`, when a read lock upgrades to a write lock — exactly what a claim
 does). Postgres `LISTEN`/`NOTIFY` (a low-latency alternative to polling) is a
 planned opt-in; today the transport polls on every dialect.
+
+### 8.5 The durable local SHM broker
+
+**`modulith/adapters/shm_broker.py` and `_shm_*.py`.** This stdlib-only broker
+is the process-topology default when no broker URL/DSN is configured. Despite
+the scheme name, SQLite is authoritative: each successful publish commits the
+publication and current delivery rows before a best-effort mmap sequence hint
+is written. The mmap ring contains no payload, subscription, claim, retry, or
+completion state. Torn, missing, stale, wrapped, or incompatible hints only
+delay consumers until their periodic SQLite safety poll.
+
+Subscriptions are persisted. Every publication is retained for 24 hours, so
+groups that register after publication receive one replay before expiry instead
+of losing the startup race. Claims use owner and generation fencing. Delivery
+is at-least-once: a process crash after listener completion but before the
+fenced ack commits can cause the listener to run again.
+
+The broker is local-host only. Its canonical `state_dir`, `sqlite_path`, and
+`hint_path` resolve to absolute, package-namespaced paths under a private
+per-user state directory (`0700` directories and `0600` files on POSIX).
+Explicit SHM rejects DSNs and SQLAlchemy/network URLs. SQLite uses WAL with
+`synchronous=NORMAL` by default, which survives application/process restart on
+the same disk; set `sqlite_synchronous="FULL"` for the last commits to survive
+OS failure or power loss.
+
+Resource limits are enforced before and inside the authoritative store.
+`max_payload_bytes` defaults to 16 MiB (maximum 1 GiB) and rejects oversized
+payloads before opening a publish transaction. `max_store_bytes` defaults to
+1 GiB (maximum 1 TiB) and sets SQLite `max_page_count`; page exhaustion rejects
+the publish and rolls back, applying backpressure without corrupting existing
+rows. Both accept `MODULITH_BROKER_*` environment overrides. The legacy
+`shm_slot_size` option is deprecated and ignored because hint slots are
+fixed-size sequence records.
 
 ---
 
@@ -527,7 +560,7 @@ for the full contract.
 | Plugin system | `hooks.py`, `markers.py`, `manager.py`, `protocols.py`, `types.py` |
 | Event bus | `event_bus.py` |
 | Outbox | `builtin/outbox.py`, `adapters/postgres_outbox.py` |
-| Brokers | `brokers.py`, `adapters/redis_broker.py`, `adapters/db_broker.py`, `_consumer.py` |
+| Brokers | `brokers.py`, `adapters/redis_broker.py`, `adapters/db_broker.py`, `adapters/shm_broker.py`, `adapters/_shm_*.py`, `_consumer.py` |
 | Process topology | `_worker.py`, `supervisor.py`, `proxy.py` |
 | Verification & tooling | `builtin/verifier.py`, `builtin/audit.py`, `builtin/docs.py`, `cli.py` |
 | Observability & testing | `builtin/observability.py`, `testing.py` |

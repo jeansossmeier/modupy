@@ -50,12 +50,50 @@ jobs:
         if: matrix.python-version == '3.11'
         # Coverage is collected once on 3.11 (plan Task 9): 90% package-wide,
         # 100% on the outbox plugin. Thresholds live in pyproject.toml
-        # [tool.coverage.report] so local and CI agree.
+        # [tool.coverage.report] so local and CI agree. Use coverage.py directly
+        # instead of pytest --cov=modulith so isolated pytest subprocesses do
+        # not inherit pytest-cov's process environment.
         run: |
-          pytest -m "not integration" -v --tb=short \
-            --cov=modulith --cov-report=term-missing
+          coverage erase
+          coverage run --source=modulith --branch -m pytest \
+            -m 'not integration' -v --tb=short
           coverage report --fail-under=90
           coverage report --include='modulith/builtin/outbox.py' --fail-under=100
+
+  shm:
+    name: focused SHM (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install project
+        run: uv pip install --system -e ".[test]"
+
+      - name: Run focused SHM and state tests serially
+        run: >-
+          pytest -q
+          tests/test_shm_broker.py
+          tests/test_shm_coldstore.py
+          tests/test_shm_consumer.py
+          tests/test_shm_ring.py
+          tests/test_shm_scenarios.py
+          tests/test_shm_store.py
+          tests/test_state_path.py
 
   integration:
     name: pytest -m integration (Python ${{ matrix.python-version }})
@@ -184,6 +222,62 @@ jobs:
 
       - name: Build distributions
         run: python -m build
+
+      - name: Inspect distribution contents
+        run: |
+          python - <<'PY'
+          from pathlib import Path, PurePosixPath
+          import tarfile
+          import zipfile
+
+          adapters = Path("modulith/adapters")
+          required = {path.as_posix() for path in adapters.glob("_shm*.py")}
+          required.update(
+              {
+                  "modulith/adapters/shm_broker.py",
+                  "modulith/adapters/_state_path.py",
+                  "modulith/adapters/_consumer_protocol.py",
+                  "modulith/adapters/_delivery_dispatch.py",
+                  "modulith/adapters/_polling_consumer.py",
+              }
+          )
+
+          def normalized(names):
+              result = set()
+              for name in names:
+                  parts = PurePosixPath(name).parts
+                  if parts and parts[0].startswith("modulith-"):
+                      parts = parts[1:]
+                  if parts:
+                      result.add("/".join(parts))
+              return result
+
+          def forbidden(name):
+              parts = PurePosixPath(name).parts
+              filename = parts[-1] if parts else ""
+              analysis = any(part in {".code_analyzer", "graphify-out"} for part in parts)
+              state = filename.endswith(
+                  (".db", ".db-wal", ".db-shm", ".db-journal", ".hints", ".mmap")
+              )
+              temporary_hint = filename.endswith(".tmp") and (
+                  "hint" in filename or "mmap" in filename or "notifier" in filename
+              )
+              return analysis or state or temporary_hint
+
+          wheel = next(Path("dist").glob("*.whl"))
+          sdist = next(Path("dist").glob("*.tar.gz"))
+          with zipfile.ZipFile(wheel) as archive:
+              wheel_names = normalized(archive.namelist())
+          with tarfile.open(sdist, "r:gz") as archive:
+              sdist_names = normalized(archive.getnames())
+
+          for label, names in (("wheel", wheel_names), ("sdist", sdist_names)):
+              missing = sorted(required - names)
+              leaked = sorted(name for name in names if forbidden(name))
+              assert not missing, f"{label} missing runtime modules: {missing}"
+              assert not leaked, f"{label} contains private artifacts: {leaked}"
+              print(f"{label}: runtime modules present; private artifacts absent")
+          PY
 
       - name: Smoke-test wheel installs
         # The wheel must install cleanly into a fresh interpreter so users

@@ -794,3 +794,44 @@ def test_build_worker_env_redis_aliases_do_not_override_explicit_specific_names(
     env = _build_worker_env(spec)
 
     assert env["REDIS_URL"] == "redis://explicit-override:6379"
+
+
+def test_build_worker_env_preserves_inherited_broker_url(monkeypatch) -> None:
+    """Inherited MODULITH_BROKER_URL beats a pyproject URL forwarded in spec.env
+    — matches adapter env > broker_options precedence."""
+    monkeypatch.setenv("MODULITH_BROKER_URL", "postgresql+asyncpg://db/prod")
+    spec = WorkerSpec(
+        module_name="orders",
+        package="myapp",
+        port=9001,
+        env={
+            "MODULITH_BROKER": "database",
+            "MODULITH_BROKER_URL": "sqlite+aiosqlite:///dev.db",
+        },
+    )
+
+    env = _build_worker_env(spec)
+
+    assert env["MODULITH_BROKER_URL"] == "postgresql+asyncpg://db/prod"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "MODULITH_BROKER_STATE_DIR",
+        "MODULITH_BROKER_SQLITE_PATH",
+        "MODULITH_BROKER_HINT_PATH",
+    ],
+)
+def test_build_worker_env_preserves_nonempty_inherited_state_paths(
+    monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    monkeypatch.setenv(key, "/deployment/state")
+    spec = WorkerSpec(
+        module_name="orders",
+        package="myapp",
+        port=9001,
+        env={key: "/parent/resolved/state"},
+    )
+
+    assert _build_worker_env(spec)[key] == "/deployment/state"

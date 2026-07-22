@@ -19,9 +19,9 @@ green):
   (with ratcheting baselines), transactional outbox (Postgres adapter +
   alembic migrations), the CLI, and the documentation generator.
 - **Phase 2 — polish:** the pytest plugin, codebase audit + `doctor`
-  diagnostics, OpenTelemetry auto-instrumentation, and two cross-process
-  brokers — the production Redis Streams broker and a database-backed broker
-  (Postgres / MySQL / SQLite) for a Redis-free deployment.
+  diagnostics, OpenTelemetry auto-instrumentation, and cross-process brokers:
+  durable local SHM, Redis Streams, and a database-backed broker
+  (Postgres / MySQL / SQLite).
 - **Phase 3 — process-per-module:** the worker factory, process supervisor
   with crash recovery, reverse proxy, and cross-process event delivery through
   the broker (publishing *and* consuming — each worker subscribes to the
@@ -168,7 +168,7 @@ users never set anything beyond `outbox`:
 [tool.modulith]
 package = "myapp"               # auto-detected if not set
 outbox = "postgres"             # default "memory" — switch for production
-broker = "redis-streams"        # default "memory" — for process-per-module
+broker = "redis-streams"        # default "memory" (single) / "shm" (processes)
 topology = "single"             # "single" | "processes"
 
 [tool.modulith.workers]
@@ -186,10 +186,24 @@ sweepers), with `"advisory_lock"` (Postgres) and `"none"` as alternatives.
 
 Broker destinations for process-per-module topology are declared via
 `subscription_source` (`manifest` by default, or `config` /
-`listener`) plus static `@externalized(target=...)` inference. The database
-broker's `no_subscriber_policy` defaults to `"error"` (also `"wait"` /
-`"store"` with configurable orphan replay). Actuator protection is
+`listener`) plus static `@externalized(target=...)` inference. The SHM broker
+retains publications for 24 hours so a subscription that registers after a
+publish can replay them. The database broker's `no_subscriber_policy` defaults
+to `"error"` (also `"wait"` / `"store"` with configurable orphan replay).
+Actuator protection is
 `actuator_mode="auto"` (token required in production / non-loopback).
+
+The local SHM broker reads canonical `state_dir`, `sqlite_path`, and `hint_path`
+options. Defaults are absolute, package-namespaced paths in the platform's
+private per-user state directory (`0700` directories and `0600` files on
+POSIX). `sqlite_synchronous` defaults to `"NORMAL"`; use `"FULL"` when the last
+commits must survive OS failure or power loss. Explicit `broker = "shm"`
+accepts filesystem paths only and rejects DSNs and SQLAlchemy/network URLs.
+`max_payload_bytes` defaults to 16 MiB (maximum 1 GiB), and
+`max_store_bytes` defaults to 1 GiB (maximum 1 TiB). Oversized payloads fail
+before a SQLite transaction starts; a full store applies publish backpressure
+through SQLite `max_page_count`. Legacy `shm_slot_size` is deprecated and
+ignored because hint slots contain fixed-size sequences.
 
 The database broker reads `[tool.modulith.broker_options]` too: `url`/`dsn`
 (the SQLAlchemy URL — its dialect selects Postgres, MySQL, or SQLite),
@@ -205,7 +219,10 @@ Any *scalar* key has a `MODULITH_*` env var equivalent for production
 overrides (e.g. `MODULITH_OUTBOX`, `MODULITH_BROKER`, `MODULITH_PRODUCTION`).
 The table-valued keys (`outbox_options`, `broker_options`, `workers`) are
 pyproject-only — but a couple of adapters lift their own subtable from the
-environment on top. The Redis Streams broker honors `REDIS_URL` (plus
+environment on top. The SHM broker honors `MODULITH_BROKER_STATE_DIR`,
+`MODULITH_BROKER_SQLITE_PATH`, `MODULITH_BROKER_HINT_PATH`,
+`MODULITH_BROKER_MAX_PAYLOAD_BYTES`, and
+`MODULITH_BROKER_MAX_STORE_BYTES`. The Redis Streams broker honors `REDIS_URL` (plus
 `MODULITH_CONSUMER_GROUP` / `MODULITH_STREAM_PREFIX` /
 `MODULITH_STREAM_MAXLEN`); the database broker reads every `broker_options`
 key from `MODULITH_BROKER_<KEY>` (e.g. `MODULITH_BROKER_URL`,
@@ -213,11 +230,19 @@ key from `MODULITH_BROKER_<KEY>` (e.g. `MODULITH_BROKER_URL`,
 receives its connection URL; and the packaged alembic migration runner reads
 `MODULITH_DB_URL` (see [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md), Step 5).
 
-For `topology = "processes"` a real cross-process broker is required:
-leaving the default `broker = "memory"` in place is a loud
-`ConfigurationError` at startup, and a broker scheme with no registered
-adapter is a startup warning plus a `ConfigurationError` on the first
-cross-process publish — never a silently-dropped event.
+For `topology = "processes"`, an omitted broker defaults to the stdlib-only
+`shm` adapter. If `broker_options.url`/`dsn` or its environment equivalent is
+present, modulith instead infers `database`. An explicit `broker = "memory"` is
+a loud `ConfigurationError`; explicit SHM rejects connection URLs.
+
+Despite its name, SHM is a same-host durable SQLite queue. Every successful
+publish has committed to SQLite before the file-backed mmap ring receives an
+advisory sequence hint. Missing, torn, stale, or wrapped hints only delay the
+next safety poll; they never own payloads or delivery state. `NORMAL` survives
+application, worker, supervisor, and process restart on the same disk.
+Delivery is at-least-once: a crash after the listener returns but before its
+ack commits can deliver the event again, so listeners must be idempotent.
+Use a networked `database` or Redis broker for cross-host delivery.
 
 ---
 

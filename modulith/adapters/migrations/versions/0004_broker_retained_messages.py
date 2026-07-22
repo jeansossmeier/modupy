@@ -22,7 +22,7 @@ _ID_LEN = 64
 _TARGET_LEN = 255
 _GROUP_LEN = 255
 _EVENT_TYPE_LEN = 255
-_TS = sa.DateTime(timezone=True).with_variant(MySQLDateTime(fsp=6), "mysql")
+_TS = sa.DateTime(timezone=True).with_variant(MySQLDateTime(fsp=6), "mysql", "mariadb")
 
 
 def upgrade() -> None:

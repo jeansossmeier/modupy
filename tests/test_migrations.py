@@ -201,6 +201,47 @@ def test_broker_migration_column_metadata_matches_schema(tmp_path: Path) -> None
         assert migrated == from_schema, f"{table}: migration {migrated} != schema {from_schema}"
 
 
+def test_broker_timestamp_types_compile_with_microseconds_for_mysql_and_mariadb() -> None:
+    """Runtime and migration timestamps must retain sub-second precision."""
+    import importlib
+
+    from sqlalchemy import DateTime
+    from sqlalchemy.dialects.mysql import dialect as mysql_dialect
+    from sqlalchemy.dialects.mysql import mariadb
+
+    from modulith.adapters.db_broker import broker_schema
+
+    metadata, _, _ = broker_schema()
+    timestamp_types = {
+        f"{table.name}.{column.name}": column.type
+        for table in metadata.tables.values()
+        for column in table.columns
+        if isinstance(column.type, DateTime)
+    }
+    assert set(timestamp_types) == {
+        "broker_subscription.updated_at",
+        "broker_message.available_at",
+        "broker_message.claimed_at",
+        "broker_message.created_at",
+        "broker_retained_message.created_at",
+        "broker_retained_message.expires_at",
+        "broker_retained_delivery.delivered_at",
+    }
+
+    revision_0002 = importlib.import_module(
+        "modulith.adapters.migrations.versions.0002_broker_message"
+    )
+    revision_0004 = importlib.import_module(
+        "modulith.adapters.migrations.versions.0004_broker_retained_messages"
+    )
+    for dialect in (mysql_dialect(), mariadb.MariaDBDialect()):
+        assert {
+            column_type.compile(dialect=dialect) for column_type in timestamp_types.values()
+        } == {"DATETIME(6)"}
+        assert revision_0002._TS.compile(dialect=dialect) == "DATETIME(6)"
+        assert revision_0004._TS.compile(dialect=dialect) == "DATETIME(6)"
+
+
 def test_alembic_offline_mode_emits_full_ddl(tmp_path: Path, capsys) -> None:
     """A6-r2-89: offline/--sql mode (env.py's run_migrations_offline) must
     render the complete DDL — both tables and the pending partial index —

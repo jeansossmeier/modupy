@@ -444,12 +444,40 @@ def _run_process_topology(
     # differ, and its own configure() call doesn't read them — so without this
     # a URL/DSN (or any tuning key) set in pyproject or resolved at the parent
     # never reaches the worker's broker/consumer, and e.g. the database broker
-    # fails to build an engine. Env takes precedence over the subtable per
-    # _broker_opt, which is the documented resolution order.
-    worker_env: dict[str, str] = {"MODULITH_BROKER": cfg.broker}
+    # fails to build an engine.
+    #
+    # Precedence matches _broker_opt (env > broker_options): never overwrite a
+    # non-empty MODULITH_BROKER_* already in the parent's environment. Omit
+    # MODULITH_BROKER when the parent auto-defaulted it so workers also see
+    # is_explicit("broker") == False. Structured option values (dicts/lists)
+    # are JSON-encoded — str(dict) is not json.loads()-able.
+    worker_env: dict[str, str] = {}
+    if cfg.is_explicit("broker"):
+        worker_env["MODULITH_BROKER"] = cfg.broker
     for key, value in (cfg.broker_options or {}).items():
-        if value is not None:
-            worker_env[f"MODULITH_BROKER_{key.upper()}"] = str(value)
+        if value is None:
+            continue
+        env_key = f"MODULITH_BROKER_{key.upper()}"
+        if os.environ.get(env_key):
+            continue  # parent env already wins
+        if isinstance(value, (dict, list)):
+            worker_env[env_key] = json.dumps(value)
+        else:
+            worker_env[env_key] = str(value)
+    if cfg.broker == "shm":
+        from .adapters.shm_broker import _resolve_shm_paths
+
+        state_dir, sqlite_path, hint_path = _resolve_shm_paths(
+            cfg.package,
+            cfg.broker_options or {},
+        )
+        for env_key, path in (
+            ("MODULITH_BROKER_STATE_DIR", state_dir),
+            ("MODULITH_BROKER_SQLITE_PATH", sqlite_path),
+            ("MODULITH_BROKER_HINT_PATH", hint_path),
+        ):
+            if not os.environ.get(env_key):
+                worker_env[env_key] = str(path)
 
     config: dict[str, Any] = {
         "package": cfg.package,

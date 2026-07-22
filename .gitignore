@@ -193,16 +193,26 @@ cython_debug/
 #   and can be added to the global gitignore or merged into this file.
 .idea/
 
-# graphify knowledge-graph output — locally-built analysis artifacts, never
-# tracked and never packaged (W3 R5-03: a local sdist build swept 386 stray
-# files from these directories into the tarball).
+# Local analysis output is reproducible and must never be tracked or packaged.
+.code_analyzer/
 graphify-out/
 
-# modulith embedded SQLite broker file (auto-created when topology='processes'
-# with no broker url configured; override with broker_options.url).
-.modulith-broker.db
-.modulith-broker.db-wal
-.modulith-broker.db-shm
+# Private local broker state. The defaults normally live outside the project in
+# a per-user state directory; these patterns protect explicit project-local paths.
+.modulith-broker.db*
+.modulith-broker-*.db*
+.modulith-shm-broker.db*
+.modulith-shm-broker-*.db*
+.modulith-*.db-journal
+.modulith-*.hints
+# SQLite sidecars and SHM hint files may use explicit non-default basenames.
+*.db-wal
+*.db-shm
+*.db-journal
+*.hints
+*.mmap
+.*.hints.*.tmp
+.*.mmap.*.tmp
 
 # Abstra
 #   Abstra is an AI-powered process automation framework.

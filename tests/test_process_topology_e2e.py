@@ -1,4 +1,4 @@
-"""Process-per-module topology end-to-end: real workers, proxy, and Redis.
+"""Process-per-module topology end-to-end with real workers and brokers.
 
 Everything below the supervisor is tested in isolation elsewhere — ``create_app``
 with a TestClient (test_worker.py), the proxy with an in-process backend
@@ -9,11 +9,12 @@ with a TestClient (test_worker.py), the proxy with an in-process backend
     (``modulith._worker:create_app``), one per module;
   * the reverse proxy routes real HTTP to the correct worker by path prefix;
   * placing an order through the proxy publishes an event that crosses a real
-    process boundary over real Redis and fires a listener in the *other* worker;
+    process boundary and fires a listener in the *other* worker;
   * ``Supervisor.stop()`` tears the fleet down.
 
-Provisioned by ``redis_url``/``redis_client`` (testcontainers Redis); skipped
-without Docker. Slow (spawns real processes) — hence ``@pytest.mark.integration``.
+The Redis variant uses testcontainers and skips without Docker. The local SHM
+variant uses only private files under ``tmp_path``. Both are slow because they
+spawn real processes, hence ``@pytest.mark.integration``.
 """
 
 from __future__ import annotations
@@ -72,8 +73,11 @@ def _write_app(root: Path) -> None:
     (pkg / "orders" / "__init__.py").write_text(
         dedent(
             """
+            import os
+
             from fastapi import APIRouter
             from modulith import publish
+            from modulith.runtime import _runtime
             from shopapp.contracts import OrderPlaced
 
             router = APIRouter()
@@ -83,6 +87,19 @@ def _write_app(root: Path) -> None:
                 # No local listener here → the runtime routes this to the broker.
                 await publish(OrderPlaced(order_id=order_id))
                 return {"order_id": order_id}
+
+            @router.get("/broker-paths")
+            async def broker_paths() -> dict:
+                registry = _runtime.broker_registry
+                assert registry is not None
+                broker = registry.get("shm")
+                return {
+                    "broker": _runtime.config.broker,
+                    "state_dir": os.environ["MODULITH_BROKER_STATE_DIR"],
+                    "sqlite_path": os.environ["MODULITH_BROKER_SQLITE_PATH"],
+                    "hint_path": os.environ["MODULITH_BROKER_HINT_PATH"],
+                    "ring_path": str(broker._ring.path),
+                }
             """
         )
     )
@@ -91,8 +108,11 @@ def _write_app(root: Path) -> None:
     (pkg / "inventory" / "__init__.py").write_text(
         dedent(
             """
+            import os
+
             from fastapi import APIRouter
             from modulith import listener
+            from modulith.runtime import _runtime
             from shopapp.contracts import OrderPlaced
 
             received: list[str] = []
@@ -105,6 +125,19 @@ def _write_app(root: Path) -> None:
             @router.get("/received")
             async def get_received() -> dict:
                 return {"received": received}
+
+            @router.get("/broker-paths")
+            async def broker_paths() -> dict:
+                registry = _runtime.broker_registry
+                assert registry is not None
+                broker = registry.get("shm")
+                return {
+                    "broker": _runtime.config.broker,
+                    "state_dir": os.environ["MODULITH_BROKER_STATE_DIR"],
+                    "sqlite_path": os.environ["MODULITH_BROKER_SQLITE_PATH"],
+                    "hint_path": os.environ["MODULITH_BROKER_HINT_PATH"],
+                    "ring_path": str(broker._ring.path),
+                }
             """
         )
     )
@@ -132,6 +165,67 @@ async def _wait_healthy(client: httpx.AsyncClient, port: int, module: str) -> No
     await _until_async(ok, timeout=40.0)
 
 
+def _port_is_closed(port: int) -> bool:
+    """Return whether no process accepts TCP connections on the worker port."""
+    with socket.socket() as probe:
+        probe.settimeout(0.1)
+        return probe.connect_ex(("127.0.0.1", port)) != 0
+
+
+async def _stop_and_assert_workers_gone(supervisor: Supervisor, ports: tuple[int, ...]) -> None:
+    """Bound supervisor shutdown and reap every process after partial startup."""
+    try:
+        await asyncio.wait_for(supervisor.stop(), timeout=15.0)
+    finally:
+        processes = tuple(supervisor._processes.values())
+
+        # stop() normally reaps every process. This fallback also covers a
+        # cancelled or partially failed stop without leaving worker ports open.
+        for process in processes:
+            if process.returncode is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+        if processes:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(process.wait() for process in processes)),
+                    timeout=5.0,
+                )
+            except TimeoutError:
+                for process in processes:
+                    if process.returncode is None:
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                await asyncio.wait_for(
+                    asyncio.gather(*(process.wait() for process in processes)),
+                    timeout=5.0,
+                )
+
+        # A failed stop may not reach its task cleanup. Cancel and await the
+        # remaining test-owned monitor/log tasks before the event loop closes.
+        tasks = [*supervisor._monitor_tasks, *supervisor._log_tasks]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=5.0,
+            )
+
+        assert all(process.returncode is not None for process in processes)
+
+        async def all_ports_closed() -> bool:
+            return all(_port_is_closed(port) for port in ports)
+
+        await _until_async(all_ports_closed, timeout=5.0, interval=0.05)
+        assert all(_port_is_closed(port) for port in ports)
+
+
 async def test_two_real_workers_route_http_and_deliver_cross_process_event(
     tmp_path, redis_url, redis_client
 ) -> None:
@@ -153,8 +247,8 @@ async def test_two_real_workers_route_http_and_deliver_cross_process_event(
     ]
 
     supervisor = Supervisor(specs)
-    await supervisor.start()
     try:
+        await supervisor.start()
         # Workers come up as real uvicorn processes; wait for both to be ready.
         async with httpx.AsyncClient(timeout=5.0) as direct:
             await _wait_healthy(direct, orders_port, "orders")
@@ -189,9 +283,97 @@ async def test_two_real_workers_route_http_and_deliver_cross_process_event(
 
             await _until_async(delivered, timeout=20.0)
     finally:
-        await supervisor.stop()
+        await _stop_and_assert_workers_gone(supervisor, (orders_port, inventory_port))
 
-    # After shutdown the worker processes are gone.
-    async with httpx.AsyncClient(timeout=2.0) as direct:
-        with pytest.raises(httpx.HTTPError):
-            await direct.get(f"http://127.0.0.1:{orders_port}/health")
+
+@pytest.mark.parametrize("explicit_broker", [False, True], ids=["default-shm", "explicit-shm"])
+async def test_two_real_workers_share_parent_resolved_shm_and_deliver_exact_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    explicit_broker: bool,
+) -> None:
+    """Default and explicit SHM workers must converge on the parent's files."""
+    _write_app(tmp_path)
+    state_dir = (tmp_path / "state").resolve()
+    sqlite_path = (state_dir / "broker.db").resolve()
+    hint_path = (state_dir / "broker.hints").resolve()
+    order_id = f"shm-{'explicit' if explicit_broker else 'default'}"
+
+    # Ambient broker settings have higher precedence than WorkerSpec.env.
+    # Remove them so this test proves the parent-resolved values below.
+    for key in (
+        "MODULITH_BROKER",
+        "MODULITH_BROKER_URL",
+        "MODULITH_BROKER_DSN",
+        "MODULITH_BROKER_STATE_DIR",
+        "MODULITH_BROKER_SQLITE_PATH",
+        "MODULITH_BROKER_HINT_PATH",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    worker_env = {
+        "MODULITH_BROKER_STATE_DIR": str(state_dir),
+        "MODULITH_BROKER_SQLITE_PATH": str(sqlite_path),
+        "MODULITH_BROKER_HINT_PATH": str(hint_path),
+        "MODULITH_BROKER_POLL_INTERVAL_MS": "10",
+        "PYTHONPATH": f"{tmp_path}{os.pathsep}{_REPO_ROOT}",
+    }
+    if explicit_broker:
+        worker_env["MODULITH_BROKER"] = "shm"
+
+    orders_port = _free_port()
+    inventory_port = _free_port()
+    specs = [
+        WorkerSpec(module_name="orders", package="shopapp", port=orders_port, env=dict(worker_env)),
+        WorkerSpec(
+            module_name="inventory",
+            package="shopapp",
+            port=inventory_port,
+            env=dict(worker_env),
+        ),
+    ]
+    supervisor = Supervisor(specs, shutdown_timeout=5.0)
+    try:
+        await asyncio.wait_for(supervisor.start(), timeout=10.0)
+        async with httpx.AsyncClient(timeout=5.0) as direct:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    _wait_healthy(direct, orders_port, "orders"),
+                    _wait_healthy(direct, inventory_port, "inventory"),
+                ),
+                timeout=40.0,
+            )
+
+        proxy_app = create_proxy_app(_rules_from_specs(specs))
+        transport = httpx.ASGITransport(app=proxy_app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+            timeout=10.0,
+        ) as client:
+            expected_paths = {
+                "broker": "shm",
+                "state_dir": str(state_dir),
+                "sqlite_path": str(sqlite_path),
+                "hint_path": str(hint_path),
+                "ring_path": str(hint_path),
+            }
+            orders_paths = await client.get("/orders/broker-paths")
+            inventory_paths = await client.get("/inventory/broker-paths")
+            assert orders_paths.json() == expected_paths
+            assert inventory_paths.json() == expected_paths
+
+            before = await client.get("/inventory/received")
+            assert before.json() == {"received": []}
+            placed = await client.post("/orders/place", params={"order_id": order_id})
+            assert placed.json() == {"order_id": order_id}
+
+            async def delivered_exactly_once() -> bool:
+                response = await client.get("/inventory/received")
+                return response.status_code == 200 and response.json() == {"received": [order_id]}
+
+            await _until_async(delivered_exactly_once, timeout=20.0)
+            assert sqlite_path.is_file()
+            assert hint_path.is_file()
+    finally:
+        await _stop_and_assert_workers_gone(supervisor, (orders_port, inventory_port))

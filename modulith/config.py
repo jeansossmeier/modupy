@@ -16,15 +16,28 @@ from __future__ import annotations
 
 import difflib
 import logging
+import math
 import os
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ._claims import VALID_CLAIM_STRATEGIES
 
 logger = logging.getLogger(__name__)
+
+_SHM_SYNCHRONOUS_MODES = frozenset({"NORMAL", "FULL"})
+_SHM_COMPLETION_MODES = frozenset({"delete", "mark"})
+_SHM_MAX_HINT_CAPACITY = 1_000_000
+_SHM_MAX_CLAIM_BATCH_SIZE = 10_000
+_SHM_MAX_DISPATCH_CONCURRENCY = 1_000
+_SHM_MAX_DELIVERY_ATTEMPTS = 10_000
+DEFAULT_SHM_MAX_PAYLOAD_BYTES = 16 * 1024**2
+DEFAULT_SHM_MAX_STORE_BYTES = 1024**3
+_SHM_MAX_PAYLOAD_BYTES = 1024**3
+_SHM_MAX_STORE_BYTES = 1024**4
 
 
 class ConfigurationError(Exception):
@@ -44,12 +57,10 @@ _VALID_TOPOLOGIES = ("single", "processes", "subinterpreters")
 _VALID_SUBSCRIPTION_SOURCES = ("manifest", "config", "listener")
 _VALID_ACTUATOR_MODES = ("auto", "token", "open", "disabled")
 
-# Filename of the embedded SQLite broker file that the database broker
-# adapter creates in the process cwd when topology='processes' defaults the
-# broker and no broker_options url is configured. Owned here (not in the
-# adapter) so the defaulting warning below, the adapter's path construction
-# (modulith/adapters/db_broker.py), and .gitignore all share one literal.
+# Filenames used inside the package-namespaced per-user state directory.
+# They remain centralized so configuration warnings and adapters agree.
 DEFAULT_BROKER_DB_FILENAME = ".modulith-broker.db"
+DEFAULT_SHM_BROKER_DB_FILENAME = ".modulith-shm-broker.db"
 
 
 @dataclass(frozen=True)
@@ -78,7 +89,8 @@ class Configuration:
 
     # Default broker for cross-process events. "memory" only valid when
     # topology == "single". When topology == "processes" and this is absent,
-    # load_configuration automatically defaults to "database" (embedded SQLite).
+    # load_configuration defaults to durable local SHM, or to database when
+    # an effective URL/DSN preserves a legacy database-broker configuration.
     broker: str = "memory"
 
     # Source used to resolve cross-process listener subscriptions.
@@ -136,40 +148,221 @@ def load_configuration(**overrides: Any) -> Configuration:
 
     # Validate before constructing — fail fast on typos and bad values.
     _validate(explicit)
+    broker_options = explicit.get("broker_options")
+    if (
+        isinstance(broker_options, dict) and "shm_slot_size" in broker_options
+    ) or "MODULITH_BROKER_SHM_SLOT_SIZE" in os.environ:
+        logger.warning(
+            "shm_slot_size is deprecated and ignored; SHM hints use fixed-size sequence slots"
+        )
 
     # Freeze explicit_keys BEFORE injecting the broker default so
     # cfg.is_explicit("broker") stays False for the auto-default case.
     explicit_keys = frozenset(explicit.keys())
     if explicit.get("topology") == "processes" and "broker" not in explicit:
-        explicit["broker"] = "database"
-        broker_options = explicit.get("broker_options")
-        configured_url = (
-            broker_options.get("url") or broker_options.get("dsn")
-            if isinstance(broker_options, dict)
-            else None
-        )
-        if configured_url:
-            # A url without a scalar broker name: adopt the 'database' adapter
-            # for it rather than claiming an SQLite file that will never exist.
-            # A non-database url (e.g. redis://) will fail loudly at engine
-            # construction — the warning names the adapter so that error is
-            # traceable to this default.
+        configured_url = _configured_broker_url(explicit.get("broker_options"))
+        explicit["broker"] = "database" if configured_url is not None else "shm"
+        if configured_url is not None:
             logger.warning(
-                "topology='processes' with broker_options.url but no broker "
-                "name — defaulting to the 'database' adapter for %r. Set "
-                "[tool.modulith].broker explicitly if a different adapter "
-                "was intended.",
-                configured_url,
+                "topology='processes' with a broker URL but no broker "
+                "name \u2014 inferring the 'database' adapter for %s.",
+                _redact_broker_url(configured_url),
             )
         else:
             logger.warning(
-                "topology='processes' with no broker configured — defaulting to "
-                "the embedded SQLite database broker (file '%s' in the working "
-                "directory). Set [tool.modulith].broker explicitly to silence "
-                "this warning.",
-                DEFAULT_BROKER_DB_FILENAME,
+                "topology='processes' with no broker configured \u2014 defaulting to "
+                "the durable SHM broker with embedded SQLite (file '%s' in a "
+                "private per-user state directory). Set "
+                "[tool.modulith].broker explicitly to silence this warning.",
+                DEFAULT_SHM_BROKER_DB_FILENAME,
             )
     return Configuration(**explicit, explicit_keys=explicit_keys)
+
+
+def _redact_broker_url(url: object) -> str:
+    """Return a parsed, fail-closed rendering that never exposes credentials."""
+    if not isinstance(url, str):
+        return f"<{type(url).__name__}>"
+    if any(ord(character) < 32 for character in url):
+        return "<redacted broker URL>"
+    try:
+        parsed = urlsplit(url)
+        if not parsed.scheme or "://" not in url:
+            return "<redacted broker URL>"
+        # These properties perform urllib's bracket and port validation.
+        _ = parsed.hostname, parsed.port
+        netloc = parsed.netloc
+        if netloc.count("@") > 1:
+            return "<redacted broker URL>"
+        if "@" in netloc:
+            _userinfo, host = netloc.rsplit("@", 1)
+            if not host:
+                return "<redacted broker URL>"
+            netloc = f"***@{host}"
+
+        query = [(key, "***") for key, _value in parse_qsl(parsed.query, keep_blank_values=True)]
+        fragment = "***" if parsed.fragment else ""
+        return urlunsplit((parsed.scheme, netloc, parsed.path, urlencode(query), fragment))
+    except (TypeError, ValueError, UnicodeError):
+        return "<redacted broker URL>"
+
+
+def _configured_broker_url(broker_options: object) -> str | None:
+    """Return the effective connection URL while preserving URL/DSN precedence."""
+    env_url = _env_str("MODULITH_BROKER_URL")
+    if env_url is not None:
+        return env_url if _looks_like_connection_url(env_url) else None
+    env_dsn = _env_str("MODULITH_BROKER_DSN")
+    if env_dsn is not None:
+        return env_dsn
+    if isinstance(broker_options, dict):
+        url = broker_options.get("url")
+        if isinstance(url, str) and url:
+            return url if _looks_like_connection_url(url) else None
+        dsn = broker_options.get("dsn")
+        if isinstance(dsn, str) and dsn:
+            return dsn
+    return None
+
+
+def _looks_like_connection_url(value: str) -> bool:
+    """Distinguish URL syntax from the SHM adapter's plain path compatibility alias."""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return True
+    return bool(parsed.scheme and "://" in value)
+
+
+def _validate_shm_broker_options(options: dict[str, Any]) -> None:
+    """Validate every built-in SHM option before adapter construction."""
+    for name in ("state_dir", "sqlite_path", "hint_path", "shm_name", "url"):
+        if name in options and (not isinstance(options[name], str) or not options[name].strip()):
+            raise ConfigurationError(f"broker_options.{name} must be a non-empty filesystem path")
+
+    env_url = _env_str("MODULITH_BROKER_URL")
+    option_url = options.get("url")
+    configured_url = (
+        env_url
+        if env_url is not None
+        else option_url
+        if isinstance(option_url, str) and option_url
+        else None
+    )
+    if env_url is None and (
+        _env_str("MODULITH_BROKER_DSN") is not None
+        or (configured_url is None and options.get("dsn"))
+    ):
+        raise ConfigurationError(
+            "broker='shm' does not accept a DSN; use state_dir, sqlite_path, and hint_path instead."
+        )
+
+    if configured_url is not None and _looks_like_connection_url(configured_url):
+        raise ConfigurationError(
+            "broker='shm' accepts only filesystem paths, not SQLAlchemy or "
+            "network URLs. Use state_dir/sqlite_path/hint_path, or select "
+            "broker='database' for a database URL."
+        )
+
+    _validate_shm_int_option(
+        options,
+        "shm_capacity",
+        maximum=_SHM_MAX_HINT_CAPACITY,
+    )
+    _validate_shm_int_option(
+        options,
+        "max_payload_bytes",
+        maximum=_SHM_MAX_PAYLOAD_BYTES,
+    )
+    _validate_shm_int_option(
+        options,
+        "max_store_bytes",
+        maximum=_SHM_MAX_STORE_BYTES,
+    )
+    _validate_shm_int_option(
+        options,
+        "batch_size",
+        maximum=_SHM_MAX_CLAIM_BATCH_SIZE,
+    )
+    _validate_shm_int_option(
+        options,
+        "dispatch_concurrency",
+        maximum=_SHM_MAX_DISPATCH_CONCURRENCY,
+    )
+    _validate_shm_int_option(
+        options,
+        "max_delivery_attempts",
+        maximum=_SHM_MAX_DELIVERY_ATTEMPTS,
+    )
+    for name in ("poll_interval_ms", "reclaim_stale_seconds", "retention_age_seconds"):
+        _validate_shm_float_option(options, name, allow_zero=False)
+    _validate_shm_float_option(options, "prune_interval_seconds", allow_zero=True)
+
+    if "sqlite_synchronous" in options:
+        value = options["sqlite_synchronous"]
+        if type(value) is not str or value.upper() not in _SHM_SYNCHRONOUS_MODES:
+            raise ConfigurationError(
+                f"broker_options.sqlite_synchronous must be NORMAL or FULL, got {value!r}"
+            )
+    if "completion_mode" in options:
+        value = options["completion_mode"]
+        if type(value) is not str or value not in _SHM_COMPLETION_MODES:
+            raise ConfigurationError(
+                "broker_options.completion_mode must be one of "
+                f"{sorted(_SHM_COMPLETION_MODES)}, got {value!r}"
+            )
+
+
+def _validate_shm_int_option(
+    options: dict[str, Any],
+    name: str,
+    *,
+    maximum: int,
+) -> None:
+    if name not in options:
+        return
+    value = options[name]
+    if type(value) is int:
+        number = value
+    elif type(value) is str:
+        try:
+            number = int(value)
+        except ValueError as exc:
+            raise ConfigurationError(
+                f"broker_options.{name} must be an integer from 1 to {maximum}, got {value!r}"
+            ) from exc
+    else:
+        raise ConfigurationError(
+            f"broker_options.{name} must be an integer from 1 to {maximum}, got {value!r}"
+        )
+    if not 1 <= number <= maximum:
+        raise ConfigurationError(
+            f"broker_options.{name} must be an integer from 1 to {maximum}, got {value!r}"
+        )
+
+
+def _validate_shm_float_option(
+    options: dict[str, Any],
+    name: str,
+    *,
+    allow_zero: bool,
+) -> None:
+    if name not in options:
+        return
+    value = options[name]
+    if isinstance(value, bool):
+        number = math.nan
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = math.nan
+    minimum_valid = number >= 0 if allow_zero else number > 0
+    if not math.isfinite(number) or not minimum_valid:
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ConfigurationError(
+            f"broker_options.{name} must be a finite {qualifier} number, got {value!r}"
+        )
 
 
 # Configuration fields that hold tables of options rather than scalars.
@@ -538,6 +731,13 @@ def _validate(data: dict[str, Any]) -> None:
     broker_options = data.get("broker_options")
     if data.get("broker", "memory") == "redis-streams" and broker_options is not None:
         _validate_redis_broker_options(broker_options)
+    selected_broker = data.get("broker")
+    if selected_broker is None and data.get("topology") == "processes":
+        selected_broker = (
+            "database" if _configured_broker_url(broker_options) is not None else "shm"
+        )
+    if selected_broker == "shm":
+        _validate_shm_broker_options(broker_options or {})
 
     workers = data.get("workers")
     if workers is not None:
@@ -585,29 +785,34 @@ def _validate(data: dict[str, Any]) -> None:
         )
 
     # Cross-field: a multi-process topology needs a real cross-process broker.
-    # An absent broker is fine — load_configuration will default it to "database".
+    # An absent broker is fine — load_configuration will default it to "shm".
     # An *explicit* memory broker is always wrong for cross-process topologies.
     effective_topology = data.get("topology", "single")
-    if (
-        effective_topology in ("processes", "subinterpreters")
-        and data.get("broker") == "memory"
-    ):
+    if effective_topology in ("processes", "subinterpreters") and data.get("broker") == "memory":
         raise ConfigurationError(
             f"topology={effective_topology!r} requires a cross-process broker, but "
             "broker='memory' was explicitly configured. Set [tool.modulith].broker "
-            "to a real adapter (e.g. 'database' or 'redis-streams'); "
+            "to a real adapter (e.g. 'shm', 'database', or 'redis-streams'); "
             "broker='memory' is only valid for topology='single'."
         )
 
-    # Production mode + defaulted process broker = implicit embedded SQLite in
-    # production. Refuse unless the broker is explicit.
-    if data.get("production") and effective_topology == "processes" and "broker" not in data:
+    # Production + explicit database broker still needs a URL — otherwise
+    # registration invents a per-host SQLite file and cross-host delivery splits.
+    if (
+        data.get("production")
+        and effective_topology == "processes"
+        and data.get("broker") == "database"
+        and _configured_broker_url(data.get("broker_options")) is None
+    ):
         raise ConfigurationError(
-            "Cannot start in production mode with a defaulted broker for "
-            "topology='processes' — events would ride an implicit embedded SQLite "
-            "file. Set [tool.modulith].broker explicitly (e.g. 'database' or "
-            "'redis-streams')."
+            "Cannot start in production with broker='database' and no URL — "
+            "an implicit embedded SQLite file is not durable across hosts. "
+            "Set [tool.modulith.broker_options].url or MODULITH_BROKER_URL."
         )
+
+    # Blank / whitespace-only broker names are never valid schemes.
+    if "broker" in data and isinstance(data["broker"], str) and not data["broker"].strip():
+        raise ConfigurationError(f"broker must be a non-empty adapter name, got {data['broker']!r}")
 
     # "subinterpreters" is reserved but unshipped (SPEC §9.5 option C;
     # ROADMAP Phase 4). Accepting it would route the app through the real

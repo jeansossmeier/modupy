@@ -111,6 +111,8 @@ The defaults stack:
 - **Event bus**: in-memory async bus, no broker required
 - **Outbox**: disabled by default; enable with `outbox = "postgres"` in pyproject
 - **Topology**: single-process; flip to processes with one flag
+- **Broker**: in-memory for `single`; durable local `shm` for `processes` unless
+  a configured URL/DSN selects `database`
 - **Observability**: auto-enabled if OpenTelemetry is installed, silent no-op if not
 - **Verification**: warnings in dev, hard checks via `modulith verify` in CI
 - **Logging**: standard library `logging`, inherits app's config
@@ -432,9 +434,9 @@ In `modulith/config.py`. Resolution order (highest priority first):
 3. `[tool.modulith]` section in pyproject.toml
 4. Hardcoded defaults
 
-Every *scalar* `Configuration` field has a `MODULITH_<KEY>` env var equivalent: `MODULITH_PACKAGE`, `MODULITH_CONTRACTS_MODULE`, `MODULITH_OUTBOX`, `MODULITH_TOPOLOGY`, `MODULITH_BROKER`, `MODULITH_PRODUCTION`, `MODULITH_AUTO_DISCOVER`, `MODULITH_OBSERVABILITY`, `MODULITH_VERIFY_MANIFESTS`. Booleans accept `1`/`true`/`yes` and `0`/`false`/`no` (case-insensitive); any other non-empty value raises `ConfigurationError`. The dict-typed fields (`outbox_options`, `broker_options`, `workers`) have **no** env var — they come only from the `[tool.modulith.*]` subtables in pyproject.toml. Adapter-specific env vars are separate contracts: the Redis Streams broker reads `REDIS_URL`, `MODULITH_CONSUMER_GROUP`, `MODULITH_STREAM_PREFIX`, `MODULITH_STREAM_MAXLEN` ([§10.2](#102-redis-streams-broker)), and the packaged alembic migration runner reads `MODULITH_DB_URL` ([§10.1](#101-postgres-outbox-store)).
+Every *scalar* `Configuration` field has a `MODULITH_<KEY>` env var equivalent: `MODULITH_PACKAGE`, `MODULITH_CONTRACTS_MODULE`, `MODULITH_OUTBOX`, `MODULITH_TOPOLOGY`, `MODULITH_BROKER`, `MODULITH_PRODUCTION`, `MODULITH_AUTO_DISCOVER`, `MODULITH_OBSERVABILITY`, `MODULITH_VERIFY_MANIFESTS`. Booleans accept `1`/`true`/`yes` and `0`/`false`/`no` (case-insensitive); any other non-empty value raises `ConfigurationError`. The dict-typed fields (`outbox_options`, `broker_options`, `workers`) have **no generic** env var — they come from the `[tool.modulith.*]` subtables in pyproject.toml. Adapter-specific env vars are separate contracts: SHM and database options use `MODULITH_BROKER_<KEY>`, Redis Streams reads `REDIS_URL`, `MODULITH_CONSUMER_GROUP`, `MODULITH_STREAM_PREFIX`, and `MODULITH_STREAM_MAXLEN`, and the packaged alembic runner reads `MODULITH_DB_URL`.
 
-Validation happens before construction. Unknown keys raise `ConfigurationError` with the list of valid keys (catches typos). Production mode + default memory outbox raises (forces explicit opt-in for unsafe defaults).
+Validation happens before construction. Unknown keys raise `ConfigurationError` with the list of valid keys (catches typos). Production mode + default memory outbox raises (forces explicit opt-in for unsafe defaults). Process topology defaults to local `shm`; an URL/DSN without an explicit broker selects `database`. Explicit `shm` accepts filesystem paths only and rejects DSNs and SQLAlchemy/network URLs.
 
 The `explicit_keys: frozenset[str]` field tracks which values were set vs defaulted. Used by the production safety check.
 
@@ -606,7 +608,7 @@ The v2 wedge. The feature that makes "modulith now, microservices later" credibl
 
 Three options, ranked by setup ease:
 
-- **A. One process per module, local broker for IPC** ✅ **chosen.** Each module runs as its own uvicorn worker. Communication via Redis Streams (default) or any registered broker. Reuses outbox + externalization machinery. Latency: ~1-5ms per inter-module call.
+- **A. One process per module, local broker for IPC** ✅ **chosen.** Each module runs as its own uvicorn worker. Communication defaults to the durable local SHM/SQLite broker; configured URL/DSN options select the database broker, while Redis Streams remains explicit. Reuses outbox + externalization machinery. Latency is workload- and host-dependent and must be measured, not assumed.
 - **B. Unix domain sockets** — lower latency, no broker dependency, but you lose durability without keeping Postgres in the loop. Net complexity gain is small.
 - **C. Subinterpreters (PEP 734, 3.13+)** — true per-module GIL, no IPC. Ecosystem support too thin in 2026. Worth designing toward; not worth shipping on.
 
@@ -704,7 +706,7 @@ v2.1 enhancement.
 ```toml
 [tool.modulith]
 topology = "processes"       # or "single" ("subinterpreters" is reserved, not yet implemented)
-broker = "redis-streams"     # REQUIRED for topology = "processes"
+# broker omitted             # defaults to local durable "shm"
 
 [tool.modulith.workers]
 default = 1
@@ -715,10 +717,11 @@ There is no `[tool.modulith.supervisor]` subtable — configuration resolution r
 
 Startup failure modes for the cross-process broker are deliberately loud:
 
-- `topology = "processes"` (or the reserved `"subinterpreters"`) with the
-  default in-memory broker raises `ConfigurationError` at configuration
-  resolution — an in-memory broker cannot carry events between processes,
-  so this combination would silently no-op delivery.
+- `topology = "processes"` with no broker or URL/DSN selects local `shm`; a
+  URL/DSN instead selects `database`. Explicit `broker = "memory"` raises
+  because an in-memory broker cannot carry events between processes.
+- Explicit `broker = "shm"` rejects DSNs and SQLAlchemy/network URLs; use its
+  canonical filesystem options or select `database`.
 - `topology = "subinterpreters"` parses as a known topology but is rejected
   with "not yet implemented" (reserved for a future release; ROADMAP Phase 4).
 - A cross-process topology whose configured broker *scheme* has no registered
@@ -785,7 +788,7 @@ MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
 
 ### 10.2 Redis Streams Broker
 
-Extra: `modulith[redis]` (`modulith/adapters/redis_broker.py`). Implements `Broker` against `redis.asyncio`. Default broker for process-per-module mode because of its low-millisecond latencies (the ~1-5ms per inter-module call of [§9.1](#91-the-topology-decision)) and ubiquity.
+Extra: `modulith[redis]` (`modulith/adapters/redis_broker.py`). Implements `Broker` against `redis.asyncio`. It is an explicit networked choice for process-per-module deployments.
 
 Select the broker by name, and supply connection options under the
 `[tool.modulith.broker]` subtable. TOML forbids one key (`broker`) being both a
@@ -821,6 +824,40 @@ Size `max_stream_len` well above the worst-case backlog (publish rate ×
 consumer downtime/latency). The dead-letter stream is likewise bounded
 (`dlq_max_stream_len`, default 10× `max_stream_len`) and best-effort, not a
 durable audit log — size it to the forensic retention window you need.
+
+### 10.2a Durable Local SHM Broker
+
+Extra: none; `modulith/adapters/shm_broker.py` and `_shm_*.py` use only the
+standard library. This is the implicit broker for `topology = "processes"` when
+no URL/DSN is configured, and it is local-host only.
+
+The scheme name does not define the durability boundary. SQLite is
+authoritative for publications, subscriptions, claims, retries, and completion.
+Every successful publish commits SQLite before writing a best-effort sequence
+hint to the file-backed mmap ring. The ring never contains payload or delivery
+state; missing, torn, stale, wrapped, or incompatible hints fall back to a
+periodic SQLite safety poll.
+
+Publications are retained for 24 hours. A consumer group that subscribes after
+publication receives one replay before expiry, preventing silent loss during
+worker startup. Delivery is at-least-once: a crash after listener completion
+but before the fenced acknowledgement commits can cause a duplicate.
+
+Canonical `state_dir`, `sqlite_path`, and `hint_path` resolve to absolute,
+package-namespaced paths under a private per-user directory (`0700` directories
+and `0600` files on POSIX). Explicit SHM rejects DSNs and SQLAlchemy/network
+URLs. WAL with `synchronous=NORMAL` survives application/process restart on the
+same disk; `FULL` is the explicit opt-in for OS-failure and power-loss
+durability.
+
+Two byte limits bound the authoritative store. `max_payload_bytes` defaults to
+16 MiB and cannot exceed 1 GiB; payload validation occurs before the publish
+transaction. `max_store_bytes` defaults to 1 GiB and cannot exceed 1 TiB; it is
+translated to SQLite `max_page_count`, so page exhaustion rolls back and
+rejects the publish as backpressure. Both have
+`MODULITH_BROKER_MAX_PAYLOAD_BYTES` / `MODULITH_BROKER_MAX_STORE_BYTES`
+overrides. `shm_slot_size` is deprecated and ignored because mmap hint slots
+are fixed-size sequence records.
 
 ### 10.3 Kafka Broker (planned — not shipped)
 
@@ -1007,6 +1044,14 @@ A compressed summary of MIGRATION_GUIDE.md's seven steps — three phases, delib
 
 Process-per-module (guide Step 6) and true microservices extraction (guide Step 7) are optional later moves justified by data, not architecture.
 
+### 13.4 Migrating the Legacy SHM Store
+
+Stop the full process fleet and back up its private state directory before the
+first new worker opens the old overflow-only v0 database. First open migrates
+the `shm_message` schema transactionally. Only messages that spilled to that
+SQLite store are recoverable; payloads that existed only in the old ring cannot
+be recovered. Never mix old and new workers against the same state files.
+
 ---
 
 ## Part XIV — The Seven Gap Mitigations
@@ -1039,7 +1084,7 @@ From the brutal-truth analysis. Each gap has a concrete mitigation.
 
 ### Gap 7: The plugin ecosystem might never form
 
-**Mitigation:** reframe the positioning. Plugin system is for internal modularity, not for community ecosystem. We ship 3 first-party adapters today (Postgres outbox, Redis Streams broker, OpenTelemetry observability), with Kafka and RabbitMQ brokers on the Phase 4 roadmap — together covering the large majority of users. Community plugins are nice-to-have, not required for success.
+**Mitigation:** reframe the positioning. Plugin system is for internal modularity, not for community ecosystem. First-party adapters cover the Postgres outbox, durable local SHM, Redis Streams, relational-database brokering, and OpenTelemetry; Kafka and RabbitMQ remain Phase 4. Community plugins are nice-to-have, not required for success.
 
 ---
 
@@ -1179,6 +1224,9 @@ The minimum scope where modulith provides value over "FastAPI plus folders."
 | `__init__.py` | ✅ | ~10 | Namespace package |
 | `postgres_outbox.py` | ✅ | ~180 | SQLAlchemy + Postgres PublicationStore, alembic migrations (Phase 1) |
 | `redis_broker.py` | ✅ | ~80 | Redis Streams Broker (Phase 2) |
+| `db_broker.py` | ✅ | — | Postgres/MySQL/SQLite database broker |
+| `shm_broker.py` + `_shm_*.py` | ✅ | — | SQLite-authoritative local broker + advisory mmap hints |
+| `_state_path.py` | ✅ | — | Private package-namespaced broker state paths |
 | `kafka_broker.py` | ⏳ | ~80 | Kafka Broker (Phase 4 — not shipped, see §10.3) |
 
 ### Tests: `tests/`
@@ -1273,12 +1321,14 @@ dependencies = ["pluggy>=1.3"]
 [project.optional-dependencies]
 postgres = ["sqlalchemy>=2.0", "asyncpg>=0.29", "alembic>=1.13"]
 redis = ["redis>=5.0"]
+database = ["sqlalchemy>=2.0", "asyncpg>=0.29", "aiomysql>=0.2", "aiosqlite>=0.19", "..."]
+# local SHM broker has no extra; it is stdlib-only
 # no kafka extra — the adapter is Phase 4, unshipped (§10.3)
 otel = ["opentelemetry-api", "opentelemetry-sdk"]
 fastapi = ["fastapi>=0.110", "uvicorn>=0.27", "httpx>=0.26"]
 cli = ["typer>=0.12", "rich>=13.0"]
 test = ["pytest", "pytest-asyncio", "..."]  # see pyproject.toml for the full pins
-all = ["modulith[postgres,redis,otel,fastapi,cli,test]"]
+all = ["modulith[postgres,redis,database,otel,fastapi,cli,test]"]
 
 [project.scripts]
 modulith = "modulith.cli:main"

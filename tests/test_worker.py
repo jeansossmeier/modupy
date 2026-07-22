@@ -14,6 +14,8 @@ routing is a separate concern (covered with the topology/proxy work).
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
 import sys
 
 import pytest
@@ -22,6 +24,7 @@ from fastapi.testclient import TestClient
 import modulith._worker as worker_module
 from modulith import ConfigurationError, Consumer, ConsumerSpec
 from modulith._worker import _build_consumer, create_app
+from modulith.adapters.shm_broker import ShmBroker, ShmConsumer
 from modulith.protocols import ConsumerHealth, ConsumerStatus
 from modulith.runtime import _runtime
 
@@ -467,6 +470,49 @@ def test_listener_free_worker_does_not_require_broker_adapters(
     create_app()
 
     assert _build_consumer("orders") is None
+
+
+def test_shm_worker_without_listeners_reconciles_previous_deployment(
+    make_fake_app,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+    database_path = tmp_path / "worker.db"
+    monkeypatch.setenv("MODULITH_BROKER", "shm")
+    monkeypatch.setenv("MODULITH_BROKER_SQLITE_PATH", str(database_path))
+    monkeypatch.setenv("MODULITH_BROKER_HINT_PATH", str(tmp_path / "worker.hints"))
+
+    app = create_app()
+    assert _runtime.broker_registry is not None
+    broker = _runtime.broker_registry.get("shm")
+    assert isinstance(broker, ShmBroker)
+    asyncio.run(broker._cold.get_subscriptions())
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        INSERT INTO shm_subscription (target, consumer_group)
+        VALUES ('events.PreviousListener', 'modulith-orders')
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    # Starting the listener-free redeployment must reconcile the stale set.
+    # It needs no poll task because there are no current delivery targets.
+    with TestClient(app):
+        consumer = app.state.consumer
+        assert isinstance(consumer, ShmConsumer)
+        assert consumer._task is None
+        connection = sqlite3.connect(database_path)
+        try:
+            subscriptions = connection.execute(
+                "SELECT target, consumer_group FROM shm_subscription"
+            ).fetchall()
+        finally:
+            connection.close()
+        assert subscriptions == []
 
 
 # ---------------------------------------------------------------------------

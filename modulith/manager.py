@@ -49,6 +49,7 @@ BUILTIN_PLUGINS = (
     "modulith.builtin.observability",
     "modulith.adapters.redis_broker",
     "modulith.adapters.db_broker",
+    "modulith.adapters.shm_broker",
 )
 
 # Name the observe-shield registers under. Listed in ``disable`` it can be

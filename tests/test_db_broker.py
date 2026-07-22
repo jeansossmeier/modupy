@@ -28,6 +28,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -35,6 +36,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from modulith import Broker, BrokerRegistry, Consumer, ConsumerRegistry, ConsumerSpec, event
+from modulith.adapters._state_path import _namespace
 from modulith.adapters.db_broker import (
     _SQLITE_BUSY_MAX_RETRIES,
     DatabaseBroker,
@@ -676,6 +678,27 @@ async def test_subscription_upsert_is_idempotent(engine: Any) -> None:
     assert await _row_count(engine, table=subscription) == 1  # never duplicated
 
 
+def test_mariadb_subscription_upsert_compiles_idempotent_statement() -> None:
+    """MariaDB subscriptions must update an existing composite-key row."""
+    from sqlalchemy.dialects.mysql import mariadb
+
+    dialect = mariadb.MariaDBDialect()
+    broker = DatabaseBroker(engine=SimpleNamespace(dialect=dialect))
+    _, subscription, _ = broker_schema()
+    rows = [
+        {
+            "target": "fakeapp.orders.WidgetCreated",
+            "consumer_group": "modulith-inventory",
+            "updated_at": datetime.now(UTC),
+        }
+    ]
+
+    statement = broker._upsert_subscription(subscription, rows)
+    sql = str(statement.compile(dialect=dialect))
+
+    assert "ON DUPLICATE KEY UPDATE" in sql
+
+
 # ---------------------------------------------------------------------------
 # Claim -> dispatch -> ack, end to end through the real consumer loop
 # ---------------------------------------------------------------------------
@@ -836,8 +859,10 @@ async def test_heartbeat_keeps_slow_batch_from_peer_reclaim(engine: Any) -> None
     because the batch heartbeat renews the claim at reclaim/3 cadence."""
     delivered: list[str] = []
     release = asyncio.Event()
+    handler_started = asyncio.Event()
 
     async def slow_handler(evt: WidgetCreated) -> None:
+        handler_started.set()
         await asyncio.wait_for(release.wait(), timeout=5.0)
         delivered.append(evt.name)
 
@@ -862,10 +887,10 @@ async def test_heartbeat_keeps_slow_batch_from_peer_reclaim(engine: Any) -> None
         payload = serializer.serialize(WidgetCreated(name="w1"))
         await broker.publish(target, payload, {"event_type": target})
 
-        # Hold the listener well past the 1.0s reclaim window. The heartbeat
-        # (ticking ~every 0.33s) must keep the claim fresh the whole time; a
-        # runner stall would have to exceed ~0.67s between two renewals to
-        # produce a false steal.
+        # Wait until THIS consumer owns the row and is dispatching, then hold
+        # past the reclaim window. Without handler_started a late claim could
+        # still look fresh even with no heartbeat.
+        await asyncio.wait_for(handler_started.wait(), timeout=5.0)
         await asyncio.sleep(1.5)
         stolen = await broker.claim_batch(
             "modulith-inventory",
@@ -890,8 +915,10 @@ async def test_lease_cap_releases_rows_of_wedged_listener(engine: Any) -> None:
     claim goes stale, and a peer reclaims the row (at-least-once liveness).
     Lower-bound timing only — a slow runner just waits longer."""
     wedged = asyncio.Event()  # never set — the listener hangs forever
+    handler_started = asyncio.Event()
 
     async def wedged_handler(evt: WidgetCreated) -> None:
+        handler_started.set()
         await wedged.wait()
 
     bus = InMemoryEventBus()
@@ -915,6 +942,17 @@ async def test_lease_cap_releases_rows_of_wedged_listener(engine: Any) -> None:
         payload = serializer.serialize(WidgetCreated(name="w1"))
         await broker.publish(target, payload, {"event_type": target})
 
+        # Prove the original consumer claimed and entered the handler before
+        # any peer reclaim — otherwise the peer could win the first claim.
+        await asyncio.wait_for(handler_started.wait(), timeout=5.0)
+        early = await broker.claim_batch(
+            "modulith-inventory",
+            batch_size=10,
+            consumer_name="peer",
+            reclaim_stale_seconds=0.1,
+        )
+        assert early == []  # still owned + renewed
+
         async def _peer_reclaims() -> bool:
             rows = await broker.claim_batch(
                 "modulith-inventory",
@@ -933,23 +971,25 @@ async def test_lease_cap_releases_rows_of_wedged_listener(engine: Any) -> None:
 
 
 async def test_dispatch_concurrency_fans_out_within_batch(engine: Any) -> None:
-    """With dispatch_concurrency=4, four claimed rows dispatch concurrently:
-    every handler blocks until all four have STARTED — sequential dispatch
-    would deadlock here, so completion proves the fan-out."""
+    """With dispatch_concurrency=2 and four rows, at most two handlers run at
+    once and all four eventually complete — proves both the fan-out and the
+    semaphore ceiling (concurrency=4 with four rows would not catch a missing
+    semaphore)."""
     started = 0
-    all_started = asyncio.Event()
+    max_inflight = 0
+    gate = asyncio.Event()
     delivered: list[str] = []
 
-    async def rendezvous_handler(evt: WidgetCreated) -> None:
-        nonlocal started
+    async def gated_handler(evt: WidgetCreated) -> None:
+        nonlocal started, max_inflight
         started += 1
-        if started == 4:
-            all_started.set()
-        await asyncio.wait_for(all_started.wait(), timeout=5.0)
+        max_inflight = max(max_inflight, started)
+        await asyncio.wait_for(gate.wait(), timeout=5.0)
+        started -= 1
         delivered.append(evt.name)
 
     bus = InMemoryEventBus()
-    bus.register(WidgetCreated, rendezvous_handler)
+    bus.register(WidgetCreated, gated_handler)
     serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
 
     broker = DatabaseBroker(engine=engine)
@@ -963,11 +1003,8 @@ async def test_dispatch_concurrency_fans_out_within_batch(engine: Any) -> None:
         targets=[target],
         poll_interval_s=0.01,
         batch_size=10,
-        dispatch_concurrency=4,
+        dispatch_concurrency=2,
     )
-    # Publish all four rows BEFORE the loop starts: the first claim then takes
-    # them in ONE batch, which the rendezvous below requires (a row claimed in
-    # an earlier batch could never see the other three start).
     await broker.subscribe([target], "modulith-inventory")
     for i in range(4):
         payload = serializer.serialize(WidgetCreated(name=f"w{i}"))
@@ -975,6 +1012,13 @@ async def test_dispatch_concurrency_fans_out_within_batch(engine: Any) -> None:
 
     await consumer.start()
     try:
+        # Wait until the concurrency ceiling is visibly hit.
+        async def _ceiling_hit() -> bool:
+            return max_inflight >= 2
+
+        await _until_async(_ceiling_hit, timeout=5.0)
+        assert max_inflight == 2
+        gate.set()
 
         async def _all_delivered() -> bool:
             return sorted(delivered) == ["w0", "w1", "w2", "w3"]
@@ -982,6 +1026,7 @@ async def test_dispatch_concurrency_fans_out_within_batch(engine: Any) -> None:
         await _until_async(_all_delivered)
         await _until_async(lambda: _zero_rows(engine))
     finally:
+        gate.set()
         await consumer.stop()
 
 
@@ -1168,6 +1213,101 @@ async def test_double_stop_does_not_raise(engine: Any) -> None:
     await consumer.stop()  # second stop — must not raise
 
 
+async def test_database_consumer_idle_wait_retains_asyncio_sleep_timing(engine: Any) -> None:
+    consumer = DatabaseConsumer(
+        broker=DatabaseBroker(engine=engine),
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=["fakeapp.orders.WidgetCreated"],
+    )
+
+    started_at = asyncio.get_running_loop().time()
+    await consumer._wait_when_idle(0.03)
+
+    assert asyncio.get_running_loop().time() - started_at >= 0.025
+
+
+async def test_database_consumer_empty_claim_uses_fixed_poll_interval(engine: Any) -> None:
+    class ObservedIdleConsumer(DatabaseConsumer):
+        def __init__(self, **options: Any) -> None:
+            super().__init__(**options)
+            self.delays: list[float] = []
+
+        async def _wait_when_idle(self, safety_timeout: float) -> None:
+            self.delays.append(safety_timeout)
+            if len(self.delays) == 4:
+                self._stopping = True
+
+    broker = DatabaseBroker(engine=engine)
+    target = "fakeapp.orders.WidgetCreated"
+    await broker.subscribe([target], "modulith-inventory")
+    consumer = ObservedIdleConsumer(
+        broker=broker,
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=[target],
+        poll_interval_s=0.01,
+    )
+
+    await asyncio.wait_for(consumer._run(), timeout=5.0)
+
+    assert consumer.delays == [0.01] * 4
+
+
+async def test_stop_propagates_cancellation_of_the_stopping_task(engine: Any) -> None:
+    child_is_unwinding = asyncio.Event()
+    release_child = asyncio.Event()
+
+    async def child() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            child_is_unwinding.set()
+            await release_child.wait()
+            raise
+
+    async def prune() -> None:
+        await asyncio.Event().wait()
+
+    consumer = DatabaseConsumer(
+        broker=DatabaseBroker(engine=engine),
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=["fakeapp.orders.WidgetCreated"],
+    )
+    child_task = asyncio.create_task(child())
+    prune_task = asyncio.create_task(prune())
+    consumer._task = child_task
+    consumer._prune_task = prune_task
+    stop_task = asyncio.create_task(consumer.stop())
+    await asyncio.wait_for(child_is_unwinding.wait(), timeout=1.0)
+    stop_task.cancel()
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+        assert consumer._task is None
+        assert consumer._prune_task is None
+        assert child_task.done()
+        assert prune_task.done()
+        assert consumer.health() == ConsumerHealth(ready=False, status="stopped")
+    finally:
+        release_child.set()
+        for task in (child_task, prune_task, stop_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(child_task, prune_task, stop_task, return_exceptions=True),
+            timeout=1.0,
+        )
+
+
 async def test_no_targets_start_is_noop(engine: Any) -> None:
     """A leaf module with no @listener has no targets — start() must not
     launch a background task, and stop() must still be safe."""
@@ -1258,22 +1398,43 @@ async def test_database_consumer_health_reports_unexpected_task_exit(engine: Any
         consumer_name="inventory:1",
         group="modulith-inventory",
         targets=["fakeapp.orders.WidgetCreated"],
+        prune_interval_s=60,
+        retention_count=100,
     )
 
     async def crash() -> None:
         raise RuntimeError("database poll loop crashed")
 
     consumer._run = crash  # type: ignore[method-assign]
-    await consumer.start()
+    try:
+        await consumer.start()
 
-    async def _failed() -> bool:
-        return consumer.health().status == "failed"
+        async def _failed() -> bool:
+            return consumer.health().status == "failed"
 
-    await _until_async(_failed)
-    health = consumer.health()
-    assert health.ready is False
-    assert health.detail == "database poll loop crashed"
-    await consumer.stop()
+        await _until_async(_failed)
+        health = consumer.health()
+        assert health.ready is False
+        assert health.detail == "database poll loop crashed"
+        failed_task = consumer._task
+        stale_prune_task = consumer._prune_task
+        assert failed_task is not None and failed_task.done()
+        assert stale_prune_task is not None and not stale_prune_task.done()
+
+        async def run_after_restart() -> None:
+            await asyncio.Event().wait()
+
+        consumer._run = run_after_restart  # type: ignore[method-assign]
+        await consumer.start()
+        await asyncio.sleep(0)
+
+        assert consumer._task is not failed_task
+        assert consumer._task is not None and not consumer._task.done()
+        assert stale_prune_task.done()
+        assert consumer._prune_task is not stale_prune_task
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+    finally:
+        await consumer.stop()
 
 
 async def test_database_consumer_write_failures_recover_independently(engine: Any) -> None:
@@ -2166,14 +2327,16 @@ async def test_pool_options_applied_for_non_sqlite() -> None:
         await engine.dispose()
 
 
-async def test_pool_options_ignored_for_sqlite(tmp_path: Path) -> None:
-    """pool_size given but SQLite's pool rejects it — _create_engine must drop
-    it rather than raise, and still produce a working engine."""
+async def test_sqlite_file_pool_defaults_to_single_connection(tmp_path: Path) -> None:
+    """File-backed SQLite defaults to pool_size=1 / max_overflow=0 — a wider
+    pool only amplifies SQLITE_BUSY under concurrent dispatch."""
     from sqlalchemy import text
 
     url = f"sqlite+aiosqlite:///{tmp_path / 'nopool.db'}"
-    engine = _create_engine(url, {"pool_size": 5, "max_overflow": 2})
+    engine = _create_engine(url, {})
     try:
+        assert engine.sync_engine.pool.size() == 1
+        assert engine.sync_engine.pool._max_overflow == 0
         async with engine.connect() as conn:
             assert (await conn.execute(text("SELECT 1"))).scalar_one() == 1
     finally:
@@ -2228,19 +2391,30 @@ async def test_max_overflow_env_override_reaches_engine(monkeypatch: Any) -> Non
 
 
 async def test_busy_timeout_env_override_reaches_sqlite(tmp_path: Path, monkeypatch: Any) -> None:
-    """``MODULITH_BROKER_BUSY_TIMEOUT_MS`` overrides the SQLite busy_timeout with
-    no subtable value."""
+    """A configured wait larger than the write budget is capped."""
     from sqlalchemy import text
 
-    monkeypatch.setenv("MODULITH_BROKER_BUSY_TIMEOUT_MS", "2222")
+    from modulith.adapters.db_broker import _SQLITE_BUSY_TOTAL_BUDGET_S
+
+    monkeypatch.setenv("MODULITH_BROKER_BUSY_TIMEOUT_MS", "99999")
     url = f"sqlite+aiosqlite:///{tmp_path / 'envbusy.db'}"
     engine = _create_engine(url, {})
     try:
         async with engine.connect() as conn:
             busy = (await conn.execute(text("PRAGMA busy_timeout"))).scalar_one()
-        assert int(busy) == 2222
+        assert int(busy) == int(_SQLITE_BUSY_TOTAL_BUDGET_S * 1000)
     finally:
         await engine.dispose()
+
+
+def test_sqlite_busy_timeout_must_be_positive(tmp_path: Path) -> None:
+    from modulith import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="busy_timeout_ms"):
+        _create_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'invalid-busy.db'}",
+            {"busy_timeout_ms": 0},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2312,6 +2486,7 @@ class _FlakyEngine:
         self.fail_times = fail_times
         self.error_text = error_text
         self.begins = 0
+        self.dialect = SimpleNamespace(name="sqlite")
 
     def begin(self) -> _FlakyBegin:
         return _FlakyBegin(self)
@@ -2356,6 +2531,134 @@ async def test_write_does_not_retry_non_lock_errors() -> None:
     with pytest.raises(OperationalError):
         await broker._write(op)
     assert broker._engine.begins == 1  # non-lock error propagates on first try
+
+
+class _BlockedBegin:
+    def __init__(self, entered: asyncio.Event) -> None:
+        self._entered = entered
+        self._release = asyncio.Event()
+
+    async def __aenter__(self) -> object:
+        self._entered.set()
+        await self._release.wait()
+        return object()
+
+    async def __aexit__(self, *_: Any) -> bool:
+        return False
+
+
+class _BlockedEngine:
+    def __init__(self, dialect: str = "sqlite") -> None:
+        self.entered = asyncio.Event()
+        self._begin = _BlockedBegin(self.entered)
+        self.dialect = SimpleNamespace(name=dialect)
+
+    def begin(self) -> _BlockedBegin:
+        return self._begin
+
+
+async def test_write_deadline_bounds_a_blocked_operation(monkeypatch: Any) -> None:
+    import modulith.adapters.db_broker as db_broker_module
+
+    monkeypatch.setattr(db_broker_module, "_SQLITE_BUSY_TOTAL_BUDGET_S", 0.05)
+    broker = DatabaseBroker(engine=_BlockedEngine())
+
+    async def op(_conn: Any) -> None:
+        pytest.fail("a blocked transaction must not enter the operation")
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(TimeoutError):
+        await broker._write(op)
+
+    assert loop.time() - started < 0.5
+
+
+async def test_real_sqlite_write_lock_times_out_without_late_mutation(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    import sqlite3
+
+    from sqlalchemy import insert
+
+    import modulith.adapters.db_broker as db_broker_module
+
+    monkeypatch.setattr(db_broker_module, "_SQLITE_BUSY_TOTAL_BUDGET_S", 0.1)
+    db_path = tmp_path / "real-write-deadline.db"
+    broker = DatabaseBroker(
+        url=f"sqlite+aiosqlite:///{db_path}",
+        engine_options={"busy_timeout_ms": 10},
+    )
+    lock = sqlite3.connect(db_path, timeout=0.1, isolation_level=None)
+    try:
+        await broker._ensure_schema()
+        _, subscription, _ = broker_schema()
+        lock.execute("BEGIN IMMEDIATE")
+
+        async def insert_subscription(conn: Any) -> None:
+            await conn.execute(
+                insert(subscription).values(
+                    target="late.Event",
+                    consumer_group="late-group",
+                    updated_at=datetime.now(UTC),
+                )
+            )
+
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(broker._write(insert_subscription), timeout=1.0)
+        assert asyncio.get_running_loop().time() - started < 0.5
+
+        lock.rollback()
+        await asyncio.sleep(0.1)
+        row = lock.execute(
+            "SELECT COUNT(*) FROM broker_subscription "
+            "WHERE target='late.Event' AND consumer_group='late-group'"
+        ).fetchone()
+        assert row == (0,)
+    finally:
+        if lock.in_transaction:
+            lock.rollback()
+        lock.close()
+        await broker.close()
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+async def test_write_preserves_server_database_blocking_semantics(
+    monkeypatch: Any,
+    dialect: str,
+) -> None:
+    import modulith.adapters.db_broker as db_broker_module
+
+    monkeypatch.setattr(db_broker_module, "_SQLITE_BUSY_TOTAL_BUDGET_S", 0.01)
+    engine = _BlockedEngine(dialect)
+    broker = DatabaseBroker(engine=engine)
+
+    async def op(_conn: Any) -> str:
+        return "ok"
+
+    task = asyncio.create_task(broker._write(op))
+    await asyncio.wait_for(engine.entered.wait(), timeout=1.0)
+    await asyncio.sleep(0.03)
+    engine._begin._release.set()
+
+    assert await asyncio.wait_for(task, timeout=1.0) == "ok"
+
+
+async def test_write_propagates_external_cancellation() -> None:
+    engine = _BlockedEngine()
+    broker = DatabaseBroker(engine=engine)
+
+    async def op(_conn: Any) -> None:
+        pytest.fail("a blocked transaction must not enter the operation")
+
+    task = asyncio.create_task(broker._write(op))
+    await asyncio.wait_for(engine.entered.wait(), timeout=1.0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 # ---------------------------------------------------------------------------
@@ -2518,30 +2821,191 @@ def test_make_db_consumer_reads_reclaim_and_max_attempts(make_fake_app: Any) -> 
     assert consumer._dispatch_concurrency == 7
 
 
-
 def test_registration_defaults_to_sqlite_file_url(
     make_fake_app: Any, monkeypatch: Any, tmp_path: Any
 ) -> None:
-    """When topology='processes' with no broker_options.url, the registration
-    hook auto-selects an embedded SQLite file ABSOLUTIZED from the process cwd
-    (supervisor and workers must converge on ONE file; a relative URL would
-    silently split the queue on a later chdir). The engine is lazy (no file
-    created at this point), so only the URL string is checked."""
-    monkeypatch.chdir(tmp_path)  # keep default broker file out of the repo
+    """The implicit database file lives in private package-namespaced state."""
+    state_home = tmp_path / "state-home"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
     make_fake_app({"orders": ""})
     from modulith import configure
-    from modulith.config import DEFAULT_BROKER_DB_FILENAME
 
-    configure(package="fakeapp", topology="processes")  # no broker, no url
+    configure(package="fakeapp", topology="processes", broker="database")  # explicit db broker
     _runtime.ensure_bootstrapped()
 
     assert _runtime.broker_registry is not None
     broker = _runtime.broker_registry.get("database")
     assert isinstance(broker, DatabaseBroker)
-    assert (
-        str(broker.engine.url)
-        == f"sqlite+aiosqlite:///{tmp_path / DEFAULT_BROKER_DB_FILENAME}"
+    db_path = state_home / "modulith" / _namespace("fakeapp") / ".modulith-broker.db"
+    assert str(broker.engine.url) == f"sqlite+aiosqlite:///{db_path}"
+    assert db_path.is_file()
+    assert not db_path.is_symlink()
+    assert (db_path.stat().st_mode & 0o777) == 0o600
+
+
+async def test_default_url_preserves_question_mark_in_state_home(
+    make_fake_app: Any, monkeypatch: Any, tmp_path: Any
+) -> None:
+    """A state directory containing '?' must not truncate the SQLite path."""
+    weird = tmp_path / "state?review"
+    monkeypatch.setenv("XDG_STATE_HOME", str(weird))
+    make_fake_app({"orders": ""})
+    from modulith import configure
+
+    configure(package="fakeapp", topology="processes", broker="database")
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.broker_registry is not None
+    broker = _runtime.broker_registry.get("database")
+    assert isinstance(broker, DatabaseBroker)
+    # Engine must open the real path, not the truncated '/.../modupy' prefix.
+    from sqlalchemy import text
+
+    async with broker.engine.connect() as conn:
+        assert (await conn.execute(text("SELECT 1"))).scalar_one() == 1
+    db_path = weird / "modulith" / _namespace("fakeapp") / ".modulith-broker.db"
+    assert db_path.is_file()
+    assert broker.engine.url.database == str(db_path)
+
+
+def test_implicit_database_rejects_symlink_final_path(
+    make_fake_app: Any, monkeypatch: Any, tmp_path: Path
+) -> None:
+    from modulith import ConfigurationError, configure
+
+    state_home = tmp_path / "state-home"
+    make_fake_app({"orders": ""})
+    state_dir = state_home / "modulith" / _namespace("fakeapp")
+    state_dir.mkdir(parents=True, mode=0o700)
+    target = tmp_path / "target.db"
+    target.write_bytes(b"unchanged")
+    (state_dir / ".modulith-broker.db").symlink_to(target)
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    configure(package="fakeapp", topology="processes", broker="database")
+
+    with pytest.raises(ConfigurationError, match="symlink"):
+        _runtime.ensure_bootstrapped()
+
+    assert target.read_bytes() == b"unchanged"
+
+
+async def test_ensure_schema_survives_concurrent_sqlite_bootstrap(tmp_path: Path) -> None:
+    """Multiple consumers racing create_all on a fresh file must all succeed."""
+    url = f"sqlite+aiosqlite:///{tmp_path / 'race.db'}"
+    brokers = [DatabaseBroker(url=url) for _ in range(4)]
+    try:
+        results = await asyncio.gather(
+            *(broker.subscribe(["app.Event"], f"g-{i}") for i, broker in enumerate(brokers)),
+            return_exceptions=True,
+        )
+        assert not [r for r in results if isinstance(r, BaseException)], results
+    finally:
+        await asyncio.gather(*(broker.close() for broker in brokers), return_exceptions=True)
+
+
+async def test_broker_tables_present_requires_retained_tables(engine: Any) -> None:
+    metadata, subscription, message = broker_schema()
+    broker = DatabaseBroker(engine=engine)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(
+            lambda sync_conn: metadata.create_all(
+                sync_conn,
+                tables=[subscription, message],
+            )
+        )
+
+    assert await broker._broker_tables_present() is False
+    await broker._ensure_schema()
+    assert await broker._broker_tables_present() is True
+
+
+class _BlockedSchemaConn:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run_sync(self, _fn: Any) -> None:
+        self.entered.set()
+        await self.release.wait()
+
+
+class _BlockedSchemaEngine:
+    def __init__(self, dialect: str = "sqlite") -> None:
+        self.conn = _BlockedSchemaConn()
+        self.dialect = SimpleNamespace(name=dialect)
+
+    def begin(self) -> _RaceBegin:
+        return _RaceBegin(self.conn)  # type: ignore[arg-type]
+
+
+async def test_schema_deadline_does_not_cache_readiness(monkeypatch: Any) -> None:
+    import modulith.adapters.db_broker as db_broker_module
+
+    monkeypatch.setattr(db_broker_module, "_SQLITE_SCHEMA_BUSY_BUDGET_S", 0.05)
+    broker = DatabaseBroker(engine=_BlockedSchemaEngine())
+
+    with pytest.raises(TimeoutError):
+        await broker._ensure_schema()
+
+    assert broker._schema_ready is False
+
+
+async def test_real_sqlite_schema_lock_times_out_without_late_creation(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    import sqlite3
+
+    import modulith.adapters.db_broker as db_broker_module
+
+    monkeypatch.setattr(db_broker_module, "_SQLITE_SCHEMA_BUSY_BUDGET_S", 0.1)
+    db_path = tmp_path / "real-schema-deadline.db"
+    lock = sqlite3.connect(db_path, timeout=0.1, isolation_level=None)
+    lock.execute("BEGIN IMMEDIATE")
+    broker = DatabaseBroker(
+        url=f"sqlite+aiosqlite:///{db_path}",
+        engine_options={"busy_timeout_ms": 10},
     )
+    try:
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(broker._ensure_schema(), timeout=1.0)
+        assert asyncio.get_running_loop().time() - started < 0.5
+        assert broker._schema_ready is False
+
+        lock.rollback()
+        await asyncio.sleep(0.1)
+        tables = lock.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'broker_%'"
+        ).fetchall()
+        assert tables == []
+        assert broker._schema_ready is False
+    finally:
+        if lock.in_transaction:
+            lock.rollback()
+        lock.close()
+        await broker.close()
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+async def test_schema_creation_preserves_server_database_blocking_semantics(
+    monkeypatch: Any,
+    dialect: str,
+) -> None:
+    import modulith.adapters.db_broker as db_broker_module
+
+    monkeypatch.setattr(db_broker_module, "_SQLITE_SCHEMA_BUSY_BUDGET_S", 0.01)
+    engine = _BlockedSchemaEngine(dialect)
+    broker = DatabaseBroker(engine=engine)
+
+    task = asyncio.create_task(broker._ensure_schema())
+    await asyncio.wait_for(engine.conn.entered.wait(), timeout=1.0)
+    await asyncio.sleep(0.03)
+    engine.conn.release.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert broker._schema_ready is True
 
 
 # ---------------------------------------------------------------------------
@@ -2580,6 +3044,7 @@ class _SchemaRaceEngine:
 
     def __init__(self, *, error_text: str | None, persistent: bool = False) -> None:
         self._conn = _RaceConn(error_text, persistent=persistent)
+        self.dialect = SimpleNamespace(name="sqlite")
 
     def begin(self) -> _RaceBegin:
         return _RaceBegin(self._conn)
@@ -2622,7 +3087,9 @@ async def test_ensure_schema_never_marks_ready_when_reconciliation_fails() -> No
     with pytest.raises(OperationalError):
         await broker._ensure_schema()
 
-    assert broker._engine._conn.run_sync_calls == 2
+    # create_all + reconcile (+ busy/already-exists retries); never marks ready
+    # when the probe cannot confirm tables exist.
+    assert broker._engine._conn.run_sync_calls >= 2
     assert broker._schema_ready is False
 
 
@@ -2682,6 +3149,57 @@ async def test_start_is_idempotent(engine: Any) -> None:
         assert first_task is not None
         await consumer.start()  # second start must be a no-op
         assert consumer._task is first_task  # same task — the first was not orphaned
+    finally:
+        await consumer.stop()
+
+
+async def test_poll_loop_skips_malformed_row_ids_and_dispatches_valid_rows(engine: Any) -> None:
+    class MalformedBatchBroker(DatabaseBroker):
+        injected = False
+
+        async def claim_batch(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            rows = await super().claim_batch(*args, **kwargs)
+            if rows and not self.injected:
+                self.injected = True
+                return [{}, {"id": None}, {"id": 7}, {"id": ""}, *rows]
+            return rows
+
+    delivered: list[str] = []
+
+    async def handle(event: WidgetCreated) -> None:
+        delivered.append(event.name)
+
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, handle)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+    broker = MalformedBatchBroker(engine=engine)
+    target = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    await broker.subscribe([target], "modulith-inventory")
+    await broker.publish(
+        target,
+        serializer.serialize(WidgetCreated(name="valid")),
+        {"event_type": target},
+    )
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="c1",
+        group="modulith-inventory",
+        targets=[target],
+        poll_interval_s=0.01,
+    )
+
+    try:
+        await consumer.start()
+
+        async def _valid_delivered() -> bool:
+            return delivered == ["valid"]
+
+        await _until_async(_valid_delivered)
+
+        assert delivered == ["valid"]
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
     finally:
         await consumer.stop()
 

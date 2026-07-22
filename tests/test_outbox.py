@@ -26,6 +26,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -965,3 +966,625 @@ async def test_none_strategy_uses_find_incomplete_even_with_claiming_store() -> 
     assert store.claim_batch_calls == []
     assert store.find_incomplete_calls == [timedelta(0)]
     assert received == [6]
+
+
+# ---------------------------------------------------------------------------
+# Defensive lifecycle, retry, and maintenance behavior
+# ---------------------------------------------------------------------------
+
+
+class CoreOnlyStore:
+    """PublicationStore without any optional maintenance capabilities."""
+
+    def __init__(self) -> None:
+        self.rows: dict[UUID, EventPublication] = {}
+
+    async def save(self, publication: EventPublication) -> None:
+        self.rows[publication.id] = publication
+
+    async def mark_complete(self, publication_id: UUID) -> None:
+        row = self.rows.get(publication_id)
+        if row is not None:
+            row.completed_at = datetime.now(UTC)
+
+    async def find_incomplete(self, older_than: timedelta) -> list[EventPublication]:
+        now = datetime.now(UTC)
+        return [
+            row
+            for row in self.rows.values()
+            if row.completed_at is None
+            and row.published_at is not None
+            and now - row.published_at >= older_than
+        ]
+
+    async def archive(self, publication_id: UUID) -> None:
+        self.rows.pop(publication_id, None)
+
+    async def delete(self, publication_id: UUID) -> None:
+        self.rows.pop(publication_id, None)
+
+
+class MalformedClaimingStore(ClaimingStubStore):
+    """Fault-injection store that violates the claim-token return contract."""
+
+    async def claim_batch(
+        self, *, owner: str, batch_size: int, lease_seconds: float, older_than: timedelta
+    ) -> list[EventPublication]:
+        self.claim_batch_calls.append(owner)
+        return list(self.rows.values())[:batch_size]
+
+
+class SuppressedCancellationTask:
+    """Expose stop-driven renewal exits by suppressing the final task cancel."""
+
+    def __init__(self, task: asyncio.Task[None]) -> None:
+        self.task = task
+
+    def cancel(self) -> bool:
+        return False
+
+    def __await__(self) -> Any:
+        return self.task.__await__()
+
+
+def _suppress_created_task_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise defensive stop paths that stdlib Task cancellation preempts.
+
+    The production finally block calls ``stop.set()`` and ``task.cancel()``
+    without yielding between them. A standard asyncio task therefore observes
+    cancellation first. This narrow fault injection verifies that the renewal
+    coroutine also exits correctly if an alternative task implementation lets
+    the stop signal win.
+    """
+    create_task = asyncio.create_task
+
+    def create_suppressed_cancellation_task(coro: Any) -> SuppressedCancellationTask:
+        return SuppressedCancellationTask(create_task(coro))
+
+    monkeypatch.setattr(asyncio, "create_task", create_suppressed_cancellation_task)
+
+
+def test_listener_id_supports_callable_instances_without_qualname() -> None:
+    class CallableHandler:
+        async def __call__(self, event: OutboxEvent) -> None:
+            pass
+
+        def __repr__(self) -> str:
+            return "callable-handler"
+
+    handler = CallableHandler()
+
+    assert outbox._listener_id(handler) == "callable-handler"
+
+
+def test_configure_rejects_invalid_lease_and_batch_values() -> None:
+    store = StubStore()
+
+    with pytest.raises(ValueError, match="completion_mode"):
+        outbox.configure(store, JsonEventSerializer(), completion_mode="drop", start_loop=False)
+
+    with pytest.raises(ValueError, match="claim_lease_seconds"):
+        outbox.configure(store, JsonEventSerializer(), claim_lease_seconds=0, start_loop=False)
+
+    with pytest.raises(ValueError, match="claim_batch_size"):
+        outbox.configure(store, JsonEventSerializer(), claim_batch_size=True, start_loop=False)
+
+
+def test_cancel_retry_task_schedules_cancellation_on_a_foreign_loop() -> None:
+    loop = asyncio.new_event_loop()
+    task = loop.create_task(asyncio.sleep(60))
+    outbox._retry_task = task
+    try:
+        outbox._cancel_retry_task()
+
+        with pytest.raises(asyncio.CancelledError):
+            loop.run_until_complete(task)
+
+        assert outbox._retry_task is None
+    finally:
+        if not task.done():
+            task.cancel()
+            loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+        loop.close()
+
+
+def test_cancel_retry_task_tolerates_an_already_closed_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = asyncio.new_event_loop()
+    loop.close()
+
+    class TaskOnClosedLoop:
+        def done(self) -> bool:
+            return False
+
+        def get_loop(self) -> asyncio.AbstractEventLoop:
+            return loop
+
+        def cancel(self) -> bool:
+            raise AssertionError("closed loops cannot schedule cancellation")
+
+    monkeypatch.setattr(outbox, "_retry_task", TaskOnClosedLoop())
+
+    outbox._cancel_retry_task()
+
+    assert outbox._retry_task is None
+
+
+@pytest.mark.asyncio
+async def test_persist_returns_no_publications_before_runtime_bootstrap() -> None:
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+
+    publications = await outbox.persist(OutboxEvent(value=1))
+
+    assert publications == []
+    assert store.rows == {}
+
+
+def test_persisted_broker_route_starts_deferred_retry_loop() -> None:
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
+    assert outbox._retry_task is None
+
+    async def persist_route() -> None:
+        publication = await outbox.persist_broker_route(OutboxEvent(value=2), "test:events")
+
+        assert store.rows == {publication.id: publication}
+        assert outbox._retry_task is not None and not outbox._retry_task.done()
+
+    asyncio.run(persist_route())
+
+
+@pytest.mark.asyncio
+async def test_dispatch_without_bootstrapped_bus_records_missing_listener() -> None:
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    publication = _make_pub(record, value=3)
+    await store.save(publication)
+
+    await outbox._dispatch_publication(publication)
+
+    assert publication.attempt_count == 1
+    assert publication.last_error is not None
+    assert "no registered listener" in publication.last_error
+    assert publication.completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_with_missing_plugin_manager_preserves_success_and_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fault injection verifies dispatch remains safe without hook infrastructure.
+
+    Normal runtime bootstrap installs the event bus and plugin manager together.
+    Keeping the bus while removing the manager exercises the outbox's explicit
+    optional-manager guards without replacing listener or store behavior.
+    """
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+    assert _runtime.event_bus is not None
+    _runtime.event_bus.register(OutboxEvent, boom)
+    monkeypatch.setattr(_runtime, "_plugin_manager", None)
+
+    successful = _make_pub(record, value=4)
+    failed = _make_pub(boom, value=5)
+    await store.save(successful)
+    await store.save(failed)
+
+    await outbox._dispatch_publication(successful)
+    await outbox._dispatch_publication(failed)
+
+    assert received == [4]
+    assert successful.completed_at is not None
+    assert failed.attempt_count == 1
+    assert failed.last_error == "dispatch failed"
+
+
+@pytest.mark.asyncio
+async def test_stale_failure_claim_does_not_burn_retry_budget() -> None:
+    store = ClaimingStubStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    _bootstrap_with_listener(boom)
+    publication = _make_pub(boom, value=6)
+    await store.save(publication)
+    (claimed,) = await store.claim_batch(
+        owner="worker-a", batch_size=1, lease_seconds=60, older_than=timedelta(0)
+    )
+    store.claims[claimed.id] = ("worker-b", "new-token", datetime.now(UTC) + timedelta(minutes=1))
+    claimed.claim_token = "stale-token"
+
+    await outbox._dispatch_publication(claimed)
+
+    assert claimed.attempt_count == 0
+    assert store.rows[claimed.id].attempt_count == 0
+    assert store.rows[claimed.id].completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_broker_completion_failure_records_retryable_state() -> None:
+    sent: list[tuple[str, bytes]] = []
+
+    class Broker:
+        async def publish(
+            self, target: str, payload: bytes, headers: dict[str, str] | None = None
+        ) -> None:
+            sent.append((target, payload))
+
+        async def close(self) -> None:
+            pass
+
+    class FailingCompletionStore(StubStore):
+        async def mark_complete(self, publication_id: UUID) -> None:
+            raise ConnectionError("completion database unavailable")
+
+    _runtime.configure(package="outboxtest", auto_discover=False)
+    _runtime.ensure_bootstrapped()
+    assert _runtime.broker_registry is not None
+    _runtime.broker_registry.register("test", Broker())
+    store = FailingCompletionStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    publication = EventPublication(
+        id=uuid4(),
+        payload=b'{"value": 7}',
+        event_type=f"{OutboxEvent.__module__}.{OutboxEvent.__qualname__}",
+        listener=outbox._BROKER_ROUTE_LISTENER_PREFIX + "test:events",
+        published_at=datetime.now(UTC),
+    )
+    await store.save(publication)
+
+    await outbox._dispatch_publication(publication)
+
+    assert sent == [("events", publication.payload)]
+    assert publication.attempt_count == 1
+    assert publication.last_error == "completion database unavailable"
+    assert publication.completed_at is None
+
+
+def test_backoff_allows_legacy_publication_without_timestamps() -> None:
+    outbox.configure(StubStore(), JsonEventSerializer(), start_loop=False)
+    publication = _make_pub(
+        record,
+        attempt_count=1,
+        published_at=None,
+        last_attempt_at=None,
+    )
+
+    assert outbox._backoff_elapsed(publication) is True
+
+
+@pytest.mark.asyncio
+async def test_unclaimed_sweep_skips_publication_still_in_backoff() -> None:
+    store = StubStore()
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="none",
+        start_loop=False,
+    )
+    _bootstrap_with_listener(record)
+    publication = _make_pub(record, attempt_count=1, last_attempt_at=datetime.now(UTC))
+    await store.save(publication)
+
+    await outbox._sweep(timedelta(0))
+
+    assert received == []
+    assert publication.completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_malformed_tokenless_claims_are_safe_during_runtime_outage() -> None:
+    store = MalformedClaimingStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    publication = _make_pub(record)
+    await store.save(publication)
+
+    await outbox._sweep(timedelta(0))
+
+    assert publication.attempt_count == 0
+    assert publication.completed_at is None
+    assert store.renew_calls == []
+
+
+@pytest.mark.asyncio
+async def test_lease_sweep_releases_dead_lettered_claim() -> None:
+    store = ClaimingStubStore()
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        dead_letter_after_attempts=3,
+        start_loop=False,
+    )
+    _bootstrap_with_listener(record)
+    publication = _make_pub(record, attempt_count=3)
+    await store.save(publication)
+
+    await outbox._sweep(timedelta(0))
+
+    assert received == []
+    assert any(call[0] == publication.id and call[2] == 0 for call in store.renew_calls)
+    assert publication.completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_malformed_tokenless_claims_skip_unsafe_rows_and_dispatch_eligible() -> None:
+    store = MalformedClaimingStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    _bootstrap_with_listener(record)
+    backing_off = _make_pub(record, value=8, attempt_count=1, last_attempt_at=datetime.now(UTC))
+    eligible = _make_pub(record, value=9)
+    dead = _make_pub(record, value=10, attempt_count=10)
+    await store.save(backing_off)
+    await store.save(eligible)
+    await store.save(dead)
+
+    await outbox._sweep(timedelta(0))
+
+    assert received == [9]
+    assert backing_off.completed_at is None
+    assert eligible.completed_at is not None
+    assert dead.attempt_count == 10
+
+
+@pytest.mark.asyncio
+async def test_advisory_sweep_waits_for_runtime_before_locking() -> None:
+    store = ClaimingStubStore()
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="advisory_lock",
+        start_loop=False,
+    )
+    publication = _make_pub(record)
+    await store.save(publication)
+
+    await outbox._sweep(timedelta(0))
+
+    assert store.lock_calls == []
+    assert publication.attempt_count == 0
+
+
+@pytest.mark.asyncio
+async def test_advisory_sweep_skips_dead_letters_and_backoff() -> None:
+    store = ClaimingStubStore()
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="advisory_lock",
+        dead_letter_after_attempts=3,
+        start_loop=False,
+    )
+    _bootstrap_with_listener(record)
+    dead = _make_pub(record, value=10, attempt_count=3)
+    backing_off = _make_pub(
+        record,
+        value=11,
+        attempt_count=1,
+        last_attempt_at=datetime.now(UTC),
+    )
+    await store.save(dead)
+    await store.save(backing_off)
+
+    await outbox._sweep(timedelta(0))
+
+    assert store.lock_calls == []
+    assert received == []
+    assert dead.attempt_count == 3
+    assert backing_off.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_exits_when_stop_is_already_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _suppress_created_task_cancellation(monkeypatch)
+    store = ClaimingStubStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    _bootstrap_with_listener(record)
+    publication = _make_pub(record, value=12)
+    await store.save(publication)
+    (claimed,) = await store.claim_batch(
+        owner="worker", batch_size=1, lease_seconds=60, older_than=timedelta(0)
+    )
+
+    await outbox._dispatch_with_lease_renewal(claimed)
+
+    assert received == [12]
+    assert store.rows[claimed.id].completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_returns_when_stop_wait_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _suppress_created_task_cancellation(monkeypatch)
+    store = ClaimingStubStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+
+    async def yielding_handler(event: OutboxEvent) -> None:
+        await asyncio.sleep(0)
+        received.append(event.value)
+
+    _bootstrap_with_listener(yielding_handler)
+    publication = _make_pub(yielding_handler, value=13)
+    await store.save(publication)
+    (claimed,) = await store.claim_batch(
+        owner="worker", batch_size=1, lease_seconds=60, older_than=timedelta(0)
+    )
+
+    await outbox._dispatch_with_lease_renewal(claimed)
+
+    assert received == [13]
+    assert store.rows[claimed.id].completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_lost_lease_stops_renewal_without_cancelling_dispatch() -> None:
+    lease_lost = asyncio.Event()
+
+    class LosingRenewalStore(ClaimingStubStore):
+        async def renew_claim(self, publication_id: UUID, token: str, lease_seconds: float) -> bool:
+            self.renew_calls.append((publication_id, token, lease_seconds))
+            lease_lost.set()
+            return False
+
+    async def wait_for_lease_loss(event: OutboxEvent) -> None:
+        await lease_lost.wait()
+        received.append(event.value)
+
+    store = LosingRenewalStore()
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        claim_lease_seconds=0.03,
+        start_loop=False,
+    )
+    _bootstrap_with_listener(wait_for_lease_loss)
+    publication = _make_pub(wait_for_lease_loss, value=14)
+    await store.save(publication)
+
+    await asyncio.wait_for(outbox._sweep(timedelta(0)), timeout=1)
+
+    assert lease_lost.is_set()
+    assert received == [14]
+    assert store.rows[publication.id].completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_handles_running_loop_lookup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fault injection verifies the defensive no-running-loop cancellation path.
+
+    Awaiting this coroutine normally guarantees a running event loop. Raising
+    once from the lookup exercises the fallback without changing task behavior.
+    """
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
+    task = outbox._retry_task
+    assert task is not None
+    get_running_loop = asyncio.get_running_loop
+    attempts = 0
+
+    def fail_once() -> asyncio.AbstractEventLoop:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("running loop temporarily unavailable")
+        return get_running_loop()
+
+    monkeypatch.setattr(asyncio, "get_running_loop", fail_once)
+
+    await outbox.shutdown()
+
+    assert task.cancelled()
+    assert outbox._retry_task is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_preserves_concurrently_installed_retry_task() -> None:
+    replacement: asyncio.Task[None] | None = None
+
+    async def retiring_task() -> None:
+        nonlocal replacement
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            replacement = asyncio.create_task(asyncio.sleep(60))
+            outbox._retry_task = replacement
+            raise
+
+    original = asyncio.create_task(retiring_task())
+    await asyncio.sleep(0)
+    outbox._retry_task = original
+
+    await outbox.shutdown()
+
+    assert replacement is not None
+    assert outbox._retry_task is replacement
+    assert not replacement.done()
+    await outbox.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_core_store_maintenance_fallbacks_report_public_state() -> None:
+    store = CoreOnlyStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    publication = _make_pub(record)
+    await store.save(publication)
+
+    counts = await outbox.status()
+    purged = await outbox.purge_completed(timedelta(days=1))
+
+    assert counts == {"incomplete": 1, "completed": 0, "dead_lettered": 0}
+    assert purged == 0
+
+
+@pytest.mark.asyncio
+async def test_force_retry_direct_lookup_ignores_missing_and_completed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class LookupStore(StubStore):
+        async def find_by_id(self, publication_id: UUID) -> EventPublication | None:
+            return self.rows.get(publication_id)
+
+    store = LookupStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+    completed = _make_pub(record, value=15)
+    completed.completed_at = datetime.now(UTC)
+    store.rows[completed.id] = completed
+
+    with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
+        await outbox.force_retry(uuid4())
+        await outbox.force_retry(completed.id)
+
+    assert received == []
+    assert sum("not found or already complete" in item.message for item in caplog.records) == 2
+
+
+@pytest.mark.asyncio
+async def test_force_retry_legacy_scan_reaches_later_candidate() -> None:
+    store = CoreOnlyStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+    first = _make_pub(record, value=16)
+    target = _make_pub(record, value=17)
+    await store.save(first)
+    await store.save(target)
+
+    await outbox.force_retry(target.id)
+
+    assert received == [17]
+    assert first.completed_at is None
+    assert target.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_force_retry_legacy_scan_warns_for_unknown_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = CoreOnlyStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+
+    with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
+        await outbox.force_retry(uuid4())
+
+    assert any("not found or already complete" in item.message for item in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_list_dead_lettered_accepts_empty_paginated_result() -> None:
+    class EmptyPagedStore(StubStore):
+        async def find_dead_lettered(
+            self, *, after: tuple[datetime, UUID] | None, limit: int
+        ) -> list[EventPublication]:
+            return []
+
+    store = EmptyPagedStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+
+    assert await outbox.list_dead_lettered() == []

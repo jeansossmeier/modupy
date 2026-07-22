@@ -16,7 +16,8 @@ end-to-end version of recipes 1–5 lives in
 6. [Enable the durable Postgres outbox](#6-enable-the-durable-postgres-outbox)
 7. [Choose an outbox completion mode](#7-choose-an-outbox-completion-mode)
 8. [Go process-per-module and externalize an event](#8-go-process-per-module-and-externalize-an-event)
-    - [Without Redis: a database as the broker](#without-redis-a-database-as-the-broker)
+    - [Durable local SHM default](#durable-local-shm-default)
+    - [Use a shared database broker](#use-a-shared-database-broker)
 9. [Test an event flow with the pytest plugin](#9-test-an-event-flow-with-the-pytest-plugin)
 10. [Enforce boundaries in CI](#10-enforce-boundaries-in-ci)
 11. [Extend modulith with a plugin](#11-extend-modulith-with-a-plugin)
@@ -308,19 +309,13 @@ mode here in the wiring code, not in pyproject.
 **Goal:** run one module in its own process (its own CPU/memory budget) while
 keeping the same module code.
 
-Switch topology and configure a real cross-process broker (the in-memory broker
-can't cross processes, so `topology="processes"` with the default broker is a
-loud startup error):
-
-```bash
-pip install 'modulith[redis]'
-```
+Switch topology to process-per-module. With no broker or URL configured,
+modulith selects the stdlib-only, durable local `shm` broker:
 
 ```toml
 # pyproject.toml
 [tool.modulith]
 topology = "processes"
-broker = "redis-streams"
 
 [tool.modulith.workers]
 default = 1
@@ -341,7 +336,7 @@ from modulith import event, externalized
 class OrderPlaced:
     order_id: str
 
-@externalized(target="redis-streams:orders.placed")   # or pin the destination
+@externalized(target="shm:orders.placed")             # explicitly pins local SHM
 @event
 @dataclass(frozen=True)
 class StockReserved:
@@ -359,19 +354,58 @@ backoff), and the reverse proxy routes each request to the right worker by URL
 prefix. In single-process topology `@externalized` is an inert marker, so you can
 add it before you need multi-process and it costs nothing until then.
 
-### Without Redis: a database as the broker
+For Redis Streams, install `modulith[redis]` and set
+`broker = "redis-streams"` explicitly.
 
-The setup above uses Redis, but the same process-per-module topology runs over a
-relational database instead — and with SQLite, no server at all. Only the
-configuration changes; the module code (the `@externalized` events above) is
-identical, because the broker is chosen at bootstrap.
+### Durable local SHM default
+
+The `shm` broker is local-host only. SQLite is authoritative for publications,
+subscriptions, claims, retries, and acknowledgements. The mmap ring stores only
+advisory committed-sequence hints; consumers safely poll SQLite when a hint is
+missing, corrupt, stale, or wrapped. A successful `publish()` has already
+committed to SQLite.
+
+By default its absolute, package-namespaced files live in the platform's private
+per-user state directory. Configure paths canonically when needed:
+
+```toml
+[tool.modulith.broker_options]
+state_dir = "/private/app-state"
+sqlite_path = "broker.db"       # relative to state_dir
+hint_path = "broker.hints"      # advisory notifier, never payload storage
+sqlite_synchronous = "NORMAL"   # set "FULL" for power-loss durability
+max_payload_bytes = 16777216    # default 16 MiB; maximum 1 GiB
+max_store_bytes = 1073741824    # default 1 GiB; maximum 1 TiB
+```
+
+`NORMAL` preserves committed work across application, worker, supervisor, and
+process restarts on the same disk. Only `FULL` promises the last commits across
+OS failure or power loss. Delivery is at-least-once: a crash after a listener
+returns but before its ack commits can cause a duplicate, so listeners must be
+idempotent. Publications without a registered group are retained for 24 hours
+and replayed once to every group that subscribes before expiry.
+
+Payloads over `max_payload_bytes` are rejected before a transaction starts.
+`max_store_bytes` configures SQLite `max_page_count`; a full store rejects new
+publishes until space is pruned or the limit is raised. Override either with
+`MODULITH_BROKER_MAX_PAYLOAD_BYTES` / `MODULITH_BROKER_MAX_STORE_BYTES`.
+`shm_slot_size` is deprecated and ignored because hint slots are fixed-size.
+
+Explicit `broker = "shm"` rejects DSNs and SQLAlchemy/network URLs. If the
+broker name is omitted but `broker_options.url`/`dsn` (or the equivalent
+environment variable) exists, modulith infers the `database` adapter instead.
+
+### Use a shared database broker
+
+For cross-host delivery, the same process-per-module topology can use a
+relational database. Bare `@externalized` events need only configuration
+changes; intentionally scheme-pinned targets must be updated.
 
 ```bash
 pip install 'modulith[database]'
 ```
 
-The zero-infrastructure bootstrap is an embedded SQLite *file* shared by the
-worker processes — nothing to run, ideal for getting started or a small
+An explicit database broker may still use an embedded SQLite file for a small
 single-host deployment:
 
 ```toml

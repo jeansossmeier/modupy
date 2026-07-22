@@ -129,10 +129,18 @@ def _build_worker_env(spec: WorkerSpec) -> dict[str, str]:
     settings forwarded by the CLI), then the three reserved identity vars —
     so nothing in ``spec.env`` can ever misroute a worker to the wrong
     module/package/topology.
+
+    Exception: non-empty inherited ``MODULITH_BROKER*`` values beat
+    ``spec.env`` for the same key. That matches the adapter's documented
+    env > broker_options order and prevents a pyproject URL forwarded in
+    ``spec.env`` from clobbering a deployment ``MODULITH_BROKER_URL``.
     """
     env = dict(os.environ)
     if spec.env:
-        env.update(spec.env)
+        for key, value in spec.env.items():
+            if key.startswith("MODULITH_BROKER") and env.get(key):
+                continue
+            env[key] = value
     env["MODULITH_MODULE"] = spec.module_name
     env["MODULITH_APP_PACKAGE"] = spec.package
     env["MODULITH_TOPOLOGY"] = "processes"

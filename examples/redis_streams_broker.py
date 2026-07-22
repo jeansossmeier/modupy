@@ -37,8 +37,12 @@ disable the built-in first (``create_plugin_manager(disable=
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 from modulith import BrokerRegistry, hookimpl
+
+if TYPE_CHECKING:
+    from redis.typing import EncodableT
 
 
 class RedisStreamsBroker:
@@ -65,7 +69,7 @@ class RedisStreamsBroker:
         # Redis Streams entries are field maps. We pack the event body
         # under a single key and lift each header to its own h:* field
         # so consumers can read them without unpacking the payload.
-        fields: dict[bytes, bytes] = {b"data": payload}
+        fields: dict[EncodableT, EncodableT] = {b"data": payload}
         if headers:
             for key, value in headers.items():
                 fields[f"h:{key}".encode()] = value.encode()

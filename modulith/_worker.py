@@ -21,7 +21,8 @@ broker, and the worker's lifespan starts a ``BrokerConsumer`` (see
 streams, deserializes each message via its ``event_type`` header, and
 dispatches it to the local listeners. The consumer is skipped (HTTP-only
 worker) in single topology, when no broker is registered, or when the module
-consumes nothing.
+consumes nothing. SHM is the exception: it starts a task-free consumer once
+to remove subscriptions left by an earlier deployment.
 """
 
 from __future__ import annotations
@@ -177,9 +178,10 @@ def _build_consumer(module_name: str, consumer_name: str | None = None) -> Any:
     """Build this worker's cross-process consumer, or None when there's nothing to do.
 
     Returns None — and the worker runs HTTP-only — when topology is not
-    ``processes`` or the module has no subscription targets. A process worker
-    with targets requires both broker and consumer adapters so delivery cannot
-    be silently disabled by incomplete configuration.
+    ``processes`` or a non-SHM module has no subscription targets. SHM still
+    builds an empty consumer so startup can remove stale subscriptions without
+    launching a poll task. A worker that needs a consumer requires both broker
+    and consumer adapters so delivery cannot be silently disabled.
 
     The concrete consumer is built by the scheme's registered factory
     (``modulith_register_consumers``), not hardcoded here — the redis-streams
@@ -202,7 +204,7 @@ def _build_consumer(module_name: str, consumer_name: str | None = None) -> Any:
         return None
 
     targets = consumer_targets(bus, cfg, module_name)
-    if not targets:
+    if not targets and cfg.broker != "shm":
         return None
     if broker_registry is None or cfg.broker not in broker_registry.schemes():
         raise ConfigurationError(

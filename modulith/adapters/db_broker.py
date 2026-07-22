@@ -23,15 +23,15 @@ for Postgres.
 Configuration resolves ``MODULITH_BROKER_<KEY>`` env var (blank == unset) >
 ``[tool.modulith.broker_options]`` subtable, per key:
   url / dsn                   SQLAlchemy URL (absent -> embedded SQLite file
-                               '.modulith-broker.db' in the process cwd, with
-                               a startup warning)
+                               '.modulith-broker.db' in a collision-safe private
+                               per-user state directory, with a startup warning)
   completion_mode             'delete' (default, keeps the table small) |
                                'mark' (sets status='done', row stays for the
                                prune job)
-  pool_size / max_overflow    connection-pool sizing (Postgres / MySQL; ignored
-                               for SQLite, whose pool rejects them)
+  pool_size / max_overflow    connection-pool sizing (Postgres / MySQL defaults
+                               to QueuePool; file SQLite defaults to 1/0)
   busy_timeout_ms             SQLite only: how long a blocked writer waits for
-                               the lock before SQLITE_BUSY (default 5000)
+                               the lock before SQLITE_BUSY (default 250)
   sqlite_synchronous          SQLite only: PRAGMA synchronous mode (default
                                NORMAL — the WAL pairing; set FULL for
                                power-loss durability at ~2.5ms/commit fsync)
@@ -129,7 +129,6 @@ import os
 import random
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -143,7 +142,8 @@ from modulith import (
 )
 
 from ..config import DEFAULT_BROKER_DB_FILENAME
-from ..protocols import ConsumerHealth
+from ._polling_consumer import PollingConsumer
+from ._state_path import resolve_state_file
 
 logger = logging.getLogger("modulith.adapters.db")
 
@@ -170,11 +170,6 @@ _DEFAULT_ORPHAN_RETENTION_S = 86400.0
 # chronic poison producer cannot grow the table unboundedly. Disable the
 # background prune entirely with ``prune_interval_seconds = 0``.
 _DEFAULT_RETENTION_AGE_S = 3 * 86400.0
-
-# How often the consumer's background prune runs when retention is configured
-# but ``prune_interval_seconds`` was not set explicitly. Deliberately coarse:
-# prune is table maintenance, not on the delivery hot path.
-_DEFAULT_PRUNE_INTERVAL_S = 300.0
 
 # The two terminal statuses prune is allowed to delete. 'pending'/'claimed'
 # rows are undelivered work and must NEVER be pruned (that would be message
@@ -221,26 +216,24 @@ _SKIP_LOCKED_DIALECTS = frozenset({"postgresql", "mysql", "mariadb"})
 
 # SQLite ``busy_timeout`` (ms) applied to every connection when none is
 # configured: how long a blocked writer waits for the lock before raising
-# SQLITE_BUSY. Makes file-backed SQLite usable as a best-effort multi-process
-# broker instead of erroring on the first contended write.
-_DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 5000
+# SQLITE_BUSY. Kept short (250ms) so app-level retries stay in control of the
+# total budget — a 5s timeout per attempt made ``_SQLITE_BUSY_MAX_RETRIES``
+# stretch toward tens of seconds under multi-worker startup contention.
+_DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 250
 
 # App-level retry budget for a transient SQLite "database is locked" error.
-# ``busy_timeout`` handles the common wait-for-lock case, but SQLite returns
+# ``busy_timeout`` handles short wait-for-lock cases, but SQLite returns
 # SQLITE_BUSY *immediately* (ignoring busy_timeout) when a transaction upgrades
 # a read lock to a write lock under contention — exactly what claim_batch's
 # SELECT-then-UPDATE does — so a bounded application retry is still needed.
-# 8 attempts x _sqlite_busy_delay (geometric 2ms..50ms) ~= a 170ms total
-# budget: enough to ride out a 100-row claim commit or a prune sweep holding
-# the write lock, without the old 350ms+ of outage-scale sleeps.
+# Wall budget caps the sum of (busy_timeout waits + geometric sleeps) so a
+# contended fleet cannot stall a single write for 8 x busy_timeout.
 _SQLITE_BUSY_MAX_RETRIES = 8
-
-# Liveness backstop for the claim-renewal heartbeat: a wedged-but-alive
-# listener must not pin its claimed rows forever. After this many reclaim
-# windows of continuous renewal the heartbeat stops (with an ERROR log) so
-# the ordinary stale-claim reclaim reasserts at-least-once delivery; the
-# owner-guards turn any later ack/fail from the wedged worker into no-ops.
-_MAX_LEASE_EXTENSION_FACTOR = 10.0
+_SQLITE_BUSY_TOTAL_BUDGET_S = 2.0
+# Schema create is startup-only and may wait on a peer's create_all; allow a
+# longer wall budget / retry count than the hot-path write retries.
+_SQLITE_SCHEMA_BUSY_BUDGET_S = 15.0
+_SQLITE_SCHEMA_BUSY_MAX_RETRIES = 32
 
 # MySQL named locks are connection-scoped, so the implementation holds them
 # until the replay transaction commits and then releases them explicitly.
@@ -440,21 +433,24 @@ def _supports_skip_locked(engine: Any) -> bool:
     return engine.dialect.name in _SKIP_LOCKED_DIALECTS
 
 
-def _is_sqlite_url(url: str) -> bool:
+def _is_sqlite_url(url: Any) -> bool:
     """True when ``url`` names the SQLite backend (any driver), resolved via
     ``make_url`` rather than string-matching so ``sqlite+aiosqlite://`` and a
-    bare ``sqlite://`` both classify correctly."""
+    bare ``sqlite://`` both classify correctly. Accepts a SQLAlchemy ``URL``
+    object too — callers must not ``str()`` a URL whose path contains ``?``.
+    """
     from sqlalchemy.engine import make_url
 
     return make_url(url).get_backend_name() == "sqlite"
 
 
-def _is_sqlite_memory_url(url: str) -> bool:
+def _is_sqlite_memory_url(url: Any) -> bool:
     """Return whether SQLAlchemy will open this SQLite URL in memory.
 
     SQLite treats both an empty database path and ``:memory:`` as private
     in-memory databases. URI mode also supports named/shared memory databases;
     SQLAlchemy exposes those URI controls in the parsed query mapping.
+    Accepts a SQLAlchemy ``URL`` object (same reason as ``_is_sqlite_url``).
     """
     from sqlalchemy.engine import make_url
 
@@ -510,17 +506,19 @@ def _install_sqlite_pragmas(engine: Any, busy_timeout_ms: int, synchronous: str)
     def _set_sqlite_pragmas(dbapi_connection: Any, _record: Any) -> None:
         cursor = dbapi_connection.cursor()
         try:
-            cursor.execute("PRAGMA journal_mode=WAL")
+            # busy_timeout FIRST: journal_mode=WAL can itself block on a
+            # contended file, and must inherit the wait budget.
             # ``timeout`` is an int and ``sync_mode`` is vetted against the
             # frozen set above -> safe to interpolate (PRAGMA takes no bind
             # params); never a raw user string.
             cursor.execute(f"PRAGMA busy_timeout={timeout}")
+            cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute(f"PRAGMA synchronous={sync_mode}")
         finally:
             cursor.close()
 
 
-def _create_engine(url: str, opts: dict[str, Any]) -> Any:
+def _create_engine(url: Any, opts: dict[str, Any]) -> Any:
     """Build the async engine, applying dialect-appropriate options resolved
     ``MODULITH_BROKER_<KEY>`` env var > ``[tool.modulith.broker_options]``
     subtable (via ``_broker_opt``, exactly like the URL and consumer options),
@@ -529,8 +527,10 @@ def _create_engine(url: str, opts: dict[str, Any]) -> Any:
 
     - Postgres / MySQL: ``pool_size`` / ``max_overflow`` size the connection
       pool (both optional; omitted -> SQLAlchemy's QueuePool defaults).
-    - SQLite: pool-sizing kwargs are NOT passed (SQLite's pool rejects them);
-      instead WAL + ``busy_timeout`` are installed per connection.
+    - File-backed SQLite: defaults to ``pool_size=1, max_overflow=0`` (one
+      writer); WAL + ``busy_timeout`` are installed per connection. Pass a
+      SQLAlchemy ``URL`` object (not ``str(URL)``) when the path may contain
+      ``?`` / ``#`` — stringifying and reparsing truncates at ``?``.
     """
     try:
         from sqlalchemy.ext.asyncio import create_async_engine
@@ -539,15 +539,42 @@ def _create_engine(url: str, opts: dict[str, Any]) -> Any:
         # missing extra only surfaces here — when an app actually selects
         # ``broker='database'`` and builds an engine from a URL. Replace the
         # opaque bare ``ModuleNotFoundError: No module named 'sqlalchemy'`` with
-        # the same guided message the postgres_outbox adapter uses.
-        raise ImportError(
+        # an actionable ConfigurationError the CLI maps to exit 1.
+        raise ConfigurationError(
             "The 'database' broker requires SQLAlchemy (async) plus a DB driver. "
             "Install the extra: pip install 'modulith[database]'"
         ) from exc
 
-    kwargs: dict[str, Any] = {}
     sqlite = _is_sqlite_url(url)
-    if not sqlite:
+    busy_timeout_ms: int | None = None
+    if sqlite:
+        configured_timeout = _opt_int(_broker_opt(opts, "busy_timeout_ms", "BUSY_TIMEOUT_MS"))
+        busy_timeout_ms = (
+            _DEFAULT_SQLITE_BUSY_TIMEOUT_MS if configured_timeout is None else configured_timeout
+        )
+        if busy_timeout_ms <= 0:
+            raise ConfigurationError(
+                f"busy_timeout_ms must be a positive integer, got {busy_timeout_ms!r}"
+            )
+        maximum_timeout_ms = int(_SQLITE_BUSY_TOTAL_BUDGET_S * 1000)
+        if busy_timeout_ms > maximum_timeout_ms:
+            logger.warning(
+                "SQLite busy_timeout_ms=%d exceeds the %.3gs write deadline; capping it to %dms",
+                busy_timeout_ms,
+                _SQLITE_BUSY_TOTAL_BUDGET_S,
+                maximum_timeout_ms,
+            )
+            busy_timeout_ms = maximum_timeout_ms
+
+    kwargs: dict[str, Any] = {}
+    if sqlite and not _is_sqlite_memory_url(url):
+        # File-backed SQLite has one writer. SQLAlchemy's default QueuePool
+        # (5+10) only multiplies SQLITE_BUSY under concurrent dispatch.
+        pool_size = _opt_int(_broker_opt(opts, "pool_size", "POOL_SIZE"))
+        kwargs["pool_size"] = 1 if pool_size is None else pool_size
+        max_overflow = _opt_int(_broker_opt(opts, "max_overflow", "MAX_OVERFLOW"))
+        kwargs["max_overflow"] = 0 if max_overflow is None else max_overflow
+    elif not sqlite:
         pool_size = _opt_int(_broker_opt(opts, "pool_size", "POOL_SIZE"))
         if pool_size is not None:
             kwargs["pool_size"] = pool_size
@@ -556,10 +583,7 @@ def _create_engine(url: str, opts: dict[str, Any]) -> Any:
             kwargs["max_overflow"] = max_overflow
     engine = create_async_engine(url, **kwargs)
     if sqlite:
-        busy_timeout_ms = (
-            _opt_int(_broker_opt(opts, "busy_timeout_ms", "BUSY_TIMEOUT_MS"))
-            or _DEFAULT_SQLITE_BUSY_TIMEOUT_MS
-        )
+        assert busy_timeout_ms is not None
         synchronous = _option_or_default(
             _broker_opt(opts, "sqlite_synchronous", "SQLITE_SYNCHRONOUS"),
             _DEFAULT_SQLITE_SYNCHRONOUS,
@@ -604,15 +628,15 @@ def broker_schema() -> tuple[Any, Any, Any]:
     )
     from sqlalchemy.dialects.mysql import DATETIME as MySQLDateTime
 
-    # Timestamp type with microsecond precision on EVERY dialect. MySQL's
-    # DATETIME defaults to whole-second precision (fsp=0) and ROUNDS on insert,
-    # which corrupts the broker's sub-second timing — available_at with a
-    # 0.05-0.2s backoff, the claimed_at reclaim window — making an immediate
-    # claim see available_at > now and return nothing. fsp=6 fixes it on MySQL;
+    # Timestamp type with microsecond precision on EVERY dialect. MySQL and
+    # MariaDB default DATETIME to whole-second precision (fsp=0), which loses
+    # the broker's sub-second timing — available_at with
+    # a 0.05-0.2s backoff, the claimed_at reclaim window — making an immediate
+    # claim see available_at > now and return nothing. fsp=6 fixes both;
     # Postgres/SQLite already keep microseconds so the variant is inert there
     # (the migration mirrors this exactly). One shared instance is fine —
     # SQLAlchemy type objects are reusable across columns.
-    ts = DateTime(timezone=True).with_variant(MySQLDateTime(fsp=6), "mysql")
+    ts = DateTime(timezone=True).with_variant(MySQLDateTime(fsp=6), "mysql", "mariadb")
 
     metadata = MetaData()
 
@@ -749,7 +773,7 @@ class DatabaseBroker:
 
     def __init__(
         self,
-        url: str | None = None,
+        url: Any | None = None,
         *,
         engine: Any | None = None,
         completion_mode: str = _DEFAULT_COMPLETION_MODE,
@@ -774,6 +798,8 @@ class DatabaseBroker:
                 )
             # Lazy engine build (SQLAlchemy stays a soft dependency): applies
             # pooling / SQLite hardening from broker_options — see _create_engine.
+            # Prefer a SQLAlchemy URL object over str(URL) when the path may
+            # contain '?' — stringifying then reparsing truncates there.
             self._engine = _create_engine(url, engine_options or {})
         if completion_mode not in _COMPLETION_MODES:
             raise ConfigurationError(
@@ -801,6 +827,11 @@ class DatabaseBroker:
         self._expected_consumer_groups = _validate_expected_consumer_groups(
             {} if expected_consumer_groups is None else expected_consumer_groups
         )
+        # Real SQLAlchemy engines always expose a dialect. Minimal injected
+        # engines without one retain the adapter's historical SQLite behavior.
+        self._is_sqlite = getattr(getattr(self._engine, "dialect", None), "name", "sqlite") == (
+            "sqlite"
+        )
         self._schema_ready = False
         self._schema_lock = asyncio.Lock()
 
@@ -816,6 +847,29 @@ class DatabaseBroker:
         narrowed across the ``async with`` the second check sits inside)."""
         return self._schema_ready
 
+    async def _broker_tables_present(self, *, deadline: float | None = None) -> bool:
+        """True only when every table in broker metadata is queryable."""
+        from sqlalchemy import select
+
+        async def probe() -> bool:
+            metadata, _, _ = broker_schema()
+            async with self._engine.connect() as conn:
+                for table in metadata.sorted_tables:
+                    await conn.execute(select(1).select_from(table).limit(0))
+            return True
+
+        try:
+            if deadline is None:
+                return await probe()
+            async with asyncio.timeout_at(deadline):
+                return await probe()
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            raise
+        except Exception:
+            return False
+
     async def _ensure_schema(self) -> None:
         """Create the broker tables if absent — idempotent, cheap after the
         first call (short-circuits on the in-process flag), and safe across
@@ -823,10 +877,10 @@ class DatabaseBroker:
 
         ``create_all`` does a SELECT-then-CREATE per table, so two workers
         bootstrapping the same fresh DB at once can race: both see a table
-        missing, both CREATE it, and the loser fails with 'already exists'.
-        That failure may occur before later tables were checked, so a fresh
-        ``create_all`` pass must reconcile the full schema before the in-process
-        readiness flag is set. Any other DDL error propagates.
+        missing, both CREATE it, and the loser fails with 'already exists'
+        or SQLITE_BUSY. Retries both; on a second 'already exists' the peer
+        finished the schema and we mark ready (partial creates are reconciled
+        by the first successful create_all after the race).
         """
         if self._schema_is_ready():
             return
@@ -834,25 +888,78 @@ class DatabaseBroker:
             if self._schema_is_ready():
                 return
             metadata, _, _ = broker_schema()
-            try:
-                async with self._engine.begin() as conn:
-                    await conn.run_sync(metadata.create_all)
-            except Exception as exc:
-                if not _is_already_exists(exc):
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + _SQLITE_SCHEMA_BUSY_BUDGET_S if self._is_sqlite else None
+            attempt = 0
+
+            async def create_schema() -> None:
+                async def create() -> None:
+                    async with self._engine.begin() as conn:
+                        await conn.run_sync(metadata.create_all)
+
+                if deadline is None:
+                    await create()
+                else:
+                    async with asyncio.timeout_at(deadline):
+                        await create()
+
+            async def retry_delay() -> None:
+                delay = _sqlite_busy_delay(attempt)
+                if deadline is None:
+                    await asyncio.sleep(delay)
+                else:
+                    async with asyncio.timeout_at(deadline):
+                        await asyncio.sleep(delay)
+
+            while True:
+                attempt += 1
+                try:
+                    await create_schema()
+                    self._schema_ready = True
+                    return
+                except asyncio.CancelledError:
                     raise
-                logger.debug(
-                    "broker schema create raced with a peer — reconciling all required tables"
-                )
-                # The failed create_all call may have created only a prefix of
-                # the schema. A fresh transaction reruns every check and creates
-                # anything still missing before readiness is cached.
-                async with self._engine.begin() as conn:
-                    await conn.run_sync(metadata.create_all)
-            self._schema_ready = True
+                except Exception as exc:
+                    if _is_already_exists(exc):
+                        logger.debug("broker schema create raced with a peer — reconciling")
+                        try:
+                            await create_schema()
+                        except Exception as exc2:
+                            if _is_already_exists(exc2):
+                                # Peer likely finished. Verify before marking
+                                # ready — a persistent DDL error must still raise.
+                                if await self._broker_tables_present(deadline=deadline):
+                                    self._schema_ready = True
+                                    return
+                                if attempt >= _SQLITE_SCHEMA_BUSY_MAX_RETRIES or (
+                                    deadline is not None and loop.time() >= deadline
+                                ):
+                                    raise
+                                await retry_delay()
+                                continue
+                            if not _is_sqlite_locked(exc2):
+                                raise
+                            exc = exc2  # fall through to busy retry
+                        else:
+                            self._schema_ready = True
+                            return
+                    if not _is_sqlite_locked(exc):
+                        raise
+                    if attempt >= _SQLITE_SCHEMA_BUSY_MAX_RETRIES or (
+                        deadline is not None and loop.time() >= deadline
+                    ):
+                        raise
+                    logger.warning(
+                        "SQLite busy on schema create (attempt %d/%d) — retrying",
+                        attempt,
+                        _SQLITE_SCHEMA_BUSY_MAX_RETRIES,
+                    )
+                    await retry_delay()
 
     async def _write(self, operation: Callable[[Any], Awaitable[Any]]) -> Any:
         """Run ``operation(conn)`` inside one transaction, retrying a transient
-        SQLite lock up to ``_SQLITE_BUSY_MAX_RETRIES`` times with backoff.
+        SQLite lock up to ``_SQLITE_BUSY_MAX_RETRIES`` times with backoff,
+        bounded by ``_SQLITE_BUSY_TOTAL_BUDGET_S`` wall time.
 
         Each attempt is a fresh transaction (``engine.begin()`` rolls back on
         the raised lock error), so a retry re-runs the whole operation from a
@@ -861,23 +968,35 @@ class DatabaseBroker:
         On Postgres / MySQL ``_is_sqlite_locked`` never matches, so this is a
         plain single-attempt transaction there.
         """
+        if not self._is_sqlite:
+            async with self._engine.begin() as conn:
+                return await operation(conn)
+
         attempt = 0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _SQLITE_BUSY_TOTAL_BUDGET_S
         while True:
             attempt += 1
             try:
-                async with self._engine.begin() as conn:
-                    return await operation(conn)
+                async with asyncio.timeout_at(deadline):
+                    async with self._engine.begin() as conn:
+                        return await operation(conn)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if attempt >= _SQLITE_BUSY_MAX_RETRIES or not _is_sqlite_locked(exc):
+                if (
+                    attempt >= _SQLITE_BUSY_MAX_RETRIES
+                    or loop.time() >= deadline
+                    or not _is_sqlite_locked(exc)
+                ):
                     raise
                 logger.warning(
                     "SQLite busy on write (attempt %d/%d) — retrying",
                     attempt,
                     _SQLITE_BUSY_MAX_RETRIES,
                 )
-                await asyncio.sleep(_sqlite_busy_delay(attempt))
+                async with asyncio.timeout_at(deadline):
+                    await asyncio.sleep(_sqlite_busy_delay(attempt))
 
     async def _write_target_locked(
         self,
@@ -1216,7 +1335,7 @@ class DatabaseBroker:
         concurrency-safe.
 
         Uses the dialect-native upsert (Postgres/SQLite ``ON CONFLICT DO
-        UPDATE``, MySQL ``ON DUPLICATE KEY UPDATE``) so two workers of the same
+        UPDATE``, MySQL/MariaDB ``ON DUPLICATE KEY UPDATE``) so two workers of the same
         replicated module registering the same ``(target, consumer_group)`` at
         once can't collide on the PK. A check-then-insert races here: both
         workers see no row, both insert, and one dies with IntegrityError —
@@ -1273,8 +1392,8 @@ class DatabaseBroker:
         """Build the dialect-native subscription upsert statement.
 
         Postgres/SQLite: ``INSERT ... ON CONFLICT (target, consumer_group) DO
-        UPDATE SET updated_at=excluded.updated_at``. MySQL: ``INSERT ... ON
-        DUPLICATE KEY UPDATE``. Any other dialect (unreachable for the three
+        UPDATE SET updated_at=excluded.updated_at``. MySQL/MariaDB: ``INSERT
+        ... ON DUPLICATE KEY UPDATE``. Any other dialect (unreachable for the
         supported backends) falls back to a plain insert.
         """
         name = self._engine.dialect.name
@@ -1294,7 +1413,7 @@ class DatabaseBroker:
                 index_elements=["target", "consumer_group"],
                 set_={"updated_at": sqlite_stmt.excluded.updated_at},
             )
-        if name == "mysql":
+        if name in {"mysql", "mariadb"}:
             from sqlalchemy.dialects.mysql import insert as mysql_insert
 
             mysql_stmt = mysql_insert(subscription).values(rows)
@@ -1580,15 +1699,8 @@ class DatabaseBroker:
 # ---------------------------------------------------------------------------
 
 
-class DatabaseConsumer:
-    """Poll/claim/ack loop for the ``database`` broker scheme.
-
-    Mirrors ``modulith._consumer.BrokerConsumer``'s resilience posture: a
-    background ``asyncio.Task`` poll loop, capped exponential backoff on
-    claim failures, poison messages dead-lettered immediately, dispatch
-    failures retried with backoff up to an attempt cap, and a ``stop()``
-    that cancels the loop and never raises.
-    """
+class DatabaseConsumer(PollingConsumer):
+    """Compatibility wrapper over the shared durable polling lifecycle."""
 
     def __init__(
         self,
@@ -1608,404 +1720,40 @@ class DatabaseConsumer:
         retention_age_seconds: float | None = None,
         retention_count: int | None = None,
     ) -> None:
-        self._broker = broker
-        self._bus = bus
-        self._serializer = serializer
-        self._consumer_name = consumer_name
-        self._group = group
-        self._targets = list(targets)
-        self._poll_interval_s = _positive_finite_float(poll_interval_s, "poll_interval_s")
-        self._batch_size = _positive_int(batch_size, "batch_size")
-        self._dispatch_concurrency = _positive_int(dispatch_concurrency, "dispatch_concurrency")
-        self._max_attempts = _positive_int(max_attempts, "max_attempts")
-        self._reclaim_stale_seconds = _positive_finite_float(
-            reclaim_stale_seconds, "reclaim_stale_seconds"
+        super().__init__(
+            broker=broker,
+            bus=bus,
+            serializer=serializer,
+            consumer_name=consumer_name,
+            group=group,
+            targets=targets,
+            poll_interval_s=_positive_finite_float(poll_interval_s, "poll_interval_s"),
+            batch_size=_positive_int(batch_size, "batch_size"),
+            dispatch_concurrency=_positive_int(dispatch_concurrency, "dispatch_concurrency"),
+            max_attempts=_positive_int(max_attempts, "max_attempts"),
+            reclaim_stale_seconds=_positive_finite_float(
+                reclaim_stale_seconds,
+                "reclaim_stale_seconds",
+            ),
+            prune_interval_s=(
+                None
+                if prune_interval_s is None
+                else _non_negative_finite_float(prune_interval_s, "prune_interval_s")
+            ),
+            retention_age_seconds=(
+                None
+                if retention_age_seconds is None
+                else _positive_finite_float(retention_age_seconds, "retention_age_seconds")
+            ),
+            retention_count=(
+                None
+                if retention_count is None
+                else _non_negative_int(retention_count, "retention_count")
+            ),
+            logger=logger,
+            scheme=_DB_SCHEME,
+            idle_backoff=False,
         )
-        self._prune_interval_s = (
-            None
-            if prune_interval_s is None
-            else _non_negative_finite_float(prune_interval_s, "prune_interval_s")
-        )
-        self._retention_age_seconds = (
-            None
-            if retention_age_seconds is None
-            else _positive_finite_float(retention_age_seconds, "retention_age_seconds")
-        )
-        self._retention_count = (
-            None
-            if retention_count is None
-            else _non_negative_int(retention_count, "retention_count")
-        )
-        self._task: asyncio.Task[None] | None = None
-        self._prune_task: asyncio.Task[None] | None = None
-        self._stopping = False
-        self._health = ConsumerHealth(ready=False, status="stopped")
-        self._health_failures: dict[tuple[str, str], str] = {}
-        self._consecutive_failures = 0
-
-    async def start(self) -> None:
-        """Upsert subscriptions, then launch the poll loop.
-
-        No-op (no background task) when the worker consumes nothing — a leaf
-        module with no @listener has no targets to claim for. Idempotent: a
-        second ``start()`` while the poll loop is already running is ignored
-        (starting twice would orphan the first task and double every claim).
-        """
-        if self._task is not None:
-            logger.debug("db consumer %r already started — ignoring re-start", self._consumer_name)
-            return
-        if not self._targets:
-            self._stopping = False
-            self._health_failures.clear()
-            self._health = ConsumerHealth(ready=True, status="ready")
-            logger.debug(
-                "consumer %r has no subscribed targets — not starting", self._consumer_name
-            )
-            return
-        self._stopping = False
-        self._health_failures.clear()
-        self._health = ConsumerHealth(ready=False, status="starting")
-        try:
-            await self._broker.subscribe(self._targets, self._group)
-            self._task = asyncio.create_task(self._run())
-            self._task.add_done_callback(self._on_task_done)
-            if self._prune_enabled():
-                self._prune_task = asyncio.create_task(self._prune_loop())
-        except Exception as exc:
-            self._health = ConsumerHealth(ready=False, status="failed", detail=str(exc))
-            raise
-        if self._health.status == "starting":
-            self._health = ConsumerHealth(ready=True, status="ready")
-        logger.info(
-            "db consumer %r (group %r) subscribed to %d target(s)%s",
-            self._consumer_name,
-            self._group,
-            len(self._targets),
-            " (prune on)" if self._prune_enabled() else "",
-        )
-
-    def _prune_enabled(self) -> bool:
-        """Prune runs when a retention knob is set and the interval is not
-        explicitly disabled (``prune_interval_s == 0``)."""
-        if self._prune_interval_s is not None and self._prune_interval_s <= 0:
-            return False
-        return self._retention_age_seconds is not None or self._retention_count is not None
-
-    def _should_stop(self) -> bool:
-        """Indirection over ``self._stopping`` so the in-loop re-check isn't
-        statically narrowed to a constant by mypy — the flag genuinely can
-        flip to True (via ``stop()`` from another task) while this task is
-        between claims, and a method call, unlike the bare attribute
-        expression checked at the top of ``_run``'s ``while`` loop, isn't
-        narrowed by a later check in the same iteration."""
-        return self._stopping
-
-    async def stop(self) -> None:
-        """Cancel the poll loop (and the prune loop, if running) and wait for
-        both to unwind. Never raises."""
-        self._stopping = True
-        await self._cancel(self._task, "poll")
-        self._task = None
-        await self._cancel(self._prune_task, "prune")
-        self._prune_task = None
-        self._health = ConsumerHealth(ready=False, status="stopped")
-
-    def health(self) -> ConsumerHealth:
-        """Return an immutable snapshot of the consumer's readiness."""
-        if self._health.status != "ready":
-            return self._health
-        if self._targets and (self._task is None or self._task.done()):
-            return ConsumerHealth(
-                ready=False,
-                status="failed",
-                detail="poll loop is not running",
-            )
-        if self._health_failures:
-            details = list(self._health_failures.items())
-            detail = (
-                details[0][1]
-                if len(details) == 1
-                else "; ".join(
-                    f"{operation} ({target}): {error}" for (operation, target), error in details
-                )
-            )
-            return ConsumerHealth(ready=False, status="degraded", detail=detail)
-        return self._health
-
-    def _on_task_done(self, task: asyncio.Task[None]) -> None:
-        """Record an unexpected poll-loop exit without changing shutdown."""
-        if self._stopping or task.cancelled():
-            return
-        error = task.exception()
-        detail = str(error) if error is not None else "poll loop exited unexpectedly"
-        self._health = ConsumerHealth(ready=False, status="failed", detail=detail)
-        if error is None:
-            logger.error("db consumer %r poll task exited unexpectedly", self._consumer_name)
-        else:
-            logger.error(
-                "db consumer %r poll task exited with an unexpected error",
-                self._consumer_name,
-                exc_info=(type(error), error, error.__traceback__),
-            )
-
-    def _mark_broker_failure(self, operation: str, target: str, exc: Exception) -> None:
-        self._health_failures[(operation, target)] = str(exc)
-
-    def _mark_broker_recovered(self, operation: str, target: str) -> None:
-        self._health_failures.pop((operation, target), None)
-
-    async def _cancel(self, task: asyncio.Task[None] | None, label: str) -> None:
-        """Cancel one background task and swallow its unwind. Never raises."""
-        if task is None:
-            return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception(
-                "consumer %r %s task had already died with an unexpected error",
-                self._consumer_name,
-                label,
-            )
-
-    async def _run(self) -> None:
-        while True:
-            if self._stopping:
-                return
-            try:
-                rows = await self._broker.claim_batch(
-                    self._group,
-                    batch_size=self._batch_size,
-                    consumer_name=self._consumer_name,
-                    reclaim_stale_seconds=self._reclaim_stale_seconds,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._mark_broker_failure("claim", self._group, exc)
-                logger.exception("claim failed for group %s", self._group)
-                await self._backoff_after_failure()
-                continue
-            self._consecutive_failures = 0
-            self._mark_broker_recovered("claim", self._group)
-            if not rows:
-                await asyncio.sleep(self._poll_interval_s)
-                continue
-            await self._dispatch_batch(rows)
-
-    async def _backoff_after_failure(self) -> None:
-        self._consecutive_failures += 1
-        await asyncio.sleep(_backoff_delay(self._consecutive_failures))
-
-    async def _dispatch_batch(self, rows: list[dict[str, Any]]) -> None:
-        """Dispatch one claimed batch, renewing its claims while in flight.
-
-        Rows fan out through a semaphore bounded by ``dispatch_concurrency``
-        (default 10; configure ``dispatch_concurrency = 1`` for the historical
-        sequential order). A background
-        heartbeat re-stamps ``claimed_at`` for every not-yet-completed row at
-        one third of the reclaim window, so ``batch_size x listener_time`` may
-        exceed ``reclaim_stale_seconds`` without a peer reclaiming (and
-        double-dispatching) the tail of the batch. Per-row exceptions are
-        swallowed per row; cancellation propagates and stops both the row
-        tasks and the heartbeat.
-
-        With ``dispatch_concurrency > 1`` rows in one batch complete in
-        listener-speed order, not ``available_at`` order. Cross-process
-        ordering was never guaranteed (reclaim, competing consumers), so
-        listeners must already tolerate reordering.
-        """
-        in_flight = {cast(str, row["id"]) for row in rows}
-        renewer = asyncio.create_task(self._renew_loop(in_flight))
-        semaphore = asyncio.Semaphore(self._dispatch_concurrency)
-        try:
-            async with asyncio.TaskGroup() as tg:
-                for row in rows:
-                    tg.create_task(self._dispatch_guarded(row, semaphore, in_flight))
-        finally:
-            await self._cancel(renewer, "claim-renewal")
-
-    async def _dispatch_guarded(
-        self,
-        row: dict[str, Any],
-        semaphore: asyncio.Semaphore,
-        in_flight: set[str],
-    ) -> None:
-        """One row through the concurrency gate; never raises (except cancel)."""
-        row_id = cast(str, row["id"])
-        try:
-            async with semaphore:
-                if self._should_stop():
-                    return  # stays claimed; a peer reclaims it after the stale window
-                await self._dispatch_one(row)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # Safety net mirroring BrokerConsumer._run: any escaped per-row
-            # exception must not kill the poll task permanently.
-            logger.exception("dispatch_one crashed for row %s — loop continues", row_id)
-        finally:
-            in_flight.discard(row_id)
-
-    async def _renew_loop(self, in_flight: set[str]) -> None:
-        """Heartbeat: extend this batch's claims while any row is in flight.
-
-        A renewal miss (DB hiccup) is logged and retried next tick; if a row
-        truly was reclaimed by a peer, the owner-guards on ack/fail make our
-        late writes no-ops — worst case is one duplicate dispatch, which is
-        the documented at-least-once contract, not a new failure mode.
-
-        Bounded: renewal stops with an ERROR log once the batch has been
-        extended for ``_MAX_LEASE_EXTENSION_FACTOR`` reclaim windows. A
-        wedged-but-alive listener must not pin its rows forever — after the
-        stale window then passes, peers reclaim the rows and this worker's
-        late completions are fenced into no-ops by the owner-guards.
-        """
-        interval = self._reclaim_stale_seconds / 3.0
-        deadline = (
-            asyncio.get_running_loop().time()
-            + self._reclaim_stale_seconds * _MAX_LEASE_EXTENSION_FACTOR
-        )
-        while True:
-            await asyncio.sleep(interval)
-            ids = list(in_flight)
-            if not ids:
-                return
-            if asyncio.get_running_loop().time() >= deadline:
-                logger.error(
-                    "claim renewal for group %s exceeded %.0fs with %d row(s) "
-                    "still in flight — a listener appears wedged; stopping "
-                    "renewal so peers can reclaim after the stale window",
-                    self._group,
-                    self._reclaim_stale_seconds * _MAX_LEASE_EXTENSION_FACTOR,
-                    len(ids),
-                )
-                return
-            try:
-                renewed = await self._broker.renew_claims(
-                    ids, consumer_name=self._consumer_name
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception(
-                    "claim renewal failed for group %s — retrying next tick", self._group
-                )
-                continue
-            # Rows acked/failed between the snapshot and the UPDATE commit
-            # legitimately miss the owner-guard (they are no longer 'claimed'),
-            # so only warn about rows we still believe are in flight.
-            still_ours = sum(1 for row_id in ids if row_id in in_flight)
-            if renewed < still_ours:
-                logger.warning(
-                    "renewed %d/%d claims for group %s — %d row(s) reclaimed by a peer",
-                    renewed,
-                    still_ours,
-                    self._group,
-                    still_ours - renewed,
-                )
-
-    async def _prune_loop(self) -> None:
-        """Background retention sweep: every ``prune_interval_s`` (default
-        ``_DEFAULT_PRUNE_INTERVAL_S`` when unset), delete terminal rows past the
-        configured retention. Sleeps FIRST so many workers starting at once
-        don't all prune simultaneously. A prune failure is logged and the loop
-        continues — retention is best-effort maintenance, never fatal.
-
-        Redundant-but-idempotent across replicas: every consuming worker runs
-        this, and ``prune`` deletes globally, so extra runs are cheap no-ops
-        rather than duplicated deletes.
-        """
-        interval = self._prune_interval_s or _DEFAULT_PRUNE_INTERVAL_S
-        while True:
-            await asyncio.sleep(interval)
-            if self._should_stop():
-                return
-            try:
-                await self._broker.prune(
-                    retention_age_seconds=self._retention_age_seconds,
-                    retention_count=self._retention_count,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("prune failed for group %s — loop continues", self._group)
-
-    async def _dispatch_one(self, row: dict[str, Any]) -> None:
-        """Deserialize one claimed row and dispatch it to local listeners.
-
-        Acks on success. Missing ``event_type`` or an undeserializable
-        payload is poison -> dead-lettered immediately. A dispatch failure
-        increments the attempt count (staying 'pending' with backoff) until
-        the cap is reached, then dead-letters.
-        """
-        row_id = cast(str, row["id"])
-        target = str(row.get("target") or "<unknown>")
-        event_type = row.get("event_type")
-        payload = cast(bytes, row["payload"])
-
-        if not event_type:
-            logger.warning(
-                "message %s on %s missing event_type — dead-lettering", row_id, row.get("target")
-            )
-            await self._dead_letter(row_id, "missing event_type", target)
-            return
-
-        try:
-            event = self._serializer.deserialize(payload, event_type)
-        except Exception as exc:
-            logger.exception("undeserializable message %s — dead-lettering", row_id)
-            await self._dead_letter(row_id, f"deserialize failed: {exc}", target)
-            return
-
-        try:
-            await self._bus.publish(event)
-        except Exception as exc:
-            attempts = cast(int, row.get("attempts", 0))
-            logger.warning("dispatch failed for %s (attempt %d) — %s", row_id, attempts + 1, exc)
-            await self._fail(row_id, str(exc), target)
-            return
-
-        try:
-            await self._broker.ack(row_id, consumer_name=self._consumer_name)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self._mark_broker_failure("ack", target, exc)
-            logger.exception("ack failed for %s — message stays claimed", row_id)
-        else:
-            self._mark_broker_recovered("ack", target)
-
-    async def _fail(self, row_id: str, error: str, target: str) -> None:
-        try:
-            await self._broker.fail(
-                row_id,
-                error,
-                consumer_name=self._consumer_name,
-                max_attempts=self._max_attempts,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self._mark_broker_failure("fail", target, exc)
-            raise
-        self._mark_broker_recovered("fail", target)
-
-    async def _dead_letter(self, row_id: str, reason: str, target: str) -> None:
-        try:
-            await self._broker.dead_letter(
-                row_id,
-                reason,
-                consumer_name=self._consumer_name,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self._mark_broker_failure("dead_letter", target, exc)
-            raise
-        self._mark_broker_recovered("dead_letter", target)
 
 
 # ---------------------------------------------------------------------------
@@ -2030,25 +1778,40 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
         return
 
     opts = cfg.broker_options or {}
-    url = _broker_opt(opts, "url", "URL") or _broker_opt(opts, "dsn", "DSN")
+    url: Any = _broker_opt(opts, "url", "URL") or _broker_opt(opts, "dsn", "DSN")
     if not url:
-        from sqlalchemy.engine import URL
-
-        # URL.create escapes URL-special characters (?, #, %) in the cwd —
-        # a plain f-string would silently truncate the database path there.
-        url = str(
-            URL.create(
-                "sqlite+aiosqlite",
-                database=str(Path.cwd() / DEFAULT_BROKER_DB_FILENAME),
+        # Production must never invent a per-host SQLite file — cross-host
+        # delivery would silently split. Dev/test get an embedded file.
+        if cfg.production:
+            raise ConfigurationError(
+                "broker='database' in production requires an explicit URL "
+                "(set [tool.modulith.broker_options].url or MODULITH_BROKER_URL). "
+                "An implicit embedded SQLite file is not durable across hosts."
             )
+        try:
+            from sqlalchemy.engine import URL
+        except ImportError as exc:
+            raise ConfigurationError(
+                "The 'database' broker requires SQLAlchemy (async) plus a DB "
+                "driver. Install the extra: pip install 'modulith[database]'"
+            ) from exc
+
+        # Keep the URL object (do NOT str() it): reparsing str(URL) truncates a
+        # filesystem path that contains '?'.
+        db_path = resolve_state_file(
+            cfg.package,
+            filename=DEFAULT_BROKER_DB_FILENAME,
+            state_dir=_broker_opt(opts, "state_dir", "STATE_DIR"),
+            label="database broker SQLite file",
         )
+        url = URL.create("sqlite+aiosqlite", database=str(db_path))
         logger.warning(
             "database broker has no url configured — defaulting to embedded "
             "SQLite at %s (override with [tool.modulith.broker_options].url "
             "or MODULITH_BROKER_URL)",
-            url,
+            db_path,
         )
-    if cfg.topology == "processes" and isinstance(url, str) and _is_sqlite_memory_url(url):
+    if cfg.topology == "processes" and _is_sqlite_memory_url(url):
         raise ConfigurationError(
             "the database broker cannot use in-memory SQLite with "
             "topology='processes'; each worker would have an isolated database. "
@@ -2223,9 +1986,7 @@ def _make_db_consumer(spec: ConsumerSpec) -> Consumer:
             _broker_opt(opts, "prune_interval_seconds", "PRUNE_INTERVAL_SECONDS")
         ),
         retention_age_seconds=(
-            retention_age_seconds
-            if retention_age_seconds is not None
-            else _DEFAULT_RETENTION_AGE_S
+            retention_age_seconds if retention_age_seconds is not None else _DEFAULT_RETENTION_AGE_S
         ),
         retention_count=_opt_int(_broker_opt(opts, "retention_count", "RETENTION_COUNT")),
     )

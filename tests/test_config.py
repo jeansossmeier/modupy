@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
+import subprocess
+import tomllib
+from pathlib import Path, PurePosixPath
 
 import pytest
 
 from modulith import ConfigurationError
-from modulith.config import load_configuration
+from modulith.config import _redact_broker_url, load_configuration
 
 
 # Reset cwd-dependent state by running each test in a tmp_path. This
@@ -176,11 +178,11 @@ def test_production_with_durable_outbox_is_allowed() -> None:
     assert cfg.outbox == "postgres"
 
 
-def test_process_topology_defaults_to_database_broker() -> None:
-    """topology=processes with no broker configured auto-selects the database
-    broker (embedded SQLite) — the broker is NOT marked as explicitly set."""
+def test_process_topology_defaults_to_shm_broker() -> None:
+    """topology=processes with no broker configured auto-selects the shm
+    broker (shared-memory ring buffer) — the broker is NOT marked as explicitly set."""
     cfg = load_configuration(topology="processes")
-    assert cfg.broker == "database"
+    assert cfg.broker == "shm"
     assert cfg.is_explicit("broker") is False
 
 
@@ -189,7 +191,7 @@ def test_env_driven_process_topology_also_defaults_broker(monkeypatch) -> None:
     the injection keys off the merged explicit dict, not the call site."""
     monkeypatch.setenv("MODULITH_TOPOLOGY", "processes")
     cfg = load_configuration()
-    assert cfg.broker == "database"
+    assert cfg.broker == "shm"
     assert cfg.is_explicit("broker") is False
 
 
@@ -201,7 +203,7 @@ def test_default_broker_warning_fires_only_on_defaulted_path(caplog) -> None:
 
     with caplog.at_level(logging.WARNING, logger="modulith.config"):
         load_configuration(topology="processes")
-    assert any(".modulith-broker.db" in r.getMessage() for r in caplog.records)
+    assert any(".modulith-shm-broker.db" in r.getMessage() for r in caplog.records)
 
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="modulith.config"):
@@ -229,20 +231,324 @@ def test_subinterpreters_topology_with_memory_broker_refuses_to_start() -> None:
         load_configuration(topology="subinterpreters", broker="memory")
 
 
-def test_production_refuses_defaulted_process_broker() -> None:
-    """Production + topology=processes + no explicit broker raises — implicit
-    embedded SQLite is not suitable for production."""
-    with pytest.raises(ConfigurationError, match="defaulted broker"):
-        load_configuration(topology="processes", production=True)
+def test_production_allows_implicit_shm_with_explicit_outbox() -> None:
+    """The private durable SHM default is valid in production on one host."""
+    cfg = load_configuration(topology="processes", production=True, outbox="postgres")
+    assert cfg.broker == "shm"
+    assert cfg.is_explicit("broker") is False
 
 
-def test_production_with_explicit_database_broker_and_processes_is_allowed() -> None:
-    """Explicit broker='database' in production + processes is accepted."""
+def test_production_with_explicit_database_broker_requires_url() -> None:
+    """Production + broker='database' without a URL is refused — otherwise
+    registration would invent a per-host SQLite file."""
+    with pytest.raises(ConfigurationError, match="no URL"):
+        load_configuration(
+            topology="processes", production=True, broker="database", outbox="postgres"
+        )
+
+
+def test_production_with_explicit_database_broker_and_url_is_allowed() -> None:
+    """Explicit broker='database' + URL in production + processes is accepted."""
     cfg = load_configuration(
-        topology="processes", production=True, broker="database", outbox="postgres"
+        topology="processes",
+        production=True,
+        broker="database",
+        outbox="postgres",
+        broker_options={"url": "postgresql+asyncpg://db/prod"},
     )
     assert cfg.broker == "database"
     assert cfg.topology == "processes"
+
+
+def test_blank_broker_name_is_rejected() -> None:
+    with pytest.raises(ConfigurationError, match="non-empty"):
+        load_configuration(broker="   ")
+
+
+def test_process_topology_with_url_infers_database_and_redacts_credentials(caplog) -> None:
+    """A legacy URL-only config selects database without logging its password."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="modulith.config"):
+        cfg = load_configuration(
+            topology="processes",
+            broker_options={"url": "postgresql+asyncpg://alice:secret@db/prod"},
+        )
+    assert cfg.broker == "database"
+    assert cfg.is_explicit("broker") is False
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "secret" not in joined
+    assert "alice" not in joined
+    assert "***@db" in joined
+
+
+def test_process_topology_with_plain_filesystem_url_infers_shm(tmp_path: Path) -> None:
+    """The SHM adapter's legacy ``url`` path alias is not a database connection."""
+    cfg = load_configuration(
+        topology="processes",
+        broker_options={"url": str(tmp_path / "broker.db")},
+    )
+
+    assert cfg.broker == "shm"
+    assert cfg.broker_options["url"] == str(tmp_path / "broker.db")
+
+
+def test_env_broker_url_does_not_claim_embedded_sqlite(caplog, monkeypatch) -> None:
+    """MODULITH_BROKER_URL alone must not emit the embedded-SQLite-file warning."""
+    import logging
+
+    monkeypatch.setenv("MODULITH_BROKER_URL", "postgresql+asyncpg://db/prod")
+    with caplog.at_level(logging.WARNING, logger="modulith.config"):
+        cfg = load_configuration(topology="processes")
+    assert cfg.broker == "database"
+    assert cfg.is_explicit("broker") is False
+    assert not any(".modulith-shm-broker.db" in r.getMessage() for r in caplog.records)
+    assert any("broker URL" in r.getMessage() for r in caplog.records)
+
+
+def test_env_plain_filesystem_url_takes_precedence_over_dsn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The URL alias remains first in env precedence without becoming a DSN."""
+    monkeypatch.setenv("MODULITH_BROKER_URL", str(tmp_path / "broker.db"))
+    monkeypatch.setenv("MODULITH_BROKER_DSN", "postgresql+asyncpg://db/prod")
+
+    cfg = load_configuration(topology="processes")
+
+    assert cfg.broker == "shm"
+
+
+def test_env_broker_dsn_infers_database(monkeypatch) -> None:
+    monkeypatch.setenv("MODULITH_BROKER_DSN", "postgresql+asyncpg://db/prod")
+
+    cfg = load_configuration(topology="processes")
+
+    assert cfg.broker == "database"
+    assert cfg.is_explicit("broker") is False
+
+
+def test_broker_options_dsn_infers_database() -> None:
+    cfg = load_configuration(
+        topology="processes",
+        broker_options={"dsn": "postgresql+asyncpg://db/prod"},
+    )
+
+    assert cfg.broker == "database"
+    assert cfg.is_explicit("broker") is False
+
+
+def test_production_allows_inferred_database_with_url(monkeypatch) -> None:
+    monkeypatch.setenv("MODULITH_BROKER_URL", "postgresql+asyncpg://db/prod")
+
+    cfg = load_configuration(topology="processes", production=True, outbox="postgres")
+
+    assert cfg.broker == "database"
+    assert cfg.is_explicit("broker") is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql+asyncpg://db/prod",
+        "sqlite+aiosqlite:///tmp/broker.db",
+        "redis://cache:6379/0",
+    ],
+)
+def test_explicit_shm_rejects_sqlalchemy_and_network_urls(url: str) -> None:
+    with pytest.raises(ConfigurationError, match="shm"):
+        load_configuration(
+            topology="processes",
+            broker="shm",
+            broker_options={"url": url},
+        )
+
+
+def test_explicit_shm_accepts_plain_filesystem_url_alias(tmp_path: Path) -> None:
+    cfg = load_configuration(
+        topology="processes",
+        broker="shm",
+        broker_options={"url": str(tmp_path / "broker.db")},
+    )
+
+    assert cfg.broker_options["url"] == str(tmp_path / "broker.db")
+
+
+def test_implicit_shm_validates_canonical_path_options() -> None:
+    with pytest.raises(ConfigurationError, match="state_dir"):
+        load_configuration(
+            topology="processes",
+            broker_options={"state_dir": 42},
+        )
+
+
+@pytest.mark.parametrize(
+    ("url", "secrets"),
+    [
+        ("postgresql://:passwordonly@db/prod", ("passwordonly",)),
+        ("postgresql://alice:s%65cret@db/prod", ("s%65cret", "secret")),
+        (
+            "postgresql://db/prod?access_token=querysecret&ssl=true",
+            ("querysecret",),
+        ),
+        (
+            "postgresql://alice:usersecret@db/prod?sslmode=querysecret#fragmentsecret",
+            ("alice", "usersecret", "querysecret", "fragmentsecret"),
+        ),
+        (
+            "postgresql://alice:malformed-secret@@db/prod",
+            ("alice", "malformed-secret"),
+        ),
+        ("host=db password=rawsecret", ("rawsecret",)),
+    ],
+)
+def test_inferred_broker_warning_redacts_adversarial_urls(
+    caplog, url: str, secrets: tuple[str, ...]
+) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="modulith.config"):
+        load_configuration(topology="processes", broker_options={"url": url})
+
+    joined = " ".join(record.getMessage() for record in caplog.records)
+    for secret in secrets:
+        assert secret not in joined
+
+
+def test_broker_url_redaction_masks_all_userinfo_query_values_and_fragment() -> None:
+    redacted = _redact_broker_url(
+        "postgresql://alice:password@db/prod"
+        "?sslmode=verify-full&application_name=orders#client-certificate"
+    )
+
+    assert redacted == ("postgresql://***@db/prod?sslmode=%2A%2A%2A&application_name=%2A%2A%2A#***")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "host=db password=secret",
+        "postgresql://db:invalid-port/prod",
+        "postgresql://[invalid/prod",
+        "postgresql://db/prod\ninjected",
+    ],
+)
+def test_broker_url_redaction_fails_closed_for_unparseable_input(url: str) -> None:
+    assert _redact_broker_url(url) == "<redacted broker URL>"
+
+
+@pytest.mark.parametrize(
+    ("options", "option_name"),
+    [
+        ({"sqlite_synchronous": "OFF"}, "sqlite_synchronous"),
+        ({"completion_mode": []}, "completion_mode"),
+        ({"max_payload_bytes": 0}, "max_payload_bytes"),
+        ({"max_payload_bytes": 1024**3 + 1}, "max_payload_bytes"),
+        ({"max_store_bytes": True}, "max_store_bytes"),
+        ({"max_store_bytes": 1024**4 + 1}, "max_store_bytes"),
+        ({"shm_capacity": 0}, "shm_capacity"),
+        ({"shm_capacity": 10**12}, "shm_capacity"),
+        ({"batch_size": 0}, "batch_size"),
+        ({"batch_size": 10**12}, "batch_size"),
+        ({"dispatch_concurrency": 0}, "dispatch_concurrency"),
+        ({"dispatch_concurrency": 10**12}, "dispatch_concurrency"),
+        ({"max_delivery_attempts": 0}, "max_delivery_attempts"),
+        ({"poll_interval_ms": float("inf")}, "poll_interval_ms"),
+        ({"reclaim_stale_seconds": float("nan")}, "reclaim_stale_seconds"),
+        ({"retention_age_seconds": 0}, "retention_age_seconds"),
+        ({"prune_interval_seconds": -1}, "prune_interval_seconds"),
+    ],
+)
+def test_shm_options_are_validated_before_adapter_construction(
+    options: dict[str, object],
+    option_name: str,
+) -> None:
+    with pytest.raises(ConfigurationError, match=option_name):
+        load_configuration(
+            topology="processes",
+            broker="shm",
+            broker_options=options,
+        )
+
+
+def test_shm_storage_limits_accept_documented_safe_maxima() -> None:
+    cfg = load_configuration(
+        topology="processes",
+        broker="shm",
+        broker_options={
+            "max_payload_bytes": 1024**3,
+            "max_store_bytes": 1024**4,
+        },
+    )
+
+    assert cfg.broker_options["max_payload_bytes"] == 1024**3
+    assert cfg.broker_options["max_store_bytes"] == 1024**4
+
+
+@pytest.mark.parametrize("source", ["config", "environment"])
+def test_shm_slot_size_is_ignored_with_one_deprecation_warning(
+    source: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The removed sizing knob accepts legacy values but is never presented as active."""
+    import logging
+
+    options: dict[str, object] = {}
+    if source == "config":
+        options["shm_slot_size"] = "not-a-size"
+    else:
+        monkeypatch.setenv("MODULITH_BROKER_SHM_SLOT_SIZE", "not-a-size")
+
+    with caplog.at_level(logging.WARNING, logger="modulith.config"):
+        cfg = load_configuration(
+            topology="processes",
+            broker="shm",
+            broker_options=options,
+        )
+
+    warnings = [
+        record
+        for record in caplog.records
+        if "shm_slot_size is deprecated and ignored" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert cfg.broker == "shm"
+
+
+def test_local_broker_artifacts_are_excluded_generically() -> None:
+    root = Path(__file__).parents[1]
+    patterns = {"*.db-wal", "*.db-shm", "*.db-journal", "*.hints"}
+    artifacts = {
+        "nested/.modulith-broker.db",
+        "nested/.modulith-shm-broker.db",
+        "nested/custom.db-wal",
+        "nested/custom.db-shm",
+        "nested/custom.db-journal",
+        "nested/custom.hints",
+        "nested/custom.mmap",
+        "nested/.custom.hints.123.tmp",
+        "nested/.custom.mmap.123.tmp",
+    }
+    gitignore = set((root / ".gitignore").read_text(encoding="utf-8").splitlines())
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    sdist_excludes = set(pyproject["tool"]["hatch"]["build"]["targets"]["sdist"]["exclude"])
+
+    assert patterns <= gitignore
+    assert {f"**/{pattern}" for pattern in patterns} <= sdist_excludes
+    ignored = subprocess.run(
+        ["git", "check-ignore", "--no-index", "--stdin"],
+        cwd=root,
+        input="\n".join(sorted(artifacts)),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert set(ignored.stdout.splitlines()) == artifacts
+    assert all(
+        any(PurePosixPath(artifact).match(pattern) for pattern in sdist_excludes)
+        for artifact in artifacts
+    )
 
 
 def test_production_with_explicit_redis_broker_and_processes_is_allowed() -> None:

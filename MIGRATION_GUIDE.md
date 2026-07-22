@@ -275,8 +275,6 @@ it to its own process:
 ```toml
 [tool.modulith]
 topology = "processes"
-broker = "redis-streams"        # REQUIRED: processes need a real broker
-                                # (install with: pip install 'modulith[redis]')
 
 [tool.modulith.workers]
 default = 1
@@ -287,17 +285,15 @@ reports = 4                     # this module gets 4 worker processes
 modulith run app.main:app --topology=processes
 ```
 
-The broker line is not optional: `topology = "processes"` with the
-default in-memory broker is a loud `ConfigurationError` at startup — an
-in-memory broker can't carry events between processes. If the configured
-broker *scheme* has no registered adapter (typo, missing extra), startup
-logs a warning and the first cross-process publish raises
-`ConfigurationError` instead of silently dropping the event.
+With no broker or URL/DSN configured, process topology selects the stdlib-only
+`shm` broker. If a URL/DSN is present, it infers `database`. An explicit
+in-memory broker is a loud `ConfigurationError`, and explicit SHM rejects
+SQLAlchemy/network URLs.
 
 The supervisor spawns workers. The reverse proxy routes requests by
-URL prefix. Cross-module events flow through Redis Streams (or your
-configured broker). **No code changes needed if you've been following
-events for cross-module communication** — an event whose consumer lives
+URL prefix. Cross-module events flow through the configured broker. **No code
+changes are needed if you've been following events for cross-module
+communication** — an event whose consumer lives
 in another worker routes to the broker automatically. The one exception
 is fan-out: an event consumed *both* by a local listener *and* by a
 remote worker must be marked `@externalized` (from `modulith`), or
@@ -316,6 +312,54 @@ class OrderPlaced:
 If you have direct cross-module function calls remaining, they will
 break here — that's the cliff that `modulith doctor` was warning about.
 Fix them by migrating to events first.
+
+### Local SHM state and durability
+
+The default `shm` adapter is local-host only. SQLite—not the mmap ring—is
+authoritative for every publication, delivery, retry, and acknowledgement.
+Every successful publish is committed before the ring receives its advisory
+sequence hint. `synchronous=NORMAL` survives application, worker, supervisor,
+and process restart on the same disk; set `sqlite_synchronous = "FULL"` when
+the last commits must survive OS failure or power loss.
+
+Delivery is at-least-once. A crash after a listener returns but before its ack
+commits can deliver the event again, so make listeners idempotent. A publication
+without a registered group is retained for 24 hours and replayed to groups that
+subscribe before expiry.
+
+Use canonical private paths rather than the legacy names:
+
+```toml
+[tool.modulith.broker_options]
+state_dir = "/private/app-state"
+sqlite_path = "broker.db"
+hint_path = "broker.hints"
+max_payload_bytes = 16777216
+max_store_bytes = 1073741824
+```
+
+Defaults are absolute, package-namespaced paths in the platform's per-user
+state directory (`0700` directories and `0600` files on POSIX).
+`max_payload_bytes` defaults to 16 MiB (maximum 1 GiB) and rejects oversized
+messages before a publish transaction. `max_store_bytes` defaults to 1 GiB
+(maximum 1 TiB) and uses SQLite `max_page_count` to reject new writes when the
+store is full. Environment overrides are
+`MODULITH_BROKER_MAX_PAYLOAD_BYTES` and `MODULITH_BROKER_MAX_STORE_BYTES`.
+Remove legacy `shm_slot_size`; it is deprecated and ignored.
+
+### Migrating the old overflow-only SHM store
+
+Stop the entire process fleet before opening an old store with the new runtime.
+Back up the state directory, deploy one version everywhere, then restart. On
+first open, the v0 `shm_message` overflow schema migrates transactionally to the
+SQLite-authoritative schema; a failed migration rolls back.
+
+Only rows that reached the old SQLite overflow store can migrate. Messages that
+existed only in the old payload ring cannot be recovered. Do not run old and new
+workers against the same files during migration.
+
+For cross-host delivery, explicitly configure Redis Streams
+(`modulith[redis]`) or a networked `database` URL.
 
 ---
 

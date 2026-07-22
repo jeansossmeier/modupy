@@ -73,7 +73,8 @@ postgres = [
     "psycopg[binary]>=3.1,<4.0",
 ]
 
-# Redis Streams broker. The default broker for process-per-module mode.
+# Redis Streams broker. An explicit networked alternative to the local SHM
+# default used by process-per-module mode.
 # redis-py 5/6/7 are API-compatible for the commands the adapter uses
 # (XADD/XREADGROUP/XAUTOCLAIM/XACK and aclose()); upper bound tracks the next
 # unverified major.
@@ -233,6 +234,30 @@ modulith = "modulith.testing"
 [tool.hatch.build.targets.wheel]
 packages = ["modulith"]
 
+[tool.hatch.build.targets.sdist]
+# Keep reproducible analysis output and private broker state out even when a
+# local build runs from a dirty tree. Package sources are listed as artifacts so
+# newly-added runtime modules are not dropped merely because Git has not staged
+# them yet.
+artifacts = [
+    "/modulith/**/*.py",
+    "/modulith/**/*.ini",
+    "/modulith/**/*.mako",
+]
+exclude = [
+    "/.code_analyzer/**",
+    "/graphify-out/**",
+    "**/.modulith-*.db*",
+    "**/.modulith-*.hints",
+    "**/*.db-wal",
+    "**/*.db-shm",
+    "**/*.db-journal",
+    "**/*.hints",
+    "**/*.mmap",
+    "**/.*.hints.*.tmp",
+    "**/.*.mmap.*.tmp",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 # examples/demo_app/tests exercises the modulith.testing scenario/modulith_app
@@ -389,7 +414,7 @@ ignore_missing_imports = true
 [tool.modulith]
 # package = "myapp"          # auto-detected if not set
 # outbox = "memory"          # default — switch to "postgres" for production
-# broker = "memory"          # default — switch to "redis-streams" for IPC
+# broker = "memory"          # default for single; processes defaults to durable local "shm"
 # topology = "single"        # "single" | "processes" ("subinterpreters" reserved, not yet implemented)
 # contracts_module = "contracts"  # name of the shared-events subpackage (default: "contracts")
 # subscription_source = "manifest"  # "manifest" | "config" | "listener"
@@ -412,8 +437,17 @@ ignore_missing_imports = true
 # max_attempts = 10
 # max_retry_backoff_seconds = 300
 
-# Database-broker policies (read by the database broker adapter):
+# Broker options. Local SHM uses canonical private paths; an omitted process
+# broker becomes "database" instead when url/dsn is configured.
 # [tool.modulith.broker_options]
+# state_dir = "/private/app-state"       # package-namespaced default if omitted
+# sqlite_path = "broker.db"              # relative to state_dir
+# hint_path = "broker.hints"             # advisory sequence notifier only
+# sqlite_synchronous = "NORMAL"          # use "FULL" for power-loss durability
+# max_payload_bytes = 16777216            # default 16 MiB; maximum 1 GiB
+# max_store_bytes = 1073741824            # default 1 GiB; maximum 1 TiB
+# shm_slot_size is deprecated and ignored; hint slots are fixed-size sequences
+# url = "postgresql+asyncpg://..."       # selects database when broker is omitted
 # no_subscriber_policy = "error"   # "error" | "wait" | "store"
 # orphan_replay_policy = "ttl_all_groups"  # "ttl_all_groups" | "first_groups" | "expected_groups"
 # orphan_retention_seconds = 86400

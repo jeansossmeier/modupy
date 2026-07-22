@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 import tomllib
 from pathlib import Path
@@ -281,25 +282,100 @@ def _jobs() -> dict[str, Any]:
     return jobs
 
 
+def _job_steps(job_name: str) -> list[dict[str, Any]]:
+    """Return one parsed job's steps so YAML comments cannot satisfy guards."""
+    job = _jobs().get(job_name)
+    assert isinstance(job, dict), f"ci.yml must define a `{job_name}` job"
+    steps = job.get("steps")
+    assert isinstance(steps, list) and steps, f"`{job_name}` job must define steps"
+    assert all(isinstance(step, dict) for step in steps)
+    return steps
+
+
+def _shell_commands(script: str) -> list[list[str]]:
+    """Tokenize executable shell lines while discarding shell comments."""
+    commands: list[list[str]] = []
+    for raw_line in script.replace("\\\n", " ").splitlines():
+        tokens = shlex.split(raw_line.strip(), comments=True, posix=True)
+        if tokens:
+            commands.append(tokens)
+    return commands
+
+
+def _has_shell_command(script: str, expected_prefix: list[str]) -> bool:
+    return any(
+        command[: len(expected_prefix)] == expected_prefix for command in _shell_commands(script)
+    )
+
+
 def test_unit_matrix_collects_coverage_once_on_311() -> None:
-    """Coverage is collected once on 3.11 and fails the job under threshold."""
-    ci = _ci_text()
-    assert "coverage" in ci or "pytest-cov" in ci or "--cov" in ci, (
-        "CI must collect coverage (pytest --cov / coverage report)"
+    """The parsed test job must run both package coverage gates on Python 3.11."""
+    test_job = _jobs().get("test")
+    assert isinstance(test_job, dict), "ci.yml must define a `test` job"
+    strategy = test_job.get("strategy")
+    assert isinstance(strategy, dict), "test job must define a matrix strategy"
+    matrix = strategy.get("matrix")
+    assert isinstance(matrix, dict)
+    assert matrix.get("python-version") == ["3.11", "3.12", "3.13"], (
+        "test matrix must cover exactly Python 3.11, 3.12, and 3.13"
     )
-    assert re.search(r"--cov(=modulith|\s+modulith)", ci), (
-        "unit lane must run pytest with --cov=modulith on at least one matrix cell"
+
+    coverage_run = [
+        step
+        for step in _job_steps("test")
+        if isinstance(step.get("run"), str)
+        and _has_shell_command(
+            step["run"],
+            ["coverage", "run", "--source=modulith", "--branch", "-m", "pytest"],
+        )
+    ]
+    assert len(coverage_run) == 1, (
+        "test job must have exactly one executable "
+        "`coverage run --source=modulith --branch -m pytest` command"
     )
-    # Thresholds live in pyproject so local and CI agree.
-    tool = _pyproject().get("tool", {})
-    assert isinstance(tool, dict)
-    coverage = tool.get("coverage", {})
-    assert isinstance(coverage, dict)
-    report = coverage.get("report", {})
-    assert isinstance(report, dict)
-    assert report.get("fail_under") == 90, (
-        "tool.coverage.report.fail_under must be 90 for the package threshold"
+    coverage_step = coverage_run[0]
+    condition = coverage_step.get("if")
+    assert isinstance(condition, str)
+    assert condition.strip().replace('"', "'") == "matrix.python-version == '3.11'", (
+        "coverage step must run only when matrix.python-version is 3.11"
     )
+    script = coverage_step["run"]
+    assert _has_shell_command(script, ["coverage", "report", "--fail-under=90"]), (
+        "coverage step must execute the package-wide 90% report gate"
+    )
+    assert _has_shell_command(
+        script,
+        [
+            "coverage",
+            "report",
+            "--include=modulith/builtin/outbox.py",
+            "--fail-under=100",
+        ],
+    ), "coverage step must execute the 100% outbox report gate"
+
+
+def test_shell_command_guards_ignore_comments() -> None:
+    """Commented commands are documentation, not executable CI coverage gates."""
+    commented = (
+        "# coverage run --source=modulith --branch -m pytest\n# coverage report --fail-under=90\n"
+    )
+    assert not _has_shell_command(
+        commented,
+        ["coverage", "run", "--source=modulith", "--branch", "-m", "pytest"],
+    )
+
+
+def test_focused_shm_matrix_covers_supported_operating_systems() -> None:
+    """The focused SHM lane must span every supported OS and Python boundary."""
+    shm = _jobs().get("shm")
+    assert isinstance(shm, dict), "ci.yml must define a focused `shm` job"
+    assert shm.get("runs-on") == "${{ matrix.os }}"
+    strategy = shm.get("strategy")
+    assert isinstance(strategy, dict)
+    matrix = strategy.get("matrix")
+    assert isinstance(matrix, dict)
+    assert matrix.get("os") == ["ubuntu-latest", "macos-latest", "windows-latest"]
+    assert matrix.get("python-version") == ["3.11", "3.13"]
 
 
 def test_integration_matrix_covers_311_and_313() -> None:
@@ -345,6 +421,35 @@ def test_build_smoke_installs_all_extras_and_runs_migration() -> None:
     assert "gen_api_reference" in ci or "API_REFERENCE" in ci, (
         "CI must run the API-reference drift check"
     )
+
+
+def test_build_job_executes_package_artifact_assertions() -> None:
+    """Wheel and sdist inspection must reject missing modules and private files."""
+    inspection_scripts = [
+        step["run"]
+        for step in _job_steps("build")
+        if isinstance(step.get("run"), str) and step.get("name") == "Inspect distribution contents"
+    ]
+    assert len(inspection_scripts) == 1
+    executable_lines = [
+        line.strip()
+        for line in inspection_scripts[0].splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert any(line.startswith("assert not missing") for line in executable_lines)
+    assert any(line.startswith("assert not leaked") for line in executable_lines)
+    assert any('("wheel", wheel_names)' in line for line in executable_lines)
+    assert any('("sdist", sdist_names)' in line for line in executable_lines)
+
+    uploads = [
+        step
+        for step in _job_steps("build")
+        if isinstance(step.get("uses"), str) and step["uses"].startswith("actions/upload-artifact@")
+    ]
+    assert len(uploads) == 1
+    upload_config = uploads[0].get("with")
+    assert isinstance(upload_config, dict)
+    assert upload_config.get("path") == "dist/"
 
 
 def test_coverage_outbox_path_is_fully_covered() -> None:

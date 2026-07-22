@@ -17,8 +17,10 @@ commands run against a stub store, with one full end-to-end dispatch to prove
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -242,6 +244,7 @@ def test_dev_processes_topology_forwards_broker_options_to_workers(
         "[tool.modulith.broker_options]\n"
         'url = "sqlite+aiosqlite:///wf.db"\n'
         "poll_interval_ms = 250\n"
+        'expected_consumer_groups = { "fakeapp.orders.WidgetCreated" = ["inventory"] }\n'
     )
     monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
 
@@ -259,6 +262,82 @@ def test_dev_processes_topology_forwards_broker_options_to_workers(
     assert spec.env["MODULITH_BROKER"] == "database"
     assert spec.env["MODULITH_BROKER_URL"] == "sqlite+aiosqlite:///wf.db"
     assert spec.env["MODULITH_BROKER_POLL_INTERVAL_MS"] == "250"
+    assert json.loads(spec.env["MODULITH_BROKER_EXPECTED_CONSUMER_GROUPS"]) == {
+        "fakeapp.orders.WidgetCreated": ["inventory"]
+    }
+
+
+def test_process_topology_resolves_shm_paths_once_before_worker_cwd_changes(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app(
+        {"orders": ""},
+        extra_files={"main.py": "from fastapi import FastAPI\napp = FastAPI()\n"},
+    )
+    state_home = tmp_path / "state-home"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["dev", "fakeapp.main:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    (spec,) = captured["specs"]
+    expected_dir = Path(spec.env["MODULITH_BROKER_STATE_DIR"])
+    assert expected_dir.parent == state_home / "modulith"
+    assert expected_dir.name.startswith("fakeapp-")
+    expected_sqlite = expected_dir / ".modulith-shm-broker.db"
+    expected_hint = expected_dir / ".modulith-shm-broker.hints"
+    assert Path(spec.env["MODULITH_BROKER_SQLITE_PATH"]) == expected_sqlite
+    assert Path(spec.env["MODULITH_BROKER_HINT_PATH"]) == expected_hint
+
+    different_cwd = tmp_path / "worker-cwd"
+    different_cwd.mkdir()
+    monkeypatch.chdir(different_cwd)
+    from modulith.supervisor import _build_worker_env
+
+    worker_env = _build_worker_env(spec)
+    assert Path(worker_env["MODULITH_BROKER_SQLITE_PATH"]) == expected_sqlite
+    assert Path(worker_env["MODULITH_BROKER_HINT_PATH"]) == expected_hint
+
+
+def test_dev_processes_topology_env_url_beats_pyproject_url(make_fake_app, monkeypatch, tmp_path):
+    """Parent MODULITH_BROKER_URL must reach workers, not the pyproject URL."""
+    make_fake_app(
+        {"orders": ""},
+        extra_files={"main.py": "from fastapi import FastAPI\napp = FastAPI()\n"},
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.modulith]\n"
+        'broker = "database"\n'
+        "[tool.modulith.broker_options]\n"
+        'url = "sqlite+aiosqlite:///dev.db"\n'
+    )
+    monkeypatch.setenv("MODULITH_BROKER_URL", "postgresql+asyncpg://db/prod")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["dev", "fakeapp.main:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    (spec,) = captured["specs"]
+    # CLI must not forward the lower-priority pyproject URL into spec.env.
+    assert "MODULITH_BROKER_URL" not in (spec.env or {})
+    # Supervisor still inherits the parent's env for the worker process.
+    from modulith.supervisor import _build_worker_env
+
+    assert _build_worker_env(spec)["MODULITH_BROKER_URL"] == "postgresql+asyncpg://db/prod"
 
 
 def test_run_processes_topology_runs_supervisor(make_fake_app, monkeypatch):

@@ -41,11 +41,11 @@ _EVENT_TYPE_LEN = 255
 _STATUS_LEN = 32
 _CLAIMED_BY_LEN = 255
 
-# Microsecond-precision timestamp on every dialect — MySQL's DATETIME defaults
-# to whole-second precision (fsp=0) and rounds, corrupting the broker's
-# sub-second timing; fsp=6 fixes it. Inert on Postgres/SQLite. Mirrors
+# Microsecond-precision timestamp on every dialect — MySQL and MariaDB default
+# DATETIME to whole-second precision (fsp=0), losing the broker's sub-second
+# timing; fsp=6 fixes both. Inert on Postgres/SQLite. Mirrors
 # db_broker.broker_schema()'s `ts` type exactly (drift tests enforce it).
-_TS = sa.DateTime(timezone=True).with_variant(MySQLDateTime(fsp=6), "mysql")
+_TS = sa.DateTime(timezone=True).with_variant(MySQLDateTime(fsp=6), "mysql", "mariadb")
 
 
 def upgrade() -> None:
