@@ -226,9 +226,9 @@ Wire your SQLAlchemy session to modulith:
 from modulith.adapters.postgres_outbox import (
     PostgresPublicationStore,
     bind_session,
+    unbind_session,
 )
 from modulith.builtin import outbox
-from modulith.builtin.outbox import _current_session
 from modulith.serializers import JsonEventSerializer
 
 from app.contracts.events import OrderCreated  # your event types
@@ -253,7 +253,7 @@ async def get_db():
             yield session
         finally:
             # bind_session returned this token; reset it when the request ends.
-            _current_session.reset(token)
+            unbind_session(token)
 ```
 
 Now `publish()` calls inside a transaction are atomically persisted.

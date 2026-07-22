@@ -69,7 +69,7 @@ The minimum scope where modulith provides value over "FastAPI plus folders."
 - [x] `modulith run` — production mode
 - [x] `modulith verify` — boundary checks
 - [x] `modulith docs` — generate documentation
-- [x] `modulith outbox {status,retry,purge}` — operational commands
+- [x] `modulith outbox {status,retry,purge,dead-letter}` — operational commands
 - [x] `modulith info` — show detected config
 
 ### Documentation generator

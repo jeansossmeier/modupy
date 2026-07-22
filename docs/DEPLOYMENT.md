@@ -151,6 +151,8 @@ MODULITH_BROKER=redis-streams \
 - Built-in dead-letter handling
 - Ideal for: high-volume deployments with Redis infrastructure already in place
 
+**⚠️ Redis Durability Caveat:** XADD MAXLEN `~` (approximate trimming) is blind to consumer-group PEL state. An undersized `max_stream_len` can permanently drop unacked entries, violating at-least-once delivery. Size `max_stream_len` well above worst-case backlog: **publish_rate × (consumer_downtime + processing_latency + reclaim_min_idle_ms)**. Default SHM and database brokers are NOT affected.
+
 **Tuning:**
 
 ```bash

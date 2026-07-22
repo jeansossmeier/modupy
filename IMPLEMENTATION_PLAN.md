@@ -22,7 +22,7 @@
 | T0.3 — Env-var bool coercion (B5) | ✓ | Phantom bug — already returned bool; locked in by identity test |
 | T0.4 — `tests/conftest.py` shared fixtures | ✓ | `make_fake_app()` factory; 6 smoke tests; `fake_app` back-compat shim |
 | T0.5 — CI scaffolding | ✓ | `.github/workflows/ci.yml` — 4 jobs (test matrix 3.11/3.12/3.13, lint, typecheck, build) |
-| T0.6 — Pin runtime deps + extras upper bounds | ✓ | `modulith[all,kafka]` resolves; ruff per-file ignores + mypy excludes for stub files |
+| T0.6 — Pin runtime deps + extras upper bounds | ✓ | ruff per-file ignores + mypy excludes for stub files; kafka adapter deferred to Phase 4 |
 | T0.7 — Fix `_read_pyproject()` subtable handling | ✓ | P0 bug discovered during T0.3: TOML subtables (`[tool.modulith.outbox]`, `.workers`) crashed bootstrap on this repo's own `pyproject.toml`. Fixed via `SUBTABLE_FIELD` mapping. |
 
 **Verification gate (all green)**
