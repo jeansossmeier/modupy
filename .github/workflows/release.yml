@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  test:
+    name: pytest (Python 3.11)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install project
+        run: uv pip install --system -e ".[dev]"
+
+      - name: Run pytest
+        # Gate against broken test trees before publishing.
+        # Explicitly deselect integration tests since Docker may not be available
+        # in the release environment.
+        run: pytest -m "not integration" -v --tb=short
+
+  build:
+    name: build wheel + sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build
+        run: pip install build
+
+      - name: Build distributions
+        run: python -m build
+
+      - name: Inspect distribution contents
+        run: |
+          python - <<'PY'
+          from pathlib import Path, PurePosixPath
+          import tarfile
+          import zipfile
+
+          adapters = Path("modulith/adapters")
+          required = {path.as_posix() for path in adapters.glob("_shm*.py")}
+          required.update(
+              {
+                  "modulith/adapters/shm_broker.py",
+                  "modulith/adapters/_state_path.py",
+                  "modulith/adapters/_consumer_protocol.py",
+                  "modulith/adapters/_delivery_dispatch.py",
+                  "modulith/adapters/_polling_consumer.py",
+              }
+          )
+
+          def normalized(names):
+              result = set()
+              for name in names:
+                  parts = PurePosixPath(name).parts
+                  if parts and parts[0].startswith("modulith-"):
+                      parts = parts[1:]
+                  if parts:
+                      result.add("/".join(parts))
+              return result
+
+          def forbidden(name):
+              parts = PurePosixPath(name).parts
+              filename = parts[-1] if parts else ""
+              analysis = any(part in {".code_analyzer", "graphify-out"} for part in parts)
+              state = filename.endswith(
+                  (".db", ".db-wal", ".db-shm", ".db-journal", ".hints", ".mmap")
+              )
+              temporary_hint = filename.endswith(".tmp") and (
+                  "hint" in filename or "mmap" in filename or "notifier" in filename
+              )
+              return analysis or state or temporary_hint
+
+          wheel = next(Path("dist").glob("*.whl"))
+          sdist = next(Path("dist").glob("*.tar.gz"))
+          with zipfile.ZipFile(wheel) as archive:
+              wheel_names = normalized(archive.namelist())
+          with tarfile.open(sdist, "r:gz") as archive:
+              sdist_names = normalized(archive.getnames())
+
+          for label, names in (("wheel", wheel_names), ("sdist", sdist_names)):
+              missing = sorted(required - names)
+              leaked = sorted(name for name in names if forbidden(name))
+              assert not missing, f"{label} missing runtime modules: {missing}"
+              assert not leaked, f"{label} contains private artifacts: {leaked}"
+              print(f"{label}: runtime modules present; private artifacts absent")
+          PY
+
+      - name: Smoke-test wheel installs
+        run: |
+          python -m venv /tmp/smoke
+          WHL=$(ls dist/*.whl)
+          /tmp/smoke/bin/pip install "${WHL}[all]"
+          /tmp/smoke/bin/python -c "import modulith; print(modulith.__name__)"
+          /tmp/smoke/bin/modulith --help
+          /tmp/smoke/bin/python -c "from importlib.metadata import entry_points; eps = entry_points(group='console_scripts'); assert any(e.name == 'modulith' for e in eps)"
+          /tmp/smoke/bin/python - <<'PY'
+          from pathlib import Path
+          import tempfile
+          from alembic import command
+          from alembic.config import Config
+          import modulith.adapters as adapters_pkg
+          migrations = Path(adapters_pkg.__file__).parent / "migrations"
+          with tempfile.TemporaryDirectory() as td:
+              db = Path(td) / "smoke.db"
+              cfg = Config()
+              cfg.set_main_option("script_location", str(migrations))
+              cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db}")
+              command.upgrade(cfg, "head")
+              print("sqlite migration ok", db.exists())
+          PY
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 14
+
+  publish:
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

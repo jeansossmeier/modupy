@@ -466,3 +466,150 @@ def test_coverage_outbox_path_is_fully_covered() -> None:
     assert has_outbox_gate, (
         "CI or coverage config must enforce 100% coverage on modulith/builtin/outbox.py"
     )
+
+
+# ---------------------------------------------------------------------------
+# Release workflow validation
+# ---------------------------------------------------------------------------
+
+
+def _release_workflow() -> dict[str, Any]:
+    """Parse the release.yml workflow."""
+    release_path = REPO_ROOT / ".github" / "workflows" / "release.yml"
+    assert release_path.exists(), "release.yml must exist"
+    workflow = yaml.safe_load(release_path.read_text(encoding="utf-8"))
+    assert isinstance(workflow, dict)
+    return workflow
+
+
+def test_release_workflow_exists() -> None:
+    """release.yml must exist and be valid YAML."""
+    workflow = _release_workflow()
+    assert workflow is not None
+
+
+def test_release_triggers_on_version_tags() -> None:
+    """release.yml must trigger on v* tags."""
+    workflow = _release_workflow()
+    # YAML parses 'on' as the boolean True key, not the string 'on'
+    on = workflow.get(True)
+    assert isinstance(on, dict), (
+        "release.yml must define an 'on' trigger"
+    )
+    push = on.get("push")
+    assert isinstance(push, dict)
+    tags = push.get("tags")
+    assert isinstance(tags, list) and "v*" in tags, (
+        "release.yml must trigger on push with tags: ['v*']"
+    )
+
+
+def test_release_has_test_build_publish_jobs() -> None:
+    """release.yml must define test, build, and publish jobs."""
+    workflow = _release_workflow()
+    jobs = workflow.get("jobs")
+    assert isinstance(jobs, dict)
+    assert "test" in jobs, "release.yml must define a test job"
+    assert "build" in jobs, "release.yml must define a build job"
+    assert "publish" in jobs, "release.yml must define a publish job"
+
+
+def test_release_publish_job_has_oidc_permission() -> None:
+    """publish job must have id-token: write permission for OIDC trusted publishing."""
+    workflow = _release_workflow()
+    jobs = workflow.get("jobs")
+    assert isinstance(jobs, dict)
+    publish = jobs.get("publish")
+    assert isinstance(publish, dict)
+    permissions = publish.get("permissions")
+    assert isinstance(permissions, dict), (
+        "publish job must define permissions"
+    )
+    id_token = permissions.get("id-token")
+    assert id_token == "write", (
+        "publish job must have permissions.id-token: write for OIDC trusted publishing"
+    )
+
+
+def test_release_publish_job_uses_pypa_action() -> None:
+    """publish job must use pypa/gh-action-pypi-publish@release/v1."""
+    workflow = _release_workflow()
+    jobs = workflow.get("jobs")
+    assert isinstance(jobs, dict)
+    publish = jobs.get("publish")
+    assert isinstance(publish, dict)
+    steps = publish.get("steps")
+    assert isinstance(steps, list) and steps
+
+    pypa_steps = [
+        step for step in steps
+        if isinstance(step.get("uses"), str)
+        and step["uses"].startswith("pypa/gh-action-pypi-publish@")
+    ]
+    assert len(pypa_steps) == 1, (
+        "publish job must use exactly one pypa/gh-action-pypi-publish action"
+    )
+    assert pypa_steps[0]["uses"] == "pypa/gh-action-pypi-publish@release/v1", (
+        "publish job must use pypa/gh-action-pypi-publish@release/v1"
+    )
+
+
+def test_release_publish_job_needs_test_and_build() -> None:
+    """publish job must depend on test and build jobs."""
+    workflow = _release_workflow()
+    jobs = workflow.get("jobs")
+    assert isinstance(jobs, dict)
+    publish = jobs.get("publish")
+    assert isinstance(publish, dict)
+    needs = publish.get("needs")
+    assert isinstance(needs, (list, str)), "publish job must define needs"
+
+    if isinstance(needs, str):
+        needs = [needs]
+    assert "test" in needs and "build" in needs, (
+        "publish job must depend on both test and build jobs (needs: [test, build])"
+    )
+
+
+def test_release_publish_has_no_hardcoded_token() -> None:
+    """publish job must not use hardcoded PyPI tokens or secrets."""
+    workflow = _release_workflow()
+    jobs = workflow.get("jobs")
+    assert isinstance(jobs, dict)
+    publish = jobs.get("publish")
+    assert isinstance(publish, dict)
+
+    workflow_text = yaml.dump(publish)
+    assert "PYPI_API_TOKEN" not in workflow_text
+    assert "secrets.PYPI" not in workflow_text
+    assert "password:" not in workflow_text or "password:" not in str(publish)
+    # OIDC trusted publishing should not use user/password
+    pypa_steps = [
+        step for step in publish.get("steps", [])
+        if isinstance(step.get("uses"), str)
+        and "pypa/gh-action-pypi-publish" in step["uses"]
+    ]
+    for step in pypa_steps:
+        with_config = step.get("with", {})
+        assert not isinstance(with_config, dict) or "password" not in with_config, (
+            "publish action must not pass password via OIDC trusted publishing"
+        )
+
+
+def test_release_build_job_has_inspection_and_smoke_test() -> None:
+    """build job in release.yml must include distribution inspection and smoke-test."""
+    workflow = _release_workflow()
+    jobs = workflow.get("jobs")
+    assert isinstance(jobs, dict)
+    build = jobs.get("build")
+    assert isinstance(build, dict)
+    steps = build.get("steps")
+    assert isinstance(steps, list) and steps
+
+    step_names = {step.get("name", "") for step in steps if isinstance(step, dict)}
+    assert "Inspect distribution contents" in step_names, (
+        "build job must include 'Inspect distribution contents' step"
+    )
+    assert "Smoke-test wheel installs" in step_names, (
+        "build job must include 'Smoke-test wheel installs' step"
+    )
