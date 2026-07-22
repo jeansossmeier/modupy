@@ -343,7 +343,7 @@ def test_derive_specs_rejects_non_positive_default_count(make_fake_app) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.integration
+@pytest.mark.real_process
 async def test_log_forwarder_tasks_are_pruned_when_worker_exits() -> None:
     """A8-r1-29: every (re)spawn appended two log-forwarder tasks to
     Supervisor._log_tasks and nothing removed finished entries outside
@@ -368,7 +368,7 @@ async def test_log_forwarder_tasks_are_pruned_when_worker_exits() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.integration
+@pytest.mark.real_process
 async def test_worker_respawned_during_stop_still_gets_sigterm() -> None:
     """A8-r5-213: stop()'s SIGTERM cascade is a one-shot snapshot of
     self._processes. A monitor that is *inside* _spawn (respawning a crashed
@@ -426,7 +426,7 @@ async def test_worker_respawned_during_stop_still_gets_sigterm() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.integration
+@pytest.mark.real_process
 @pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG is Linux-only")
 async def test_workers_die_when_supervisor_is_sigkilled(tmp_path: Path) -> None:
     """A8-r1-26: workers were spawned with no parent-death signal, so a
@@ -580,7 +580,7 @@ def _raw_echo_upstream() -> Any:
     return app
 
 
-@pytest.mark.integration
+@pytest.mark.real_process
 async def test_proxy_preserves_duplicate_headers_and_raw_path_over_real_sockets() -> None:
     """Task 7: real end-to-end proof (not ASGITransport) that the proxy (a)
     preserves every occurrence of a repeated header name and (b) forwards an
@@ -616,7 +616,7 @@ async def test_proxy_preserves_duplicate_headers_and_raw_path_over_real_sockets(
     assert cookie_values == ["a=1", "b=2"]  # both occurrences forwarded, not just one
 
 
-@pytest.mark.integration
+@pytest.mark.real_process
 async def test_proxy_actuator_reachable_over_real_sockets() -> None:
     """Task 7: sanity check that the actuator endpoints themselves — not just
     the catch-all proxy route — work over a genuine TCP round trip."""
@@ -715,7 +715,7 @@ def test_resolve_actuator_auto_accepts_token_in_production() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.integration
+@pytest.mark.real_process
 async def test_forward_logs_drains_oversized_line_without_dying(caplog: Any) -> None:
     """Task 7: a single log line longer than StreamReader's buffer limit
     raises ValueError from readline() — _forward_logs must log a truncation

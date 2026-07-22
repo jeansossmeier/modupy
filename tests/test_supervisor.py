@@ -203,7 +203,7 @@ async def test_run_supervised_stops_workers_when_start_fails_partway() -> None:
     assert served == []  # the proxy never served — start() failed first
 
 
-@pytest.mark.integration
+@pytest.mark.real_process
 async def test_run_supervised_reaps_partial_spawn_of_real_workers() -> None:
     """S3-r3-161 (W2 RESIDUALS item 8), real-subprocess form: the 2nd of two
     workers fails to spawn (nonexistent binary) partway through start() —
@@ -233,7 +233,7 @@ async def test_run_supervised_reaps_partial_spawn_of_real_workers() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.integration
+@pytest.mark.real_process
 async def test_start_spawns_all_workers() -> None:
     sup = Supervisor([WorkerSpec("orders", "fakeapp", 9001)], command_builder=_sleep_builder)
     try:
@@ -245,7 +245,7 @@ async def test_start_spawns_all_workers() -> None:
         await sup.stop()
 
 
-@pytest.mark.integration
+@pytest.mark.real_process
 async def test_worker_count_spawns_replicas() -> None:
     sup = Supervisor(
         [WorkerSpec("orders", "fakeapp", 9001, worker_count=2)],
@@ -258,7 +258,7 @@ async def test_worker_count_spawns_replicas() -> None:
         await sup.stop()
 
 
-@pytest.mark.integration
+@pytest.mark.real_process
 async def test_stop_terminates_all_workers() -> None:
     sup = Supervisor([WorkerSpec("orders", "fakeapp", 9001)], command_builder=_sleep_builder)
     await sup.start()
@@ -269,7 +269,7 @@ async def test_stop_terminates_all_workers() -> None:
     assert proc.returncode is not None  # exited
 
 
-@pytest.mark.integration
+@pytest.mark.real_process
 async def test_crashed_worker_is_restarted_with_backoff() -> None:
     calls: list[tuple[str, int]] = []
 
@@ -354,7 +354,7 @@ def test_restart_policy_resets_crash_streak_after_recovery() -> None:
     assert p.on_crash(uptime=10.0, now=20.0) is not None
 
 
-@pytest.mark.integration
+@pytest.mark.real_process
 async def test_crash_loop_gives_up_after_max_restarts() -> None:
     """An always-crashing worker is abandoned once the breaker trips (#33).
 
@@ -407,7 +407,7 @@ def _free_port() -> int:
     return port
 
 
-@pytest.mark.integration
+@pytest.mark.real_process
 async def test_run_supervised_default_serve_binds_real_uvicorn() -> None:
     """S3-r2-121: with no ``serve=`` override, run_supervised must serve the
     proxy via the real ``_serve_uvicorn`` — the production default behind
