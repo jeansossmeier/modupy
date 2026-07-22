@@ -71,6 +71,7 @@ def _upstream_app() -> FastAPI:
     @up.get("/orders/slow")
     async def slow_response() -> dict[str, str]:
         import asyncio
+
         # Delay >5s to exercise the read=None timeout config:
         # without read=None, httpx would kill this with ReadTimeout.
         await asyncio.sleep(6)
@@ -201,7 +202,9 @@ def test_proxy_maps_all_transport_errors_to_502(exc: Exception) -> None:
     # ConnectError used to be the only caught case; reachable-but-unresponsive
     # or mid-handshake-death backends leaked as 500. All TransportError → 502.
     app = create_proxy_app(
-        [RoutingRule("/orders", "http://orders-worker")], client=_FailingClient(exc)
+        [RoutingRule("/orders", "http://orders-worker")],
+        client=_FailingClient(exc),
+        connect_retry_attempts=1,
     )
     with TestClient(app) as client:
         resp = client.get("/orders/ping")
@@ -314,6 +317,7 @@ def test_proxy_transport_error_logs_omit_query_string_secrets(caplog) -> None:
     app = create_proxy_app(
         [RoutingRule("/orders", "http://orders-worker")],
         client=_FailingClient(httpx.ConnectError("refused")),
+        connect_retry_attempts=1,
     )
 
     with TestClient(app) as client:
@@ -322,6 +326,111 @@ def test_proxy_transport_error_logs_omit_query_string_secrets(caplog) -> None:
     assert resp.status_code == 502
     assert "token=secret" not in caplog.text
     assert "/orders/ping" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Bounded connect retry (worker startup/respawn bind window)
+# ---------------------------------------------------------------------------
+
+
+class _SuccessResponse:
+    """Minimal response-like object for successful async responses."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.status_code = 200
+        self.headers = httpx.Headers({"content-type": "application/json"})
+
+    async def aiter_raw(self, chunk_size=None):
+        # Yield the data in one chunk
+        yield self.data
+
+    async def aclose(self) -> None:
+        pass
+
+
+class _EventuallyBindingClient:
+    """httpx-shaped client that raises ConnectError for the first N calls,
+    then returns a successful response — simulates a worker that eventually
+    starts binding its port."""
+
+    def __init__(self, fail_count: int) -> None:
+        self._fail_count = fail_count
+        self.send_calls = 0
+
+    def build_request(self, *, method, url, headers=None, content=None):
+        return httpx.Request(method, url, headers=headers, content=content)
+
+    async def send(self, request, *, stream: bool = False):
+        self.send_calls += 1
+        if self.send_calls <= self._fail_count:
+            raise httpx.ConnectError("worker port not bound yet")
+        # Return a successful response once the worker "binds"
+        import json
+
+        return _SuccessResponse(json.dumps({"pong": True}).encode())
+
+    async def aclose(self) -> None:
+        pass
+
+
+def test_proxy_retries_connect_error_until_backend_binds() -> None:
+    """Verify that ConnectError is retried and the request succeeds once the
+    worker's port becomes available (simulating worker startup/respawn)."""
+    client = _EventuallyBindingClient(fail_count=2)
+    app = create_proxy_app(
+        [RoutingRule("/orders", "http://orders-worker")],
+        client=client,
+        connect_retry_attempts=5,
+        connect_retry_backoff=0.0,  # instant for test speed
+    )
+
+    with TestClient(app) as test_client:
+        resp = test_client.get("/orders/ping")
+
+    # Request succeeded on retry
+    assert resp.status_code == 200
+    assert resp.json() == {"pong": True}
+    # Send was called exactly 3 times: 2 failures + 1 success
+    assert client.send_calls == 3
+
+
+class _AlwaysFailingClient:
+    """httpx-shaped client whose send() always raises ConnectError."""
+
+    def __init__(self) -> None:
+        self.send_calls = 0
+
+    def build_request(self, *, method, url, headers=None, content=None):
+        return httpx.Request(method, url, headers=headers, content=content)
+
+    async def send(self, request, *, stream: bool = False):
+        self.send_calls += 1
+        raise httpx.ConnectError("worker port never bound")
+
+    async def aclose(self) -> None:
+        pass
+
+
+def test_proxy_exhausts_connect_retry_budget_then_502() -> None:
+    """Verify that ConnectError retries are bounded — after exhausting the
+    retry budget, the request returns 502 instead of retrying forever."""
+    client = _AlwaysFailingClient()
+    app = create_proxy_app(
+        [RoutingRule("/orders", "http://orders-worker")],
+        client=client,
+        connect_retry_attempts=3,
+        connect_retry_backoff=0.0,  # instant for test speed
+    )
+
+    with TestClient(app) as test_client:
+        resp = test_client.get("/orders/ping")
+
+    # Request failed with 502 after budget exhausted
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "backend unreachable"
+    # Send was called exactly 3 times (the budget limit)
+    assert client.send_calls == 3
 
 
 # ---------------------------------------------------------------------------

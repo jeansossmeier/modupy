@@ -66,6 +66,8 @@ def create_proxy_app(
     actuator_token: str | None = None,
     actuator_enabled: bool = True,
     timeout: httpx.Timeout | None = None,
+    connect_retry_attempts: int = 5,
+    connect_retry_backoff: float = 0.2,
 ) -> FastAPI:
     """Build the reverse-proxy ASGI app.
 
@@ -79,6 +81,15 @@ def create_proxy_app(
     read timeout to support long-polling, streaming responses, and slow
     upstreams. Ignored if ``client`` is injected (the caller owns the client's
     configuration).
+
+    ``connect_retry_attempts`` and ``connect_retry_backoff`` configure bounded
+    retry on ``httpx.ConnectError`` (worker port not yet bound during startup/
+    respawn). Total worst-case added latency before a truly-dead backend returns
+    502 ≈ ``connect_retry_backoff * (connect_retry_attempts - 1)`` ≈ 0.8s with
+    defaults. Retries ONLY ConnectError (TCP connection never completed, safe
+    to retry any HTTP method); other TransportError types (ConnectTimeout,
+    ReadError, etc.) are not retried. Heavy/slow-starting apps can raise the
+    budget.
 
     ``actuator_enabled=False`` (``actuator_mode="disabled"``, resolved by
     ``run_supervised``) unmounts ``/_modulith/*`` entirely — those paths fall
@@ -234,49 +245,69 @@ def create_proxy_app(
                 exc,
             )
             return JSONResponse({"detail": "invalid request"}, status_code=400)
-        try:
-            upstream_resp = await http_client.send(upstream_req, stream=True)
-        except httpx.TransportError as exc:
-            # TransportError covers the whole connect/read failure tree —
-            # ConnectError (refused/DNS), ConnectTimeout (reachable but
-            # unresponsive), ReadError/ReadTimeout/RemoteProtocolError (worker
-            # died mid-handshake). All mean "backend unavailable" → 502, never
-            # an uncaught 500.
-            logger.warning(
-                "backend %s unreachable for %s: %s",
-                rule.backend_url,
-                _without_query(upstream),
-                exc,
+        attempts = max(1, connect_retry_attempts)
+        for attempt in range(attempts):
+            try:
+                upstream_resp = await http_client.send(upstream_req, stream=True)
+            except httpx.ConnectError as exc:
+                # Worker port not bound yet (initial start or crash-respawn
+                # window). The TCP connection never completed, so no request
+                # bytes were sent — safe to retry any method. Bounded budget,
+                # then fall through to 502.
+                if attempt + 1 >= attempts:
+                    logger.warning(
+                        "backend %s unreachable after %d connect attempts for %s: %s",
+                        rule.backend_url,
+                        attempts,
+                        _without_query(upstream),
+                        exc,
+                    )
+                    return JSONResponse({"detail": "backend unreachable"}, status_code=502)
+                await asyncio.sleep(connect_retry_backoff)
+                continue
+            except httpx.TransportError as exc:
+                # TransportError covers the whole connect/read failure tree —
+                # ConnectError (refused/DNS), ConnectTimeout (reachable but
+                # unresponsive), ReadError/ReadTimeout/RemoteProtocolError (worker
+                # died mid-handshake). All mean "backend unavailable" → 502, never
+                # an uncaught 500.
+                logger.warning(
+                    "backend %s unreachable for %s: %s",
+                    rule.backend_url,
+                    _without_query(upstream),
+                    exc,
+                )
+                return JSONResponse({"detail": "backend unreachable"}, status_code=502)
+            except httpx.RequestError as exc:
+                # RequestError siblings outside the TransportError subtree —
+                # httpx.TooManyRedirects (a redirect-looping backend behind an
+                # injected follow_redirects=True client, S3-r3-162) and
+                # httpx.DecodingError. Both mean "no valid response could be
+                # obtained from the backend" → 502, honoring the
+                # never-an-uncaught-500 contract documented above.
+                logger.warning(
+                    "backend %s returned no usable response for %s: %s",
+                    rule.backend_url,
+                    _without_query(upstream),
+                    exc,
+                )
+                return JSONResponse({"detail": "backend error"}, status_code=502)
+            # success: build + return the streaming response
+            response = StreamingResponse(
+                _safe_stream(upstream_resp, _without_query(upstream)),
+                status_code=upstream_resp.status_code,
             )
-            return JSONResponse({"detail": "backend unreachable"}, status_code=502)
-        except httpx.RequestError as exc:
-            # RequestError siblings outside the TransportError subtree —
-            # httpx.TooManyRedirects (a redirect-looping backend behind an
-            # injected follow_redirects=True client, S3-r3-162) and
-            # httpx.DecodingError. Both mean "no valid response could be
-            # obtained from the backend" → 502, honoring the
-            # never-an-uncaught-500 contract documented above.
-            logger.warning(
-                "backend %s returned no usable response for %s: %s",
-                rule.backend_url,
-                _without_query(upstream),
-                exc,
-            )
-            return JSONResponse({"detail": "backend error"}, status_code=502)
-
-        response = StreamingResponse(
-            _safe_stream(upstream_resp, _without_query(upstream)),
-            status_code=upstream_resp.status_code,
-        )
-        # Passing headers= to StreamingResponse builds a plain dict internally
-        # (Response.init_headers), which loses duplicates the same way as on
-        # the request side (e.g. multiple Set-Cookie). Setting raw_headers
-        # directly after construction preserves every occurrence.
-        response.raw_headers = [
-            (k.lower().encode("latin-1"), v.encode("latin-1"))
-            for k, v in _filter_headers(_header_pairs(upstream_resp.headers.raw))
-        ]
-        return response
+            # Passing headers= to StreamingResponse builds a plain dict internally
+            # (Response.init_headers), which loses duplicates the same way as on
+            # the request side (e.g. multiple Set-Cookie). Setting raw_headers
+            # directly after construction preserves every occurrence.
+            response.raw_headers = [
+                (k.lower().encode("latin-1"), v.encode("latin-1"))
+                for k, v in _filter_headers(_header_pairs(upstream_resp.headers.raw))
+            ]
+            return response
+        # Loop always returns above; satisfies the type checker.
+        return JSONResponse({"detail": "backend unreachable"}, status_code=502)
 
     return app
 
