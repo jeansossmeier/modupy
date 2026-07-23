@@ -27,7 +27,7 @@ description = "Modular monolith pattern for Python — module structure, event-d
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
-authors = [{ name = "modulith contributors" }]
+authors = [{ name = "Jean Sossmeier" }]
 keywords = [
     "modular-monolith",
     "ddd",
@@ -200,10 +200,11 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/modulith/modulith"
-Documentation = "https://modulith.readthedocs.io"
-Repository = "https://github.com/modulith/modulith"
-Issues = "https://github.com/modulith/modulith/issues"
+Homepage = "https://github.com/jeansossmeier/modupy"
+Documentation = "https://github.com/jeansossmeier/modupy/tree/main/docs"
+Repository = "https://github.com/jeansossmeier/modupy"
+Issues = "https://github.com/jeansossmeier/modupy/issues"
+Changelog = "https://github.com/jeansossmeier/modupy/blob/main/CHANGELOG.md"
 
 # The `modulith` console script. Available on PATH after `pip install`.
 # Implementation lives in modulith/cli.py.

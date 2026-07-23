@@ -124,6 +124,12 @@ class Configuration:
     # Run manifest verification during bootstrap. Disable for gradual adoption.
     verify_manifests: bool = True
 
+    # Enforce boundary violations at bootstrap as fatal errors.
+    # When False (default), violations generate warnings only. When True,
+    # the startup fails immediately, catching boundary breaches before
+    # the application starts.
+    strict_boundaries: bool = False
+
     # Tracks which keys were explicitly set vs got their default value.
     # Used by safety checks (e.g. "production + default outbox = error").
     explicit_keys: frozenset[str] = field(default_factory=frozenset)
@@ -619,6 +625,7 @@ def _read_env_vars() -> dict[str, Any]:
         ("MODULITH_AUTO_DISCOVER", "auto_discover"),
         ("MODULITH_OBSERVABILITY", "observability"),
         ("MODULITH_VERIFY_MANIFESTS", "verify_manifests"),
+        ("MODULITH_STRICT_BOUNDARIES", "strict_boundaries"),
     )
     for env_name, field_name in bool_vars:
         if (flag := _env_bool(env_name)) is not None:
@@ -703,6 +710,7 @@ def _validate(data: dict[str, Any]) -> None:
         "production": (bool,),
         "observability": (bool, type(None)),
         "verify_manifests": (bool,),
+        "strict_boundaries": (bool,),
     }
     for field_name, expected_types in scalar_types.items():
         if field_name in data and type(data[field_name]) not in expected_types:

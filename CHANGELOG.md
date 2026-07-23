@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.9.0] — 2026-07-22
 
-**Pre-1.0 feature-complete release.** Modulith is near-production-ready with all Phase 0–3 features implemented.
+**Pre-1.0 feature-complete alpha release.** All Phase 0–3 features are implemented and tested; the core API is stable enough for early adopters, though the public API may still shift before 1.0. See [STABILITY.md](docs/STABILITY.md) for pre-1.0 SemVer guarantees.
 
 ### Added
 

@@ -58,7 +58,7 @@ class RedisStreamsBroker:
         # install this adapter never pay the import cost.
         import redis.asyncio as redis
 
-        self._client = redis.from_url(url)
+        self._client = redis.from_url(url)  # type: ignore[no-untyped-call]  # redis-py 6.x from_url is unannotated
 
     async def publish(
         self,

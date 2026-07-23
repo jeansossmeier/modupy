@@ -1,5 +1,10 @@
 # modulith
 
+[![CI Status](https://github.com/jeansossmeier/modupy/actions/workflows/ci.yml/badge.svg)](https://github.com/jeansossmeier/modupy/actions?query=workflow%3ACI)
+[![PyPI Version](https://img.shields.io/pypi/v/modulith)](https://pypi.org/project/modulith/)
+[![Python Versions](https://img.shields.io/pypi/pyversions/modulith)](https://pypi.org/project/modulith/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 > A Python framework for the modular monolith pattern. Module structure
 > with enforced boundaries, event-driven communication between modules,
 > transactional outbox for crash-safe delivery, and an optional
@@ -86,22 +91,29 @@ modulith bootstraps lazily, so the banner follows uvicorn's own startup
 lines: it appears on first use — the first request that `publish()`es
 an event — not at process start.
 
+The framework starts with zero external dependencies: in-memory broker and
+outbox for development, then scales to durable SHM/SQLite (single-host),
+Redis Streams, or Postgres/MySQL/SQLite (distributed) with one config line.
+
 ---
 
 ## What modulith provides
 
 **Module structure with enforced boundaries.** Subpackages of your
-application are modules. Underscore-prefixed names are private. The
-verifier catches cross-module access to internals before they ship.
+application are modules. Underscore-prefixed names are private. Static
+AST analysis verifies module boundaries at load time. `modulith verify`
+catches and fails CI on boundary violations; `modulith dev` reports them
+as startup warnings (non-fatal by design).
 
 **Event-driven inter-module communication.** Modules talk through
 events, not direct function calls. The coupling stays low; refactoring
 stays cheap.
 
-**Transactional outbox.** When enabled, events published inside a
-database transaction are durably stored and delivered at-least-once
-after commit. Process crashes don't lose events; rolled-back
-transactions don't leak ghost events.
+**Transactional outbox.** The outbox is always wired into your
+application; durability is opt-in. Default is in-memory (no persistence);
+set `outbox = "postgres"` (or MySQL/SQLite) in `[tool.modulith]` for
+durable, transactional event storage with at-least-once delivery after
+commit. Process crashes and transaction rollbacks stay consistent.
 
 **Optional process-per-module runtime.** When one module needs its own
 CPU/memory budget, run it in its own process via the supervisor. Same
@@ -253,7 +265,7 @@ modulith dev myapp.main:app       # like uvicorn --reload, with banner +
                                   # boundary warnings at startup (non-fatal)
 modulith run myapp.main:app --topology=processes # production, process-per-module
 modulith verify --mode=ratchet    # boundary checks for CI
-                                  # (--fail-on-warnings to fail on WARNINGs too)
+                                  # (ERROR-severity failures always fatal)
 modulith docs                     # generate Mermaid diagrams + canvas
 modulith audit                    # analyze existing codebase for migration
                                   # (writes MIGRATION.md; --output to change)
@@ -268,9 +280,14 @@ works the same way.
 
 Exit codes are uniform: **0** success (warnings may still be reported —
 `modulith dev` echoes verifier violations as non-fatal startup warnings,
-and `verify` passes WARNING-severity findings unless `--fail-on-warnings`
-is set), **1** violations or user error (bad flags, config errors),
-**2** unexpected internal error.
+and `verify` fails only on ERROR-severity findings), **1** violations or
+user error (bad flags, config errors), **2** unexpected internal error.
+
+Set `strict_boundaries = true` in `[tool.modulith]` to fail fast on any
+boundary violation (ERROR or WARNING) in `modulith verify`, `modulith run`,
+and `modulith dev --topology=processes`. Note: single-process `modulith dev`
+remains warn-only regardless of `strict_boundaries` (its interactive
+development contract is inviolable).
 
 ---
 
@@ -291,15 +308,15 @@ the public API, see `tests/`.
 
 ## Comparison to alternatives
 
-| | modulith | Spring Modulith | bare FastAPI + folders | microservices |
-|---|---|---|---|---|
-| Module boundaries | ✓ enforced | ✓ enforced | ✗ convention only | ✓ network-enforced |
-| Event-driven IPC | ✓ in-process or broker | ✓ in-process or broker | ✗ DIY | ✓ broker-only |
-| Transactional outbox | ✓ built-in | ✓ built-in | ✗ DIY | ✓ DIY per service |
-| Migration path | ✓ ratchet from existing | ✓ ratchet | n/a | ✗ rewrite |
-| Process-per-module | ✓ optional | ✗ | ✗ | n/a — already separate |
-| Operational complexity | low | low | lowest | highest |
-| Python | ✓ | ✗ Java | ✓ | ✓ |
+| | modulith | Spring Modulith | bare FastAPI + folders | FastAPI + Celery + import-linter | microservices |
+|---|---|---|---|---|---|
+| Module boundaries | ✓ enforced | ✓ enforced | ✗ convention only | ✓ import-linter enforces | ✓ network-enforced |
+| Event-driven IPC | ✓ in-process or broker | ✓ in-process or broker | ✗ DIY | ✓ Celery | ✓ broker-only |
+| Transactional outbox | ✓ built-in | ✓ built-in | ✗ DIY | ✗ hand-rolled | ✓ DIY per service |
+| Migration path | ✓ ratchet from existing | ✓ ratchet | n/a | ✓ from existing | ✗ rewrite |
+| Process-per-module | ✓ optional | ✗ | ✗ | ✗ broker-based only | n/a — already separate |
+| Operational complexity | low | low | lowest | medium | highest |
+| Python | ✓ | ✗ Java | ✓ | ✓ | ✓ |
 
 The modulith pattern fits teams of 3-15 engineers building B2B SaaS in
 Python who want to delay microservices for as long as possible. If
@@ -316,7 +333,8 @@ opinionated; please read [SPEC.md](SPEC.md) before opening large PRs.
 
 The plugin contract (12 hookspecs, 4 protocols) is the most stable
 part of the project — additions are easy, signature changes require
-strong justification.
+strong justification. For a complete stability policy and what's guaranteed
+across 0.x minor releases, see [STABILITY.md](docs/STABILITY.md).
 
 ### Running the tests
 

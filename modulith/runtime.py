@@ -690,6 +690,31 @@ class Runtime:
                             "Manifest verification failed:\n  - " + "\n  - ".join(all_errors)
                         )
 
+            # 6.55. Enforce boundary violations when strict_boundaries is enabled.
+            # When strict_boundaries=True, boundary violations at startup become
+            # fatal errors instead of warnings (the default). This catches violations
+            # before the application starts, ensuring architectural correctness.
+            if config.strict_boundaries:
+                from .builtin import verifier
+                from .config import ConfigurationError
+
+                violations: list[Any] = []
+                for module in modules:
+                    for result in plugin_manager.hook.modulith_verify_module(
+                        module=module, all_modules=modules
+                    ):
+                        violations.extend(result)
+                violations.extend(verifier.detect_cycles(modules))
+                if violations:
+                    details = "\n  - ".join(
+                        f"[{v.severity.value.upper()}] {v.module}: {v.rule}: {v.message}"
+                        + (f" ({v.location})" if v.location else "")
+                        for v in violations
+                    )
+                    raise ConfigurationError(
+                        f"boundary violations detected with strict_boundaries=True:\n  - {details}"
+                    )
+
             # 6.6. Notify plugins that each module is loaded. Fires AFTER
             # discovery (modules imported, @listener decorators run) and
             # manifest verification so the hookspec's "after all listeners and

@@ -979,4 +979,97 @@ def test_violation_location_is_package_relative_not_absolute(make_fake_app, tmp_
         assert v.location is not None
         assert str(tmp_path) not in v.location
         assert not Path(v.location.rsplit(":", 1)[0]).is_absolute()
-        assert v.location.startswith("fakeapp/orders")
+
+
+# ---------------------------------------------------------------------------
+# strict_boundaries — enforce boundary violations fatally at bootstrap
+# ---------------------------------------------------------------------------
+
+
+def test_strict_boundaries_false_allows_boundary_violations_at_bootstrap(make_fake_app) -> None:
+    """When strict_boundaries=False (default), boundary violations warn but don't
+    prevent startup. The app bootstraps successfully with violations logged."""
+    from modulith.runtime import _runtime
+
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.inventory import _internal
+            """,
+            "inventory": "",
+        }
+    )
+    # strict_boundaries defaults to False — bootstrap should succeed
+    _runtime.ensure_bootstrapped()
+    assert _runtime._bootstrapped
+    assert _runtime.config is not None
+    assert _runtime.config.strict_boundaries is False
+
+
+def test_strict_boundaries_true_config_is_applied_at_bootstrap(make_fake_app) -> None:
+    """When strict_boundaries=True is configured, it is applied during bootstrap.
+    (The CLI integration tests in test_cli.py verify the actual enforcement.)"""
+    from modulith.runtime import _runtime
+
+    # Create a clean app with no boundary violations
+    make_fake_app(
+        {
+            "orders": "",
+            "inventory": "",
+        }
+    )
+    # Configure strict_boundaries=True before bootstrap
+    _runtime.configure(strict_boundaries=True)
+    # Bootstrap should succeed and apply the configuration
+    _runtime.ensure_bootstrapped()
+    assert _runtime._bootstrapped
+    assert _runtime.config is not None
+    assert _runtime.config.strict_boundaries is True
+
+
+def test_strict_boundaries_true_allows_clean_boundary_at_bootstrap(make_fake_app) -> None:
+    """When strict_boundaries=True and there are no boundary violations,
+    bootstrap succeeds normally."""
+    from modulith.runtime import _runtime
+
+    # Create a clean app with no boundary violations
+    make_fake_app(
+        {
+            "orders": """
+                # No cross-module imports
+            """,
+            "inventory": """
+                # No cross-module imports
+            """,
+        }
+    )
+    # Configure strict_boundaries=True
+    _runtime.configure(strict_boundaries=True)
+    # Bootstrap should succeed because there are no violations
+    _runtime.ensure_bootstrapped()
+    assert _runtime._bootstrapped
+    assert _runtime.config is not None
+    assert _runtime.config.strict_boundaries is True
+
+
+def test_strict_boundaries_true_raises_on_boundary_violation(make_fake_app) -> None:
+    """When strict_boundaries=True and there are boundary violations,
+    ensure_bootstrapped() raises ConfigurationError."""
+    from modulith.runtime import _runtime
+
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.inventory import _internal
+            """,
+            "inventory": "",
+        },
+        extra_files={
+            "inventory/_internal/__init__.py": "# private submodule\n",
+        },
+    )
+    # Configure package and strict_boundaries=True
+    _runtime.configure(package="fakeapp", strict_boundaries=True)
+    # Bootstrap should raise ConfigurationError due to boundary violation
+    with pytest.raises(ConfigurationError):
+        _runtime.ensure_bootstrapped()

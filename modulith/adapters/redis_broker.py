@@ -1,8 +1,10 @@
 """Redis Streams broker adapter.
 
-Default broker for process-per-module topology. Redis Streams gives us
+Production-scale broker for distributed systems. Redis Streams gives us
 microsecond IPC latency, durable message delivery, consumer groups for
-horizontal scaling, and is already in most teams' infrastructure.
+horizontal scaling, and is already in most teams' infrastructure. Opt-in
+via `modulith.configure(broker="redis")` for process-per-module and
+process-per-monolith topologies.
 
 Distributed via the `modulith[redis]` extra. Optional dependency:
 redis>=5.0 (the official redis-py package, which has async support). The

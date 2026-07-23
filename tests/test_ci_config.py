@@ -473,7 +473,7 @@ def test_coverage_outbox_path_is_fully_covered() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _release_workflow() -> dict[str, Any]:
+def _release_workflow() -> dict[Any, Any]:
     """Parse the release.yml workflow."""
     release_path = REPO_ROOT / ".github" / "workflows" / "release.yml"
     assert release_path.exists(), "release.yml must exist"
@@ -493,9 +493,7 @@ def test_release_triggers_on_version_tags() -> None:
     workflow = _release_workflow()
     # YAML parses 'on' as the boolean True key, not the string 'on'
     on = workflow.get(True)
-    assert isinstance(on, dict), (
-        "release.yml must define an 'on' trigger"
-    )
+    assert isinstance(on, dict), "release.yml must define an 'on' trigger"
     push = on.get("push")
     assert isinstance(push, dict)
     tags = push.get("tags")
@@ -522,9 +520,7 @@ def test_release_publish_job_has_oidc_permission() -> None:
     publish = jobs.get("publish")
     assert isinstance(publish, dict)
     permissions = publish.get("permissions")
-    assert isinstance(permissions, dict), (
-        "publish job must define permissions"
-    )
+    assert isinstance(permissions, dict), "publish job must define permissions"
     id_token = permissions.get("id-token")
     assert id_token == "write", (
         "publish job must have permissions.id-token: write for OIDC trusted publishing"
@@ -542,7 +538,8 @@ def test_release_publish_job_uses_pypa_action() -> None:
     assert isinstance(steps, list) and steps
 
     pypa_steps = [
-        step for step in steps
+        step
+        for step in steps
         if isinstance(step.get("uses"), str)
         and step["uses"].startswith("pypa/gh-action-pypi-publish@")
     ]
@@ -585,9 +582,9 @@ def test_release_publish_has_no_hardcoded_token() -> None:
     assert "password:" not in workflow_text or "password:" not in str(publish)
     # OIDC trusted publishing should not use user/password
     pypa_steps = [
-        step for step in publish.get("steps", [])
-        if isinstance(step.get("uses"), str)
-        and "pypa/gh-action-pypi-publish" in step["uses"]
+        step
+        for step in publish.get("steps", [])
+        if isinstance(step.get("uses"), str) and "pypa/gh-action-pypi-publish" in step["uses"]
     ]
     for step in pypa_steps:
         with_config = step.get("with", {})

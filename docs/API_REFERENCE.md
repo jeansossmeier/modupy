@@ -333,6 +333,7 @@ Mutating it after the runtime starts would create inconsistent state.
 - `subscriptions: dict[str, list[str]]` (default factory)
 - `observability: bool | None` = `None`
 - `verify_manifests: bool` = `True`
+- `strict_boundaries: bool` = `False`
 - `explicit_keys: frozenset[str]` (default factory)
 
 **Methods:**

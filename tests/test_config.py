@@ -1056,3 +1056,52 @@ def test_pyproject_outbox_options_rejects_invalid_claim_batch_size(value: object
 def test_pyproject_outbox_options_accepts_valid_claim_batch_size() -> None:
     cfg = load_configuration(outbox_options={"claim_batch_size": 250})
     assert cfg.outbox_options == {"claim_batch_size": 250}
+
+
+# ----- strict_boundaries (boundary enforcement mode) --------------------------
+
+
+def test_strict_boundaries_defaults_to_false() -> None:
+    """strict_boundaries defaults to False (non-fatal warnings)."""
+    cfg = load_configuration()
+    assert cfg.strict_boundaries is False
+    assert not cfg.is_explicit("strict_boundaries")
+
+
+def test_strict_boundaries_via_pyproject(tmp_path: Path) -> None:
+    """strict_boundaries can be set via [tool.modulith].strict_boundaries."""
+    (tmp_path / "pyproject.toml").write_text("[tool.modulith]\nstrict_boundaries = true\n")
+    cfg = load_configuration()
+    assert cfg.strict_boundaries is True
+    assert cfg.is_explicit("strict_boundaries")
+
+
+def test_strict_boundaries_via_env_var(monkeypatch) -> None:
+    """strict_boundaries can be set via MODULITH_STRICT_BOUNDARIES env var."""
+    monkeypatch.setenv("MODULITH_STRICT_BOUNDARIES", "true")
+    cfg = load_configuration()
+    assert cfg.strict_boundaries is True
+    assert cfg.is_explicit("strict_boundaries")
+
+
+def test_strict_boundaries_via_env_var_false(monkeypatch) -> None:
+    """MODULITH_STRICT_BOUNDARIES=false sets it to False."""
+    monkeypatch.setenv("MODULITH_STRICT_BOUNDARIES", "false")
+    cfg = load_configuration()
+    assert cfg.strict_boundaries is False
+    assert cfg.is_explicit("strict_boundaries")
+
+
+def test_strict_boundaries_env_overrides_pyproject(tmp_path: Path, monkeypatch) -> None:
+    """MODULITH_STRICT_BOUNDARIES env var overrides pyproject setting."""
+    (tmp_path / "pyproject.toml").write_text("[tool.modulith]\nstrict_boundaries = false\n")
+    monkeypatch.setenv("MODULITH_STRICT_BOUNDARIES", "true")
+    cfg = load_configuration()
+    assert cfg.strict_boundaries is True
+
+
+def test_strict_boundaries_explicit_override_wins(monkeypatch) -> None:
+    """Explicit override to load_configuration() beats env and pyproject."""
+    monkeypatch.setenv("MODULITH_STRICT_BOUNDARIES", "false")
+    cfg = load_configuration(strict_boundaries=True)
+    assert cfg.strict_boundaries is True
