@@ -27,11 +27,26 @@ MODULITH_BROKER=memory uvicorn myapp.main:app --workers 1
 
 Add persistence without splitting processes: publish events atomically with your domain transaction.
 
+In `myapp/main.py`:
+```python
+from modulith import configure
+from modulith.builtin import outbox
+from modulith.adapters.postgres_outbox import PostgresPublicationStore
+from modulith.serializers import JsonEventSerializer
+from sqlalchemy.ext.asyncio import create_async_engine
+
+async_engine = create_async_engine("postgresql+asyncpg://user:pass@localhost/mydb")
+store = PostgresPublicationStore(engine=async_engine)
+outbox.configure(store=store, serializer=JsonEventSerializer())
+configure(outbox="postgres")
+
+app = ... # your FastAPI or ASGI app
+```
+
+Then run:
 ```bash
 pip install 'modulith[fastapi,cli,postgres]'
-MODULITH_OUTBOX=postgres \
-  MODULITH_DB_URL=postgresql+asyncpg://user:pass@localhost/mydb \
-  uvicorn myapp.main:app --workers 1
+MODULITH_OUTBOX=postgres uvicorn myapp.main:app --workers 1
 ```
 
 **What changes:**
@@ -103,8 +118,10 @@ In `pyproject.toml`:
 ```toml
 [tool.modulith]
 broker = "database"
-broker_url = "sqlite+aiosqlite:////path/to/broker.db"  # or postgres://
 topology = "processes"
+
+[tool.modulith.broker_options]
+url = "sqlite+aiosqlite:////path/to/broker.db"  # or postgres://
 ```
 
 Or via environment:
@@ -116,22 +133,20 @@ modulith run myapp.main:app --topology processes
 
 **Module assignment:**
 
-By default, `modulith run --topology processes` detects subpackages and assigns one worker per submodule. To customize:
+By default, `modulith run --topology processes` detects subpackages and assigns one worker per submodule.
 
-```bash
-modulith run myapp.main:app --topology processes \
-  --modules orders,inventory,notifications
+To customize worker counts per module, configure in `pyproject.toml`:
+```toml
+[tool.modulith.workers]
+orders = 2         # 2 workers for orders module
+inventory = 3      # 3 workers for inventory module
+notifications = 1  # 1 worker for notifications (default)
 ```
 
-Or per-module in `pyproject.toml`:
-```toml
-[[tool.modulith.workers]]
-modules = ["orders", "inventory"]  # run together
-port = 8001
-
-[[tool.modulith.workers]]
-modules = ["notifications"]        # run separately
-port = 8002
+Or override entirely via `--workers` JSON flag:
+```bash
+modulith run myapp.main:app --topology processes \
+  --workers '{"orders": 2, "inventory": 3, "notifications": 1}'
 ```
 
 ### B. Redis Streams Broker
@@ -322,14 +337,18 @@ MODULITH_OUTBOX=postgres uvicorn myapp.main:app --workers 4 &
 MODULITH_OUTBOX=postgres uvicorn myapp.main:app --workers 4 &
 ```
 
-For **process-per-module**, add more instances of high-traffic modules. The supervisor will load-balance across them if configured:
+For **process-per-module**, increase worker counts via `--workers` JSON flag or `pyproject.toml` configuration:
 
 ```bash
-# Run inventory workers on dedicated nodes:
+# Run more inventory workers:
 MODULITH_BROKER=database modulith run myapp.main:app --topology processes \
-  --modules inventory &
-MODULITH_BROKER=database modulith run myapp.main:app --topology processes \
-  --modules inventory &
+  --workers '{"inventory": 4}'
+```
+
+Or in `pyproject.toml`:
+```toml
+[tool.modulith.workers]
+inventory = 4  # more workers for high-traffic module
 ```
 
 ### Vertical Scaling (Increase Worker Resources)
@@ -350,16 +369,38 @@ Or scale the broker database (connection pooling, read replicas, etc.).
 
 ### Module Isolation (Fault Domain Separation)
 
-Run fault-prone or high-load modules on separate infrastructure:
+Run fault-prone or high-load modules on separate infrastructure by adjusting worker counts and deployments:
 
-```bash
-# Production nodes: orders, inventory
-MODULITH_BROKER=database modulith run myapp.main:app \
-  --topology processes --modules orders,inventory
+**Approach 1: Separate instances with different worker configurations**
 
-# Batch nodes: notifications, reporting
-MODULITH_BROKER=database modulith run myapp.main:app \
-  --topology processes --modules notifications,reporting
+Configuration file 1 (`prod.toml` - for production nodes):
+```toml
+[tool.modulith.workers]
+orders = 4
+inventory = 4
+notifications = 0    # not running on prod nodes
+reporting = 0
+```
+
+Configuration file 2 (`batch.toml` - for batch nodes):
+```toml
+[tool.modulith.workers]
+orders = 0           # not running on batch nodes
+inventory = 0
+notifications = 2
+reporting = 2
+```
+
+Then deploy each with appropriate configuration (via environment or config override).
+
+**Approach 2: All modules in one deployment with specific worker counts**
+
+```toml
+[tool.modulith.workers]
+orders = 4      # high-load module
+inventory = 4
+notifications = 1
+reporting = 1
 ```
 
 ---
