@@ -548,6 +548,14 @@ def dev(
         )
         return
 
+    # Single-process dev is warn-only under strict_boundaries regardless of
+    # topology (README's inviolable interactive-dev contract) — signal this to
+    # runtime.py's bootstrap via an env var so it survives uvicorn's --reload
+    # fork (a subprocess re-import that shares our environment, not our
+    # in-memory state) and covers the lazy bootstrap triggered by the app's
+    # own publish()/listener registration once uvicorn is running, not just
+    # this preflight scan.
+    os.environ["MODULITH_DEV_WARN_ONLY"] = "1"
     _echo_dev_verify_warnings(app_module)
     argv = ["uvicorn", app_module, "--host", host, "--port", str(port)]
     if reload:

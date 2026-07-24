@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -105,6 +106,10 @@ def _reset_outbox_state():
     outbox._reset_for_testing()
     _runtime._reset_for_testing()
     asyncio.set_event_loop(asyncio.new_event_loop())
+    # dev() sets this directly on os.environ (not via monkeypatch — it must
+    # survive an os.execvp that replaces the process), so it needs its own
+    # explicit cleanup or it leaks into every later test in this process.
+    os.environ.pop("MODULITH_DEV_WARN_ONLY", None)
 
 
 # ---------------------------------------------------------------------------
@@ -1029,6 +1034,60 @@ def test_dev_echoes_boundary_warnings_at_startup(make_fake_app, monkeypatch) -> 
     assert captured["file"] == "uvicorn"  # violations never block dev
     assert "no-internal-imports" in result.stderr
     assert "orders" in result.stdout  # discovered module list printed
+
+
+def test_dev_single_process_strict_boundaries_warns_not_raises(
+    make_fake_app, monkeypatch, caplog
+) -> None:
+    """README:288-290 — single-process `modulith dev`'s interactive
+    development contract is inviolable: a boundary violation under
+    strict_boundaries=True must warn and let the dev server start, never
+    crash bootstrap. Before the fix, ensure_bootstrapped() raised
+    ConfigurationError here (caught only by the broad except in
+    _echo_dev_verify_warnings, which left the runtime un-bootstrapped and
+    rolled back) — the crash then hit unprotected on the next lazy
+    bootstrap (e.g. the first publish()) once uvicorn's app actually ran."""
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_STRICT_BOUNDARIES", "1")
+    make_fake_app(
+        {"orders": "from fakeapp.inventory._internal import secret\n", "inventory": ""},
+        extra_files={"inventory/_internal.py": "secret = 1\n"},
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(os, "execvp", lambda file, args: captured.update(file=file, args=args))
+
+    with caplog.at_level(logging.WARNING, logger="modulith"):
+        result = runner.invoke(app, ["dev", "fakeapp.main:app"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["file"] == "uvicorn"  # dev server still launches
+    from modulith.runtime import _runtime
+
+    assert _runtime._bootstrapped  # bootstrap completed, was not rolled back
+    assert any(
+        "boundary violations detected" in r.message and "no-internal-imports" in r.message
+        for r in caplog.records
+    )
+
+
+def test_dev_processes_topology_strict_boundaries_still_raises(
+    make_fake_app, monkeypatch
+) -> None:
+    """README:288-290 (scope check) — the warn-only downgrade is exclusive to
+    single-process dev. `modulith dev --topology=processes` must still fail
+    fast on a boundary violation under strict_boundaries=True."""
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_STRICT_BOUNDARIES", "1")
+    make_fake_app(
+        {"orders": "from fakeapp.inventory._internal import secret\n", "inventory": ""},
+        extra_files={"inventory/_internal.py": "secret = 1\n"},
+    )
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    result = runner.invoke(app, ["dev", "fakeapp.main:app", "--topology", "processes"])
+
+    assert result.exit_code == 1
+    assert "boundary violations detected" in result.stderr
 
 
 def test_verify_warning_only_violations_pass_unless_fail_on_warnings(

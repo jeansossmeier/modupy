@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 from collections.abc import Callable
 from dataclasses import replace
@@ -694,6 +695,14 @@ class Runtime:
             # When strict_boundaries=True, boundary violations at startup become
             # fatal errors instead of warnings (the default). This catches violations
             # before the application starts, ensuring architectural correctness.
+            #
+            # Exception: single-process `modulith dev` is warn-only regardless of
+            # strict_boundaries (README's "interactive development contract is
+            # inviolable"). The dev CLI signals this via MODULITH_DEV_WARN_ONLY in
+            # the environment — an env var, not an in-memory flag, because it must
+            # survive uvicorn's --reload fork, which re-imports the app (and
+            # re-triggers this same lazy bootstrap) in a subprocess that shares
+            # the parent's environment but none of its Python state.
             if config.strict_boundaries:
                 from .builtin import verifier
                 from .config import ConfigurationError
@@ -711,9 +720,16 @@ class Runtime:
                         + (f" ({v.location})" if v.location else "")
                         for v in violations
                     )
-                    raise ConfigurationError(
-                        f"boundary violations detected with strict_boundaries=True:\n  - {details}"
-                    )
+                    if os.environ.get("MODULITH_DEV_WARN_ONLY") == "1":
+                        logger.warning(
+                            "boundary violations detected with strict_boundaries=True "
+                            "(warn-only: single-process `modulith dev`):\n  - %s",
+                            details,
+                        )
+                    else:
+                        raise ConfigurationError(
+                            f"boundary violations detected with strict_boundaries=True:\n  - {details}"
+                        )
 
             # 6.6. Notify plugins that each module is loaded. Fires AFTER
             # discovery (modules imported, @listener decorators run) and

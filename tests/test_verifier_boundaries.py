@@ -1008,7 +1008,11 @@ def test_strict_boundaries_false_allows_boundary_violations_at_bootstrap(make_fa
 
 def test_strict_boundaries_true_config_is_applied_at_bootstrap(make_fake_app) -> None:
     """When strict_boundaries=True is configured, it is applied during bootstrap.
-    (The CLI integration tests in test_cli.py verify the actual enforcement.)"""
+
+    This only checks the flag is threaded through to Configuration on a clean
+    app; it does not seed a violation, so it proves nothing about enforcement.
+    See test_strict_boundaries_true_raises_on_boundary_violation below (and
+    the per-rule tests further down) for actual enforcement coverage."""
     from modulith.runtime import _runtime
 
     # Create a clean app with no boundary violations
@@ -1072,4 +1076,219 @@ def test_strict_boundaries_true_raises_on_boundary_violation(make_fake_app) -> N
     _runtime.configure(package="fakeapp", strict_boundaries=True)
     # Bootstrap should raise ConfigurationError due to boundary violation
     with pytest.raises(ConfigurationError):
+        _runtime.ensure_bootstrapped()
+
+
+# ---------------------------------------------------------------------------
+# strict_boundaries — fatal bootstrap gate must cover every verifier rule,
+# not just rule 1 (no-internal-imports). Each test below seeds a violation
+# specific to one rule and asserts ensure_bootstrapped() raises with that
+# rule name in the message.
+# ---------------------------------------------------------------------------
+
+
+def test_strict_boundaries_true_raises_on_use_contracts_violation(make_fake_app) -> None:
+    """Rule 4 (use-contracts): an annotation-only cross-module type import
+    not sourced from the contracts module is fatal under strict_boundaries."""
+    from modulith.runtime import _runtime
+
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.payments import PaymentStatus
+
+                def handle(status: PaymentStatus) -> None:
+                    pass
+            """,
+            "payments": "",
+        }
+    )
+    _runtime.configure(package="fakeapp", strict_boundaries=True)
+    with pytest.raises(ConfigurationError, match="use-contracts"):
+        _runtime.ensure_bootstrapped()
+
+
+def test_strict_boundaries_true_raises_on_undeclared_dependency(make_fake_app) -> None:
+    """Rule 3 (undeclared-dependency): an import outside a manifest's
+    declared_dependencies is fatal under strict_boundaries."""
+    from modulith import manifest as manifest_module
+    from modulith.runtime import _runtime
+
+    manifest_module._reset_for_testing()
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.payments.service import charge
+            """,
+            "payments": "",
+        }
+    )
+    manifest_module._manifests["fakeapp.orders"] = Manifest(
+        package="fakeapp.orders", declared_dependencies=()
+    )
+    try:
+        _runtime.configure(package="fakeapp", strict_boundaries=True)
+        with pytest.raises(ConfigurationError, match="undeclared-dependency"):
+            _runtime.ensure_bootstrapped()
+    finally:
+        manifest_module._reset_for_testing()
+
+
+def test_strict_boundaries_true_raises_on_data_ownership_violation(make_fake_app) -> None:
+    """Rule 5 (data-ownership): fatal even though the rule's own severity is
+    WARNING — strict_boundaries has no severity filter (README: 'ERROR or
+    WARNING'), only a violations-present check."""
+    from modulith import manifest as manifest_module
+    from modulith.runtime import _runtime
+
+    manifest_module._reset_for_testing()
+    make_fake_app({"orders": "", "billing": ""})
+    manifest_module._manifests["fakeapp.orders"] = Manifest(
+        package="fakeapp.orders", owns_tables=("invoices",)
+    )
+    manifest_module._manifests["fakeapp.billing"] = Manifest(
+        package="fakeapp.billing", owns_tables=("invoices",)
+    )
+    try:
+        _runtime.configure(package="fakeapp", strict_boundaries=True)
+        with pytest.raises(ConfigurationError, match="data-ownership"):
+            _runtime.ensure_bootstrapped()
+    finally:
+        manifest_module._reset_for_testing()
+
+
+def test_strict_boundaries_true_raises_on_contracts_is_sink_violation(make_fake_app) -> None:
+    """Rule 6 (contracts-is-sink): the contracts module importing from an
+    application module is fatal under strict_boundaries."""
+    from modulith.runtime import _runtime
+
+    make_fake_app(
+        {
+            "contracts": """
+                from fakeapp.orders.service import do_something
+
+                do_something()
+            """,
+            "orders": "",
+        }
+    )
+    _runtime.configure(package="fakeapp", strict_boundaries=True)
+    with pytest.raises(ConfigurationError, match="contracts-is-sink"):
+        _runtime.ensure_bootstrapped()
+
+
+def test_strict_boundaries_true_raises_on_parse_error_violation(
+    make_fake_app, tmp_path: Path
+) -> None:
+    """An unparseable file is an ERROR-severity violation and fatal under
+    strict_boundaries — discovery only imports each module's ``__init__.py``,
+    so the broken sibling file surfaces solely through the static AST scan."""
+    from modulith.runtime import _runtime
+
+    make_fake_app({"orders": ""})
+    (tmp_path / "fakeapp" / "orders" / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+
+    _runtime.configure(package="fakeapp", strict_boundaries=True)
+    with pytest.raises(ConfigurationError, match="parse-error"):
+        _runtime.ensure_bootstrapped()
+
+
+def test_strict_boundaries_true_raises_on_cyclic_dependency(make_fake_app) -> None:
+    """Rule 2 (no-cyclic-dependency, ``detect_cycles``): a cyclic module
+    dependency is fatal under strict_boundaries. Cycle detection runs once
+    globally at bootstrap, separately from the per-module verifier hooks
+    covered by the tests above — it needs its own seeded regression.
+
+    The mutual import is function-scoped (not top-level) so the fake app
+    stays actually importable by bootstrap's real discovery step: a genuine
+    top-level circular import would crash discovery with ImportError before
+    ever reaching the verifier. The static AST scan that feeds detect_cycles
+    still sees a function-scoped import as a real dependency edge.
+    """
+    from modulith.runtime import _runtime
+
+    make_fake_app(
+        {
+            "a": """
+                def get_b():
+                    from fakeapp.b import thing
+                    return thing
+            """,
+            "b": """
+                def get_a():
+                    from fakeapp.a import get_b
+                    return get_b
+            """,
+        }
+    )
+    _runtime.configure(package="fakeapp", strict_boundaries=True)
+    with pytest.raises(ConfigurationError, match="no-cyclic-dependency"):
+        _runtime.ensure_bootstrapped()
+
+
+# ---------------------------------------------------------------------------
+# strict_boundaries + MODULITH_DEV_WARN_ONLY — single-process `modulith dev`'s
+# warn-only downgrade (README:288-290), exercised directly at the runtime
+# layer rather than through the CLI (see test_cli.py for the full dev-command
+# integration test).
+# ---------------------------------------------------------------------------
+
+
+def test_strict_boundaries_warn_only_env_var_downgrades_raise_to_warning(
+    make_fake_app, monkeypatch, caplog
+) -> None:
+    """MODULITH_DEV_WARN_ONLY=1 downgrades the fatal raise to a logged
+    warning — the mechanism single-process ``modulith dev`` relies on to
+    honor its inviolable warn-only contract, including across uvicorn's
+    --reload fork (an env var, unlike an in-memory flag, survives it)."""
+    import logging
+
+    from modulith.runtime import _runtime
+
+    monkeypatch.setenv("MODULITH_DEV_WARN_ONLY", "1")
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.inventory import _internal
+            """,
+            "inventory": "",
+        },
+        extra_files={
+            "inventory/_internal/__init__.py": "# private submodule\n",
+        },
+    )
+    _runtime.configure(package="fakeapp", strict_boundaries=True)
+
+    with caplog.at_level(logging.WARNING, logger="modulith"):
+        _runtime.ensure_bootstrapped()  # must not raise
+
+    assert _runtime._bootstrapped
+    assert any(
+        "boundary violations detected" in r.message and "no-internal-imports" in r.message
+        for r in caplog.records
+    )
+
+
+def test_strict_boundaries_warn_only_env_var_does_not_affect_other_values(
+    make_fake_app, monkeypatch
+) -> None:
+    """Any value other than the exact '1' sentinel must not downgrade the
+    raise — guards against e.g. a stray MODULITH_DEV_WARN_ONLY=0 or =true
+    silently widening the warn-only exception beyond single-process dev."""
+    from modulith.runtime import _runtime
+
+    monkeypatch.setenv("MODULITH_DEV_WARN_ONLY", "true")
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.inventory import _internal
+            """,
+            "inventory": "",
+        },
+        extra_files={
+            "inventory/_internal/__init__.py": "# private submodule\n",
+        },
+    )
+    _runtime.configure(package="fakeapp", strict_boundaries=True)
+    with pytest.raises(ConfigurationError, match="no-internal-imports"):
         _runtime.ensure_bootstrapped()
