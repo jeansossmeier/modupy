@@ -21,12 +21,25 @@ reset, so test order can never matter.
 from __future__ import annotations
 
 import os
+import socket
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from textwrap import dedent
 
 import pytest
+
+
+def _free_port() -> int:
+    """Find a free TCP port by binding to port 0, then releasing it.
+
+    TOCTOU-style: the port is released before return, so another process
+    could claim it. Callers should bind immediately after calling this.
+    """
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port: int = sock.getsockname()[1]
+    return port
 
 
 @pytest.fixture

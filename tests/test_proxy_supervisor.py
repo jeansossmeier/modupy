@@ -12,7 +12,6 @@ import asyncio
 import contextlib
 import os
 import signal
-import socket
 import sys
 import textwrap
 import time
@@ -34,6 +33,7 @@ from modulith.supervisor import (
     derive_specs_from_config,
     run_supervised,
 )
+from conftest import _free_port
 
 # ---------------------------------------------------------------------------
 # A8-r1-25 — body-size cap must be enforced while streaming, not after
@@ -504,13 +504,6 @@ async def test_workers_die_when_supervisor_is_sigkilled(tmp_path: Path) -> None:
 # wire round-trip (h11's request parsing), not just Starlette's in-process
 # Request object.
 # ---------------------------------------------------------------------------
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port: int = sock.getsockname()[1]
-    return port
 
 
 async def _serve_app_over_socket(app: Any, port: int) -> asyncio.Task[None]:

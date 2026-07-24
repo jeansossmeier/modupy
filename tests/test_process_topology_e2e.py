@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import socket
 from pathlib import Path
 from textwrap import dedent
 
@@ -31,21 +30,13 @@ import pytest
 import modulith
 from modulith.proxy import create_proxy_app
 from modulith.supervisor import Supervisor, WorkerSpec, _rules_from_specs
+from conftest import _free_port
 
 pytestmark = [pytest.mark.integration]
 
 # Repo root (the directory containing the ``modulith`` package) so the worker
 # subprocesses can import modulith regardless of their cwd.
 _REPO_ROOT = Path(modulith.__file__).resolve().parent.parent
-
-
-def _free_port() -> int:
-    s = socket.socket()
-    try:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-    finally:
-        s.close()
 
 
 def _write_app(root: Path) -> None:

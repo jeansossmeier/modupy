@@ -18,7 +18,6 @@ import asyncio
 import contextlib
 import os
 import signal
-import socket
 import sys
 import time
 
@@ -32,6 +31,7 @@ from modulith.supervisor import (
     derive_specs_from_config,
     run_supervised,
 )
+from conftest import _free_port
 
 # Trivial worker commands — stand in for the real uvicorn worker.
 _SLEEP = [sys.executable, "-c", "import time; time.sleep(30)"]
@@ -493,13 +493,6 @@ async def test_crash_loop_gives_up_after_max_restarts() -> None:
 # ---------------------------------------------------------------------------
 # _serve_uvicorn — the real production proxy server (S3-r2-121)
 # ---------------------------------------------------------------------------
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port: int = sock.getsockname()[1]
-    return port
 
 
 @pytest.mark.real_process
