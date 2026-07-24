@@ -695,7 +695,12 @@ async def _dispatch_broker_route(publication: EventPublication) -> None:
                 f"registered schemes: {registered or 'none'})"
             )
         await registry.publish(
-            target, publication.payload, {"event_type": publication.event_type or ""}
+            target,
+            publication.payload,
+            {
+                "event_type": publication.event_type or "",
+                "publication_id": str(publication.id),
+            },
         )
     except Exception as exc:
         logger.warning("broker route %s failed for publication %s: %s", target, publication.id, exc)

@@ -24,14 +24,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 
 from modulith import EventPublication, event
+from modulith.adapters.shm_broker import ShmBroker
 from modulith.builtin import outbox
 from modulith.config import ConfigurationError
 from modulith.runtime import _runtime
@@ -1288,6 +1291,81 @@ async def test_broker_completion_failure_records_retryable_state() -> None:
     assert publication.attempt_count == 1
     assert publication.last_error == "completion database unavailable"
     assert publication.completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_broker_route_threads_publication_id_into_headers() -> None:
+    received_headers: list[dict[str, str] | None] = []
+
+    class Broker:
+        async def publish(
+            self, target: str, payload: bytes, headers: dict[str, str] | None = None
+        ) -> None:
+            received_headers.append(headers)
+
+        async def close(self) -> None:
+            pass
+
+    _runtime.configure(package="outboxtest", auto_discover=False)
+    _runtime.ensure_bootstrapped()
+    assert _runtime.broker_registry is not None
+    _runtime.broker_registry.register("test", Broker())
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    publication = EventPublication(
+        id=uuid4(),
+        payload=b'{"value": 7}',
+        event_type=f"{OutboxEvent.__module__}.{OutboxEvent.__qualname__}",
+        listener=outbox._BROKER_ROUTE_LISTENER_PREFIX + "test:events",
+        published_at=datetime.now(UTC),
+    )
+    await store.save(publication)
+
+    await outbox._dispatch_broker_route(publication)
+
+    assert received_headers == [
+        {"event_type": publication.event_type, "publication_id": str(publication.id)}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_broker_route_redispatch_is_deduped_by_publication_id(tmp_path: Path) -> None:
+    """A re-dispatch of the same publication (crash-recovery retry) must not
+    deliver a second time — the SHM broker's consumer-side dedup keys on the
+    ``publication_id`` header threaded by ``_dispatch_broker_route``."""
+    db_path = tmp_path / "outbox-dedup.db"
+    broker = ShmBroker(
+        shm_name="outbox-dedup-hints", db_path=str(db_path), max_store_bytes=64 * 1024
+    )
+    try:
+        await broker.subscribe(["events"], "workers")
+        _runtime.configure(package="outboxtest", auto_discover=False)
+        _runtime.ensure_bootstrapped()
+        assert _runtime.broker_registry is not None
+        _runtime.broker_registry.register("test", broker)
+        store = StubStore()
+        outbox.configure(store, JsonEventSerializer(), start_loop=False)
+        publication = EventPublication(
+            id=uuid4(),
+            payload=b'{"value": 7}',
+            event_type=f"{OutboxEvent.__module__}.{OutboxEvent.__qualname__}",
+            listener=outbox._BROKER_ROUTE_LISTENER_PREFIX + "test:events",
+            published_at=datetime.now(UTC),
+        )
+        await store.save(publication)
+
+        await outbox._dispatch_broker_route(publication)
+        await outbox._dispatch_broker_route(publication)  # simulated crash-recovery re-dispatch
+
+        connection = sqlite3.connect(db_path)
+        try:
+            assert connection.execute("SELECT COUNT(*) FROM shm_publication").fetchone()[0] == 1
+            assert connection.execute("SELECT COUNT(*) FROM shm_delivery").fetchone()[0] == 1
+        finally:
+            connection.close()
+    finally:
+        await broker.close()
+        broker._ring.unlink()
 
 
 def test_backoff_allows_legacy_publication_without_timestamps() -> None:

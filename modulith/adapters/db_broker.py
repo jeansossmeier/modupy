@@ -141,7 +141,11 @@ from modulith import (
     hookimpl,
 )
 
-from ..config import DEFAULT_BROKER_DB_FILENAME
+from ..config import (
+    _SHM_MAX_PAYLOAD_BYTES,
+    DEFAULT_BROKER_DB_FILENAME,
+    DEFAULT_SHM_MAX_PAYLOAD_BYTES,
+)
 from ._polling_consumer import PollingConsumer
 from ._state_path import resolve_state_file
 
@@ -786,6 +790,7 @@ class DatabaseBroker:
         orphan_replay_policy: str = _DEFAULT_ORPHAN_REPLAY_POLICY,
         orphan_retention_seconds: float = _DEFAULT_ORPHAN_RETENTION_S,
         expected_consumer_groups: dict[str, list[str]] | None = None,
+        max_payload_bytes: int = DEFAULT_SHM_MAX_PAYLOAD_BYTES,
     ) -> None:
         if engine is not None:
             self._engine = engine
@@ -827,6 +832,11 @@ class DatabaseBroker:
         self._expected_consumer_groups = _validate_expected_consumer_groups(
             {} if expected_consumer_groups is None else expected_consumer_groups
         )
+        self._max_payload_bytes = _positive_int(max_payload_bytes, "max_payload_bytes")
+        if self._max_payload_bytes > _SHM_MAX_PAYLOAD_BYTES:
+            raise ConfigurationError(
+                f"max_payload_bytes must be <= {_SHM_MAX_PAYLOAD_BYTES}, got {max_payload_bytes!r}"
+            )
         # Real SQLAlchemy engines always expose a dialect. Minimal injected
         # engines without one retain the adapter's historical SQLite behavior.
         self._is_sqlite = getattr(getattr(self._engine, "dialect", None), "name", "sqlite") == (
@@ -1269,6 +1279,12 @@ class DatabaseBroker:
         single transaction. With no group, applies the configured ``error``,
         ``wait``, or retained-message ``store`` policy.
         """
+        if len(payload) > self._max_payload_bytes:
+            raise ConfigurationError(
+                f"database broker payload is {len(payload)} bytes, exceeding "
+                f"max_payload_bytes={self._max_payload_bytes}. Reduce the payload "
+                "or increase the limit."
+            )
         await self._ensure_schema()
         if self._no_subscriber_policy == "store":
             await self._publish_stored(target, payload, headers)
@@ -1863,6 +1879,10 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
             _DEFAULT_ORPHAN_RETENTION_S,
         ),
         expected_consumer_groups=expected_consumer_groups,
+        max_payload_bytes=_option_or_default(
+            _opt_int(_broker_opt(opts, "max_payload_bytes", "MAX_PAYLOAD_BYTES")),
+            DEFAULT_SHM_MAX_PAYLOAD_BYTES,
+        ),
     )
     registry.register(_DB_SCHEME, broker)
     logger.info("registered database broker (completion_mode=%s)", completion_mode)

@@ -16,6 +16,15 @@ Configuration resolves env > [tool.modulith.broker] subtable > default:
   MODULITH_STREAM_PREFIX / stream_prefix   stream namespace (default "modulith.events")
   MODULITH_CONSUMER_GROUP / consumer_group consumer group name (default "modulith")
   MODULITH_STREAM_MAXLEN / max_stream_len  bounded retention per stream (default 10000)
+  dlq_max_stream_len                       bounded retention for the dead-letter stream
+                                            (default: max_stream_len * 10)
+  max_payload_bytes                        producer-side payload size cap, rejected with
+                                            ConfigurationError (default 16 MiB)
+  poll_block_ms                            consumer XREADGROUP block timeout, ms (default 1000)
+  reclaim_min_idle_ms                      consumer XAUTOCLAIM min-idle threshold, ms
+                                            (default 60000)
+  max_delivery_attempts                    consumer delivery attempts before dead-lettering
+                                            (default 5)
 
 Selected with (broker *name* as a scalar, options in the subtable — TOML
 forbids one key being both, so set the name via ``MODULITH_BROKER`` /
@@ -61,11 +70,14 @@ from typing import Any
 
 from modulith import (
     BrokerRegistry,
+    ConfigurationError,
     Consumer,
     ConsumerRegistry,
     ConsumerSpec,
     hookimpl,
 )
+
+from ..config import _SHM_MAX_PAYLOAD_BYTES, DEFAULT_SHM_MAX_PAYLOAD_BYTES
 
 logger = logging.getLogger("modulith.adapters.redis")
 
@@ -108,6 +120,7 @@ class RedisStreamsBroker:
         consumer_group: str | None = None,
         max_stream_len: int = _DEFAULT_MAXLEN,
         dlq_max_stream_len: int | None = None,
+        max_payload_bytes: int = DEFAULT_SHM_MAX_PAYLOAD_BYTES,
         client: Any | None = None,
     ) -> None:
         if client is not None:
@@ -127,6 +140,15 @@ class RedisStreamsBroker:
         self._dlq_max_stream_len = (
             dlq_max_stream_len if dlq_max_stream_len is not None else max_stream_len * 10
         )
+        if (
+            type(max_payload_bytes) is not int
+            or not 1 <= max_payload_bytes <= _SHM_MAX_PAYLOAD_BYTES
+        ):
+            raise ConfigurationError(
+                f"max_payload_bytes must be an integer between 1 and "
+                f"{_SHM_MAX_PAYLOAD_BYTES}, got {max_payload_bytes!r}"
+            )
+        self._max_payload_bytes = max_payload_bytes
 
     # ----- stream naming ----------------------------------------------------
 
@@ -152,6 +174,12 @@ class RedisStreamsBroker:
         ignores consumer-group pending state — see the module docstring's
         retention caveat on sizing ``max_stream_len``.
         """
+        if len(payload) > self._max_payload_bytes:
+            raise ConfigurationError(
+                f"redis-streams payload is {len(payload)} bytes, exceeding "
+                f"max_payload_bytes={self._max_payload_bytes}. Reduce the payload "
+                "or increase the limit."
+            )
         stream = self._stream_name(target)
         fields: dict[bytes, bytes] = {b"data": payload}
         if headers:
@@ -368,6 +396,7 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
             or _DEFAULT_MAXLEN
         ),
         dlq_max_stream_len=int(dlq_maxlen) if dlq_maxlen is not None else None,
+        max_payload_bytes=int(opts.get("max_payload_bytes") or DEFAULT_SHM_MAX_PAYLOAD_BYTES),
     )
     registry.register(_REDIS_SCHEME, broker)
     logger.info("registered redis-streams broker (prefix=%s)", broker._stream_prefix)

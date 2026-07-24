@@ -17,6 +17,7 @@ import json
 from typing import Any
 
 from modulith.serializers import JsonEventSerializer
+from shop.contracts.events import OrderPlaced, StockReserved
 
 _ENVELOPE_VERSION = 1
 
@@ -31,7 +32,8 @@ class VersionedJsonSerializer:
     """
 
     def __init__(self) -> None:
-        self._inner = JsonEventSerializer()
+        # Scoped to the demo's real event types — see shop/contracts/events.py.
+        self._inner = JsonEventSerializer(allowed_event_types=[OrderPlaced, StockReserved])
 
     def serialize(self, event: Any) -> bytes:
         """Encode an event to a versioned JSON envelope."""

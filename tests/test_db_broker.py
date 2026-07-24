@@ -35,7 +35,15 @@ import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from modulith import Broker, BrokerRegistry, Consumer, ConsumerRegistry, ConsumerSpec, event
+from modulith import (
+    Broker,
+    BrokerRegistry,
+    ConfigurationError,
+    Consumer,
+    ConsumerRegistry,
+    ConsumerSpec,
+    event,
+)
 from modulith.adapters._state_path import _namespace
 from modulith.adapters.db_broker import (
     _SQLITE_BUSY_MAX_RETRIES,
@@ -254,6 +262,19 @@ async def test_publish_zero_subscribers_raises_without_writing_rows(engine: Any)
         )
 
     assert await _row_count(engine) == 0
+
+
+async def test_publish_rejects_oversize_payload_and_accepts_at_limit(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine, max_payload_bytes=4)
+    await broker.subscribe(["fakeapp.orders.WidgetCreated"], "modulith-inventory")
+
+    await broker.publish("fakeapp.orders.WidgetCreated", b"1234", {"event_type": "x"})
+    assert await _row_count(engine) == 1
+
+    with pytest.raises(ConfigurationError, match="max_payload_bytes"):
+        await broker.publish("fakeapp.orders.WidgetCreated", b"12345", {"event_type": "x"})
+
+    assert await _row_count(engine) == 1  # rejected publish wrote nothing
 
 
 async def test_publish_waits_until_a_subscriber_exists(engine: Any) -> None:
@@ -1064,6 +1085,165 @@ async def test_orphaned_claim_is_reclaimed_after_visibility_timeout(engine: Any)
     )
     assert len(reclaimed) == 1
     assert reclaimed[0]["id"] == first[0]["id"]
+
+
+# ---------------------------------------------------------------------------
+# Process-death durability (real crash, not simulated)
+# ---------------------------------------------------------------------------
+
+_DB_EXIT_AFTER_CLAIM = 72
+_DB_PROCESS_TIMEOUT_SECONDS = 10.0
+
+
+def _spawn_db_claim_then_exit(
+    db_url: str,
+    claimed_row_queue: Any,
+    claim_ready: Any,
+    exit_now: Any,
+) -> None:
+    """Claim one real delivery from the database, report its id, then exit without ack.
+
+    This function is at module scope so it can be pickled by the 'spawn' context."""
+
+    async def run() -> None:
+        # Open a fresh engine to the same file as the parent.
+        broker = DatabaseBroker(url=db_url)
+        try:
+            rows = await broker.claim_batch(
+                "modulith-inventory",
+                batch_size=1,
+                consumer_name="crasher",
+                reclaim_stale_seconds=1.0,
+            )
+            if len(rows) != 1:
+                raise AssertionError(f"expected one claim, got {len(rows)}")
+            row = rows[0]
+            claimed_row_queue.put({"id": row["id"]})
+            # Flush before signaling so parent never races the queue feeder thread.
+            claimed_row_queue.close()
+            claimed_row_queue.join_thread()
+            claim_ready.set()
+            if not exit_now.wait(_DB_PROCESS_TIMEOUT_SECONDS):
+                import os
+
+                os._exit(79)  # timeout exit code
+            import os
+
+            os._exit(_DB_EXIT_AFTER_CLAIM)
+        finally:
+            # Close the broker's engine to clean up connections.
+            await broker.close()
+
+    asyncio.run(run())
+
+
+async def test_spawned_claimant_crash_preserves_durability(tmp_path: Path) -> None:
+    """A real process death (HARD KILL, not simulated) while holding a claim must
+    preserve the message in the durable store for reclaim after visibility timeout.
+
+    This proves the at-least-once contract survives genuine OS-level process death,
+    exercising real fsync/commit boundaries that simulated crashes (never-ack) cannot.
+    Mirrors test_shm_scenarios.py::test_spawned_claimant_crash_preserves_lease_and_fences_stale_token
+    but for the database broker."""
+    import multiprocessing
+    import os
+
+    # Create parent engine with explicit file path.
+    db_path = tmp_path / "crash-durability.db"
+    db_url = f"sqlite+aiosqlite:///{db_path}"
+    parent_engine = create_async_engine(db_url, poolclass=NullPool)
+
+    try:
+        # Publish one event and subscribe.
+        broker = DatabaseBroker(engine=parent_engine)
+        target = "fakeapp.orders.WidgetCreated"
+        await broker.subscribe([target], "modulith-inventory")
+        serializer = JsonEventSerializer()
+        payload = serializer.serialize(WidgetCreated(name="crash-test"))
+        await broker.publish(target, payload, {"event_type": target})
+
+        # Spawn child to claim and crash.
+        context = multiprocessing.get_context("spawn")
+        claimed_row_queue = context.Queue()
+        claim_ready = context.Event()
+        exit_now = context.Event()
+        process = context.Process(
+            target=_spawn_db_claim_then_exit,
+            args=(db_url, claimed_row_queue, claim_ready, exit_now),
+        )
+
+        try:
+            process.start()
+            # Wait for child to claim.
+            assert claim_ready.wait(_DB_PROCESS_TIMEOUT_SECONDS), "child claim timed out"
+            claimed_id = claimed_row_queue.get(timeout=_DB_PROCESS_TIMEOUT_SECONDS)["id"]
+
+            # Signal child to exit without acking.
+            exit_now.set()
+            process.join(_DB_PROCESS_TIMEOUT_SECONDS)
+            assert not process.is_alive(), "spawned process did not exit"
+            assert process.exitcode == _DB_EXIT_AFTER_CLAIM, (
+                f"expected exit code {_DB_EXIT_AFTER_CLAIM}, got {process.exitcode}"
+            )
+        finally:
+            exit_now.set()
+            if process.is_alive():
+                process.terminate()
+                process.join(_DB_PROCESS_TIMEOUT_SECONDS)
+            if process.is_alive():
+                process.kill()
+                process.join(_DB_PROCESS_TIMEOUT_SECONDS)
+            claimed_row_queue.close()
+            claimed_row_queue.join_thread()
+
+        # Close the parent broker.
+        await broker.close()
+
+        # Reopen the broker with a fresh engine on the same file.
+        # The claimed message must still be present and reclaimable after timeout.
+        fresh_engine = create_async_engine(db_url, poolclass=NullPool)
+        try:
+            fresh_broker = DatabaseBroker(engine=fresh_engine)
+            try:
+                # Before visibility timeout: message is still claimed, not available.
+                not_yet = await fresh_broker.claim_batch(
+                    "modulith-inventory",
+                    batch_size=10,
+                    consumer_name="recovery",
+                    reclaim_stale_seconds=100.0,
+                )
+                assert not_yet == [], "message should still be claimed by crashed process"
+
+                # After visibility timeout: message is reclaimed.
+                await asyncio.sleep(0.15)
+                reclaimed = await fresh_broker.claim_batch(
+                    "modulith-inventory",
+                    batch_size=10,
+                    consumer_name="recovery",
+                    reclaim_stale_seconds=0.02,
+                )
+                assert len(reclaimed) == 1, f"expected 1 reclaimed message, got {len(reclaimed)}"
+                assert reclaimed[0]["id"] == claimed_id, (
+                    f"reclaimed message id {reclaimed[0]['id']} != original {claimed_id}"
+                )
+
+                # Ack the reclaimed message to mark success.
+                await fresh_broker.ack(reclaimed[0]["id"], consumer_name="recovery")
+
+                # Verify no more messages.
+                final = await fresh_broker.claim_batch(
+                    "modulith-inventory",
+                    batch_size=10,
+                    consumer_name="recovery",
+                    reclaim_stale_seconds=0.0,
+                )
+                assert final == [], "no more messages should be available after ack"
+            finally:
+                await fresh_broker.close()
+        finally:
+            await fresh_engine.dispose()
+    finally:
+        await parent_engine.dispose()
 
 
 # ---------------------------------------------------------------------------

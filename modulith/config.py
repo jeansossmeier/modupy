@@ -682,6 +682,81 @@ def _validate_redis_broker_options(options: dict[str, Any]) -> None:
             )
 
 
+# Mirror modulith/adapters/db_broker.py's _COMPLETION_MODES /
+# _NO_SUBSCRIBER_POLICIES / _ORPHAN_REPLAY_POLICIES. Duplicated (not
+# imported) because that adapter already imports from this module
+# (DEFAULT_BROKER_DB_FILENAME) — importing back here would cycle.
+_DATABASE_COMPLETION_MODES = frozenset({"delete", "mark"})
+_DATABASE_NO_SUBSCRIBER_POLICIES = frozenset({"error", "store", "wait"})
+_DATABASE_ORPHAN_REPLAY_POLICIES = frozenset({"ttl_all_groups", "first_groups", "expected_groups"})
+
+
+def _validate_database_broker_options(options: dict[str, Any]) -> None:
+    """Validate the 'database' broker's options at config-load time.
+
+    Without this, these same shapes are only checked later, at
+    ``DatabaseBroker`` construction during plugin bootstrap (see
+    ``modulith/adapters/db_broker.py``'s ``_validate_choice``,
+    ``_positive_finite_float``, and ``_validate_expected_consumer_groups``)
+    — a validation-timing asymmetry against the shm/redis brokers, which
+    both fail fast here in ``_validate``.
+    """
+    if "sqlite_synchronous" in options:
+        value = options["sqlite_synchronous"]
+        if type(value) is not str or value.upper() not in _SHM_SYNCHRONOUS_MODES:
+            raise ConfigurationError(
+                f"broker_options.sqlite_synchronous must be NORMAL or FULL, got {value!r}"
+            )
+    if "completion_mode" in options:
+        value = options["completion_mode"]
+        if type(value) is not str or value not in _DATABASE_COMPLETION_MODES:
+            raise ConfigurationError(
+                "broker_options.completion_mode must be one of "
+                f"{sorted(_DATABASE_COMPLETION_MODES)}, got {value!r}"
+            )
+    if "no_subscriber_policy" in options:
+        value = options["no_subscriber_policy"]
+        if type(value) is not str or value not in _DATABASE_NO_SUBSCRIBER_POLICIES:
+            raise ConfigurationError(
+                "broker_options.no_subscriber_policy must be one of "
+                f"{sorted(_DATABASE_NO_SUBSCRIBER_POLICIES)}, got {value!r}"
+            )
+    if "orphan_replay_policy" in options:
+        value = options["orphan_replay_policy"]
+        if type(value) is not str or value not in _DATABASE_ORPHAN_REPLAY_POLICIES:
+            raise ConfigurationError(
+                "broker_options.orphan_replay_policy must be one of "
+                f"{sorted(_DATABASE_ORPHAN_REPLAY_POLICIES)}, got {value!r}"
+            )
+    if "busy_timeout_ms" in options:
+        value = options["busy_timeout_ms"]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ConfigurationError(
+                f"broker_options.busy_timeout_ms must be a positive integer, got {value!r}"
+            )
+    for name in (
+        "no_subscriber_wait_timeout_seconds",
+        "no_subscriber_wait_poll_interval_ms",
+        "orphan_retention_seconds",
+    ):
+        _validate_shm_float_option(options, name, allow_zero=False)
+    if "expected_consumer_groups" in options:
+        value = options["expected_consumer_groups"]
+        valid = type(value) is dict and all(
+            type(target) is str
+            and target.strip()
+            and type(groups) is list
+            and groups
+            and all(type(group) is str and group.strip() for group in groups)
+            for target, groups in value.items()
+        )
+        if not valid:
+            raise ConfigurationError(
+                "broker_options.expected_consumer_groups must map non-empty targets "
+                f"to non-empty lists of group strings, got {value!r}"
+            )
+
+
 def _validate(data: dict[str, Any]) -> None:
     """Validate config values, raising ConfigurationError with guidance."""
     # Catch typos — unknown keys would silently fail otherwise.
@@ -746,6 +821,8 @@ def _validate(data: dict[str, Any]) -> None:
         )
     if selected_broker == "shm":
         _validate_shm_broker_options(broker_options or {})
+    if selected_broker == "database" and broker_options is not None:
+        _validate_database_broker_options(broker_options)
 
     workers = data.get("workers")
     if workers is not None:

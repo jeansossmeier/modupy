@@ -72,6 +72,10 @@ _DEFAULT_SHM_CAPACITY = 8192
 _DEFAULT_SHM_SLOT_SIZE = 4096
 _DEFAULT_SHM_NAME = "modulith-shm"
 _DEFAULT_HINT_FILENAME = ".modulith-shm-broker.hints"
+# NORMAL fsyncs only at WAL checkpoints, not per-commit: an application or
+# process crash loses nothing (the WAL survives), but an OS crash or power
+# loss can still drop the last commits. Set synchronous="FULL" for
+# power-loss durability.
 _DEFAULT_SQLITE_SYNCHRONOUS = "NORMAL"
 _PRUNE_BATCH_LIMIT = 1000
 _HINT_CHECK_INTERVAL_S = 0.01
@@ -210,6 +214,10 @@ class ShmBroker:
             capacity,
             create=create,
         )
+        # Re-validate post-attach: raises ConfigurationError if the hint file
+        # was swapped for a symlink or an insecure file between the earlier
+        # check and ShmRing's own open/create above, so construction fails
+        # loudly instead of silently using a hijacked path.
         resolve_state_file(
             None,
             filename=notifier_path.name,
@@ -235,8 +243,17 @@ class ShmBroker:
         payload: bytes,
         headers: dict[str, str] | None = None,
     ) -> None:
-        """Commit one publication before emitting its advisory sequence hint."""
-        publication = await self._cold.publish(target, payload, headers)
+        """Commit one publication before emitting its advisory sequence hint.
+
+        A ``"publication_id"`` header (e.g. the outbox's stable row id) is
+        threaded through as the SQLite dedup key: re-publishing the same id
+        (a cross-retry re-dispatch) hits the ``INSERT OR IGNORE`` and returns
+        the existing row instead of delivering a second time.
+        """
+        publication_id = (headers or {}).get("publication_id")
+        publication = await self._cold.publish(
+            target, payload, headers, publication_id=publication_id
+        )
         try:
             notified = self._ring.notify(publication.sequence)
         except Exception:

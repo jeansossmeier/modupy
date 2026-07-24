@@ -25,6 +25,7 @@ import json
 import sys
 import types
 import typing
+import warnings
 from collections.abc import Iterable
 from datetime import date, datetime
 from decimal import Decimal
@@ -404,6 +405,20 @@ class JsonEventSerializer:
         """
         if self._allowed_event_types is not None and event_type not in self._allowed_event_types:
             raise ValueError(f"event type {event_type!r} is not in the allowed event types")
+        if self._allowed_event_types is None:
+            # No allowlist: about to import-resolve an arbitrary class named
+            # by the wire event_type (see the class docstring). warnings.warn
+            # (rather than logging) gets Python's built-in dedup for free —
+            # the default filter shows this exact message once per process,
+            # so it can't ship unnoticed without spamming every deserialize.
+            warnings.warn(
+                "JsonEventSerializer with no allowed_event_types resolves an "
+                "arbitrary importable class from the wire event_type. Pass "
+                "allowed_event_types=[...] whenever payloads can originate "
+                "outside this process (a shared outbox table, a broker).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         cls = _resolve_class(event_type)
         raw = json.loads(data.decode("utf-8"))
         hints = _safe_type_hints(cls)

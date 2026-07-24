@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 
+from modulith import ConfigurationError
 from modulith.adapters.redis_broker import RedisStreamsBroker, modulith_register_brokers
 from modulith.brokers import BrokerRegistry
 
@@ -177,6 +178,20 @@ async def test_publish_packs_headers_as_fields(broker, fake) -> None:
     await broker.publish("orders", b"{}", headers={"trace": "abc"})
     _name, fields, _maxlen = fake.xadds[0]
     assert fields[b"h:trace"] == b"abc"
+
+
+async def test_publish_rejects_oversize_payload_and_accepts_at_limit(fake: FakeRedis) -> None:
+    capped = RedisStreamsBroker(
+        client=fake, stream_prefix="modulith.events", consumer_group="g", max_payload_bytes=4
+    )
+
+    await capped.publish("orders", b"1234")
+    assert len(fake.xadds) == 1
+
+    with pytest.raises(ConfigurationError, match="max_payload_bytes"):
+        await capped.publish("orders", b"12345")
+
+    assert len(fake.xadds) == 1  # rejected publish issued no XADD
 
 
 # ---------------------------------------------------------------------------

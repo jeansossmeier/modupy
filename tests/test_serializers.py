@@ -7,6 +7,7 @@ preserve dataclass equality and correctly reconstruct rich field types
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -215,6 +216,29 @@ def test_allowlist_allows_registered_event_type() -> None:
     restored = serializer.deserialize(serializer.serialize(original), _fqcn(SimpleEvent))
 
     assert restored == original
+
+
+def test_deserialize_without_allowlist_warns_on_import_resolution() -> None:
+    """Hardening: an unrestricted serializer resolves an arbitrary importable
+    class from the wire ``event_type`` (see the class docstring). It must not
+    do so silently — a warning gives an operator a chance to notice before a
+    forged record ships unnoticed."""
+    serializer = JsonEventSerializer()
+    data = serializer.serialize(SimpleEvent(order_id="z", quantity=1))
+
+    with pytest.warns(RuntimeWarning, match="allowed_event_types"):
+        serializer.deserialize(data, _fqcn(SimpleEvent))
+
+
+def test_deserialize_with_allowlist_does_not_warn() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[SimpleEvent])
+    data = serializer.serialize(SimpleEvent(order_id="z", quantity=1))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        restored = serializer.deserialize(data, _fqcn(SimpleEvent))
+
+    assert restored == SimpleEvent(order_id="z", quantity=1)
 
 
 def test_round_trip_parameterized_containers_coerce_inner_types() -> None:

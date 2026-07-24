@@ -73,6 +73,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         from modulith.adapters.postgres_outbox import PostgresPublicationStore
         from modulith.builtin import outbox
         from modulith.serializers import JsonEventSerializer
+        from shop.contracts.events import OrderPlaced, StockReserved
         from shop.orders.models import Base as OrdersBase
 
         url = db_url or "sqlite+aiosqlite:///./demo.db"
@@ -94,7 +95,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
             serializer: object = VersionedJsonSerializer()
         else:
-            serializer = JsonEventSerializer()
+            # Scoped to the demo's real event types — see shop/contracts/events.py.
+            serializer = JsonEventSerializer(allowed_event_types=[OrderPlaced, StockReserved])
 
         store = PostgresPublicationStore(engine=engine)
         outbox.configure(store, serializer)

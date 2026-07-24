@@ -786,6 +786,52 @@ def test_redis_broker_delivery_options_must_be_positive_integers(
         load_configuration(broker="redis-streams", broker_options={option: value})
 
 
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("sqlite_synchronous", "OFF"),
+        ("completion_mode", "immediate"),
+        ("no_subscriber_policy", "ignore"),
+        ("orphan_replay_policy", "bogus"),
+        ("busy_timeout_ms", 0),
+        ("busy_timeout_ms", True),
+        ("no_subscriber_wait_timeout_seconds", 0),
+        ("no_subscriber_wait_poll_interval_ms", float("nan")),
+        ("orphan_retention_seconds", -1),
+        ("expected_consumer_groups", ["not", "a", "dict"]),
+        ("expected_consumer_groups", {"orders": []}),
+        ("expected_consumer_groups", {"": ["group-a"]}),
+    ],
+)
+def test_database_broker_options_are_validated_before_adapter_construction(
+    option: str, value: object
+) -> None:
+    """Database broker options fail at config-load time, not at bootstrap
+    (parity with the shm/redis brokers' load-time validators)."""
+    with pytest.raises(ConfigurationError, match=option):
+        load_configuration(broker="database", broker_options={option: value})
+
+
+def test_database_broker_options_accept_documented_valid_values() -> None:
+    cfg = load_configuration(
+        broker="database",
+        broker_options={
+            "sqlite_synchronous": "FULL",
+            "completion_mode": "mark",
+            "no_subscriber_policy": "wait",
+            "orphan_replay_policy": "first_groups",
+            "busy_timeout_ms": 5000,
+            "no_subscriber_wait_timeout_seconds": 30.0,
+            "no_subscriber_wait_poll_interval_ms": 100.0,
+            "orphan_retention_seconds": 86400.0,
+            "expected_consumer_groups": {"orders": ["billing", "shipping"]},
+        },
+    )
+
+    assert cfg.broker == "database"
+    assert cfg.broker_options["completion_mode"] == "mark"
+
+
 # ----- W2 audit fixes: env var handling (A4-r4-174, A4-r2-80 adjudicated) -----
 
 
