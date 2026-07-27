@@ -182,7 +182,7 @@ async def main(messages: int, warmup: int, rounds: int) -> None:
             finally:
                 await database.close()
         else:
-            print("DatabaseBroker skipped: install modulith[database] for same-run comparison.")
+            print("DatabaseBroker skipped: install modupy[database] for same-run comparison.")
 
     _print_results(results)
 

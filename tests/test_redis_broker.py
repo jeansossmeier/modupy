@@ -18,6 +18,7 @@ The fake matches redis-py's async surface for the methods the adapter uses.
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import pytest
@@ -35,17 +36,17 @@ class FakeRedis:
         self.groups: list[tuple[str, str]] = []
         # (name, groupname, id) — the start id matters: '0' consumes from the
         # beginning of the stream, '$' only new messages. Recorded so a flip
-        # that silently drops backlog is caught (#39).
+        # that silently drops backlog is caught.
         self.group_creates: list[tuple[str, str, str]] = []
         self.xreadgroup_calls: list[dict] = []
         self.xacks: list[tuple[str, str, tuple]] = []
         self.xautoclaim_calls: list[dict] = []
         self.xpending_range_calls: list[dict] = []
         self.eval_calls: list[tuple[str, int, tuple[Any, ...]]] = []
-        # Canned XAUTOCLAIM reply — (cursor, claimed, deleted). Tests may
-        # override it (e.g. to stage a non-empty deleted list, the
-        # trimmed-while-pending loss channel real Redis reports; audit
-        # S3-r3-160 — the old hardcoded return made that path unmodelable).
+        # Canned XAUTOCLAIM reply — (cursor, claimed, deleted). Overridable so
+        # a test can stage a non-empty deleted list: that is how real Redis
+        # reports entries trimmed while still pending, the adapter's only
+        # signal that at-least-once was violated.
         self.xautoclaim_result: Any = (b"0-0", [(b"1-0", {b"data": b"{}"})], [])
         self.xpending_range_result: Any = [
             {
@@ -194,6 +195,23 @@ async def test_publish_rejects_oversize_payload_and_accepts_at_limit(fake: FakeR
     assert len(fake.xadds) == 1  # rejected publish issued no XADD
 
 
+def test_missing_redis_dependency_names_the_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A soft dependency that isn't installed must say how to install it.
+
+    ``redis`` is optional, so constructing the broker without it is an ordinary
+    misconfiguration, not a bug. A bare ModuleNotFoundError('No module named
+    redis') names neither the broker that wanted it nor the extra that supplies
+    it, and surfaces from whatever call happened to build the broker first.
+    """
+    # A None entry in sys.modules is the documented way to make an import fail:
+    # the import system halts rather than searching the real path.
+    monkeypatch.setitem(sys.modules, "redis", None)
+    monkeypatch.setitem(sys.modules, "redis.asyncio", None)
+
+    with pytest.raises(ConfigurationError, match=r"modupy\[redis\]"):
+        RedisStreamsBroker(url="redis://localhost:6379")
+
+
 # ---------------------------------------------------------------------------
 # consumer group lifecycle + crash recovery
 # ---------------------------------------------------------------------------
@@ -327,7 +345,7 @@ class StatefulFakeRedis:
     Models (semantics probed against real Redis 7 / redis-py 6.4):
       * append-only streams with monotonic ``<seq>-0`` ids; ``maxlen`` trims
         the stream WITHOUT touching any group's PEL (real MAXLEN trimming is
-        blind to pending state — audit A7-r1-24);
+        blind to pending state);
       * per-(stream, group) last-delivered cursor and a pending-entries dict
         (PEL) recording the owning consumer and a delivery timestamp on the
         fake's **virtual clock** (``now_ms`` / ``advance()`` — deterministic,
@@ -337,15 +355,15 @@ class StatefulFakeRedis:
       * XREADGROUP with no data returns ``[]`` for ``block=None`` and any
         ``block > 0`` (redis-py returns ``[]`` on a BLOCK timeout; the fake
         skips the actual wait). ``block == 0`` on an empty read raises — real
-        Redis blocks FOREVER there (audit A7-r2-92), which a fake cannot
-        model, so it fails loudly instead of returning the inverted ``[]``;
-      * XAUTOCLAIM honors ``min_idle_time`` against the virtual clock (audit
-        S3-r2-120), caps claims at ``count`` (Redis default 100) and returns
-        an inclusive continuation cursor — ``0-0`` once the PEL scan
-        completes (audit A7-r3-140); claiming reassigns the consumer and
+        Redis blocks FOREVER there, which a fake cannot model, so it fails
+        loudly instead of returning the inverted ``[]``;
+      * XAUTOCLAIM honors ``min_idle_time`` against the virtual clock, caps
+        claims at ``count`` (Redis default 100) and returns an inclusive
+        continuation cursor — ``0-0`` once the PEL scan completes; claiming
+        reassigns the consumer and
         RESETS the idle clock; pending ids no longer present in the stream
         (trimmed/XDEL'd while pending) are reported via the third (deleted)
-        tuple element and purged from the PEL (audits S3-r3-160, A7-r1-24).
+        tuple element and purged from the PEL.
     """
 
     def __init__(self) -> None:
@@ -411,7 +429,7 @@ class StatefulFakeRedis:
         if not out and block == 0:
             raise NotImplementedError(
                 "XREADGROUP BLOCK 0 with no data blocks FOREVER on real Redis "
-                "(audit A7-r2-92) — the fake cannot model an infinite block; "
+                "— the fake cannot model an infinite block; "
                 "pass block > 0 (returns [] on timeout) or block=None."
             )
         # No data: redis-py returns [] both non-blocking and after a BLOCK
@@ -453,8 +471,8 @@ class StatefulFakeRedis:
             if mid not in by_id:
                 # Trimmed/XDEL'd while still pending: real Redis reports the id
                 # via the third tuple element and purges it from the PEL as a
-                # side effect (audits S3-r3-160, A7-r1-24) — it is NOT handed
-                # back as a claimable entry with empty fields.
+                # side effect — it is NOT handed back as a claimable entry with
+                # empty fields.
                 del pel[mid]
                 deleted.append(mid)
                 continue
@@ -494,7 +512,7 @@ async def test_publish_then_consume_round_trip(stateful_broker) -> None:
     assert fields[b"h:event_type"] == b"Order"
     # A second ">" read returns nothing new — the message was delivered once.
     # block_ms must be POSITIVE: BLOCK 0 on an exhausted stream blocks forever
-    # on real Redis (audit A7-r2-92); a positive BLOCK times out and returns [].
+    # on real Redis; a positive BLOCK times out and returns [].
     assert await stateful_broker.read("orders", consumer="c1", count=10, block_ms=1) == []
 
 
@@ -538,18 +556,18 @@ async def test_group_created_at_id_zero_delivers_pre_existing_backlog(stateful_b
 
 
 async def test_read_with_block_zero_on_empty_stream_is_rejected_by_fake(stateful_broker) -> None:
-    """BLOCK 0 on an empty stream blocks FOREVER on real Redis (audit
-    A7-r2-92) — the old fake returned [] immediately, the inverted contract.
-    The fake cannot block forever, so it must fail loudly instead."""
+    """BLOCK 0 on an empty stream blocks FOREVER on real Redis — the old fake
+    returned [] immediately, the inverted contract. The fake cannot block
+    forever, so it must fail loudly instead."""
     await stateful_broker.ensure_group("orders")
     with pytest.raises(NotImplementedError, match="BLOCK 0"):
         await stateful_broker.read("orders", consumer="c1", block_ms=0)
 
 
 async def test_reclaim_honors_min_idle_time(stateful_fake, stateful_broker) -> None:
-    """XAUTOCLAIM must NOT steal a freshly-delivered in-flight message (audit
-    S3-r2-120): real Redis refuses to claim entries idle < min_idle_time; the
-    old fake claimed everything unconditionally."""
+    """XAUTOCLAIM must NOT steal a freshly-delivered in-flight message: real
+    Redis refuses to claim entries idle < min_idle_time; the old fake claimed
+    everything unconditionally."""
     await stateful_broker.ensure_group("orders")
     await stateful_broker.publish("orders", b"payload")
     [(_s, [(mid, _f)])] = await stateful_broker.read("orders", consumer="c1", block_ms=1)
@@ -579,10 +597,10 @@ async def test_reclaim_honors_min_idle_time(stateful_fake, stateful_broker) -> N
 async def test_fake_xautoclaim_caps_at_count_and_pages_via_cursor(
     stateful_fake, stateful_broker
 ) -> None:
-    """Real XAUTOCLAIM enforces COUNT and returns a continuation cursor (audit
-    A7-r3-140, fake-fidelity half) — the old fake returned the entire PEL in
-    one call. Probed at raw-client level; the adapter's reclaim() follows the
-    cursor itself (test_reclaim_follows_cursor_to_drain_full_backlog)."""
+    """Real XAUTOCLAIM enforces COUNT and returns a continuation cursor — the
+    old fake returned the entire PEL in one call. Probed at raw-client level;
+    the adapter's reclaim() follows the cursor itself
+    (test_reclaim_follows_cursor_to_drain_full_backlog)."""
     await stateful_broker.ensure_group("orders")
     for i in range(5):
         await stateful_broker.publish("orders", f"m{i}".encode())
@@ -607,11 +625,13 @@ async def test_fake_xautoclaim_caps_at_count_and_pages_via_cursor(
 
 
 async def test_reclaim_follows_cursor_to_drain_full_backlog(stateful_broker) -> None:
-    """A7-r3-140 (production half, W2 RESIDUALS item 9): reclaim() used to
-    issue a single XAUTOCLAIM(start_id='0-0', count=100) and never follow the
-    continuation cursor, so a >COUNT idle-pending backlog drained only across
-    successive poll cycles. reclaim() must page via the returned cursor until
-    it comes back 0-0 — exactly one full PEL scan, bounded, no spin."""
+    """reclaim() must page via XAUTOCLAIM's continuation cursor.
+
+    A single XAUTOCLAIM(start_id='0-0', count=100) that never follows the
+    returned cursor drains a larger-than-COUNT idle-pending backlog only across
+    successive poll cycles. Paging until the cursor comes back 0-0 is exactly
+    one full PEL scan — bounded, no spin.
+    """
     await stateful_broker.ensure_group("orders")
     for i in range(5):
         await stateful_broker.publish("orders", f"m{i}".encode())
@@ -629,8 +649,8 @@ async def test_reclaim_follows_cursor_to_drain_full_backlog(stateful_broker) -> 
 
 
 async def test_trimmed_pending_entry_is_reported_deleted_and_purged(stateful_fake) -> None:
-    """MAXLEN-trim vs PEL (audits A7-r1-24 / S3-r3-160): an entry trimmed from
-    the stream while still pending is reported via XAUTOCLAIM's third
+    """MAXLEN-trim vs PEL: an entry trimmed from the
+    stream while still pending is reported via XAUTOCLAIM's third
     (deleted) element and purged from the PEL — NOT handed back as a claimable
     entry with empty fields (the old fake's silently-different failure mode).
     """

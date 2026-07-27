@@ -2,7 +2,7 @@
 
 Enabled by setting ``MODULITH_DEMO_OTEL=1`` (read by ``shop.main``'s
 lifespan). Not imported at all unless that flag is set, so a user who only
-installed ``modulith[fastapi,cli]`` (no ``modulith[otel]``) can still run the
+installed ``modupy[fastapi,cli]`` (no ``modupy[otel]``) can still run the
 demo in every other mode.
 """
 
@@ -29,7 +29,7 @@ def init_telemetry() -> None:
     except ImportError as exc:
         raise ImportError(
             "MODULITH_DEMO_OTEL=1 requires the OpenTelemetry SDK. "
-            "Install the extra: pip install 'modulith[otel]'"
+            "Install the extra: pip install 'modupy[otel]'"
         ) from exc
 
     provider = TracerProvider()

@@ -6,7 +6,7 @@ horizontal scaling, and is already in most teams' infrastructure. Opt-in
 via `modulith.configure(broker="redis")` for process-per-module and
 process-per-monolith topologies.
 
-Distributed via the `modulith[redis]` extra. Optional dependency:
+Distributed via the `modupy[redis]` extra. Optional dependency:
 redis>=5.0 (the official redis-py package, which has async support). The
 import is lazy — applications that don't select this broker never pay the
 cost, and the module imports fine without redis installed.
@@ -127,7 +127,16 @@ class RedisStreamsBroker:
             self._client = client
         else:
             # Lazy import keeps redis a soft dependency.
-            from redis.asyncio import Redis
+            try:
+                from redis.asyncio import Redis
+            except ImportError as exc:
+                # A bare ModuleNotFoundError('No module named redis') surfaces
+                # from whichever call first touched the broker and names neither
+                # the broker that needs it nor the extra that installs it.
+                raise ConfigurationError(
+                    "The 'redis-streams' broker requires redis-py (async). "
+                    "Install the extra: pip install 'modupy[redis]'"
+                ) from exc
 
             self._client = Redis.from_url(url or _DEFAULT_URL)
         self._stream_prefix = stream_prefix
@@ -251,8 +260,8 @@ class RedisStreamsBroker:
         XAUTOCLAIM caps each call at ``count`` and returns a continuation
         cursor; a single call therefore drains at most ``count`` entries.
         This method follows the cursor until it returns ``0-0`` — exactly one
-        full PEL scan per reclaim (A7-r3-140), bounded (it never rescans, so
-        it cannot spin) — and returns the aggregated
+        full PEL scan per reclaim, bounded (it never rescans, so it cannot
+        spin) — and returns the aggregated
         ``(b"0-0", claimed, deleted)`` triple, so a >``count`` idle-pending
         backlog is recovered in one reclaim cycle instead of leaking across
         many poll intervals.

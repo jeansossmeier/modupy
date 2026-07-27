@@ -35,8 +35,28 @@ from .builtin.verifier import CONTRACTS_MODULE, _file_package, _ImportCollector
 logger = logging.getLogger("modulith.audit")
 
 # Directories that never contain application source worth auditing.
+#
+# ``tests``/``test`` are here for a different reason than the vendored and
+# build directories: their contents are real source, they are just not module
+# candidates. Left in, a ``tests/`` directory becomes a proposed module and
+# every ``from myapp.orders import ...`` inside it is reported as a
+# cross-module import that would become a boundary violation — pure noise that
+# also drags the readiness score down, because reaching across module
+# boundaries is precisely what test code is allowed to do.
 _SKIP_DIRS = frozenset(
-    {"__pycache__", ".venv", "venv", ".git", ".tox", "build", "dist", "node_modules", ".mypy_cache"}
+    {
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".git",
+        ".tox",
+        "build",
+        "dist",
+        "node_modules",
+        ".mypy_cache",
+        "tests",
+        "test",
+    }
 )
 
 # Function-name prefixes that suggest an event-handler shape.
@@ -74,7 +94,7 @@ class AuditResult:
     # failed to parse — see parse_failures). Zero means the audited path
     # contained no Python at all (wrong path, docs-only dir, empty
     # scaffold) — the readiness score is meaningless then and the report
-    # must say so instead of a confident 100/100 (A10-r4-186).
+    # must say so instead of a confident 100/100.
     files_scanned: int = 0
 
     # Files that failed to parse (syntax/encoding errors) and were excluded
@@ -95,7 +115,13 @@ def audit_codebase(root: Path, contracts_module: str = CONTRACTS_MODULE) -> Audi
     *contracts_module* is the name exempted from cross-module coupling —
     honor a codebase's already-configured ``[tool.modulith].contracts_module``
     (mid-migration) instead of always assuming the default ``"contracts"``.
+
+    ``root`` is resolved first: the root package name is derived from
+    ``root.name``, and a relative root like ``Path(".")`` — the CLI default —
+    has an empty name, which would make every ``rootpkg.module`` import look
+    external and fabricate a perfect readiness score.
     """
+    root = root.resolve()
     files = _iter_py_files(root)
     parsed, failures = _split_by_parseability(files)
     proposed = _propose_module_structure(root, parsed)
@@ -189,11 +215,11 @@ def _target_module(
     """Map a dotted import path to a proposed module name, if it is one.
 
     A bare top-level import (``import types``) that merely *shares a name*
-    with a local module directory must not count as internal coupling
-    (A10-r5-218): when the audited root is itself a package, its children
-    are only importable as ``root.child``, so bare names are external by
-    construction; in a flat (non-package) layout a bare name can be local,
-    but a stdlib name is resolved as stdlib, not as coupling.
+    with a local module directory must not count as internal coupling: when
+    the audited root is itself a package, its children are only importable as
+    ``root.child``, so bare names are external by construction; in a flat
+    (non-package) layout a bare name can be local, but a stdlib name is
+    resolved as stdlib, not as coupling.
     """
     parts = dotted.split(".")
     if not parts or not parts[0]:
@@ -343,8 +369,8 @@ def _compute_readiness_score(
     cleanly to events). A codebase with no cross-module interaction at all
     is already modular, so it scores 100 — note this branch also fires for
     an empty tree (zero files scanned), which ``render_report`` calls out
-    explicitly (A10-r4-186). Shared tables are deliberately not part of the
-    formula; the report carries a caveat when they exist (A10-r3-148).
+    explicitly. Shared tables are deliberately not part of the formula; the
+    report carries a caveat when they exist.
     """
     direct = sum(count for _src, _tgt, count, _sample in cross_module_imports)
     event_like = len(listener_candidates)

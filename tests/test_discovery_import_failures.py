@@ -1,16 +1,15 @@
-"""W2 audit fixes: broken module / manifest imports must not be silent.
+"""Broken module / manifest imports must not be silent.
 
-Covers three audit findings against modulith/builtin/discovery.py:
+Covers three failure modes of modulith/builtin/discovery.py:
 
-* A4-r5-207 — the discover hook's "never raises" contract must hold for
-  ANY exception raised by the top-level application package, not just
-  ImportError.
-* A4-r3-133 — a module whose own package fails to import must fail
-  bootstrap loudly instead of being reported as a healthy discovered
-  module with its listeners silently missing.
-* A4-r1-10 — a module whose ``_manifest.py`` raises during import must
-  fail bootstrap loudly instead of being silently exempted from the very
-  manifest verification that is documented to catch failed imports.
+* The discover hook's "never raises" contract must hold for ANY exception
+  raised by the top-level application package, not just ImportError.
+* A module whose own package fails to import must fail bootstrap loudly
+  instead of being reported as a healthy discovered module with its
+  listeners silently missing.
+* A module whose ``_manifest.py`` raises during import must fail bootstrap
+  loudly instead of being silently exempted from the very manifest
+  verification that is documented to catch failed imports.
 """
 
 from __future__ import annotations
@@ -46,21 +45,21 @@ def reset_manifests():
 
 
 # ---------------------------------------------------------------------------
-# W3 R3-F1 — the application package's OWN import failure fails loud
-# (supersedes A4-r5-207's return-[] contract, which made verify/doctor
-# exit 0 — CI-green — on an unimportable application package)
+# The application package's OWN import failure fails loud. Returning an
+# empty module list instead made verify/doctor exit 0 — CI-green — on an
+# unimportable application package.
 # ---------------------------------------------------------------------------
 
 
 def test_app_package_import_failure_raises_configuration_error(
     make_fake_app,
 ) -> None:
-    """W3 R3-F1: a bug in the application package's own __init__ must fail
+    """A bug in the application package's own __init__ must fail
     discovery loudly (ConfigurationError, original exception chained as the
     cause) — not degrade to '0 modules discovered', which turned an
-    unimportable app into a green `modulith verify`. A4-r5-207's uniformity
-    still holds: NameError and ImportError get the SAME treatment; the raw
-    exception never propagates untyped out of the hook."""
+    unimportable app into a green `modulith verify`. Treatment is uniform:
+    NameError and ImportError are handled the SAME way; the raw exception
+    never propagates untyped out of the hook."""
     from modulith.builtin.discovery import modulith_discover_modules
 
     pkg = make_fake_app(
@@ -76,7 +75,7 @@ def test_app_package_import_failure_raises_configuration_error(
 
 
 def test_missing_app_package_raises_configuration_error() -> None:
-    """W3 R3-F1: a package that cannot be found at all (typo'd name, wrong
+    """A package that cannot be found at all (typo'd name, wrong
     cwd) is the same fatal misconfiguration as a broken __init__."""
     from modulith.builtin.discovery import modulith_discover_modules
 
@@ -85,12 +84,12 @@ def test_missing_app_package_raises_configuration_error() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A4-r3-133 — module package import failure fails bootstrap loudly
+# Module package import failure fails bootstrap loudly
 # ---------------------------------------------------------------------------
 
 
 def test_broken_module_package_fails_bootstrap(make_fake_app) -> None:
-    """A4-r3-133: a module whose __init__ raises used to be recorded as a
+    """A module whose __init__ raises used to be recorded as a
     healthy discovered module while its listeners silently never
     registered — bootstrap succeeded with only a log line. SPEC promises
     startup fails with a clear error when a module fails to import."""
@@ -104,9 +103,9 @@ def test_broken_module_package_fails_bootstrap(make_fake_app) -> None:
 
 
 def test_broken_module_does_not_abort_healthy_sibling_discovery(make_fake_app) -> None:
-    """A4-r3-133 (companion): the loud failure is aggregated AFTER the walk —
-    the healthy sibling module is still imported before bootstrap fails,
-    and the error names the broken module."""
+    """Companion to the broken-package case: the loud failure is aggregated
+    AFTER the walk — the healthy sibling module is still imported before
+    bootstrap fails, and the error names the broken module."""
     import sys as _sys
 
     from modulith import configure, publish
@@ -125,12 +124,12 @@ def test_broken_module_does_not_abort_healthy_sibling_discovery(make_fake_app) -
 
 
 # ---------------------------------------------------------------------------
-# A4-r1-10 — _manifest.py import failure fails bootstrap loudly
+# _manifest.py import failure fails bootstrap loudly
 # ---------------------------------------------------------------------------
 
 
 def test_broken_manifest_file_fails_bootstrap(make_fake_app) -> None:
-    """A4-r1-10: a _manifest.py that raises before declare_module() used to
+    """A _manifest.py that raises before declare_module() used to
     leave the module absent from the manifest registry, so verification —
     documented to catch exactly 'module silently failed to import' — never
     ran for it and bootstrap succeeded."""

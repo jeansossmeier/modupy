@@ -11,8 +11,9 @@ Why Mermaid over PlantUML:
   - Live editor at mermaid.live for previewing changes
   - Markdown integration (```mermaid blocks)
 
-Output goes to docs/modulith/ by default. Configurable via
-[tool.modulith.docs].output_dir.
+Output goes to docs/modulith/ by default; redirect it with
+``modulith docs --output-dir=DIR``. There is no pyproject knob for it — the
+generator writes exactly where the CLI points.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ logger = logging.getLogger("modulith.docs")
 # Mermaid reserved words (flowchart + sequenceDiagram grammars) that break
 # parsing when used as bare node ids or participant names — e.g. a module
 # directory named ``end`` (valid Python package, reserved in Mermaid) renders
-# an unparseable diagram (A11-r1-41). Module names come from the pluggable
+# an unparseable diagram. Module names come from the pluggable
 # discovery hook, so any valid identifier is possible. Compared lowercase.
 _MERMAID_RESERVED = frozenset(
     {
@@ -89,10 +90,10 @@ def _validate_module_names(modules: list[ModuleInfo]) -> None:
     hook, so it is user-controllable input, not trusted framework state.
     Validated BEFORE anything is written:
 
-      * duplicate names (A11-r4-189) — canvases are keyed by name, so
+      * duplicate names — canvases are keyed by name, so
         duplicates silently overwrite each other while ``produced`` claims
         both were written; and
-      * names that are not a single safe path segment (A11-r4-188) — the
+      * names that are not a single safe path segment — the
         canvas path ``<output_dir>/modules/<name>.md`` would escape (or nest
         outside) the output directory.
     """
@@ -377,8 +378,8 @@ def _introspect_events(module: ModuleInfo) -> tuple[list[str], list[str]]:
         except (OSError, SyntaxError, UnicodeDecodeError) as exc:
             # One unreadable file (broken symlink, permission denied) or
             # unparseable file must degrade this module's introspection, not
-            # abort the whole render (A11-r5-222) — and never silently
-            # (A11-r4-191): name the file and the reason.
+            # abort the whole render — and never silently: name the file and
+            # the reason.
             logger.warning(
                 "docs: skipping %s during event introspection (%s: %s)",
                 path,
@@ -409,9 +410,9 @@ def _public_api(module: ModuleInfo) -> list[str]:
     try:
         tree = ast.parse(init.read_text(encoding="utf-8"), filename=str(init))
     except (OSError, SyntaxError, UnicodeDecodeError) as exc:
-        # Same graceful-degrade + loud-skip contract as _introspect_events
-        # (A11-r5-222 / A11-r4-191): an unreadable or unparseable __init__.py
-        # yields an empty public API, with the file and reason logged.
+        # Same graceful-degrade + loud-skip contract as _introspect_events: an
+        # unreadable or unparseable __init__.py yields an empty public API,
+        # with the file and reason logged.
         logger.warning(
             "docs: skipping public-API scan of %s (%s: %s)",
             init,

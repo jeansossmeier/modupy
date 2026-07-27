@@ -15,21 +15,23 @@ storage backends. It just orchestrates the already-tested subsystems
 through the plugin hooks and the outbox maintenance API.
 
 Distribution: shipped via [project.scripts] in pyproject.toml so
-`pip install modulith[cli]` makes `modulith` available on PATH.
+`pip install modupy[cli]` makes `modulith` available on PATH.
 
 Exit-code scheme (uniform across commands; see ``main``): 0 = success,
 1 = violations or user error within a recognized command line, 2 =
 unexpected internal errors AND CLI usage errors (missing required
 argument, unknown option) — the latter is click's convention, which
-modulith follows rather than fighting the framework (W3 R3-F3).
+modulith follows rather than fighting the framework.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
+import shutil
 import sys
 import traceback
 from collections import defaultdict
@@ -43,13 +45,13 @@ try:
     import typer
 except ImportError:
     print(
-        "modulith CLI requires the 'cli' extra. Install with:\n  pip install 'modulith[cli]'",
+        "modulith CLI requires the 'cli' extra. Install with:\n  pip install 'modupy[cli]'",
         file=sys.stderr,
     )
     sys.exit(1)
 
 from .builtin import outbox, verifier
-from .config import ConfigurationError, load_configuration
+from .config import ConfigurationError, _find_pyproject, load_configuration
 from .discovery import _detect_from_pyproject_name
 from .manifest import get_manifest
 from .runtime import Runtime, _runtime
@@ -89,6 +91,31 @@ def _main(
 # ---------------------------------------------------------------------------
 
 
+def _add_project_root_to_syspath() -> None:
+    """Make the project the CLI was launched in importable.
+
+    A console script's ``sys.path[0]`` is the directory holding the script
+    (``.venv/bin`` after ``pip install``), never the working directory. So an
+    application package that sits next to ``pyproject.toml`` — the layout every
+    quickstart produces — is invisible to ``import``, and every command that
+    bootstraps the runtime dies with ``ModuleNotFoundError`` on the very
+    package the configuration names. Configuration discovery already anchors on
+    the nearest ``pyproject.toml`` walking up from the cwd; put that same
+    directory on the path so the package it declares can actually be imported,
+    rather than making users prefix each command with ``PYTHONPATH=.``.
+
+    Idempotent, and deliberately at the front: a root already on ``sys.path``
+    is left where it is, so ``python -m modulith.cli`` and an application
+    installed into site-packages both keep the resolution order they had.
+    """
+    pyproject = _find_pyproject()
+    if pyproject is None:
+        return
+    root = str(pyproject.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
 def _bootstrap_or_exit() -> Runtime:
     """Bootstrap the runtime, converting config errors into a clean exit.
 
@@ -102,8 +129,8 @@ def _bootstrap_or_exit() -> Runtime:
     every frame above a CLI command belongs to typer/click, so the stack walk
     would "detect" the CLI framework itself as the application package and
     the command would silently run against the wrong package — ``verify``
-    exited 0 without ever scanning the real app (A9-r2-94). Resolve the
-    package up front instead: explicit configuration wins, then pyproject
+    exited 0 without ever scanning the real app. Resolve the package up
+    front instead: explicit configuration wins, then pyproject
     ``[project].name``, otherwise exit 1 with actionable guidance.
     """
     if not _runtime._bootstrapped:
@@ -123,6 +150,19 @@ def _bootstrap_or_exit() -> Runtime:
                 )
                 raise typer.Exit(code=1)
             _runtime.configure(package=pkg)
+    return _ensure_bootstrapped_or_exit()
+
+
+def _ensure_bootstrapped_or_exit() -> Runtime:
+    """Bootstrap an already-configured runtime, exiting 1 on configuration errors.
+
+    The half of ``_bootstrap_or_exit`` that does not re-resolve configuration.
+    A caller that has already settled the application package — ``modulith
+    run``/``dev`` under the process topology, via
+    ``_configure_process_runtime`` — uses this instead, so one boot does not
+    read pyproject.toml and sweep the environment twice to reach an answer it
+    already has.
+    """
     try:
         _runtime.ensure_bootstrapped()
     except ConfigurationError as exc:
@@ -144,7 +184,7 @@ def _configure_process_runtime(app_module: str) -> None:
     is derived from ``app_module``. When both exist and disagree, warn loudly:
     the process topology runs the *configured* package's modules and never
     reads ``app_module`` again, so silence here launched a different app's
-    workers on a typo'd argument (A9-r4-182).
+    workers on a typo'd argument.
     """
     try:
         resolved = load_configuration(topology="processes")
@@ -172,6 +212,29 @@ def _configure_process_runtime(app_module: str) -> None:
     _runtime.configure(**overrides)
 
 
+def _prefer_sibling_uvicorn() -> None:
+    """Put the running interpreter's script directory first on ``PATH``.
+
+    ``os.execvp`` resolves ``uvicorn`` through ``PATH``, which is not the
+    environment modulith itself was imported from whenever this CLI is invoked
+    by absolute path into a virtualenv that was never activated — a systemd
+    ``ExecStart=/srv/app/venv/bin/modulith``, a container
+    ``CMD ["/app/venv/bin/modulith", "run", ...]``, a Makefile recipe, a CI
+    step. ``PATH`` then hands back whichever uvicorn comes first, potentially
+    one bound to a different interpreter that cannot import the app at all.
+
+    Hoisting ``sys.executable``'s directory makes the co-installed uvicorn win
+    — the same one ``pip install modupy[fastapi]`` put there. When no uvicorn
+    lives beside the interpreter, ``PATH`` is left untouched and resolution
+    falls through to it, so an intentionally-shadowed uvicorn still runs.
+    """
+    bindir = os.path.dirname(sys.executable)
+    # shutil.which, not an exists() check: it applies PATHEXT, so the Windows
+    # Scripts\uvicorn.exe is found by the same bare name as the POSIX script.
+    if bindir and shutil.which("uvicorn", path=bindir):
+        os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", os.defpath)
+
+
 def _exec_uvicorn(argv: list[str]) -> None:
     """Replace this process with uvicorn, mapping launch failure to exit 1.
 
@@ -179,15 +242,16 @@ def _exec_uvicorn(argv: list[str]) -> None:
     (FileNotFoundError) — or any other OSError launching it — is an
     environment/user error per the documented exit-code scheme, so it must
     surface as an actionable message with exit 1, never the raw traceback +
-    exit 2 reserved for internal bugs (S3-r2-124).
+    exit 2 reserved for internal bugs.
     """
+    _prefer_sibling_uvicorn()
     try:
         os.execvp("uvicorn", argv)
     except OSError as exc:
         typer.echo(
             f"error: could not launch 'uvicorn' ({exc}). Install it in this "
             "environment — e.g. `pip install uvicorn` or `pip install "
-            "'modulith[fastapi]'` — or run your ASGI server directly.",
+            "'modupy[fastapi]'` — or run your ASGI server directly.",
             err=True,
         )
         raise typer.Exit(code=1) from None
@@ -197,7 +261,7 @@ _TOPOLOGIES = ("single", "processes")
 
 
 def _validate_topology(topology: str) -> None:
-    """Reject anything outside the two supported topologies (A9-r1-30).
+    """Reject anything outside the two supported topologies.
 
     Anything unrecognized used to route to the process-per-module supervisor
     (the branch was ``!= "single"``), silently launching the wrong
@@ -211,8 +275,40 @@ def _validate_topology(topology: str) -> None:
         raise typer.Exit(code=1)
 
 
+_LOG_LEVELS = ("debug", "info", "warning", "error", "critical")
+
+
+def _configure_cli_logging(log_level: str) -> str:
+    """Install this process's root log configuration; return the normalized level.
+
+    ``dev`` and ``run`` are process entry points, so owning the root logger
+    here is legitimate — a library import path must never do it. Without this
+    the root logger has no handler at all, ``logging.lastResort`` discards
+    everything below WARNING, and every INFO diagnostic modulith emits
+    disappears: which modules expose no ``router``, which workers were
+    spawned on which ports, and every line a worker subprocess wrote.
+
+    An unrecognized name exits 1 instead of falling back to a default —
+    quietly staying at INFO on a typo is exactly the invisible-logs failure
+    this flag exists to end.
+    """
+    level = log_level.strip().lower()
+    if level not in _LOG_LEVELS:
+        typer.echo(
+            f"invalid --log-level {log_level!r}: expected one of {', '.join(_LOG_LEVELS)}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    logging.basicConfig(format="%(levelname)s:  %(message)s")
+    # basicConfig is a no-op once the root logger has a handler, so set the
+    # level separately: otherwise the flag silently does nothing whenever
+    # something configured logging before this command ran.
+    logging.getLogger().setLevel(level.upper())
+    return level
+
+
 def _validate_app_module(app_module: str) -> None:
-    """Reject empty app-module arguments with a clean CLI error (A9-r3-144)."""
+    """Reject empty app-module arguments with a clean CLI error."""
     if not app_module.strip():
         typer.echo(
             f"invalid app module {app_module!r}: expected 'package.module:app'",
@@ -275,7 +371,7 @@ def _write_baseline_or_exit(baseline: Path, violations: list[Violation]) -> None
 
     A --baseline path in a nonexistent directory (or otherwise unwritable)
     is a user error per the documented exit codes — exit 1 with guidance,
-    never the raw traceback + exit 2 reserved for internal bugs (W3 R3-F4).
+    never the raw traceback + exit 2 reserved for internal bugs.
     """
     try:
         verifier.write_baseline(baseline, violations)
@@ -319,7 +415,7 @@ def _echo_violation_warnings(violations: list[Violation]) -> None:
 
 
 def _echo_dev_verify_warnings(app_module: str) -> None:
-    """Best-effort boundary check at ``modulith dev`` startup (S2-r4-195).
+    """Best-effort boundary check at ``modulith dev`` startup.
 
     Implements SPEC §3.2's "warnings in dev, hard checks via `modulith
     verify` in CI": bootstrap the runtime (deriving the package from
@@ -364,29 +460,54 @@ def _configure_dev_package(app_module: str) -> bool:
 
 
 def _require_outbox_store() -> None:
-    """Exit 1 with guidance when no durable outbox store is configured.
+    """Exit 1 with actionable guidance when no outbox store is bound.
 
-    The maintenance commands operate on the store the application wires at
-    startup (e.g. ``PostgresPublicationStore``). The default ``memory``
-    outbox persists nothing, so there is nothing to inspect or act on.
+    The maintenance commands act on the ``PublicationStore`` that
+    ``modulith.builtin.outbox.configure(store=..., serializer=...)`` binds.
+    That binding is per-process in-memory state, and a CLI invocation is its
+    own process which only runs what bootstrap's discovery import executes —
+    so a store wired exclusively inside an ASGI lifespan/startup hook lives in
+    the server process and never in this one.
+
+    Which is why the remedy depends on what the configuration already says.
+    Pointing at ``[tool.modulith].outbox`` unconditionally is a dead end once
+    that key is set: its value selects an adapter, it never constructs or
+    binds a store, so re-setting it changes nothing about what the CLI sees.
     """
-    if outbox._store is None:
-        typer.echo(
-            "no outbox store configured — the outbox commands operate on the "
-            "durable PublicationStore your application wires at startup (e.g. "
-            "PostgresPublicationStore). The default 'memory' outbox keeps "
-            "nothing to inspect; set [tool.modulith].outbox = 'postgres'.",
-            err=True,
+    if outbox._store is not None:
+        return
+    cfg = _runtime.config
+    configured = cfg.outbox if cfg is not None else "memory"
+    if configured == "memory":
+        cause = (
+            "the default 'memory' outbox persists nothing, so there is nothing "
+            "to inspect — set [tool.modulith].outbox to a durable adapter "
+            "(e.g. 'postgres')"
         )
-        raise typer.Exit(code=1)
+    else:
+        cause = f"[tool.modulith].outbox is {configured!r} but no store is bound in this process"
+    typer.echo(
+        f"no outbox store: {cause}. A store is bound only by calling "
+        "modulith.builtin.outbox.configure(store=..., serializer=...) — and the "
+        "outbox commands run in their own process, seeing only what bootstrap "
+        "imports, so that call has to run at module import time rather than "
+        "solely in an ASGI lifespan/startup hook.",
+        err=True,
+    )
+    raise typer.Exit(code=1)
 
 
 def _parse_workers_json(workers_json: str) -> dict[str, Any]:
     """Parse ``--workers`` into a dict, exiting 1 on anything else.
 
     JSON that parses but isn't an object (a list, number, string…) used to
-    crash the supervisor with an AttributeError traceback (A9-r1-31) — the
-    option's contract is an object like ``{"reports": 4}``.
+    crash the supervisor with an AttributeError traceback — the option's
+    contract is an object like ``{"reports": 4}``.
+
+    Values are validated exactly as the ``[tool.modulith.workers]`` table is
+    (``config._validate``): a positive ``int``, never a bool or a numeric
+    string. Without it the same bad count is a clean exit 1 from pyproject but
+    a ``derive_specs_from_config`` traceback and exit 2 from the flag.
     """
     try:
         parsed = json.loads(workers_json)
@@ -400,6 +521,14 @@ def _parse_workers_json(workers_json: str) -> dict[str, Any]:
             err=True,
         )
         raise typer.Exit(code=1)
+    for module_name, count in parsed.items():
+        if type(count) is not int or count <= 0:
+            typer.echo(
+                "invalid --workers JSON: workers must map module names to "
+                f"positive integer counts; got {module_name!r}: {count!r}",
+                err=True,
+            )
+            raise typer.Exit(code=1)
     return parsed
 
 
@@ -410,6 +539,7 @@ def _run_process_topology(
     isolate: str | None,
     host: str,
     port: int,
+    log_level: str,
     verify_warn: bool = False,
 ) -> None:
     """Spin up the process-per-module runtime: one worker per module + proxy.
@@ -419,6 +549,10 @@ def _run_process_topology(
     then runs the supervisor and reverse proxy on ``(host, port)``. Blocks
     until a shutdown signal arrives. With ``verify_warn`` (``modulith dev``),
     boundary violations are echoed as non-fatal warnings after bootstrap.
+
+    ``log_level`` is both this process's root log level (already installed by
+    the caller) and the level forwarded to every worker subprocess, so one
+    flag governs the whole deployment's verbosity.
     """
     from .supervisor import derive_specs_from_config, run_supervised
 
@@ -427,8 +561,12 @@ def _run_process_topology(
     if workers_json:
         workers_map = _parse_workers_json(workers_json)
 
+    # _configure_process_runtime already resolved the configuration and
+    # guaranteed a package (explicit, or derived from app_module), so the
+    # package-detection probe in _bootstrap_or_exit would re-read pyproject
+    # and re-sweep the environment only to reach the same answer.
     _configure_process_runtime(app_module)
-    rt = _bootstrap_or_exit()
+    rt = _ensure_bootstrapped_or_exit()
     if verify_warn:
         try:
             _echo_violation_warnings(_collect_violations(rt))
@@ -451,7 +589,11 @@ def _run_process_topology(
     # MODULITH_BROKER when the parent auto-defaulted it so workers also see
     # is_explicit("broker") == False. Structured option values (dicts/lists)
     # are JSON-encoded — str(dict) is not json.loads()-able.
-    worker_env: dict[str, str] = {}
+    # Workers are `python -m uvicorn` processes, and uvicorn's CLI reads every
+    # one of its options from a UVICORN_-prefixed environment variable, so this
+    # is how --log-level reaches them: filtered at the source in the worker
+    # rather than in the supervisor after the bytes have already crossed a pipe.
+    worker_env: dict[str, str] = {"UVICORN_LOG_LEVEL": log_level}
     if cfg.is_explicit("broker"):
         worker_env["MODULITH_BROKER"] = cfg.broker
     for key, value in (cfg.broker_options or {}).items():
@@ -479,12 +621,27 @@ def _run_process_topology(
             if not os.environ.get(env_key):
                 worker_env[env_key] = str(path)
 
+    # Workers are `python -m uvicorn` subprocesses, so their sys.path starts
+    # from the inherited working directory. _add_project_root_to_syspath fixed
+    # the application package's importability for THIS process only; launched
+    # from a subdirectory of the project, every worker dies importing the very
+    # package the parent just discovered, and the restart loop hides behind a
+    # proxy that stays up and answers 502. Forward the same root, prepended so
+    # it wins, without discarding an operator's own PYTHONPATH.
+    pyproject = _find_pyproject()
+    if pyproject is not None:
+        root = str(pyproject.parent)
+        inherited = os.environ.get("PYTHONPATH", "")
+        if root not in inherited.split(os.pathsep):
+            worker_env["PYTHONPATH"] = f"{root}{os.pathsep}{inherited}" if inherited else root
+
     config: dict[str, Any] = {
         "package": cfg.package,
         # --workers replaces the pyproject [tool.modulith.workers] table
-        # entirely — a full override, not a per-module patch (A9-r5-216).
+        # entirely — a full override, not a per-module patch.
         "workers": workers_map if workers_map is not None else dict(cfg.workers),
         "env": worker_env,
+        "contracts_module": cfg.contracts_module,
     }
     if isolate:
         config["isolate"] = [isolate]
@@ -499,11 +656,19 @@ def _run_process_topology(
         f"modulith → process-per-module: {len(specs)} worker(s) [{layout}], "
         f"reverse proxy on http://{host}:{port}"
     )
-    asyncio.run(
-        run_supervised(
-            specs, host, port, actuator_mode=cfg.actuator_mode, production=cfg.production
+    try:
+        asyncio.run(
+            run_supervised(
+                specs, host, port, actuator_mode=cfg.actuator_mode, production=cfg.production
+            )
         )
-    )
+    except ConfigurationError as exc:
+        # Configuration resolved inside run_supervised (actuator mode, proxy
+        # tunables) is user error like any other: the documented contract is a
+        # one-line message and exit 1, never the exit-2 traceback reserved for
+        # internal bugs.
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +684,9 @@ def dev(
     reload: bool = typer.Option(True, help="Reload on file changes"),
     host: str = typer.Option("127.0.0.1"),
     port: int = typer.Option(8000),
+    log_level: str = typer.Option(
+        "info", help="debug | info | warning | error | critical (applies to workers too)"
+    ),
 ) -> None:
     """Run the application in development mode.
 
@@ -531,12 +699,17 @@ def dev(
     worker subprocess per module behind a routing proxy on ``(host, port)``.
     (``--reload`` does not apply to the process topology in v1.)
 
+    ``--log-level`` sets this process's root log level and is passed on to
+    uvicorn (and, under the process topology, to every worker subprocess), so
+    the whole deployment's verbosity comes from one flag.
+
     Exit codes: 0 on a clean launch (dev-time verifier warnings never fail
     the command), 1 on invalid arguments or configuration errors, 2 on
     unexpected internal errors.
     """
     _validate_topology(topology)
     _validate_app_module(app_module)
+    level = _configure_cli_logging(log_level)
     if topology == "processes" or isolate is not None:
         _run_process_topology(
             app_module=app_module,
@@ -544,6 +717,7 @@ def dev(
             isolate=isolate,
             host=host,
             port=port,
+            log_level=level,
             verify_warn=True,
         )
         return
@@ -557,7 +731,7 @@ def dev(
     # this preflight scan.
     os.environ["MODULITH_DEV_WARN_ONLY"] = "1"
     _echo_dev_verify_warnings(app_module)
-    argv = ["uvicorn", app_module, "--host", host, "--port", str(port)]
+    argv = ["uvicorn", app_module, "--host", host, "--port", str(port), "--log-level", level]
     if reload:
         argv.append("--reload")
     typer.echo(
@@ -577,25 +751,37 @@ def run(
     topology: str = typer.Option("single", help="single | processes"),
     workers: str | None = typer.Option(
         None,
-        help='JSON: {"reports": 4} (replaces the pyproject [tool.modulith.workers] table entirely)',
+        # Square brackets are rich markup tags in typer's help renderer, so a
+        # bare [tool.modulith.workers] is parsed as a style and deleted from
+        # the output — leaving "replaces the pyproject  table entirely" with
+        # the one load-bearing name missing. \[ escapes it back to a literal.
+        help=r'JSON: {"reports": 4} (replaces the pyproject \[tool.modulith.workers] table entirely)',
     ),
     host: str = typer.Option("0.0.0.0"),
     port: int = typer.Option(8000),
+    log_level: str = typer.Option(
+        "info", help="debug | info | warning | error | critical (applies to workers too)"
+    ),
 ) -> None:
-    """Run the application in production mode.
+    r"""Run the application in production mode.
 
     Like ``dev`` minus reload (and minus the dev-time verifier warnings).
     Per-module worker counts (``--workers``) apply to the process-per-module
     topology: each module's worker count comes from the JSON map (with a
     ``default`` fallback). Passing ``--workers`` replaces the pyproject
-    ``[tool.modulith.workers]`` table entirely — a full override, not a
+    ``\[tool.modulith.workers]`` table entirely — a full override, not a
     per-module patch. The single-process path execs a plain uvicorn.
+
+    ``--log-level`` sets this process's root log level and is passed on to
+    uvicorn (and, under the process topology, to every worker subprocess), so
+    the whole deployment's verbosity comes from one flag.
 
     Exit codes: 0 on a clean launch, 1 on invalid arguments or configuration
     errors, 2 on unexpected internal errors.
     """
     _validate_topology(topology)
     _validate_app_module(app_module)
+    level = _configure_cli_logging(log_level)
     if topology == "processes":
         _run_process_topology(
             app_module=app_module,
@@ -603,10 +789,11 @@ def run(
             isolate=None,
             host=host,
             port=port,
+            log_level=level,
         )
         return
 
-    argv = ["uvicorn", app_module, "--host", host, "--port", str(port)]
+    argv = ["uvicorn", app_module, "--host", host, "--port", str(port), "--log-level", level]
     typer.echo(f"modulith run → {app_module} on http://{host}:{port}")
     _exec_uvicorn(argv)
 
@@ -637,7 +824,7 @@ def verify(
     records the current violation set as the accepted baseline and exits 0.
     """
     # Argument validation precedes bootstrap: a typo'd mode used to fall
-    # through to strict semantics, ignoring the baseline (A9-r3-142).
+    # through to strict semantics, ignoring the baseline.
     if mode not in ("strict", "ratchet"):
         typer.echo(f"invalid --mode {mode!r}: expected 'strict' or 'ratchet'", err=True)
         raise typer.Exit(code=1)
@@ -656,7 +843,7 @@ def verify(
             # A corrupt/schema-mismatched baseline is a user error: surface
             # load_baseline's actionable message (it names the path and the
             # regeneration command) and exit 1 — never the raw traceback +
-            # exit 2 reserved for internal bugs (G11 disclosure).
+            # exit 2 reserved for internal bugs.
             typer.echo(f"error: {exc}", err=True)
             raise typer.Exit(code=1) from None
         reported = verifier.filter_against_baseline(violations, grandfathered)
@@ -698,9 +885,9 @@ def docs(
             produced.extend(result)
     except ConfigurationError as exc:
         # The built-in generator validates module names (duplicates, unsafe
-        # path segments — A11-r4-188/189) and raises ConfigurationError with
-        # an actionable message: a user/config error per the documented exit
-        # codes, not the exit-2 traceback reserved for internal bugs.
+        # path segments) and raises ConfigurationError with an actionable
+        # message: a user/config error per the documented exit codes, not
+        # the exit-2 traceback reserved for internal bugs.
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from None
     except OSError as exc:
@@ -725,7 +912,7 @@ def docs(
 
 
 # ---------------------------------------------------------------------------
-# modulith audit — analyze an existing codebase (Phase 2)
+# modulith audit — analyze an existing codebase
 # ---------------------------------------------------------------------------
 
 
@@ -776,7 +963,7 @@ def audit(
 
 
 # ---------------------------------------------------------------------------
-# modulith doctor — operational health check (Phase 2)
+# modulith doctor — operational health check
 # ---------------------------------------------------------------------------
 
 
@@ -784,8 +971,9 @@ def audit(
 def doctor() -> None:
     """Report architectural and operational health.
 
-    Runs five checks — boundary health, process-split readiness, schema
-    drift, outbox health, and listener registration — and prints a report.
+    Runs six checks — boundary health, process-split readiness, schema
+    drift, outbox health, listener registration, and the SHM notifier — and
+    prints a report.
     Exits 1 if any check reports an error, so it doubles as a CI gate
     (warnings are reported but pass); 2 on unexpected internal errors.
     """
@@ -822,12 +1010,12 @@ async def _force_retry_known(pub_id: UUID) -> bool:
 
     ``outbox.force_retry`` only *logs* a warning on the not-found path —
     invisible whenever the application configures its own logging — so the
-    CLI checks existence itself and reports honestly (A9-r3-143). Mirrors
-    ``force_retry``'s own lookup strategy: prefer the store's ``find_by_id``
-    direct point lookup when available, since ``find_incomplete``/
-    ``list_dead_lettered`` are both capped windows (LIMIT 100) that can miss
-    a targeted row sitting further back in a large backlog. Stores without
-    ``find_by_id`` fall back to the bounded scan.
+    CLI checks existence itself and reports honestly. Mirrors ``force_retry``'s
+    own lookup strategy: prefer the store's ``find_by_id`` direct point lookup
+    when available, since ``find_incomplete``/``list_dead_lettered`` are both
+    capped windows (LIMIT 100) that can miss a targeted row sitting further
+    back in a large backlog. Stores without ``find_by_id`` fall back to the
+    bounded scan.
     """
     store = outbox._store
     assert store is not None  # _require_outbox_store already ran
@@ -903,7 +1091,7 @@ def outbox_dead_letter(
     than silently doing one (the previously-inert ``--list`` masked this).
     """
     # Argument validation precedes environment preconditions: the flag
-    # conflict must be reported even when no store is configured (A9-r3-145).
+    # conflict must be reported even when no store is configured.
     if retry_all and list_dead:
         typer.echo("--list and --retry-all are mutually exclusive", err=True)
         raise typer.Exit(code=1)
@@ -991,9 +1179,10 @@ def main() -> None:
     ``typer.Exit(1)``), 2 = unexpected internal errors (traceback printed to
     stderr) and CLI usage errors — a missing required argument or unknown
     option exits 2 per click's convention, which the CLI deliberately
-    follows (W3 R3-F3).
+    follows.
     """
     try:
+        _add_project_root_to_syspath()
         app()
     except Exception:  # final safety net: internal bugs exit 2, distinctly
         traceback.print_exc()

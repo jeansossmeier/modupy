@@ -1,7 +1,11 @@
 """Process supervisor for the process-per-module topology.
 
 Spawns one subprocess per module, monitors them, restarts crashed
-workers, multiplexes their logs back to the supervisor's stdout.
+workers, and re-emits their output through the supervisor's own logger
+(``modulith.supervisor``) so one terminal carries the whole deployment.
+Where those lines actually land — stderr, a file, a collector — is
+whatever the supervisor process configured logging to do; nothing here
+writes to stdout directly.
 
 Mental model:
 
@@ -49,6 +53,19 @@ if TYPE_CHECKING:
     from .proxy import RoutingRule
 
 logger = logging.getLogger("modulith.supervisor")
+
+# Level names a worker line can carry, mapped to the level the supervisor
+# re-emits it at. uvicorn's default formatter prefixes every record with one
+# of these plus a colon ("INFO:     Started server process [123]"), so a
+# worker's real severity is readable straight off the line.
+_LEVEL_TOKENS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+_MAX_LEVEL_TOKEN_LEN = max(len(name) for name in _LEVEL_TOKENS)
 
 # Bound on how long stop() waits for log forwarders to drain naturally (pipe
 # EOF) after their process is confirmed dead, before cancelling stragglers.
@@ -164,6 +181,19 @@ def _default_command(spec: WorkerSpec, port: int) -> list[str]:
         "--port",
         str(port),
     ]
+
+
+def _line_level(text: str, default: int) -> int:
+    """Read a leading ``LEVEL:`` token off one worker line, else ``default``.
+
+    Only an exact standard level name is honoured, so ordinary prose that
+    happens to contain a colon ("Traceback (most recent call last):") falls
+    through to ``default`` instead of being mistaken for a severity.
+    """
+    head, separator, _ = text.partition(":")
+    if separator and len(head) <= _MAX_LEVEL_TOKEN_LEN:
+        return _LEVEL_TOKENS.get(head.upper(), default)
+    return default
 
 
 # ---------------------------------------------------------------------------
@@ -333,14 +363,20 @@ class Supervisor:
             preexec_fn=_pdeathsig_preexec,  # None outside Linux
         )
         self._processes[name] = proc  # atomic: no await before this point
-        logger.info("spawned worker %r on port %d (pid %s)", spec.module_name, port, proc.pid)
+        # Log under the INSTANCE name, not spec.module_name: with
+        # worker_count > 1 every replica shares one module name, so a
+        # module-name prefix would make all replicas' interleaved output
+        # indistinguishable and unattributable to the crash/restart messages,
+        # which are keyed by instance. Single-replica instances are named
+        # after their module, so their output is unchanged.
+        logger.info("spawned worker %r on port %d (pid %s)", name, port, proc.pid)
         if proc.stdout is not None:
             self._track_log_task(
-                asyncio.create_task(self._forward_logs(spec.module_name, proc.stdout))
+                asyncio.create_task(self._forward_logs(name, proc.stdout, logging.INFO))
             )
         if proc.stderr is not None:
             self._track_log_task(
-                asyncio.create_task(self._forward_logs(spec.module_name, proc.stderr))
+                asyncio.create_task(self._forward_logs(name, proc.stderr, logging.WARNING))
             )
         return proc
 
@@ -417,7 +453,19 @@ class Supervisor:
                 # mypy narrows it to False from the earlier check and can't
                 # model concurrent mutation across the await (cf. runtime.py).
                 return  # type: ignore[unreachable]
-            proc = await self._spawn(name, spec, port)
+            try:
+                proc = await self._spawn(name, spec, port)
+            except Exception:
+                # create_subprocess_exec fails under host resource pressure
+                # (fork EAGAIN on a pid/thread cap, ENOMEM, EMFILE on the
+                # pipes). Letting that escape kills this monitor task, and
+                # nothing ever retrieves its exception — the module silently
+                # stops being supervised, with "restarting in Ns" as the last
+                # word an operator sees. Loop instead: the dead proc's wait()
+                # returns immediately, so the retry runs under the same
+                # backoff and the same crash-loop breaker as a crash does.
+                logger.exception("failed to respawn worker %s; retrying under backoff", name)
+                continue
             # Reachable for the same reason as the check above: stop() may
             # flip _stopping during _spawn's subprocess-creation await, and
             # its one-shot SIGTERM cascade snapshotted self._processes before
@@ -428,8 +476,29 @@ class Supervisor:
             if self._stopping and proc.returncode is None:  # type: ignore[unreachable]
                 proc.terminate()  # type: ignore[unreachable]
 
-    async def _forward_logs(self, prefix: str, stream: asyncio.StreamReader) -> None:
+    async def _forward_logs(
+        self, prefix: str, stream: asyncio.StreamReader, default_level: int
+    ) -> None:
         """Read a worker's output line-by-line and re-log it with its name.
+
+        Each line is re-emitted at the severity the WORKER gave it, never at a
+        fixed level: re-logging everything at INFO put the supervisor's own
+        level filter in charge of what an operator sees, and since nothing
+        configures the root logger in a plain deployment, that silently
+        swallowed every warning a worker emitted — including the one saying a
+        module exposes no ``router`` and therefore 404s every request.
+
+        ``default_level`` is the severity for a line that carries no level
+        token, and differs by stream because the two streams mean different
+        things. On stderr an untagged line came either through
+        ``logging.lastResort`` (nothing configures logging in a worker
+        process, and lastResort only emits WARNING and above) or from an
+        interpreter-level traceback, so WARNING is its floor. stdout is not a
+        logging stream at all — uvicorn logs to stderr — so a line there is
+        application ``print()`` output making no severity claim, and stays at
+        INFO. Untagged lines are never promoted past their floor, which is
+        what keeps a worker's routine INFO chatter out of an operator's
+        warning-level view.
 
         ``readline()`` raises ``ValueError`` when a single line exceeds the
         stream's buffer limit (e.g. an unbounded stack trace or a bulk debug
@@ -448,7 +517,8 @@ class Supervisor:
                     continue
                 if not line:
                     return  # EOF
-                logger.info("[%s] %s", prefix, line.decode(errors="replace").rstrip())
+                text = line.decode(errors="replace").rstrip()
+                logger.log(_line_level(text, default_level), "[%s] %s", prefix, text)
         except asyncio.CancelledError:
             raise
         except Exception:  # a dead pipe must not crash the supervisor
@@ -549,10 +619,18 @@ async def _serve_uvicorn(app: Any, host: str, port: int) -> None:
     uvicorn installs its own SIGINT/SIGTERM handlers and ``serve()`` returns
     when one fires, which lets ``run_supervised`` fall through to its
     ``finally`` and stop the workers cleanly.
+
+    The proxy logs at whatever level this process's root logger is set to
+    (uvicorn's ``Config`` takes a numeric level as readily as a name), rather
+    than a hardcoded one: the CLI's ``--log-level`` sets that root level, and
+    a proxy that ignored it would keep narrating every forwarded request into
+    an operator's deliberately quiet terminal.
     """
     import uvicorn
 
-    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    config = uvicorn.Config(
+        app, host=host, port=port, log_level=logging.getLogger().getEffectiveLevel()
+    )
     await uvicorn.Server(config).serve()
 
 
@@ -562,8 +640,30 @@ def _is_loopback_host(host: str) -> bool:
 
 
 def _env_flag(name: str) -> bool:
-    """Loose boolean env-var read: 1/true/yes (case-insensitive) is True."""
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+    """Boolean env-var read, unset (or empty) meaning False.
+
+    Delegates to ``config._env_bool`` so the supervisor and the application
+    configuration parse the same spellings and reject the same garbage. A
+    lenient parser here was a safety downgrade: ``MODULITH_PRODUCTION=ture``
+    raised in ``load_configuration()`` but silently resolved to False in this
+    process, quietly turning production hardening (the actuator's token
+    requirement) back off.
+    """
+    from .config import _env_bool
+
+    return _env_bool(name) is True
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    """Read a positive-integer env var; anything else is a configuration error."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    from .config import ConfigurationError
+
+    if not raw.isdigit() or int(raw) < 1:
+        raise ConfigurationError(f"{name} must be a positive integer, got {raw!r}")
+    return int(raw)
 
 
 def _resolve_actuator(
@@ -576,11 +676,15 @@ def _resolve_actuator(
       be configured (e.g. for other, unrelated purposes).
     - ``"token"``: token-guarded is mandatory; refuse to start without one.
     - ``"auto"`` (default): a loopback-only, non-production proxy stays open
-      for dev convenience (today's behavior). Otherwise — production, or
-      bound to a host reachable from outside this machine — a token becomes
-      mandatory too: leaving actuator metadata (topology, health) open on a
-      network-reachable production proxy is a real information disclosure,
-      not a convenience worth defaulting to.
+      for dev convenience. Otherwise — production, or bound to a host
+      reachable from outside this machine — a token is required, because
+      leaving actuator metadata (topology, health) open on a network-reachable
+      production proxy is a real information disclosure. With no token
+      configured the actuator is left unmounted rather than the whole
+      application refused a start: ``modulith run`` binds ``0.0.0.0`` by
+      default, so refusing would make the documented production command
+      unstartable out of the box, and nothing is exposed either way. Set
+      ``actuator_mode="token"`` to make the missing token fatal instead.
     """
     from .config import ConfigurationError
 
@@ -598,13 +702,15 @@ def _resolve_actuator(
         return True, token
     # "auto"
     if (production or not _is_loopback_host(host)) and not token:
-        raise ConfigurationError(
-            "actuator_mode='auto' requires MODULITH_ACTUATOR_TOKEN (or "
-            "actuator_token=...) when production=True or the proxy binds a "
-            f"non-loopback host ({host!r}) — refusing to start with an "
-            "unauthenticated actuator reachable from outside this machine. "
-            "Set actuator_mode='open' to explicitly opt out of this guard."
+        logger.warning(
+            "actuator disabled: actuator_mode='auto' will not serve an "
+            "unauthenticated /_modulith/* when production=True or the proxy "
+            "binds a non-loopback host (%r), and no token is configured. Set "
+            "MODULITH_ACTUATOR_TOKEN (or actuator_token=...) to enable it, or "
+            "actuator_mode='open' to serve it unauthenticated.",
+            host,
         )
+        return False, None
     return True, token
 
 
@@ -636,10 +742,15 @@ async def run_supervised(
     ``Configuration``'s own env resolution), so production deployments can
     enable the guard without code changes.
 
+    ``MODULITH_PROXY_MAX_BODY_BYTES`` raises the proxy's request-body cap
+    (10 MiB by default) — the proxy buffers each request body in memory, so
+    the cap exists, but an app with large uploads has no other way past it
+    from ``modulith run``.
+
     ``supervisor`` and ``serve`` are injection seams for testing; production
     callers pass neither and get a real Supervisor plus a uvicorn server.
     """
-    from .proxy import create_proxy_app
+    from .proxy import DEFAULT_MAX_REQUEST_BODY_BYTES, create_proxy_app
 
     if actuator_token is None:
         actuator_token = os.environ.get("MODULITH_ACTUATOR_TOKEN") or None
@@ -654,7 +765,12 @@ async def run_supervised(
 
     rules = _rules_from_specs(specs)
     proxy_app = create_proxy_app(
-        rules, actuator_token=actuator_token, actuator_enabled=actuator_enabled
+        rules,
+        actuator_token=actuator_token,
+        actuator_enabled=actuator_enabled,
+        max_request_body_bytes=_env_positive_int(
+            "MODULITH_PROXY_MAX_BODY_BYTES", DEFAULT_MAX_REQUEST_BODY_BYTES
+        ),
     )
     sup = supervisor if supervisor is not None else Supervisor(specs)
     serve_fn = serve if serve is not None else _serve_uvicorn
@@ -664,33 +780,47 @@ async def run_supervised(
     # disposition (immediate process death), skipping the finally below and
     # orphaning the just-spawned workers. Install a handler for that window
     # that cancels this coroutine's own task so `finally: sup.stop()` still
-    # runs. uvicorn's `Server.install_signal_handlers()` overwrites these with
-    # its own the moment serve_fn actually starts serving, so there's no
-    # fight over the signal — ours only matters until uvicorn takes over.
+    # runs.
+    #
+    # uvicorn takes the signal over with ``signal.signal()``, which replaces
+    # the Python-level disposition but leaves asyncio's add_signal_handler
+    # registration — and the wakeup fd that drives it — in place, so BOTH
+    # callbacks fire on one signal. Cancelling the task then throws straight
+    # into ``Server.main_loop``, and ``Server.shutdown()`` never runs:
+    # listening sockets stay open, in-flight requests die mid-response with a
+    # 500, and the app's lifespan shutdown is skipped. So compare the current
+    # disposition against the one asyncio installed for us and stand down when
+    # they differ — whoever replaced it owns the shutdown from that point.
+    # Nobody replacing it (a serve_fn that installs no handlers) still gets the
+    # cancel, which is what keeps the spawn window covered.
     loop = asyncio.get_running_loop()
     main_task = asyncio.current_task()
     shutdown_signalled = False
     installed_signals: list[signal.Signals] = []
+    own_dispositions: dict[signal.Signals, Any] = {}
 
-    def _handle_shutdown_signal() -> None:
+    def _handle_shutdown_signal(sig: signal.Signals) -> None:
         nonlocal shutdown_signalled
+        if signal.getsignal(sig) is not own_dispositions[sig]:
+            return
         shutdown_signalled = True
         if main_task is not None:
             main_task.cancel()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            loop.add_signal_handler(sig, _handle_shutdown_signal)
+            loop.add_signal_handler(sig, _handle_shutdown_signal, sig)
         except (NotImplementedError, RuntimeError):
             # No signal support (Windows) or not the main thread — the
             # pre-existing orphan risk on those platforms is unchanged.
             continue
         installed_signals.append(sig)
+        own_dispositions[sig] = signal.getsignal(sig)
 
     # start() sits INSIDE the try: Supervisor.start() has no mid-loop
     # rollback, so a partial-spawn failure (e.g. the 3rd of 5 workers fails
     # to exec) would otherwise never reach stop() and the already-spawned
-    # workers would be orphaned (S3-r3-161). stop() is safe on a partial
+    # workers would be orphaned. stop() is safe on a partial
     # start — it only reaps what _spawn registered.
     try:
         await sup.start()
@@ -704,6 +834,54 @@ async def run_supervised(
         await sup.stop()
 
 
+def _log_http_surface(package: str, names: list[str]) -> None:
+    """Report the deployment's HTTP surface before any worker is spawned.
+
+    A worker mounts exactly one thing — its module package's ``router``
+    attribute — under ``/<module>``. A module whose ``APIRouter`` lives in a
+    submodule (``orders/api.py``) and is never re-exported from
+    ``orders/__init__.py`` therefore serves nothing, while its worker still
+    starts and still reports healthy: every request the proxy forwards to it
+    404s.
+
+    Discovery has already imported every module package into this process, so
+    presence is read from ``sys.modules`` and nothing is imported here. A
+    module missing from it (a custom discovery hook that doesn't import) is
+    left out rather than reported as router-less.
+
+    Severity follows what this process — the only one that sees every module —
+    can actually conclude. A deployment where NO module exposes a ``router``
+    serves no HTTP at all behind the proxy and is unambiguously wrong, so it
+    warns. One router-less module among others is ordinary (a listener-only
+    module is a first-class shape), so it stays at INFO instead of training
+    operators to ignore the warning.
+    """
+    inspected = [
+        (name, sys.modules[f"{package}.{name}"])
+        for name in names
+        if f"{package}.{name}" in sys.modules
+    ]
+    with_router = [name for name, mod in inspected if getattr(mod, "router", None) is not None]
+    without_router = [name for name, mod in inspected if getattr(mod, "router", None) is None]
+    if not without_router:
+        return
+    if with_router:
+        logger.info(
+            "module(s) with no 'router' attribute serve no HTTP routes: %s (serving: %s)",
+            ", ".join(without_router),
+            ", ".join(with_router),
+        )
+        return
+    logger.warning(
+        "no module exposes a 'router' attribute (%s): each worker mounts "
+        "<module>.router under /<module>, so the proxy will answer 404 to "
+        "every request. Re-export each module's APIRouter from its package, "
+        "e.g. 'from .api import router' in %s/<module>/__init__.py.",
+        ", ".join(without_router),
+        package.replace(".", "/"),
+    )
+
+
 def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
     """Read application config, discover modules, build one WorkerSpec each.
 
@@ -711,9 +889,18 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
       - ``package``  — application root package (required)
       - ``workers``  — ``{module_name: count}`` plus optional ``default``
       - ``isolate``  — restrict to this subset of modules (optional)
+      - ``contracts_module`` — the shared-types package (default
+        ``"contracts"``), which discovery lists as a module but which gets no
+        worker of its own: it exposes no router and no listeners, so a process
+        for it would host nothing while shifting every real module's port by
+        one and publishing a dead ``/contracts`` prefix on the proxy.
 
     Ports are assigned from 9001, incrementing by each module's worker_count
     so replicas never collide.
+
+    Also reports the resulting HTTP surface (see ``_log_http_surface``): this
+    is the only process that sees every module, so it is where "nothing in
+    this deployment exposes a router" can be said at all.
     """
     package = config.get("package")
     if not package:
@@ -726,12 +913,15 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
 
     pm = create_plugin_manager()
     module_infos = pm.hook.modulith_discover_modules(app_package=package) or []
-    names = sorted(m.name for m in module_infos)
+    contracts_module = config.get("contracts_module") or "contracts"
+    names = sorted(m.name for m in module_infos if m.name != contracts_module)
 
     isolate = config.get("isolate")
     if isolate:
         wanted = set(isolate)
         names = [n for n in names if n in wanted]
+
+    _log_http_surface(package, names)
 
     workers = config.get("workers") or {}
     default_count = int(workers.get("default", 1))

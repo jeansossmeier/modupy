@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 from pathlib import Path
 from textwrap import dedent
 
@@ -30,6 +31,7 @@ import pytest
 import modulith
 from modulith.proxy import create_proxy_app
 from modulith.supervisor import Supervisor, WorkerSpec, _rules_from_specs
+
 from conftest import _free_port
 
 pytestmark = [pytest.mark.integration]

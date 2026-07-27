@@ -21,7 +21,7 @@ are optional and gated on real need.
 ## Step 1 — Install and audit (Friday afternoon, 2 hours)
 
 ```bash
-uv add 'modulith[cli]'         # or: pip install 'modulith[cli]'
+uv add 'modupy[cli]'         # or: pip install 'modupy[cli]'
 modulith audit                 # writes MIGRATION.md (use --output to change)
 ```
 
@@ -190,7 +190,7 @@ could realistically extract one to a microservice.
 When you have real users in production and event loss matters:
 
 ```bash
-uv add 'modulith[postgres]'
+uv add 'modupy[postgres]'
 ```
 
 ```toml
@@ -359,7 +359,7 @@ existed only in the old payload ring cannot be recovered. Do not run old and new
 workers against the same files during migration.
 
 For cross-host delivery, explicitly configure Redis Streams
-(`modulith[redis]`) or a networked `database` URL.
+(`modupy[redis]`) or a networked `database` URL.
 
 ---
 
@@ -401,7 +401,7 @@ Sync `@listener` functions are also accepted — they run in the event
 loop's executor.
 
 **"Tests are flaky after adding modulith."** Add the pytest plugin:
-`pip install 'modulith[test]'`. The `modulith_app` fixture handles
+`pip install 'modupy[test]'`. The `modulith_app` fixture handles
 state reset between tests, which fixes 90% of test isolation issues.
 
 **"The audit tool's proposed structure looks wrong."** It's a

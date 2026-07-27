@@ -120,7 +120,7 @@ async def test_transactional_event_without_local_listener_still_routes_to_broker
 ) -> None:
     """The durable local-listener outbox must not swallow remote-only events.
 
-    TEST-CHANGES (A2-r4-168): this test used to assert the broker received
+    This test used to assert the broker received
     the payload synchronously inside publish() — i.e. BEFORE the business
     transaction committed, which a rollback could not un-send. The fixed
     contract is commit-gated: publish() persists a broker-route publication
@@ -412,14 +412,15 @@ async def test_resolve_event_target_hook_overrides_routing(make_fake_app) -> Non
 
 
 # ---------------------------------------------------------------------------
-# Broker publish failure — producer-side fake that CAN fail (audit S3-r2-122)
+# Broker publish failure — producer-side fake that CAN fail
 # ---------------------------------------------------------------------------
 
 
 class RaisingBroker:
     """Broker whose publish() always fails — e.g. Redis unreachable. Every
-    other producer-side fake unconditionally succeeds (audit S3-r2-122), so
-    the failure path of cross-process routing had zero coverage."""
+    other producer-side fake in this file unconditionally succeeds, so
+    without this one the failure path of cross-process routing has no
+    coverage."""
 
     def __init__(self, exc: Exception) -> None:
         self._exc = exc
@@ -439,7 +440,7 @@ async def test_broker_publish_failure_propagates_to_publisher(make_fake_app) -> 
     into the caller's own business logic — runtime._maybe_route_to_broker
     wraps ``registry.publish()`` in nothing (runtime.py:451). Whether that is
     the *intended* contract (vs. a modulith-specific BrokerPublishError or
-    graceful degradation) is an OPEN design decision (audit S3-r2-122); this
+    graceful degradation) is an OPEN design decision; this
     test makes the behavior visible so a deliberate change shows up here.
     """
     make_fake_app(

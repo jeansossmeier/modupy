@@ -5,12 +5,12 @@ the global-state nightmares that come with Python's import system and
 asyncio loops.
 
 Distributed in two ways:
-  1. As `modulith[test]` extra in v1 — included with main package.
+  1. As `modupy[test]` extra in v1 — included with main package.
   2. Eventually as `pytest-modulith` standalone in v2 — separate release
      cadence, smaller install for users who only test.
 
 Registered as a pytest plugin via the `pytest11` entry point in
-pyproject.toml. Once `pip install modulith[test]` runs, fixtures are
+pyproject.toml. Once `pip install modupy[test]` runs, fixtures are
 available in any test without imports.
 
 Three primary fixtures:
@@ -312,7 +312,7 @@ class Scenario:
     def _fire_trigger(self, seconds: float, deadline: float) -> None:
         """Fire the publish/call trigger, bounded by the shared budget.
 
-        ONLY the scenario's own budget overrun is swallowed (W3 R4-W3-01):
+        ONLY the scenario's own budget overrun is swallowed:
         the trigger is cancelled and ``within()`` falls through to its poll
         loop, which checks whatever was captured before the overrun and
         raises the documented AssertionError on a miss. A TimeoutError
@@ -368,7 +368,7 @@ class Scenario:
         A budget overrun cancels the trigger so it cannot outlive this test
         on the shared daemon loop and dispatch into a later test's runtime.
         A TimeoutError raised by the coroutine itself is an application
-        failure and propagates (W3 R4-W3-01).
+        failure and propagates.
         """
         from .sync import _get_or_create_loop
 
@@ -486,8 +486,12 @@ def _forwarded_parent_args(config: pytest.Config) -> list[str]:
 
     The child re-runs a single nodeid, so everything else about the parent
     invocation — custom ``pytest_addoption`` flags, ``-m``/``-k`` filters,
-    verbosity, coverage options — must carry over; dropping them silently
-    reverted isolated tests to option defaults. Positional targets are
+    verbosity — must carry over; dropping them silently reverted isolated
+    tests to option defaults. ``--cov*`` options are forwarded verbatim too
+    but neutralized by the trailing ``--no-cov`` the caller appends: they
+    cannot be filtered out here because ``--cov`` takes an optional value
+    (``--cov myapp`` is two tokens), so dropping the flag alone would leave a
+    stray positional in the child. Positional targets are
     identified by membership in ``config.option.file_or_dir`` (an option
     *value* that string-equals a positional target would be dropped too —
     a heuristic, but pytest itself offers no cleaner split).
@@ -567,6 +571,12 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
         "addopts=",
         "-q",
     ]
+    # The child measures one nodeid, so an inherited --cov-fail-under would
+    # always trip and fail the isolated test for reasons unrelated to it.
+    # Only pass --no-cov when pytest-cov actually armed itself for this run:
+    # the option does not exist otherwise and pytest would exit the child 4.
+    if item.config.pluginmanager.hasplugin("_cov"):
+        argv.append("--no-cov")
 
     def _outcome() -> None:
         raw_timeout = item.config.getini("modulith_isolated_timeout")

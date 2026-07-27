@@ -275,7 +275,7 @@ async def test_durable_publish_fires_after_event_published(make_fake_app, monkey
 async def test_durable_publish_hook_receives_receipt_with_real_persisted_ids(
     make_fake_app, monkeypatch
 ) -> None:
-    """receipt-ID (Task 6): the durable path used to fabricate a brand-new
+    """Receipt ID: the durable path used to fabricate a brand-new
     EventPublication (a random uuid4() id, separately-serialized payload)
     for the after-publish hook — matching neither the actual persisted row
     nor the configured storage serializer's bytes. It must instead receive
@@ -385,7 +385,7 @@ async def test_shutdown_closes_registered_brokers(fake_app) -> None:
 
 
 # ---------------------------------------------------------------------------
-# disable_plugins escape hatch (G09 disclosure, W2 RESIDUALS item 5)
+# disable_plugins escape hatch
 # ---------------------------------------------------------------------------
 
 
@@ -402,11 +402,11 @@ def test_observe_shield_registered_by_default(make_fake_app) -> None:
 
 
 def test_configure_disable_plugins_reaches_plugin_manager(make_fake_app) -> None:
-    """G09 disclosure (W2 RESIDUALS item 5): the documented
-    disable=['modulith.observe-shield'] escape hatch (manager.py) was
-    unreachable from app config — bootstrap called create_plugin_manager
-    without forwarding any disable list. configure(disable_plugins=[...])
-    must reach it, following the extra_plugins pattern."""
+    """The documented disable=['modulith.observe-shield'] escape hatch
+    (manager.py) was unreachable from app config — bootstrap called
+    create_plugin_manager without forwarding any disable list.
+    configure(disable_plugins=[...]) must reach it, following the
+    extra_plugins pattern."""
     from modulith.manager import OBSERVE_SHIELD_NAME
 
     make_fake_app({"orders": ""})

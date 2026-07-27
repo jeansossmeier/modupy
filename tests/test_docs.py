@@ -236,12 +236,12 @@ def test_docs_registered_as_builtin() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Introspection resilience to unparseable files (A11-r4-191)
+# Introspection resilience to unparseable files
 # ---------------------------------------------------------------------------
 
 
 def test_introspection_skips_unparseable_file_and_keeps_good_events(make_fake_app) -> None:
-    """A11-r4-191: a file that fails to parse (SyntaxError) is skipped without
+    """A file that fails to parse (SyntaxError) is skipped without
     aborting event introspection of the module's other, valid files."""
     make_fake_app(
         {
@@ -265,7 +265,7 @@ def test_introspection_skips_unparseable_file_and_keeps_good_events(make_fake_ap
 
 
 def test_public_api_returns_empty_for_unparseable_init(make_fake_app) -> None:
-    """A11-r4-191: an unparseable ``__init__.py`` degrades to an empty public
+    """An unparseable ``__init__.py`` degrades to an empty public
     API list instead of raising out of the docs generator."""
     make_fake_app({"badinit": "def broken(:\n    pass\n"})
 
@@ -273,12 +273,12 @@ def test_public_api_returns_empty_for_unparseable_init(make_fake_app) -> None:
 
 
 # ---------------------------------------------------------------------------
-# W2 RESIDUALS — docs.py hardening
+# docs.py hardening: name validation, sanitization, loud skips
 # ---------------------------------------------------------------------------
 
 
 def test_architecture_diagram_escapes_reserved_mermaid_node_ids(make_fake_app) -> None:
-    """A11-r1-41: a module named after a Mermaid reserved word ('end') must not
+    """A module named after a Mermaid reserved word ('end') must not
     be emitted as a bare node id — that produces an unparseable diagram,
     contradicting the 'renders natively on GitHub/GitLab' claim. The sanitized
     id carries the display label with the real name; edges use the same id."""
@@ -301,7 +301,7 @@ def test_architecture_diagram_escapes_reserved_mermaid_node_ids(make_fake_app) -
 
 
 def test_event_flow_escapes_reserved_mermaid_participants(make_fake_app) -> None:
-    """A11-r1-41: sequence-diagram participants named after Mermaid reserved
+    """Sequence-diagram participants named after Mermaid reserved
     words ('end' terminates blocks in sequenceDiagram too) get a sanitized id
     with the real name as the display alias."""
     from modulith import manifest as manifest_module
@@ -323,7 +323,7 @@ def test_event_flow_escapes_reserved_mermaid_participants(make_fake_app) -> None
 
 
 def test_render_documentation_rejects_path_traversal_module_name(tmp_path: Path) -> None:
-    """A11-r4-188: ModuleInfo.name comes from the pluggable discovery hook and
+    """ModuleInfo.name comes from the pluggable discovery hook and
     is used directly as a canvas file name — a traversal name must be rejected
     loudly BEFORE anything is written, never written outside output_dir."""
     out = tmp_path / "docs"
@@ -338,7 +338,7 @@ def test_render_documentation_rejects_path_traversal_module_name(tmp_path: Path)
 
 
 def test_render_documentation_rejects_duplicate_module_names(tmp_path: Path) -> None:
-    """A11-r4-189: two modules sharing a name silently overwrote each other's
+    """Two modules sharing a name silently overwrote each other's
     canvas while 'produced' claimed both were written — duplicates must raise
     a loud error naming the colliding packages instead."""
     out = tmp_path / "docs"
@@ -370,7 +370,7 @@ def test_render_documentation_rejects_casefold_colliding_module_names(tmp_path: 
 def test_introspect_events_skips_unreadable_file_with_warning(
     make_fake_app, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A11-r5-222: a broken symlink (OSError on read) must not crash the whole
+    """A broken symlink (OSError on read) must not crash the whole
     render — the file is skipped with a warning naming file and reason, and
     the module's other, valid files still contribute their events."""
     make_fake_app(
@@ -400,7 +400,7 @@ def test_introspect_events_skips_unreadable_file_with_warning(
 def test_introspect_events_logs_warning_for_unparseable_file(
     make_fake_app, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A11-r4-191 (logging half): the SyntaxError skip at the introspection
+    """The SyntaxError skip at the introspection
     scan must log a warning with the file and reason, not skip silently."""
     make_fake_app(
         {"orders": ""},
@@ -417,7 +417,7 @@ def test_introspect_events_logs_warning_for_unparseable_file(
 def test_public_api_logs_warning_for_unparseable_init(
     make_fake_app, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A11-r4-191 (logging half): the unparseable-__init__ skip in the public
+    """The unparseable-__init__ skip in the public
     API scan must log a warning with the file and reason, not skip silently."""
     make_fake_app({"badinit": "def broken(:\n    pass\n"})
 

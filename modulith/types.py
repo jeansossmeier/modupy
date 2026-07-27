@@ -98,14 +98,14 @@ class EventPublication:
     # retried on every sweep once the record ages past the (capped) backoff.
     last_attempt_at: datetime | None = None
 
-    # Task 4 (outbox-claims): set ONLY by a claim-aware store's claim_batch()
+    # Lease fencing token. Set ONLY by a claim-aware store's claim_batch()
     # when ``claim_strategy="lease"`` — fences the completion/failure write
     # that follows dispatch to this exact claim (see
     # modulith._claims.ClaimingStore). None for every other path: direct
     # after-commit dispatch, force_retry, retry_all_dead_lettered, the
-    # "none"/"advisory_lock" strategies, and any pre-Task-4 store — all of
-    # those use the original unfenced save()/mark_complete()/delete()/
-    # archive() calls unchanged.
+    # "none"/"advisory_lock" strategies, and any store that predates the
+    # claim protocol — all of those use the unfenced
+    # save()/mark_complete()/delete()/archive() calls unchanged.
     claim_token: str | None = None
 
 

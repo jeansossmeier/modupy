@@ -4,7 +4,7 @@ This is the reference adapter. It demonstrates the complete pattern for a
 storage-backed PublicationStore: schema definition, session-aware saves, and
 after-commit dispatch hooking.
 
-Distributed as ``modulith-postgres`` / ``modulith[postgres]`` (asyncpg). It is
+Distributed as ``modupy[postgres]`` (asyncpg). It is
 named for Postgres and tuned for it (the pending-rows partial index), but is
 built on portable SQLAlchemy 2.0 so it also runs on any async dialect
 (aiosqlite in tests). Only the dialect-specific index variant differs.
@@ -17,8 +17,10 @@ Critical correctness pattern:
   2. The after-commit hook runs synchronously inside ``await session.commit()``
      and *schedules* (does not await) async dispatch tasks — commit completes
      before any listener runs.
-  3. On rollback the session never fires after_commit and its ``info`` is
-     discarded, so queued-but-uncommitted publications are never dispatched.
+  3. A rollback never fires after_commit, but ``session.info`` is *not* reset
+     by SQLAlchemy — a reused session would carry the dead ids into its next
+     commit. An after_soft_rollback listener discards the queue explicitly so
+     queued-but-uncommitted publications are never dispatched.
 
 Two deliberate deviations from the literal SPEC §10.1 schema, both forced by
 the ``PublicationStore`` Protocol (the authoritative contract):
@@ -66,12 +68,13 @@ try:
         update,
     )
     from sqlalchemy import event as sa_event
+    from sqlalchemy.dialects.mysql import LONGBLOB as MySQLLongBlob
     from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
     from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 except ImportError as exc:  # pragma: no cover — exercised in a subprocess test
     raise ImportError(
         "modulith.adapters.postgres_outbox requires SQLAlchemy (async). "
-        "Install the extra: pip install 'modulith[postgres]'"
+        "Install the extra: pip install 'modupy[postgres]'"
     ) from exc
 
 from modulith import EventPublication
@@ -91,6 +94,17 @@ class Base(DeclarativeBase):
     """Declarative base for the outbox tables."""
 
 
+# Payload type that can hold a real serialized event on EVERY dialect.
+# LargeBinary compiles to MySQL/MariaDB BLOB, which caps at 65,535 bytes — the
+# outbox imposes no size limit of its own, so a moderately large event is
+# accepted by ``save`` and then dies at flush with MySQL error 1406 ("Data too
+# long for column"), taking the *business* transaction down with it because the
+# publication row is enlisted in that same transaction. LONGBLOB (4 GiB)
+# removes the cliff; Postgres BYTEA and SQLite BLOB are already unbounded so the
+# variant is inert there. The migrations mirror this exactly.
+_PAYLOAD = LargeBinary().with_variant(MySQLLongBlob(), "mysql", "mariadb")
+
+
 class EventPublicationRow(Base):
     """The primary outbox table: one row per (event, listener) publication."""
 
@@ -104,7 +118,7 @@ class EventPublicationRow(Base):
     # keeps the "arbitrarily long dotted path" semantics portable everywhere.
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
     # BYTEA, not JSONB — payload is bytes (binary-serializer support).
-    payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    payload: Mapped[bytes] = mapped_column(_PAYLOAD, nullable=False)
     listener: Mapped[str] = mapped_column(Text, nullable=False)
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -116,8 +130,9 @@ class EventPublicationRow(Base):
     is_dead_lettered: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
-    # Reserved for Task 4's lease-based claim protocol. Keeping these nullable
-    # makes this revision behavior-neutral for the current outbox dispatcher.
+    # Lease columns for the claim protocol (see ``claim_pending``). Nullable
+    # because an unclaimed row carries no lease, and because the dispatcher's
+    # ``in_process`` claim mode never writes them at all.
     claim_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
     claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     claim_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -127,6 +142,11 @@ class EventPublicationRow(Base):
         # of completed rows. The predicate applies on Postgres; on other
         # dialects SQLAlchemy emits a plain index on published_at.
         Index("idx_pending", "published_at", postgresql_where=text("completed_at IS NULL")),
+        # Not the whole picture on Postgres: the sweep's
+        # ``coalesce(last_attempt_at, published_at)`` ordering is served by an
+        # expression index that only migration 0005 creates, because a
+        # functional partial index does not compile on MySQL or MariaDB and so
+        # cannot live in dialect-portable metadata.
     )
 
 
@@ -137,7 +157,7 @@ class EventPublicationArchiveRow(Base):
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
-    payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    payload: Mapped[bytes] = mapped_column(_PAYLOAD, nullable=False)
     listener: Mapped[str] = mapped_column(Text, nullable=False)
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -148,6 +168,13 @@ class EventPublicationArchiveRow(Base):
     )
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        # Nothing deletes from this table except ``purge_completed``, which
+        # selects by completed_at — so this is the only index it needs, and
+        # without it the purge scans an unbounded table.
+        Index("ix_event_publications_archive_completed_at", "completed_at"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +234,26 @@ def _schedule_after_commit_dispatch(session: Session) -> None:
         task = loop.create_task(store._dispatch_after_commit(publication_id))
         store._inflight.add(task)
         task.add_done_callback(store._inflight.discard)
+
+
+def _discard_pending_on_rollback(session: Session, previous_transaction: Any) -> None:
+    """Drop the queued ids when the transaction that produced them rolls back.
+
+    SQLAlchemy does not reset ``Session.info`` on rollback, and a Session is
+    routinely reused for a second transaction. Without this, the next commit's
+    after_commit pops ids whose rows were never committed and schedules a
+    dispatch for each — every one of them logging the "found no row … deleted
+    before delivery?" warning that is supposed to mean something has gone
+    wrong with a *committed* row.
+
+    A SAVEPOINT rollback is left alone: the queue is flat, so it cannot tell
+    which ids belong to the savepoint and which to the enclosing transaction,
+    and dropping the enclosing ones would silently downgrade them from
+    after-commit dispatch to retry-sweep latency.
+    """
+    if previous_transaction is not None and previous_transaction.nested:
+        return
+    session.info.pop("_modulith_pending", None)
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +328,18 @@ class PostgresPublicationStore:
     Usage::
 
         store = PostgresPublicationStore(engine=async_engine)
-        outbox.configure(store=store, serializer=JsonEventSerializer())
+        outbox.configure(
+            store=store,
+            # The outbox serializer round-trips: it deserializes rows the
+            # retry sweep reads back, and ``deserialize`` imports the module
+            # named in the row's event_type. Anything that can write to the
+            # outbox table can therefore choose which module gets imported,
+            # so pass the allowlist of event types this application actually
+            # publishes.
+            serializer=JsonEventSerializer(
+                allowed_event_types=[OrderPlaced, ShipmentDispatched],
+            ),
+        )
         configure(outbox="postgres")
     """
 
@@ -305,7 +363,7 @@ class PostgresPublicationStore:
         # FOR UPDATE SKIP LOCKED is a Postgres row-claim optimization; SQLite
         # (tests) has no row locking and would reject the clause, so gate on it.
         self._supports_skip_locked = engine.dialect.name == "postgresql"
-        # Task 4: advisory_lock claim mode needs pg_try_advisory_lock, which
+        # The advisory_lock claim mode needs pg_try_advisory_lock, which
         # only exists on Postgres. Public (no leading underscore) so
         # outbox.configure() can check it via getattr without reaching into
         # this store's SQLAlchemy engine directly (keeps the storage-agnostic
@@ -326,11 +384,12 @@ class PostgresPublicationStore:
         self._install_session_hooks()
 
     def _install_session_hooks(self) -> None:
-        """Register the global after-commit listener exactly once."""
+        """Register the global session listeners exactly once."""
         global _hook_installed
         if _hook_installed:
             return
         sa_event.listen(Session, "after_commit", _schedule_after_commit_dispatch)
+        sa_event.listen(Session, "after_soft_rollback", _discard_pending_on_rollback)
         _hook_installed = True
 
     async def save(self, publication: EventPublication) -> None:
@@ -398,11 +457,18 @@ class PostgresPublicationStore:
         attempted row to the back of the queue, bounding how long any row —
         old or new — can wait for a slot.
 
-        ``FOR UPDATE SKIP LOCKED`` (Postgres; a no-op on SQLite) lets concurrent
-        sweeps in different workers partition the rows instead of both grabbing
-        the same ones. It narrows — but does not eliminate — cross-process
-        double-dispatch, which is why delivery is at-least-once and listeners
-        must be idempotent (see the outbox plugin's correctness properties).
+        ``FOR UPDATE SKIP LOCKED`` (Postgres; a no-op on SQLite) only keeps two
+        concurrent sweeps from blocking on each other's row locks — it does NOT
+        partition the work between them. The locks live and die with this
+        session's transaction, which ends when the ``async with`` below exits,
+        i.e. BEFORE the caller has dispatched anything: a second sweeper running
+        a moment later finds the very same rows unlocked, returns them too, and
+        both dispatch the same publication. ``claim_batch`` is what actually
+        partitions work — it COMMITs a per-row lease before returning, and only
+        rows whose lease has expired are claimable. This method is the
+        unfenced path (``claim_strategy="none"``), which is why delivery is
+        at-least-once and listeners must be idempotent (see the outbox
+        plugin's correctness properties).
         """
         cutoff = datetime.now(UTC) - older_than
         async with self._sessionmaker() as s:
@@ -503,11 +569,11 @@ class PostgresPublicationStore:
 
         ``find_incomplete`` excludes dead-letters, so this is the dedicated
         source for ``list_dead_lettered`` / ``retry_all_dead_lettered``. A
-        single unbounded call (the pre-Task-4 contract every existing caller
-        relies on) is just the first page: ``after=None, limit=100``.
+        single unpaginated call (the contract every existing caller relies
+        on) is just the first page: ``after=None, limit=100``.
 
-        Task 4 adds keyset pagination so a backlog past the 100-row page
-        doesn't silently hide from those callers: ``after`` is the
+        Keyset pagination keeps a backlog past the 100-row page from
+        silently hiding from those callers: ``after`` is the
         ``(published_at, id)`` of the last row of the previous page, and rows
         are ordered by that same pair so an exact tie on ``published_at``
         still produces a stable, gap-free, duplicate-free cursor (a plain
@@ -552,7 +618,7 @@ class PostgresPublicationStore:
             row = await s.get(EventPublicationRow, publication_id)
             return _row_to_pub(row) if row is not None else None
 
-    # ----- Task 4: claim_strategy="lease" — atomic claim + token fencing ---
+    # ----- claim_strategy="lease" — atomic claim + token fencing ----------
 
     async def claim_batch(
         self, *, owner: str, batch_size: int, lease_seconds: float, older_than: timedelta
@@ -641,9 +707,16 @@ class PostgresPublicationStore:
         """Fenced completion write: applies ``mode`` (update/delete/archive)
         ONLY if ``token`` still matches the row's claim. Returns False without
         touching the row if it doesn't — a stale claimant must never complete
-        a row a newer claimant now owns."""
+        a row a newer claimant now owns.
+
+        The row is read ``FOR UPDATE`` so the token check and the write it
+        gates happen inside one locked window. Unlocked, a peer's
+        ``claim_batch`` could commit a fresh claim in between, and this write —
+        keyed on the primary key alone — would then clobber the new claimant's
+        lease. Holding the lock instead makes that peer skip the row, because
+        ``claim_batch`` selects ``FOR UPDATE SKIP LOCKED``."""
         async with self._sessionmaker() as s:
-            row = await s.get(EventPublicationRow, publication_id)
+            row = await s.get(EventPublicationRow, publication_id, with_for_update=True)
             if row is None or row.claim_token != token:
                 return False
             if mode == "delete":
@@ -673,23 +746,35 @@ class PostgresPublicationStore:
         ``last_error`` ONLY if ``token`` still matches. On success, the claim
         is released (``claim_owner``/``claim_token``/``claim_until`` cleared)
         so the row is immediately reclaimable on the next sweep rather than
-        sitting idle for the remainder of the lease."""
+        sitting idle for the remainder of the lease.
+
+        The token predicate lives in the UPDATE itself (like ``renew_claim``),
+        not in a preceding SELECT: a read-then-write pair leaves a window in
+        which a peer's ``claim_batch`` commits a new claim that the write then
+        clobbers. Rowcount 0 means the row is gone or the peer owns it."""
         dead = publication.attempt_count >= self.dead_letter_after_attempts
         async with self._sessionmaker() as s:
-            row = await s.get(EventPublicationRow, publication.id)
-            if row is None or row.claim_token != token:
-                return False
-            row.attempt_count = publication.attempt_count
-            row.last_error = publication.last_error
-            row.last_attempt_at = _to_utc(publication.last_attempt_at)
-            row.is_dead_lettered = dead
-            row.claim_owner = None
-            row.claim_token = None
-            row.claim_until = None
+            stmt = (
+                update(EventPublicationRow)
+                .where(
+                    EventPublicationRow.id == publication.id,
+                    EventPublicationRow.claim_token == token,
+                )
+                .values(
+                    attempt_count=publication.attempt_count,
+                    last_error=publication.last_error,
+                    last_attempt_at=_to_utc(publication.last_attempt_at),
+                    is_dead_lettered=dead,
+                    claim_owner=None,
+                    claim_token=None,
+                    claim_until=None,
+                )
+            )
+            result = await s.execute(stmt)
             await s.commit()
-            return True
+            return bool(cast(CursorResult[Any], result).rowcount)
 
-    # ----- Task 4: claim_strategy="advisory_lock" — Postgres-only ---------
+    # ----- claim_strategy="advisory_lock" — Postgres-only -----------------
 
     async def try_lock_publication(self, publication_id: UUID) -> object | None:
         """Attempt to acquire a session-level Postgres advisory lock keyed by
@@ -727,15 +812,27 @@ class PostgresPublicationStore:
             await conn.close()
 
     async def purge_completed(self, older_than: timedelta) -> int:
+        """Delete completed publications older than ``older_than`` from BOTH
+        tables; returns the total number of rows removed.
+
+        ``completion_mode="archive"`` MOVES the row into
+        ``event_publications_archive``, so under that mode the primary table
+        holds no completed rows at all: purging only the primary table would
+        report a truthful-looking zero every night while the archive grows
+        without bound.
+        """
         cutoff = datetime.now(UTC) - older_than
+        purged = 0
         async with self._sessionmaker() as s:
-            stmt = delete(EventPublicationRow).where(
-                EventPublicationRow.completed_at.is_not(None),
-                EventPublicationRow.completed_at <= cutoff,
-            )
-            result = await s.execute(stmt)
+            for table in (EventPublicationRow, EventPublicationArchiveRow):
+                stmt = delete(table).where(
+                    table.completed_at.is_not(None),
+                    table.completed_at <= cutoff,
+                )
+                result = await s.execute(stmt)
+                purged += int(cast(CursorResult[Any], result).rowcount or 0)
             await s.commit()
-            return int(cast(CursorResult[Any], result).rowcount or 0)
+        return purged
 
     # ----- Dispatch + lifecycle -------------------------------------------
 
@@ -797,6 +894,7 @@ class PostgresPublicationStore:
             _active_store = _store_stack[-1] if _store_stack else None
             if _active_store is None and _hook_installed:
                 sa_event.remove(Session, "after_commit", _schedule_after_commit_dispatch)
+                sa_event.remove(Session, "after_soft_rollback", _discard_pending_on_rollback)
                 _hook_installed = False
 
 
@@ -862,6 +960,7 @@ def _reset_for_testing() -> None:
     _active_store = None
     if _hook_installed:
         sa_event.remove(Session, "after_commit", _schedule_after_commit_dispatch)
+        sa_event.remove(Session, "after_soft_rollback", _discard_pending_on_rollback)
         _hook_installed = False
 
 

@@ -1,7 +1,6 @@
 """Behavioral regression tests for the Runtime singleton.
 
-Each test cites the audit finding id it reproduces. Written failing-first
-against the pre-fix code (strict TDD; verified red on the base revision).
+Each test's docstring states the contract it pins.
 
 NOTE: no `from __future__ import annotations` — some tests use @listener with
 locally-defined event classes, whose annotations must stay real objects.
@@ -18,7 +17,15 @@ from uuid import UUID
 
 import pytest
 
-from modulith import ConfigurationError, EventPublication, configure, event, hookimpl, listener
+from modulith import (
+    ConfigurationError,
+    EventPublication,
+    configure,
+    event,
+    externalized,
+    hookimpl,
+    listener,
+)
 from modulith.brokers import BrokerRegistry
 from modulith.event_bus import InMemoryEventBus
 from modulith.runtime import Runtime, _runtime
@@ -76,7 +83,7 @@ class StubStore:
 
 
 # ---------------------------------------------------------------------------
-# A2-r5-203 — ensure_bootstrapped() must be genuinely retryable
+# ensure_bootstrapped() must be genuinely retryable
 # ---------------------------------------------------------------------------
 
 
@@ -98,7 +105,7 @@ _LISTENER_MODULE = """
 
 
 async def test_failed_bootstrap_retry_keeps_already_imported_listeners(make_fake_app) -> None:
-    """A2-r5-203: a bootstrap that fails AFTER discovery has imported modules
+    """A bootstrap that fails AFTER discovery has imported modules
     must not strand those modules' listeners — a retry (once the transient
     failure clears) must deliver events to them. The old in-place bootstrap
     flushed-and-cleared the pending queue into a bus it then discarded, so
@@ -138,7 +145,7 @@ async def test_failed_bootstrap_retry_keeps_already_imported_listeners(make_fake
 
 
 def test_register_brokers_hook_sees_resolved_config_during_bootstrap() -> None:
-    """A2-r5-203 (regression found in remediation): making bootstrap atomic
+    """Making bootstrap atomic
     must NOT hide the resolved configuration from the broker-registration
     hook — adapter hookimpls (the shipped redis-streams broker,
     adapters/redis_broker.py) read it lazily via ``_runtime.config`` to
@@ -167,7 +174,7 @@ def test_register_brokers_hook_sees_resolved_config_during_bootstrap() -> None:
 
 
 def test_failed_bootstrap_rolls_back_early_config_install() -> None:
-    """A2-r5-203 companion: the early config install that the broker hook
+    """The early config install that the broker hook
     needs (test above) must be rolled back when a later step fails, so a
     failed bootstrap still leaves the runtime pristine for a clean retry."""
 
@@ -187,14 +194,14 @@ def test_failed_bootstrap_rolls_back_early_config_install() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A2-r1-5 / S1-r1-44 — reentrant runtime use during bootstrap must not deadlock
+# Reentrant runtime use during bootstrap must not deadlock
 # ---------------------------------------------------------------------------
 
 
 def test_configure_and_rebootstrap_during_bootstrap_raise_instead_of_deadlocking(
     make_fake_app,
 ) -> None:
-    """A2-r1-5 / S1-r1-44: configure() or ensure_bootstrapped() reached from
+    """configure() or ensure_bootstrapped() reached from
     plugin/module code running inside bootstrap (same thread, lock held) used
     to deadlock the process forever on the non-reentrant lock. It must now
     raise a clear ConfigurationError and let bootstrap proceed."""
@@ -230,7 +237,7 @@ def test_configure_and_rebootstrap_during_bootstrap_raise_instead_of_deadlocking
 
 
 # ---------------------------------------------------------------------------
-# A2-r2-74 / S1-r2-101 / A2-r5-204 — register_listener vs bootstrap races
+# register_listener vs bootstrap races
 # ---------------------------------------------------------------------------
 
 
@@ -240,11 +247,11 @@ class RtEvent:
 
 
 def test_register_listener_cannot_land_in_consumed_pending_list() -> None:
-    """A2-r2-74 / S1-r2-101: a register_listener() racing bootstrap's
+    """A register_listener() racing bootstrap's
     pending-listener flush must never append to the already-flushed list
     (which silently lost the listener forever). With the fix the registration
     blocks on the runtime lock until 'bootstrap' completes, then registers
-    directly on the live bus. (A2-r5-204's crash — bootstrap iterating the
+    directly on the live bus. (A second crash mode — bootstrap iterating the
     handler dict while a concurrent registration mutates it — is excluded by
     the same lock.)"""
     rt = Runtime()
@@ -288,7 +295,7 @@ def test_register_listener_cannot_land_in_consumed_pending_list() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A2-r3-128 / A2-r4-169 — unregistered broker schemes must fail loudly + uniformly
+# Unregistered broker schemes must fail loudly + uniformly
 # ---------------------------------------------------------------------------
 
 
@@ -307,7 +314,7 @@ _PUBLISHER_MODULE = """
 
 
 async def test_unregistered_default_scheme_raises_config_error(make_fake_app, caplog) -> None:
-    """A2-r3-128: a typo'd/uninstalled default broker scheme in a cross-process
+    """A typo'd/uninstalled default broker scheme in a cross-process
     topology must not silently drop every cross-process event forever — the
     publish raises ConfigurationError and bootstrap warns about the mismatch."""
     make_fake_app({"orders": _PUBLISHER_MODULE})
@@ -342,7 +349,7 @@ _EXPLICIT_TARGET_MODULE = """
 
 
 async def test_unregistered_explicit_target_scheme_raises_config_error(make_fake_app) -> None:
-    """A2-r4-169: an @externalized(target=...) scheme with no registered broker
+    """An @externalized(target=...) scheme with no registered broker
     must fail with the SAME loud ConfigurationError as the default-scheme case
     — not an undocumented UnknownBrokerError leaking out of publish()."""
     make_fake_app({"orders": _EXPLICIT_TARGET_MODULE})
@@ -359,12 +366,12 @@ async def test_unregistered_explicit_target_scheme_raises_config_error(make_fake
 
 
 # ---------------------------------------------------------------------------
-# A1-r1-2 — hook-facing publications must carry the real payload bytes
+# Hook-facing publications must carry the real payload bytes
 # ---------------------------------------------------------------------------
 
 
 async def test_in_memory_dispatch_hook_publications_carry_real_payload() -> None:
-    """A1-r1-2: the EventPublications handed to the lifecycle hooks on the
+    """The EventPublications handed to the lifecycle hooks on the
     in-memory dispatch path carried a hardcoded b'' payload, defeating the
     documented dead-letter/audit use cases. They must carry the event's
     serialized bytes."""
@@ -415,12 +422,12 @@ async def test_in_memory_dispatch_hook_publications_carry_real_payload() -> None
 
 
 # ---------------------------------------------------------------------------
-# S1-r1-46 — shutdown() must drain the store's in-flight dispatch tasks
+# shutdown() must drain the store's in-flight dispatch tasks
 # ---------------------------------------------------------------------------
 
 
 async def test_shutdown_waits_for_inflight_store_dispatch() -> None:
-    """S1-r1-46: Runtime.shutdown() must drain the active publication store's
+    """Runtime.shutdown() must drain the active publication store's
     in-flight after-commit dispatch tasks (duck-typed wait_for_dispatch())
     instead of abandoning mid-flight listener execution."""
     from modulith.builtin import outbox
@@ -444,12 +451,12 @@ async def test_shutdown_waits_for_inflight_store_dispatch() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A2-r2-75 — _reset_for_testing() must not leak brokers or outbox state
+# _reset_for_testing() must not leak brokers or outbox state
 # ---------------------------------------------------------------------------
 
 
 def test_reset_for_testing_closes_registered_brokers() -> None:
-    """A2-r2-75 (broker half): the reset every test fixture calls must close
+    """Broker half: the reset every test fixture calls must close
     registered brokers — the exact leak shutdown() exists to prevent."""
     rt = Runtime()
     registry = BrokerRegistry()
@@ -464,7 +471,7 @@ def test_reset_for_testing_closes_registered_brokers() -> None:
 
 
 async def test_reset_for_testing_clears_outbox_state_and_cancels_retry_task() -> None:
-    """A2-r2-75 (outbox half): the reset must clear modulith.builtin.outbox's
+    """Outbox half: the reset must clear modulith.builtin.outbox's
     module state and cancel its retry task, so one test's durable-path
     configuration can't bleed into the next 'fresh' runtime."""
     from modulith.builtin import outbox
@@ -484,7 +491,7 @@ async def test_reset_for_testing_clears_outbox_state_and_cancels_retry_task() ->
 
 
 # ---------------------------------------------------------------------------
-# Task 6 (runtime-sync) — a failed bootstrap must close provisional brokers
+# A failed bootstrap must close provisional brokers
 # ---------------------------------------------------------------------------
 
 
@@ -521,7 +528,7 @@ def test_failed_bootstrap_closes_provisional_brokers(make_fake_app) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Task 6 (runtime-sync) — shutdown() processes local/broker failures
+# shutdown() processes local/broker failures
 # independently, raising an ExceptionGroup only when BOTH fail
 # ---------------------------------------------------------------------------
 
@@ -577,3 +584,214 @@ async def test_shutdown_raises_exception_group_when_local_and_broker_both_fail()
 
     causes = {type(exc) for exc in excinfo.value.exceptions}
     assert causes == {ConnectionError, RuntimeError}
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap's pending-listener queue vs. the hooks that fire after the flush
+# ---------------------------------------------------------------------------
+
+
+async def test_listener_registered_from_after_module_load_hook_survives(make_fake_app) -> None:
+    """A plugin registering a listener from modulith_after_module_load — the
+    documented "react to module load completion" hook — runs on the bootstrap
+    thread AFTER the pending-listener flush. Its registration therefore lands
+    in the pending list the commit point clears one statement later, and the
+    listener was destroyed with no error, no warning and no log line. The
+    commit point must drain that tail before clearing it."""
+
+    @dataclass(frozen=True)
+    class LateEvent:
+        n: int
+
+    received: list[int] = []
+
+    async def late_handler(evt: LateEvent) -> None:
+        received.append(evt.n)
+
+    class LateRegistrar:
+        @hookimpl
+        def modulith_after_module_load(self, module: Any) -> None:
+            _runtime.register_listener(LateEvent, late_handler)
+
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp")
+    _runtime._extra_plugins.append(LateRegistrar())
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.event_bus is not None
+    # Exactly one registration — the tail drain must not re-flush the whole
+    # queue, since the bus appends without dedupe.
+    assert _runtime.event_bus.listeners_for(LateEvent) == [late_handler]
+
+    from modulith import publish
+
+    await publish(LateEvent(n=3))
+    assert received == [3]
+
+
+# ---------------------------------------------------------------------------
+# Fan-out publish: a failing broker route must not swallow listener diagnostics
+# ---------------------------------------------------------------------------
+
+
+async def test_broker_route_failure_does_not_swallow_listener_failure(caplog) -> None:
+    """The fan-out broker route is awaited between the listener gather and the
+    per-listener error logging, and it re-raises. A broker outage therefore
+    dropped the listener results on the floor — never logged, never raised —
+    so the operator had no record that local processing failed too. The
+    diagnostics must land before the route can propagate."""
+
+    class FailingBroker(FakeBroker):
+        async def publish(self, target, payload, headers=None):
+            raise ConnectionError("redis unreachable")
+
+    @event
+    @externalized
+    @dataclass(frozen=True)
+    class FanOut:
+        n: int
+
+    configure(package="routefail", auto_discover=False, topology="processes", broker="testbroker")
+    _runtime.ensure_bootstrapped()
+    registry = _runtime.broker_registry
+    assert registry is not None
+    registry.register("testbroker", FailingBroker())
+
+    @listener
+    async def on_fanout(evt: FanOut) -> None:
+        raise ValueError("bad order total")
+
+    from modulith import publish
+
+    with caplog.at_level(logging.ERROR, logger="modulith"):
+        # The fail-loud broker contract still wins the propagation.
+        with pytest.raises(ConnectionError, match="redis unreachable"):
+            await publish(FanOut(n=1))
+
+    assert any("bad order total" in record.message for record in caplog.records), (
+        "the listener failure vanished when the broker route raised"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The publish span must be closed on every escape from dispatch
+# ---------------------------------------------------------------------------
+
+
+async def test_cancelled_in_memory_publish_fires_the_publish_error_hook() -> None:
+    """Cancellation while the listeners run escapes BETWEEN the paired publish
+    hooks: modulith_after_event_published never fires, so without a matching
+    modulith_on_publish_error the observability publish span opened in the
+    before hook leaks — never ended, therefore never exported, and its child
+    dispatch spans point at a parent the backend never receives."""
+
+    class _PublishHooks:
+        def __init__(self) -> None:
+            self.errors: list[BaseException] = []
+            self.after = 0
+
+        @hookimpl
+        def modulith_on_publish_error(self, event: Any, exception: BaseException) -> None:
+            self.errors.append(exception)
+
+        @hookimpl
+        def modulith_after_event_published(self, event: Any, publication: Any) -> None:
+            self.after += 1
+
+    @event
+    @dataclass(frozen=True)
+    class Slow:
+        n: int
+
+    hooks = _PublishHooks()
+    configure(package="canceltest", auto_discover=False)
+    _runtime._extra_plugins.append(hooks)
+
+    started = asyncio.Event()
+
+    @listener
+    async def on_slow(evt: Slow) -> None:
+        started.set()
+        await asyncio.sleep(30)
+
+    from modulith import publish
+
+    task = asyncio.create_task(publish(Slow(n=1)))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert hooks.after == 0, "the after hook fired for a publish that never completed"
+    assert [type(exc) for exc in hooks.errors] == [asyncio.CancelledError]
+
+
+# ---------------------------------------------------------------------------
+# The in-memory payload is produced only for hooks that can actually read it
+# ---------------------------------------------------------------------------
+
+
+async def test_in_memory_publish_skips_payload_nobody_can_read(monkeypatch) -> None:
+    """The hook-facing payload exists for third-party dead-letter/audit
+    hookimpls; not one of modulith's own reads it. A full recursive dataclass
+    walk dominated the cost of every in-memory publish, so with only built-in
+    plugins registered the bytes must not be produced at all. (Its converse —
+    real bytes as soon as an outside hookimpl is registered — is pinned by
+    test_in_memory_dispatch_hook_publications_carry_real_payload above.)"""
+    serialized: list[Any] = []
+    real_serialize = JsonEventSerializer.serialize
+
+    def _counting(self, evt):
+        serialized.append(evt)
+        return real_serialize(self, evt)
+
+    monkeypatch.setattr(JsonEventSerializer, "serialize", _counting)
+
+    @event
+    @dataclass(frozen=True)
+    class Quiet:
+        x: int
+
+    configure(package="payloadskip", auto_discover=False)
+
+    seen: list[Any] = []
+
+    @listener
+    async def on_quiet(evt: Quiet) -> None:
+        seen.append(evt)
+
+    from modulith import publish
+
+    await publish(Quiet(x=1))
+
+    assert len(seen) == 1
+    assert serialized == [], "serialized a payload no registered hookimpl can read"
+
+
+# ---------------------------------------------------------------------------
+# strict_boundaries — the dev warn-only escape hatch stops at production
+# ---------------------------------------------------------------------------
+
+
+def test_dev_warn_only_cannot_disarm_strict_boundaries_in_production(
+    make_fake_app, monkeypatch
+) -> None:
+    """MODULITH_DEV_WARN_ONLY is an internal signal single-process `modulith
+    dev` sets for itself, undocumented and with no other legitimate producer.
+    `modulith dev` never runs in production, so a value inherited from a
+    container image, a CI job or a copied shell profile must not turn the
+    strict_boundaries gate into a log line there."""
+    monkeypatch.setenv("MODULITH_DEV_WARN_ONLY", "1")
+    make_fake_app(
+        {
+            "orders": "from fakeapp.inventory import _internal",
+            "inventory": "",
+        },
+        extra_files={"inventory/_internal/__init__.py": "# private submodule\n"},
+    )
+    # outbox="memory" is the explicit production opt-in; without it config
+    # validation raises first and never reaches the boundary gate.
+    configure(package="fakeapp", strict_boundaries=True, production=True, outbox="memory")
+
+    with pytest.raises(ConfigurationError, match="boundary violations detected"):
+        _runtime.ensure_bootstrapped()

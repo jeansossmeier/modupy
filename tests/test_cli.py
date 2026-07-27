@@ -20,6 +20,8 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -33,6 +35,24 @@ from modulith.cli import _parse_duration, app
 from modulith.serializers import JsonEventSerializer
 
 runner = CliRunner()
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(autouse=True)
+def _restore_root_log_level():
+    """Undo the root-logger level ``dev``/``run`` install.
+
+    Owning the root logger is deliberate in those two commands (they are
+    process entry points), but in-process ``CliRunner`` invocations would
+    otherwise leak that level into every later test.
+    """
+    root = logging.getLogger()
+    level = root.level
+    try:
+        yield
+    finally:
+        root.setLevel(level)
 
 
 # ---------------------------------------------------------------------------
@@ -89,8 +109,8 @@ def _reset_outbox_state():
     ``make_fake_app`` resets the runtime singleton, but not the outbox
     plugin's module globals — and tests that do NOT use ``make_fake_app``
     (e.g. the ``dev`` tests, whose startup verify pass bootstraps the
-    runtime since S2-r4-195) would otherwise leak a bootstrapped singleton
-    into later tests, breaking their ``configure()`` calls.
+    runtime) would otherwise leak a bootstrapped singleton into later
+    tests, breaking their ``configure()`` calls.
 
     The outbox CLI commands call ``asyncio.run()``, which leaves the thread
     with no current event loop. In production each command is its own
@@ -173,6 +193,122 @@ def test_run_invokes_uvicorn_without_reload(monkeypatch):
     assert result.exit_code == 0, result.output
     assert captured["file"] == "uvicorn"
     assert "--reload" not in captured["args"]
+
+
+# ---------------------------------------------------------------------------
+# --log-level
+# ---------------------------------------------------------------------------
+
+
+def test_run_configures_the_root_logger_and_tells_uvicorn(monkeypatch):
+    """README's two remedies both say "enable INFO logging" — this is the
+    mechanism that makes them possible. Without it the root logger has no
+    handler, ``logging.lastResort`` drops everything under WARNING, and every
+    INFO diagnostic modulith emits is unreachable from any CLI flag."""
+    argv: list[str] = []
+    monkeypatch.setattr(os, "execvp", lambda file, args: argv.extend(args))
+    logging.getLogger().setLevel(logging.CRITICAL)
+
+    result = runner.invoke(app, ["run", "myapp:app", "--log-level", "debug"])
+
+    assert result.exit_code == 0, result.output
+    assert logging.getLogger().level == logging.DEBUG
+    assert argv[argv.index("--log-level") + 1] == "debug"
+
+
+def test_dev_accepts_a_log_level_in_any_case(monkeypatch):
+    argv: list[str] = []
+    monkeypatch.setattr(os, "execvp", lambda file, args: argv.extend(args))
+
+    result = runner.invoke(app, ["dev", "myapp:app", "--log-level", "WARNING"])
+
+    assert result.exit_code == 0, result.output
+    assert logging.getLogger().level == logging.WARNING
+    assert argv[argv.index("--log-level") + 1] == "warning"
+
+
+def test_unknown_log_level_exits_one_instead_of_defaulting(monkeypatch):
+    """Silently keeping the previous level on a typo is the exact failure the
+    flag exists to end, so an unrecognized name is a user error."""
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    result = runner.invoke(app, ["run", "myapp:app", "--log-level", "verbose"])
+
+    assert result.exit_code == 1
+    assert "verbose" in result.stderr
+    assert "critical" in result.stderr
+
+
+def test_processes_topology_forwards_the_log_level_to_workers(make_fake_app, monkeypatch):
+    """A worker is its own process with its own logging config, so the flag has
+    to cross the process boundary or it only quiets the supervisor."""
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(
+        app, ["run", "fakeapp:app", "--topology", "processes", "--log-level", "warning"]
+    )
+
+    assert result.exit_code == 0, result.output
+    specs = captured["specs"]
+    assert [s.env["UVICORN_LOG_LEVEL"] for s in specs] == ["warning"]
+
+
+def test_processes_topology_forwards_the_project_root_to_workers(
+    make_fake_app, tmp_path, monkeypatch
+):
+    """A worker is `python -m uvicorn`, so its sys.path starts at the inherited
+    working directory. Run from a subdirectory of the project, the parent still
+    finds the application package (it walks up to pyproject.toml) while every
+    worker dies importing it — a restart loop behind a proxy that stays up."""
+    make_fake_app({"orders": ""})
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "fakeapp"\n')
+    monkeypatch.chdir(tmp_path / "fakeapp" / "orders")
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["run", "fakeapp:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    specs = captured["specs"]
+    assert [s.env["PYTHONPATH"] for s in specs] == [str(tmp_path)]
+
+
+# ---------------------------------------------------------------------------
+# python -m modulith
+# ---------------------------------------------------------------------------
+
+
+def test_cli_is_reachable_as_a_module():
+    """``python -m modulith`` must work, not just the console script: it is the
+    only entry point available when the script directory is off PATH — an
+    unactivated virtualenv, a shadowed name, a sandbox that permits only an
+    interpreter invoked by path."""
+    completed = subprocess.run(
+        [sys.executable, "-m", "modulith", "--help"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "run" in completed.stdout
 
 
 def test_dev_processes_topology_runs_supervisor(make_fake_app, monkeypatch):
@@ -432,9 +568,9 @@ def test_verify_dirty_exits_one_and_reports_violation(make_fake_app, monkeypatch
 
 
 def test_verify_unimportable_package_exits_one(make_fake_app, monkeypatch):
-    """W3 R3-F1: an application package whose own __init__ raises must fail
-    `modulith verify` (exit 1 with the cause) — not report '✓ no boundary
-    violations' and exit 0, going CI-green on an unimportable app."""
+    """An application package whose own __init__ raises must fail `modulith
+    verify` (exit 1 with the cause) — not report '✓ no boundary violations'
+    and exit 0, going CI-green on an unimportable app."""
     monkeypatch.setenv("MODULITH_PACKAGE", "brokenrootapp")
     make_fake_app(
         {},
@@ -450,7 +586,7 @@ def test_verify_unimportable_package_exits_one(make_fake_app, monkeypatch):
 
 
 def test_verify_missing_package_exits_one(monkeypatch):
-    """W3 R3-F1: a package that doesn't exist at all must also fail verify."""
+    """A package that doesn't exist at all must also fail verify."""
     monkeypatch.setenv("MODULITH_PACKAGE", "w3_ghost_pkg_does_not_exist")
 
     result = runner.invoke(app, ["verify"])
@@ -662,10 +798,10 @@ class CappedScanStore(StubStore):
 
 
 def test_outbox_retry_uses_direct_lookup_outside_capped_scan_window(make_fake_app, monkeypatch):
-    """A9-r3-143 follow-through: `outbox retry` must use the store's
-    ``find_by_id`` direct point lookup — mirroring ``force_retry`` — rather
-    than only the capped ``find_incomplete``/``list_dead_lettered`` scan,
-    which can miss a targeted row further back in a large backlog."""
+    """`outbox retry` must use the store's ``find_by_id`` direct point
+    lookup — mirroring ``force_retry`` — rather than only the capped
+    ``find_incomplete``/``list_dead_lettered`` scan, which can miss a
+    targeted row further back in a large backlog."""
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app(
         {
@@ -818,7 +954,7 @@ def test_parse_duration_overflow_message_is_clean() -> None:
 
 
 # ---------------------------------------------------------------------------
-# regression: --version, stderr streams, dead-letter flag exclusivity (audit)
+# regression: --version, stderr streams, dead-letter flag exclusivity
 # ---------------------------------------------------------------------------
 
 
@@ -868,8 +1004,8 @@ def test_dead_letter_list_and_retry_all_are_mutually_exclusive(make_fake_app, mo
 
 
 def test_dev_rejects_unknown_topology(monkeypatch) -> None:
-    """A9-r1-30: a typo'd --topology must error loudly (echoing the actual
-    value), not silently launch the process-per-module supervisor."""
+    """A typo'd --topology must error loudly (echoing the actual value),
+    not silently launch the process-per-module supervisor."""
     monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
 
     result = runner.invoke(app, ["dev", "myapp:app", "--topology", "sngle"])
@@ -880,7 +1016,7 @@ def test_dev_rejects_unknown_topology(monkeypatch) -> None:
 
 
 def test_run_rejects_unknown_topology(monkeypatch) -> None:
-    """A9-r1-30: `run` validates --topology the same way `dev` does."""
+    """`run` validates --topology the same way `dev` does."""
     monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
 
     result = runner.invoke(app, ["run", "myapp:app", "--topology", "processess"])
@@ -890,8 +1026,8 @@ def test_run_rejects_unknown_topology(monkeypatch) -> None:
 
 
 def test_verify_rejects_unknown_mode(make_fake_app, monkeypatch) -> None:
-    """A9-r3-142: `verify --mode ratchset` must error loudly instead of
-    silently taking the strict branch and ignoring the baseline."""
+    """`verify --mode ratchset` must error loudly instead of silently
+    taking the strict branch and ignoring the baseline."""
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app({"orders": ""})
 
@@ -901,9 +1037,24 @@ def test_verify_rejects_unknown_mode(make_fake_app, monkeypatch) -> None:
     assert "ratchset" in result.stderr
 
 
+def test_run_help_names_the_table_workers_replaces() -> None:
+    """`run --help` must name the pyproject table ``--workers`` overrides.
+
+    typer renders help through rich, which treats square-bracketed text as a
+    style tag and deletes it: unescaped, both the option help and the command
+    description read "replaces the pyproject  table entirely" — dropping the
+    one fact a user needs before overwriting their worker counts.
+    """
+    result = runner.invoke(app, ["run", "--help"], env={"COLUMNS": "200"})
+
+    assert result.exit_code == 0, result.output
+    # Once in the --workers option help, once in the command description.
+    assert result.output.count("[tool.modulith.workers]") == 2
+
+
 def test_run_workers_json_non_object_is_clean_error(make_fake_app, monkeypatch) -> None:
-    """A9-r1-31: a syntactically-valid but non-object --workers JSON value
-    must be a clean CLI error, not an AttributeError traceback."""
+    """A syntactically-valid but non-object --workers JSON value must be a
+    clean CLI error, not an AttributeError traceback."""
     make_fake_app({"orders": ""})
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     monkeypatch.setenv("MODULITH_BROKER", "testbroker")
@@ -918,9 +1069,46 @@ def test_run_workers_json_non_object_is_clean_error(make_fake_app, monkeypatch) 
     assert not isinstance(result.exception, AttributeError)
 
 
+@pytest.mark.parametrize("count", ["0", "-3", '"many"', '"2"', "true"])
+def test_run_workers_json_bad_count_is_clean_error(count, make_fake_app, monkeypatch) -> None:
+    """A bad worker count reached derive_specs_from_config and surfaced as a
+    ValueError traceback with exit 2 — while the identical value written to
+    [tool.modulith.workers] is a clean exit 1. Same input, same contract:
+    positive int, never a bool or a numeric string."""
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    result = runner.invoke(
+        app,
+        ["run", "myapp:app", "--topology", "processes", "--workers", f'{{"orders": {count}}}'],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "positive integer counts" in result.stderr
+
+
+def test_run_process_topology_config_error_exits_one(make_fake_app, monkeypatch) -> None:
+    """A ConfigurationError raised inside run_supervised used to escape to
+    main()'s catch-all: a raw traceback and exit 2, which CI reads as a
+    modulith crash rather than the user's own bad configuration."""
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setenv("MODULITH_PROXY_MAX_BODY_BYTES", "10MB")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    result = runner.invoke(app, ["run", "myapp:app", "--topology", "processes"])
+
+    assert result.exit_code == 1, result.output
+    assert "MODULITH_PROXY_MAX_BODY_BYTES" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
 def test_outbox_retry_unknown_id_errors(make_fake_app, monkeypatch) -> None:
-    """A9-r3-143: retrying a nonexistent publication must exit 1 with a
-    'not found' message, not print unconditional success."""
+    """Retrying a nonexistent publication must exit 1 with a 'not found'
+    message, not print unconditional success."""
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app({"orders": ""})
     outbox.configure(store=StubStore(), serializer=JsonEventSerializer(), start_loop=False)
@@ -933,8 +1121,8 @@ def test_outbox_retry_unknown_id_errors(make_fake_app, monkeypatch) -> None:
 
 
 def test_dev_empty_app_module_is_clean_error(monkeypatch) -> None:
-    """A9-r3-144: an empty app_module must be a clean CLI error, not an
-    unhandled `ValueError: Empty module name` traceback."""
+    """An empty app_module must be a clean CLI error, not an unhandled
+    `ValueError: Empty module name` traceback."""
     monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
 
     result = runner.invoke(app, ["dev", "", "--topology", "processes"])
@@ -947,8 +1135,8 @@ def test_dev_empty_app_module_is_clean_error(monkeypatch) -> None:
 def test_dead_letter_flag_conflict_reported_before_store_precondition(
     make_fake_app, monkeypatch
 ) -> None:
-    """A9-r3-145: the --list/--retry-all conflict is an argument error and
-    must be reported even when no outbox store is configured."""
+    """The --list/--retry-all conflict is an argument error and must be
+    reported even when no outbox store is configured."""
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app({"orders": ""})
     # Deliberately no outbox.configure(): the store precondition would fail.
@@ -960,12 +1148,49 @@ def test_dead_letter_flag_conflict_reported_before_store_precondition(
     assert "no outbox store" not in result.stderr
 
 
+def test_outbox_store_error_does_not_prescribe_already_set_config(
+    make_fake_app, monkeypatch
+) -> None:
+    """The missing-store error must not send a configured user in a circle.
+
+    A durable adapter is already named, so "set [tool.modulith].outbox =
+    'postgres'" is a dead end: the value selects an adapter, it never binds a
+    store. The message has to name the real cause — nothing called
+    ``outbox.configure()`` in *this* process — and the real remedy.
+    """
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_OUTBOX", "postgres")
+    make_fake_app({"orders": ""})
+    # Deliberately no outbox.configure(): this is the state the message describes.
+
+    result = runner.invoke(app, ["outbox", "status"])
+
+    assert result.exit_code == 1
+    assert "outbox = 'postgres'" not in result.stderr
+    assert "no store is bound in this process" in result.stderr
+    assert "outbox.configure(" in result.stderr
+
+
+def test_outbox_store_error_on_memory_outbox_names_the_config_key(
+    make_fake_app, monkeypatch
+) -> None:
+    """With the default memory outbox, pointing at the config key IS the fix."""
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+
+    result = runner.invoke(app, ["outbox", "status"])
+
+    assert result.exit_code == 1
+    assert "[tool.modulith].outbox" in result.stderr
+    assert "'memory' outbox persists nothing" in result.stderr
+
+
 def test_processes_topology_warns_on_app_module_package_mismatch(
     make_fake_app, monkeypatch
 ) -> None:
-    """A9-r4-182: when configuration already names a package, a conflicting
-    app_module argument must produce a loud warning naming both packages,
-    not silently launch the configured package's workers."""
+    """When configuration already names a package, a conflicting app_module
+    argument must produce a loud warning naming both packages, not silently
+    launch the configured package's workers."""
     make_fake_app({"orders": ""})
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     monkeypatch.setenv("MODULITH_BROKER", "testbroker")
@@ -986,8 +1211,8 @@ def test_processes_topology_warns_on_app_module_package_mismatch(
 def test_verify_uses_pyproject_project_name_not_cli_frame(
     make_fake_app, monkeypatch, tmp_path
 ) -> None:
-    """A9-r2-94: with no explicit package config, CLI bootstrap must resolve
-    the package from pyproject [project].name — the caller-stack heuristic
+    """With no explicit package config, CLI bootstrap must resolve the
+    package from pyproject [project].name — the caller-stack heuristic
     'detects' the CLI framework itself ('typer'), so `verify` exited 0
     without ever scanning the real app."""
     monkeypatch.delenv("MODULITH_PACKAGE", raising=False)
@@ -1005,8 +1230,8 @@ def test_verify_uses_pyproject_project_name_not_cli_frame(
 
 
 def test_info_without_any_package_config_errors_cleanly(make_fake_app, monkeypatch) -> None:
-    """A9-r2-94: no package config anywhere → clean actionable error, never
-    a silent bootstrap against the CLI framework's own package."""
+    """No package config anywhere → clean actionable error, never a silent
+    bootstrap against the CLI framework's own package."""
     monkeypatch.delenv("MODULITH_PACKAGE", raising=False)
     make_fake_app({})  # importable dir exists, but nothing names the package
 
@@ -1018,8 +1243,8 @@ def test_info_without_any_package_config_errors_cleanly(make_fake_app, monkeypat
 
 
 def test_dev_echoes_boundary_warnings_at_startup(make_fake_app, monkeypatch) -> None:
-    """S2-r4-195: `modulith dev` runs the verifier at startup and echoes
-    violations as non-fatal warnings — the dev server still starts."""
+    """`modulith dev` runs the verifier at startup and echoes violations
+    as non-fatal warnings — the dev server still starts."""
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app(
         {"orders": "from fakeapp.inventory._internal import secret\n", "inventory": ""},
@@ -1039,8 +1264,9 @@ def test_dev_echoes_boundary_warnings_at_startup(make_fake_app, monkeypatch) -> 
 def test_dev_single_process_strict_boundaries_warns_not_raises(
     make_fake_app, monkeypatch, caplog
 ) -> None:
-    """README:288-290 — single-process `modulith dev`'s interactive
-    development contract is inviolable: a boundary violation under
+    """Per README's "CLI" section (the `modulith dev` warn-only note),
+    single-process `modulith dev`'s interactive development
+    contract is inviolable: a boundary violation under
     strict_boundaries=True must warn and let the dev server start, never
     crash bootstrap. Before the fix, ensure_bootstrapped() raised
     ConfigurationError here (caught only by the broad except in
@@ -1070,10 +1296,9 @@ def test_dev_single_process_strict_boundaries_warns_not_raises(
     )
 
 
-def test_dev_processes_topology_strict_boundaries_still_raises(
-    make_fake_app, monkeypatch
-) -> None:
-    """README:288-290 (scope check) — the warn-only downgrade is exclusive to
+def test_dev_processes_topology_strict_boundaries_still_raises(make_fake_app, monkeypatch) -> None:
+    """Scope check on the same README "CLI" section note: the warn-only
+    downgrade is exclusive to
     single-process dev. `modulith dev --topology=processes` must still fail
     fast on a boundary violation under strict_boundaries=True."""
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
@@ -1093,8 +1318,8 @@ def test_dev_processes_topology_strict_boundaries_still_raises(
 def test_verify_warning_only_violations_pass_unless_fail_on_warnings(
     make_fake_app, monkeypatch
 ) -> None:
-    """A9-r5-215: WARNING-severity violations are reported but exit 0 by
-    default; --fail-on-warnings opts in to exit 1."""
+    """WARNING-severity violations are reported but exit 0 by default;
+    --fail-on-warnings opts in to exit 1."""
     from modulith import manifest as manifest_module
 
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
@@ -1146,14 +1371,14 @@ def test_main_unexpected_internal_error_exits_2(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# uvicorn console script missing from PATH (S3-r2-124)
+# uvicorn console script missing from PATH
 # ---------------------------------------------------------------------------
 
 
 def test_run_missing_uvicorn_binary_is_a_clean_user_error(monkeypatch, capsys) -> None:
-    """S3-r2-124: when the uvicorn console script is not on PATH, the CLI
-    should print an actionable error naming uvicorn and exit 1 (user/
-    environment error) — never a raw traceback with the internal-error code."""
+    """When the uvicorn console script is not on PATH, the CLI should print
+    an actionable error naming uvicorn and exit 1 (user/environment error)
+    — never a raw traceback with the internal-error code."""
     import sys as _sys
 
     import modulith.cli as cli
@@ -1175,9 +1400,9 @@ def test_run_missing_uvicorn_binary_is_a_clean_user_error(monkeypatch, capsys) -
 
 
 def test_dev_missing_uvicorn_binary_is_a_clean_user_error(monkeypatch, capsys) -> None:
-    """S3-r2-124 (W2 RESIDUALS item 4): the `dev` single-process path execs
-    uvicorn too — a missing binary must be the same clean exit-1 user error
-    as `run`, never a raw FileNotFoundError traceback with exit code 2."""
+    """The `dev` single-process path execs uvicorn too — a missing binary
+    must be the same clean exit-1 user error as `run`, never a raw
+    FileNotFoundError traceback with exit code 2."""
     import sys as _sys
 
     import modulith.cli as cli
@@ -1198,17 +1423,16 @@ def test_dev_missing_uvicorn_binary_is_a_clean_user_error(monkeypatch, capsys) -
 
 
 # ---------------------------------------------------------------------------
-# corrupt ratchet baseline is a user error (G11 disclosure, W2 RESIDUALS)
+# corrupt ratchet baseline is a user error
 # ---------------------------------------------------------------------------
 
 
 def test_verify_ratchet_corrupt_baseline_is_clean_user_error(
     make_fake_app, monkeypatch, capsys, tmp_path
 ) -> None:
-    """G11 disclosure (W2 RESIDUALS item 3): `verify --mode=ratchet` on a
-    corrupt baseline must surface load_baseline's actionable
-    ConfigurationError and exit 1 (user error) — never the raw traceback +
-    exit 2 reserved for internal bugs."""
+    """`verify --mode=ratchet` on a corrupt baseline must surface
+    load_baseline's actionable ConfigurationError and exit 1 (user error)
+    — never the raw traceback + exit 2 reserved for internal bugs."""
     import sys as _sys
 
     import modulith.cli as cli
@@ -1235,10 +1459,9 @@ def test_verify_ratchet_corrupt_baseline_is_clean_user_error(
 def test_verify_update_baseline_unwritable_path_is_clean_user_error(
     make_fake_app, monkeypatch, capsys, tmp_path
 ) -> None:
-    """W3 R3-F4: `verify --update-baseline` with a --baseline path in a
-    nonexistent directory must exit 1 with a clean actionable message —
-    never the raw FileNotFoundError traceback + exit 2 reserved for
-    internal bugs."""
+    """`verify --update-baseline` with a --baseline path in a nonexistent
+    directory must exit 1 with a clean actionable message — never the raw
+    FileNotFoundError traceback + exit 2 reserved for internal bugs."""
     import sys as _sys
 
     import modulith.cli as cli
@@ -1272,10 +1495,9 @@ def test_verify_update_baseline_unwritable_path_is_clean_user_error(
 def test_docs_command_config_error_from_render_hook_is_clean_user_error(
     make_fake_app, monkeypatch, capsys, tmp_path
 ) -> None:
-    """W2 RESIDUALS follow-through (A11-r4-188/189): the docs generator now
-    raises ConfigurationError for duplicate/unsafe module names — the `docs`
-    command must map it to the documented exit 1 (user error), never the
-    exit-2 traceback reserved for internal bugs."""
+    """The docs generator raises ConfigurationError for duplicate/unsafe
+    module names — the `docs` command must map it to the documented exit 1
+    (user error), never the exit-2 traceback reserved for internal bugs."""
     import sys as _sys
 
     import modulith.cli as cli
@@ -1353,4 +1575,56 @@ def test_audit_unwritable_output_path_is_clean_user_error(
     captured = capsys.readouterr()
     assert excinfo.value.code == 1  # user/filesystem error, not internal (2)
     assert "Traceback" not in captured.err
-    assert "Traceback" not in captured.err
+
+
+# ---------------------------------------------------------------------------
+# the entry point makes the discovered project root importable
+# ---------------------------------------------------------------------------
+
+
+def test_entry_point_imports_app_package_at_project_root(tmp_path) -> None:
+    """An app package at the project root must import from the console script.
+
+    A console script's ``sys.path[0]`` is the directory holding the script
+    (``.venv/bin``), never the working directory — so the application package
+    sitting next to ``pyproject.toml``, which is what every quickstart layout
+    produces, is invisible to ``import`` unless the CLI puts that root on the
+    path itself. Reproduced with a launcher outside the project and no
+    PYTHONPATH: ``modulith info`` must still discover and import ``shop``.
+    """
+    import subprocess
+    import sys as _sys
+
+    project = tmp_path / "project"
+    (project / "shop" / "orders").mkdir(parents=True)
+    (project / "pyproject.toml").write_text(
+        '[project]\nname = "shop"\nversion = "0.1.0"\n\n[tool.modulith]\npackage = "shop"\n',
+        encoding="utf-8",
+    )
+    (project / "shop" / "__init__.py").write_text("", encoding="utf-8")
+    (project / "shop" / "orders" / "__init__.py").write_text("", encoding="utf-8")
+
+    # Stands in for the installed console script: a launcher that lives
+    # outside the project, so sys.path[0] is its own directory and the
+    # project root is reachable only if the CLI adds it.
+    launcher_dir = tmp_path / "bin"
+    launcher_dir.mkdir()
+    launcher = launcher_dir / "modulith_launcher.py"
+    launcher.write_text(
+        "import sys\nfrom modulith.cli import main\nsys.exit(main())\n", encoding="utf-8"
+    )
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MODULITH_")}
+    env.pop("PYTHONPATH", None)
+
+    proc = subprocess.run(
+        [_sys.executable, str(launcher), "info"],
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "package: shop" in proc.stdout
+    assert "orders" in proc.stdout

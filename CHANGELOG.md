@@ -16,10 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 #### Core Framework
 - **Module system** — Auto-discovery of subpackages as modules with configurable naming
 - **Event-driven boundaries** — `@event`, `@listener`, `publish()` API with async/sync support
-- **Boundary verifier** — Five default rules for cross-module dependency compliance
-  - No cross-module imports (structural)
-  - No public imports (API leakage)
-  - No circular module dependencies (graph cycles)
+- **Boundary verifier** — Six default rules for cross-module dependency compliance
+  - `no-internal-imports` — no reaching into another module's private packages or `_`-prefixed names
+  - `use-contracts` — shared types come from the contracts module; no wildcard cross-module imports
+  - `undeclared-dependency` — every cross-module import must appear in the manifest's `declared_dependencies`
+  - `data-ownership` — exactly one module owns a table; others reach it through events or its public API
+  - `contracts-is-sink` — the contracts module may not import application modules
+  - `no-cyclic-dependency` — the module dependency graph stays acyclic
   - Manual baseline ratcheting for gradual remediation
 - **Module manifests** — `declare_module()` with startup verification of contract satisfaction
 - **Plugin system** — Pluggy-based hooks for custom brokers, verifiers, serializers, and lifecycle
@@ -27,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 #### Durability & Outbox
 - **Transactional outbox pattern** — Atomic publish-with-transaction for at-least-once delivery
 - **Postgres adapter** — SQLAlchemy + async driver for production outbox store
-- **SQLite adapter** — Embedded database for zero-infrastructure deployments
+- **SQLite outbox** — The same adapter pointed at a `sqlite+aiosqlite://` URL, for zero-infrastructure deployments; there is no separate SQLite module
 - **Crash recovery** — Automatic replay of uncommitted events on restart
 - **Retry loop** — Exponential backoff with configurable max attempts and dead-letter store
 - **Idempotency guards** — Per-event deduplication via hash
@@ -71,7 +74,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `modulith_module` — Module-isolated runtime with manifests cleared
   - `scenario` — Fluent event-driven test API with `publish().expect_event().within()`
 - **Subprocess isolation** — `@pytest.mark.modulith_isolated` for testing topology in CI
-- **Helper assertions** — `event_published()`, `listener_called()`
+- **Captured state** — `ModulithTestApp.published_events`, `.listener_calls`, and `.published_events_of_type()` for assertions
 
 #### Observability
 - **OpenTelemetry integration** — Spans for publish, listen, and outbox dispatch
@@ -82,13 +85,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Architecture guide** — Internal design, plugin contracts, broker comparison
 - **Migration guide** — Strategies for adopting modulith in existing FastAPI applications
 - **API reference** — Auto-generated from docstrings for all public APIs
-- **Cookbook** — 11+ recipes covering common patterns
+- **Cookbook** — 11 recipes covering common patterns
 - **Deployment guide** — Scaling from monolith to process-per-module, Docker, Kubernetes, operational playbooks
 - **Examples** — Runnable demo app (`examples/demo_app/shop`) demonstrating all modes
 
 ### Fixed
 
 - Verifier false positives from aliased imports (now correctly traces through `__all__` and re-exports)
+- `modulith outbox purge` left `event_publications_archive` untouched — under `completion_mode="archive"` the primary table holds no completed rows, so the purge reported a truthful-looking zero every night while the archive grew without bound. It now deletes from both tables and returns the combined row count
 - Outbox claim-lease handling under concurrent claims
 - Broker consumer group rebalancing on member timeout
 - Health check propagation in multi-worker topology
@@ -110,6 +114,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Performance
 
+- Outbox scan indexes (migration `0005_outbox_scan_indexes`) — a partial expression index on the sweep's claim ordering, so a sweep no longer reads and sorts every pending row on each pass (Postgres only: it needs both functional and partial index support), plus a `completed_at` index on the archive table for the purge scan on every dialect
 - Batch event dispatch for database and Redis brokers (configurable batch size)
 - Connection pooling for database brokers
 - Claim-lease-based lock-free fan-out (Postgres broker)
@@ -119,11 +124,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## v0.9.0 Statistics
 
-- **Lines of code (core):** ~4,500 (modulith/)
-- **Test suite:** 1,383 tests, 0 failures
+Measured at the 0.9.0 tag; these drift with every release and are not a
+contract.
+
+- **Lines of code (core):** ~20,600 across 54 modules in `modulith/`
+- **Test suite:** 1,439 tests in the default (non-integration) suite, 0 failures
+- **Test code:** ~37,300 lines in `tests/`
 - **Type safety:** 100% typed, mypy `--strict` passing
-- **Documentation:** 400+ pages (guides, API, cookbook, examples)
-- **Time to first event:** <50ms (in-memory), <100ms (database), <200ms (Redis)
+- **Documentation:** ~5,400 lines of Markdown (README, SPEC, guides, cookbook)
 
 ---
 
@@ -153,28 +161,28 @@ See [ROADMAP.md](ROADMAP.md) for detailed phase breakdowns and kill criteria.
 - See [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)
 
 **For new applications:**
-- Start with `modulith[fastapi,cli]` and in-memory broker
-- Add durability via `modulith[postgres]` when needed
-- Scale to processes via `MODULITH_BROKER=database --topology processes`
+- Start with `modupy[fastapi,cli]` and in-memory broker
+- Add durability via `modupy[postgres]` when needed
+- Scale to processes with the `database` broker and `--topology processes`
 
 ---
 
 ## Installation
 
 ```bash
-pip install modulith
+pip install modupy
 
 # With FastAPI and CLI:
-pip install 'modulith[fastapi,cli]'
+pip install 'modupy[fastapi,cli]'
 
 # With Postgres outbox:
-pip install 'modulith[postgres]'
+pip install 'modupy[postgres]'
 
 # With database broker:
-pip install 'modulith[database]'
+pip install 'modupy[database]'
 
 # Full stack (all adapters):
-pip install 'modulith[all]'
+pip install 'modupy[all]'
 ```
 
 **Requires:** Python 3.11+

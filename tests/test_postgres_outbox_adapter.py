@@ -1,6 +1,6 @@
-"""Regression tests for Postgres outbox-adapter audit findings.
+"""Regression tests for the Postgres outbox adapter.
 
-Each test cites the audit finding id it reproduces in its docstring. The
+Each test's docstring states the contract it pins. The
 adapter is portable SQLAlchemy 2.0, so these run against aiosqlite (no Docker)
 — a tmp-file DB with per-session connections (see the ``engine`` fixture for
 why NOT StaticPool + :memory:). Async/timing behavior is synchronized with
@@ -58,7 +58,7 @@ async def engine(tmp_path: Path) -> Any:
     the retry loop) one session's close (ROLLBACK) clobbered another session's
     in-flight INSERT->COMMIT, a topology impossible on per-connection Postgres.
     See test_concurrent_reader_close_does_not_roll_back_inflight_save for the
-    deterministic repro of the S1-r3-155 retry-loop flake this caused.
+    deterministic repro of the retry-loop flake this caused.
     A tmp-file DB also survives connection invalidation (a StaticPool reconnect
     produced a brand-new empty :memory: database mid-test)."""
     eng = create_async_engine(
@@ -104,12 +104,12 @@ def _pub(value: int, handler: Any = record, **overrides: Any) -> EventPublicatio
 
 
 # ---------------------------------------------------------------------------
-# A6-r2-86 — pending publications must never be dropped silently
+# Pending publications must never be dropped silently
 # ---------------------------------------------------------------------------
 
 
 async def test_after_commit_with_pending_but_no_store_warns_loudly(engine: Any, caplog) -> None:
-    """A6-r2-86: publications queued on session.info while no store is active
+    """Publications queued on session.info while no store is active
     were silently discarded by the after-commit hook (bare early return, zero
     log output) — unlike the no-running-loop branch, which warns. The committed
     row is durable and recoverable by a later store's retry sweep, but the
@@ -143,12 +143,12 @@ async def test_after_commit_with_pending_but_no_store_warns_loudly(engine: Any, 
 
 
 # ---------------------------------------------------------------------------
-# S1-r3-155 — retry-loop-driven failures must advance attempt_count in the DB
+# Retry-loop-driven failures must advance attempt_count in the DB
 # ---------------------------------------------------------------------------
 
 
 async def test_retry_loop_driven_failures_advance_attempt_count_in_db(engine: Any) -> None:
-    """S1-r3-155: the retry task copies the creating call site's contextvars;
+    """The retry task copies the creating call site's contextvars;
     when it is (re)created while a request session is bound, save() inside a
     retry-driven _record_failure read that frozen, closed session and enlisted
     the bookkeeping row there — never committed, so attempt_count stayed stuck
@@ -203,13 +203,13 @@ async def test_retry_loop_driven_failures_advance_attempt_count_in_db(engine: An
 
 
 # ---------------------------------------------------------------------------
-# S1-r3-155 flake — concurrent session close must not clobber an in-flight save
+# Concurrent session close must not clobber an in-flight save
 # ---------------------------------------------------------------------------
 
 
 async def test_concurrent_reader_close_does_not_roll_back_inflight_save(engine: Any) -> None:
     """Regression for the ~7%-under-load flake in
-    test_retry_loop_driven_failures_advance_attempt_count_in_db (S1-r3-155):
+    test_retry_loop_driven_failures_advance_attempt_count_in_db:
     the old engine fixture (StaticPool + ``sqlite+aiosqlite://``) handed EVERY
     session the same single DBAPI connection, and SQLite has exactly one
     transaction per connection. When the retry loop's crash-sweep read session
@@ -263,12 +263,12 @@ async def test_concurrent_reader_close_does_not_roll_back_inflight_save(engine: 
 
 
 # ---------------------------------------------------------------------------
-# A6-r1-20 — a retrying backlog must not starve newer publications forever
+# A retrying backlog must not starve newer publications forever
 # ---------------------------------------------------------------------------
 
 
 async def test_find_incomplete_rotates_past_retrying_backlog(engine: Any) -> None:
-    """A6-r1-20: find_incomplete's LIMIT 100 + raw published_at ordering let a
+    """find_incomplete's LIMIT 100 + raw published_at ordering let a
     backlog of >100 legitimately-retrying rows occupy the window on every
     sweep forever (retries never change published_at), so newer publications
     were never surfaced. Ordering by the last attempt instead (falling back to
@@ -313,12 +313,12 @@ async def test_find_incomplete_rotates_past_retrying_backlog(engine: Any) -> Non
 
 
 # ---------------------------------------------------------------------------
-# S1-r5-223 — out-of-order dispose must not resurrect a disposed store
+# Out-of-order dispose must not resurrect a disposed store
 # ---------------------------------------------------------------------------
 
 
 async def test_out_of_order_dispose_does_not_resurrect_disposed_store(engine: Any) -> None:
-    """S1-r5-223: dispose() restored ``_active_store`` from a single
+    """dispose() restored ``_active_store`` from a single
     ``_prev_store`` back-pointer, which only unwinds correctly in strict LIFO
     order. Disposing first-then-second (creation order) resurrected the
     already-disposed first store — possibly with a closed engine — as the live
@@ -338,12 +338,12 @@ async def test_out_of_order_dispose_does_not_resurrect_disposed_store(engine: An
 
 
 # ---------------------------------------------------------------------------
-# A6-r3-137 — save() must accept a bound plain (sync) SQLAlchemy Session
+# save() must accept a bound plain (sync) SQLAlchemy Session
 # ---------------------------------------------------------------------------
 
 
 def test_save_with_bound_sync_session_persists_and_defers_to_sweep(tmp_path) -> None:
-    """A6-r3-137: save() unconditionally accessed ``session.sync_session.info``
+    """save() unconditionally accessed ``session.sync_session.info``
     — an AsyncSession-only attribute — so binding the plain (sync) Session the
     degraded no-running-loop path is documented for crashed with a confusing
     AttributeError. The real save() must enlist the row and queue the pending
@@ -377,12 +377,12 @@ def test_save_with_bound_sync_session_persists_and_defers_to_sweep(tmp_path) -> 
 
 
 # ---------------------------------------------------------------------------
-# S1-r3-156 — _reset_for_testing must not leak in-flight dispatch tasks
+# _reset_for_testing must not leak in-flight dispatch tasks
 # ---------------------------------------------------------------------------
 
 
 async def test_reset_for_testing_cancels_inflight_dispatch_tasks(engine: Any) -> None:
-    """S1-r3-156: postgres_outbox._reset_for_testing() cleared the module
+    """postgres_outbox._reset_for_testing() cleared the module
     globals but left in-flight after-commit dispatch tasks running on the
     orphaned store. Once the sibling outbox._reset_for_testing() nulled the
     plugin's _store, the orphaned task resumed against torn-down module state
@@ -425,16 +425,16 @@ async def test_reset_for_testing_cancels_inflight_dispatch_tasks(engine: Any) ->
 
 
 # ---------------------------------------------------------------------------
-# A6-r4-177 — non-UTC-aware timestamps must round-trip as the same instant
+# Non-UTC-aware timestamps must round-trip as the same instant
 # ---------------------------------------------------------------------------
 
 
 async def test_non_utc_aware_timestamps_round_trip_as_same_instant(engine: Any) -> None:
-    """A6-r4-177: on the SQLite dialect the driver stores the wall-clock digits
+    """On the SQLite dialect the driver stores the wall-clock digits
     and drops the offset; _aware() then reattached UTC on read, silently
     shifting any non-UTC-aware published_at/last_attempt_at/completed_at by its
     offset (10:00+05:00 came back as 10:00+00:00 — a 5-hour corruption).
-    Normalizing to UTC on WRITE (adjudicated fix) makes the read-side
+    Normalizing to UTC on WRITE makes the read-side
     assumption hold on every dialect."""
     store = PostgresPublicationStore(engine=engine)
     plus5 = timezone(timedelta(hours=5))
@@ -468,15 +468,15 @@ async def test_non_utc_aware_timestamps_round_trip_as_same_instant(engine: Any) 
 
 
 # ---------------------------------------------------------------------------
-# S4-r5-230 — missing SQLAlchemy must fail with an actionable ImportError
+# Missing SQLAlchemy must fail with an actionable ImportError
 # ---------------------------------------------------------------------------
 
 
 def test_missing_sqlalchemy_raises_helpful_import_error() -> None:
-    """S4-r5-230: postgres_outbox imports sqlalchemy at module level with no
+    """postgres_outbox imports sqlalchemy at module level with no
     guard (unlike redis_broker's lazy import / cli.py's try-except), so a base
     install importing it got a bare 'No module named sqlalchemy'. The import
-    must fail with an ImportError that names the ``modulith[postgres]`` extra.
+    must fail with an ImportError that names the ``modupy[postgres]`` extra.
     Run in a subprocess with sqlalchemy blocked, since this venv has it."""
     import subprocess
     import sys
@@ -498,7 +498,7 @@ def test_missing_sqlalchemy_raises_helpful_import_error() -> None:
         try:
             import modulith.adapters.postgres_outbox
         except ImportError as exc:
-            assert "modulith[postgres]" in str(exc), f"unhelpful message: {exc}"
+            assert "modupy[postgres]" in str(exc), f"unhelpful message: {exc}"
             sys.exit(0)
         sys.exit(1)  # imported despite sqlalchemy being unavailable?!
         """

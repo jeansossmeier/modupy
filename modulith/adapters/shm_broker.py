@@ -214,6 +214,20 @@ class ShmBroker:
             capacity,
             create=create,
         )
+        if not self._ring.available:
+            # An existing hint file is never re-created, and attaching requires
+            # its header to match `capacity` exactly, so changing shm_capacity
+            # leaves the notifier permanently dead for this process. Delivery
+            # is unaffected (SQLite stays authoritative) but every consumer
+            # falls back to its safety poll, which is invisible without this.
+            logger.warning(
+                "shm hint file %s could not be attached at capacity=%d — "
+                "publishes will not notify and consumers fall back to the "
+                "safety poll. Stop every worker and delete the file to have it "
+                "re-created at the configured capacity.",
+                notifier_path,
+                capacity,
+            )
         # Re-validate post-attach: raises ConfigurationError if the hint file
         # was swapped for a symlink or an insecure file between the earlier
         # check and ShmRing's own open/create above, so construction fails

@@ -69,7 +69,7 @@ def test_missing_pyproject_falls_through_to_defaults(tmp_path: Path) -> None:
 
 
 def test_malformed_pyproject_raises_configuration_error(tmp_path: Path) -> None:
-    """A4-r4-172 / design decision 1: TOML parse errors are LOUD.
+    """TOML parse errors are LOUD.
 
     A malformed pyproject.toml must raise ConfigurationError instead of
     silently discarding the whole [tool.modulith] table (which would
@@ -209,6 +209,45 @@ def test_default_broker_warning_fires_only_on_defaulted_path(caplog) -> None:
     with caplog.at_level(logging.WARNING, logger="modulith.config"):
         load_configuration(topology="processes", broker="database")
     assert caplog.records == []
+
+
+def test_default_broker_warning_is_announced_once_per_boot(caplog) -> None:
+    """One boot resolving the configuration repeatedly announces the default once.
+
+    ``modulith run --topology=processes`` resolves the same configuration three
+    times before the first worker starts (the CLI places the topology, then
+    finds the application package, then ``Runtime.ensure_bootstrapped()``
+    resolves it again), and each resolution reaches the same defaulting branch.
+    Three identical warnings read as three separate problems.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="modulith.config"):
+        for _ in range(3):
+            assert load_configuration(topology="processes").broker == "shm"
+
+    announced = [r for r in caplog.records if ".modulith-shm-broker.db" in r.getMessage()]
+    assert len(announced) == 1, [r.getMessage() for r in announced]
+
+
+def test_a_different_broker_default_is_still_announced(caplog) -> None:
+    """Suppression is per decision, so a reload landing elsewhere still warns.
+
+    The URL-inferred 'database' adapter and the SHM fallback are different
+    answers to the same question; announcing one must not silence the other.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="modulith.config"):
+        load_configuration(topology="processes")
+        load_configuration(
+            topology="processes",
+            broker_options={"url": "postgresql+asyncpg://db/prod"},
+        )
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(".modulith-shm-broker.db" in m for m in messages), messages
+    assert any("inferring the 'database' adapter" in m for m in messages), messages
 
 
 def test_subinterpreters_without_broker_raises_not_implemented() -> None:
@@ -592,9 +631,8 @@ def test_production_env_var_is_strict_bool_not_string(monkeypatch) -> None:
 def test_production_env_var_falsy_value_is_strict_false(monkeypatch) -> None:
     """MODULITH_PRODUCTION=false produces False (bool).
 
-    (Docstring updated per the A4-r2-80 adjudication: unrecognized values
-    now raise ConfigurationError instead of coercing to False — see
-    test_garbage_boolean_env_var_raises.)
+    Unrecognized values raise ConfigurationError instead of coercing to
+    False — see test_garbage_boolean_env_var_raises.
     """
     monkeypatch.setenv("MODULITH_PRODUCTION", "false")
     cfg = load_configuration()
@@ -683,12 +721,11 @@ def test_pyproject_with_only_empty_subtables_uses_defaults(tmp_path: Path) -> No
     assert cfg.workers == {}
 
 
-# ----- W2 audit fixes: loud TOML errors, subtable contract (A4-r4-172, -------
-# ----- A4-r2-79, A4-r5-208, design decision 1) --------------------------------
+# ----- loud TOML errors, subtable contract ------------------------------------
 
 
 def test_scalar_and_subtable_outbox_collision_is_loud(tmp_path: Path) -> None:
-    """A4-r4-172: the documented scalar+subtable dup-key collision is LOUD.
+    """The documented scalar+subtable dup-key collision is LOUD.
 
     TOML forbids `outbox = "postgres"` plus `[tool.modulith.outbox]` in one
     file (duplicate key). tomllib raises TOMLDecodeError; that must surface
@@ -708,8 +745,8 @@ def test_scalar_and_subtable_outbox_collision_is_loud(tmp_path: Path) -> None:
 
 
 def test_broker_and_broker_options_subtables_together_raise(tmp_path: Path) -> None:
-    """A4-r2-79: both broker-options spellings in one file must not silently
-    overwrite each other — whichever came last used to win with zero warning."""
+    """Both broker-options spellings in one file must not silently overwrite
+    each other — whichever came last used to win with zero warning."""
     (tmp_path / "pyproject.toml").write_text(
         '[tool.modulith.broker]\nurl = "redis://a:6379"\n'
         '[tool.modulith.broker_options]\nconsumer_group = "grp"\n'
@@ -719,16 +756,16 @@ def test_broker_and_broker_options_subtables_together_raise(tmp_path: Path) -> N
 
 
 def test_misspelled_subtable_raises_did_you_mean(tmp_path: Path) -> None:
-    """A4-r5-208: a typo of a real subtable ([tool.modulith.worker] for
-    workers) must raise loudly, not be silently dropped as forward-compat."""
+    """A typo of a real subtable ([tool.modulith.worker] for workers) must
+    raise loudly, not be silently dropped as forward-compat."""
     (tmp_path / "pyproject.toml").write_text("[tool.modulith.worker]\ndefault = 1\n")
     with pytest.raises(ConfigurationError, match="workers"):
         load_configuration()
 
 
 def test_scalar_field_written_as_subtable_raises(tmp_path: Path) -> None:
-    """A4-r5-208 (companion): a scalar option written as a table is user
-    error, not forward-compat space — reject it loudly."""
+    """A scalar option written as a table is user error, not forward-compat
+    space — reject it loudly."""
     (tmp_path / "pyproject.toml").write_text('[tool.modulith.package]\nname = "myapp"\n')
     with pytest.raises(ConfigurationError, match="package"):
         load_configuration()
@@ -743,12 +780,12 @@ def test_verify_subtable_stays_reserved_noop(tmp_path: Path) -> None:
     assert cfg.outbox == "postgres"
 
 
-# ----- W2 audit fixes: dict-typed field validation (A4-r4-173) ----------------
+# ----- dict-typed field validation --------------------------------------------
 
 
 def test_scalar_outbox_options_in_pyproject_raises(tmp_path: Path) -> None:
-    """A4-r4-173: outbox_options = "string" (forgot the table header) must be
-    rejected at load time, not crash later with AttributeError on .get()."""
+    """outbox_options = "string" (forgot the table header) must be rejected
+    at load time, not crash later with AttributeError on .get()."""
     (tmp_path / "pyproject.toml").write_text(
         '[tool.modulith]\noutbox_options = "this-should-be-a-table-not-a-string"\n'
     )
@@ -757,13 +794,13 @@ def test_scalar_outbox_options_in_pyproject_raises(tmp_path: Path) -> None:
 
 
 def test_scalar_workers_kwarg_raises() -> None:
-    """A4-r4-173: the dict-typed check also guards explicit kwargs."""
+    """The dict-typed check also guards explicit kwargs."""
     with pytest.raises(ConfigurationError, match="table"):
         load_configuration(workers=3)
 
 
 def test_scalar_broker_options_kwarg_raises() -> None:
-    """A4-r4-173: broker_options gets the same dict type check."""
+    """broker_options gets the same dict type check."""
     with pytest.raises(ConfigurationError, match="table"):
         load_configuration(broker_options="redis://x")
 
@@ -832,13 +869,13 @@ def test_database_broker_options_accept_documented_valid_values() -> None:
     assert cfg.broker_options["completion_mode"] == "mark"
 
 
-# ----- W2 audit fixes: env var handling (A4-r4-174, A4-r2-80 adjudicated) -----
+# ----- env var handling -------------------------------------------------------
 
 
 def test_empty_string_env_vars_are_documented_as_unset(monkeypatch) -> None:
-    """A4-r4-174: MODULITH_X="" (e.g. from a CI template with a missing
-    source variable) is treated as unset by documented contract — the field
-    keeps its default and is NOT marked explicit."""
+    """MODULITH_X="" (e.g. from a CI template with a missing source
+    variable) is treated as unset by documented contract — the field keeps
+    its default and is NOT marked explicit."""
     monkeypatch.setenv("MODULITH_PACKAGE", "")
     monkeypatch.setenv("MODULITH_TOPOLOGY", "")
     monkeypatch.setenv("MODULITH_OUTBOX", "")
@@ -852,7 +889,7 @@ def test_empty_string_env_vars_are_documented_as_unset(monkeypatch) -> None:
 
 
 def test_empty_production_env_var_is_unset_not_false(monkeypatch) -> None:
-    """A4-r2-80 (adjudicated): MODULITH_PRODUCTION="" = unset (documented)."""
+    """MODULITH_PRODUCTION="" = unset (documented)."""
     monkeypatch.setenv("MODULITH_PRODUCTION", "")
     cfg = load_configuration()
     assert cfg.production is False
@@ -860,23 +897,23 @@ def test_empty_production_env_var_is_unset_not_false(monkeypatch) -> None:
 
 
 def test_garbage_boolean_env_var_raises(monkeypatch) -> None:
-    """A4-r2-80 (adjudicated): a non-empty unrecognized boolean value must
-    raise ConfigurationError, not silently coerce to False — a typo like
-    'ture' would otherwise flip the production safety check off."""
+    """A non-empty unrecognized boolean value must raise ConfigurationError,
+    not silently coerce to False — a typo like 'ture' would otherwise flip
+    the production safety check off."""
     monkeypatch.setenv("MODULITH_PRODUCTION", "ture")
     with pytest.raises(ConfigurationError, match="MODULITH_PRODUCTION"):
         load_configuration()
 
 
 def test_garbage_auto_discover_env_var_raises(monkeypatch) -> None:
-    """A4-r4-174: strict boolean parsing applies to every boolean env var."""
+    """Strict boolean parsing applies to every boolean env var."""
     monkeypatch.setenv("MODULITH_AUTO_DISCOVER", "banana")
     with pytest.raises(ConfigurationError, match="MODULITH_AUTO_DISCOVER"):
         load_configuration()
 
 
 def test_boolean_env_var_accepts_explicit_false_words(monkeypatch) -> None:
-    """A4-r2-80 (adjudicated): 0/false/no parse to explicit False."""
+    """0/false/no parse to explicit False."""
     for value in ("0", "no", "FALSE", " false "):
         monkeypatch.setenv("MODULITH_PRODUCTION", value)
         cfg = load_configuration()
@@ -884,18 +921,18 @@ def test_boolean_env_var_accepts_explicit_false_words(monkeypatch) -> None:
         assert cfg.is_explicit("production"), f"expected explicit for {value!r}"
 
 
-# ----- W2 audit fixes: unshipped subinterpreters topology (S2-r1-49) ----------
+# ----- unshipped subinterpreters topology -------------------------------------
 
 
 def test_subinterpreters_topology_is_rejected_as_unimplemented() -> None:
-    """S2-r1-49: SPEC/ROADMAP declare subinterpreters unshipped, but config
+    """SPEC/ROADMAP declare subinterpreters unshipped, but config
     resolution accepted it and the CLI routed it through the real process
     supervisor. It must fail loudly even with a valid cross-process broker."""
     with pytest.raises(ConfigurationError, match="not yet implemented"):
         load_configuration(topology="subinterpreters", broker="redis-streams")
 
 
-# ----- Task 1: validated public configuration contracts ---------------------
+# ----- Validated public configuration contracts ------------------------------
 
 
 def test_reads_subscription_and_actuator_configuration(tmp_path: Path) -> None:
@@ -1048,7 +1085,7 @@ def test_subtable_typo_of_scalar_includes_suggestion(tmp_path: Path) -> None:
         load_configuration()
 
 
-# ----- Task 4: outbox_options claim-strategy validation ----------------------
+# ----- outbox_options claim-strategy validation -------------------------------
 
 
 def test_pyproject_outbox_options_claim_defaults(tmp_path: Path) -> None:

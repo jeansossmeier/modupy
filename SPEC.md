@@ -149,7 +149,7 @@ The single most important framing principle: **we don't lie about our limitation
 
 The plugin contract is the most stable part of modulith. Once published, every plugin ever written depends on it. Additions are fine; signature changes are major-version events.
 
-### 4.1 The Twelve Hookspecs
+### 4.1 The Thirteen Hookspecs
 
 Defined in `modulith/hooks.py`. Each is a stable, versioned contract.
 
@@ -163,29 +163,31 @@ Defined in `modulith/hooks.py`. Each is a stable, versioned contract.
 
 3. `modulith_verify_module(module: ModuleInfo, all_modules: list[ModuleInfo]) -> list[Violation]` — aggregate. Plugins return violations; results combine into the full report.
 
-**Event lifecycle (5):**
+**Event lifecycle (6):**
 
 4. `modulith_before_event_published(event: Any) -> None` — pre-publish validation/enrichment. Raising aborts publication.
 
-5. `modulith_after_event_published(event: Any, publication: EventPublication) -> None` — post-publish observability.
+5. `modulith_after_event_published(event: Any, publication: EventPublication | EventPublishReceipt) -> None` — post-publish observability. `EventPublication` on the in-memory path, `EventPublishReceipt` wrapping the persisted rows on the durable path.
 
-6. `modulith_on_listener_dispatch(event: Any, listener_name: str, publication: EventPublication) -> None` — per-listener tracing/correlation.
+6. `modulith_on_publish_error(event: Any, exception: BaseException) -> None` — fires when a publish fails between the two hooks above (outbox persist, event serialization, an inline broker route). `modulith_after_event_published` is scoped to a successful publish, so this is the paired hook for closing whatever `modulith_before_event_published` opened — a publish span, most notably. Observe-only: implementations that raise are logged and swallowed, never masking the original failure.
 
-7. `modulith_on_listener_complete(event: Any, listener_name: str, publication: EventPublication, exception: BaseException | None) -> None` — fires after every listener invocation, success or failure (`exception` is None on success). Pairs with `modulith_on_listener_dispatch` so observability plugins can close the spans they open there.
+7. `modulith_on_listener_dispatch(event: Any, listener_name: str, publication: EventPublication) -> None` — per-listener tracing/correlation.
 
-8. `modulith_on_listener_error(event: Any, listener_name: str, publication: EventPublication, exception: BaseException) -> None` — listener failure handling.
+8. `modulith_on_listener_complete(event: Any, listener_name: str, publication: EventPublication, exception: BaseException | None) -> None` — fires after every listener invocation, success or failure (`exception` is None on success). Pairs with `modulith_on_listener_dispatch` so observability plugins can close the spans they open there.
+
+9. `modulith_on_listener_error(event: Any, listener_name: str, publication: EventPublication, exception: BaseException) -> None` — listener failure handling.
 
 **Externalization (3):**
 
-9. `modulith_resolve_event_target(event: Any) -> str | None` — `firstresult=True`. Dynamic routing override; first non-None wins.
+10. `modulith_resolve_event_target(event: Any) -> str | None` — `firstresult=True`. Dynamic routing override; first non-None wins.
 
-10. `modulith_register_brokers(registry: BrokerRegistry) -> None` — broker (producer) adapters register at startup.
+11. `modulith_register_brokers(registry: BrokerRegistry) -> None` — broker (producer) adapters register at startup.
 
-11. `modulith_register_consumers(registry: ConsumerRegistry) -> None` — cross-process consumer factories register at startup, right after brokers. The consumer-side mirror of `modulith_register_brokers`; the process-per-module worker builds one `Consumer` per module from the registered factory.
+12. `modulith_register_consumers(registry: ConsumerRegistry) -> None` — cross-process consumer factories register at startup, right after brokers. The consumer-side mirror of `modulith_register_brokers`; the process-per-module worker builds one `Consumer` per module from the registered factory.
 
 **Documentation (1):**
 
-12. `modulith_render_documentation(modules: list[ModuleInfo], output_dir: str) -> list[str]` — aggregate. Plugins write artifacts and return paths.
+13. `modulith_render_documentation(modules: list[ModuleInfo], output_dir: str) -> list[str]` — aggregate. Plugins write artifacts and return paths.
 
 ### 4.2 The Four Driver Protocols
 
@@ -519,7 +521,7 @@ A background task started by the outbox plugin polls `find_incomplete(older_than
 - On startup: `older_than=timedelta(0)` to catch crash recovery
 - During normal operation: `older_than=timedelta(seconds=30)` to avoid thrashing fresh events
 
-Failed dispatches stay incomplete with `attempt_count` incremented and `last_error` set. Retries use exponential backoff capped at the configured max (default 5 minutes). After `max_attempts` (default 10), the record is moved to a dead-letter status (column flag) and surfaced via the actuator.
+Failed dispatches stay incomplete with `attempt_count` incremented and `last_error` set. Retries use exponential backoff capped at the configured max (`max_retry_backoff_seconds`, default 5 minutes). Once `attempt_count` reaches `dead_letter_after_attempts` (unset by default, which resolves to the store's own setting if it has one, else 10), the record is moved to a dead-letter status (column flag) and surfaced via the actuator.
 
 ### 7.5 Maintenance Operations
 
@@ -713,7 +715,7 @@ default = 1
 reports = 4
 ```
 
-There is no `[tool.modulith.supervisor]` subtable — configuration resolution reads only the `outbox_options`, `broker_options`, and `workers` subtables. The supervisor's restart policy is built in, not configurable via pyproject (`modulith/supervisor.py`): per-instance exponential backoff starting at 1s, doubling to a 60s cap, with a crash-loop circuit breaker that stops respawning an instance after more than 5 crashes inside a rolling 60s window, and a backoff reset once an instance has stayed up past the healthy-uptime threshold (defaults to the 60s cap). Crash detection is process-exit-based — the supervisor awaits each worker process; there is no periodic health-check polling.
+There is no `[tool.modulith.supervisor]` subtable — configuration resolution reads only the `outbox_options`, `broker_options`, and `workers` subtables. The supervisor's restart policy is built in, not configurable via pyproject (`modulith/supervisor.py`): per-instance exponential backoff starting at 1s, doubling to a 60s cap, with a crash-loop circuit breaker that stops respawning an instance after more than 5 crashes in a row with no healthy run in between (the spacing between crashes is irrelevant — a module crashing every few minutes trips it just the same), and a backoff reset once an instance has stayed up past the healthy-uptime threshold (defaults to the 60s cap), which also clears the crash streak. Crash detection is process-exit-based — the supervisor awaits each worker process; there is no periodic health-check polling.
 
 Startup failure modes for the cross-process broker are deliberately loud:
 
@@ -733,11 +735,11 @@ Startup failure modes for the cross-process broker are deliberately loud:
 
 ## Part X — Built-in Adapters
 
-Each adapter ships as an optional *extra* of the single `modulith` distribution so dependencies stay optional. `pip install 'modulith[postgres]'` pulls in the SQLAlchemy adapter; without it, the outbox can't use Postgres but everything else works. (Splitting adapters into separately-published packages remains a possible later move — see [Part XVI](#part-xvi--file-inventory) — but is not the shipped model.)
+Each adapter ships as an optional *extra* of the single `modulith` distribution so dependencies stay optional. `pip install 'modupy[postgres]'` pulls in the SQLAlchemy adapter; without it, the outbox can't use Postgres but everything else works. (Splitting adapters into separately-published packages remains a possible later move — see [Part XVI](#part-xvi--file-inventory) — but is not the shipped model.)
 
 ### 10.1 Postgres Outbox Store
 
-Extra: `modulith[postgres]` (`modulith/adapters/postgres_outbox.py`). Implements `PublicationStore` against a SQLAlchemy async engine. Ships:
+Extra: `modupy[postgres]` (`modulith/adapters/postgres_outbox.py`). Implements `PublicationStore` against a SQLAlchemy async engine. Ships:
 
 - Schema migrations (alembic, packaged under `modulith/adapters/migrations/`) for `event_publications` and `event_publications_archive`
 - The session-event integration described in [§7.2](#72-sqlalchemy-integration)
@@ -788,7 +790,7 @@ MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
 
 ### 10.2 Redis Streams Broker
 
-Extra: `modulith[redis]` (`modulith/adapters/redis_broker.py`). Implements `Broker` against `redis.asyncio`. It is an explicit networked choice for process-per-module deployments.
+Extra: `modupy[redis]` (`modulith/adapters/redis_broker.py`). Implements `Broker` against `redis.asyncio`. It is an explicit networked choice for process-per-module deployments.
 
 Select the broker by name, and supply connection options under the
 `[tool.modulith.broker]` subtable. TOML forbids one key (`broker`) being both a
@@ -865,7 +867,7 @@ are fixed-size sequence records.
 
 ### 10.4 OpenTelemetry Observability
 
-Extra: `modulith[otel]` (built-in plugin `modulith/builtin/observability.py`; a silent no-op when OTel isn't installed, or installed without a configured tracer provider). Auto-instrumentation emits two span types via the paired event-lifecycle hooks:
+Extra: `modupy[otel]` (built-in plugin `modulith/builtin/observability.py`; a silent no-op when OTel isn't installed, or installed without a configured tracer provider). Auto-instrumentation emits two span types via the paired event-lifecycle hooks:
 
 - `modulith.event.publish` — one per publication, attributes `event.type`, `event.module`, `modulith.duration_ms`. On the durable (outbox) path the span brackets the persistence step; a persist/serialize/broker-route failure still ends the span, with the exception recorded and status ERROR (the span never leaks).
 - `modulith.event.dispatch` — one per listener invocation, attributes `event.type`, `listener.name`, `publication.id`; status ERROR (with recorded exception) when the listener raises. Parenting depends on the path: on the **in-memory path** the dispatch span is a child of the publish span; on the **durable (outbox) path** listener dispatch runs after the business transaction commits, in a different context, so those dispatch spans are **not** parented to the publish span — correlate them via `publication.id` instead.
@@ -886,7 +888,7 @@ Mermaid over PlantUML because it renders natively on GitHub/GitLab. Canvas is ma
 
 ### 11.1 The pytest Plugin
 
-Ships bundled in the main distribution as `modulith/testing.py`, installed via the `modulith[test]` extra (registered under pytest's `pytest11` entry point, so the fixtures are available automatically). A standalone `pytest-modulith` package is a planned later split, not current reality. Provides:
+Ships bundled in the main distribution as `modulith/testing.py`, installed via the `modupy[test]` extra (registered under pytest's `pytest11` entry point, so the fixtures are available automatically). A standalone `pytest-modulith` package is a planned later split, not current reality. Provides:
 
 ```python
 # Automatic per-test isolation (autouse fixture)
@@ -996,7 +998,7 @@ Uniform across every command:
 
 ```bash
 # 1. Install
-uv add modulith
+uv add modupy
 
 # 2. Define modules as subpackages (zero config)
 mkdir myapp/orders myapp/inventory
@@ -1011,7 +1013,7 @@ uvicorn myapp.main:app --reload
 
 ```bash
 # 1. Install (the CLI needs the cli extra)
-uv add 'modulith[cli]'
+uv add 'modupy[cli]'
 
 # 2. Audit existing structure (writes MIGRATION.md by default; --output to change.
 #    Don't shell-redirect stdout onto the same file — the command already writes
@@ -1076,7 +1078,7 @@ From the brutal-truth analysis. Each gap has a concrete mitigation.
 
 ### Gap 5: Testing is genuinely harder than the docs admit
 
-**Mitigation:** the bundled pytest plugin, installed via `modulith[test]` ([Part XI](#part-xi--testing)). Auto-reset between tests, subprocess-per-test for isolation, Scenario API for event-driven flows.
+**Mitigation:** the bundled pytest plugin, installed via `modupy[test]` ([Part XI](#part-xi--testing)). Auto-reset between tests, subprocess-per-test for isolation, Scenario API for event-driven flows.
 
 ### Gap 6: No story for adopting modulith on existing codebases
 
@@ -1099,7 +1101,7 @@ Time-boxed phases. Each has explicit kill criteria.
 
 ### Phase 0: Foundation ✅ DONE
 
-- Plugin contract (12 hookspecs, 4 protocols)
+- Plugin contract (13 hookspecs, 5 protocols)
 - Auto-discovery + lazy bootstrap
 - Configuration system
 - In-memory event bus
@@ -1127,7 +1129,7 @@ The minimum scope where modulith provides value over "FastAPI plus folders."
 ### Phase 2: v1.1 Polish (2-3 weeks)
 
 **Should-ship:**
-1. **The pytest plugin** (planned then as a separate `pytest-modulith` package; shipped instead as the `modulith[test]` extra). ~200 lines.
+1. **The pytest plugin** (planned then as a separate `pytest-modulith` package; shipped instead as the `modupy[test]` extra). ~200 lines.
 2. **Scenario API**. ~100 lines.
 3. **Audit tool** (`modulith audit`) — `modulith/audit.py`. ~150 lines.
 4. **Doctor command** (`modulith doctor`) — `modulith/doctor.py`. ~120 lines.
@@ -1169,10 +1171,12 @@ The minimum scope where modulith provides value over "FastAPI plus folders."
 
 ## Part XVI — File Inventory
 
-> **Planning snapshot, statuses refreshed.** The Lines column preserves the
-> original planning estimates, not current line counts. For live delivery
-> status, [ROADMAP.md](ROADMAP.md) is the single source of truth; the Status
-> column below has been updated to match it.
+> **What each file is, not how big it is.** The original planning table carried
+> a per-file line-count estimate. Those estimates drifted by multiples as the
+> code landed, and a hand-typed line count is not something a reader can act on
+> — `wc -l` answers it exactly and never goes stale — so the column is dropped
+> rather than re-guessed. For live delivery status, [ROADMAP.md](ROADMAP.md) is
+> the single source of truth; the Status column below matches it.
 
 ### Status legend
 - ✅ — Built and tested
@@ -1180,54 +1184,54 @@ The minimum scope where modulith provides value over "FastAPI plus folders."
 
 ### Core package: `modulith/`
 
-| File | Status | Lines | Notes |
-|---|---|---|---|
-| `__init__.py` | ✅ | 75 | Public API exports |
-| `types.py` | ✅ | 113 | ModuleInfo, EventPublication, Violation |
-| `protocols.py` | ✅ | 151 | PublicationStore, EventSerializer, Broker |
-| `hooks.py` | ✅ | 198 | The 11 hookspecs |
-| `markers.py` | ✅ | 27 | hookimpl re-export |
-| `brokers.py` | ✅ | 128 | BrokerRegistry |
-| `manager.py` | ✅ | 119 | create_plugin_manager |
-| `config.py` | ✅ | 176 | Configuration + load_configuration |
-| `discovery.py` | ✅ | 134 | detect_application_package |
-| `event_bus.py` | ✅ | 95 | InMemoryEventBus |
-| `runtime.py` | ✅ | 174 | Runtime singleton |
-| `decorators.py` | ✅ | 117 | @event, @listener, publish, configure |
-| `serializers.py` | ✅ | — | JsonEventSerializer (default EventSerializer, `allowed_event_types` allowlist) |
-| `sync.py` | ✅ | ~150 | publish_sync, sync listener support (Phase 1) |
-| `manifest.py` | ✅ | ~120 | declare_module API (Phase 1) |
-| `audit.py` | ✅ | ~150 | Codebase analysis (Phase 2) |
-| `doctor.py` | ✅ | ~120 | Health diagnostics (Phase 2) |
-| `cli.py` | ✅ | ~150 | Typer-based CLI (Phase 1) |
-| `_worker.py` | ✅ | ~80 | Per-module FastAPI app generator (Phase 3) |
-| `_consumer.py` | ✅ | — | BrokerConsumer: per-worker stream subscription + dispatch (Phase 3) |
-| `supervisor.py` | ✅ | ~200 | Process orchestration (Phase 3) |
-| `proxy.py` | ✅ | ~120 | Reverse proxy (Phase 3) |
-| `testing.py` | ✅ | ~100 | pytest plugin entry points (Phase 2) |
+| File | Status | Notes |
+|---|---|---|
+| `__init__.py` | ✅ | Public API exports |
+| `types.py` | ✅ | Public dataclasses and enums for module metadata, event publications and boundary violations |
+| `protocols.py` | ✅ | `PublicationStore`, `EventSerializer`, `Broker`, `Consumer`, `HealthAwareConsumer` |
+| `hooks.py` | ✅ | The 13 hookspecs |
+| `markers.py` | ✅ | hookimpl re-export |
+| `brokers.py` | ✅ | BrokerRegistry |
+| `manager.py` | ✅ | create_plugin_manager |
+| `config.py` | ✅ | Configuration + load_configuration |
+| `discovery.py` | ✅ | detect_application_package |
+| `event_bus.py` | ✅ | InMemoryEventBus |
+| `runtime.py` | ✅ | Runtime singleton |
+| `decorators.py` | ✅ | @event, @listener, publish, configure |
+| `serializers.py` | ✅ | JsonEventSerializer (default EventSerializer, `allowed_event_types` allowlist) |
+| `sync.py` | ✅ | publish_sync, sync listener support (Phase 1) |
+| `manifest.py` | ✅ | declare_module API (Phase 1) |
+| `audit.py` | ✅ | Codebase analysis (Phase 2) |
+| `doctor.py` | ✅ | Health diagnostics (Phase 2) |
+| `cli.py` | ✅ | Typer-based CLI (Phase 1) |
+| `_worker.py` | ✅ | Per-module FastAPI app generator (Phase 3) |
+| `_consumer.py` | ✅ | BrokerConsumer: per-worker stream subscription + dispatch (Phase 3) |
+| `supervisor.py` | ✅ | Process orchestration (Phase 3) |
+| `proxy.py` | ✅ | Reverse proxy (Phase 3) |
+| `testing.py` | ✅ | pytest plugin entry points (Phase 2) |
 
 ### Built-in plugins: `modulith/builtin/`
 
-| File | Status | Lines | Notes |
-|---|---|---|---|
-| `__init__.py` | ✅ | 11 | Namespace package |
-| `discovery.py` | ✅ | 74 | Default subpackage walker |
-| `verifier.py` | ✅ | ~200 | AST-based boundary verification (Phase 1) |
-| `outbox.py` | ✅ | ~150 | Outbox plugin core, calls store adapter (Phase 1) |
-| `observability.py` | ✅ | ~120 | OTel auto-instrumentation (Phase 2) |
-| `docs.py` | ✅ | ~150 | Mermaid + canvas generation (Phase 1) |
+| File | Status | Notes |
+|---|---|---|
+| `__init__.py` | ✅ | Namespace package |
+| `discovery.py` | ✅ | Default subpackage walker |
+| `verifier.py` | ✅ | AST-based boundary verification (Phase 1) |
+| `outbox.py` | ✅ | Outbox plugin core, calls store adapter (Phase 1) |
+| `observability.py` | ✅ | OTel auto-instrumentation (Phase 2) |
+| `docs.py` | ✅ | Mermaid + canvas generation (Phase 1) |
 
 ### Storage adapters: `modulith/adapters/`
 
-| File | Status | Lines | Notes |
-|---|---|---|---|
-| `__init__.py` | ✅ | ~10 | Namespace package |
-| `postgres_outbox.py` | ✅ | ~180 | SQLAlchemy + Postgres PublicationStore, alembic migrations (Phase 1) |
-| `redis_broker.py` | ✅ | ~80 | Redis Streams Broker (Phase 2) |
-| `db_broker.py` | ✅ | — | Postgres/MySQL/SQLite database broker |
-| `shm_broker.py` + `_shm_*.py` | ✅ | — | SQLite-authoritative local broker + advisory mmap hints |
-| `_state_path.py` | ✅ | — | Private package-namespaced broker state paths |
-| `kafka_broker.py` | ⏳ | ~80 | Kafka Broker (Phase 4 — not shipped, see §10.3) |
+| File | Status | Notes |
+|---|---|---|
+| `__init__.py` | ✅ | Namespace package |
+| `postgres_outbox.py` | ✅ | SQLAlchemy + Postgres PublicationStore, alembic migrations (Phase 1) |
+| `redis_broker.py` | ✅ | Redis Streams Broker (Phase 2) |
+| `db_broker.py` | ✅ | Postgres/MySQL/SQLite database broker |
+| `shm_broker.py` + `_shm_*.py` | ✅ | SQLite-authoritative local broker + advisory mmap hints |
+| `_state_path.py` | ✅ | Private package-namespaced broker state paths |
+| `kafka_broker.py` | ⏳ | Kafka Broker (Phase 4 — not shipped, see §10.3) |
 
 ### Tests: `tests/`
 
@@ -1258,9 +1262,9 @@ per-file plan is omitted rather than maintained here in parallel.
 
 The original plan floated separately-published packages. The shipped decision
 is **extras of the single `modulith` distribution** (see Part X): the test
-plugin is `modulith[test]` (standalone `pytest-modulith` remains a possible
-v2 split), the Postgres outbox is `modulith[postgres]`, the Redis broker is
-`modulith[redis]`. A Kafka adapter (whether extra or package) is Phase 4.
+plugin is `modupy[test]` (standalone `pytest-modulith` remains a possible
+v2 split), the Postgres outbox is `modupy[postgres]`, the Redis broker is
+`modupy[redis]`. A Kafka adapter (whether extra or package) is Phase 4.
 
 ---
 
@@ -1312,7 +1316,7 @@ See `pyproject.toml` in the source tree. Key sections:
 
 ```toml
 [project]
-name = "modulith"
+name = "modupy"
 version = "0.1.0"
 description = "Modular monolith pattern for Python"
 requires-python = ">=3.11"
@@ -1328,7 +1332,7 @@ otel = ["opentelemetry-api", "opentelemetry-sdk"]
 fastapi = ["fastapi>=0.110", "uvicorn>=0.27", "httpx>=0.26"]
 cli = ["typer>=0.12", "rich>=13.0"]
 test = ["pytest", "pytest-asyncio", "..."]  # see pyproject.toml for the full pins
-all = ["modulith[postgres,redis,database,otel,fastapi,cli,test]"]
+all = ["modupy[postgres,redis,database,otel,fastapi,cli,test]"]
 
 [project.scripts]
 modulith = "modulith.cli:main"

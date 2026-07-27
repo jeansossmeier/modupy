@@ -20,6 +20,29 @@ def reset_manifests():
     manifest_module._reset_for_testing()
 
 
+@pytest.fixture
+def verification_log(monkeypatch):
+    """Record every ``verify_manifest`` call bootstrap makes: (package, errors).
+
+    A passing bootstrap and a *skipped* bootstrap check are both observable
+    only as "nothing raised", so a test that ends at ``await publish(...)``
+    cannot tell the two apart — verification silently ceasing to run for a
+    module would leave the positive tests green. The spy delegates to the real
+    function (it is a witness, not a stub), so the checks themselves still
+    execute exactly as in production.
+    """
+    real = manifest_module.verify_manifest
+    calls: list[tuple[str, list[str]]] = []
+
+    def spy(manifest, registered_listeners):
+        errors = real(manifest, registered_listeners)
+        calls.append((manifest.package, errors))
+        return errors
+
+    monkeypatch.setattr(manifest_module, "verify_manifest", spy)
+    return calls
+
+
 # ---------------------------------------------------------------------------
 # T1.1.3 — bootstrap verification
 # ---------------------------------------------------------------------------
@@ -60,7 +83,7 @@ class TestManifestBootstrap:
         with pytest.raises(ConfigurationError, match="Manifest verification failed"):
             await publish(object())  # triggers bootstrap
 
-    async def test_matching_manifest_passes_bootstrap(self, make_fake_app):
+    async def test_matching_manifest_passes_bootstrap(self, make_fake_app, verification_log):
         """An app whose manifest matches reality → bootstrap succeeds."""
         make_fake_app(
             {
@@ -95,10 +118,13 @@ class TestManifestBootstrap:
 
         configure(package="fakeapp")
 
-        # Should not raise.
-        await publish(object())
+        await publish(object())  # triggers bootstrap; must not raise
 
-    async def test_sync_listener_in_manifest_passes_bootstrap(self, make_fake_app):
+        assert verification_log == [("fakeapp.orders", [])]
+
+    async def test_sync_listener_in_manifest_passes_bootstrap(
+        self, make_fake_app, verification_log
+    ):
         """Regression (D1): a SYNC listener declared in a manifest must verify.
 
         Sync listeners register as async wrappers (see sync.wrap_sync_listener); the
@@ -139,10 +165,53 @@ class TestManifestBootstrap:
 
         configure(package="fakeapp")
 
-        # Should not raise — the sync listener IS registered (as an async wrapper).
+        # Must not raise — the sync listener IS registered (as an async wrapper).
         await publish(object())
 
-    async def test_verify_manifests_false_bypasses_check(self, make_fake_app):
+        # The witness is what separates "verified and matched" from "never
+        # verified": both look like a silent publish otherwise.
+        assert verification_log == [("fakeapp.orders", [])]
+
+    async def test_unregistered_sync_listener_still_fails_bootstrap(self, make_fake_app):
+        """A sync listener that never registered must still be reported.
+
+        Matching sync listeners through ``__modulith_sync_wrapped__`` must not
+        degrade into skipping sync callables outright — that would pass the
+        test above while silently exempting every sync listener from
+        verification.
+        """
+        make_fake_app(
+            {
+                "orders": """
+                    from dataclasses import dataclass
+                    from modulith import event
+
+                    @event
+                    @dataclass(frozen=True)
+                    class OrderCreated:
+                        order_id: str
+                """,
+            },
+            extra_files={
+                "orders/_manifest.py": """
+                    from modulith.manifest import declare_module
+
+                    def orphan_sync_listener(e: object) -> None:  # SYNC, never @listener
+                        pass
+
+                    declare_module(listeners=[orphan_sync_listener])
+                """,
+            },
+        )
+        from modulith import publish
+        from modulith.decorators import configure
+
+        configure(package="fakeapp")
+
+        with pytest.raises(ConfigurationError, match="orphan_sync_listener"):
+            await publish(object())
+
+    async def test_verify_manifests_false_bypasses_check(self, make_fake_app, verification_log):
         """Setting verify_manifests=False skips verification even with a bad manifest."""
         make_fake_app(
             {
@@ -172,8 +241,9 @@ class TestManifestBootstrap:
 
         configure(package="fakeapp", verify_manifests=False)
 
-        # Should not raise — verification is disabled.
-        await publish(object())
+        await publish(object())  # must not raise — verification is disabled
+
+        assert verification_log == [], "verify_manifest must not run at all"
 
     async def test_error_message_includes_package_prefix(self, make_fake_app):
         """ConfigurationError message includes the [package] prefix from the violating module."""
@@ -216,7 +286,9 @@ class TestManifestBootstrap:
 
 
 class TestManifestVerifyScope:
-    async def test_bogus_dependencies_and_tables_do_not_fail_bootstrap(self, make_fake_app):
+    async def test_bogus_dependencies_and_tables_do_not_fail_bootstrap(
+        self, make_fake_app, verification_log
+    ):
         """Bootstrap verifies only listeners + publishes.
 
         `declared_dependencies` and `owns_tables` need static source analysis
@@ -260,8 +332,12 @@ class TestManifestVerifyScope:
 
         configure(package="fakeapp")
 
-        # Should NOT raise: bogus deps/tables are out of bootstrap's scope.
+        # Must NOT raise: bogus deps/tables are out of bootstrap's scope. The
+        # witness proves the manifest really was verified rather than skipped —
+        # otherwise "out of scope" and "never checked" are the same outcome.
         await publish(object())
+
+        assert verification_log == [("fakeapp.orders", [])]
 
 
 # ---------------------------------------------------------------------------

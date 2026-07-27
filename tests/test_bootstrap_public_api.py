@@ -1,13 +1,14 @@
-"""T61 — behavioral tests for the public ``modulith.bootstrap()`` API.
+"""Behavioral tests for the public ``modulith.bootstrap()`` API and the
+shape of the ``modulith`` top-level namespace.
 
-Confirmed gap (contract audit): only *lazy* bootstrap existed — triggered
-implicitly by the first ``@listener`` registration or ``publish()`` call
-(``runtime.py``'s ``ensure_bootstrapped()``, reached privately by
-``_worker.py``). An embedding app that wants the outbox crash-recovery
-sweep to actually dispatch at startup has no public trigger: the sweep
-skips every row for the cycle while the runtime is un-bootstrapped
-(``event_bus`` is ``None`` — see ``modulith/builtin/outbox.py``'s
-``_sweep`` guard, pinned by
+``bootstrap()`` exists because *lazy* bootstrap alone is not enough: it is
+triggered implicitly by the first ``@listener`` registration or ``publish()``
+call (``runtime.py``'s ``ensure_bootstrapped()``, reached privately by
+``_worker.py``), so an embedding app that wants the outbox crash-recovery
+sweep to dispatch at startup would have no public trigger. The sweep skips
+every row for the cycle while the runtime is un-bootstrapped (``event_bus``
+is ``None`` — see ``modulith/builtin/outbox.py``'s ``_sweep`` guard, pinned
+by
 ``tests/test_outbox_wire_format.py::test_sweep_skips_rows_without_attempt_bookkeeping_when_unbootstrapped``).
 """
 
@@ -54,6 +55,27 @@ def test_publish_sync_timeout_is_exported_without_future_receipt_type() -> None:
     assert modulith.PublishSyncTimeout is PublishSyncTimeout
     assert "PublishSyncTimeout" in modulith.__all__
     assert "EventPublishReceipt" not in modulith.__all__
+
+
+def test_no_public_attribute_escapes_the_declared_api() -> None:
+    """Every public (non-underscore) attribute of ``modulith`` must be in
+    ``__all__``. A stray one — an unaliased stdlib import, say — shows up in
+    ``dir(modulith)`` and editor completion beside real modulith names, so a
+    user writes ``except modulith.SomethingError:`` around a modulith call and
+    gets a handler that can never fire."""
+    import types as _types
+
+    import modulith
+
+    leaked = sorted(
+        name
+        for name, value in vars(modulith).items()
+        if not name.startswith("_")
+        and not isinstance(value, _types.ModuleType)
+        and name not in modulith.__all__
+    )
+
+    assert leaked == []
 
 
 async def record(recovered: RecoveredEvent) -> None:

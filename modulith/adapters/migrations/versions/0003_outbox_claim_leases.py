@@ -12,12 +12,18 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects.mysql import LONGBLOB as MySQLLongBlob
 from sqlalchemy.sql.schema import SchemaItem
 
 revision: str = "0003_outbox_claim_leases"
 down_revision: str | None = "0002_broker_message"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+
+# Mirrors postgres_outbox._PAYLOAD and 0001's payload column: plain
+# LargeBinary compiles to MySQL/MariaDB BLOB (65,535 bytes), which truncates or
+# rejects a moderately large event. Inert on Postgres/SQLite.
+_PAYLOAD = sa.LargeBinary().with_variant(MySQLLongBlob(), "mysql", "mariadb")
 
 # Both tables' columns that 0001 originally created as an unbounded
 # String — MySQL's VARCHAR requires an explicit length, so that type never
@@ -45,7 +51,7 @@ def _table_as_of_0001(name: str) -> sa.Table:
     columns: list[SchemaItem] = [
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("event_type", sa.Text(), nullable=False),
-        sa.Column("payload", sa.LargeBinary(), nullable=False),
+        sa.Column("payload", _PAYLOAD, nullable=False),
         sa.Column("listener", sa.Text(), nullable=False),
         sa.Column("published_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
@@ -83,9 +89,20 @@ def upgrade() -> None:
                     type_=sa.Text(),
                     existing_nullable=nullable,
                 )
+            # Same converge-onto-a-fresh-install motive as the Text columns:
+            # an install that ran 0001 while it still emitted a plain
+            # LargeBinary has a MySQL BLOB payload capped at 65,535 bytes,
+            # where a fresh install gets LONGBLOB. Widening is lossless, and on
+            # Postgres/SQLite the variant resolves to the type already there.
+            batch_op.alter_column(
+                "payload",
+                existing_type=sa.LargeBinary(),
+                type_=_PAYLOAD,
+                existing_nullable=False,
+            )
 
-    # Task 4 will activate lease-based claiming. These columns are nullable so
-    # this schema-only revision cannot change current outbox behavior.
+    # Lease columns for the claim protocol, added nullable so this schema-only
+    # revision cannot change the behavior of a dispatcher that never sets them.
     op.add_column(
         "event_publications",
         sa.Column("claim_owner", sa.String(255), nullable=True),
@@ -105,20 +122,14 @@ def downgrade() -> None:
     op.drop_column("event_publications", "claim_token")
     op.drop_column("event_publications", "claim_owner")
 
-    # Reverse the type change with a bounded VARCHAR(255), not the original
-    # unbounded String — an unbounded VARCHAR fails to compile on MySQL, so
-    # reverting to it would break the downgrade on that dialect. This is only
-    # a schema-shape reversal for the drift tests; downgrading past this
-    # point (to base) drops the tables anyway.
-    for table in _TABLES:
-        # claim_owner/claim_token/claim_until are already dropped above, so
-        # the table entering this batch op has exactly _table_as_of_0001's
-        # shape (Text columns, no claim columns).
-        with op.batch_alter_table(table, copy_from=_table_as_of_0001(table)) as batch_op:
-            for column, nullable in _TEXT_COLUMNS.items():
-                batch_op.alter_column(
-                    column,
-                    existing_type=sa.Text(),
-                    type_=sa.String(255),
-                    existing_nullable=nullable,
-                )
+    # The Text conversion is deliberately NOT reversed. 0001 creates these
+    # columns as Text, so Text already IS the 0002 shape for every install
+    # that starts from the current tree; narrowing them on the way down would
+    # instead DESTROY data — the outbox writes up to 500 characters of
+    # ``last_error`` (see builtin/outbox._record_failure), and an
+    # ``ALTER ... TYPE VARCHAR(255)`` over an existing longer value aborts the
+    # rollback on Postgres and truncates it on non-strict MySQL. On the one
+    # deployment shape this revision's upgrade actually converts (a Postgres
+    # install that ran 0001 back when it emitted an unbounded String), leaving
+    # Text behind is a no-op: Postgres treats unbounded varchar and text
+    # identically.

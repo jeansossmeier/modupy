@@ -1,0 +1,47 @@
+name: Feature request
+description: Propose a capability the framework does not have yet.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check [ROADMAP.md](https://github.com/jeansossmeier/modupy/blob/main/ROADMAP.md)
+        first — the item may already be planned. The design is opinionated;
+        [SPEC.md](https://github.com/jeansossmeier/modupy/blob/main/SPEC.md)
+        explains the reasoning behind the current shape.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that the framework makes hard or impossible?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should the API or behaviour look like?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: >
+        Including workarounds you are using today. If a plugin hook or an
+        existing extra could cover this, say why it does not.
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Does this change the public API?
+      options:
+        - "No — internal or additive behind an existing hook"
+        - "Yes — new public export or new hookspec"
+        - "Yes — changes an existing public signature"
+        - "Not sure"
+    validations:
+      required: true

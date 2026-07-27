@@ -9,7 +9,7 @@ This guide covers scaling modulith from a single-process monolith to a distribut
 The simplest deployment: all modules run in one process with an in-memory event bus.
 
 ```bash
-pip install 'modulith[fastapi,cli]'
+pip install 'modupy[fastapi,cli]'
 MODULITH_BROKER=memory uvicorn myapp.main:app --workers 1
 ```
 
@@ -35,9 +35,19 @@ from modulith.adapters.postgres_outbox import PostgresPublicationStore
 from modulith.serializers import JsonEventSerializer
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from myapp.contracts.events import OrderPlaced, StockReserved
+
 async_engine = create_async_engine("postgresql+asyncpg://user:pass@localhost/mydb")
 store = PostgresPublicationStore(engine=async_engine)
-outbox.configure(store=store, serializer=JsonEventSerializer())
+outbox.configure(
+    store=store,
+    # allowed_event_types is the deserialization allowlist — set it in
+    # production wherever payloads can originate outside the trusted process
+    # boundary (a shared outbox table, a broker). Without it, a forged
+    # event_type could trigger an arbitrary-module import on deserialize, and
+    # the first deserialize emits a RuntimeWarning saying so.
+    serializer=JsonEventSerializer(allowed_event_types=[OrderPlaced, StockReserved]),
+)
 configure(outbox="postgres")
 
 app = ... # your FastAPI or ASGI app
@@ -45,7 +55,7 @@ app = ... # your FastAPI or ASGI app
 
 Then run:
 ```bash
-pip install 'modulith[fastapi,cli,postgres]'
+pip install 'modupy[fastapi,cli,postgres]'
 MODULITH_OUTBOX=postgres uvicorn myapp.main:app --workers 1
 ```
 
@@ -63,25 +73,42 @@ MODULITH_OUTBOX=postgres uvicorn myapp.main:app --workers 1
 **Listeners and durability:**
 - The outbox persists only the **first hop** of events (e.g., `orders` → `inventory`).
 - If `inventory` publishes a downstream event (e.g., `StockReserved` → `notifications`), that hop is **not durable by default**—it rides the in-memory bus.
-- For a durable cascade, listeners must bind their own session and publish inside it:
+- A listener takes exactly one argument — the event. No session is injected, and `publish()` takes no `session=` keyword. For a durable cascade, the listener opens its own session and binds it, so `publish()` finds it and enlists the outbox row in that transaction:
   ```python
-  @listener(external=True)
-  async def on_order_placed(event: OrderPlaced, session: AsyncSession) -> None:
-      await session.execute(insert(Reservation).values(...))
-      # Publish inside the session to make it durable:
-      await publish(StockReserved(...), session=session)
-      await session.commit()
+  from modulith.adapters.postgres_outbox import bind_session, unbind_session
+
+  @listener
+  async def on_order_placed(event: OrderPlaced) -> None:
+      async with async_session_maker() as session:
+          token = bind_session(session)
+          try:
+              await session.execute(insert(Reservation).values(...))
+              # Bound session ⇒ publish() persists StockReserved into this
+              # transaction instead of dispatching it in-memory.
+              await publish(StockReserved(...))
+              await session.commit()
+          finally:
+              unbind_session(token)
   ```
+  `examples/demo_app/shop/orders/api.py` uses the same `bind_session`/`unbind_session` pair, wrapped in a FastAPI dependency.
 
 **Outbox operations:**
 
 ```bash
-# CLI requires the app to be running (stores are app-scoped):
 modulith outbox status              # pending events
 modulith outbox retry <event-id>    # retry a failed event
 modulith outbox purge               # remove delivered events
 modulith outbox dead-letter         # inspect stuck events
 ```
+
+These run in the CLI's **own** process and operate on the store that process
+wires. They cannot reach into a separately-running server: `outbox.configure()`
+binds the store in the calling process, and nothing is shared across process
+boundaries. So they work only when your bootstrap module — the one the CLI
+imports via `[tool.modulith]` — calls `outbox.configure()` at import time. An
+app that wires the outbox inside a FastAPI lifespan instead (as
+`examples/demo_app` does) gets "no store wired" from the CLI even while the
+server is up; inspect that outbox through the running app.
 
 ---
 
@@ -89,10 +116,18 @@ modulith outbox dead-letter         # inspect stuck events
 
 Split modules across separate worker processes for independent scaling, deployment, and lifecycle. Events flow through a broker (database, Redis, or other transports).
 
+**Actuator note for every recipe in this section.** `modulith run` binds `--host 0.0.0.0`, and the default `actuator_mode="auto"` will not serve an unauthenticated `/_modulith/*` on a non-loopback host: with no token configured the actuator is left unmounted (a startup warning says so) and the health probes further down have nothing to call. Export a token if you want them:
+
+```bash
+export MODULITH_ACTUATOR_TOKEN="$(openssl rand -hex 32)"
+```
+
+See [Actuator Access](#actuator-access-_modulith).
+
 ### A. SQLite Database Broker (Zero Infrastructure)
 
 ```bash
-pip install 'modulith[fastapi,cli,database]' aiosqlite
+pip install 'modupy[fastapi,cli,database]' aiosqlite
 MODULITH_BROKER=database \
   MODULITH_BROKER_URL=sqlite+aiosqlite:////path/to/broker.db \
   modulith run myapp.main:app --topology processes
@@ -152,7 +187,7 @@ modulith run myapp.main:app --topology processes \
 ### B. Redis Streams Broker
 
 ```bash
-pip install 'modulith[fastapi,cli]'
+pip install 'modupy[fastapi,cli,redis]'
 docker run -d -p 6379:6379 redis:latest
 
 MODULITH_BROKER=redis-streams \
@@ -170,19 +205,32 @@ MODULITH_BROKER=redis-streams \
 
 **Tuning:**
 
+The Redis adapter reads exactly four environment variables:
+
 ```bash
-# Control batch size and dispatch concurrency:
-export MODULITH_REDIS_BATCH_SIZE=100           # events per dispatch
-export MODULITH_REDIS_CONCURRENCY=10           # parallel listeners
-export MODULITH_REDIS_CLAIM_TIMEOUT_MS=30000   # pending claim timeout
+export REDIS_URL=redis://localhost:6379        # connection URL
+export MODULITH_STREAM_PREFIX=myapp            # stream key prefix
+export MODULITH_CONSUMER_GROUP=myapp-workers   # consumer group name
+export MODULITH_STREAM_MAXLEN=100000           # XADD MAXLEN ~ cap (see caveat above)
 ```
+
+The consumer-loop settings have no environment variable — set them in `pyproject.toml`:
+
+```toml
+[tool.modulith.broker_options]
+poll_block_ms = 1000          # XREADGROUP block timeout
+reclaim_min_idle_ms = 60000   # idle threshold before a pending entry is claimed
+max_delivery_attempts = 5     # attempts before dead-lettering
+```
+
+Read batch size and listener concurrency are not tunable on the Redis path; scale out with more workers per module (`[tool.modulith.workers]`) instead.
 
 ### C. Postgres Broker (Advanced)
 
 For deployments where Postgres is the primary data store and you want a single database:
 
 ```bash
-pip install 'modulith[fastapi,cli,database]'
+pip install 'modupy[fastapi,cli,database]'
 MODULITH_BROKER=database \
   MODULITH_BROKER_URL=postgresql+asyncpg://user:pass@localhost/mydb \
   modulith run myapp.main:app --topology processes
@@ -193,9 +241,9 @@ Uses the `broker_message` and `broker_subscription` tables with `FOR UPDATE SKIP
 **Tuning:**
 
 ```bash
-export MODULITH_BROKER_BATCH_SIZE=50           # events per poll
-export MODULITH_BROKER_CONCURRENCY=5           # parallel listeners
-export MODULITH_BROKER_POLL_INTERVAL_MS=1000   # how often to check for new events
+export MODULITH_BROKER_BATCH_SIZE=50              # events per poll
+export MODULITH_BROKER_DISPATCH_CONCURRENCY=5     # parallel listeners
+export MODULITH_BROKER_POLL_INTERVAL_MS=1000      # how often to check for new events
 ```
 
 ---
@@ -225,6 +273,10 @@ COPY . .
 EXPOSE 8000-8100
 ENV MODULITH_BROKER=database
 ENV MODULITH_BROKER_URL=postgresql+asyncpg://...
+# The supervisor binds 0.0.0.0, where actuator_mode="auto" only mounts
+# /_modulith/* if a bearer token is configured. Pass MODULITH_ACTUATOR_TOKEN in
+# at run time (never bake a secret into an image); omit it and the app still
+# starts, just without the actuator.
 CMD ["modulith", "run", "myapp.main:app", "--topology", "processes"]
 ```
 
@@ -240,6 +292,8 @@ services:
     environment:
       MODULITH_BROKER: database
       MODULITH_BROKER_URL: postgresql+asyncpg://user:pass@postgres/mydb
+      # Mounts /_modulith/* on the proxy; drop this line to leave it unmounted.
+      MODULITH_ACTUATOR_TOKEN: ${MODULITH_ACTUATOR_TOKEN:?set MODULITH_ACTUATOR_TOKEN}
     depends_on:
       - postgres
       - redis  # if using redis broker
@@ -317,6 +371,13 @@ spec:
                 secretKeyRef:
                   name: broker-creds
                   key: url
+            # Required by the probes below: on a 0.0.0.0 bind the actuator is
+            # only mounted when a token is configured.
+            - name: MODULITH_ACTUATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: actuator-creds
+                  key: token
           # Each pod gets a stable hostname for assignment:
           # myapp-workers-0.myapp-workers.default.svc.cluster.local
 ```
@@ -369,24 +430,26 @@ Or scale the broker database (connection pooling, read replicas, etc.).
 
 ### Module Isolation (Fault Domain Separation)
 
-Run fault-prone or high-load modules on separate infrastructure by adjusting worker counts and deployments:
+Bias capacity toward fault-prone or high-load modules by giving them more workers on the nodes that serve them.
+
+**Every discovered module gets at least one worker.** `[tool.modulith.workers]` counts must be `>= 1`; `notifications = 0` is rejected at boot with `ConfigurationError: workers must map string module names to positive integer counts`, and so is a `0` passed through `--workers` JSON. `modulith run` has no per-deployment module opt-out — "this module does not run here" means a separate application package, not a worker count of zero.
 
 **Approach 1: Separate instances with different worker configurations**
 
-Configuration file 1 (`prod.toml` - for production nodes):
+Configuration file 1 (`prod.toml` - for request-serving nodes):
 ```toml
 [tool.modulith.workers]
 orders = 4
 inventory = 4
-notifications = 0    # not running on prod nodes
-reporting = 0
+notifications = 1    # minimum; cannot be switched off per node
+reporting = 1
 ```
 
 Configuration file 2 (`batch.toml` - for batch nodes):
 ```toml
 [tool.modulith.workers]
-orders = 0           # not running on batch nodes
-inventory = 0
+orders = 1           # minimum; cannot be switched off per node
+inventory = 1
 notifications = 2
 reporting = 2
 ```
@@ -405,25 +468,108 @@ reporting = 1
 
 ---
 
+## Actuator Access (`/_modulith/*`)
+
+In `--topology processes` the reverse proxy exposes three actuator routes — `/_modulith/topology`, `/_modulith/live`, and `/_modulith/health`. `modulith run` binds `--host 0.0.0.0` by default, so `actuator_mode` decides who may reach them:
+
+| `actuator_mode` | Behaviour |
+|---|---|
+| `auto` (default) | Open only on a loopback, non-production bind. On any other bind — including the default `0.0.0.0` — a token is required: with one the routes are token-guarded, without one they are not mounted at all and startup logs a warning. |
+| `token` | Token always mandatory, loopback included; the supervisor refuses to start without one. |
+| `open` | No authentication. Anyone who can reach the port reads your topology and health. |
+| `disabled` | Routes are not mounted at all — the right choice when you do not use `/_modulith/*`. Health probes then have nothing to call. |
+
+Both settings come from the environment:
+
+```bash
+export MODULITH_ACTUATOR_MODE=auto                        # auto | token | open | disabled
+export MODULITH_ACTUATOR_TOKEN="$(openssl rand -hex 32)"
+```
+
+When a token is configured, every actuator request must carry `Authorization: Bearer <token>` or it gets 401.
+
+---
+
+## API Documentation (`/<module>/docs`, `/<module>/openapi.json`)
+
+**Per-module API docs are served on the public port.** In `--topology processes` each worker publishes its schema and doc UIs *inside* its own module prefix — the prefix the reverse proxy already forwards verbatim — so they are reachable from outside with no proxy-side configuration:
+
+| URL on the public port | Serves |
+|---|---|
+| `/<module>/openapi.json` | that module's OpenAPI schema, paths already carrying the prefix (`/orders/place`) |
+| `/<module>/docs` | that module's Swagger UI |
+| `/<module>/redoc` | that module's ReDoc page |
+
+```bash
+curl http://localhost:8000/orders/openapi.json    # the orders worker's schema
+open http://localhost:8000/orders/docs            # the orders worker's Swagger UI
+open http://localhost:8000/inventory/docs         # a different worker, same public port
+```
+
+The same URLs answer on each worker's **internal** port (9001+), which is where `kubectl port-forward` reaches them — note the module prefix is part of the path there too: `http://127.0.0.1:9001/orders/docs`, not `/docs`.
+
+Three consequences worth knowing:
+
+- The app-root paths belong to no module, so `/docs`, `/openapi.json` and `/redoc` return `404 {"detail": "no worker route for '/docs'"}`. Point client generators at a module URL.
+- Inside a module's prefix, the module's own routes win: a module named `docs` keeps every path under `/docs/*`, and a module defining its own `/docs` route keeps serving it. What loses the collision is the generated doc UI for that one module, never the application's route.
+- Each schema also lists the worker's own unprefixed `/health`, which the proxy does not forward. It answers on the internal port only, so strip it (or ignore the 404) in anything generated against the public port.
+
+**A merged, cross-module schema remains out of scope for the supervisor**, and not for want of plumbing:
+
+- **The pieces do not merge cleanly.** Each worker names its models under `components.schemas`, and two modules that both define an `Order` produce two different definitions of the same key. Merging silently picks one and mistypes the other module's API; renaming rewrites identifiers your generated clients already use.
+- **Nothing owns the envelope.** `info.title`, `info.version` and the security schemes are per-worker values. A merged document has to invent one answer, so the version it reports matches no deployed module in particular.
+- **It cannot be both fresh and cheap.** Fanning out to every worker per request puts an N-worker round trip on a public endpoint; caching serves a schema that silently lags a rolling deploy.
+- **Rollouts have no good answer.** While a worker is respawning, its schema is unavailable — a per-module URL simply returns 502 for that one module, while a merged document must either omit a whole module's API without saying so or fail as a whole.
+
+If you need one document, build it where those answers are yours to make: run an aggregator over the per-module schemas, or keep a checked-in schema generated from the single-process app.
+
+Single-process topology is unaffected — modulith adds no HTTP routes there, so `/docs` is whatever your own FastAPI app configures.
+
+---
+
 ## Health Checks and Monitoring
 
-### Liveness Probe (Is the Worker Running?)
+Both probes are served by the reverse proxy on the port `modulith run` binds (8000 by default), and both need the actuator mounted — set `MODULITH_ACTUATOR_TOKEN` (see [Actuator Access](#actuator-access-_modulith)). Plain `/health` exists only on each worker's own internal port (9001+) and 404s on the proxy; there is no `/ready` route.
+
+### Liveness Probe (Is the Proxy Running?)
 
 ```bash
-curl http://localhost:8000/health
-# Returns 200 if the worker is ready.
+curl -H "Authorization: Bearer $MODULITH_ACTUATOR_TOKEN" http://localhost:8000/_modulith/live
+# Returns 200 while the proxy is serving. Deliberately independent of backend
+# health, so a degraded worker never gets the healthy proxy restarted.
 ```
 
-### Readiness Probe (Is the Broker Connected?)
+### Readiness Probe (Are the Workers Up?)
 
 ```bash
-curl http://localhost:8000/ready
-# Returns 200 if the worker is connected to the broker and accepting events.
+curl -H "Authorization: Bearer $MODULITH_ACTUATOR_TOKEN" http://localhost:8000/_modulith/health
+# Fans out to every worker's /health. 200 when all are ok, 503 otherwise.
 ```
+
+In Kubernetes, probe headers are static strings — template the token in from the same secret the container reads, or set `MODULITH_ACTUATOR_MODE=open` if the port is only reachable inside the cluster and you accept unauthenticated topology/health:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /_modulith/live
+    port: 8000
+    httpHeaders:
+      - name: Authorization
+        value: "Bearer <actuator token>"
+readinessProbe:
+  httpGet:
+    path: /_modulith/health
+    port: 8000
+    httpHeaders:
+      - name: Authorization
+        value: "Bearer <actuator token>"
+```
+
+In single-process topology there is no proxy and no actuator: modulith adds no HTTP routes, so probe whatever endpoint your own app exposes.
 
 ### Event Metrics
 
-If OpenTelemetry is enabled (`modulith[otel]`), spans are emitted for:
+If OpenTelemetry is enabled (`modupy[otel]`), spans are emitted for:
 - `modulith.publish` — an event was published
 - `modulith.listen` — an event was dispatched to a listener
 - `modulith.outbox.dispatch` — the outbox dispatched a batch
@@ -500,10 +646,10 @@ This path is why modulith exists: **every module is a potential microservice, bu
 
 ### Events Not Delivered
 
-1. Check that the listener is registered: `modulith info` → inspect `Listeners`
+1. Check that the listener's module was actually imported: `modulith info` → the module must appear under `modules` marked `[manifest]`. (`info` prints modules, configuration, plugins, and registered broker schemes — there is no per-listener listing. A module that silently failed to import is the most common cause, and manifest verification is what turns a declared-but-unregistered listener into a boot failure.)
 2. Verify the manifest declares the event: `_manifest.py` → check `consumes`
 3. Inspect broker state:
-   - Database: `SELECT * FROM broker_message WHERE status != 'delivered'`
+   - Database: `SELECT * FROM broker_message WHERE status IN ('pending','claimed')` for work still in flight, and `WHERE status = 'dead'` for the dead-letter view. The column only ever holds `pending`, `claimed`, `done`, or `dead`.
    - Redis: `xinfo groups myapp-events`
 
 ### Worker Crash Loop
@@ -514,9 +660,26 @@ This path is why modulith exists: **every module is a potential microservice, bu
 
 ### High Latency
 
-1. Tune batch size: `MODULITH_BROKER_BATCH_SIZE=200`
-2. Increase concurrency: `MODULITH_REDIS_CONCURRENCY=20`
-3. Profile with `modulith[otel]` and check span duration
+1. Database broker — tune batch size: `MODULITH_BROKER_BATCH_SIZE=200`
+2. Database broker — increase concurrency: `MODULITH_BROKER_DISPATCH_CONCURRENCY=20`
+3. Redis broker — neither knob exists; add workers instead (`[tool.modulith.workers]`)
+4. Profile with `modupy[otel]` and check span duration
+
+---
+
+## Reference: Supervisor, Proxy, and Boundary Environment Variables
+
+Broker and outbox settings are covered in the topology sections above
+(`MODULITH_BROKER`, `MODULITH_BROKER_<KEY>`, `MODULITH_OUTBOX`,
+`MODULITH_DB_URL`). These are the remaining process-level knobs:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MODULITH_ACTUATOR_MODE` | `auto` | `auto` \| `token` \| `open` \| `disabled` — see [Actuator Access](#actuator-access-_modulith). |
+| `MODULITH_ACTUATOR_TOKEN` | unset | Bearer token for `/_modulith/*`. Required to mount the actuator under `auto` on a non-loopback bind or in production. |
+| `MODULITH_PRODUCTION` | unset (false) | `1`/`true`/`yes`, case-insensitive. Treats the deployment as production: the actuator's `auto` mode requires a token even on loopback, and the boundary gate below is never disarmed. |
+| `MODULITH_PROXY_MAX_BODY_BYTES` | `10485760` (10 MiB) | Per-request body cap for the reverse proxy in `--topology processes`. The proxy buffers each request body in memory, which is why the cap exists; raise it for large uploads. Must be a positive integer — anything else fails startup with a `ConfigurationError`, rather than silently reverting to the default. |
+| `MODULITH_DEV_WARN_ONLY` | unset | Set to `1` by `modulith dev` itself. Under `strict_boundaries = true`, boundary violations then log a warning instead of aborting the boot, keeping interactive development usable. Ignored when `MODULITH_PRODUCTION` is set, so a value inherited from a container image or a copied shell profile cannot disarm the gate in production. It is an environment variable rather than an in-process flag because it has to survive uvicorn's `--reload` fork. Do not set it in a deployment — that is what `strict_boundaries = false` is for. |
 
 ---
 
@@ -536,4 +699,4 @@ This path is why modulith exists: **every module is a potential microservice, bu
 - For **detailed internal architecture**, see [docs/ARCHITECTURE.md](ARCHITECTURE.md)
 - For **API reference**, see [docs/API_REFERENCE.md](API_REFERENCE.md)
 - For **working examples**, see [examples/demo_app](../examples/demo_app)
-- For **testing**, see [Cookbook §Testing](COOKBOOK.md#testing)
+- For **testing**, see [Cookbook §9](COOKBOOK.md#9-test-an-event-flow-with-the-pytest-plugin)

@@ -1,8 +1,8 @@
 # modulith
 
 [![CI Status](https://github.com/jeansossmeier/modupy/actions/workflows/ci.yml/badge.svg)](https://github.com/jeansossmeier/modupy/actions?query=workflow%3ACI)
-[![PyPI Version](https://img.shields.io/pypi/v/modulith)](https://pypi.org/project/modulith/)
-[![Python Versions](https://img.shields.io/pypi/pyversions/modulith)](https://pypi.org/project/modulith/)
+[![PyPI Version](https://img.shields.io/pypi/v/modupy)](https://pypi.org/project/modupy/)
+[![Python Versions](https://img.shields.io/pypi/pyversions/modupy)](https://pypi.org/project/modupy/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 > A Python framework for the modular monolith pattern. Module structure
@@ -45,28 +45,93 @@ you want to understand the project completely or contribute.
 ## The 30-second pitch
 
 ```python
+# myapp/contracts/events.py
+from dataclasses import dataclass
+
+from modulith import event
+
+
+@event
+@dataclass(frozen=True)
+class OrderCreated:
+    order_id: str
+
+
+@event
+@dataclass(frozen=True)
+class PaymentReceived:
+    order_id: str
+```
+
+An event is any class marked `@event`; a frozen dataclass is the recommended
+shape because its value semantics (equality, hashing) give the outbox reliable
+round-trip fidelity. Cookbook recipes
+[1](docs/COOKBOOK.md#1-define-an-event-and-a-listener) and
+[2](docs/COOKBOOK.md#2-share-event-types-through-a-contracts-module) go deeper.
+
+```python
 # myapp/orders/__init__.py
-from modulith import event, listener, publish
+from modulith import listener, publish
+
 from myapp.contracts.events import OrderCreated, PaymentReceived
+
+_orders: dict[str, str] = {}  # order_id -> customer_id
+_fulfilled: set[str] = set()
+
+
+async def create_order(customer_id: str) -> str:
+    order_id = f"ord-{len(_orders) + 1}"
+    _orders[order_id] = customer_id  # your real persistence goes here
+    await publish(OrderCreated(order_id=order_id))
+    return order_id
+
 
 @listener
 async def on_payment(event: PaymentReceived) -> None:
     """Cross-module communication via events, not direct calls."""
-    await fulfill_order(event.order_id)
+    _fulfilled.add(event.order_id)  # your real fulfilment goes here
 
-async def create_order(customer_id: str) -> str:
-    order_id = await persist_order(customer_id)
-    await publish(OrderCreated(order_id=order_id))
-    return order_id
+
+# Re-export the router onto the module package. Process-per-module mode serves
+# HTTP by mounting each module package's `router` attribute under /<module>.
+from myapp.orders.api import router as router  # noqa: E402
 ```
 
 ```python
+# myapp/orders/api.py
+from fastapi import APIRouter
+from pydantic import BaseModel
+
+from myapp.orders import create_order
+
+router = APIRouter()
+
+
+class NewOrder(BaseModel):
+    customer_id: str
+
+
+@router.post("")
+async def post_order(body: NewOrder) -> dict[str, str]:
+    return {"order_id": await create_order(body.customer_id)}
+```
+
+The route sits at the router root (`""`) and `main.py` mounts the router under
+`/orders` — the same prefix a process-per-module worker uses. Both topologies
+therefore serve the identical URL, `POST /orders`.
+
+```python
 # myapp/main.py
+import logging
+
 from fastapi import FastAPI
-from myapp.orders.api import router as orders_router
+
+from myapp.orders import router as orders_router
+
+logging.basicConfig(level=logging.INFO)  # so the banner below is visible
 
 app = FastAPI()
-app.include_router(orders_router)
+app.include_router(orders_router, prefix="/orders")
 
 # That's it. Modules auto-discovered. Listeners auto-registered.
 # Transactional outbox available with one config line.
@@ -82,16 +147,25 @@ INFO:modulith:outbox disabled — set [tool.modulith].outbox = 'postgres' for du
 INFO:modulith:ready
 ```
 
+```bash
+$ curl -sX POST localhost:8000/orders \
+      -H 'content-type: application/json' -d '{"customer_id": "alice"}'
+{"order_id":"ord-1"}
+```
+
 The banner is emitted through the standard `modulith` logger at INFO
 level — it inherits your app's logging configuration rather than
 printing directly. Python surfaces only WARNING+ by default (and
-uvicorn configures only its own loggers), so enable INFO logging to
-see it, e.g. `logging.basicConfig(level=logging.INFO)` in `main.py`.
+uvicorn configures only its own loggers), which is why `main.py` above
+calls `logging.basicConfig(level=logging.INFO)`. That line is for plain
+`uvicorn`; the CLI sets the level itself from `--log-level` (default
+`info`), so `modulith dev` and `modulith run` show the banner with no
+logging setup of your own.
 modulith bootstraps lazily, so the banner follows uvicorn's own startup
 lines: it appears on first use — the first request that `publish()`es
-an event — not at process start.
+an event, i.e. the `curl` above — not at process start.
 
-The framework starts with zero external dependencies: in-memory broker and
+The framework starts with no external services at all: in-memory broker and
 outbox for development, then scales to durable SHM/SQLite (single-host),
 Redis Streams, or Postgres/MySQL/SQLite (distributed) with one config line.
 
@@ -134,31 +208,80 @@ configures itself.
 ### Install
 
 ```bash
-pip install modulith                 # just the framework
-pip install 'modulith[postgres]'     # adds Postgres outbox
-pip install 'modulith[database]'     # adds the database broker (Postgres/MySQL/SQLite)
-pip install 'modulith[all]'          # everything
+pip install 'modupy[fastapi,cli]'  # what the quickstart needs: FastAPI, uvicorn, the CLI
+pip install modupy                 # framework only — pluggy is its single dependency
+pip install 'modupy[postgres]'     # adds Postgres outbox
+pip install 'modupy[database]'     # adds the database broker (Postgres/MySQL/SQLite)
+pip install 'modupy[all]'          # everything
 ```
+
+Plain `pip install modupy` deliberately resolves to two packages, `modupy` and
+`pluggy`: the framework does not pick your web layer for you. The `fastapi`
+extra adds `fastapi`, `uvicorn` and `httpx` — needed by the quickstart below,
+by `uvicorn myapp.main:app`, and by the reverse proxy in process-per-module
+mode. The `cli` extra adds the `modulith` command (`typer` + `rich`).
+
+The distribution is `modupy` on PyPI, but the import name and the CLI are both
+`modulith` — `import modulith`, `modulith --help`. The two differ because the
+`modulith` name on PyPI belongs to an unrelated project.
 
 ### Define modules as subpackages
 
 ```
-myapp/
-├── __init__.py
-├── contracts/
-│   └── events.py              # shared event definitions
-├── orders/
-│   ├── __init__.py            # public API
-│   ├── _internal/             # private — verifier blocks cross-module access
-│   ├── api.py                 # FastAPI router
-│   └── handlers.py            # @listener functions (import from __init__.py!)
-├── inventory/
-└── main.py                    # FastAPI app
+myproject/                         # project root
+├── pyproject.toml                 # [project].name or [tool.modulith].package
+│                                  # — required by the CLI, see below
+└── myapp/
+    ├── __init__.py
+    ├── contracts/
+    │   ├── __init__.py            # shared event definitions
+    │   └── events.py
+    ├── inventory/
+    │   └── __init__.py
+    ├── orders/
+    │   ├── __init__.py            # public API + `router` re-export
+    │   ├── _internal/             # private — verifier blocks cross-module access
+    │   ├── api.py                 # FastAPI router — re-exported by __init__.py
+    │   └── handlers.py            # @listener functions (import from __init__.py!)
+    ├── payments/
+    │   └── __init__.py
+    └── main.py                    # FastAPI app
 ```
 
-Discovery imports each module *package* — keep `@listener` functions
-reachable from the module's `__init__.py` (e.g. `from . import handlers`)
-so they register at startup.
+Discovery imports each module *package*, so every module directory needs an
+`__init__.py` — a directory without one is a namespace package and is skipped
+silently. Keep `@listener` functions reachable from that `__init__.py`
+(e.g. `from . import handlers`) so they register at startup.
+
+**Re-export each module's router from its `__init__.py`.** Under `uvicorn`,
+`main.py` decides what is mounted where. Under `--topology=processes` there is
+no `main.py` in the worker at all: each worker process imports only its own
+module package and mounts whatever that package's `router` attribute holds
+under `/<module>`. A module whose router lives only in `api.py`, wired only
+through `main.py`, therefore serves nothing in that topology — every route
+answers 404 while the supervisor correctly reports the worker healthy, because
+the worker did boot and simply found no router to mount. The worker does say
+so — it logs a warning naming the module and the missing `router`, which the
+supervisor re-emits under a `[<module>]` prefix. Read that line before hunting
+an unexplained 404 anywhere else; if you have turned the logs down, the default
+`modulith run --log-level info` brings it back. The
+`from myapp.orders.api import router` line in `orders/__init__.py` above is what
+lets the same codebase serve both topologies; Cookbook recipe
+[8](docs/COOKBOOK.md#8-go-process-per-module-and-externalize-an-event) shows the
+same re-export in context, including where in `__init__.py` to put it when
+`api.py` imports back from the package. A module with no HTTP surface needs no
+`router`; it still gets a worker, and still consumes events.
+
+`pyproject.toml` is optional under `uvicorn` — the runtime infers the package
+from the calling module — but every CLI command except `audit` needs it (see
+the [CLI](#cli) section). The minimum that satisfies it:
+
+```toml
+# myproject/pyproject.toml
+[project]
+name = "myapp"
+version = "0.1.0"
+```
 
 ### Run normally
 
@@ -169,6 +292,29 @@ uvicorn myapp.main:app --reload
 The framework auto-detects your package, discovers modules, registers
 listeners, and configures itself. No `modulith.bootstrap()` call needed.
 
+### Run the same code process-per-module
+
+```bash
+$ modulith run myapp.main:app --topology=processes
+modulith → process-per-module: 3 worker(s) [inventory:9001, orders:9002, payments:9003], reverse proxy on http://0.0.0.0:8000
+```
+
+```bash
+$ curl -sX POST localhost:8000/orders \
+      -H 'content-type: application/json' -d '{"customer_id": "alice"}'
+{"order_id":"ord-1"}
+```
+
+The reverse proxy is the only public port; it routes `/<module>/...` to that
+module's worker, so the URL is unchanged from the single-process run above.
+The shared `contracts` module gets no worker of its own — it holds event
+definitions, not behaviour, and every worker imports it directly.
+
+Each worker's own output is re-emitted by the supervisor under a `[<module>]`
+prefix. The default `--log-level info` shows all of it; raise the level and a
+failing worker can shrink to `worker <name> exited with code N` with the
+traceback that explains it filtered out.
+
 ---
 
 ## Configuration
@@ -178,7 +324,7 @@ users never set anything beyond `outbox`:
 
 ```toml
 [tool.modulith]
-package = "myapp"               # auto-detected if not set
+package = "myapp"               # falls back to [project].name
 outbox = "postgres"             # default "memory" — switch for production
 broker = "redis-streams"        # default "memory" (single) / "shm" (processes)
 topology = "single"             # "single" | "processes"
@@ -242,6 +388,13 @@ key from `MODULITH_BROKER_<KEY>` (e.g. `MODULITH_BROKER_URL`,
 receives its connection URL; and the packaged alembic migration runner reads
 `MODULITH_DB_URL` (see [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md), Step 5).
 
+Two env vars have no `[tool.modulith]` counterpart at all.
+`MODULITH_PROXY_MAX_BODY_BYTES` raises the reverse proxy's request-body cap
+under `--topology processes` (10 MiB by default; the proxy buffers each body
+in memory, and a non-positive-integer value is a configuration error).
+`MODULITH_DEV_WARN_ONLY=1` downgrades `strict_boundaries` to warnings outside
+production — see the `strict_boundaries` note in the CLI section below.
+
 For `topology = "processes"`, an omitted broker defaults to the stdlib-only
 `shm` adapter. If `broker_options.url`/`dsn` or its environment equivalent is
 present, modulith instead infers `database`. An explicit `broker = "memory"` is
@@ -270,24 +423,50 @@ modulith docs                     # generate Mermaid diagrams + canvas
 modulith audit                    # analyze existing codebase for migration
                                   # (writes MIGRATION.md; --output to change)
 modulith doctor                   # operational + architectural health
-modulith outbox status            # outbox metrics
+modulith outbox status            # outbox metrics (needs a durable outbox —
+                                  # the default 'memory' store has nothing to
+                                  # report and exits 1)
 modulith info                     # show detected config
 ```
 
-The CLI requires the `cli` extra (`pip install 'modulith[cli]'`) and is a
+The CLI requires the `cli` extra (`pip install 'modupy[cli]'`) and is a
 progressive enhancement, not a requirement. Plain `uvicorn myapp.main:app`
 works the same way.
+
+**Turning the logs up or down.** `modulith dev` and `modulith run` both take
+`--log-level` — `debug`, `info`, `warning`, `error` or `critical`,
+case-insensitive — and propagate it to every worker subprocess under
+`--topology=processes`. The default is `info`, which is what makes the startup
+banner, the boundary warnings, and each worker's re-emitted `[<module>]` output
+visible without any `logging.basicConfig()` of your own; raise it and they go
+quiet. It is a flag only: there is no `[tool.modulith]` key and no environment
+variable for it.
+
+**The CLI needs a `pyproject.toml`.** Under uvicorn the runtime infers the
+application package by walking the call stack to the module that called into
+modulith; a CLI process has no such frame, so it reads
+`[tool.modulith].package` — falling back to `[project].name` — from the
+`pyproject.toml` in the current directory or any parent. Without one, every
+command except `audit` (which takes a path and needs no config) exits **1**
+with `could not determine the application package`. `MODULITH_PACKAGE` is the
+escape hatch when there is genuinely no `pyproject.toml`.
 
 Exit codes are uniform: **0** success (warnings may still be reported —
 `modulith dev` echoes verifier violations as non-fatal startup warnings,
 and `verify` fails only on ERROR-severity findings), **1** violations or
-user error (bad flags, config errors), **2** unexpected internal error.
+user error within a recognized command line (bad flag *values*, config
+errors), **2** unexpected internal error *and* CLI usage errors — an
+unknown option or a missing required argument exits 2, click's convention,
+which the CLI follows rather than fighting the framework.
 
 Set `strict_boundaries = true` in `[tool.modulith]` to fail fast on any
 boundary violation (ERROR or WARNING) in `modulith verify`, `modulith run`,
 and `modulith dev --topology=processes`. Note: single-process `modulith dev`
 remains warn-only regardless of `strict_boundaries` (its interactive
-development contract is inviolable).
+development contract is inviolable). It signals that to the runtime by
+setting `MODULITH_DEV_WARN_ONLY=1`, which survives uvicorn's `--reload` fork;
+exporting it yourself makes any non-production run warn-only, and
+`production = true` ignores it.
 
 ---
 
@@ -297,6 +476,7 @@ development contract is inviolable).
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — how modulith works internally: runtime, plugin contract, outbox, cross-process delivery, verifier
 - **[docs/COOKBOOK.md](docs/COOKBOOK.md)** — task-oriented recipes for common jobs
 - **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)** — the public API surface (generated from docstrings via `scripts/gen_api_reference.py`)
+- **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** — Docker/Kubernetes topologies, scaling strategies, health probes, operational playbooks
 - **[ROADMAP.md](ROADMAP.md)** — phase plan with checkboxes and kill criteria
 - **[MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)** — adopting on existing codebases
 - **[examples/demo_app](examples/demo_app)** — a runnable three-module shop; the fastest way to see modulith end-to-end
@@ -331,7 +511,7 @@ The project is currently in single-author development with the goal of
 shipping v1 in 3 months. Contributions are welcome but the design is
 opinionated; please read [SPEC.md](SPEC.md) before opening large PRs.
 
-The plugin contract (12 hookspecs, 4 protocols) is the most stable
+The plugin contract (13 hookspecs, 5 protocols) is the most stable
 part of the project — additions are easy, signature changes require
 strong justification. For a complete stability policy and what's guaranteed
 across 0.x minor releases, see [STABILITY.md](docs/STABILITY.md).
@@ -344,7 +524,7 @@ against fakes:
 
 ```bash
 pip install -e '.[test]'
-pytest                     # ~400 tests, no external services
+pytest                     # ~1,400 tests, no external services
 ```
 
 The **integration suite** exercises the real adapters end-to-end — a real
@@ -379,4 +559,4 @@ pytest -m integration
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Copyright 2026 Jean Sossmeier. Apache-2.0 — see [LICENSE](LICENSE).

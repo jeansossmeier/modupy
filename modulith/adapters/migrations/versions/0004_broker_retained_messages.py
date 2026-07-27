@@ -12,6 +12,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.mysql import DATETIME as MySQLDateTime
+from sqlalchemy.dialects.mysql import LONGBLOB as MySQLLongBlob
 
 revision: str = "0004_broker_retained_messages"
 down_revision: str | None = "0003_outbox_claim_leases"
@@ -24,6 +25,12 @@ _GROUP_LEN = 255
 _EVENT_TYPE_LEN = 255
 _TS = sa.DateTime(timezone=True).with_variant(MySQLDateTime(fsp=6), "mysql", "mariadb")
 
+# Payload type that holds a full-size publish on every dialect — plain
+# LargeBinary compiles to MySQL/MariaDB BLOB (65,535 bytes), far below the
+# broker's payload cap, so an oversized INSERT fails with error 1406. Inert on
+# Postgres/SQLite. Mirrors db_broker.broker_schema()'s `payload_type` exactly.
+_PAYLOAD = sa.LargeBinary().with_variant(MySQLLongBlob(), "mysql", "mariadb")
+
 
 def upgrade() -> None:
     op.create_table(
@@ -31,7 +38,7 @@ def upgrade() -> None:
         sa.Column("id", sa.String(_ID_LEN), nullable=False),
         sa.Column("target", sa.String(_TARGET_LEN), nullable=False),
         sa.Column("event_type", sa.String(_EVENT_TYPE_LEN), nullable=True),
-        sa.Column("payload", sa.LargeBinary(), nullable=False),
+        sa.Column("payload", _PAYLOAD, nullable=False),
         sa.Column("headers", sa.Text(), nullable=True),
         sa.Column("created_at", _TS, nullable=False),
         sa.Column("expires_at", _TS, nullable=False),

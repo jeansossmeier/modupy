@@ -1,7 +1,7 @@
 """Behavioral regression tests for InMemoryEventBus + BrokerRegistry.
 
-Each test cites the audit finding id it reproduces. These tests were written
-failing-first against the pre-fix code (strict TDD).
+Each test names the behaviour it pins, and was written failing-first against
+code that did not yet have it (strict TDD).
 """
 
 from __future__ import annotations
@@ -23,12 +23,12 @@ class BusEvent:
 
 
 # ---------------------------------------------------------------------------
-# A3-r3-130 — eager gather() argument evaluation
+# Eager gather() argument evaluation
 # ---------------------------------------------------------------------------
 
 
 async def test_call_time_error_does_not_skip_sibling_listeners() -> None:
-    """A3-r3-130: a handler that raises synchronously at call time (wrong
+    """A handler that raises synchronously at call time (wrong
     arity) must become a per-listener failure — it must NOT abort the whole
     dispatch before any sibling listener runs."""
     bus = InMemoryEventBus()
@@ -56,12 +56,12 @@ async def test_call_time_error_does_not_skip_sibling_listeners() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A3-r4-171 — register() must enforce its "handler must be async" contract
+# register() must enforce its "handler must be async" contract
 # ---------------------------------------------------------------------------
 
 
 def test_register_rejects_sync_handler_with_clear_error() -> None:
-    """A3-r4-171: registering a plain sync callable must fail loudly at
+    """Registering a plain sync callable must fail loudly at
     registration time, naming the handler — not poison the whole gather()
     batch at publish time with an opaque asyncio TypeError."""
     bus = InMemoryEventBus()
@@ -77,7 +77,7 @@ def test_register_rejects_sync_handler_with_clear_error() -> None:
 
 
 def test_register_accepts_wrapped_sync_and_async_handlers() -> None:
-    """A3-r4-171: the documented entry points (async def, wrap_sync_listener
+    """The documented entry points (async def, wrap_sync_listener
     output) must keep working."""
     from modulith.sync import wrap_sync_listener
 
@@ -95,7 +95,7 @@ def test_register_accepts_wrapped_sync_and_async_handlers() -> None:
 
 
 async def test_runtime_register_listener_rejects_sync_handler() -> None:
-    """A3-r4-171: the pre-bootstrap queueing path must validate too, so the
+    """The pre-bootstrap queueing path must validate too, so the
     error surfaces at the registration call site, not mid-bootstrap."""
     from modulith.runtime import Runtime
 
@@ -110,15 +110,15 @@ async def test_runtime_register_listener_rejects_sync_handler() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A3-r4-170 / A3-r5-205 — unsynchronized _handlers access
+# Unsynchronized _handlers access
 # ---------------------------------------------------------------------------
 
 
 def test_registered_event_types_safe_under_concurrent_register() -> None:
-    """A3-r4-170: registered_event_types() must not crash with 'dictionary
-    changed size during iteration' while another thread registers new event
-    types. (A3-r5-205's adjudicated fix — snapshot under a lock — is the same
-    mechanism, exercised here.)"""
+    """registered_event_types() must not crash with 'dictionary changed size
+    during iteration' while another thread registers new event types. The fix
+    — snapshotting the dict under the bus lock — also covers the sibling
+    listeners_for() read exercised here."""
     bus = InMemoryEventBus()
 
     async def handler(event: object) -> None:  # pragma: no cover
@@ -152,12 +152,12 @@ def test_registered_event_types_safe_under_concurrent_register() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A1-r3-127 — close_all() must survive a cancelled broker close
+# close_all() must survive a cancelled broker close
 # ---------------------------------------------------------------------------
 
 
 async def test_close_all_continues_after_cancelled_close() -> None:
-    """A1-r3-127: a broker whose close() raises asyncio.CancelledError must
+    """A broker whose close() raises asyncio.CancelledError must
     not abort cleanup of brokers registered after it."""
 
     class OkBroker:
@@ -191,7 +191,7 @@ async def test_close_all_continues_after_cancelled_close() -> None:
 
 
 # ---------------------------------------------------------------------------
-# W2 COVERAGE batch — closes audit coverage-gap findings (ids in docstrings)
+# BrokerRegistry partial-failure / replacement contracts and bus introspection
 # ---------------------------------------------------------------------------
 
 
@@ -212,7 +212,7 @@ class _RecordingBroker:
 
 
 async def test_close_all_logs_and_continues_after_raising_close(caplog) -> None:
-    """A1-r1-3: a broker whose close() raises a plain Exception must not abort
+    """A broker whose close() raises a plain Exception must not abort
     cleanup of brokers registered after it, and the error must be logged
     rather than propagated — the partial-failure contract close_all()'s
     docstring documents."""
@@ -239,7 +239,7 @@ async def test_close_all_logs_and_continues_after_raising_close(caplog) -> None:
 
 
 def test_unregister_is_a_noop_for_an_absent_scheme() -> None:
-    """A1-r2-73: unregister() on a scheme that was never registered is the
+    """unregister() on a scheme that was never registered is the
     documented silent no-op (0/1 boundary)."""
     registry = BrokerRegistry()
 
@@ -249,7 +249,7 @@ def test_unregister_is_a_noop_for_an_absent_scheme() -> None:
 
 
 async def test_unregister_then_register_replaces_the_broker() -> None:
-    """A1-r2-73: the sanctioned replace sequence — unregister, then register —
+    """The sanctioned replace sequence — unregister, then register —
     must succeed and route subsequent publishes to the replacement broker
     (re-registering without unregister stays a loud DuplicateBrokerError)."""
     registry = BrokerRegistry()
@@ -270,7 +270,7 @@ async def test_unregister_then_register_replaces_the_broker() -> None:
 
 
 def test_registered_event_types_lists_exactly_the_listened_types() -> None:
-    """A3-r1-8: registered_event_types() feeds the worker's deserialization
+    """registered_event_types() feeds the worker's deserialization
     allowlist (modulith/_worker.py) and its broker-stream subscriptions
     (modulith/_consumer.py), so its output must be exactly the event types
     with at least one registered listener — no duplicates, no strays."""
@@ -300,7 +300,7 @@ def test_registered_event_types_lists_exactly_the_listened_types() -> None:
 
 
 def test_clear_empties_listeners_and_registered_event_types() -> None:
-    """A3-r3-132: clear() removes every listener, emptying both listeners_for()
+    """clear() removes every listener, emptying both listeners_for()
     and registered_event_types() — the documented embedder-facing reset."""
     bus = InMemoryEventBus()
 
@@ -315,7 +315,7 @@ def test_clear_empties_listeners_and_registered_event_types() -> None:
 
 
 async def test_publish_logs_every_failing_listener_and_reraises_the_first(caplog) -> None:
-    """A3-r3-132: with several failing listeners, publish() logs each failure
+    """With several failing listeners, publish() logs each failure
     individually (debugging must not depend on which exception happens to be
     re-raised), re-raises the first in registration order, and still runs the
     healthy sibling."""

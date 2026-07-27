@@ -11,6 +11,7 @@ Output sections:
   3. Schema drift — events whose definitions changed since the last check
   4. Outbox health — incomplete/dead-letter counts
   5. Listener registration — declared vs actually registered
+  6. SHM notifier — whether each SHM broker's hint ring attached
 
 Each section either reports OK with summary stats or surfaces problems.
 A check that raises is reported as an error rather than aborting the run,
@@ -99,6 +100,7 @@ def run_doctor() -> HealthReport:
         ("schema drift", _check_schema_drift),
         ("outbox health", _check_outbox_health),
         ("listener registration", _check_listener_registration),
+        ("shm notifier", _check_shm_notifier),
     ]
 
     checks: list[HealthCheck] = []
@@ -242,10 +244,10 @@ def _check_split_readiness(rt: Runtime) -> HealthCheck:
     score = round(100 * publish_total / total)
     # MIGRATION_GUIDE.md's documented milestones are inclusive: 80%+ = ready
     # to split a module into its own process, 95%+ = ready to extract a
-    # microservice (A9-r1-32). Below that the score is an informational
+    # microservice. Below that the score is an informational
     # maturity signal and caps at "warn" — never "error": doctor doubles as a
     # CI gate, and a low score is the framework's own recommended starting
-    # state for a migration, not a defect (A9-r4-183).
+    # state for a migration, not a defect.
     if score >= 95:
         status, tier = "ok", " — microservice-ready"
     elif score >= 80:
@@ -421,6 +423,57 @@ def _check_listener_registration(rt: Runtime) -> HealthCheck:
     declared = sum(len(m.listeners) for m in manifests.values())
     return HealthCheck(
         "listener registration", "ok", f"{declared} declared listener(s), all registered"
+    )
+
+
+def _check_shm_notifier(rt: Runtime) -> HealthCheck:
+    """Report whether each SHM broker's hint ring actually attached.
+
+    A hint file is never re-created once it exists, and attaching requires its
+    header to match the configured ``shm_capacity`` exactly — so changing that
+    capacity on a deployment whose file already exists leaves the notifier dead
+    for every process that starts afterwards. Delivery is unaffected (SQLite
+    stays authoritative), but every consumer falls back to its safety poll,
+    which costs a poll interval of latency per message. The adapter logs one
+    WARNING when it happens (modulith/adapters/shm_broker.py), invisible to
+    anyone attaching to an already-running deployment; this makes it a standing
+    signal instead.
+
+    Warn, never error: the application is correct, only slower — and doctor
+    doubles as a CI gate.
+
+    Detected by duck-typing the broker's hint ring rather than importing the
+    adapter, so the check costs nothing for deployments that use a different
+    broker (or none).
+    """
+    registry = rt.broker_registry
+    if registry is None:
+        return HealthCheck("shm notifier", "ok", "no broker registry (single-process)")
+
+    attached = 0
+    detached: list[str] = []
+    for scheme in registry.schemes():
+        ring = getattr(registry.get(scheme), "_ring", None)
+        if ring is None:
+            continue  # not an SHM broker — it has no hint ring to attach
+        if ring.available:
+            attached += 1
+        else:
+            detached.append(
+                f"[{scheme}] hint file {ring.name} not attached at capacity={ring.capacity} "
+                "— consumers are polling. Stop every worker and delete the file "
+                "to have it re-created at the configured capacity."
+            )
+
+    if not detached:
+        if attached == 0:
+            return HealthCheck("shm notifier", "ok", "no shm broker registered")
+        return HealthCheck("shm notifier", "ok", f"{attached} hint ring(s) attached")
+    return HealthCheck(
+        "shm notifier",
+        "warn",
+        f"{len(detached)} of {len(detached) + attached} shm broker(s) have no working notifier",
+        detached,
     )
 
 

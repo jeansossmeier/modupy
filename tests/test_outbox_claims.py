@@ -1,6 +1,6 @@
-"""Regression tests for outbox claim / concurrency audit findings.
+"""Regression tests for outbox claim / concurrency behaviour.
 
-Each test cites the audit finding id it reproduces in its docstring. These
+Each test's docstring states the contract it pins. These
 exercise the storage-agnostic plugin logic against in-memory stub stores —
 no database. Async/timing behavior is synchronized with events and barriers,
 never with sleeps.
@@ -122,7 +122,7 @@ def _make_pub(handler: Any, *, value: int = 1, **overrides: Any) -> EventPublica
 
 
 # ---------------------------------------------------------------------------
-# A5-r4-175 — completion failure must record a failed attempt
+# Completion failure must record a failed attempt
 # ---------------------------------------------------------------------------
 
 
@@ -132,7 +132,7 @@ class FailingCompletionStore(StubStore):
 
 
 async def test_completion_failure_records_failed_attempt() -> None:
-    """A5-r4-175: a failure in _complete() must route through _record_failure
+    """A failure in _complete() must route through _record_failure
     so attempt_count/last_error/backoff/dead-lettering engage, instead of the
     exception escaping with the record forever looking never-attempted."""
     store = FailingCompletionStore()
@@ -153,7 +153,7 @@ async def test_completion_failure_records_failed_attempt() -> None:
 
 
 async def test_completion_failure_does_not_set_completed_at() -> None:
-    """Task 4: ``completed_at`` must be set only AFTER the store's completion
+    """``completed_at`` must be set only AFTER the store's completion
     write actually succeeds. Setting it beforehand (then failing the store
     call) leaves the in-memory record looking completed while the resave in
     _record_failure persists an inconsistent row: attempt_count incremented
@@ -171,7 +171,7 @@ async def test_completion_failure_does_not_set_completed_at() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Task 4 — retry-task shutdown must be safe across event loops
+# Retry-task shutdown must be safe across event loops
 # ---------------------------------------------------------------------------
 
 
@@ -211,8 +211,8 @@ async def test_shutdown_stops_retry_task_running_on_a_foreign_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A5-r2-84 / A5-r4-176 — observe-only hookimpls must never gate outbox dispatch
-# (fixed at the plugin-manager level by the G09 observe shield; these lock the
+# Observe-only hookimpls must never gate outbox dispatch
+# (fixed at the plugin-manager level by the observe-shield; these lock the
 # contract on the outbox dispatch path specifically)
 # ---------------------------------------------------------------------------
 
@@ -232,7 +232,7 @@ class _RaisingObserverPlugin:
 
 
 async def test_raising_dispatch_hookimpl_does_not_gate_listener() -> None:
-    """A5-r2-84: a raising modulith_on_listener_dispatch hookimpl must not
+    """A raising modulith_on_listener_dispatch hookimpl must not
     block listener invocation — the hookspec promises 'it observes, it
     doesn't gate'."""
     store = StubStore()
@@ -251,7 +251,7 @@ async def test_raising_dispatch_hookimpl_does_not_gate_listener() -> None:
 
 
 async def test_raising_error_and_complete_hookimpls_do_not_mask_failure() -> None:
-    """A5-r4-176: raising modulith_on_listener_error/_complete hookimpls must
+    """Raising modulith_on_listener_error/_complete hookimpls must
     be swallowed ('must not re-raise') — not escape dispatch and kill the
     retry loop while masking the listener's own failure handling."""
 
@@ -275,12 +275,12 @@ async def test_raising_error_and_complete_hookimpls_do_not_mask_failure() -> Non
 
 
 # ---------------------------------------------------------------------------
-# S1-r2-100 — retry-loop task must not inherit the creating publish's session
+# Retry-loop task must not inherit the creating publish's session
 # ---------------------------------------------------------------------------
 
 
 async def test_retry_loop_dispatch_does_not_inherit_bound_session() -> None:
-    """S1-r2-100: the retry task copies the ambient contextvars at creation
+    """The retry task copies the ambient contextvars at creation
     time; when it is lazily started during a transactional publish it froze
     the request's bound session forever, so cascading publishes from
     retry-dispatched listeners enlisted in a stale, never-committed session."""
@@ -310,12 +310,12 @@ async def test_retry_loop_dispatch_does_not_inherit_bound_session() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A5-r1-14 — dead_letter_after_attempts must be >= 1
+# dead_letter_after_attempts must be >= 1
 # ---------------------------------------------------------------------------
 
 
 def test_configure_rejects_nonpositive_dead_letter_threshold() -> None:
-    """A5-r1-14: a threshold <= 0 makes every record instantly dead-lettered,
+    """A threshold <= 0 makes every record instantly dead-lettered,
     silently blackholing crash-recovered publications forever."""
     store = StubStore()
     for bad in (0, -3):
@@ -326,7 +326,7 @@ def test_configure_rejects_nonpositive_dead_letter_threshold() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A5-r1-15 — a failing sweep must not kill the retry loop
+# A failing sweep must not kill the retry loop
 # ---------------------------------------------------------------------------
 
 
@@ -346,7 +346,7 @@ class FlakyStore(StubStore):
 
 
 async def test_sweep_failure_does_not_kill_retry_loop() -> None:
-    """A5-r1-15: a transient store error during one sweep must only skip that
+    """A transient store error during one sweep must only skip that
     sweep — previously it permanently killed the retry-loop task."""
     store = FlakyStore()
     outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=0.01)
@@ -358,12 +358,12 @@ async def test_sweep_failure_does_not_kill_retry_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A5-r2-83 / S1-r1-47 — _reset_for_testing must cancel the retry task
+# _reset_for_testing must cancel the retry task
 # ---------------------------------------------------------------------------
 
 
 async def test_reset_for_testing_cancels_retry_task() -> None:
-    """A5-r2-83 / S1-r1-47: _reset_for_testing() dropped the task reference
+    """_reset_for_testing() dropped the task reference
     without cancelling, leaking ghost retry loops that keep polling whatever
     store is currently bound."""
     store = StubStore()
@@ -378,12 +378,12 @@ async def test_reset_for_testing_cancels_retry_task() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A5-r2-85 — naive datetimes from a nonconforming store must not crash backoff
+# Naive datetimes from a nonconforming store must not crash backoff
 # ---------------------------------------------------------------------------
 
 
 def test_backoff_elapsed_tolerates_naive_datetimes() -> None:
-    """A5-r2-85: a custom store may round-trip naive datetimes (SQLite loses
+    """A custom store may round-trip naive datetimes (SQLite loses
     tz); _backoff_elapsed must interpret them as UTC instead of crashing the
     retry loop with a naive/aware subtraction TypeError."""
     naive_now_utc = datetime.now(UTC).replace(tzinfo=None)
@@ -403,12 +403,12 @@ def test_backoff_elapsed_tolerates_naive_datetimes() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A5-r3-134 — shutdown() window must not allow a second retry loop to spawn
+# shutdown() window must not allow a second retry loop to spawn
 # ---------------------------------------------------------------------------
 
 
 async def test_shutdown_window_does_not_spawn_second_retry_loop() -> None:
-    """A5-r3-134: shutdown() nulled _retry_task before cancellation completed,
+    """shutdown() nulled _retry_task before cancellation completed,
     so a concurrent transactional publish spun up a second retry loop that
     survived shutdown entirely."""
     store = StubStore()
@@ -432,12 +432,12 @@ async def test_shutdown_window_does_not_spawn_second_retry_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A5-r1-16 — re-configure must not silently reuse the stale retry loop
+# Re-configure must not silently reuse the stale retry loop
 # ---------------------------------------------------------------------------
 
 
 async def test_reconfigure_replaces_retry_loop_and_resweeps_new_store() -> None:
-    """A5-r1-16 (adjudicated): configure() with a live retry task must cancel
+    """configure() with a live retry task must cancel
     and restart it so the new store gets its own crash sweep."""
     store_a = StubStore()
     store_b = StubStore()
@@ -457,14 +457,14 @@ async def test_reconfigure_replaces_retry_loop_and_resweeps_new_store() -> None:
 
 
 # ---------------------------------------------------------------------------
-# S1-r2-102 — retry-loop startup must be single-shot across OS threads/loops
+# Retry-loop startup must be single-shot across OS threads/loops
 # ---------------------------------------------------------------------------
 
 
 def test_ensure_retry_loop_single_task_across_threads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """S1-r2-102: two event loops on two OS threads (main loop + sync.py's
+    """Two event loops on two OS threads (main loop + sync.py's
     daemon-thread loop) racing _ensure_retry_loop() must produce exactly one
     retry-loop task — the module slot is process-global.
 
@@ -524,14 +524,14 @@ def test_ensure_retry_loop_single_task_across_threads(
 
 
 # ---------------------------------------------------------------------------
-# S1-r2-103 — the in-flight guard must be atomic across OS threads/loops
+# The in-flight guard must be atomic across OS threads/loops
 # ---------------------------------------------------------------------------
 
 
 def test_inflight_guard_is_atomic_across_threads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """S1-r2-103: the documented same-process non-reentrancy guarantee must
+    """The documented same-process non-reentrancy guarantee must
     hold across two event loops on two OS threads — the plain-set check+add
     let both dispatchers pass the check before either added, delivering the
     same publication to its listener concurrently."""

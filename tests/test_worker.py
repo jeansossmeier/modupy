@@ -312,6 +312,162 @@ def test_module_router_is_mounted_under_module_prefix(make_fake_app, monkeypatch
     assert resp.json() == {"pong": True}
 
 
+def test_module_without_router_warns_naming_module_and_attribute(
+    make_fake_app, monkeypatch, caplog
+) -> None:
+    """A module with no ``router`` attribute produced a worker that booted,
+    reported healthy, and 404'd every request under its prefix without a word
+    anywhere. The worker must say what it looked for and where, at WARNING —
+    uvicorn leaves the root logger handler-less, so an INFO line would be
+    dropped in exactly the deployment that needs it."""
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+    caplog.set_level("WARNING", logger="modulith.worker")
+
+    app = create_app()
+    with TestClient(app) as client:
+        assert client.get("/orders/anything").status_code == 404
+
+    warnings = [r.getMessage() for r in caplog.records if r.name == "modulith.worker"]
+    assert any("'router'" in m and "fakeapp.orders" in m and "404" in m for m in warnings), (
+        f"no diagnosable warning about the missing router: {warnings}"
+    )
+
+
+def test_module_with_router_does_not_warn(make_fake_app, monkeypatch, caplog) -> None:
+    """The companion guard: a module that DOES expose a router must stay
+    silent at WARNING, so the missing-router warning keeps its signal."""
+    make_fake_app(
+        {
+            "orders": """
+                from fastapi import APIRouter
+
+                router = APIRouter()
+
+                @router.get("/ping")
+                async def ping() -> dict[str, bool]:
+                    return {"pong": True}
+            """
+        }
+    )
+    _set_worker_env(monkeypatch, "orders")
+    caplog.set_level("WARNING", logger="modulith.worker")
+
+    create_app()
+
+    assert [r.getMessage() for r in caplog.records if r.name == "modulith.worker"] == []
+
+
+# ---------------------------------------------------------------------------
+# docs / OpenAPI URLs
+#
+# The reverse proxy forwards /<module>/* to this worker and nothing else, so
+# FastAPI's default doc paths are unreachable from the public port. The worker
+# serves them under its own module prefix instead. tests/test_worker_docs_urls.py
+# proves the same URLs answer through a real proxy on a real socket.
+# ---------------------------------------------------------------------------
+
+
+def test_docs_and_schema_are_served_under_the_module_prefix(make_fake_app, monkeypatch) -> None:
+    """FastAPI defaults /docs, /redoc, /openapi.json and /docs/oauth2-redirect
+    to app-root paths, all of which sit outside the /<module> prefix the proxy
+    forwards — every one of them 404s on the public port. The worker serves all
+    four under its own prefix instead, and moves rather than duplicates them:
+    the root copies answer only on the internal port, where a second set of URLs
+    for the same schema is just a way to document the wrong one."""
+    make_fake_app(
+        {
+            "orders": """
+                from fastapi import APIRouter
+
+                router = APIRouter()
+
+                @router.get("/ping")
+                async def ping() -> dict[str, bool]:
+                    return {"pong": True}
+            """
+        }
+    )
+    _set_worker_env(monkeypatch, "orders")
+
+    app = create_app()
+    with TestClient(app) as client:
+        schema = client.get("/orders/openapi.json")
+        prefixed = {
+            path: client.get(path).status_code
+            for path in ("/orders/docs", "/orders/redoc", "/orders/docs/oauth2-redirect")
+        }
+        unprefixed = {
+            path: client.get(path).status_code
+            for path in ("/openapi.json", "/docs", "/redoc", "/docs/oauth2-redirect")
+        }
+
+    assert schema.status_code == 200
+    assert "/orders/ping" in schema.json()["paths"]
+    assert prefixed == {
+        "/orders/docs": 200,
+        "/orders/redoc": 200,
+        "/orders/docs/oauth2-redirect": 200,
+    }
+    assert unprefixed == {
+        "/openapi.json": 404,
+        "/docs": 404,
+        "/redoc": 404,
+        "/docs/oauth2-redirect": 404,
+    }
+
+
+def test_doc_pages_reference_prefixed_urls(make_fake_app, monkeypatch) -> None:
+    """Reaching /<module>/docs is only half of it: the page is useless unless
+    the URLs it embeds resolve from the public port too. Swagger UI fetches the
+    schema from the openapi_url baked into the page and posts OAuth2 back to
+    swagger_ui_oauth2_redirect_url, which FastAPI does NOT derive from docs_url
+    — it defaults to the literal "/docs/oauth2-redirect"."""
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+
+    app = create_app()
+    with TestClient(app) as client:
+        swagger = client.get("/orders/docs").text
+        redoc = client.get("/orders/redoc").text
+
+    assert "url: '/orders/openapi.json'" in swagger
+    assert "'/orders/docs/oauth2-redirect'" in swagger
+    assert 'spec-url="/orders/openapi.json"' in redoc
+
+
+@pytest.mark.parametrize("module_name", ["orders", "docs"])
+def test_module_route_wins_over_generated_doc_route(
+    make_fake_app, monkeypatch, module_name: str
+) -> None:
+    """Serving docs under /<module> puts them inside the module's own URL
+    namespace, where they can collide with the module's routes: a module named
+    "docs" gets its UI at /docs/docs, and any module defining its own /docs
+    route lands on the same path. The application's route must win — the
+    reverse is a real route silently shadowed by a generated UI page."""
+    make_fake_app(
+        {
+            module_name: """
+                from fastapi import APIRouter
+
+                router = APIRouter()
+
+                @router.get("/docs")
+                async def module_docs() -> dict[str, str]:
+                    return {"served_by": "module"}
+            """
+        }
+    )
+    _set_worker_env(monkeypatch, module_name)
+
+    app = create_app()
+    with TestClient(app) as client:
+        response = client.get(f"/{module_name}/docs")
+
+    assert response.status_code == 200
+    assert response.json() == {"served_by": "module"}
+
+
 # ---------------------------------------------------------------------------
 # contracts module import
 # ---------------------------------------------------------------------------
@@ -516,13 +672,13 @@ def test_shm_worker_without_listeners_reconciles_previous_deployment(
 
 
 # ---------------------------------------------------------------------------
-# Task 6 (runtime-sync) — module lifecycle fires for the isolated worker's
-# own module, and lifespan teardown always reaches runtime/broker shutdown
+# Module lifecycle fires for the isolated worker's own module, and lifespan
+# teardown always reaches runtime/broker shutdown
 # ---------------------------------------------------------------------------
 
 
 def test_worker_fires_after_module_load_for_its_own_module(make_fake_app, monkeypatch) -> None:
-    """lifecycle-location: the monolith's bootstrap fires
+    """The monolith's bootstrap fires
     modulith_after_module_load once per discovered module (see
     test_runtime_hooks.py::test_bootstrap_fires_after_module_load_once_per_module).
     A process-per-module worker bootstraps with auto_discover=False, so that
@@ -554,7 +710,7 @@ def test_worker_fires_after_module_load_for_its_own_module(make_fake_app, monkey
 async def test_lifespan_teardown_runs_runtime_shutdown_when_consumer_stop_fails(
     make_fake_app, monkeypatch
 ) -> None:
-    """simultaneous-error (worker half): a consumer.stop() failure during
+    """A consumer.stop() failure during
     lifespan teardown must not skip runtime.shutdown() — otherwise every
     broker connection the worker registered leaks whenever the consumer
     fails to stop cleanly (a very ordinary shutdown-race occurrence, not an
@@ -597,8 +753,8 @@ async def test_lifespan_teardown_runs_runtime_shutdown_when_consumer_stop_fails(
 async def test_lifespan_teardown_combines_both_failures_into_exception_group(
     make_fake_app, monkeypatch
 ) -> None:
-    """simultaneous-error (worker half, both sides failing): when
-    consumer.stop() AND runtime.shutdown() both fail, neither error may
+    """When both sides fail —
+    consumer.stop() AND runtime.shutdown() — neither error may
     silently displace the other. A bare re-raise of whichever failed last
     would hide the first failure from whoever is debugging the teardown."""
 
@@ -630,3 +786,85 @@ async def test_lifespan_teardown_combines_both_failures_into_exception_group(
 
     messages = {str(exc) for exc in exc_info.value.exceptions}
     assert messages == {"consumer refused to stop", "runtime shutdown also failed"}
+
+
+async def test_lifespan_startup_failure_still_runs_runtime_shutdown(
+    make_fake_app, monkeypatch
+) -> None:
+    """A consumer.start() failure (broker down, group creation denied, bad
+    credentials) must still reach runtime.shutdown(). uvicorn exits the
+    process on a lifespan-startup error so the OS reclaims the sockets, but
+    an embedder that keeps the process alive — a test harness, a retry loop —
+    leaks every broker client the runtime registered on each attempt."""
+
+    class _FailingStartConsumer:
+        def __init__(self) -> None:
+            self.stopped = False
+
+        async def start(self) -> None:
+            raise RuntimeError("broker unreachable at startup")
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    consumer = _FailingStartConsumer()
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.setattr(
+        worker_module,
+        "_build_consumer",
+        lambda _module, _consumer_name: consumer,
+    )
+
+    app = create_app()
+
+    shutdown_called = False
+    original_shutdown = _runtime.shutdown
+
+    async def _tracking_shutdown() -> None:
+        nonlocal shutdown_called
+        shutdown_called = True
+        await original_shutdown()
+
+    monkeypatch.setattr(_runtime, "shutdown", _tracking_shutdown)
+
+    with pytest.raises(RuntimeError, match="broker unreachable at startup"):
+        with TestClient(app):
+            pass
+
+    assert shutdown_called, "runtime.shutdown() was skipped because consumer.start() raised"
+    assert consumer.stopped, "consumer.stop() was skipped because consumer.start() raised"
+
+
+async def test_lifespan_consumer_build_failure_still_runs_runtime_shutdown(
+    make_fake_app, monkeypatch
+) -> None:
+    """Same leak, one step earlier: _build_consumer() raising (a missing
+    broker/consumer adapter for the configured scheme) must not bypass
+    runtime.shutdown() either — bootstrap has already run by then, so the
+    runtime owns registrations that need releasing."""
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+
+    def _explode(_module, _consumer_name):
+        raise ConfigurationError("no consumer adapter registered")
+
+    monkeypatch.setattr(worker_module, "_build_consumer", _explode)
+
+    app = create_app()
+
+    shutdown_called = False
+    original_shutdown = _runtime.shutdown
+
+    async def _tracking_shutdown() -> None:
+        nonlocal shutdown_called
+        shutdown_called = True
+        await original_shutdown()
+
+    monkeypatch.setattr(_runtime, "shutdown", _tracking_shutdown)
+
+    with pytest.raises(ConfigurationError, match="no consumer adapter registered"):
+        with TestClient(app):
+            pass
+
+    assert shutdown_called, "runtime.shutdown() was skipped because _build_consumer() raised"

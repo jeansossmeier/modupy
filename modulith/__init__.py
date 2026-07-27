@@ -12,12 +12,17 @@ Public API for two audiences:
 Anything not re-exported here is internal and may change without notice.
 """
 
-from importlib.metadata import PackageNotFoundError
+# Both importlib.metadata names are aliased under a leading underscore: an
+# unaliased import would bind ``modulith.PackageNotFoundError`` as a public
+# attribute, offering it in ``dir(modulith)`` and editor completion next to
+# real modulith errors like ConfigurationError — where it would never fire,
+# since it can only be raised during this module's own import.
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
 try:
-    __version__ = _pkg_version("modulith")
-except PackageNotFoundError:  # running from a source checkout that isn't installed
+    __version__ = _pkg_version("modupy")
+except _PackageNotFoundError:  # running from a source checkout that isn't installed
     __version__ = "0.9.0"
 
 # ----- Application-facing API (what most users need) -----------------------

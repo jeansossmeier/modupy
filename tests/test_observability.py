@@ -202,7 +202,7 @@ def test_hooks_are_noop_when_otel_unavailable(monkeypatch) -> None:
 
 
 async def test_durable_path_emits_publish_span(span_exporter) -> None:
-    """A11-r4-187: the durable (outbox) path must emit a publish span.
+    """The durable (outbox) path must emit a publish span.
 
     ``Runtime.publish`` fires ``modulith_after_event_published`` on the
     durable path right after the event is persisted (the hookspec's
@@ -242,12 +242,12 @@ async def test_durable_path_emits_publish_span(span_exporter) -> None:
 
 
 # ---------------------------------------------------------------------------
-# event.module attribute (A11-r4-190)
+# event.module attribute
 # ---------------------------------------------------------------------------
 
 
 async def test_publish_span_carries_calling_module(make_fake_app, span_exporter) -> None:
-    """A11-r4-190: the publish span's documented ``event.module`` attribute
+    """The publish span's documented ``event.module`` attribute
     must name the application module publish() was called from (populated by
     ``_detect_calling_module``'s stack walk)."""
     make_fake_app(
@@ -276,7 +276,7 @@ async def test_publish_span_carries_calling_module(make_fake_app, span_exporter)
 
 
 def test_publish_span_event_module_falls_back_to_unknown(span_exporter) -> None:
-    """A11-r4-190: when no application package is configured, calling-module
+    """When no application package is configured, calling-module
     detection degrades to the documented ``"unknown"`` fallback instead of
     perturbing the publish path."""
     from uuid import uuid4
@@ -293,3 +293,32 @@ def test_publish_span_event_module_falls_back_to_unknown(span_exporter) -> None:
 
     (publish_span,) = _spans_by_name(span_exporter, "modulith.event.publish")
     assert publish_span.attributes["event.module"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Instrumenting-library version
+# ---------------------------------------------------------------------------
+
+
+def test_tracer_version_is_not_a_hardcoded_copy() -> None:
+    """The instrumenting-library version must come from ``modulith.__version__``.
+
+    A literal here is a silent third copy of the release version, feeding live
+    OTel scope metadata: a release bump that misses it ships spans tagged with
+    the previous version, and nothing in the build notices. Read the source
+    (importing the module yields the resolved value, which cannot detect the
+    drift) and assert no version literal was reintroduced.
+    """
+    import re
+    from pathlib import Path
+
+    import modulith
+    from modulith.builtin import observability as obs
+
+    source = Path(obs.__file__).read_text(encoding="utf-8")
+    literals = re.findall(r'^\s*\w+\s*=\s*"(\d+\.\d+\.\d+[^"]*)"', source, re.MULTILINE)
+    assert literals == [], (
+        f"modulith/builtin/observability.py hardcodes version literal(s) {literals} — "
+        "use modulith.__version__ so the tracer metadata cannot drift"
+    )
+    assert obs._tracer._instrumenting_library_version == modulith.__version__

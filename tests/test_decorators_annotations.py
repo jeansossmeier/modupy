@@ -150,3 +150,66 @@ def test_unresolvable_string_annotation_raises_clear_error(make_fake_app) -> Non
 
     with pytest.raises(TypeError, match="could not resolve"):
         importlib.import_module(f"{pkg}.broken")
+
+
+@pytest.mark.asyncio
+async def test_type_checking_only_annotation_on_another_parameter_is_tolerated(
+    make_fake_app,
+) -> None:
+    """Only the EVENT parameter's annotation is resolved.
+
+    Resolving the whole annotation dict (``inspect.get_annotations(eval_str=
+    True)``) evaluated the return type and every other parameter too, so a
+    ``TYPE_CHECKING``-only import on a second parameter — the framework's own
+    sanctioned way to break a runtime import cycle, see ``builtin.verifier`` —
+    raised NameError and was reported as an unresolvable *event* annotation.
+    That blamed the wrong parameter AND rejected, at import time, a listener
+    the bus invokes with the event alone and which runs perfectly well.
+    """
+    make_fake_app(
+        {
+            "orders": """
+                from __future__ import annotations
+
+                from dataclasses import dataclass
+                from typing import TYPE_CHECKING
+
+                from modulith import event, listener, publish
+
+                if TYPE_CHECKING:
+                    from nowhere.at.all import Session
+
+                @event
+                @dataclass(frozen=True)
+                class Ping:
+                    n: int
+
+                seen: list[int] = []
+
+                @listener
+                async def on_ping(event: Ping, session: Session | None = None) -> None:
+                    seen.append(event.n)
+
+                async def ping(n: int) -> None:
+                    await publish(Ping(n=n))
+            """,
+        }
+    )
+
+    from modulith.runtime import _runtime
+
+    _runtime.configure(package="fakeapp")
+    _runtime.ensure_bootstrapped()
+
+    from fakeapp.orders import (  # type: ignore[import-not-found]
+        Ping,
+        on_ping,
+        ping,
+        seen,
+    )
+
+    assert _runtime.event_bus is not None
+    assert on_ping in _runtime.event_bus.listeners_for(Ping)
+
+    await ping(7)
+    assert seen == [7]

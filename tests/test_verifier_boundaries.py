@@ -1,10 +1,8 @@
-"""Regression tests for audit findings on the boundary
-verifier (``modulith/builtin/verifier.py``), manifests (``modulith/manifest.py``)
-and the audit tool (``modulith/audit.py``).
+"""Regression tests for the boundary verifier (``modulith/builtin/verifier.py``),
+manifests (``modulith/manifest.py``) and the audit tool (``modulith/audit.py``).
 
-Each test cites the audit finding id it reproduces. Written test-first: every
-behavioral test here failed against the pre-fix code for the reason the
-finding describes.
+Written test-first: every behavioral test here failed against the pre-fix code
+for the reason its own docstring describes.
 """
 
 from __future__ import annotations
@@ -45,12 +43,12 @@ def _write(root: Path, rel: str, source: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# A10-r1-33 — baseline fingerprint must survive unrelated line shifts
+# Baseline fingerprint must survive unrelated line shifts
 # ---------------------------------------------------------------------------
 
 
 def test_baseline_survives_line_shift(tmp_path: Path) -> None:
-    """A10-r1-33: a grandfathered violation must stay grandfathered when an
+    """A grandfathered violation must stay grandfathered when an
     unrelated edit above it shifts its line number."""
     path = tmp_path / "baseline.json"
     at_line_10 = Violation(
@@ -68,7 +66,7 @@ def test_baseline_survives_line_shift(tmp_path: Path) -> None:
 
 
 def test_legacy_baseline_with_file_line_locations_still_matches(tmp_path: Path) -> None:
-    """A10-r1-33: baselines written by older versions carry ``file:line``
+    """Baselines written by older versions carry ``file:line``
     locations; they must be normalized on load, not silently mismatched."""
     message = "orders imports inventory._internal"
     digest = hashlib.sha256(message.encode("utf-8")).hexdigest()[:8]
@@ -98,7 +96,7 @@ def test_legacy_baseline_with_file_line_locations_still_matches(tmp_path: Path) 
 
 
 # ---------------------------------------------------------------------------
-# W3 R3-F2 — count-aware ratchet: a NEW violation identical to a
+# Count-aware ratchet: a NEW violation identical to a
 # grandfathered one (same rule/module/file/message, different line) must
 # not slip through the baseline
 # ---------------------------------------------------------------------------
@@ -114,7 +112,7 @@ def _ratchet_violation(location: str) -> Violation:
 
 
 def test_new_identical_violation_fails_ratchet(tmp_path: Path) -> None:
-    """W3 R3-F2: with ONE grandfathered violation baselined, a SECOND
+    """With ONE grandfathered violation baselined, a SECOND
     violation carrying the identical fingerprint (new line, same file/rule/
     module/message) must be reported — the baseline grants an allowance of
     one, not a blanket pass for the fingerprint."""
@@ -130,7 +128,7 @@ def test_new_identical_violation_fails_ratchet(tmp_path: Path) -> None:
 
 
 def test_ratchet_allows_up_to_baselined_count(tmp_path: Path) -> None:
-    """W3 R3-F2: a baseline recorded with two identical violations allows
+    """A baseline recorded with two identical violations allows
     two — and fewer than baselined stays green (the ratchet only tightens)."""
     path = tmp_path / "baseline.json"
     first = _ratchet_violation("fakeapp/orders/__init__.py:10")
@@ -145,7 +143,7 @@ def test_ratchet_allows_up_to_baselined_count(tmp_path: Path) -> None:
 
 
 def test_write_baseline_records_fingerprint_counts(tmp_path: Path) -> None:
-    """W3 R3-F2: the baseline stores one entry per fingerprint with its
+    """The baseline stores one entry per fingerprint with its
     count, so --update-baseline captures the multiplicity."""
     path = tmp_path / "baseline.json"
     first = _ratchet_violation("fakeapp/orders/__init__.py:10")
@@ -158,7 +156,7 @@ def test_write_baseline_records_fingerprint_counts(tmp_path: Path) -> None:
 
 
 def test_old_baseline_without_count_defaults_to_one(tmp_path: Path) -> None:
-    """W3 R3-F2 backward compat: entries written by older versions carry no
+    """Backward compat: entries written by older versions carry no
     ``count`` — they read as an allowance of exactly one."""
     message = "orders imports inventory._internal"
     digest = hashlib.sha256(message.encode("utf-8")).hexdigest()[:8]
@@ -185,8 +183,8 @@ def test_old_baseline_without_count_defaults_to_one(tmp_path: Path) -> None:
 
 
 def test_load_baseline_invalid_count_raises_configuration_error(tmp_path: Path) -> None:
-    """W3 R3-F2: a malformed ``count`` is a schema error with the same clean
-    ConfigurationError treatment as the other fields (A10-r5-219)."""
+    """A malformed ``count`` is a schema error with the same clean
+    ConfigurationError treatment as the other fields."""
     path = tmp_path / "baseline.json"
     path.write_text(
         json.dumps(
@@ -207,13 +205,13 @@ def test_load_baseline_invalid_count_raises_configuration_error(tmp_path: Path) 
 
 
 # ---------------------------------------------------------------------------
-# A10-r1-34 / A10-r3-146 — TYPE_CHECKING imports visible to rules 1, 3, 4;
+# TYPE_CHECKING imports visible to rules 1, 3, 4;
 # still exempt from cycle detection (rule 2)
 # ---------------------------------------------------------------------------
 
 
 def test_type_checking_private_import_flagged_by_rule_1(make_fake_app) -> None:
-    """A10-r1-34: a private-package import inside ``if TYPE_CHECKING:`` must
+    """A private-package import inside ``if TYPE_CHECKING:`` must
     still violate no-internal-imports."""
     make_fake_app(
         {
@@ -235,7 +233,7 @@ def test_type_checking_private_import_flagged_by_rule_1(make_fake_app) -> None:
 
 
 def test_type_checking_type_import_flagged_by_rule_4(make_fake_app) -> None:
-    """A10-r1-34: a cross-module type import inside ``if TYPE_CHECKING:`` is
+    """A cross-module type import inside ``if TYPE_CHECKING:`` is
     exactly rule 4's target case and must be flagged."""
     make_fake_app(
         {
@@ -257,7 +255,7 @@ def test_type_checking_type_import_flagged_by_rule_4(make_fake_app) -> None:
 
 
 def test_type_checking_import_flagged_by_rule_3(make_fake_app) -> None:
-    """A10-r3-146: a TYPE_CHECKING-only import from an undeclared module must
+    """A TYPE_CHECKING-only import from an undeclared module must
     violate declared_dependencies (deny-all via explicit empty tuple)."""
     from modulith import manifest as manifest_module
 
@@ -285,7 +283,7 @@ def test_type_checking_import_flagged_by_rule_3(make_fake_app) -> None:
 
 
 def test_type_checking_mutual_imports_are_not_a_cycle(make_fake_app) -> None:
-    """A10-r3-146 / A10-r1-34: TYPE_CHECKING-guarded imports impose no runtime
+    """TYPE_CHECKING-guarded imports impose no runtime
     dependency — they are the sanctioned way to break a runtime cycle, so
     cycle detection (rule 2) must ignore them."""
     make_fake_app(
@@ -308,12 +306,12 @@ def test_type_checking_mutual_imports_are_not_a_cycle(make_fake_app) -> None:
 
 
 # ---------------------------------------------------------------------------
-# A10-r5-217 — TYPE_CHECKING alias must be recognized as a guard
+# TYPE_CHECKING alias must be recognized as a guard
 # ---------------------------------------------------------------------------
 
 
 def test_aliased_type_checking_guard_is_recognized(make_fake_app) -> None:
-    """A10-r5-217: ``from typing import TYPE_CHECKING as TC`` must still be
+    """``from typing import TYPE_CHECKING as TC`` must still be
     detected as a type-only guard — mutual TC-guarded imports are not a
     runtime cycle, and the guarded records are tagged type_only."""
     make_fake_app(
@@ -341,12 +339,12 @@ def test_aliased_type_checking_guard_is_recognized(make_fake_app) -> None:
 
 
 # ---------------------------------------------------------------------------
-# A10-r2-96 — rule 4 must match runtime usage by the locally-bound alias
+# Rule 4 must match runtime usage by the locally-bound alias
 # ---------------------------------------------------------------------------
 
 
 def test_aliased_import_used_at_runtime_is_not_flagged(make_fake_app) -> None:
-    """A10-r2-96: ``from x import Y as Z`` with Z used at runtime is a runtime
+    """``from x import Y as Z`` with Z used at runtime is a runtime
     value, not an annotation-only type — rule 4 must not flag it."""
     make_fake_app(
         {
@@ -365,7 +363,7 @@ def test_aliased_import_used_at_runtime_is_not_flagged(make_fake_app) -> None:
 
 
 def test_aliased_annotation_only_import_is_still_flagged(make_fake_app) -> None:
-    """A10-r2-96 (guard against over-fix): an aliased import used only in an
+    """Guard against over-fix: an aliased import used only in an
     annotation is still an annotation-only type import — flagged."""
     make_fake_app(
         {
@@ -384,12 +382,12 @@ def test_aliased_annotation_only_import_is_still_flagged(make_fake_app) -> None:
 
 
 # ---------------------------------------------------------------------------
-# A10-r4-185 — names referenced only inside TYPE_CHECKING are not runtime uses
+# Names referenced only inside TYPE_CHECKING are not runtime uses
 # ---------------------------------------------------------------------------
 
 
 def test_type_checking_reference_does_not_count_as_runtime_use(make_fake_app) -> None:
-    """A10-r4-185: a name referenced only inside ``if TYPE_CHECKING:`` never
+    """A name referenced only inside ``if TYPE_CHECKING:`` never
     executes — it must not exempt a real annotation-only import from rule 4."""
     make_fake_app(
         {
@@ -412,12 +410,12 @@ def test_type_checking_reference_does_not_count_as_runtime_use(make_fake_app) ->
 
 
 # ---------------------------------------------------------------------------
-# A10-r1-35 — contracts is an import sink
+# The contracts package is an import sink
 # ---------------------------------------------------------------------------
 
 
 def test_contracts_importing_from_module_is_flagged(make_fake_app) -> None:
-    """A10-r1-35: SPEC 5.3 — contracts may not import from any application
+    """SPEC 5.3 — contracts may not import from any application
     module; a plain runtime import must be flagged."""
     make_fake_app(
         {
@@ -437,7 +435,7 @@ def test_contracts_importing_from_module_is_flagged(make_fake_app) -> None:
 
 
 def test_module_importing_contracts_is_not_flagged_as_sink(make_fake_app) -> None:
-    """A10-r1-35 (direction check): the sink rule only applies to the
+    """Direction check: the sink rule only applies to the
     contracts module itself."""
     make_fake_app(
         {
@@ -455,14 +453,14 @@ def test_module_importing_contracts_is_not_flagged_as_sink(make_fake_app) -> Non
 
 
 # ---------------------------------------------------------------------------
-# A10-r2-97 — rule 3 message must not embed the declared_dependencies list
+# Rule 3's message must not embed the declared_dependencies list
 # ---------------------------------------------------------------------------
 
 
 def test_adding_a_dependency_does_not_reopen_grandfathered_violations(
     make_fake_app, tmp_path: Path
 ) -> None:
-    """A10-r2-97: fixing one undeclared dependency by declaring it must not
+    """Fixing one undeclared dependency by declaring it must not
     change the baseline fingerprint of the other grandfathered violations."""
     from modulith import manifest as manifest_module
 
@@ -502,12 +500,12 @@ def test_adding_a_dependency_does_not_reopen_grandfathered_violations(
 
 
 # ---------------------------------------------------------------------------
-# A10-r1-36 — declared_dependencies: None = not declared; () = deny-all
+# declared_dependencies: None = not declared; () = deny-all
 # ---------------------------------------------------------------------------
 
 
 def test_manifest_without_declared_dependencies_skips_rule_3(make_fake_app) -> None:
-    """A10-r1-36 (adjudicated): declaring a manifest for an unrelated field
+    """Declaring a manifest for an unrelated field
     (owns_tables only) must NOT switch rule 3 into deny-all mode."""
     from modulith import manifest as manifest_module
 
@@ -532,7 +530,7 @@ def test_manifest_without_declared_dependencies_skips_rule_3(make_fake_app) -> N
 
 
 def test_explicit_empty_declared_dependencies_means_deny_all(make_fake_app) -> None:
-    """A10-r1-36 (adjudicated): an explicit empty tuple means 'depends on
+    """An explicit empty tuple means 'depends on
     nothing' and enforces deny-all (contracts excepted)."""
     from modulith import manifest as manifest_module
 
@@ -573,12 +571,12 @@ def test_declare_module_default_dependencies_remain_iterable_but_undeclared() ->
 
 
 # ---------------------------------------------------------------------------
-# A10-r3-147 — rule 4 must not be blind to wildcard imports
+# Rule 4 must not be blind to wildcard imports
 # ---------------------------------------------------------------------------
 
 
 def test_star_import_across_modules_is_flagged(make_fake_app) -> None:
-    """A10-r3-147: ``from other_module import *`` cannot be resolved to
+    """``from other_module import *`` cannot be resolved to
     specific names — the wildcard import itself is flagged by rule 4."""
     make_fake_app(
         {
@@ -598,7 +596,7 @@ def test_star_import_across_modules_is_flagged(make_fake_app) -> None:
 
 
 def test_star_import_from_contracts_is_allowed(make_fake_app) -> None:
-    """A10-r3-147 (scope check): wildcard imports from contracts stay exempt."""
+    """Scope check: wildcard imports from contracts stay exempt."""
     make_fake_app(
         {
             "orders": """
@@ -613,12 +611,12 @@ def test_star_import_from_contracts_is_allowed(make_fake_app) -> None:
 
 
 # ---------------------------------------------------------------------------
-# A10-r3-149 — conflicting owns_tables declarations
+# Conflicting owns_tables declarations
 # ---------------------------------------------------------------------------
 
 
 def test_co_owner_of_conflicted_table_is_not_falsely_flagged(make_fake_app) -> None:
-    """A10-r3-149: when two manifests both declare the same table, the module
+    """When two manifests both declare the same table, the module
     that co-declared ownership must not be flagged as referencing 'someone
     else's' table; the conflict itself must be surfaced instead."""
     from modulith import manifest as manifest_module
@@ -656,12 +654,12 @@ def test_co_owner_of_conflicted_table_is_not_falsely_flagged(make_fake_app) -> N
 
 
 # ---------------------------------------------------------------------------
-# A10-r5-219 — load_baseline error handling
+# load_baseline error handling
 # ---------------------------------------------------------------------------
 
 
 def test_load_baseline_invalid_json_raises_configuration_error(tmp_path: Path) -> None:
-    """A10-r5-219: malformed JSON must raise a clear ConfigurationError naming
+    """Malformed JSON must raise a clear ConfigurationError naming
     the path, not a raw JSONDecodeError."""
     path = tmp_path / "baseline.json"
     path.write_text("{not valid json", encoding="utf-8")
@@ -670,7 +668,7 @@ def test_load_baseline_invalid_json_raises_configuration_error(tmp_path: Path) -
 
 
 def test_load_baseline_missing_keys_raises_configuration_error(tmp_path: Path) -> None:
-    """A10-r5-219: a schema-mismatched entry must raise ConfigurationError
+    """A schema-mismatched entry must raise ConfigurationError
     suggesting --update-baseline, not a raw KeyError."""
     path = tmp_path / "baseline.json"
     path.write_text(json.dumps([{"rule": "x", "module": "y"}]), encoding="utf-8")
@@ -679,7 +677,7 @@ def test_load_baseline_missing_keys_raises_configuration_error(tmp_path: Path) -
 
 
 def test_load_baseline_non_list_payload_raises_configuration_error(tmp_path: Path) -> None:
-    """A10-r5-219: a valid-JSON but wrong-shape payload is also rejected loudly."""
+    """A valid-JSON but wrong-shape payload is also rejected loudly."""
     path = tmp_path / "baseline.json"
     path.write_text(json.dumps({"rule": "x"}), encoding="utf-8")
     with pytest.raises(ConfigurationError, match="list"):
@@ -687,12 +685,12 @@ def test_load_baseline_non_list_payload_raises_configuration_error(tmp_path: Pat
 
 
 # ---------------------------------------------------------------------------
-# A4-r1-11 — manifest verification errors carry file:line
+# Manifest verification errors carry file:line
 # ---------------------------------------------------------------------------
 
 
 def test_unregistered_listener_error_includes_file_and_line() -> None:
-    """A4-r1-11: SPEC promises 'a clear error and file:line' when a declared
+    """SPEC promises 'a clear error and file:line' when a declared
     listener wasn't registered."""
 
     async def orphan_listener(e: object) -> None: ...
@@ -705,12 +703,12 @@ def test_unregistered_listener_error_includes_file_and_line() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A4-r2-81 — publishes check must flag names bound to None
+# The publishes check must flag names bound to None
 # ---------------------------------------------------------------------------
 
 
 def test_publishes_name_bound_to_none_is_flagged() -> None:
-    """A4-r2-81: an event name explicitly bound to None (failed conditional
+    """An event name explicitly bound to None (failed conditional
     import) must be flagged, per the check's own stated intent."""
     fake_pkg = types_module.ModuleType("fakeapp_none_event")
     fake_pkg.OrderCreated = None  # type: ignore[attr-defined]
@@ -726,7 +724,7 @@ def test_publishes_name_bound_to_none_is_flagged() -> None:
 
 
 def test_publishes_name_present_and_not_none_is_clean() -> None:
-    """A4-r2-81 (guard against over-fix): a defined event type passes."""
+    """Guard against over-fix: a defined event type passes."""
     fake_pkg = types_module.ModuleType("fakeapp_defined_event")
     fake_pkg.OrderCreated = object()  # type: ignore[attr-defined]
     sys.modules["fakeapp_defined_event"] = fake_pkg
@@ -738,12 +736,12 @@ def test_publishes_name_present_and_not_none_is_clean() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A10-r4-186 — audit of an empty tree must not report a confident 100/100
+# Audit of an empty tree must not report a confident 100/100
 # ---------------------------------------------------------------------------
 
 
 def test_audit_empty_directory_warns_instead_of_confident_score(tmp_path: Path) -> None:
-    """A10-r4-186: zero .py files found must be distinguishable from 'genuinely
+    """Zero .py files found must be distinguishable from 'genuinely
     zero coupling' — the report warns and the module section says None."""
     root = tmp_path / "empty"
     root.mkdir()
@@ -756,7 +754,7 @@ def test_audit_empty_directory_warns_instead_of_confident_score(tmp_path: Path) 
 
 
 def test_audit_populated_tree_reports_files_scanned(tmp_path: Path) -> None:
-    """A10-r4-186: a populated tree records how many files were scanned and
+    """A populated tree records how many files were scanned and
     renders no empty-tree warning."""
     root = tmp_path / "app"
     _write(root, "__init__.py", "")
@@ -770,12 +768,12 @@ def test_audit_populated_tree_reports_files_scanned(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# A10-r3-148 — readiness score caveat for shared tables
+# Readiness score caveat for shared tables
 # ---------------------------------------------------------------------------
 
 
 def test_report_caveats_score_when_shared_tables_present(tmp_path: Path) -> None:
-    """A10-r3-148 (adjudicated): the formula stays, but the report must say
+    """The formula stays, but the report must say
     the score excludes shared-table entanglement when tables are shared."""
     root = tmp_path / "app"
     _write(root, "__init__.py", "")
@@ -802,19 +800,19 @@ def test_report_caveats_score_when_shared_tables_present(tmp_path: Path) -> None
 
     result = audit_codebase(root)
     assert result.shared_tables == ["invoices"]
-    assert result.readiness_score == 100  # formula unchanged (adjudicated)
+    assert result.readiness_score == 100  # shared tables are reported, not scored
 
     report = render_report(result)
     assert "shared-table entanglement" in report
 
 
 # ---------------------------------------------------------------------------
-# A10-r5-218 — stdlib/third-party name collisions in the audit import heuristic
+# Stdlib/third-party name collisions in the audit import heuristic
 # ---------------------------------------------------------------------------
 
 
 def test_stdlib_import_colliding_with_local_dir_not_counted(tmp_path: Path) -> None:
-    """A10-r5-218: ``import types`` (stdlib) must not be reported as coupling
+    """``import types`` (stdlib) must not be reported as coupling
     to a local ``types/`` module directory when the root is a package."""
     root = tmp_path / "myapp"
     _write(root, "__init__.py", "")
@@ -829,7 +827,7 @@ def test_stdlib_import_colliding_with_local_dir_not_counted(tmp_path: Path) -> N
 
 
 def test_flat_layout_stdlib_collision_not_counted(tmp_path: Path) -> None:
-    """A10-r5-218: in a flat (non-package) layout the stdlib name still wins
+    """In a flat (non-package) layout the stdlib name still wins
     the ambiguity — no false coupling edge."""
     root = tmp_path / "repo"
     _write(root, "types/__init__.py", "")
@@ -843,7 +841,7 @@ def test_flat_layout_stdlib_collision_not_counted(tmp_path: Path) -> None:
 
 
 def test_flat_layout_bare_local_import_still_detected(tmp_path: Path) -> None:
-    """A10-r5-218 (guard against over-fix): a genuine bare intra-tree import
+    """Guard against over-fix: a genuine bare intra-tree import
     in a flat layout is still a cross-module edge."""
     root = tmp_path / "repo"
     _write(root, "inventory/__init__.py", "")
@@ -857,7 +855,7 @@ def test_flat_layout_bare_local_import_still_detected(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Task 8 (tooling) — shorthand ImportFrom resolution
+# Shorthand ImportFrom resolution
 # ---------------------------------------------------------------------------
 
 
@@ -896,8 +894,59 @@ def test_shorthand_public_import_is_not_flagged(make_fake_app) -> None:
     assert all(v.rule != "no-internal-imports" for v in violations)
 
 
+def test_private_name_imported_from_a_submodule_is_flagged(make_fake_app) -> None:
+    """The imported-name check only ran when target_module WAS the owner
+    package, so the deeper — and more natural — spelling escaped: reaching
+    for a neighbour's private symbol via one of its public submodules is the
+    same boundary breach as reaching for it via the package root."""
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.inventory.models import _Hidden
+            """,
+            "inventory": "",
+        }
+    )
+    mods = [_module("orders"), _module("inventory")]
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    assert any(v.rule == "no-internal-imports" for v in violations)
+
+
+def test_nested_private_subpackage_is_flagged(make_fake_app) -> None:
+    """Only the FIRST remainder segment was tested for a leading underscore,
+    so a private subpackage nested under a public one was invisible — the
+    module docstring promises "any other ``_``-prefixed subpackage"."""
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.inventory.models._priv import thing
+            """,
+            "inventory": "",
+        }
+    )
+    mods = [_module("orders"), _module("inventory")]
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    assert any(v.rule == "no-internal-imports" for v in violations)
+
+
+def test_public_name_imported_from_a_submodule_is_not_flagged(make_fake_app) -> None:
+    """Guard against over-fix: a public name from a public submodule of
+    another module stays clean."""
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.inventory.models import StockItem
+            """,
+            "inventory": "",
+        }
+    )
+    mods = [_module("orders"), _module("inventory")]
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    assert all(v.rule != "no-internal-imports" for v in violations)
+
+
 # ---------------------------------------------------------------------------
-# Task 8 (tooling) — parse failures must surface as violations
+# Parse failures must surface as violations
 # ---------------------------------------------------------------------------
 
 
@@ -917,7 +966,7 @@ def test_unparseable_file_is_surfaced_as_error(make_fake_app, tmp_path: Path) ->
 
 
 # ---------------------------------------------------------------------------
-# Task 8 (tooling) — rule 4 runtime-name analysis must be per file
+# Rule 4 runtime-name analysis must be per file
 # ---------------------------------------------------------------------------
 
 
@@ -954,7 +1003,7 @@ def test_runtime_name_in_other_file_does_not_exempt_annotation_only_import(
 
 
 # ---------------------------------------------------------------------------
-# Task 8 (tooling) — ratchet baseline locations must be portable
+# Ratchet baseline locations must be portable
 # ---------------------------------------------------------------------------
 
 
@@ -987,8 +1036,11 @@ def test_violation_location_is_package_relative_not_absolute(make_fake_app, tmp_
 
 
 def test_strict_boundaries_false_allows_boundary_violations_at_bootstrap(make_fake_app) -> None:
-    """When strict_boundaries=False (default), boundary violations warn but don't
-    prevent startup. The app bootstraps successfully with violations logged."""
+    """When strict_boundaries=False (the default), bootstrap runs no boundary
+    scan at all: the whole enforcement block in ``Runtime.ensure_bootstrapped``
+    is gated on the flag, so nothing is verified, nothing is logged and nothing
+    warns. An app with violations starts clean — ``modulith verify`` is what
+    catches them in CI."""
     from modulith.runtime import _runtime
 
     make_fake_app(
@@ -1228,7 +1280,7 @@ def test_strict_boundaries_true_raises_on_cyclic_dependency(make_fake_app) -> No
 
 # ---------------------------------------------------------------------------
 # strict_boundaries + MODULITH_DEV_WARN_ONLY — single-process `modulith dev`'s
-# warn-only downgrade (README:288-290), exercised directly at the runtime
+# warn-only downgrade (README's "CLI" section), exercised directly at the runtime
 # layer rather than through the CLI (see test_cli.py for the full dev-command
 # integration test).
 # ---------------------------------------------------------------------------

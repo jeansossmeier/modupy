@@ -14,7 +14,7 @@ from typing import Any, cast
 import pytest
 
 from modulith import ConfigurationError, configure
-from modulith.adapters._shm_ring import _HEADER_SIZE, _SLOT_SIZE
+from modulith.adapters._shm_ring import _HEADER_SIZE, _SLOT_SIZE, _SLOT_STRUCT
 from modulith.adapters._shm_store import SqliteQueueStore
 from modulith.adapters.shm_broker import (
     ShmBroker,
@@ -375,6 +375,106 @@ async def test_hint_wait_times_out_and_unavailable_ring_uses_safety_delay(
 
     broker._ring.close()
     assert await broker.wait_for_hint(after_sequence=-1, safety_timeout=-1) is None
+
+
+async def test_idle_hint_reads_answer_without_unpacking_every_slot(
+    broker: ShmBroker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consumer whose cursor already sits at the newest hint re-reads the
+    ring every few milliseconds for the whole length of its safety poll.
+    Answering that from the per-slot unpack loop costs O(capacity) per read,
+    which keeps an otherwise idle worker busy and stalls its event loop at
+    large capacities."""
+    unpacks = 0
+
+    class CountingSlotStruct:
+        def unpack(self, buffer: bytes) -> tuple[int, int]:
+            nonlocal unpacks
+            unpacks += 1
+            sequence, complement = _SLOT_STRUCT.unpack(buffer)
+            return int(sequence), int(complement)
+
+    assert broker._ring.notify(7)
+    monkeypatch.setattr("modulith.adapters._shm_ring._SLOT_STRUCT", CountingSlotStruct())
+
+    assert broker._ring.read_hints(after_sequence=7) == []
+    assert unpacks == 0
+
+    assert broker._ring.read_hints(after_sequence=6) == [7]
+    assert unpacks == broker._ring.capacity
+
+
+async def test_hint_prescan_returns_exactly_what_the_per_slot_scan_returns(
+    broker: ShmBroker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The strided pre-scan is an optimisation only. It must agree with the
+    per-slot loop on every cursor, including on a ring nobody has notified:
+    all-zero slots are indistinguishable from a genuine hint of sequence 0 on
+    the sequence words alone, so the complements have to settle that case."""
+    cursors = (-1, 0, 3, 6, 7, 8)
+
+    def read_all() -> dict[int, list[int]]:
+        return {cursor: broker._ring.read_hints(after_sequence=cursor) for cursor in cursors}
+
+    def scan_only() -> dict[int, list[int]]:
+        monkeypatch.setattr("modulith.adapters._shm_ring._NATIVE_LITTLE_ENDIAN", False)
+        try:
+            return read_all()
+        finally:
+            monkeypatch.undo()
+
+    assert read_all() == scan_only()
+    assert read_all()[-1] == []
+
+    for sequence in (0, 3, 7):
+        assert broker._ring.notify(sequence)
+
+    assert read_all() == scan_only()
+    assert read_all()[-1] == [0, 3, 7]
+
+
+async def test_hint_file_kept_at_another_capacity_warns_that_notification_is_dead(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An existing hint file is never re-created and only attaches when its
+    header matches the requested capacity, so raising ``shm_capacity`` on an
+    existing deployment leaves this process unable to notify at all. Delivery
+    still works — SQLite stays authoritative — so the degradation is invisible
+    without the warning."""
+    hint_path = str(tmp_path / "capacity.hints")
+    original = ShmBroker(
+        shm_name=hint_path,
+        capacity=16,
+        db_path=str(tmp_path / "capacity.db"),
+    )
+    try:
+        assert original._ring.available
+
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
+            widened = ShmBroker(
+                shm_name=hint_path,
+                capacity=32,
+                db_path=str(tmp_path / "capacity-widened.db"),
+            )
+        try:
+            assert not widened._ring.available
+            assert any(
+                "could not be attached at capacity=32" in record.getMessage()
+                for record in caplog.records
+            )
+
+            await widened.subscribe(["events"], "workers")
+            await widened.publish("events", b"durable")
+            rows = await widened.claim_batch("workers", batch_size=1, consumer_name="worker")
+            assert [row["payload"] for row in rows] == [b"durable"]
+        finally:
+            await widened.close()
+    finally:
+        await original.close()
+        original._ring.unlink()
 
 
 async def test_prune_without_age_retention_is_disabled(broker: ShmBroker) -> None:

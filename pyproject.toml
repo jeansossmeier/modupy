@@ -13,21 +13,31 @@
 # - Core dependencies are intentionally minimal. We don't pull in SQLAlchemy
 #   for users who don't use the outbox; we don't pull in FastAPI for users
 #   who use Starlette directly. Each adapter goes behind an extra.
-# - `pip install modulith` gives you the framework. `pip install modulith[all]`
+# - `pip install modupy` gives you the framework. `pip install modupy[all]`
 #   gives you everything. Most users will pick 2-3 extras.
 
 [build-system]
-requires = ["hatchling>=1.18"]
+# Floor is 1.27, the first hatchling that understands the PEP 639 SPDX
+# `license = "Apache-2.0"` expression used below. Older backends still build,
+# but emit Metadata-Version 2.1 with a free-text `License:` field (plus an
+# out-of-spec `License-File:`) instead of `License-Expression:`, so a build
+# under a constraints file capping hatchling would ship different license
+# provenance from the PyPI artifact.
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "modulith"
+# Distribution name only. The import name, the console script, the config
+# table and the environment-variable prefix are all `modulith`; the PyPI name
+# `modulith` belongs to an unrelated project, so the distribution ships as
+# `modupy` (`pip install modupy` then `import modulith`).
+name = "modupy"
 version = "0.9.0"
 description = "Modular monolith pattern for Python — module structure, event-driven boundaries, transactional outbox, optional process-per-module runtime."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
-authors = [{ name = "Jean Sossmeier" }]
+authors = [{ name = "Jean Sossmeier", email = "jeansossmeier@gmail.com" }]
 keywords = [
     "modular-monolith",
     "ddd",
@@ -129,11 +139,11 @@ cli = [
     "rich>=13.0,<15.0",
 ]
 
-# Test plugin (separate package conceptually, included here for v1
-# convenience; will split into pytest-modulith in Phase 2).
+# Test plugin (separate package conceptually, but shipped inside modupy as
+# this extra; a standalone pytest-modulith remains a possible future split).
 #
 # This extra must install everything the default (non-integration) test suite
-# imports at collection time, so `pip install modulith[test] && pytest` is
+# imports at collection time, so `pip install modupy[test] && pytest` is
 # reproducible. The suite runs the Postgres adapter against aiosqlite, so we
 # pull SQLAlchemy + alembic + aiosqlite directly (NOT asyncpg — the sqlite path
 # doesn't need it), plus the feature extras whose libraries the tests import
@@ -150,7 +160,7 @@ test = [
     # (yaml.safe_load) to execute the integration lane's guard logic against
     # synthetic pytest summaries — the CI-drift guards run in the default lane.
     "pyyaml>=6.0,<7.0",
-    "modulith[redis,otel,fastapi,cli]",
+    "modupy[redis,otel,fastapi,cli]",
 ]
 
 # Integration test suite — the testcontainers-backed end-to-end tests
@@ -166,10 +176,10 @@ test = [
 #   - pymysql: the SYNC driver Alembic uses for the MySQL migration test
 #     (mysql+pymysql://), same reason — aiomysql can't drive it either
 # Layered on `test` so it also gets pytest, redis, fastapi, etc. Run with
-# `pip install modulith[integration] && pytest -m integration`; the suite
+# `pip install modupy[integration] && pytest -m integration`; the suite
 # auto-skips these when Docker is unreachable (see tests/conftest.py).
 integration = [
-    "modulith[test]",
+    "modupy[test]",
     "testcontainers>=4.0,<5.0",
     "asyncpg>=0.29,<1.0",
     "aiomysql>=0.2,<1.0",
@@ -181,14 +191,14 @@ integration = [
 
 # Everything. For "I want all the features" users.
 all = [
-    "modulith[postgres,redis,database,otel,fastapi,cli,test]",
+    "modupy[postgres,redis,database,otel,fastapi,cli,test]",
 ]
 
 # Development dependencies — for working ON modulith, not WITH it.
 # Includes `integration` so contributors can run the full testcontainers
 # suite locally; `all` alone only covers the sqlite-backed default tests.
 dev = [
-    "modulith[all,integration]",
+    "modupy[all,integration]",
     "ruff>=0.4,<1.0",
     # mypy 2.0 verified: modulith/ + tests/ type-check clean under --strict
     # with mypy 2.0.0, so the bound is <3.0 (next unverified major). CI's
@@ -226,7 +236,7 @@ modulith = "modulith.cli:main"
 
 # Pytest plugin entry point. Installs `modulith.testing` as a pytest
 # plugin so fixtures (modulith_app, modulith_module, scenario) become
-# available automatically on `pip install modulith[test]`.
+# available automatically on `pip install modupy[test]`.
 [project.entry-points."pytest11"]
 modulith = "modulith.testing"
 
@@ -267,6 +277,21 @@ exclude = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Pinned explicitly because pytest-asyncio warns when it is unset and will
+# change the default in a future release. "function" matches what the suite
+# already gets: every async fixture here is function-scoped (the only
+# session-scoped fixtures in tests/conftest.py — the testcontainers URLs — are
+# plain sync generators).
+asyncio_default_fixture_loop_scope = "function"
+# The suite makes real TCP binds, spawns child processes, and waits on queues
+# and asyncio Events; without a bound a regression that never signals hangs the
+# job until the CI hard limit with no traceback. 600s is generous enough to
+# absorb a cold testcontainers image pull inside a session-scoped fixture,
+# while still turning a hang into a pointed failure. timeout_method is left at
+# its default deliberately: pytest-timeout uses SIGALRM where available, which
+# dumps a traceback at the hung test and lets the rest of the run finish, and
+# falls back to the thread method on Windows on its own.
+timeout = 600
 # examples/demo_app/tests exercises the modulith.testing scenario/modulith_app
 # fixtures against a real (non-synthetic) app; without it here, CI's default
 # `pytest` (no path argument) never collects it — testpaths is the only path
@@ -300,7 +325,7 @@ source = ["modulith"]
 branch = true
 
 [tool.coverage.report]
-# Task 9: package-wide floor. Outbox is gated separately at 100% in CI
+# Package-wide floor. Outbox is gated separately at 100% in CI
 # (`coverage report --include='modulith/builtin/outbox.py' --fail-under=100`).
 fail_under = 90
 show_missing = true
@@ -320,6 +345,13 @@ ignore = [
     "E501",  # line too long — formatter handles it
 ]
 
+[tool.ruff.lint.isort]
+# `from conftest import ...` is a sibling-module import: pytest's prepend import
+# mode puts tests/ on sys.path, so test modules can import the shared helpers
+# that live in tests/conftest.py. Without this, ruff classifies `conftest` as a
+# third-party distribution and demands it be sorted in among httpx/pytest.
+known-local-folder = ["conftest"]
+
 [tool.ruff.lint.per-file-ignores]
 # Typer's idiomatic API uses Argument(...) and Option(...) as defaults;
 # B008 ("function call in default") is a false positive for click/typer apps.
@@ -329,7 +361,6 @@ ignore = [
 python_version = "3.11"
 strict = true
 warn_unreachable = true
-disallow_untyped_decorators = false  # decorators with TypeVar are awkward
 # No exclusions: every module is implemented and type-checks under --strict.
 # tests/ is type-checked in CI too (mypy --strict modulith/ tests/).
 # tests/ has no __init__.py, so explicit package bases are needed for the
@@ -393,6 +424,16 @@ disable_error_code = [
 ]
 
 [[tool.mypy.overrides]]
+# tests/ has no __init__.py, so mypy maps tests/conftest.py to `tests.conftest`
+# and cannot resolve the bare name `conftest`. At runtime the bare name is the
+# correct one: pytest's prepend import mode puts tests/ on sys.path, which is
+# how the shared `_free_port` helper is shared across the topology/supervisor
+# suites. Silence only the unresolvable import; the modules doing the importing
+# stay fully type-checked.
+module = ["conftest"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 # Synthetic app packages that tests generate on disk at runtime (fixture
 # factories write `fakeapp/`, the demo app installs as `shop`); they don't
 # exist at type-check time. testcontainers, docker, and pyyaml ship no
@@ -403,12 +444,11 @@ module = ["fakeapp", "fakeapp.*", "shop", "shop.*", "testcontainers.*", "docker"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-# Deliberately unimportable TYPE_CHECKING-only scaffold module: the G03
-# regression test (tests/test_serializers.py, audit A6-r5-210) mirrors an
-# event module whose annotation-only dependency isn't installed in the
-# worker process. It must never resolve — silence import-not-found so the
-# CI tests-lane `mypy --strict modulith/ tests/` stays green (DX, W2
-# RESIDUALS item 12b).
+# Deliberately unimportable TYPE_CHECKING-only scaffold module: a regression
+# test in tests/test_serializers.py mirrors an event module whose
+# annotation-only dependency isn't installed in the worker process. It must
+# never resolve — silence import-not-found so the CI tests-lane
+# `mypy --strict modulith/ tests/` stays green.
 module = ["nonexistent_debug_module"]
 ignore_missing_imports = true
 
@@ -442,7 +482,8 @@ ignore_missing_imports = true
 # claim_lease_seconds = 60.0
 # claim_batch_size = 100
 # retry_interval_seconds = 30
-# max_attempts = 10
+# dead_letter_after_attempts = 10  # NOT `max_attempts` — that is the broker
+#                                  # consumer's redelivery cap, a different knob
 # max_retry_backoff_seconds = 300
 
 # Broker options. Local SHM uses canonical private paths; an omitted process

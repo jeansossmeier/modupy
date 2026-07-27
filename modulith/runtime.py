@@ -35,6 +35,18 @@ logger = logging.getLogger("modulith")
 # collected before it runs.
 _background_tasks: set[asyncio.Task[Any]] = set()
 
+# The hooks that hand plugins an ``EventPublication``. None of modulith's own
+# hookimpls reads the publication's ``payload`` — observability uses only
+# ``id``, and the outbox's after-publish hookimpl is a no-op on the in-memory
+# path — so when every registered implementation of all four lives inside
+# modulith, the bytes are provably unobservable and need never be produced.
+_PUBLICATION_HOOKS = (
+    "modulith_after_event_published",
+    "modulith_on_listener_dispatch",
+    "modulith_on_listener_error",
+    "modulith_on_listener_complete",
+)
+
 
 class Runtime:
     """The lazily-initialized modulith runtime.
@@ -87,7 +99,7 @@ class Runtime:
         # configure(disable_plugins=[...]); the extra_plugins counterpart.
         # This is what makes the documented escape hatches (e.g.
         # disable=['modulith.observe-shield'], or replacing a built-in)
-        # reachable from application configuration (G09 disclosure).
+        # reachable from application configuration.
         self._disabled_plugins: list[str] = []
 
     # ----- Accessors (read-only views for plugins and tooling) -------------
@@ -196,7 +208,11 @@ class Runtime:
         flush, or blocks until bootstrap finishes and registers directly.
         The lock is reentrant, so module-level @listener decorators firing
         during the discovery import phase (on the bootstrap thread itself)
-        enter without deadlocking.
+        enter without deadlocking. A registration made on the bootstrap
+        thread *after* the flush — from a ``modulith_verify_module`` or
+        ``modulith_after_module_load`` hookimpl — cannot be covered by the
+        lock at all; _bootstrap()'s commit point drains that tail before
+        clearing the queue.
         """
         # Validate here — not only inside the bus — so a sync handler is
         # rejected at the registration call site instead of surfacing as a
@@ -226,7 +242,7 @@ class Runtime:
         Failure contract on the DIRECT (non-transactional) path: when the
         event routes to a cross-process broker, the broker send is awaited
         inline and a broker publish failure PROPAGATES to this caller —
-        fail-loud by design (S3-r2-122), never swallowed: with no outbox
+        fail-loud by design, never swallowed: with no outbox
         row persisted, a swallowed send would lose the event for every
         remote consumer with zero trace. Callers that need publish() to be
         decoupled from broker availability should use the transactional
@@ -266,7 +282,7 @@ class Runtime:
                 # modulith_after_event_published is contractually scoped to
                 # successful persistence, so it must NOT fire — but the
                 # observability publish span started in the before hook would
-                # then leak (never ended, stale ContextVar — W3 R4-W3-02).
+                # then leak (never ended, stale ContextVar).
                 # modulith_on_publish_error gives plugins (observability
                 # included) a paired hook to close out whatever they opened.
                 self._fire_publish_error(event, exc)
@@ -302,7 +318,7 @@ class Runtime:
 
         The inline broker route runs between the paired publish hooks, so a
         route failure must close the observability publish span before it
-        propagates (W3 R4-W3-02, direct-path leg).
+        propagates — the direct-path leg of that pairing.
         """
         try:
             await self._maybe_route_to_broker(event, has_local_handler=has_local_handler)
@@ -319,7 +335,7 @@ class Runtime:
         hook to success — so any cleanup a plugin started in the before hook
         (the built-in observability plugin's publish span, most notably)
         leaked: never ended, with a stale ContextVar mis-parenting the next
-        dispatch span in the same context (W3 R4-W3-02). Purely observational
+        dispatch span in the same context. Purely observational
         — the ``_ObserveContractShield`` in ``manager.py`` guarantees a
         raising hookimpl is logged and swallowed rather than masking the
         original publish failure, which the caller always re-raises
@@ -328,6 +344,22 @@ class Runtime:
         if self._plugin_manager is None:
             return
         self._plugin_manager.hook.modulith_on_publish_error(event=event, exception=exc)
+
+    def _payload_is_observed(self) -> bool:
+        """True when a hookimpl defined outside modulith receives a publication.
+
+        Every ``_PUBLICATION_HOOKS`` implementation shipped in this package
+        ignores ``publication.payload``, so with only built-ins registered the
+        serialized bytes can never be read by anyone.
+        """
+        pm = self._plugin_manager
+        if pm is None:
+            return False
+        for hook_name in _PUBLICATION_HOOKS:
+            for impl in getattr(pm.hook, hook_name).get_hookimpls():
+                if not (impl.function.__module__ or "").startswith("modulith."):
+                    return True
+        return False
 
     def _serialized_payload(self, event: Any) -> bytes:
         """Best-effort serialized bytes for hook-facing EventPublications.
@@ -340,7 +372,15 @@ class Runtime:
         with a debug log instead of failing the publish. Serialization uses
         the default JSON serializer; these publications are observational
         only — they are never persisted or redelivered.
+
+        Skipped — back to ``b""`` — when no hookimpl outside modulith is
+        registered for any publication-carrying hook: a full recursive
+        dataclass walk dominates the cost of an in-memory publish, and on the
+        default plugin set not one byte of it is ever read.
         """
+        if not self._payload_is_observed():
+            return b""
+
         from .serializers import JsonEventSerializer
 
         try:
@@ -361,6 +401,11 @@ class Runtime:
         run concurrently; every failure is logged; the first exception is
         re-raised after all complete) but additionally fires the
         per-listener observability hooks and the post-publish hook.
+
+        The one divergence: a fan-out broker route failing after the listeners
+        ran propagates instead of the first listener error — the fail-loud
+        broker contract in ``publish()``'s docstring outranks it. The listener
+        failures are already logged by then, so they stay diagnosable.
         """
         assert self._event_bus is not None  # for type-checker
         assert self._plugin_manager is not None
@@ -385,6 +430,87 @@ class Runtime:
             await self._route_to_broker_guarded(event, has_local_handler=False)
             pm.hook.modulith_after_event_published(event=event, publication=publish_pub)
             return
+
+        try:
+            first_error = await self._run_listeners(
+                event, handlers, payload=payload, event_type=event_type
+            )
+        except BaseException as exc:
+            # Cancellation is the only way out of _run_listeners — listener
+            # failures come back as a return value — and it lands BETWEEN the
+            # paired publish hooks: modulith_after_event_published below never
+            # fires, so the observability publish span opened in the before
+            # hook would leak (never ended, stale ContextVar).
+            # Same pairing as the durable branch in publish() and as
+            # _route_to_broker_guarded.
+            self._fire_publish_error(event, exc)
+            raise
+
+        # Fan-out: an externalized event also crosses to the broker even though
+        # it has local listeners here — remote workers consume it too. Routing
+        # is independent of local delivery, so a local listener failure (raised
+        # below) must not suppress it. No-op unless the event resolves to a
+        # remote target (see _maybe_route_to_broker).
+        await self._route_to_broker_guarded(event, has_local_handler=True)
+
+        pm.hook.modulith_after_event_published(event=event, publication=publish_pub)
+
+        if first_error is not None:
+            raise first_error
+
+    async def dispatch_local(self, event: Any, bus: Any) -> None:
+        """Deliver an event received from another process to local listeners.
+
+        The cross-process consumers call this instead of ``bus.publish`` so a
+        remotely-delivered event fires the same per-listener lifecycle hooks
+        (``modulith_on_listener_dispatch`` / ``_error`` / ``_complete``) an
+        in-memory publish does. Without it every listener invocation in a
+        worker process is untraced and a plugin using
+        ``modulith_on_listener_error`` for alerting never sees a cross-process
+        listener failure, even though the hookspec scopes those hooks to every
+        ``(event, listener)`` pair unconditionally.
+
+        The *publish* hooks and broker routing stay out on purpose: this
+        process did not publish the event, and re-routing a consumed event to
+        the target it was consumed from is an infinite redelivery loop.
+        """
+        if self._plugin_manager is None:
+            # No bootstrapped plugin manager (a consumer driven directly by a
+            # test harness): there are no hookimpls to fire, so plain bus
+            # delivery already is the whole contract.
+            await bus.publish(event)
+            return
+        handlers = bus.listeners_for(type(event))
+        if not handlers:
+            return
+        first_error = await self._run_listeners(
+            event,
+            handlers,
+            payload=self._serialized_payload(event),
+            event_type=f"{type(event).__module__}.{type(event).__qualname__}",
+        )
+        if first_error is not None:
+            raise first_error
+
+    async def _run_listeners(
+        self,
+        event: Any,
+        handlers: list[Callable[..., Any]],
+        *,
+        payload: bytes,
+        event_type: str,
+    ) -> BaseException | None:
+        """Run every listener concurrently, wrapped in the per-listener hooks.
+
+        Returns the first listener failure rather than raising it: the caller
+        still has work to finish (broker fan-out, the post-publish hook) that a
+        local listener failure must not skip. Every failure is logged HERE,
+        before returning, so a caller that goes on to raise for its own reasons
+        — a broker route failing during an outage — can never swallow the
+        listener diagnostics along with it.
+        """
+        assert self._plugin_manager is not None
+        pm = self._plugin_manager
 
         async def _run_one(handler: Callable[..., Any]) -> None:
             name = getattr(handler, "__qualname__", repr(handler))
@@ -412,15 +538,6 @@ class Runtime:
 
         results = await asyncio.gather(*(_run_one(h) for h in handlers), return_exceptions=True)
 
-        # Fan-out: an externalized event also crosses to the broker even though
-        # it has local listeners here — remote workers consume it too. Routing
-        # is independent of local delivery, so a local listener failure (raised
-        # below) must not suppress it. No-op unless the event resolves to a
-        # remote target (see _maybe_route_to_broker).
-        await self._route_to_broker_guarded(event, has_local_handler=True)
-
-        pm.hook.modulith_after_event_published(event=event, publication=publish_pub)
-
         first_error: BaseException | None = None
         for handler, result in zip(handlers, results, strict=False):
             if isinstance(result, BaseException):
@@ -432,8 +549,7 @@ class Runtime:
                 )
                 if first_error is None:
                     first_error = result
-        if first_error is not None:
-            raise first_error
+        return first_error
 
     def _resolve_broker_target(self, event: Any) -> str | None:
         """Resolve an event's explicit broker target, or None for the default.
@@ -668,6 +784,7 @@ class Runtime:
             # a failure below must leave it intact for the next attempt.
             for event_type, handler in list(self._pending_listeners):
                 event_bus.register(event_type, handler)
+            flushed = len(self._pending_listeners)
 
             # 6.5. Verify manifests against observed reality. Iterates the LOCAL
             # bus (unpublished, and register_listener blocks on the runtime lock
@@ -692,9 +809,14 @@ class Runtime:
                         )
 
             # 6.55. Enforce boundary violations when strict_boundaries is enabled.
-            # When strict_boundaries=True, boundary violations at startup become
-            # fatal errors instead of warnings (the default). This catches violations
-            # before the application starts, ensuring architectural correctness.
+            # strict_boundaries=True re-runs the boundary scan here and aborts
+            # bootstrap with ConfigurationError on any violation, so a violating
+            # app can never start. The default (False) skips this block
+            # entirely — no scan, no warning, nothing logged; `modulith verify`
+            # is where boundaries get checked, typically as a CI gate. That is
+            # the trade-off: enabling it re-parses every .py file under every
+            # application module (see modulith/builtin/verifier.py) on every
+            # process start, which the CLI gate pays once per pipeline run.
             #
             # Exception: single-process `modulith dev` is warn-only regardless of
             # strict_boundaries (README's "interactive development contract is
@@ -702,7 +824,10 @@ class Runtime:
             # the environment — an env var, not an in-memory flag, because it must
             # survive uvicorn's --reload fork, which re-imports the app (and
             # re-triggers this same lazy bootstrap) in a subprocess that shares
-            # the parent's environment but none of its Python state.
+            # the parent's environment but none of its Python state. Ignored
+            # under ``production`` — `modulith dev` never runs there, so a value
+            # inherited from a container image or a copied shell profile has no
+            # legitimate producer and must not disarm the gate.
             if config.strict_boundaries:
                 from .builtin import verifier
                 from .config import ConfigurationError
@@ -720,7 +845,10 @@ class Runtime:
                         + (f" ({v.location})" if v.location else "")
                         for v in violations
                     )
-                    if os.environ.get("MODULITH_DEV_WARN_ONLY") == "1":
+                    warn_only = (
+                        os.environ.get("MODULITH_DEV_WARN_ONLY") == "1" and not config.production
+                    )
+                    if warn_only:
                         logger.warning(
                             "boundary violations detected with strict_boundaries=True "
                             "(warn-only: single-process `modulith dev`):\n  - %s",
@@ -759,6 +887,16 @@ class Runtime:
         self._broker_registry = broker_registry
         self._consumer_registry = consumer_registry
         self._modules = modules
+        # Drain whatever queued AFTER the step-6 flush. A hookimpl for
+        # modulith_verify_module (6.55) or modulith_after_module_load (6.6)
+        # runs on this very thread, and the lock is reentrant, so a plugin
+        # registering a listener from one of them takes register_listener's
+        # pending branch (self._event_bus is still None up here) and the
+        # clear() below would destroy it with no error, no warning, no log.
+        # Only the tail is drained: the bus appends without dedupe, so
+        # re-flushing the whole list would double-register step 6's listeners.
+        for event_type, handler in self._pending_listeners[flushed:]:
+            event_bus.register(event_type, handler)
         self._pending_listeners.clear()
 
         # 7.5. Friendly startup banner so users see what's active.

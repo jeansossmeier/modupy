@@ -169,11 +169,11 @@ def test_builtin_discovery_survives_a_broken_module(make_fake_app) -> None:
     assert f"{pkg}.good" in _sys.modules
 
 
-# ----- builtin discovery skip/guard branches (A4-r1-12) ----------------------
+# ----- builtin discovery skip/guard branches ---------------------------------
 
 
 def test_builtin_discovery_skips_underscore_and_single_file_submodules(make_fake_app) -> None:
-    """A4-r1-12: underscore-prefixed subpackages are private and skipped, and
+    """Underscore-prefixed subpackages are private and skipped, and
     a top-level single ``.py`` file is not a module (modules are packages) —
     neither may appear in the returned ModuleInfo list."""
     from modulith.builtin.discovery import modulith_discover_modules
@@ -189,9 +189,9 @@ def test_builtin_discovery_skips_underscore_and_single_file_submodules(make_fake
 
 
 def test_builtin_discovery_fails_loud_for_unimportable_app_package() -> None:
-    """W3 R3-F1 (supersedes A4-r1-12's return-[] contract): a missing or
-    unimportable app package raises ConfigurationError so verify/doctor
-    cannot go CI-green on an app that doesn't import."""
+    """A missing or unimportable app package raises ConfigurationError so
+    verify/doctor cannot go CI-green on an app that doesn't import — it
+    must not degrade to an empty module list."""
     from modulith import ConfigurationError
     from modulith.builtin.discovery import modulith_discover_modules
 
@@ -202,7 +202,7 @@ def test_builtin_discovery_fails_loud_for_unimportable_app_package() -> None:
 def test_builtin_discovery_returns_empty_for_single_file_app_package(
     make_fake_app, tmp_path: Path
 ) -> None:
-    """A4-r1-12: an app package that is itself a plain module (no ``__path__``)
+    """An app package that is itself a plain module (no ``__path__``)
     has no subpackages to discover — returns [] without raising."""
     import sys as _sys
 

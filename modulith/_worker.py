@@ -52,8 +52,14 @@ def create_app() -> FastAPI:
 
     Configures modulith with ``auto_discover=False`` so bootstrap imports no
     modules, then selectively imports the contracts module (shared event types,
-    if present) and this worker's module. Mounts the module's ``router`` (if it
-    exposes one) under ``/<module>`` and adds a ``/health`` endpoint.
+    if present) and this worker's module. Mounts the module's ``router`` under
+    ``/<module>`` and adds a ``/health`` endpoint; a module that exposes no
+    ``router`` still starts (listener-only workers are legitimate) but says so
+    at WARNING, because otherwise its 404s have no explanation anywhere.
+
+    The OpenAPI schema and doc UIs are served under the module prefix too
+    (``/<module>/openapi.json``, ``/<module>/docs``, ``/<module>/redoc``), which
+    is what makes them reachable through the reverse proxy on the public port.
     """
     module_name = os.environ.get("MODULITH_MODULE")
     app_package = os.environ.get("MODULITH_APP_PACKAGE")
@@ -98,12 +104,20 @@ def create_app() -> FastAPI:
         # cross-process events actually get delivered (the consumer half of the
         # process-per-module topology). Teardown: stop the consumer and release
         # the runtime's broker connections so the worker doesn't leak its client.
-        consumer = _build_consumer(module_name, consumer_name)
-        _app.state.consumer = consumer
+        #
+        # Startup runs INSIDE the guarded region: building or starting the
+        # consumer can fail (broker unreachable, group creation denied, bad
+        # credentials), and outside the try that failure would skip the
+        # finally, leaking every broker client the runtime already registered.
+        # stop() before a successful start() is safe by the Consumer protocol.
+        consumer: Any = None
+        _app.state.consumer = None
         _app.state.legacy_health_warning_emitted = False
-        if consumer is not None:
-            await consumer.start()
         try:
+            consumer = _build_consumer(module_name, consumer_name)
+            _app.state.consumer = consumer
+            if consumer is not None:
+                await consumer.start()
             yield
         finally:
             # consumer.stop() and _runtime.shutdown() must both be attempted
@@ -139,12 +153,63 @@ def create_app() -> FastAPI:
             if consumer_error is not None:
                 raise consumer_error
 
-    app = FastAPI(title=f"modulith-{module_name}", lifespan=lifespan)
+    # Docs are registered further down, after the module's own router, and
+    # under the module prefix — see the comment on that block.
+    app = FastAPI(
+        title=f"modulith-{module_name}",
+        lifespan=lifespan,
+        openapi_url=None,
+        docs_url=None,
+        redoc_url=None,
+    )
 
     router = getattr(module, "router", None)
     if router is not None:
         app.include_router(router, prefix=f"/{module_name}")
         logger.info("mounted router for module %r under /%s", module_name, module_name)
+    else:
+        # A worker mounts exactly one thing: the module package's `router`.
+        # Without it the worker still boots and still reports healthy, so an
+        # APIRouter defined in a submodule (orders/api.py) and never
+        # re-exported turns into a 404 on every path under /<module> with
+        # nothing to explain it.
+        #
+        # WARNING rather than INFO because uvicorn configures only its own
+        # loggers and leaves the root logger without a handler: INFO from this
+        # logger is dropped in any deployment that doesn't set logging up
+        # itself, and the one line explaining a dark worker has to survive the
+        # default configuration. It costs a listener-only module one line per
+        # process start, which the message names as the expected case.
+        logger.warning(
+            "module %r exposes no 'router' attribute — this worker serves no "
+            "HTTP routes, so every request to /%s/... returns 404. Expected "
+            "for a listener-only module; otherwise re-export the APIRouter "
+            "from %s (e.g. 'from .api import router' in its __init__.py).",
+            module_name,
+            module_name,
+            module_package,
+        )
+
+    # Docs live UNDER the module prefix. The supervisor's reverse proxy
+    # forwards /<module>/* to this worker verbatim and nothing else, so
+    # FastAPI's defaults (/docs, /openapi.json, /redoc) are unreachable from
+    # the public port. swagger_ui_oauth2_redirect_url has to be set too: it
+    # defaults to the literal "/docs/oauth2-redirect" and does not follow
+    # docs_url, so leaving it alone would hand the Swagger UI an OAuth2
+    # redirect URI outside this worker's prefix.
+    #
+    # Registered here, AFTER include_router, so the module's own routes win any
+    # collision: Starlette matches routes in registration order, so a module
+    # named "docs" (prefix /docs, doc UI at /docs/docs) or one exposing its own
+    # /docs, /redoc or /openapi.json route would otherwise have that route
+    # silently shadowed by the doc UI. FastAPI registers its doc routes from
+    # setup(), which __init__ already called while all three URLs were None —
+    # a no-op then, so this call registers each of them exactly once.
+    app.openapi_url = f"/{module_name}/openapi.json"
+    app.docs_url = f"/{module_name}/docs"
+    app.redoc_url = f"/{module_name}/redoc"
+    app.swagger_ui_oauth2_redirect_url = f"/{module_name}/docs/oauth2-redirect"
+    app.setup()
 
     @app.get("/health")
     async def health() -> Any:

@@ -357,21 +357,19 @@ async def test_dispatch_deserialize_failure_increments_count_and_records_error()
     outbox.configure(store, JsonEventSerializer(), start_loop=False)
     _bootstrap_with_listener(record)
 
-    pub = EventPublication(
-        id=uuid4(),
-        payload=b"{}",
-        event_type="no.such.module.Ghost",
-        listener=outbox._listener_id(record),
-        published_at=datetime.now(UTC),
-    )
+    # A REGISTERED event type (so the unregistered-type guard lets it through)
+    # whose stored bytes are not decodable — the poison-payload case, which is
+    # what actually reaches the deserialize step.
+    pub = _make_pub(record, payload=b"not json")
     await store.save(pub)
 
     await outbox._dispatch_publication(pub)
 
     assert pub.attempt_count == 1
     assert pub.last_error is not None
-    assert "no.such.module" in pub.last_error
+    assert "Expecting value" in pub.last_error  # the JSON decode error, verbatim
     assert pub.completed_at is None
+    assert received == []  # nothing was delivered
     assert store.saved == [pub.id, pub.id]
 
 
@@ -427,7 +425,7 @@ class _StoreWithOwnDeadLetterThreshold(StubStore):
 
 
 def test_configure_rejects_conflicting_dead_letter_thresholds() -> None:
-    """Task 4: unify dead-letter thresholds — a store constructed with its OWN
+    """Dead-letter thresholds are unified: a store constructed with its OWN
     explicit dead_letter_after_attempts that disagrees with the value passed
     to outbox.configure() must fail loudly during configuration instead of
     silently leaving the store's is_dead_lettered flag and the plugin's own
@@ -464,9 +462,10 @@ def test_configure_pushes_its_threshold_down_to_the_store() -> None:
 
 
 class _LegacyDeadLetterStore(StubStore):
-    """A pre-Task-4 third-party store: exposes ``find_dead_lettered()`` with
-    NO pagination kwargs. ``list_dead_lettered()`` must fall back to its
-    single unbounded/capped call rather than raising TypeError."""
+    """A third-party store predating keyset pagination: exposes
+    ``find_dead_lettered()`` with NO pagination kwargs.
+    ``list_dead_lettered()`` must fall back to its single unbounded/capped
+    call rather than raising TypeError."""
 
     async def find_dead_lettered(self) -> list[EventPublication]:
         return [p for p in self.rows.values() if p.attempt_count >= 10]
@@ -474,7 +473,7 @@ class _LegacyDeadLetterStore(StubStore):
 
 @pytest.mark.asyncio
 async def test_list_dead_lettered_falls_back_for_store_without_pagination_kwargs() -> None:
-    """Task 4 keyset pagination must retain fallback behavior for third-party
+    """Keyset pagination must retain fallback behavior for third-party
     stores whose find_dead_lettered() predates the after/limit kwargs."""
     store = _LegacyDeadLetterStore()
     outbox.configure(store, JsonEventSerializer(), start_loop=False)
@@ -665,8 +664,77 @@ def test_backoff_measured_from_last_attempt_not_published_at() -> None:
     assert outbox._backoff_elapsed(pub) is True
 
 
+def test_backoff_survives_attempt_counts_that_overflow_the_exponent() -> None:
+    """A huge attempt_count must not raise OverflowError.
+
+    ``2.0 ** 1024`` exceeds the float range. Exponentiating before applying
+    the cap made every sweep raise once any row passed 1024 attempts, and the
+    raise aborts the whole cycle rather than one row — so every publication
+    behind it in the (oldest-attempt-first) ordering stalls forever. Reachable
+    because dead_letter_after_attempts accepts arbitrarily large values, which
+    is how operators express "effectively never dead-letter".
+    """
+    outbox.configure(
+        StubStore(), JsonEventSerializer(), max_retry_backoff_seconds=300.0, start_loop=False
+    )
+
+    pub = _make_pub(
+        record,
+        attempt_count=100_000,
+        last_attempt_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    # Still inside the 300s cap → not eligible, but computed, not raised.
+    assert outbox._backoff_elapsed(pub) is False
+
+    pub.last_attempt_at = datetime.now(UTC) - timedelta(seconds=301)
+    assert outbox._backoff_elapsed(pub) is True
+
+
+@pytest.mark.asyncio
+async def test_sweep_dispatches_rows_behind_a_high_attempt_count_row() -> None:
+    """One row with an overflowing attempt_count must not stall the sweep.
+
+    The OverflowError escaped ``_sweep_unclaimed`` before reaching any later
+    row, so a single poisoned publication blocked the entire backlog.
+    """
+    _bootstrap_with_listener(record)
+    store = StubStore()
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        dead_letter_after_attempts=1_000_000,
+        claim_strategy="none",
+        start_loop=False,
+    )
+
+    stuck = _make_pub(
+        record,
+        value=1,
+        attempt_count=100_000,
+        last_attempt_at=datetime.now(UTC) - timedelta(hours=1),
+    )
+    behind = _make_pub(record, value=2)
+    store.rows[stuck.id] = stuck
+    store.rows[behind.id] = behind
+
+    await outbox._sweep(timedelta(0))
+
+    assert sorted(received) == [1, 2]
+
+
+def test_all_advertises_no_private_names() -> None:
+    """``__all__`` is the star-import surface, so a leading-underscore entry
+    there contradicts itself: the import binds the name while every linter and
+    reader treats it as private. ``_current_session`` in particular is bound
+    and released through ``modulith.adapters.postgres_outbox.bind_session`` /
+    ``unbind_session``, which restore the previous value; advertising the raw
+    ContextVar invites callers to set it directly and lose that guarantee.
+    """
+    assert [n for n in outbox.__all__ if n.startswith("_")] == []
+
+
 # ---------------------------------------------------------------------------
-# Task 4: claim_strategy wiring in the outbox plugin
+# claim_strategy wiring in the outbox plugin
 # ---------------------------------------------------------------------------
 
 
@@ -876,9 +944,63 @@ async def test_lease_renews_during_slow_dispatch() -> None:
 
     await outbox._sweep(timedelta(0))
 
+    # The first positive renewal is the pre-dispatch re-arm; a renewal BEYOND
+    # it is the in-dispatch loop firing at ~lease/3.
     renewals = [c for c in store.renew_calls if c[2] > 0]
-    assert renewals, "lease renewal must run at ~lease/3 during slow dispatch"
+    assert len(renewals) > 1, "lease renewal must run at ~lease/3 during slow dispatch"
     assert received == [3]
+
+
+@pytest.mark.asyncio
+async def test_lease_skips_a_row_a_peer_reclaimed_and_dispatches_the_rest() -> None:
+    """One claim_batch call leases every row with the SAME expiry while
+    dispatch is serial, so a row's lease can run out before its turn and a peer
+    sweeper can claim it. The re-arm before dispatch must catch that: skip the
+    row rather than deliver it a second time under a dead lease, and carry on
+    with the rest of the batch.
+    """
+    stolen: list[UUID] = []
+
+    class PeerReclaimsBeforeDispatch(ClaimingStubStore):
+        """A peer takes the stolen rows over in the window between our
+        claim_batch returning them and the sweep reaching them."""
+
+        async def claim_batch(
+            self, *, owner: str, batch_size: int, lease_seconds: float, older_than: timedelta
+        ) -> list[EventPublication]:
+            claimed = await super().claim_batch(
+                owner=owner,
+                batch_size=batch_size,
+                lease_seconds=lease_seconds,
+                older_than=older_than,
+            )
+            peer_until = datetime.now(UTC) + timedelta(hours=1)
+            for pub in claimed:
+                if pub.id in stolen:
+                    self.claims[pub.id] = ("worker-b", "peer-token", peer_until)
+            return claimed
+
+    store = PeerReclaimsBeforeDispatch()
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        claim_lease_seconds=60.0,
+        start_loop=False,
+    )
+    _bootstrap_with_listener(record)
+    first = _make_pub(record, value=1, published_at=datetime.now(UTC) - timedelta(seconds=2))
+    second = _make_pub(record, value=2, published_at=datetime.now(UTC) - timedelta(seconds=1))
+    await store.save(first)
+    await store.save(second)
+    stolen.append(first.id)
+
+    await outbox._sweep(timedelta(0))
+
+    assert received == [2]  # the first row belongs to the peer now
+    assert [c[0] for c in store.complete_claim_calls] == [second.id]
+    assert store.rows[first.id].completed_at is None
+    assert store.rows[first.id].attempt_count == 0  # skipped, not failed
 
 
 @pytest.mark.asyncio
@@ -1551,8 +1673,13 @@ async def test_lost_lease_stops_renewal_without_cancelling_dispatch() -> None:
     lease_lost = asyncio.Event()
 
     class LosingRenewalStore(ClaimingStubStore):
+        """Grants the pre-dispatch re-arm, then loses the lease mid-dispatch —
+        the row WAS ours when delivery started, so it must run to completion."""
+
         async def renew_claim(self, publication_id: UUID, token: str, lease_seconds: float) -> bool:
             self.renew_calls.append((publication_id, token, lease_seconds))
+            if len(self.renew_calls) == 1:
+                return True
             lease_lost.set()
             return False
 

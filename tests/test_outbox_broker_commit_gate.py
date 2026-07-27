@@ -1,4 +1,4 @@
-"""Durable-path broker sends must be commit-gated (A2-r4-168).
+"""Durable-path broker sends must be commit-gated.
 
 `publish()` on the durable path (outbox store configured + session bound) used
 to hand @externalized / cross-module events to the broker *synchronously,
@@ -126,7 +126,7 @@ def _broker_routes(store: RecordingStore) -> list[EventPublication]:
 
 
 async def test_durable_publish_defers_broker_send_to_after_commit() -> None:
-    """A2-r4-168: inside a transaction, publish() must not touch the broker.
+    """Inside a transaction, publish() must not touch the broker.
 
     The route is persisted as a publication row in the bound session; the
     after-commit dispatch delivers it.
@@ -158,7 +158,7 @@ async def test_durable_publish_defers_broker_send_to_after_commit() -> None:
 
 
 async def test_rolled_back_publish_never_reaches_broker() -> None:
-    """A2-r4-168: a rollback discards the broker-route row with the business
+    """A rollback discards the broker-route row with the business
     transaction — nothing was sent synchronously, so nothing can leak out."""
     fake, _store = _durable_processes_setup()
 
@@ -175,7 +175,7 @@ async def test_rolled_back_publish_never_reaches_broker() -> None:
 
 
 async def test_externalized_event_with_local_listener_fans_out_after_commit() -> None:
-    """A2-r4-168 (fan-out): an @externalized event with a local listener gets
+    """Fan-out: an @externalized event with a local listener gets
     one listener row AND one broker-route row; both deliver after commit."""
     fake, store = _durable_processes_setup()
 
@@ -210,7 +210,7 @@ async def test_externalized_event_with_local_listener_fans_out_after_commit() ->
 
 
 async def test_failed_broker_route_dispatch_is_recorded_for_retry() -> None:
-    """A2-r4-168 (durability): a broker-route row whose send fails after
+    """Durability: a broker-route row whose send fails after
     commit records the attempt (retry-loop food) instead of raising out of
     the after-commit dispatch task."""
     fake, store = _durable_processes_setup()

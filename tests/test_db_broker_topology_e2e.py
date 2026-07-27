@@ -44,6 +44,7 @@ import modulith
 from modulith.adapters.db_broker import DatabaseBroker, broker_schema
 from modulith.proxy import create_proxy_app
 from modulith.supervisor import Supervisor, WorkerSpec, _rules_from_specs
+
 from conftest import _free_port
 
 pytestmark = [pytest.mark.integration]

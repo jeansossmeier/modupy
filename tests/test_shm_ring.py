@@ -26,6 +26,12 @@ from modulith.adapters._shm_ring import (
 )
 
 _PROCESS_TIMEOUT_SECONDS = 5.0
+# Budget for a spawn child to boot a cold interpreter, import, and report.
+# Deliberately far larger than the reaper deadline above: this one is a
+# liveness bound on a slow (Windows/macOS, antivirus-scanned) CI runner,
+# whereas _PROCESS_TIMEOUT_SECONDS is how long we wait for an already-finished
+# child to be collected before escalating to terminate/kill.
+_SPAWN_STARTUP_TIMEOUT_SECONDS = 60.0
 
 
 class _SpawnProcess(Protocol):
@@ -58,8 +64,7 @@ def _stop_process(process: _SpawnProcess) -> None:
 
 @pytest.fixture()
 def notifier(tmp_path: Path) -> Iterator[ShmRing]:
-    """Create a notifier while exercising the legacy slot_size argument."""
-    instance = ShmRing(tmp_path / "hints.mmap", capacity=4, slot_size=512, create=True)
+    instance = ShmRing(tmp_path / "hints.mmap", capacity=4, create=True)
     yield instance
     instance.close()
 
@@ -71,7 +76,7 @@ def test_create_and_attach_share_sequence_hints(notifier: ShmRing) -> None:
     attached = ShmRing(notifier.path, capacity=4)
     try:
         assert attached.available
-        assert attached.read_hints(after_sequence=0, through_sequence=5) == [5]
+        assert attached.read_hints(after_sequence=0) == [5]
     finally:
         attached.close()
 
@@ -89,29 +94,26 @@ def test_invalid_sequences_are_rejected_without_touching_the_ring(
     assert notifier.read_hints() == []
 
 
-def test_constructor_and_compatibility_properties_report_notifier_limits(
-    tmp_path: Path,
-) -> None:
+def test_constructor_rejects_empty_capacity_and_reports_its_path(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="capacity"):
         ShmRing(tmp_path / "invalid.mmap", capacity=0, create=True)
 
     notifier = ShmRing(tmp_path / "properties.mmap", capacity=1, create=True)
     try:
         assert notifier.name == str(notifier.path)
-        assert notifier.max_payload_size == 0
-        notifier.ack(1)
-        assert not notifier.renew(1)
+        assert notifier.capacity == 1
     finally:
         notifier.close()
         notifier.unlink()
 
 
-def test_read_window_rejects_empty_ranges_and_filters_newer_hints(notifier: ShmRing) -> None:
+def test_read_hints_returns_only_sequences_past_the_cursor(notifier: ShmRing) -> None:
     assert notifier.notify(1)
     assert notifier.notify(3)
 
-    assert notifier.read_hints(after_sequence=3, through_sequence=3) == []
-    assert notifier.read_hints(after_sequence=0, through_sequence=2) == [1]
+    assert notifier.read_hints(after_sequence=0) == [1, 3]
+    assert notifier.read_hints(after_sequence=1) == [3]
+    assert notifier.read_hints(after_sequence=3) == []
 
 
 def test_spawned_process_can_attach_and_notify(notifier: ShmRing) -> None:
@@ -124,11 +126,15 @@ def test_spawned_process_can_attach_and_notify(notifier: ShmRing) -> None:
 
     process.start()
     try:
+        # Wait on the child's own result, not on the reaper: _stop_process is a
+        # force-kill guard, so using it as the startup budget makes a merely
+        # slow runner SIGTERM the child and surface as `assert -15 == 0` —
+        # a message that accuses ShmRing of a regression it did not commit.
+        assert result_queue.get(timeout=_SPAWN_STARTUP_TIMEOUT_SECONDS) == (True, True)
         _stop_process(process)
         assert not process.is_alive(), "spawned notifier process survived terminate/kill"
         assert process.exitcode == 0
-        assert result_queue.get(timeout=1) == (True, True)
-        assert notifier.read_hints(after_sequence=0, through_sequence=7) == [7]
+        assert notifier.read_hints(after_sequence=0) == [7]
     finally:
         _stop_process(process)
         result_queue.close()
@@ -139,8 +145,8 @@ def test_wrapped_slots_only_expose_current_sequences(tmp_path: Path) -> None:
     notifier = ShmRing(tmp_path / "wrap.mmap", capacity=2, create=True)
     try:
         assert all(notifier.notify(sequence) for sequence in (1, 2, 3))
-        assert notifier.read_hints(after_sequence=0, through_sequence=3) == [2, 3]
-        assert notifier.read_hints(after_sequence=2, through_sequence=3) == [3]
+        assert notifier.read_hints(after_sequence=0) == [2, 3]
+        assert notifier.read_hints(after_sequence=2) == [3]
     finally:
         notifier.close()
 
@@ -151,12 +157,12 @@ def test_torn_and_misplaced_slots_are_ignored(notifier: ShmRing) -> None:
     with notifier.path.open("r+b") as file_handle:
         with mmap.mmap(file_handle.fileno(), 0) as mapping:
             struct.pack_into("<Q", mapping, offset + 8, 123)
-    assert notifier.read_hints(after_sequence=0, through_sequence=5) == []
+    assert notifier.read_hints(after_sequence=0) == []
 
     with notifier.path.open("r+b") as file_handle:
         with mmap.mmap(file_handle.fileno(), 0) as mapping:
             struct.pack_into("<QQ", mapping, offset, 6, 6 ^ ((1 << 64) - 1))
-    assert notifier.read_hints(after_sequence=0, through_sequence=6) == []
+    assert notifier.read_hints(after_sequence=0) == []
 
 
 def test_incompatible_header_degrades_cleanly(tmp_path: Path) -> None:
@@ -170,7 +176,7 @@ def test_incompatible_header_degrades_cleanly(tmp_path: Path) -> None:
     notifier = ShmRing(path, capacity=4)
     assert not notifier.available
     assert not notifier.notify(1)
-    assert notifier.read_hints(after_sequence=0, through_sequence=1) == []
+    assert notifier.read_hints(after_sequence=0) == []
     notifier.close()
 
 
@@ -263,7 +269,7 @@ def test_create_never_replaces_an_existing_notifier(tmp_path: Path) -> None:
     try:
         assert not mismatch.available
         assert path.read_bytes() == original
-        assert active.read_hints(after_sequence=0, through_sequence=3) == [3]
+        assert active.read_hints(after_sequence=0) == [3]
     finally:
         mismatch.close()
         active.close()
@@ -294,6 +300,35 @@ def test_attach_retries_while_existing_file_is_sized(tmp_path: Path) -> None:
         notifier.close()
 
 
-def test_legacy_payload_api_forces_durable_fallback(notifier: ShmRing) -> None:
-    assert not notifier.write(b"target", b"payload", b"group", sequence=9)
-    assert notifier.claim(b"group", batch_size=1) == []
+def test_create_leaves_no_extra_hard_link_visible_to_a_racing_peer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A peer that stats the hint file mid-create must never see st_nlink > 1.
+
+    The file is installed with a hard link from a private scratch name, and a
+    state file carrying more than one link is rejected outright as a possible
+    hijack (_state_path._validate_regular_file). Closing the creator's
+    descriptor is the last thing that happens while the scratch name could
+    still exist, so it is the widest point of the window: sample the link
+    count there.
+    """
+    path = tmp_path / "racy.mmap"
+    real_close = os.close
+    link_counts: list[int] = []
+
+    def sampling_close(fd: int) -> None:
+        if path.exists():
+            link_counts.append(path.stat().st_nlink)
+        real_close(fd)
+
+    monkeypatch.setattr(os, "close", sampling_close)
+    notifier = ShmRing(path, capacity=4, create=True)
+    monkeypatch.undo()
+    try:
+        assert notifier.available
+        assert link_counts, "the creator never closed its descriptor"
+        assert link_counts == [1] * len(link_counts)
+        assert path.stat().st_nlink == 1
+    finally:
+        notifier.close()

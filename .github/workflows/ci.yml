@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: nothing here writes to the repository, so the workflow token
+# only needs to read it. Without this the token inherits whatever the repository
+# default is, which for many repos is write-all.
+permissions:
+  contents: read
+
 # Cancel in-flight runs of this workflow for the same ref so a quick push
 # rebases doesn't burn CI minutes on stale commits.
 concurrency:
@@ -48,7 +54,7 @@ jobs:
 
       - name: Run pytest with coverage (3.11 only)
         if: matrix.python-version == '3.11'
-        # Coverage is collected once on 3.11 (plan Task 9): 90% package-wide,
+        # Coverage is collected once, on 3.11: 90% package-wide,
         # 100% on the outbox plugin. Thresholds live in pyproject.toml
         # [tool.coverage.report] so local and CI agree. Use coverage.py directly
         # instead of pytest --cov=modulith so isolated pytest subprocesses do
@@ -101,7 +107,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Exercise both ends of the supported range (Task 9).
+        # Exercise both ends of the supported range.
         python-version: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
@@ -128,15 +134,14 @@ jobs:
         # tests/conftest.py pytest.skip's the ENTIRE integration suite when
         # Docker is unreachable, and pytest exits 0 on all-skipped — without
         # this preflight a runner-image Docker breakage turns the lane
-        # permanently green while proving nothing (W3 R5-01): the exact
+        # permanently green while proving nothing: the exact
         # rubber-stamp the unit-lane comment above warns about.
         run: docker info
 
       - name: Run integration suite
         # Belt and braces with the preflight: ANY skip in this lane means the
         # Docker/testcontainers path silently degraded mid-run. Fail the job
-        # when the pytest summary reports skipped tests or no passed tests
-        # (W3 R5-01).
+        # when the pytest summary reports skipped tests or no passed tests.
         run: |
           set -o pipefail
           pytest -m integration -v | tee pytest-integration.log
@@ -171,7 +176,7 @@ jobs:
         run: uv pip install --system "ruff>=0.4,<1.0"
 
       - name: Lint
-        # Task 9: include packaged tooling and examples, not just the library.
+        # Covers packaged tooling and examples, not just the library.
         run: ruff check modulith tests scripts examples
 
       - name: Format check
@@ -202,8 +207,8 @@ jobs:
 
       - name: Type check
         # tests/ is type-checked too; per-module strictness relaxations for
-        # tests live in pyproject.toml [[tool.mypy.overrides]].
-        # Task 9: also type-check scripts/ and examples/.
+        # tests live in pyproject.toml [[tool.mypy.overrides]]. scripts/ and
+        # examples/ are checked too — they ship in the sdist.
         run: mypy --strict modulith/ tests/ scripts/ examples/
 
   build:
@@ -227,6 +232,7 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path, PurePosixPath
+          import re
           import tarfile
           import zipfile
 
@@ -242,11 +248,19 @@ jobs:
               }
           )
 
+          # An sdist puts everything under one `<distribution>-<version>/` root
+          # and a wheel puts metadata under `<distribution>-<version>.dist-info/`.
+          # Match the shape rather than the literal distribution name: the
+          # distribution is `modupy` while the import package is `modulith`, and
+          # a name-specific prefix would silently strip nothing after a rename,
+          # turning every assertion below into a no-op.
+          ARCHIVE_ROOT = re.compile(r"^[A-Za-z0-9._]+-\d[A-Za-z0-9._+!-]*(\.dist-info)?$")
+
           def normalized(names):
               result = set()
               for name in names:
                   parts = PurePosixPath(name).parts
-                  if parts and parts[0].startswith("modulith-"):
+                  if parts and ARCHIVE_ROOT.match(parts[0]):
                       parts = parts[1:]
                   if parts:
                       result.add("/".join(parts))
@@ -282,8 +296,8 @@ jobs:
       - name: Smoke-test wheel installs
         # The wheel must install cleanly into a fresh interpreter so users
         # who pip-install from PyPI don't hit packaging surprises in prod.
-        # Task 9: install with all extras, verify entry points/assets, run a
-        # packaged SQLite migration, and check API-reference drift.
+        # Installs with all extras, verifies entry points and packaged assets,
+        # and runs a packaged SQLite migration end to end.
         run: |
           python -m venv /tmp/smoke
           WHL=$(ls dist/*.whl)

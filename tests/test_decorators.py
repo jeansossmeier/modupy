@@ -14,7 +14,11 @@ from __future__ import annotations
 
 import functools
 import inspect
+import subprocess
+import sys
+import textwrap
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -228,7 +232,7 @@ def test_sync_wrapper_around_async_listener_preserves_manifest_identity() -> Non
 def test_listener_rejects_invalid_broker_targets(broker_targets: object) -> None:
     with pytest.raises(TypeError, match="broker_targets"):
 
-        @listener(broker_targets=broker_targets)  # type: ignore[arg-type]
+        @listener(broker_targets=broker_targets)  # type: ignore[call-overload]
         async def handler(evt: E) -> None:
             pass
 
@@ -252,3 +256,77 @@ def test_listener_rejects_unannotated_event_arg() -> None:
         @listener
         async def handler(evt) -> None:  # type: ignore[no-untyped-def]
             pass
+
+
+# ---------------------------------------------------------------------------
+# @listener — static typing contract
+# ---------------------------------------------------------------------------
+
+
+def test_listener_preserves_the_handler_signature_for_type_checkers(tmp_path: Path) -> None:
+    """A decorated handler must keep its own signature, not collapse to Any.
+
+    This package ships ``py.typed``, so a decorator declared only as
+    ``-> Any`` silently switches OFF type checking for every call to every
+    ``@listener`` function in a user's app, and the parameterized form trips
+    ``untyped-decorator`` under ``--strict``. Only a real type checker can
+    observe that, so this drives mypy over a probe module.
+
+    ``--follow-imports=silent`` keeps the assertions about the *probe*: errors
+    inside ``modulith`` itself (which runs under the project's own, looser
+    settings) must not leak into this file's output.
+    """
+    pytest.importorskip("mypy")
+
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        textwrap.dedent(
+            """
+            from dataclasses import dataclass
+
+            from modulith import event, listener
+
+
+            @event
+            @dataclass(frozen=True)
+            class Placed:
+                n: int
+
+
+            @listener
+            async def on_placed(evt: Placed) -> None: ...
+
+
+            @listener(broker_targets=["redis-streams:orders"])
+            async def on_placed2(evt: Placed) -> None: ...
+
+
+            async def main() -> None:
+                await on_placed("nope")
+                await on_placed2()
+            """
+        )
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mypy",
+            "--strict",
+            "--disallow-untyped-decorators",
+            "--follow-imports=silent",
+            "--cache-dir",
+            str(tmp_path / "mypy_cache"),
+            str(probe),
+        ],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+    )
+
+    # The bare form keeps the parameter type: a str where the event goes is an error.
+    assert "[arg-type]" in result.stdout, result.stdout
+    # The parameterized form keeps the arity AND is itself typed.
+    assert "[call-arg]" in result.stdout, result.stdout
+    assert "untyped-decorator" not in result.stdout, result.stdout

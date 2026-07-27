@@ -208,7 +208,7 @@ async def test_skip_locked_partitions_concurrent_sweepers(engine) -> None:
 
 
 # ---------------------------------------------------------------------------
-# find_incomplete: dead-letter exclusion + LIMIT-100 window — S3-r1-64
+# find_incomplete: dead-letter exclusion + LIMIT-100 window
 # ---------------------------------------------------------------------------
 
 
@@ -228,7 +228,7 @@ def _row(*, published_at, dead: bool = False, attempts: int = 0) -> EventPublica
 
 
 async def test_find_incomplete_dead_letter_backlog_does_not_starve_live_rows(engine) -> None:
-    """S3-r1-64: the docstring's exact starvation scenario on real Postgres —
+    """``find_incomplete``'s documented starvation scenario on real Postgres —
     a backlog of >100 dead-lettered rows, all OLDER than the live rows, would
     fill the LIMIT-100 window and hide every live retryable row if the
     ``is_dead_lettered IS FALSE`` filter regressed out of the WHERE clause.
@@ -255,7 +255,7 @@ async def test_find_incomplete_dead_letter_backlog_does_not_starve_live_rows(eng
 
 
 async def test_find_incomplete_caps_the_sweep_window_at_100_rows(engine) -> None:
-    """S3-r1-64: the sweep window is capped at 100 rows on real Postgres, and
+    """The sweep window is capped at 100 rows on real Postgres, and
     the cap admits the least-recently-attempted rows first (never-attempted
     rows sort by ``published_at``)."""
     base = datetime.now(UTC) - timedelta(hours=1)

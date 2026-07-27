@@ -1,6 +1,6 @@
 """Regression tests for the modulith pytest plugin (``modulith.testing``).
 
-Covers audit findings on ``Scenario.within()``'s timeout contract and on the
+Covers ``Scenario.within()``'s timeout contract and the
 ``@pytest.mark.modulith_isolated`` subprocess re-invocation.
 
 Note: like tests/test_testing_plugin.py, this file deliberately does *not*
@@ -55,7 +55,7 @@ def _roundtrip(loop: asyncio.AbstractEventLoop) -> None:
 
 
 def test_within_call_coroutine_timeout_raises_assertion_error():
-    """A11-r2-98: a ``.call()`` coroutine trigger that overruns the budget
+    """A ``.call()`` coroutine trigger that overruns the budget
     must surface as the documented AssertionError, not as a bare
     concurrent.futures.TimeoutError escaping ``within()``."""
     from modulith.sync import _get_or_create_loop
@@ -99,7 +99,7 @@ def test_within_call_sync_trigger_respects_seconds_budget():
 
 
 def test_within_timeout_cancels_call_coroutine_trigger():
-    """A11-r5-221: a ``.call()`` coroutine trigger that times out must be
+    """A ``.call()`` coroutine trigger that times out must be
     cancelled — not left running on the shared daemon-loop, where it can
     resume later and dispatch into a subsequent test's runtime."""
     from modulith.sync import _get_or_create_loop
@@ -128,7 +128,7 @@ def test_within_timeout_cancels_call_coroutine_trigger():
 
 
 def test_within_call_coroutine_shares_single_time_budget():
-    """A11-r2-98 (budget doubling): the trigger phase and the poll phase
+    """Budget doubling: the trigger phase and the poll phase
     share ONE ``seconds`` budget; previously each got its own full window,
     silently waiting ~2x the requested time."""
 
@@ -161,7 +161,7 @@ def test_within_rejects_non_finite_or_negative_seconds():
 
 
 def test_within_publish_trigger_respects_seconds_budget(scenario):
-    """A11-r3-150: a ``.publish()`` trigger must be bounded by the caller's
+    """A ``.publish()`` trigger must be bounded by the caller's
     ``within(seconds=...)`` budget, not by publish_sync's own hardcoded 30s
     default — and the AssertionError must not overstate how long was waited."""
     _isolate()
@@ -186,7 +186,7 @@ def test_within_publish_trigger_respects_seconds_budget(scenario):
 
 
 def test_isolated_subprocess_timeout_fails_test_not_suite(pytester):
-    """A11-r1-37: the isolated-test subprocess has a bounded runtime.
+    """The isolated-test subprocess has a bounded runtime.
 
     A hung isolated test must be killed after ``modulith_isolated_timeout``
     seconds and reported as a single failed test — not block the entire
@@ -216,7 +216,7 @@ def test_isolated_subprocess_timeout_fails_test_not_suite(pytester):
 
 
 def test_isolated_subprocess_launch_failure_fails_only_that_test(pytester):
-    """A11-r1-38: an exception from the subprocess launch itself (fork/exec
+    """An exception from the subprocess launch itself (fork/exec
     failure) must fail just the marked test, not crash the whole session
     with an INTERNALERROR that prevents every other test from running."""
     pytester.makeconftest(
@@ -249,7 +249,7 @@ def test_isolated_subprocess_launch_failure_fails_only_that_test(pytester):
 
 
 def test_isolated_subprocess_forwards_cli_options(pytester):
-    """A11-r3-151: the child re-invocation must forward the parent's CLI
+    """The child re-invocation must forward the parent's CLI
     arguments (custom pytest_addoption flags, -m/-k filters, ...) instead of
     silently reverting isolated tests to option defaults."""
     pytester.makeconftest(
@@ -278,7 +278,7 @@ def test_isolated_subprocess_forwards_cli_options(pytester):
 
 
 def test_isolated_subprocess_runs_from_rootdir_not_parent_cwd(pytester):
-    """A11-r1-39: the child must resolve ``item.nodeid`` against pytest's
+    """The child must resolve ``item.nodeid`` against pytest's
     rootdir, not the parent process's incidental cwd — otherwise any run
     where cwd != rootdir fails with a misleading 'file not found'."""
     proj = pytester.mkdir("proj")

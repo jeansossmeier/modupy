@@ -29,6 +29,23 @@ from textwrap import dedent
 
 import pytest
 
+from modulith.config import _announced_broker_defaults
+
+
+@pytest.fixture(autouse=True)
+def _fresh_broker_announcements() -> Iterator[None]:
+    """Give each test the clean slate a freshly-started process would have.
+
+    ``load_configuration`` announces an auto-selected broker once per process
+    and remembers the decision in module-global state. Without this, the first
+    test anywhere in the suite that defaults a broker silences the warning for
+    every test that runs after it, so whether a test asserting on the
+    announcement passes depends on which files ran before it.
+    """
+    _announced_broker_defaults.clear()
+    yield
+    _announced_broker_defaults.clear()
+
 
 def _free_port() -> int:
     """Find a free TCP port by binding to port 0, then releasing it.

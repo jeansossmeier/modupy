@@ -1,6 +1,6 @@
 """Behavioral tests for the SQLAlchemy outbox adapter.
 
-The adapter is named for Postgres (it ships in ``modulith[postgres]`` with
+The adapter is named for Postgres (it ships in ``modupy[postgres]`` with
 asyncpg) but is built on portable SQLAlchemy 2.0 Core/ORM, so these tests run
 it against aiosqlite — no Docker: a tmp-file DB with per-session connections
 (see the ``engine`` fixture for why NOT StaticPool + :memory:). The same code
@@ -229,8 +229,40 @@ async def test_rollback_drops_pending(engine) -> None:
         assert rows == []
 
 
+async def test_rollback_does_not_leak_pending_ids_into_the_next_commit(engine, caplog) -> None:
+    """A reused session must not dispatch what its rolled-back sibling queued.
+
+    SQLAlchemy does not reset ``Session.info`` on rollback, and reusing a
+    Session across transactions is ordinary. Without an explicit discard the
+    rolled-back id survives in the queue and the *next* commit dispatches it,
+    finding no row and logging the "deleted before delivery?" warning that is
+    supposed to mean a committed row went missing.
+    """
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener()
+
+    sessionmaker = async_sessionmaker(engine)
+    async with sessionmaker() as session:
+        token = bind_session(session)
+        try:
+            await store.save(_pub(6))
+            await session.rollback()
+            # Same session, second transaction — the queue must start empty.
+            await store.save(_pub(7))
+            with caplog.at_level(logging.WARNING, logger="modulith.adapters.postgres"):
+                await session.commit()
+                await store.wait_for_dispatch()
+        finally:
+            outbox._current_session.reset(token)
+
+    assert received == [7]
+    assert "deleted before delivery" not in caplog.text
+
+
 def test_after_commit_without_running_loop_defers_to_retry_sweep(tmp_path, caplog) -> None:
-    """Degraded path (postgres_outbox.py:154-162): a *sync* SQLAlchemy session
+    """Degraded path (postgres_outbox._schedule_after_commit_dispatch): a
+    *sync* SQLAlchemy session
     committing from a thread with no running event loop fires the global
     after_commit hook, but dispatch tasks can't be scheduled. The hook must NOT
     crash — it logs and leaves the committed row for the retry sweep.
@@ -365,7 +397,7 @@ async def test_purge_completed_removes_old(engine) -> None:
 
 
 # ---------------------------------------------------------------------------
-# regression: reopen guard, dead-letter exclusion, unbounded counts (audit)
+# regression: reopen guard, dead-letter exclusion, unbounded counts
 # ---------------------------------------------------------------------------
 
 
@@ -443,7 +475,7 @@ async def test_status_distinguishes_open_completed_dead_via_store_counts(engine)
 
 
 async def test_configure_rejects_conflicting_dead_letter_thresholds(engine) -> None:
-    """Task 4: unify dead-letter thresholds — constructing the store with an
+    """Dead-letter thresholds are unified — constructing the store with an
     explicit threshold that disagrees with the one passed to
     outbox.configure() must fail loudly instead of leaving the store's
     is_dead_lettered flag (written from ITS OWN threshold in save()) out of
@@ -484,8 +516,8 @@ async def test_force_retry_reaches_dead_lettered_publication(engine) -> None:
 
 
 async def test_find_by_id_reaches_publication_outside_capped_windows(engine) -> None:
-    """Task 4: force_retry must not depend on the capped find_incomplete
-    (LIMIT 100) / find_dead_lettered (LIMIT 100, pre-Task-4) scans to locate a
+    """force_retry must not depend on the capped find_incomplete
+    (LIMIT 100) / find_dead_lettered (LIMIT 100) scans to locate a
     target row — a direct point lookup reaches it regardless of backlog size."""
     store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=2)
     outbox.configure(store, JsonEventSerializer(), dead_letter_after_attempts=2, start_loop=False)
@@ -502,7 +534,7 @@ async def test_find_by_id_reaches_publication_outside_capped_windows(engine) -> 
 
 
 async def test_find_dead_lettered_keyset_pagination_reaches_101_plus(engine) -> None:
-    """Task 4: 101+ dead-lettered rows must all be reachable — the old
+    """101+ dead-lettered rows must all be reachable — the old
     find_dead_lettered() (LIMIT 100, no cursor) silently hid every row past
     the 100th from list_dead_lettered() / retry_all_dead_lettered()."""
     store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=1)
@@ -531,7 +563,7 @@ async def test_last_attempt_at_persists_and_round_trips(engine) -> None:
 
 
 # ---------------------------------------------------------------------------
-# regression: after-commit hook + active-store lifecycle (audit)
+# regression: after-commit hook + active-store lifecycle
 # ---------------------------------------------------------------------------
 
 
@@ -646,7 +678,7 @@ async def test_after_commit_and_sweep_race_is_bounded(engine) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Task 4: outbox-claims — lease-mode claim_batch/renew_claim/complete_claim/
+# Outbox claims — lease-mode claim_batch/renew_claim/complete_claim/
 # fail_claim, and advisory-lock capability gating
 # ---------------------------------------------------------------------------
 

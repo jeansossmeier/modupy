@@ -5,7 +5,7 @@ Lets process-per-module topology use a relational database (Postgres / MySQL
 SQLite doubles as a zero-dependency bootstrap broker (embedded file or
 ``:memory:``).
 
-Distributed via the ``modulith[database]`` extra (async SQLAlchemy + the
+Distributed via the ``modupy[database]`` extra (async SQLAlchemy + the
 asyncpg / aiomysql / aiosqlite drivers, plus ``cryptography`` for MySQL 8
 caching_sha2_password auth). Because this adapter is registered as a BUILTIN
 plugin (loaded at
@@ -128,6 +128,7 @@ import math
 import os
 import random
 from collections.abc import Awaitable, Callable
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -241,7 +242,22 @@ _SQLITE_SCHEMA_BUSY_MAX_RETRIES = 32
 
 # MySQL named locks are connection-scoped, so the implementation holds them
 # until the replay transaction commits and then releases them explicitly.
+# Total wall budget for winning every named lock a target-locked write needs.
 _TARGET_LOCK_TIMEOUT_S = 30
+# How long ONE attempt waits inside GET_LOCK before giving its pooled
+# connection back and retrying. Waiting the whole budget in a single call kept
+# the connection checked out for the entire wait, so a handful of publishers
+# contending for one target could occupy every slot in the pool and make
+# unrelated claims, acks and prunes fail with a QueuePool timeout against a
+# perfectly healthy database.
+_TARGET_LOCK_ATTEMPT_WAIT_S = 1
+
+# How many retained-message ids one statement may bind, and how many retained
+# sources one replay page holds. Far below every driver's bind-parameter limit
+# (SQLite 32,766; asyncpg 32,767) so a large retained table still deletes and
+# replays; small enough that a replay page's payloads stay a bounded working
+# set rather than the whole table.
+_RETAINED_ID_CHUNK = 500
 
 
 class NoSubscribersError(RuntimeError):
@@ -546,7 +562,7 @@ def _create_engine(url: Any, opts: dict[str, Any]) -> Any:
         # an actionable ConfigurationError the CLI maps to exit 1.
         raise ConfigurationError(
             "The 'database' broker requires SQLAlchemy (async) plus a DB driver. "
-            "Install the extra: pip install 'modulith[database]'"
+            "Install the extra: pip install 'modupy[database]'"
         ) from exc
 
     sqlite = _is_sqlite_url(url)
@@ -631,6 +647,7 @@ def broker_schema() -> tuple[Any, Any, Any]:
         UniqueConstraint,
     )
     from sqlalchemy.dialects.mysql import DATETIME as MySQLDateTime
+    from sqlalchemy.dialects.mysql import LONGBLOB as MySQLLongBlob
 
     # Timestamp type with microsecond precision on EVERY dialect. MySQL and
     # MariaDB default DATETIME to whole-second precision (fsp=0), which loses
@@ -641,6 +658,15 @@ def broker_schema() -> tuple[Any, Any, Any]:
     # (the migration mirrors this exactly). One shared instance is fine —
     # SQLAlchemy type objects are reusable across columns.
     ts = DateTime(timezone=True).with_variant(MySQLDateTime(fsp=6), "mysql", "mariadb")
+
+    # Payload type that can actually hold a ``max_payload_bytes`` publish on
+    # EVERY dialect. LargeBinary compiles to MySQL/MariaDB BLOB, which caps at
+    # 65,535 bytes — a fraction of the broker's default cap — so a modest
+    # payload passes publish()'s check and then dies with MySQL error 1406
+    # ("Data too long for column"). LONGBLOB (4 GiB) covers the whole accepted
+    # range; Postgres BYTEA and SQLite BLOB are already unbounded so the
+    # variant is inert there (the migrations mirror this exactly).
+    payload_type = LargeBinary().with_variant(MySQLLongBlob(), "mysql", "mariadb")
 
     metadata = MetaData()
 
@@ -670,7 +696,7 @@ def broker_schema() -> tuple[Any, Any, Any]:
         # that the consumer dead-letters on first claim, rather than a schema
         # violation at insert time.
         Column("event_type", String(_EVENT_TYPE_LEN), nullable=True),
-        Column("payload", LargeBinary, nullable=False),
+        Column("payload", payload_type, nullable=False),
         Column("headers", Text, nullable=True),
         Column(
             "status",
@@ -699,7 +725,7 @@ def broker_schema() -> tuple[Any, Any, Any]:
         Column("id", String(_ID_LEN), primary_key=True),
         Column("target", String(_TARGET_LEN), nullable=False),
         Column("event_type", String(_EVENT_TYPE_LEN), nullable=True),
-        Column("payload", LargeBinary, nullable=False),
+        Column("payload", payload_type, nullable=False),
         Column("headers", Text, nullable=True),
         Column("created_at", ts, nullable=False),
         Column("expires_at", ts, nullable=False),
@@ -977,6 +1003,20 @@ class DatabaseBroker:
         errors propagate immediately; ``CancelledError`` is never swallowed.
         On Postgres / MySQL ``_is_sqlite_locked`` never matches, so this is a
         plain single-attempt transaction there.
+
+        The wall budget covers waiting — acquiring the connection/transaction
+        and the geometric backoff sleeps — but NOT ``operation`` itself. An
+        attempt that has started doing work runs to completion: capping the
+        work aborted legitimately long writes (a bulk ``prune`` delete over a
+        few hundred thousand rows) with a ``TimeoutError`` that
+        ``_is_sqlite_locked`` cannot match, so it never retried, and could
+        abandon a transaction the database had already committed.
+
+        Exhausting that budget always surfaces as ``TimeoutError``, whether the
+        lock blocked the transaction itself or the first statement inside it —
+        which of the two happens depends on when the driver defers ``BEGIN``,
+        and the caller should not see the outcome change with it. Exhausting
+        ``_SQLITE_BUSY_MAX_RETRIES`` first keeps raising the driver's own error.
         """
         if not self._is_sqlite:
             async with self._engine.begin() as conn:
@@ -988,17 +1028,20 @@ class DatabaseBroker:
         while True:
             attempt += 1
             try:
-                async with asyncio.timeout_at(deadline):
-                    async with self._engine.begin() as conn:
-                        return await operation(conn)
+                async with AsyncExitStack() as stack:
+                    async with asyncio.timeout_at(deadline):
+                        conn = await stack.enter_async_context(self._engine.begin())
+                    return await operation(conn)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if (
-                    attempt >= _SQLITE_BUSY_MAX_RETRIES
-                    or loop.time() >= deadline
-                    or not _is_sqlite_locked(exc)
-                ):
+                if not _is_sqlite_locked(exc):
+                    raise
+                if loop.time() >= deadline:
+                    raise TimeoutError(
+                        f"SQLite write did not get its lock within {_SQLITE_BUSY_TOTAL_BUDGET_S}s"
+                    ) from exc
+                if attempt >= _SQLITE_BUSY_MAX_RETRIES:
                     raise
                 logger.warning(
                     "SQLite busy on write (attempt %d/%d) — retrying",
@@ -1019,7 +1062,10 @@ class DatabaseBroker:
         ordered_targets = sorted(set(targets))
         if not ordered_targets:
             return await self._write(operation)
-        dialect = self._engine.dialect.name
+        # Same defensive read as __init__'s _is_sqlite: a minimal injected
+        # engine without a dialect keeps the adapter's historical SQLite
+        # behavior instead of raising AttributeError on this path alone.
+        dialect = getattr(getattr(self._engine, "dialect", None), "name", "sqlite")
         if dialect in {"mysql", "mariadb"}:
             return await self._write_mysql_target_locked(ordered_targets, operation)
 
@@ -1043,27 +1089,59 @@ class DatabaseBroker:
         targets: list[str],
         operation: Callable[[Any], Awaitable[Any]],
     ) -> Any:
-        """Hold MySQL connection locks until the transaction has committed."""
+        """Hold MySQL connection locks until the transaction has committed.
+
+        A contended waiter must not sit on a pooled connection for the whole
+        ``_TARGET_LOCK_TIMEOUT_S`` budget: each attempt waits only
+        ``_TARGET_LOCK_ATTEMPT_WAIT_S`` inside GET_LOCK and hands the
+        connection back before retrying, so publishers queueing on one target
+        cannot exhaust the pool and stall unrelated broker work.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _TARGET_LOCK_TIMEOUT_S
+        while True:
+            blocked, value = await self._attempt_mysql_target_locked(targets, operation)
+            if blocked is None:
+                return value
+            if loop.time() >= deadline:
+                raise RuntimeError(
+                    f"timed out acquiring database broker target lock for {blocked!r}"
+                )
+
+    async def _attempt_mysql_target_locked(
+        self,
+        targets: list[str],
+        operation: Callable[[Any], Awaitable[Any]],
+    ) -> tuple[str | None, Any]:
+        """Take one pooled connection and either do the work or give it back.
+
+        Returns ``(None, result)`` once every named lock was won and the
+        operation committed, or ``(blocked_target, None)`` when a lock was
+        still held elsewhere — and in that case the connection is already back
+        in the pool with no lock retained, so the caller can retry cheaply.
+        """
         from sqlalchemy import text
 
         async with self._engine.connect() as conn:
             transaction = await conn.begin()
             acquired: list[str] = []
+            blocked: str | None = None
             try:
                 for target in targets:
                     lock_name = _mysql_target_lock_name(target)
                     result = await conn.execute(
                         text("SELECT GET_LOCK(:name, :timeout)"),
-                        {"name": lock_name, "timeout": _TARGET_LOCK_TIMEOUT_S},
+                        {"name": lock_name, "timeout": _TARGET_LOCK_ATTEMPT_WAIT_S},
                     )
                     if result.scalar_one() != 1:
-                        raise RuntimeError(
-                            f"timed out acquiring database broker target lock for {target!r}"
-                        )
+                        blocked = target
+                        break
                     acquired.append(lock_name)
+                if blocked is not None:
+                    return blocked, None
                 value = await operation(conn)
                 await transaction.commit()
-                return value
+                return None, value
             except BaseException:
                 if transaction.is_active:
                     await transaction.rollback()
@@ -1119,14 +1197,23 @@ class DatabaseBroker:
         The FK also cascades on server databases. The explicit delete keeps
         cleanup correct on injected SQLite engines where foreign keys may not
         have been enabled by ``_install_sqlite_pragmas``.
+
+        Chunked because every caller's id list is bounded only by the retained
+        table's own size: one ``IN (...)`` over more ids than the driver's bind
+        limit raises (SQLite "too many SQL variables" at 32,766; asyncpg at
+        32,767), and since prune/publish/subscribe all delete through here, the
+        only routine that can shrink the table would be the one that fails on
+        it.
         """
         if not retained_ids:
             return
         from sqlalchemy import delete
 
         retained, delivery = _retained_tables()
-        await conn.execute(delete(delivery).where(delivery.c.retained_message_id.in_(retained_ids)))
-        await conn.execute(delete(retained).where(retained.c.id.in_(retained_ids)))
+        for start in range(0, len(retained_ids), _RETAINED_ID_CHUNK):
+            chunk = retained_ids[start : start + _RETAINED_ID_CHUNK]
+            await conn.execute(delete(delivery).where(delivery.c.retained_message_id.in_(chunk)))
+            await conn.execute(delete(retained).where(retained.c.id.in_(chunk)))
 
     async def _prune_expired_retained(
         self,
@@ -1379,13 +1466,6 @@ class DatabaseBroker:
                 return
             for target in ordered_targets:
                 await self._prune_expired_retained(conn, now, target)
-                result = await conn.execute(
-                    select(retained).where(
-                        retained.c.target == target,
-                        retained.c.expires_at > now,
-                    )
-                )
-                sources = list(result.mappings())
                 if self._orphan_replay_policy == "ttl_all_groups":
                     replay_groups = [group]
                 elif self._orphan_replay_policy == "first_groups":
@@ -1395,12 +1475,32 @@ class DatabaseBroker:
                     replay_groups = [row[0] for row in group_result]
                 else:
                     continue
-                await self._fan_out_retained(conn, sources, replay_groups)
-                if self._orphan_replay_policy == "first_groups":
-                    await self._delete_retained(
-                        conn,
-                        [cast(str, source["id"]) for source in sources],
+                # Page the replay by id. Under ``ttl_all_groups`` the retained
+                # table holds every publish for the whole retention window even
+                # while consumers are healthy, and this runs on every consumer
+                # start — selecting the full rows in one statement would make
+                # the backlog's entire payload volume resident at once
+                # (SQLAlchemy's async execute() prebuffers the whole result),
+                # so a restart after a busy window OOMs on the way up.
+                id_result = await conn.execute(
+                    select(retained.c.id)
+                    .where(
+                        retained.c.target == target,
+                        retained.c.expires_at > now,
                     )
+                    .order_by(retained.c.created_at, retained.c.id)
+                )
+                source_ids = [row[0] for row in id_result]
+                for start in range(0, len(source_ids), _RETAINED_ID_CHUNK):
+                    page = source_ids[start : start + _RETAINED_ID_CHUNK]
+                    page_result = await conn.execute(
+                        select(retained)
+                        .where(retained.c.id.in_(page))
+                        .order_by(retained.c.created_at, retained.c.id)
+                    )
+                    await self._fan_out_retained(conn, list(page_result.mappings()), replay_groups)
+                    if self._orphan_replay_policy == "first_groups":
+                        await self._delete_retained(conn, page)
 
         await self._write_target_locked(ordered_targets, op)
 
@@ -1768,7 +1868,14 @@ class DatabaseConsumer(PollingConsumer):
             ),
             logger=logger,
             scheme=_DB_SCHEME,
-            idle_backoff=False,
+            # Every empty poll here is a network round-trip and a write
+            # transaction (SELECT ... FOR UPDATE SKIP LOCKED), so a fleet idling
+            # at the 20ms default poll interval spends thousands of claim
+            # transactions per second finding nothing. Consecutive empty polls
+            # widen the wait up to the shared cap and the first non-empty poll
+            # snaps it straight back, so the cost is bounded pickup latency on
+            # the first message after an idle stretch.
+            idle_backoff=True,
         )
 
 
@@ -1809,7 +1916,7 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
         except ImportError as exc:
             raise ConfigurationError(
                 "The 'database' broker requires SQLAlchemy (async) plus a DB "
-                "driver. Install the extra: pip install 'modulith[database]'"
+                "driver. Install the extra: pip install 'modupy[database]'"
             ) from exc
 
         # Keep the URL object (do NOT str() it): reparsing str(URL) truncates a

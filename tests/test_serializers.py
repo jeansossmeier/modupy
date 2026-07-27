@@ -7,6 +7,7 @@ preserve dataclass equality and correctly reconstruct rich field types
 
 from __future__ import annotations
 
+import logging
 import warnings
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -23,7 +24,7 @@ from modulith.serializers import JsonEventSerializer
 if TYPE_CHECKING:
     # Deliberately unimportable at runtime — mirrors an event module whose
     # annotation-only dependency isn't installed in the worker process
-    # (regression scaffolding for audit A6-r5-210).
+    # (scaffolding for the TYPE_CHECKING-forward-reference regression below).
     from nonexistent_debug_module import DebugInfo
 
 # ---------------------------------------------------------------------------
@@ -230,21 +231,54 @@ def test_deserialize_without_allowlist_warns_on_import_resolution() -> None:
         serializer.deserialize(data, _fqcn(SimpleEvent))
 
 
-def test_deserialize_with_allowlist_does_not_warn() -> None:
+def test_deserialize_without_allowlist_also_logs(caplog) -> None:
+    """A RuntimeWarning alone is not enough: ``PYTHONWARNINGS=ignore`` and
+    ``-W ignore`` silence the warnings channel wholesale, and warnings go to
+    stderr rather than the app's log pipeline. The fail-open configuration
+    must also reach the logs a deployment actually collects."""
+    serializer = JsonEventSerializer()
+    data = serializer.serialize(SimpleEvent(order_id="z", quantity=1))
+
+    with caplog.at_level(logging.WARNING, logger="modulith.serializers"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            serializer.deserialize(data, _fqcn(SimpleEvent))
+
+    assert [r.getMessage() for r in caplog.records if "allowed_event_types" in r.getMessage()]
+
+
+def test_unrestricted_deserialize_announces_once_per_instance(caplog) -> None:
+    """Bounded to one announcement per serializer so a hot dispatch loop
+    cannot flood the log with the same advisory."""
+    serializer = JsonEventSerializer()
+    data = serializer.serialize(SimpleEvent(order_id="z", quantity=1))
+
+    with caplog.at_level(logging.WARNING, logger="modulith.serializers"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            for _ in range(5):
+                serializer.deserialize(data, _fqcn(SimpleEvent))
+
+    matching = [r for r in caplog.records if "allowed_event_types" in r.getMessage()]
+    assert len(matching) == 1
+
+
+def test_deserialize_with_allowlist_does_not_warn(caplog) -> None:
     serializer = JsonEventSerializer(allowed_event_types=[SimpleEvent])
     data = serializer.serialize(SimpleEvent(order_id="z", quantity=1))
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        restored = serializer.deserialize(data, _fqcn(SimpleEvent))
+    with caplog.at_level(logging.WARNING, logger="modulith.serializers"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            restored = serializer.deserialize(data, _fqcn(SimpleEvent))
 
     assert restored == SimpleEvent(order_id="z", quantity=1)
+    assert caplog.records == []
 
 
 def test_round_trip_parameterized_containers_coerce_inner_types() -> None:
-    # Regression for the audit finding: list[datetime] / dict[str, Decimal] /
-    # set[UUID] / tuple[date, ...] must coerce their *inner* elements, not leave
-    # them as raw JSON strings.
+    # list[datetime] / dict[str, Decimal] / set[UUID] / tuple[date, ...] must
+    # coerce their *inner* elements, not leave them as raw JSON strings.
     serializer = JsonEventSerializer()
     original = ContainerEvent(
         stamps=[datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 2, 2, tzinfo=UTC)],
@@ -261,8 +295,8 @@ def test_round_trip_parameterized_containers_coerce_inner_types() -> None:
 
 
 def test_round_trip_nested_dataclass_fields() -> None:
-    # Regression for the audit finding: a field typed as another @dataclass (and
-    # a list of them) must serialize and reconstruct, not raise TypeError.
+    # A field typed as another @dataclass (and a list of them) must serialize
+    # and reconstruct, not raise TypeError.
     serializer = JsonEventSerializer()
     original = NestedEvent(
         order_id="o-1",
@@ -280,7 +314,7 @@ def test_round_trip_nested_dataclass_fields() -> None:
 
 
 def test_non_dataclass_event_round_trip_coerces_types() -> None:
-    """A6-r1-18: the non-dataclass deserialize path silently reverted rich
+    """The non-dataclass deserialize path silently reverted rich
     fields (datetime/UUID/Decimal) to raw strings — it must coerce using the
     class/__init__ annotations, like the dataclass path does."""
     serializer = JsonEventSerializer()
@@ -295,7 +329,7 @@ def test_non_dataclass_event_round_trip_coerces_types() -> None:
 
 
 def test_dict_bool_keys_round_trip() -> None:
-    """A6-r5-209: json.dumps stringifies bool dict keys to "true"/"false"
+    """json.dumps stringifies bool dict keys to "true"/"false"
     without consulting the default hook; the round trip must restore real
     bool keys so dataclass equality survives."""
     serializer = JsonEventSerializer()
@@ -306,7 +340,7 @@ def test_dict_bool_keys_round_trip() -> None:
 
 
 def test_dict_uuid_keys_serialize_and_round_trip() -> None:
-    """A6-r2-87: dict[UUID, X] fields crashed serialize() with the json
+    """dict[UUID, X] fields crashed serialize() with the json
     module's own opaque TypeError (keys never hit the default hook); keys
     must be pre-encoded and coerced back on the way in."""
     serializer = JsonEventSerializer()
@@ -318,7 +352,7 @@ def test_dict_uuid_keys_serialize_and_round_trip() -> None:
 
 
 def test_unsupported_dict_key_type_raises_serializer_error() -> None:
-    """A6-r2-87: unsupported key types must fail loudly with the serializer's
+    """Unsupported key types must fail loudly with the serializer's
     own message, not the json module's generic one."""
 
     @dataclass(frozen=True)
@@ -331,7 +365,7 @@ def test_unsupported_dict_key_type_raises_serializer_error() -> None:
 
 
 def test_type_checking_forward_ref_does_not_block_deserialize() -> None:
-    """A6-r5-210: a TYPE_CHECKING-only forward-referenced field made
+    """A TYPE_CHECKING-only forward-referenced field made
     get_type_hints raise NameError, blocking reconstruction of the whole
     event even though the offending field needed no coercion."""
     serializer = JsonEventSerializer()
@@ -343,7 +377,7 @@ def test_type_checking_forward_ref_does_not_block_deserialize() -> None:
 
 
 def test_slotted_event_serializes_and_round_trips() -> None:
-    """A6-r5-211: the documented vars() fallback crashed with a raw TypeError
+    """The documented vars() fallback crashed with a raw TypeError
     for __slots__ classes; slots must be read as the instance attributes."""
     serializer = JsonEventSerializer()
     original = SlottedEvent(order_id="o-slot", stamp=datetime(2026, 1, 5, tzinfo=UTC))
@@ -354,7 +388,7 @@ def test_slotted_event_serializes_and_round_trips() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Enum / IntEnum round-tripping (A6-r2-88)
+# Enum / IntEnum round-tripping
 # ---------------------------------------------------------------------------
 
 
@@ -395,7 +429,7 @@ class EnumEvent:
 
 
 def test_enum_field_round_trips_with_exact_json() -> None:
-    """A6-r2-88: a str-valued Enum field encodes as its value (via the
+    """A str-valued Enum field encodes as its value (via the
     serializer's dedicated Enum branch) and decodes back to the member —
     both the wire format and the restored type identity are pinned."""
     serializer = JsonEventSerializer()
@@ -411,7 +445,7 @@ def test_enum_field_round_trips_with_exact_json() -> None:
 
 
 def test_int_enum_field_round_trips_to_member_identity() -> None:
-    """A6-r2-88: IntEnum members are int subclasses, so encode bypasses the
+    """IntEnum members are int subclasses, so encode bypasses the
     Enum branch entirely (json's native int encoder wins) — only decode-side
     coercion restores the member. A reordering of _coerce's checks (e.g. an
     early int fast-path) would silently break this; pin it."""

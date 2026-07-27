@@ -10,6 +10,10 @@ Routing model:
     /reports/*      → http://127.0.0.1:9003
     /_modulith/*    → handled by the proxy itself (actuator)
 
+``/_modulith/*`` is the only prefix the proxy keeps for itself; it publishes no
+OpenAPI schema and no docs UI, so ``/openapi.json``, ``/docs`` and ``/redoc``
+are proxied or 404 like any other path (see ``create_proxy_app``).
+
 Uses ``httpx.AsyncClient`` for streaming proxying. Hop-by-hop headers are
 stripped per RFC 7230. WebSocket support is a v2.1 enhancement; v1 is HTTP only.
 """
@@ -107,7 +111,19 @@ def create_proxy_app(
         if owns_client:
             await http_client.aclose()
 
-    app = FastAPI(title="modulith-proxy", lifespan=lifespan)
+    # ``openapi_url=None`` unregisters FastAPI's own /openapi.json, /docs,
+    # /docs/oauth2-redirect and /redoc. A reverse proxy must not claim paths it
+    # cannot answer for the application: those routes are registered ahead of
+    # the catch-all below, so /openapi.json served a schema holding only this
+    # proxy's actuator routes (never the application's), /docs rendered a
+    # Swagger UI over that empty schema, and a module actually named ``docs``
+    # had its own routes shadowed outright. Unregistered, the four paths fall
+    # through to the catch-all and behave like any other path — proxied when a
+    # rule matches, 404 otherwise. Each worker still serves its own schema on
+    # its internal port; the proxy publishes no aggregate one. ``app.openapi()``
+    # remains callable, so a caller that wants the proxy's own schema can build
+    # it in-process.
+    app = FastAPI(title="modulith-proxy", lifespan=lifespan, openapi_url=None)
 
     def _actuator_auth_response(request: Request) -> JSONResponse | None:
         if actuator_token is None:
@@ -174,9 +190,15 @@ def create_proxy_app(
                 return JSONResponse(body, status_code=503)
             return body
 
+    # ``include_in_schema=False``: FastAPI derives one operation id per *route*
+    # but emits one OpenAPI operation per *method*, so a single multi-method
+    # route yields seven operations sharing one id and FastAPI warns
+    # ("Duplicate Operation ID") once per collision while building the schema.
+    # A catch-all that forwards opaque bytes has nothing to describe anyway.
     @app.api_route(
         "/{path:path}",
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+        include_in_schema=False,
     )
     async def proxy(request: Request, path: str) -> Response:
         rule = _match_rule(request.url.path, rules)
@@ -281,7 +303,7 @@ def create_proxy_app(
             except httpx.RequestError as exc:
                 # RequestError siblings outside the TransportError subtree —
                 # httpx.TooManyRedirects (a redirect-looping backend behind an
-                # injected follow_redirects=True client, S3-r3-162) and
+                # injected follow_redirects=True client) and
                 # httpx.DecodingError. Both mean "no valid response could be
                 # obtained from the backend" → 502, honoring the
                 # never-an-uncaught-500 contract documented above.
@@ -303,7 +325,10 @@ def create_proxy_app(
             # directly after construction preserves every occurrence.
             response.raw_headers = [
                 (k.lower().encode("latin-1"), v.encode("latin-1"))
-                for k, v in _filter_headers(_header_pairs(upstream_resp.headers.raw))
+                for k, v in _relativize_location(
+                    _filter_headers(_header_pairs(upstream_resp.headers.raw)),
+                    rule.backend_url,
+                )
             ]
             return response
         # Loop always returns above; satisfies the type checker.
@@ -357,6 +382,28 @@ def _filter_headers(headers: list[tuple[str, str]]) -> list[tuple[str, str]]:
     }
     drop = HOP_BY_HOP_HEADERS | connection_named
     return [(k, v) for k, v in headers if k.lower() not in drop]
+
+
+def _relativize_location(headers: list[tuple[str, str]], backend_url: str) -> list[tuple[str, str]]:
+    """Strip the worker's own authority off a ``Location`` redirect.
+
+    Workers see the loopback authority as their Host (the client's is dropped
+    on the way in), so any absolute URL they generate — most commonly
+    Starlette's default trailing-slash redirect, but also ``url_for`` and
+    OpenAPI ``servers`` — points at ``http://127.0.0.1:<worker port>``, which
+    the client cannot follow. The proxy forwards the full path including the
+    module prefix, so the worker's path is already the public one: dropping
+    scheme+authority yields a relative Location the client resolves against
+    the authority it actually asked for. A redirect to anywhere else (an
+    external site) is left alone.
+    """
+    prefix = backend_url.rstrip("/")
+    return [
+        (name, value[len(prefix) :] or "/")
+        if name.lower() == "location" and (value == prefix or value.startswith(prefix + "/"))
+        else (name, value)
+        for name, value in headers
+    ]
 
 
 def _body_too_large(request: Request, limit: int | None) -> JSONResponse | None:

@@ -24,17 +24,25 @@ shop/
 ├── contracts/
 │   └── events.py            # OrderPlaced, StockReserved  (shared vocabulary)
 ├── orders/
-│   ├── __init__.py          # place_order() → publishes OrderPlaced
+│   ├── __init__.py          # place_order() → publishes OrderPlaced; re-exports `router`
 │   ├── _manifest.py         # declared contract (verified at startup)
 │   └── api.py               # FastAPI router: POST /orders
 ├── inventory/
-│   ├── __init__.py          # @listener reserve_stock → publishes StockReserved
+│   ├── __init__.py          # @listener reserve_stock → publishes StockReserved; `router`
 │   └── _manifest.py
 ├── notifications/
-│   ├── __init__.py          # @listener notify_customer
+│   ├── __init__.py          # @listener notify_customer; `router`
 │   └── _manifest.py
-└── main.py                  # FastAPI app (includes the orders router)
+└── main.py                  # FastAPI app (includes all three module routers)
 ```
+
+Every module package exposes its HTTP routes as a `router` attribute — the
+orders module re-exports the one defined in `orders/api.py`. That attribute is
+what the process-per-module worker mounts under `/<module>` (modes D and E
+below), so a router left reachable only as `orders.api.router` would give
+healthy workers and a 404 on every route. `shop/main.py` mounts the same three
+routers under the same prefixes, which is why `POST /orders` and
+`GET /inventory/reserved` are the same URLs in every mode.
 
 ## Run it
 
@@ -45,7 +53,7 @@ From this directory (`examples/demo_app`), pick a deployment mode below.
 The simplest path — no database, no Docker, all events live in RAM:
 
 ```bash
-pip install 'modulith[fastapi,cli]'
+pip install 'modupy[fastapi,cli]'
 uvicorn shop.main:app --reload
 #   …or with the CLI (adds the modulith banner):
 # modulith dev shop.main:app
@@ -62,7 +70,7 @@ curl -X POST localhost:8000/orders \
 Persists orders and events atomically in a local SQLite file (zero infrastructure):
 
 ```bash
-pip install 'modulith[fastapi,cli,postgres]' aiosqlite
+pip install 'modupy[fastapi,cli,postgres]' aiosqlite
 MODULITH_OUTBOX=postgres MODULITH_DB_URL=sqlite+aiosqlite:///./demo.db \
   uvicorn shop.main:app
 
@@ -109,15 +117,24 @@ curl -X POST localhost:8000/orders \
 `docker compose stop` and `docker compose down` preserve it across restarts —
 only `docker compose down -v` (or an explicit `docker volume rm`) deletes it.
 
+**Startup warning in modes D and E.** `modulith run` binds `0.0.0.0`, and the
+default `actuator_mode="auto"` will not serve an unauthenticated `/_modulith/*`
+on a non-loopback bind. With no `MODULITH_ACTUATOR_TOKEN` exported the
+supervisor logs a warning and leaves the actuator unmounted — the demo's own
+routes below are unaffected, so you can ignore it. Export a token
+(`export MODULITH_ACTUATOR_TOKEN="$(openssl rand -hex 32)"`) if you want the
+topology/health endpoints; see
+[docs/DEPLOYMENT.md §Actuator Access](../../docs/DEPLOYMENT.md#actuator-access-_modulith).
+
 ### D. Process-per-module topology over SQLite database broker
 
 Distributes modules across separate workers using SQLite as the inter-process
 message bus (zero infrastructure):
 
 ```bash
-pip install 'modulith[fastapi,cli,database]' aiosqlite
+pip install 'modupy[fastapi,cli,database]' aiosqlite
 MODULITH_BROKER=database \
-  MODULITH_BROKER_URL=sqlite+aiosqlite:////$(pwd)/demo-broker.db \
+  MODULITH_BROKER_URL=sqlite+aiosqlite:///$(pwd)/demo-broker.db \
   modulith run shop.main:app --topology processes
 
 # In another terminal, test it:
@@ -147,9 +164,10 @@ redundant.
 Distributes modules across workers using Redis (requires Redis running):
 
 ```bash
+pip install 'modupy[fastapi,cli,redis]'
 docker compose up -d redis
 MODULITH_BROKER=redis-streams \
-  REDIS_URL=redis://localhost:6379 \
+  REDIS_URL=redis://:modulith@localhost:6379 \
   modulith run shop.main:app --topology processes
 
 # Test it:
@@ -163,33 +181,51 @@ curl localhost:8000/notifications/sent
 ### F. CLI operations (modes A–E compatible)
 
 The `modulith` CLI auto-detects the `shop` package via `[tool.modulith]` in
-`pyproject.toml`:
+`pyproject.toml`, and puts the directory holding that `pyproject.toml` on
+`sys.path` before running the command (`modulith/cli.py`,
+`_add_project_root_to_syspath`). So `shop` is importable from this directory
+even though it lives here rather than in site-packages — no `PYTHONPATH=.`
+prefix is needed on any `modulith` command in this file. (`modulith dev` and
+single-process `modulith run` hand off to `uvicorn`, which adds the current
+directory itself, exactly as mode A does.)
 
 ```bash
-modulith info        # detected package, modules, manifests, plugins
-modulith verify      # boundary checks — this demo passes clean
-modulith docs        # Mermaid architecture + event-flow diagrams + module canvases
-modulith doctor      # health check on wired drivers and stores
-modulith audit       # code-level boundary compliance (no cross-module imports)
+modulith info      # detected package, modules, manifests, plugins
+modulith verify    # boundary checks — this demo passes clean
+modulith docs      # Mermaid architecture + event-flow diagrams + module canvases
+modulith doctor    # health check on wired drivers and stores
 ```
+
+(`modulith audit` is deliberately absent: it is the migration-readiness scanner
+for codebases that have *not* adopted modulith yet. Pointed at this demo it
+reports `readiness score: 100/100` with 0 cross-module import patterns — the
+demo already talks across modules by events, so the scanner has nothing to
+propose — and writes a `MIGRATION.md` into the directory it runs from.
+`verify` is the boundary check for a modulith-native codebase.)
 
 **Important caveat:** The `modulith outbox status|retry <id>|purge|dead-letter`
 subcommands operate on a **wired outbox store**. This demo wires the store
 inside the FastAPI app's lifespan (in `shop/main.py`), not at bare CLI
-bootstrap. So if you run `modulith outbox status` standalone while the app is
-not running, it will report "no store wired," and `modulith doctor` will note
-that the outbox is configured but no store is active. This is by design: stores
-are initialized by the application at startup, not auto-discovered. To inspect
-the outbox, run the app in mode B or C first, then use the subcommands in
-another terminal.
+bootstrap. So `modulith outbox status` reports "no store wired," and `modulith
+doctor` notes that the outbox is configured but no store is active. This is by
+design: stores are initialized by the application at startup, not
+auto-discovered.
+
+Running the app in another terminal does not change that — `outbox.configure()`
+binds the store in the *calling process*, and the CLI is a different process
+with nothing shared between them. The subcommands are usable only from a
+process that wires the store itself, i.e. an app whose bootstrap module
+(imported by the CLI via `[tool.modulith]`) calls `outbox.configure()` at import
+time. This demo wires it in the lifespan instead, so its outbox is inspectable
+through the running app, not through the CLI.
 
 ### G. Testing your modules
 
-The demo includes tests using the `modulith[test]` extra and pytest plugin:
+The demo includes tests using the `modupy[test]` extra and pytest plugin:
 
 ```bash
-pip install 'modulith[fastapi,cli,test]' pytest pytest-asyncio
-pytest examples/demo_app/tests/
+pip install 'modupy[fastapi,cli,test]' pytest pytest-asyncio
+pytest tests/
 ```
 
 Example test from `test_shop_flow.py`:
@@ -206,7 +242,7 @@ def test_order_placed_triggers_stock_reserved_via_scenario(scenario: Scenario) -
     assert isinstance(result, StockReserved)
 ```
 
-The `scenario` and `modulith_app` fixtures are provided by the `modulith[test]`
+The `scenario` and `modulith_app` fixtures are provided by the `modupy[test]`
 extra and auto-loaded via the pytest11 plugin entry point.
 
 ### H. OpenTelemetry (optional, any mode)
@@ -214,7 +250,7 @@ extra and auto-loaded via the pytest11 plugin entry point.
 Enable distributed tracing (console exporter):
 
 ```bash
-pip install 'modulith[otel]'
+pip install 'modupy[otel]'
 MODULITH_DEMO_OTEL=1 uvicorn shop.main:app
 ```
 

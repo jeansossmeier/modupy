@@ -49,6 +49,11 @@ def test_alembic_upgrade_creates_schema(tmp_path: Path) -> None:
     assert "event_publications" in tables
     assert "event_publications_archive" in tables
     assert "idx_pending" in _objects(db, "index")
+    # 0005's archive-purge index. Its sibling ``ix_event_publications_claim_order``
+    # is deliberately absent here: that one is a functional + partial index, which
+    # 0005 creates only on Postgres (MySQL/MariaDB express neither), so SQLite
+    # never gets it. tests/test_migration_postgres.py asserts the Postgres half.
+    assert "ix_event_publications_archive_completed_at" in _objects(db, "index")
 
 
 def test_alembic_upgrade_creates_broker_schema(tmp_path: Path) -> None:
@@ -120,9 +125,9 @@ def test_alembic_downgrade_removes_schema(tmp_path: Path) -> None:
 
 
 def test_migration_column_metadata_matches_orm(tmp_path: Path) -> None:
-    """A6-r4-178: the name-set comparison above is blind to type/nullable/
-    server_default drift — the exact bug class that already shipped one
-    CRITICAL (boolean server_default rendered as integer 0). Compare the full
+    """The name-set comparison above is blind to type/nullable/server_default
+    drift — the bug class that once shipped a boolean server_default rendered
+    as the integer 0. Compare the full
     PRAGMA table_info metadata of the migrated schema against a schema created
     straight from the ORM metadata: inspector-to-inspector, so both sides
     render through the same dialect and equivalent definitions compare equal."""
@@ -242,10 +247,48 @@ def test_broker_timestamp_types_compile_with_microseconds_for_mysql_and_mariadb(
         assert revision_0004._TS.compile(dialect=dialect) == "DATETIME(6)"
 
 
+def test_outbox_payload_columns_compile_to_longblob_for_mysql_and_mariadb() -> None:
+    """The outbox payload column must hold a real event on every dialect.
+
+    ``LargeBinary`` compiles to MySQL/MariaDB ``BLOB``, which caps at 65,535
+    bytes. The outbox imposes no size limit of its own, so an event over that
+    is accepted by ``save`` and dies at flush with error 1406 — inside the
+    caller's *business* transaction, because the publication row is enlisted
+    there. The ORM schema and the migrations that create the column must render
+    the same type or the two drift apart on MySQL only.
+    """
+    import importlib
+
+    from sqlalchemy.dialects.mysql import dialect as mysql_dialect
+    from sqlalchemy.dialects.mysql import mariadb
+    from sqlalchemy.dialects.sqlite import dialect as sqlite_dialect
+    from sqlalchemy.schema import CreateTable
+
+    from modulith.adapters.postgres_outbox import Base
+
+    revision_0001 = importlib.import_module("modulith.adapters.migrations.versions.0001_initial")
+    revision_0003 = importlib.import_module(
+        "modulith.adapters.migrations.versions.0003_outbox_claim_leases"
+    )
+    payload_tables = ("event_publications", "event_publications_archive")
+
+    for dialect in (mysql_dialect(), mariadb.MariaDBDialect()):
+        for table_name in payload_tables:
+            ddl = str(CreateTable(Base.metadata.tables[table_name]).compile(dialect=dialect))
+            assert "payload LONGBLOB NOT NULL" in ddl, ddl
+        assert revision_0001._PAYLOAD.compile(dialect=dialect) == "LONGBLOB"
+        assert revision_0003._PAYLOAD.compile(dialect=dialect) == "LONGBLOB"
+
+    # The variant is inert everywhere else — SQLite BLOB is already unbounded.
+    for table_name in payload_tables:
+        ddl = str(CreateTable(Base.metadata.tables[table_name]).compile(dialect=sqlite_dialect()))
+        assert "payload BLOB NOT NULL" in ddl, ddl
+
+
 def test_alembic_offline_mode_emits_full_ddl(tmp_path: Path, capsys) -> None:
-    """A6-r2-89: offline/--sql mode (env.py's run_migrations_offline) must
-    render the complete DDL — both tables and the pending partial index —
-    without ever touching a database."""
+    """Offline/--sql mode (env.py's run_migrations_offline) must render the
+    complete DDL — both tables and the pending partial index — without ever
+    touching a database."""
     db = tmp_path / "offline.db"
     command.upgrade(_cfg(db), "head", sql=True)
 
@@ -286,5 +329,11 @@ def test_alembic_offline_mode_emits_mysql_ddl_without_a_connection(capsys) -> No
     # TEXT instead — this is the exact bug class this file's docstring cites.
     assert "event_type TEXT NOT NULL" in ddl
     assert "listener TEXT NOT NULL" in ddl
+    # A plain LargeBinary renders as BLOB here, capped at 65,535 bytes, so a
+    # moderately large event fails at INSERT with error 1406 and takes the
+    # business transaction with it. Both outbox tables must render LONGBLOB
+    # when created, and 0003 must widen an install created before that.
+    assert "payload BLOB NOT NULL" not in ddl
+    assert ddl.count("MODIFY payload LONGBLOB NOT NULL") == 2
     assert "idx_pending" in ddl
     assert "CREATE TABLE broker_subscription (" in ddl

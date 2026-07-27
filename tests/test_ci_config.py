@@ -1,15 +1,15 @@
 """Guard tests for CI/packaging configuration drift.
 
-These reproduce and lock in the fixes for audit findings:
+Two classes of drift are locked down here:
 
-- S2-r1-56 / S2-r2-114: CI must run the integration suite in a dedicated
+- Integration coverage: CI must run the integration suite in a dedicated
   lane (installing the ``integration`` extra, which carries testcontainers
   and the real Postgres drivers), the default test job must deselect
   ``-m integration`` (those tests silently skip without Docker drivers,
   giving false green), and mypy in CI must type-check ``tests/`` too.
-- S4-r3-164 / S4-r2-125: version constraints for standalone tool installs
-  in ci.yml (ruff, mypy, ...) must mirror pyproject.toml exactly, so CI
-  can never resolve a tool major that local development forbids.
+- Tool version constraints: the standalone tool installs in ci.yml (ruff,
+  mypy, ...) must mirror pyproject.toml exactly, so CI can never resolve a
+  tool major that local development forbids.
 
 They parse the *actual* files in the repository so any future drift
 between ``.github/workflows/ci.yml`` and ``pyproject.toml`` fails fast in
@@ -22,6 +22,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -51,7 +52,7 @@ def _optional_dependencies() -> dict[str, list[str]]:
 
 
 def test_default_pytest_job_deselects_integration() -> None:
-    """S2-r1-56: the default test job must not rely on silent auto-skip.
+    """The default test job must not rely on silent auto-skip.
 
     Without ``-m "not integration"`` the integration tests are collected in
     the default job, where the drivers (testcontainers/asyncpg/psycopg) are
@@ -66,7 +67,7 @@ def test_default_pytest_job_deselects_integration() -> None:
 
 
 def test_integration_job_runs_marked_suite() -> None:
-    """S2-r1-56 / S2-r2-114: CI must actually execute the integration suite.
+    """CI must actually execute the integration suite.
 
     The lane must install the ``integration`` extra (the only extra that
     carries testcontainers + real Postgres drivers) and run
@@ -82,7 +83,7 @@ def test_integration_job_runs_marked_suite() -> None:
 
 
 def test_integration_extra_provides_testcontainers_drivers() -> None:
-    """S2-r2-114: the extra CI installs must carry the real e2e drivers."""
+    """The extra CI installs must carry the real e2e drivers."""
     extras = _optional_dependencies()
     assert "integration" in extras
     names = {re.split(r"[><=!~\[]", req, maxsplit=1)[0] for req in extras["integration"]}
@@ -92,10 +93,9 @@ def test_integration_extra_provides_testcontainers_drivers() -> None:
 
 
 def test_mypy_job_type_checks_tests() -> None:
-    """S2-r1-56: mypy in CI must cover tests/, not just modulith/ — and it
-    must run under --strict (W2 RESIDUALS item 12a: the previous regex made
-    ``--strict`` optional, so CI silently dropping it would still pass this
-    guard)."""
+    """mypy in CI must cover tests/, not just modulith/ — and it
+    must run under --strict. The earlier form of this regex made ``--strict``
+    optional, so CI silently dropping it would still have passed the guard."""
     ci = _ci_text()
     assert re.search(r"mypy\s+--strict\s+modulith/?\s+tests/?", ci), (
         "CI mypy invocation must run `mypy --strict` over both modulith/ and tests/"
@@ -155,7 +155,7 @@ def _run_guard_script(
 
 
 def test_integration_job_cannot_go_green_without_docker(tmp_path: Path) -> None:
-    """W3 R5-01: the integration lane must FAIL when Docker is unreachable.
+    """The integration lane must FAIL when Docker is unreachable.
 
     tests/conftest.py ``pytest.skip``s the entire integration suite when the
     Docker probe fails, and pytest exits 0 on all-skipped — so a runner-image
@@ -249,7 +249,7 @@ def test_integration_job_cannot_go_green_without_docker(tmp_path: Path) -> None:
 
 
 def test_standalone_tool_pins_mirror_pyproject() -> None:
-    """S4-r3-164 / S4-r2-125: no constraint drift between ci.yml and pyproject.
+    """No constraint drift between ci.yml and pyproject.
 
     Every quoted requirement that ci.yml installs standalone (e.g.
     ``uv pip install --system "ruff>=0.4,<1.0"``) must appear verbatim in a
@@ -264,12 +264,32 @@ def test_standalone_tool_pins_mirror_pyproject() -> None:
     for pin in standalone_pins:
         assert pin in pyproject_reqs, (
             f"ci.yml installs {pin!r} but pyproject.toml declares no identical "
-            "requirement — the two constraints have drifted (S4-r3-164/S4-r2-125)"
+            "requirement — the two constraints have drifted"
         )
 
 
+def test_version_fallback_literal_mirrors_pyproject() -> None:
+    """``modulith/__init__.py`` carries a hardcoded ``__version__`` fallback for
+    source checkouts with no distribution metadata. Nothing gated it: release.yml
+    only compares the git tag against pyproject.toml, and the one test that reads
+    ``__version__`` compares the imported value to itself. Read the literal out of
+    the source (importing it yields the *installed* metadata, which cannot detect
+    the drift) and pin it to pyproject.
+    """
+    source = (REPO_ROOT / "modulith" / "__init__.py").read_text(encoding="utf-8")
+    match = re.search(r'^\s*__version__ = "([^"]+)"', source, re.MULTILINE)
+    assert match, "modulith/__init__.py must keep a literal __version__ fallback"
+
+    project = _pyproject()["project"]
+    assert isinstance(project, dict)
+    assert match.group(1) == project["version"], (
+        f"modulith/__init__.py falls back to {match.group(1)!r} but pyproject.toml "
+        f"declares {project['version']!r} — bump both together"
+    )
+
+
 # ---------------------------------------------------------------------------
-# Task 9: coverage, integration matrix, scripts/examples lint, wheel smoke,
+# Coverage gates, integration matrix, scripts/examples lint, wheel smoke,
 # API-reference drift check
 # ---------------------------------------------------------------------------
 
@@ -415,9 +435,14 @@ def test_build_smoke_installs_all_extras_and_runs_migration() -> None:
     assert re.search(r"pip install[^\n]*\[all\]|pip install[^\n]*\.\[all\]", ci) or (
         "dist/*.whl" in ci and "[all]" in ci
     ), "build smoke must install the wheel with the [all] extra"
-    assert "modulith" in ci and ("migrate" in ci or "alembic" in ci), (
-        "build smoke must run a packaged SQLite migration"
+    # Assert the migration is actually driven, not merely that the word
+    # "modulith" occurs somewhere in a file that names the package on almost
+    # every line — that half of the original condition could never fail.
+    assert "alembic" in ci, "build smoke must drive the packaged Alembic migrations"
+    assert re.search(r'command\.upgrade\(\s*cfg\s*,\s*"head"\s*\)', ci), (
+        "build smoke must run `alembic upgrade head`, not just import alembic"
     )
+    assert "sqlite:///" in ci, "build smoke's migration must target SQLite"
     assert "gen_api_reference" in ci or "API_REFERENCE" in ci, (
         "CI must run the API-reference drift check"
     )
@@ -465,6 +490,70 @@ def test_coverage_outbox_path_is_fully_covered() -> None:
     )
     assert has_outbox_gate, (
         "CI or coverage config must enforce 100% coverage on modulith/builtin/outbox.py"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Build backend
+# ---------------------------------------------------------------------------
+
+
+def test_build_backend_floor_supports_the_declared_license_form() -> None:
+    """The hatchling floor must be able to emit the license metadata we declare.
+
+    ``project.license`` is the PEP 639 SPDX expression form, which hatchling
+    only understands from 1.27. An older backend still builds, but downgrades
+    the wheel to Metadata-Version 2.1 with a free-text ``License:`` field, so a
+    build under a constraints file that caps hatchling would ship different
+    license provenance than the PyPI artifact.
+    """
+    build_system = _pyproject()["build-system"]
+    assert isinstance(build_system, dict)
+    requires = build_system["requires"]
+    assert isinstance(requires, list)
+    floors = [
+        tuple(int(part) for part in match.group(1).split("."))
+        for req in requires
+        if (match := re.fullmatch(r"hatchling>=([\d.]+)", str(req).strip()))
+    ]
+    assert floors, f"build-system.requires {requires!r} must pin a hatchling floor"
+    assert min(floors) >= (1, 27), (
+        f"build-system.requires {requires!r} floors hatchling below the 1.27 "
+        "that PEP 639 license expressions need"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Packaged tooling: the API-reference generator's own CLI
+# ---------------------------------------------------------------------------
+
+
+def test_api_reference_generator_rejects_unknown_flags() -> None:
+    """An unrecognized flag must exit non-zero and write nothing.
+
+    Argument handling used to be ``"--check" in argv[1:]``, so anything else —
+    ``--checks``, ``--check --verbose``, even ``--help`` — fell through to the
+    write branch and exited 0. A CI step that drifted to such an invocation
+    would regenerate the reference in the workspace and pass, turning the
+    staleness gate into a permanent rubber stamp.
+    """
+    script = REPO_ROOT / "scripts" / "gen_api_reference.py"
+    reference = REPO_ROOT / "docs" / "API_REFERENCE.md"
+    before = reference.read_bytes()
+
+    typo = subprocess.run(
+        [sys.executable, str(script), "--checks"], capture_output=True, text=True, timeout=120
+    )
+    assert typo.returncode == 2, f"unknown flag must exit 2, got {typo.returncode}"
+
+    helped = subprocess.run(
+        [sys.executable, str(script), "--help"], capture_output=True, text=True, timeout=120
+    )
+    assert helped.returncode == 0
+    assert "--check" in helped.stdout
+
+    assert reference.read_bytes() == before, (
+        "neither an unknown flag nor --help may rewrite the committed reference"
     )
 
 
@@ -568,6 +657,17 @@ def test_release_publish_job_needs_test_and_build() -> None:
     )
 
 
+def _credential_markers(publish: dict[str, Any]) -> list[str]:
+    """Credential-shaped strings found anywhere in the publish job.
+
+    Serializing the parsed job (rather than scanning it key by key) covers a
+    `password` wherever it sits — an `env:` block, a non-pypa action's `with:`,
+    a nested step — not just the shapes enumerated below.
+    """
+    text = yaml.dump(publish)
+    return [marker for marker in ("PYPI_API_TOKEN", "secrets.PYPI", "password:") if marker in text]
+
+
 def test_release_publish_has_no_hardcoded_token() -> None:
     """publish job must not use hardcoded PyPI tokens or secrets."""
     workflow = _release_workflow()
@@ -576,10 +676,10 @@ def test_release_publish_has_no_hardcoded_token() -> None:
     publish = jobs.get("publish")
     assert isinstance(publish, dict)
 
-    workflow_text = yaml.dump(publish)
-    assert "PYPI_API_TOKEN" not in workflow_text
-    assert "secrets.PYPI" not in workflow_text
-    assert "password:" not in workflow_text or "password:" not in str(publish)
+    assert _credential_markers(publish) == [], (
+        "publish job must publish via OIDC trusted publishing only — no "
+        "credential may be spelled out in release.yml"
+    )
     # OIDC trusted publishing should not use user/password
     pypa_steps = [
         step
@@ -591,6 +691,19 @@ def test_release_publish_has_no_hardcoded_token() -> None:
         assert not isinstance(with_config, dict) or "password" not in with_config, (
             "publish action must not pass password via OIDC trusted publishing"
         )
+
+
+def test_publish_credential_scan_detects_a_planted_password() -> None:
+    """The credential guard above used to read ``"password:" not in text or
+    "password:" not in str(publish)``; the right operand stringifies a dict,
+    whose keys always render quoted, so it was unconditionally true and the
+    whole guard could never fail. Prove the replacement actually bites."""
+    leaky = {
+        "runs-on": "ubuntu-latest",
+        "steps": [{"uses": "some/other-action@v1", "with": {"password": "pypi-AgEIcHl"}}],
+    }
+
+    assert _credential_markers(leaky) == ["password:"]
 
 
 def test_release_build_job_has_inspection_and_smoke_test() -> None:

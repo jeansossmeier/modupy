@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import json
+import logging
 import sys
 import types
 import typing
@@ -34,6 +35,8 @@ from typing import Any, Union
 from uuid import UUID
 
 __all__ = ["JsonEventSerializer"]
+
+logger = logging.getLogger("modulith.serializers")
 
 _UNION_TAG = "__modulith_union_type__"
 
@@ -366,6 +369,16 @@ class JsonEventSerializer:
     ``deserialize`` imports the module named in ``event_type``, so without an
     allowlist a forged record can trigger arbitrary-module import and
     instantiation.
+
+    Omitting it stays legal because pure *encoding* has no attack surface —
+    ``serialize`` never resolves a class, and the framework's own encode-only
+    instances (the outbox wire serializer, the direct-publish path) would
+    otherwise have to invent an allowlist they never consult. The cost of that
+    is that the first ``deserialize`` on an unrestricted instance is announced
+    twice: a ``RuntimeWarning`` and a ``modulith.serializers`` log record, so
+    the fail-open configuration surfaces both to a developer running with
+    default warning filters and to a deployment that captures logs but not
+    warnings.
     """
 
     def __init__(self, *, allowed_event_types: Iterable[str | type] | None = None) -> None:
@@ -374,6 +387,7 @@ class JsonEventSerializer:
             if allowed_event_types is None
             else {_event_type_name(event_type) for event_type in allowed_event_types}
         )
+        self._unrestricted_use_announced = False
 
     def serialize(self, event: Any) -> bytes:
         """Encode an event instance to JSON bytes.
@@ -405,20 +419,24 @@ class JsonEventSerializer:
         """
         if self._allowed_event_types is not None and event_type not in self._allowed_event_types:
             raise ValueError(f"event type {event_type!r} is not in the allowed event types")
-        if self._allowed_event_types is None:
+        if self._allowed_event_types is None and not self._unrestricted_use_announced:
             # No allowlist: about to import-resolve an arbitrary class named
-            # by the wire event_type (see the class docstring). warnings.warn
-            # (rather than logging) gets Python's built-in dedup for free —
-            # the default filter shows this exact message once per process,
-            # so it can't ship unnoticed without spamming every deserialize.
-            warnings.warn(
+            # by the wire event_type (see the class docstring). Announced on
+            # both channels because neither alone reaches everyone: a
+            # RuntimeWarning is what a developer sees under default filters
+            # but is silenced wholesale by PYTHONWARNINGS/-W ignore, while a
+            # log record is what a deployment's log pipeline actually
+            # captures. The flag bounds each to once per instance, so a hot
+            # dispatch loop can't turn either into a flood.
+            self._unrestricted_use_announced = True
+            message = (
                 "JsonEventSerializer with no allowed_event_types resolves an "
                 "arbitrary importable class from the wire event_type. Pass "
                 "allowed_event_types=[...] whenever payloads can originate "
-                "outside this process (a shared outbox table, a broker).",
-                RuntimeWarning,
-                stacklevel=2,
+                "outside this process (a shared outbox table, a broker)."
             )
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+            logger.warning("%s", message)
         cls = _resolve_class(event_type)
         raw = json.loads(data.decode("utf-8"))
         hints = _safe_type_hints(cls)

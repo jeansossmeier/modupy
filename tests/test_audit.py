@@ -90,6 +90,34 @@ def test_detects_cross_module_imports(tmp_path: Path) -> None:
     assert ("orders", "inventory") in pairs
 
 
+def test_test_directories_are_not_module_candidates(tmp_path: Path) -> None:
+    """Test code is not a module, and its cross-module imports are not debt.
+
+    A top-level ``tests/`` used to be proposed as a module, so every
+    ``from myapp.orders import ...`` in it counted as a cross-module import
+    heading for a boundary violation — punishing a codebase for the one place
+    where reaching across modules is legitimate.
+    """
+    root = tmp_path / "myapp"
+    _write(root, "__init__.py", "")
+    _write(root, "orders/__init__.py", "")
+    _write(root, "orders/service.py", "def create(): ...\n")
+    _write(root, "inventory/__init__.py", "")
+    _write(root, "inventory/stock.py", "def reserve(): ...\n")
+    _write(root, "tests/test_orders.py", "from myapp.inventory.stock import reserve\n")
+    _write(root, "orders/tests/test_service.py", "from myapp.inventory.stock import reserve\n")
+
+    result = audit_codebase(root)
+
+    assert "tests" not in result.proposed_modules
+    assert result.cross_module_imports == []
+    assert result.readiness_score == 100
+    # Test files are excluded from the scan entirely, not merely unattributed.
+    scanned = {p.name for files in result.proposed_modules.values() for p in files}
+    assert "test_orders.py" not in scanned
+    assert "test_service.py" not in scanned
+
+
 def test_relative_cross_module_import_is_detected(tmp_path: Path) -> None:
     root = tmp_path / "app"
     _write(root, "__init__.py", "")
@@ -198,7 +226,7 @@ def test_audit_cli_writes_report(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Task 8 (tooling) — parse-failure counting and disclosure
+# Parse-failure counting and disclosure
 # ---------------------------------------------------------------------------
 
 
@@ -243,7 +271,7 @@ def test_no_parse_failures_omits_disclosure(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Task 8 (tooling) — audit must honor a configured contracts-module name
+# The audit must honor a configured contracts-module name
 # ---------------------------------------------------------------------------
 
 
@@ -285,3 +313,26 @@ def test_audit_cli_honors_configured_contracts_module(monkeypatch, tmp_path: Pat
 
     assert result.exit_code == 0, result.output
     assert "0 cross-module import pattern(s)" in result.output
+
+
+def test_relative_root_scores_the_same_as_absolute_root(monkeypatch, tmp_path: Path) -> None:
+    """``Path(".")`` is the CLI's default argument, so the bare
+    ``modulith audit`` invocation must analyze the tree exactly as an absolute
+    path does. The root package name comes from ``root.name``, which is empty
+    for a relative root — every ``myapp.other`` import then looked external
+    and the audit reported a fabricated 100/100."""
+    root = _make_codebase(tmp_path)
+
+    absolute = audit_codebase(root)
+    monkeypatch.chdir(root)
+    relative = audit_codebase(Path("."))
+
+    assert absolute.readiness_score == relative.readiness_score
+    assert {(src, tgt) for src, tgt, _c, _s in relative.cross_module_imports} == {
+        (src, tgt) for src, tgt, _c, _s in absolute.cross_module_imports
+    }
+    assert ("orders", "inventory") in {
+        (src, tgt) for src, tgt, _c, _s in relative.cross_module_imports
+    }
+    # A relative root also attributed root-level files to a module named "".
+    assert "" not in relative.proposed_modules

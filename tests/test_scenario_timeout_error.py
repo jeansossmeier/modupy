@@ -36,7 +36,7 @@ def _isolate() -> None:
 
 
 def test_call_trigger_app_timeouterror_propagates(scenario):
-    """W3 R4-W3-01: an async trigger that publishes the expected event and
+    """An async trigger that publishes the expected event and
     THEN raises TimeoutError is an application bug — the scenario must fail
     loudly, not return the event and go false-green."""
     _isolate()
@@ -50,7 +50,7 @@ def test_call_trigger_app_timeouterror_propagates(scenario):
 
 
 def test_publish_trigger_listener_timeouterror_propagates(scenario):
-    """W3 R4-W3-01: a listener raising TimeoutError under a publish trigger
+    """A listener raising TimeoutError under a publish trigger
     must fail the test even though another listener produced the expected
     event — the app error must not be misread as the scenario's budget."""
     _isolate()
@@ -68,7 +68,7 @@ def test_publish_trigger_listener_timeouterror_propagates(scenario):
 
 
 def test_publish_sync_propagates_listener_timeouterror():
-    """W3 R4-W3-01 (origin): publish_sync must re-raise a listener's own
+    """publish_sync must re-raise a listener's own
     TimeoutError unchanged instead of misclassifying it as its budget
     timeout (concurrent.futures.TimeoutError IS TimeoutError on 3.11+)."""
     from modulith.runtime import _runtime

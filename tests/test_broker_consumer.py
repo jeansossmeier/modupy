@@ -1,6 +1,6 @@
 """BrokerConsumer resilience and Redis broker documentation contracts.
 
-Each test cites the audit finding id it reproduces. All tests are deterministic:
+Each test names the failure mode it reproduces. All tests are deterministic:
 no wall-clock sleeps as synchronization — loops are driven by injected fakes and
 bounded polling helpers (the one timed window, in the backoff test, asserts an
 upper bound that timing jitter can only make easier to satisfy).
@@ -155,12 +155,12 @@ def _make_consumer(
 
 
 # ---------------------------------------------------------------------------
-# A7-r1-21 — XAUTOCLAIM's deleted-ids element must be surfaced, not discarded
+# XAUTOCLAIM's deleted-ids element must be surfaced, not discarded
 # ---------------------------------------------------------------------------
 
 
 async def test_reclaim_surfaces_deleted_pending_messages(caplog) -> None:
-    """A7-r1-21: a still-pending message trimmed out of the stream (MAXLEN)
+    """A still-pending message trimmed out of the stream (MAXLEN)
     is reported by XAUTOCLAIM's 3rd tuple element ('deleted'). The consumer
     must log the permanent loss at ERROR with target + ids — previously
     result[2] was silently discarded and the data loss was invisible."""
@@ -181,12 +181,12 @@ async def test_reclaim_surfaces_deleted_pending_messages(caplog) -> None:
 
 
 # ---------------------------------------------------------------------------
-# A7-r3-138 — attempt counters must be keyed by (target, id), not id alone
+# Attempt counters must be keyed by (target, id), not id alone
 # ---------------------------------------------------------------------------
 
 
 async def test_attempt_counters_do_not_leak_across_targets() -> None:
-    """A7-r3-138: Redis stream ids are stream-local, so two different targets
+    """Redis stream ids are stream-local, so two different targets
     can carry the identical message id. A message failing on target t1 must
     not inherit/contaminate the retry counter of an id-colliding message on
     target t2 — previously the shared mid-only key dead-lettered t2's message
@@ -217,12 +217,12 @@ async def test_attempt_counters_do_not_leak_across_targets() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A7-r1-22 — a broker-side ack()/dead_letter() blip must not kill the loop
+# A broker-side ack()/dead_letter() blip must not kill the loop
 # ---------------------------------------------------------------------------
 
 
 async def test_ack_failure_does_not_kill_consumer_loop() -> None:
-    """A7-r1-22: an exception from broker.ack() propagated out of the task and
+    """An exception from broker.ack() propagated out of the task and
     permanently, silently killed the whole consumer loop. It must instead be
     logged and degrade to 'message stays pending, retried later'."""
     received: list[int] = []
@@ -253,7 +253,7 @@ async def test_ack_failure_does_not_kill_consumer_loop() -> None:
 
 
 async def test_dead_letter_failure_does_not_kill_consumer_loop() -> None:
-    """A7-r1-22: an exception from broker.dead_letter() (poison-message path)
+    """An exception from broker.dead_letter() (poison-message path)
     killed the loop the same way. It must be logged and the loop must keep
     consuming subsequent messages."""
     received: list[int] = []
@@ -284,9 +284,10 @@ async def test_dead_letter_failure_does_not_kill_consumer_loop() -> None:
 
 
 async def test_stop_does_not_reraise_non_cancelled_task_death() -> None:
-    """A7-r1-22 (companion): stop() only swallowed CancelledError, so calling
-    stop() on a consumer whose task had already died with a real exception
-    re-raised that exception at shutdown time. stop() must never raise."""
+    """Companion to the ack/dead_letter cases: stop() only swallowed
+    CancelledError, so calling stop() on a consumer whose task had already died
+    with a real exception re-raised that exception at shutdown time. stop() must
+    never raise."""
     broker = InjectableBroker()
     consumer = _make_consumer(broker, targets=["t"])
 
@@ -300,12 +301,12 @@ async def test_stop_does_not_reraise_non_cancelled_task_death() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A7-r2-91 — NOGROUP must trigger group re-creation, not a permanent stall
+# NOGROUP must trigger group re-creation, not a permanent stall
 # ---------------------------------------------------------------------------
 
 
 async def test_nogroup_triggers_group_recreation_and_recovery() -> None:
-    """A7-r2-91: ensure_group() was invoked exactly once at start(); when Redis
+    """ensure_group() was invoked exactly once at start(); when Redis
     lost stream/group state and came back fresh (e.g. crash without a snapshot),
     every subsequent read()/reclaim() failed forever with NOGROUP and the
     consumer silently never delivered another message. On NOGROUP the consumer
@@ -335,12 +336,12 @@ async def test_nogroup_triggers_group_recreation_and_recovery() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A7-r1-23 — broker outage must back off, not busy-spin (~281 failures/sec)
+# Broker outage must back off, not busy-spin (~281 failures/sec)
 # ---------------------------------------------------------------------------
 
 
 async def test_broker_outage_backs_off_instead_of_busy_spinning() -> None:
-    """A7-r1-23: with the broker down, read()/reclaim() failures retried with
+    """With the broker down, read()/reclaim() failures retried with
     zero backoff (~281 failures/sec measured against a killed Redis). Worse,
     when the broker raised synchronously the loop never yielded to the event
     loop at all, starving every other coroutine. With capped exponential
@@ -369,12 +370,12 @@ async def test_broker_outage_backs_off_instead_of_busy_spinning() -> None:
 
 
 # ---------------------------------------------------------------------------
-# S3-r3-163 — BLOCK 0 must never reach a real broker (blocks forever)
+# BLOCK 0 must never reach a real broker (blocks forever)
 # ---------------------------------------------------------------------------
 
 
 async def test_nonpositive_poll_block_ms_is_clamped() -> None:
-    """S3-r3-163: real Redis treats XREADGROUP BLOCK 0 as 'block forever
+    """Real Redis treats XREADGROUP BLOCK 0 as 'block forever
     awaiting new entries' (the test fakes modeled the opposite: an immediate
     empty return). A non-positive poll_block_ms must be clamped before it
     reaches the broker so a real worker can never hang indefinitely."""

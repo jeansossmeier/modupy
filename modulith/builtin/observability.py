@@ -11,7 +11,7 @@ apps ship with OTel as a soft dependency (configured per environment).
 Even when OTel *is* installed but no provider is configured, the proxy
 tracer hands back non-recording spans, so the cost is negligible.
 
-Distributed via the `modulith[otel]` extra. The plugin auto-detects
+Distributed via the `modupy[otel]` extra. The plugin auto-detects
 OTel availability at import time via a try/except block.
 
 Spans emitted:
@@ -55,14 +55,10 @@ import time
 from contextvars import ContextVar
 from typing import Any
 
-from modulith import EventPublication, hookimpl
+from modulith import EventPublication, __version__, hookimpl
 from modulith.types import EventPublishReceipt
 
 logger = logging.getLogger("modulith.observability")
-
-# Instrumenting-library version recorded on the tracer. Passed positionally —
-# OTel >= 1.43 removed the ``version=`` keyword from get_tracer().
-_INSTRUMENTING_VERSION = "0.9.0"
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +70,11 @@ try:
     from opentelemetry.trace import Status, StatusCode
 
     _OTEL_AVAILABLE = True
-    _tracer: Any = trace.get_tracer("modulith", _INSTRUMENTING_VERSION)
+    # The instrumenting-library version is the package's own version — read it
+    # from ``modulith.__version__`` rather than restating the literal here, so
+    # a release bump cannot leave the tracer metadata behind. Passed
+    # positionally: OTel >= 1.43 removed the ``version=`` keyword.
+    _tracer: Any = trace.get_tracer("modulith", __version__)
 except ImportError:
     _OTEL_AVAILABLE = False
     _tracer = None
@@ -147,8 +147,8 @@ def modulith_on_publish_error(event: Any, exception: BaseException) -> None:
 
     ``modulith_after_event_published`` is contractually scoped to successful
     persistence/dispatch, so when ``Runtime.publish`` fails between the
-    paired hooks (outbox persist/serialize/broker-route raised — W3
-    R4-W3-02) no hook fires and the span started in
+    paired hooks (outbox persist/serialize/broker-route raised) no hook
+    fires and the span started in
     ``modulith_before_event_published`` leaked: never ended (so never
     exported — tracing went blind exactly during the outages the outbox
     exists for) and left stale in the ContextVar, mis-parenting the next

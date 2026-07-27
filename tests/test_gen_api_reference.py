@@ -9,6 +9,7 @@ exercise the generator's rendering functions directly.
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -72,6 +73,46 @@ def test_render_methods_block_includes_def_keyword():
 # ---------------------------------------------------------------------------
 # Stable, namespaced (collision-safe) anchors
 # ---------------------------------------------------------------------------
+
+
+def test_anchor_keeps_underscores_like_github():
+    """The slug builder dropped every character that is neither alphanumeric
+    nor a space/hyphen, so underscores vanished. GitHub keeps them (``_`` is a
+    word character), which made every TOC entry for an underscore-bearing
+    symbol — publish_sync, declare_module, get_manifest,
+    create_plugin_manager — point at a fragment no heading owns."""
+    assert gen_api_reference._anchor("publish_sync") == "publish_sync"
+    assert gen_api_reference._anchor("create_plugin_manager") == "create_plugin_manager"
+    # Punctuation is still stripped and spaces still become hyphens.
+    assert gen_api_reference._anchor("Application API") == "application-api"
+
+
+def test_every_toc_link_targets_an_emitted_heading():
+    """A TOC entry whose fragment matches no heading in the same document
+    silently fails to scroll. The heading anchors here are derived by an
+    independent implementation of GitHub's slug rule — lowercase, drop
+    everything outside ``[\\w -]``, spaces to hyphens, repeats suffixed by
+    document order — deliberately NOT by calling the generator's own
+    ``_anchor``, which would make the check agree with any bug it has."""
+    rendered = gen_api_reference.render_api_reference()
+    toc_end = rendered.index("## Application API")
+
+    seen: dict[str, int] = {}
+    heading_anchors = set()
+    for line in rendered.splitlines():
+        if not (line.startswith("## ") or line.startswith("### ")):
+            continue
+        base = re.sub(r"[^\w\- ]", "", line.lstrip("#").strip().lower()).replace(" ", "-")
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+        heading_anchors.add(base if count == 0 else f"{base}-{count}")
+
+    toc_targets = set(re.findall(r"\]\(#([^)]+)\)", rendered[:toc_end]))
+
+    assert toc_targets, "the generated reference must emit a table of contents"
+    assert toc_targets <= heading_anchors, (
+        f"TOC links with no matching heading: {sorted(toc_targets - heading_anchors)}"
+    )
 
 
 def test_toc_disambiguates_colliding_anchors_like_github():

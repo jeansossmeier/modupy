@@ -1,5 +1,5 @@
 """Deterministic regression tests for publish_sync's budget-overrun exception
-type under the budget-expiry/dispatch-completion race (W3 residual).
+type under the budget-expiry/dispatch-completion race.
 
 ``Future.result(timeout=...)`` raises a BARE ``concurrent.futures.TimeoutError``
 — a fresh object created inside ``result()`` — when the wait expires while the
@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import time
 from typing import Any
 
 import pytest
@@ -121,10 +122,50 @@ def test_budget_overrun_race_nested_dispatch_raises_publish_sync_timeout(
         _run_nested_dispatch(noop(), _Ping(), 0.01)
 
 
+def test_budget_overrun_after_the_nested_loop_closed_raises_publish_sync_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worst case of the same race: the nested dispatch not only completed, its
+    fresh loop is already CLOSED by the time the budget handler cancels the
+    task. ``call_soon_threadsafe`` raises ``RuntimeError: Event loop is closed``
+    on a closed loop, so an unguarded cancel hands the caller that instead of
+    PublishSyncTimeout — the exception type the whole path exists to guarantee.
+    """
+    loops: list[asyncio.AbstractEventLoop] = []
+    real_new_event_loop = asyncio.new_event_loop
+
+    def recording_new_event_loop() -> asyncio.AbstractEventLoop:
+        loop = real_new_event_loop()
+        loops.append(loop)
+        return loop
+
+    class _ClosedLoopFuture(_RaceFuture):
+        """Raises the expired-wait TimeoutError only once the worker thread has
+        run the dispatch to completion AND torn its loop down, which pins the
+        interleaving instead of racing for it."""
+
+        def result(self, timeout: float | None = None) -> None:
+            deadline = time.monotonic() + 5.0
+            while not (loops and loops[0].is_closed()):
+                if time.monotonic() > deadline:
+                    raise AssertionError("nested dispatch loop never closed")
+                time.sleep(0.001)
+            raise concurrent.futures.TimeoutError()
+
+    monkeypatch.setattr(asyncio, "new_event_loop", recording_new_event_loop)
+    monkeypatch.setattr(concurrent.futures, "Future", _ClosedLoopFuture)
+
+    async def noop() -> None:
+        pass
+
+    with pytest.raises(PublishSyncTimeout):
+        _run_nested_dispatch(noop(), _Ping(), 0.01)
+
+
 def test_dispatch_raised_timeouterror_still_propagates_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Guard against over-correction (W3 R4-W3-01): when the caught
+    """Guard against over-correction: when the caught
     TimeoutError IS the dispatch's own stored exception — a listener raised it
     and ``result()`` re-raised the exact object, no budget expiry involved —
     publish_sync must surface it unchanged, never as PublishSyncTimeout."""

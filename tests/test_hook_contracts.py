@@ -1,4 +1,4 @@
-"""Contract tests for hookspec guarantees (W2 fix batch G09_contract).
+"""Contract tests for hookspec guarantees.
 
 The hookspec docstrings in modulith/hooks.py make explicit promises:
 observe-shaped hooks (dispatch/complete/error) observe, they don't gate —
@@ -7,11 +7,13 @@ the listener's own exception. And modulith/manager.py promises that the
 ``disable`` list skips plugins *during loading* and that hookimpl name
 typos surface loudly rather than silently never firing.
 
-Each test cites the audit finding id it reproduces.
+The set of hookspecs is itself part of that contract, so it is pinned here
+(see DECLARED_HOOKSPECS at the bottom of the file).
 """
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from textwrap import dedent
@@ -42,7 +44,7 @@ def _register_via_bootstrap(monkeypatch, plugin, name: str) -> None:
 
 @pytest.mark.asyncio
 async def test_raising_dispatch_hookimpl_does_not_gate_listener(fake_app, monkeypatch):
-    """A1-r4-165: a modulith_on_listener_dispatch hookimpl that raises must
+    """A modulith_on_listener_dispatch hookimpl that raises must
     not prevent the listener from running.
 
     hooks.py documents: "The listener invocation happens regardless of what
@@ -69,7 +71,7 @@ async def test_raising_dispatch_hookimpl_does_not_gate_listener(fake_app, monkey
 
 @pytest.mark.asyncio
 async def test_raising_complete_hookimpl_does_not_mask_listener_error(make_fake_app, monkeypatch):
-    """A1-r4-166: a modulith_on_listener_complete hookimpl that raises must
+    """A modulith_on_listener_complete hookimpl that raises must
     not mask the listener's own exception.
 
     hooks.py documents that the complete hook, "like the other observe
@@ -126,7 +128,7 @@ async def test_raising_complete_hookimpl_does_not_mask_listener_error(make_fake_
 
 @pytest.mark.asyncio
 async def test_raising_error_hookimpl_does_not_mask_listener_error(make_fake_app, monkeypatch):
-    """Companion to A1-r4-166 for the error hook's own documented contract:
+    """Companion to the complete-hook case, for the error hook's own contract:
     "exceptions from this hook are swallowed to prevent one plugin's failure
     from masking another's" (hooks.py, modulith_on_listener_error).
     """
@@ -167,7 +169,7 @@ async def test_raising_error_hookimpl_does_not_mask_listener_error(make_fake_app
 
 
 # ---------------------------------------------------------------------------
-# Observe-only publish-error hook (Task 6 runtime-sync)
+# Observe-only publish-error hook (modulith_on_publish_error)
 # ---------------------------------------------------------------------------
 
 
@@ -209,7 +211,7 @@ async def test_publish_error_fires_observe_only_hook_without_masking_failure(
 
 
 # ---------------------------------------------------------------------------
-# Entry-point plugin loading: disable must skip during loading (A1-r2-72)
+# Entry-point plugin loading: disable must skip during loading
 # ---------------------------------------------------------------------------
 
 
@@ -249,8 +251,8 @@ def _write_fake_dist(tmp_path: Path, plugin_name: str, module_name: str) -> Path
 
 
 def test_entrypoint_plugin_loads_without_disable(tmp_path, monkeypatch):
-    """Positive control for A1-r2-72: the fake distribution really is
-    discovered, imported, and registered when not disabled."""
+    """Positive control for the disable tests below: the fake distribution
+    really is discovered, imported, and registered when not disabled."""
     site = _write_fake_dist(tmp_path, "fake_ep_pos", "fake_ep_pos_mod")
     monkeypatch.syspath_prepend(str(site))
     try:
@@ -263,7 +265,7 @@ def test_entrypoint_plugin_loads_without_disable(tmp_path, monkeypatch):
 
 
 def test_disable_skips_entrypoint_plugin_import(tmp_path, monkeypatch):
-    """A1-r2-72: ``disable`` promises to skip plugins *during loading* —
+    """``disable`` promises to skip plugins *during loading* —
     a disabled entry-point plugin's module must never be imported, so its
     import-time side effects must never run."""
     site = _write_fake_dist(tmp_path, "fake_ep_dis", "fake_ep_dis_mod")
@@ -284,7 +286,7 @@ def test_disable_skips_entrypoint_plugin_import(tmp_path, monkeypatch):
 
 
 def test_disable_does_not_block_explicit_extra_plugins(tmp_path, monkeypatch):
-    """Regression guard for A1-r2-72's fix: blocking entry-point names must
+    """Guard against over-fixing the skip above: blocking entry-point names must
     not prevent an *explicitly passed* extra plugin from registering under
     the same canonical name — extras are intentional and register last."""
 
@@ -305,12 +307,12 @@ def test_disable_does_not_block_explicit_extra_plugins(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Hookimpl name typos must be rejected loudly (A1-r5-201)
+# Hookimpl name typos must be rejected loudly
 # ---------------------------------------------------------------------------
 
 
 def test_typoed_hookimpl_name_is_rejected_loudly():
-    """A1-r5-201: a hookimpl whose name matches no declared hookspec (a
+    """A hookimpl whose name matches no declared hookspec (a
     typo) must fail manager creation with PluginValidationError, not be
     silently accepted and never invoked."""
 
@@ -325,3 +327,78 @@ def test_typoed_hookimpl_name_is_rejected_loudly():
             load_builtins=False,
             load_entrypoints=False,
         )
+
+
+# ---------------------------------------------------------------------------
+# The hookspec set is the published plugin contract — pin it
+# ---------------------------------------------------------------------------
+
+# Every hookspec declared in modulith/hooks.py. Adding, removing or renaming
+# one is a change to the public plugin contract, so it must be a deliberate
+# edit here as well — and the documented count must move with it, which
+# test_documented_hookspec_count_matches_the_code below enforces.
+DECLARED_HOOKSPECS = frozenset(
+    {
+        "modulith_discover_modules",
+        "modulith_after_module_load",
+        "modulith_verify_module",
+        "modulith_before_event_published",
+        "modulith_after_event_published",
+        "modulith_on_publish_error",
+        "modulith_on_listener_dispatch",
+        "modulith_on_listener_complete",
+        "modulith_on_listener_error",
+        "modulith_resolve_event_target",
+        "modulith_register_brokers",
+        "modulith_register_consumers",
+        "modulith_render_documentation",
+    }
+)
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# "13 hookspecs", "**13 hookspecs**", "all 13 hookspecs …" — every prose form
+# in which the shipped Markdown states how large the plugin contract is.
+QUOTED_HOOKSPEC_COUNT = re.compile(r"(\d+)\**\s+hookspecs\b")
+
+
+def _declared_hookspecs() -> set[str]:
+    """Names carrying pluggy's hookspec marker, read off the module itself.
+
+    Keyed on the marker attribute pluggy stamps on each spec (``<project>_spec``)
+    rather than a name prefix, so a plain helper function added to hooks.py
+    cannot be mistaken for part of the contract.
+    """
+    import inspect
+
+    from modulith import hooks
+
+    return {
+        name
+        for name, obj in vars(hooks).items()
+        if inspect.isfunction(obj) and hasattr(obj, "modulith_spec")
+    }
+
+
+def test_hookspec_set_is_pinned():
+    """The declared hookspecs must match DECLARED_HOOKSPECS exactly."""
+    assert _declared_hookspecs() == set(DECLARED_HOOKSPECS)
+
+
+def test_documented_hookspec_count_matches_the_code():
+    """Prose stating a hookspec count must state the real one.
+
+    The count drifted while the code moved on, and different documents ended
+    up claiming different numbers. Every ``N hookspecs`` phrase in the shipped
+    Markdown is held to the number of specs actually declared, so the docs
+    cannot be updated one file at a time.
+    """
+    expected = len(DECLARED_HOOKSPECS)
+    sources = sorted(REPO_ROOT.glob("*.md")) + sorted((REPO_ROOT / "docs").glob("*.md"))
+    stale = {
+        path.relative_to(REPO_ROOT).as_posix(): sorted(counts)
+        for path in sources
+        if (counts := {int(n) for n in QUOTED_HOOKSPEC_COUNT.findall(path.read_text("utf-8"))})
+        - {expected}
+    }
+    assert not stale, f"docs claim the wrong hookspec count (hooks.py declares {expected}): {stale}"

@@ -15,12 +15,19 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects.mysql import LONGBLOB as MySQLLongBlob
 
 # revision identifiers, used by Alembic.
 revision: str = "0001_initial"
 down_revision: str | None = None
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+
+# Payload type that holds a real serialized event on every dialect — plain
+# LargeBinary compiles to MySQL/MariaDB BLOB (65,535 bytes), so a moderately
+# large event fails at flush with error 1406 and takes the business transaction
+# with it. Inert on Postgres/SQLite. Mirrors postgres_outbox._PAYLOAD exactly.
+_PAYLOAD = sa.LargeBinary().with_variant(MySQLLongBlob(), "mysql", "mariadb")
 
 
 def upgrade() -> None:
@@ -32,7 +39,7 @@ def upgrade() -> None:
         # no-op on Postgres/SQLite, which treat Text and unbounded String
         # identically). Mirrors postgres_outbox.EventPublicationRow.
         sa.Column("event_type", sa.Text(), nullable=False),
-        sa.Column("payload", sa.LargeBinary(), nullable=False),
+        sa.Column("payload", _PAYLOAD, nullable=False),
         sa.Column("listener", sa.Text(), nullable=False),
         sa.Column("published_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
@@ -55,7 +62,7 @@ def upgrade() -> None:
         "event_publications_archive",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("event_type", sa.Text(), nullable=False),
-        sa.Column("payload", sa.LargeBinary(), nullable=False),
+        sa.Column("payload", _PAYLOAD, nullable=False),
         sa.Column("listener", sa.Text(), nullable=False),
         sa.Column("published_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),

@@ -42,7 +42,9 @@ from modulith import (
     Consumer,
     ConsumerRegistry,
     ConsumerSpec,
+    configure,
     event,
+    hookimpl,
 )
 from modulith.adapters._state_path import _namespace
 from modulith.adapters.db_broker import (
@@ -508,6 +510,100 @@ async def test_prune_removes_expired_retained_messages_and_ledgers(engine: Any) 
     assert await _row_count(engine, table=delivery) == 0
 
 
+async def test_prune_clears_more_retained_rows_than_a_driver_will_bind(engine: Any) -> None:
+    """Retained ids are deleted in bounded chunks, not one ``IN (...)`` list.
+
+    A single list is capped by the driver: SQLite refuses more than 32,766 bind
+    parameters and asyncpg more than 32,767. Since prune, publish and every
+    consumer start all delete through the same helper, a retention window that
+    outgrew the limit broke all three at once — including the only routine that
+    could have shrunk the table back under it.
+    """
+    from sqlalchemy import insert
+
+    broker = DatabaseBroker(engine=engine, no_subscriber_policy="store")
+    target = "fakeapp.orders.WidgetCreated"
+    metadata, _, _ = broker_schema()
+    retained = metadata.tables["broker_retained_message"]
+    delivery = metadata.tables["broker_retained_delivery"]
+    expired_at = datetime.now(UTC) - timedelta(hours=1)
+    row_count = 33_000
+
+    await broker._ensure_schema()
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(retained),
+            [
+                {
+                    "id": f"retained-{index}",
+                    "target": target,
+                    "event_type": target,
+                    "payload": b"payload",
+                    "headers": None,
+                    "created_at": expired_at,
+                    "expires_at": expired_at,
+                }
+                for index in range(row_count)
+            ],
+        )
+
+    assert await broker.prune() == row_count
+    assert await _row_count(engine, table=retained) == 0
+    assert await _row_count(engine, table=delivery) == 0
+
+
+async def test_first_groups_replay_pages_through_every_retained_source(
+    engine: Any,
+    monkeypatch: Any,
+) -> None:
+    """Replay loads retained payloads one bounded page at a time.
+
+    SQLAlchemy's async ``execute()`` prebuffers a whole result, so selecting
+    every retained row in one statement made the backlog's entire payload
+    volume resident on consumer start. Paging must not lose a source: each page
+    is fanned out and retired before the next one is read.
+    """
+    from sqlalchemy import event as sqlalchemy_event
+
+    import modulith.adapters.db_broker as db_broker_module
+
+    monkeypatch.setattr(db_broker_module, "_RETAINED_ID_CHUNK", 2)
+    broker = DatabaseBroker(
+        engine=engine,
+        no_subscriber_policy="store",
+        orphan_replay_policy="first_groups",
+    )
+    target = "fakeapp.orders.WidgetCreated"
+    metadata, _, _ = broker_schema()
+    retained = metadata.tables["broker_retained_message"]
+    delivery = metadata.tables["broker_retained_delivery"]
+    payloads = [f"payload-{index}".encode() for index in range(5)]
+
+    for payload in payloads:
+        await broker.publish(target, payload, {"event_type": target})
+    assert await _row_count(engine, table=retained) == len(payloads)
+
+    payload_selects = 0
+
+    def count_payload_selects(_conn: Any, _cursor: Any, statement: str, *_: Any) -> None:
+        nonlocal payload_selects
+        if statement.startswith("SELECT") and "broker_retained_message.payload" in statement:
+            payload_selects += 1
+
+    sqlalchemy_event.listen(engine.sync_engine, "before_cursor_execute", count_payload_selects)
+    try:
+        await broker.subscribe([target], "inventory")
+    finally:
+        sqlalchemy_event.remove(engine.sync_engine, "before_cursor_execute", count_payload_selects)
+    rows = await broker.claim_batch("inventory", batch_size=10, consumer_name="c1")
+
+    assert sorted(row["payload"] for row in rows) == sorted(payloads)
+    # 5 sources at 2 ids per page: three payload-bearing reads, not one.
+    assert payload_selects == 3
+    assert await _row_count(engine, table=retained) == 0
+    assert await _row_count(engine, table=delivery) == 0
+
+
 async def test_retained_expiry_uses_database_clock(
     engine: Any,
     monkeypatch: Any,
@@ -575,6 +671,44 @@ def test_broker_schema_keeps_public_shape_and_adds_replay_tables() -> None:
         "retained_message_id",
         "consumer_group",
     ]
+
+
+def test_payload_columns_compile_to_longblob_for_mysql_and_mariadb() -> None:
+    """A payload column must hold anything publish() accepts, on every dialect.
+
+    ``LargeBinary`` compiles to MySQL/MariaDB ``BLOB``, which caps at 65,535
+    bytes — a fraction of the broker's payload limit — so a payload that passes
+    publish()'s own check dies at INSERT with error 1406 ("Data too long for
+    column"). The migrations that create these tables must render the same type
+    as the runtime schema or the two drift apart on MySQL only.
+    """
+    import importlib
+
+    from sqlalchemy.dialects.mysql import dialect as mysql_dialect
+    from sqlalchemy.dialects.mysql import mariadb
+    from sqlalchemy.dialects.sqlite import dialect as sqlite_dialect
+    from sqlalchemy.schema import CreateTable
+
+    metadata, _, _ = broker_schema()
+    revision_0002 = importlib.import_module(
+        "modulith.adapters.migrations.versions.0002_broker_message"
+    )
+    revision_0004 = importlib.import_module(
+        "modulith.adapters.migrations.versions.0004_broker_retained_messages"
+    )
+    payload_tables = ("broker_message", "broker_retained_message")
+
+    for dialect in (mysql_dialect(), mariadb.MariaDBDialect()):
+        for table_name in payload_tables:
+            ddl = str(CreateTable(metadata.tables[table_name]).compile(dialect=dialect))
+            assert "payload LONGBLOB NOT NULL" in ddl, ddl
+        assert revision_0002._PAYLOAD.compile(dialect=dialect) == "LONGBLOB"
+        assert revision_0004._PAYLOAD.compile(dialect=dialect) == "LONGBLOB"
+
+    # The variant is inert everywhere else — SQLite BLOB is already unbounded.
+    for table_name in payload_tables:
+        ddl = str(CreateTable(metadata.tables[table_name]).compile(dialect=sqlite_dialect()))
+        assert "payload BLOB NOT NULL" in ddl, ddl
 
 
 @pytest.mark.parametrize(
@@ -1146,7 +1280,6 @@ async def test_spawned_claimant_crash_preserves_durability(tmp_path: Path) -> No
     Mirrors test_shm_scenarios.py::test_spawned_claimant_crash_preserves_lease_and_fences_stale_token
     but for the database broker."""
     import multiprocessing
-    import os
 
     # Create parent engine with explicit file path.
     db_path = tmp_path / "crash-durability.db"
@@ -1409,7 +1542,17 @@ async def test_database_consumer_idle_wait_retains_asyncio_sleep_timing(engine: 
     assert asyncio.get_running_loop().time() - started_at >= 0.025
 
 
-async def test_database_consumer_empty_claim_uses_fixed_poll_interval(engine: Any) -> None:
+async def test_database_consumer_backs_off_while_idle(engine: Any) -> None:
+    """Consecutive empty claims must widen the wait, not hammer the database.
+
+    Every poll here is a network round-trip AND a write transaction
+    (``SELECT ... FOR UPDATE SKIP LOCKED``), so polling the 20ms default
+    forever costs ~50 claim transactions per second per worker on a system
+    with nothing to deliver. The wait doubles per empty poll up to the shared
+    cap; jitter (up to 25% of the base) spreads a fleet's polls apart, so each
+    observed delay sits in ``[base, base * 1.25]``.
+    """
+
     class ObservedIdleConsumer(DatabaseConsumer):
         def __init__(self, **options: Any) -> None:
             super().__init__(**options)
@@ -1427,7 +1570,7 @@ async def test_database_consumer_empty_claim_uses_fixed_poll_interval(engine: An
         broker=broker,
         bus=InMemoryEventBus(),
         serializer=JsonEventSerializer(),
-        consumer_name="inventory:1",
+        consumer_name="modulith-inventory",
         group="modulith-inventory",
         targets=[target],
         poll_interval_s=0.01,
@@ -1435,7 +1578,9 @@ async def test_database_consumer_empty_claim_uses_fixed_poll_interval(engine: An
 
     await asyncio.wait_for(consumer._run(), timeout=5.0)
 
-    assert consumer.delays == [0.01] * 4
+    assert len(consumer.delays) == 4
+    for delay, base in zip(consumer.delays, [0.01, 0.02, 0.04, 0.08], strict=True):
+        assert base <= delay <= base * 1.25, consumer.delays
 
 
 async def test_stop_propagates_cancellation_of_the_stopping_task(engine: Any) -> None:
@@ -1739,6 +1884,95 @@ async def test_database_consumer_write_failures_recover_independently(engine: An
         assert consumer.health() == ConsumerHealth(ready=True, status="ready")
     finally:
         await consumer.stop()
+
+
+async def test_database_consumer_dispatch_fires_the_per_listener_lifecycle_hooks(
+    engine: Any,
+) -> None:
+    """A worker process consuming from the database must not be a blind spot.
+
+    ``modulith_on_listener_dispatch`` / ``_error`` / ``_complete`` are scoped by
+    the hookspec to every ``(event, listener)`` pair unconditionally. Handing a
+    consumed message straight to ``bus.publish`` bypasses the runtime, so every
+    listener invocation in a worker goes untraced and a plugin alerting on
+    ``modulith_on_listener_error`` never sees a cross-process failure. The
+    *publish* hooks stay out: this process did not publish the event, and
+    re-routing it to the target it was just consumed from would redeliver
+    forever.
+    """
+
+    class _Capture:
+        def __init__(self) -> None:
+            self.dispatched: list[str] = []
+            self.errored: list[str] = []
+            self.completed: list[str] = []
+            self.published: list[Any] = []
+
+        @hookimpl
+        def modulith_on_listener_dispatch(
+            self, event: Any, listener_name: str, publication: Any
+        ) -> None:
+            self.dispatched.append(listener_name)
+
+        @hookimpl
+        def modulith_on_listener_error(
+            self, event: Any, listener_name: str, publication: Any, exception: Any
+        ) -> None:
+            self.errored.append(listener_name)
+
+        @hookimpl
+        def modulith_on_listener_complete(
+            self, event: Any, listener_name: str, publication: Any, exception: Any
+        ) -> None:
+            self.completed.append(listener_name)
+
+        @hookimpl
+        def modulith_after_event_published(self, event: Any, publication: Any) -> None:
+            self.published.append(event)
+
+    listener_fails = False
+
+    async def handler(_event: WidgetCreated) -> None:
+        if listener_fails:
+            raise RuntimeError("listener unavailable")
+
+    capture = _Capture()
+    configure(package="dbhooktest", auto_discover=False)
+    _runtime._extra_plugins.append(capture)
+    _runtime.ensure_bootstrapped()
+
+    broker = DatabaseBroker(engine=engine)
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+    target = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    await broker.subscribe([target], "modulith-inventory")
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="modulith-inventory",
+        group="modulith-inventory",
+        targets=[target],
+    )
+    row = {
+        "id": "hook-row",
+        "target": target,
+        "event_type": target,
+        "payload": serializer.serialize(WidgetCreated(name="w1")),
+        "attempts": 0,
+    }
+
+    await consumer._dispatch_one(row)
+    listener_fails = True
+    await consumer._dispatch_one({**row, "id": "hook-row-failure"})
+
+    assert [name.split(".")[-1] for name in capture.dispatched] == ["handler", "handler"]
+    assert [name.split(".")[-1] for name in capture.completed] == ["handler", "handler"]
+    assert [name.split(".")[-1] for name in capture.errored] == ["handler"]
+    # Consuming is not publishing: the publish hooks must stay silent, or the
+    # event would be re-routed to the broker it was just read from.
+    assert capture.published == []
 
 
 async def test_database_consumer_health_recovery_is_scoped_to_target(engine: Any) -> None:
@@ -2700,6 +2934,32 @@ async def test_write_gives_up_after_max_retries() -> None:
     assert broker._engine.begins == _SQLITE_BUSY_MAX_RETRIES  # bounded, not infinite
 
 
+async def test_write_reports_budget_exhaustion_as_a_timeout_wherever_the_lock_hits(
+    monkeypatch: Any,
+) -> None:
+    """A driver may defer BEGIN, so the same contention surfaces either on the
+    transaction or on the first statement inside it. Exhausting the wall budget
+    must look the same to the caller either way — otherwise the error type
+    depends on how warm the connection pool happened to be — while the driver's
+    own error stays reachable as the cause."""
+    from sqlalchemy.exc import OperationalError
+
+    import modulith.adapters.db_broker as db_broker_module
+
+    monkeypatch.setattr(db_broker_module, "_SQLITE_BUSY_TOTAL_BUDGET_S", 0.05)
+    broker = DatabaseBroker(engine=_FlakyEngine(fail_times=0))
+
+    async def locked_op(_conn: Any) -> None:
+        await asyncio.sleep(0.06)
+        raise OperationalError("stmt", {}, Exception("database is locked"))
+
+    with pytest.raises(TimeoutError) as excinfo:
+        await broker._write(locked_op)
+
+    assert broker._engine.begins == 1  # the budget stops it, not the retry cap
+    assert isinstance(excinfo.value.__cause__, OperationalError)
+
+
 async def test_write_does_not_retry_non_lock_errors() -> None:
     from sqlalchemy.exc import OperationalError
 
@@ -2737,6 +2997,30 @@ class _BlockedEngine:
         return self._begin
 
 
+# Liveness budget for "this must finish on its own". Deliberately enormous
+# relative to every write budget under test: it exists only to turn a hang into
+# a failure, never to measure one, so no amount of machine load can trip it.
+_MUST_SETTLE_SECONDS = 30.0
+
+
+async def _settled(coro: Any, what: str) -> asyncio.Task[Any]:
+    """Run ``coro`` to completion, failing the test if it hangs instead.
+
+    Returns the finished task so the caller can assert on its outcome. This is
+    not ``asyncio.wait_for``: wait_for raises ``TimeoutError`` itself, which is
+    indistinguishable from the ``TimeoutError`` a write budget raises, so a
+    test asserting "the budget fired" would pass just as happily when the
+    budget never fired at all.
+    """
+    task = asyncio.ensure_future(coro)
+    _done, pending = await asyncio.wait({task}, timeout=_MUST_SETTLE_SECONDS)
+    if pending:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        pytest.fail(f"{what} never settled within {_MUST_SETTLE_SECONDS}s")
+    return task
+
+
 async def test_write_deadline_bounds_a_blocked_operation(monkeypatch: Any) -> None:
     import modulith.adapters.db_broker as db_broker_module
 
@@ -2746,18 +3030,136 @@ async def test_write_deadline_bounds_a_blocked_operation(monkeypatch: Any) -> No
     async def op(_conn: Any) -> None:
         pytest.fail("a blocked transaction must not enter the operation")
 
-    loop = asyncio.get_running_loop()
-    started = loop.time()
-    with pytest.raises(TimeoutError):
-        await broker._write(op)
+    task = await _settled(broker._write(op), "a write blocked on begin()")
 
-    assert loop.time() - started < 0.5
+    with pytest.raises(TimeoutError):
+        task.result()
+
+
+class _FakeMySQLConnection:
+    """Records GET_LOCK/RELEASE_LOCK and answers from a scripted contention."""
+
+    def __init__(self, engine: _FakeMySQLEngine) -> None:
+        self._engine = engine
+        self._in_transaction = False
+
+    async def __aenter__(self) -> _FakeMySQLConnection:
+        self._engine.checked_out += 1
+        self._engine.peak_checked_out = max(self._engine.peak_checked_out, self._engine.checked_out)
+        return self
+
+    async def __aexit__(self, *_: Any) -> bool:
+        self._engine.checked_out -= 1
+        return False
+
+    async def begin(self) -> Any:
+        self._in_transaction = True
+        return SimpleNamespace(
+            is_active=True,
+            commit=self._end,
+            rollback=self._end,
+        )
+
+    async def _end(self) -> None:
+        self._in_transaction = False
+
+    rollback = _end
+
+    def in_transaction(self) -> bool:
+        return self._in_transaction
+
+    async def execute(self, statement: Any, parameters: Any = None) -> Any:
+        sql = str(statement)
+        if "GET_LOCK" in sql:
+            self._engine.lock_calls.append(parameters["name"])
+            granted = self._engine.grant_after <= 0
+            self._engine.grant_after -= 1
+            # Nothing is held across the boundary of a refused attempt, so the
+            # connection this attempt used goes straight back to the pool.
+            assert self._engine.checked_out == 1, "a retry must not stack connections"
+            return SimpleNamespace(scalar_one=lambda: 1 if granted else 0)
+        if "RELEASE_LOCK" in sql:
+            self._engine.released.append(parameters["name"])
+            return SimpleNamespace(scalar_one=lambda: 1)
+        raise AssertionError(f"unexpected statement: {sql}")
+
+
+class _FakeMySQLEngine:
+    def __init__(self, grant_after: int) -> None:
+        self.dialect = SimpleNamespace(name="mysql")
+        self.grant_after = grant_after
+        self.checked_out = 0
+        self.peak_checked_out = 0
+        self.lock_calls: list[str] = []
+        self.released: list[str] = []
+
+    def connect(self) -> _FakeMySQLConnection:
+        return _FakeMySQLConnection(self)
+
+
+async def test_mysql_target_lock_hands_its_connection_back_between_attempts() -> None:
+    """A publisher queueing on a contended target must not hoard a connection.
+
+    MySQL named locks are connection-scoped, so waiting inside a single
+    ``GET_LOCK`` for the whole target-lock budget keeps that pooled connection
+    checked out for the entire wait. A handful of publishers contending on one
+    target then occupy every slot in the pool, and unrelated claims, acks and
+    prunes start failing with a QueuePool timeout against a perfectly healthy
+    database. Each attempt must therefore wait only its own short slice and
+    return the connection before retrying.
+    """
+    import modulith.adapters.db_broker as db_broker_module
+
+    engine = _FakeMySQLEngine(grant_after=2)
+    broker = DatabaseBroker(engine=engine)
+    calls: list[Any] = []
+
+    async def operation(conn: Any) -> str:
+        calls.append(conn)
+        return "done"
+
+    result = await broker._write_target_locked(["fakeapp.orders.WidgetCreated"], operation)
+
+    assert result == "done"
+    assert len(calls) == 1
+    # Three attempts: refused, refused, granted — each on its own connection.
+    assert len(engine.lock_calls) == 3
+    assert engine.peak_checked_out == 1
+    assert engine.checked_out == 0
+    # Only the winning attempt holds a lock, and it releases it.
+    assert engine.released == [engine.lock_calls[-1]]
+    # The per-attempt wait is a slice of the budget, never the whole thing.
+    assert db_broker_module._TARGET_LOCK_ATTEMPT_WAIT_S < db_broker_module._TARGET_LOCK_TIMEOUT_S
+
+
+async def test_mysql_target_lock_gives_up_at_the_overall_budget(monkeypatch: Any) -> None:
+    """The retry loop is bounded by the total budget, not by attempt count."""
+    import modulith.adapters.db_broker as db_broker_module
+
+    monkeypatch.setattr(db_broker_module, "_TARGET_LOCK_TIMEOUT_S", 0.0)
+    engine = _FakeMySQLEngine(grant_after=10**6)  # never granted
+    broker = DatabaseBroker(engine=engine)
+
+    async def operation(_conn: Any) -> None:
+        pytest.fail("the operation must not run without the lock")
+
+    with pytest.raises(RuntimeError, match="timed out acquiring database broker target lock"):
+        await broker._write_target_locked(["fakeapp.orders.WidgetCreated"], operation)
+
+    assert engine.checked_out == 0
+    assert engine.released == []
 
 
 async def test_real_sqlite_write_lock_times_out_without_late_mutation(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
+    """A write that loses the database lock must give up, not land later.
+
+    Against a real file held by another connection's BEGIN IMMEDIATE, the
+    budget must raise rather than block forever — and once the holder releases,
+    the abandoned INSERT must not still appear.
+    """
     import sqlite3
 
     from sqlalchemy import insert
@@ -2785,10 +3187,12 @@ async def test_real_sqlite_write_lock_times_out_without_late_mutation(
                 )
             )
 
-        started = asyncio.get_running_loop().time()
+        task = await _settled(
+            broker._write(insert_subscription),
+            "a write blocked by another connection's BEGIN IMMEDIATE",
+        )
         with pytest.raises(TimeoutError):
-            await asyncio.wait_for(broker._write(insert_subscription), timeout=1.0)
-        assert asyncio.get_running_loop().time() - started < 0.5
+            task.result()
 
         lock.rollback()
         await asyncio.sleep(0.1)
@@ -2802,6 +3206,41 @@ async def test_real_sqlite_write_lock_times_out_without_late_mutation(
             lock.rollback()
         lock.close()
         await broker.close()
+
+
+async def test_write_budget_does_not_abort_an_operation_already_in_progress(
+    engine: Any,
+    monkeypatch: Any,
+) -> None:
+    """The budget bounds waiting for the transaction, never the work itself.
+
+    A bulk delete over a large table legitimately outruns it, and cancelling
+    that mid-flight raised a ``TimeoutError`` — which ``_is_sqlite_locked``
+    cannot match, so it was never retried — while the database may already have
+    committed the transaction being abandoned.
+    """
+    import modulith.adapters.db_broker as db_broker_module
+
+    monkeypatch.setattr(db_broker_module, "_SQLITE_BUSY_TOTAL_BUDGET_S", 0.05)
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    _, subscription, _ = broker_schema()
+
+    async def slow_insert(conn: Any) -> str:
+        from sqlalchemy import insert
+
+        await asyncio.sleep(0.2)
+        await conn.execute(
+            insert(subscription).values(
+                target="slow.Event",
+                consumer_group="slow-group",
+                updated_at=datetime.now(UTC),
+            )
+        )
+        return "committed"
+
+    assert await broker._write(slow_insert) == "committed"
+    assert await _row_count(engine, table=subscription) == 1
 
 
 @pytest.mark.parametrize("dialect", ["postgresql", "mysql"])

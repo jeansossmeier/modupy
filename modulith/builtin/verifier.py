@@ -125,14 +125,13 @@ class ImportRecord:
     # Locally-bound names, parallel to imported_names (``asname or name``).
     # Rule 4 matches runtime usage against these so an aliased import
     # (``from x import Y as Z``) is tracked under the name the file
-    # actually uses (A10-r2-96).
+    # actually uses.
     local_names: list[str] = field(default_factory=list)
 
     # True when the import sits inside an ``if TYPE_CHECKING:`` block.
     # Boundary rules (1, 3, 4) still check these; cycle detection (rule 2)
     # skips them — a type-only import imposes no runtime dependency and is
-    # the sanctioned idiom for breaking a runtime cycle (A10-r1-34,
-    # A10-r3-146).
+    # the sanctioned idiom for breaking a runtime cycle.
     type_only: bool = False
 
 
@@ -152,8 +151,8 @@ def _is_type_checking(test: ast.expr, aliases: Collection[str] = ("TYPE_CHECKING
 
     Recognizes the bare name, any ``<mod>.TYPE_CHECKING`` attribute, and —
     via *aliases* — names bound by ``from typing import TYPE_CHECKING as TC``
-    (A10-r5-217: an unresolved alias made the guard invisible, so guarded
-    imports were treated as unconditional runtime imports).
+    (an unresolved alias makes the guard invisible, and guarded imports are
+    then treated as unconditional runtime imports).
     """
     if isinstance(test, ast.Name):
         return test.id in aliases
@@ -184,7 +183,7 @@ class _ImportCollector(ast.NodeVisitor):
     Imports inside ``if TYPE_CHECKING:`` blocks are collected with
     ``type_only=True`` so the boundary rules (1, 3, 4) still see them —
     wrapping an import in the guard must not bypass encapsulation
-    (A10-r1-34, A10-r3-146) — while cycle detection (rule 2) can skip them.
+    — while cycle detection (rule 2) can skip them.
     """
 
     def __init__(self, source_file: Path, file_package: str) -> None:
@@ -355,8 +354,10 @@ def _check_no_internal_imports(
         if owner is None or owner.package == module.package:
             continue
         remainder = record.target_module[len(owner.package) + 1 :]
-        first_segment = remainder.split(".", 1)[0] if remainder else ""
-        if first_segment.startswith("_"):
+        # Any ``_``-prefixed segment makes the whole path private, not just
+        # the first: ``owner.models._priv`` reaches into a private subpackage
+        # exactly as ``owner._internal`` does.
+        if any(seg.startswith("_") for seg in remainder.split(".") if seg):
             violations.append(
                 Violation(
                     rule="no-internal-imports",
@@ -370,18 +371,13 @@ def _check_no_internal_imports(
                 )
             )
             continue
-        if remainder:
-            # Already resolved to a deeper (non-private) path under the
-            # owner — the shorthand check below only applies when
-            # target_module IS the owner package itself (see below).
-            continue
-        # Shorthand `from <owner-package> import <name>` — including the
-        # relative `from . import <name>` spelling from inside the owner's
-        # own root __init__ — resolves target_module to the owner package
-        # itself, so `remainder` above is empty and the leading-underscore
-        # check never sees it. But `<name>` may itself be a private
-        # submodule rather than a public attribute of the owner package, so
-        # the same convention must apply to it directly.
+        # The imported *names* carry the same convention as the path
+        # segments, and the check above never sees them: `from <owner-pkg>
+        # import <name>` (including the relative `from . import <name>`
+        # spelling from inside the owner's own root __init__) resolves
+        # target_module to the owner package itself, and `from
+        # <owner-pkg>.models import <name>` resolves it to a public
+        # submodule. Either way `<name>` may be the private part.
         private_names = sorted(n for n in record.imported_names if n.startswith("_"))
         if private_names:
             violations.append(
@@ -420,7 +416,7 @@ class _NameUsageCollector(ast.NodeVisitor):
         # Code inside ``if TYPE_CHECKING:`` never executes, so names
         # referenced there are NOT runtime uses — counting them let an
         # unrelated guarded reference exempt a real annotation-only import
-        # from rule 4 (A10-r4-185). The else-branch is runtime code.
+        # from rule 4. The else-branch is runtime code.
         if _is_type_checking(node.test, self._tc_aliases):
             for child in node.orelse:
                 self.visit(child)
@@ -494,8 +490,8 @@ def _check_uses_contracts_module(
 
     Runtime usage is matched against the *locally-bound* name (``asname or
     name``) so aliased imports are classified by the name the file actually
-    uses (A10-r2-96). Wildcard imports cannot be resolved to specific names,
-    so the ``import *`` itself is flagged (A10-r3-147).
+    uses. Wildcard imports cannot be resolved to specific names, so the
+    ``import *`` itself is flagged.
     """
     violations: list[Violation] = []
     # Computed lazily on first candidate, keyed per file (not aggregated
@@ -565,7 +561,7 @@ def _check_declared_dependencies(
     The violation message deliberately does NOT embed the module's current
     declared_dependencies list: the ratchet baseline hashes the message, so
     embedding module-wide state would reopen every grandfathered rule-3
-    violation whenever any one dependency is added (A10-r2-97).
+    violation whenever any one dependency is added.
     """
     from modulith.manifest import get_manifest
 
@@ -605,7 +601,7 @@ def _collect_table_refs(module: ModuleInfo) -> list[tuple[str, str]]:
 
     Detects both SQLAlchemy Core ``Table("name")`` calls and the declarative
     ORM ``__tablename__ = "name"`` assignment (the dominant pattern). Mirrors
-    the audit tool's ``_string_table_refs`` so the verifier and audit agree on
+    ``modulith.audit._string_table_refs`` so the two agree on
     what counts as a table reference — without it, ownership violations on
     declarative models went undetected.
     """
@@ -654,7 +650,7 @@ def _check_data_ownership(
     manifests claiming the same table is a manifest-authoring conflict that
     must be surfaced, not silently resolved last-write-wins — which both
     hid the conflict and falsely flagged the first-declared owner
-    (A10-r3-149). A module that co-declared ownership is never flagged for
+    as the offender. A module that co-declared ownership is never flagged for
     referencing the table; the conflict itself is reported instead.
     """
     from modulith.manifest import all_manifests
@@ -726,7 +722,7 @@ def _check_contracts_is_sink(
     may not import from any module. None of rules 1/3/4 covers the reverse
     direction (their heuristics gate on privacy, manifests, and type-shaped
     names), so an ordinary runtime import from e.g. ``orders`` into
-    contracts sailed through undetected (A10-r1-35). This rule flags ANY
+    contracts sailed through undetected. This rule flags ANY
     import — runtime or type-only — whose owner is another application
     module when the module under check IS the contracts module.
     """
@@ -865,8 +861,8 @@ def _normalize_location(location: str | None) -> str:
 
     The exact line is presentation metadata, not identity: any unrelated
     edit above a grandfathered violation shifts its line, and a line-exact
-    fingerprint would resurrect it as a "new" failing violation
-    (A10-r1-33). Identity therefore uses the file path only.
+    fingerprint would resurrect it as a "new" failing violation.
+    Identity therefore uses the file path only.
     """
     if not location:
         return ""
@@ -889,7 +885,7 @@ def _entry_for(violation: Violation) -> BaselineEntry:
 def load_baseline(path: Path) -> dict[BaselineEntry, int]:
     """Read the baseline file; return grandfathered fingerprints with counts.
 
-    The ratchet is count-aware (W3 R3-F2): each fingerprint maps to the
+    The ratchet is count-aware: each fingerprint maps to the
     number of violations grandfathered under it, so a NEW violation that is
     identical to a baselined one (same rule/module/file/message, different
     line) still fails the build. Entries written by older versions carry no
@@ -898,7 +894,7 @@ def load_baseline(path: Path) -> dict[BaselineEntry, int]:
 
     A corrupted or schema-mismatched file raises ConfigurationError naming
     the path and the regeneration command — never a raw JSONDecodeError or
-    KeyError traceback (A10-r5-219). Legacy entries carrying ``file:line``
+    KeyError traceback. Legacy entries carrying ``file:line``
     locations are normalized on load so old baselines keep matching.
     """
     from modulith.config import ConfigurationError
@@ -957,7 +953,7 @@ def filter_against_baseline(
     """Return the violations beyond the baseline's per-fingerprint allowance.
 
     Each grandfathered fingerprint admits at most its baselined count; every
-    violation past that allowance is reported (W3 R3-F2). Fewer violations
+    violation past that allowance is reported. Fewer violations
     than baselined is an improvement and passes — the ratchet only tightens.
     """
     remaining = dict(baseline)
@@ -974,7 +970,7 @@ def filter_against_baseline(
 def write_baseline(path: Path, violations: list[Violation]) -> None:
     """Write the current violation set as a new baseline (stable JSON).
 
-    One entry per fingerprint with its ``count`` (W3 R3-F2), so the
+    One entry per fingerprint with its ``count``, so the
     multiplicity of identical violations is part of the ratchet.
     """
     counts = Counter(_entry_for(v) for v in violations)

@@ -29,7 +29,7 @@ logger = logging.getLogger("modulith.discovery")
 # them entirely used to exempt exactly those modules from manifest
 # verification: a module that never imports never registers a manifest, so
 # the "module silently failed to import" safety net could not fire for the
-# very failure mode it documents (A4-r1-10, A4-r3-133). The runtime calls
+# very failure mode it documents. The runtime calls
 # modulith_after_module_load for every discovered module during bootstrap;
 # the hookimpl below turns any recorded failure into a loud, aggregated
 # ConfigurationError there.
@@ -44,10 +44,10 @@ def modulith_discover_modules(app_package: str) -> list[ModuleInfo]:
     Each surviving subpackage is imported eagerly so any @listener
     decorators it contains register against the event bus.
 
-    Failure semantics (W3 R3-F1):
+    Failure semantics:
 
     * The APPLICATION PACKAGE's own import failure — missing package and a
-      bug in the app's ``__init__`` alike (A4-r5-207 uniformity) — is a
+      bug in the app's ``__init__`` treated alike — is a
       fatal misconfiguration: it raises ConfigurationError with the original
       exception chained as the cause, so bootstrap (and thus ``modulith
       verify``/``doctor``) fails loudly instead of going CI-green on an app
@@ -65,9 +65,9 @@ def modulith_discover_modules(app_package: str) -> list[ModuleInfo]:
     try:
         root = importlib.import_module(app_package)
     except Exception as exc:
-        # Deliberately broad (A4-r5-207): a NameError inside the app's
-        # __init__ must fail exactly like a missing package (ImportError) —
-        # but LOUDLY (W3 R3-F1). Returning [] here made `modulith verify`
+        # Deliberately broad: a NameError inside the app's __init__ must fail
+        # exactly like a missing package (ImportError) — but LOUDLY.
+        # Returning [] here made `modulith verify`
         # print "✓ no boundary violations" and exit 0 on an unimportable
         # application package.
         logger.exception("could not import application package %r: %s", app_package, exc)
@@ -150,8 +150,8 @@ def modulith_after_module_load(module: ModuleInfo) -> None:
     trace beyond a log line. Raising here turns that into the same loud
     startup failure that manifest verification produces, closing the gap
     where the exact bug the manifest check documents ("module silently
-    failed to import") also prevented the check from running (A4-r1-10,
-    A4-r3-133). All recorded failures are aggregated into one message so a
+    failed to import") also prevented the check from running. All recorded
+    failures are aggregated into one message so a
     multi-module breakage surfaces in a single startup error.
     """
     if module.package not in _import_failures:

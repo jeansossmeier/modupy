@@ -4,6 +4,12 @@ on:
   push:
     tags: ['v*']
 
+# Least privilege by default. The publish job re-declares its own broader
+# permissions block (id-token: write for PyPI trusted publishing); a job-level
+# block replaces this one rather than adding to it.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: pytest (Python 3.11)
@@ -30,6 +36,17 @@ jobs:
         # in the release environment.
         run: pytest -m "not integration" -v --tb=short
 
+      - name: Lint
+        # Same gate CI applies on every PR. A tag push can reach this workflow
+        # without ever having gone through CI (a tag on an unmerged commit, a
+        # re-tag, a force-push), so the release path re-runs the checks itself.
+        run: |
+          ruff check modulith tests scripts examples
+          ruff format --check modulith tests scripts examples
+
+      - name: Type check
+        run: mypy --strict modulith/ tests/ scripts/ examples/
+
   build:
     name: build wheel + sdist
     runs-on: ubuntu-latest
@@ -53,6 +70,20 @@ jobs:
           fi
           echo "tag $GITHUB_REF_NAME matches pyproject.toml version $pyproject_version"
 
+      - name: Verify CHANGELOG has an entry for this version
+        # An unreleased-notes gap is invisible until users go looking for it
+        # after the fact, when the release is already immutable on PyPI.
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          # Headings use the Keep a Changelog form `## [0.9.0] — date`; accept a
+          # bare or v-prefixed variant too so a style change here is not a
+          # release-blocking surprise.
+          if ! grep -qE "^#+ +\[?v?${tag//./\\.}\]?([^0-9.]|$)" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no heading for version $tag"
+            exit 1
+          fi
+          echo "CHANGELOG.md documents $tag"
+
       - name: Install build
         run: pip install build
 
@@ -63,6 +94,7 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path, PurePosixPath
+          import re
           import tarfile
           import zipfile
 
@@ -78,11 +110,19 @@ jobs:
               }
           )
 
+          # An sdist puts everything under one `<distribution>-<version>/` root
+          # and a wheel puts metadata under `<distribution>-<version>.dist-info/`.
+          # Match the shape rather than the literal distribution name: the
+          # distribution is `modupy` while the import package is `modulith`, and
+          # a name-specific prefix would silently strip nothing after a rename,
+          # turning every assertion below into a no-op.
+          ARCHIVE_ROOT = re.compile(r"^[A-Za-z0-9._]+-\d[A-Za-z0-9._+!-]*(\.dist-info)?$")
+
           def normalized(names):
               result = set()
               for name in names:
                   parts = PurePosixPath(name).parts
-                  if parts and parts[0].startswith("modulith-"):
+                  if parts and ARCHIVE_ROOT.match(parts[0]):
                       parts = parts[1:]
                   if parts:
                       result.add("/".join(parts))

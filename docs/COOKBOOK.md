@@ -14,6 +14,7 @@ end-to-end version of recipes 1–5 lives in
 4. [Publish from sync code (views, scripts)](#4-publish-from-sync-code-views-scripts)
 5. [Declare a manifest and let bootstrap verify it](#5-declare-a-manifest-and-let-bootstrap-verify-it)
 6. [Enable the durable Postgres outbox](#6-enable-the-durable-postgres-outbox)
+    - [Coordinating concurrent sweepers](#coordinating-concurrent-sweepers)
 7. [Choose an outbox completion mode](#7-choose-an-outbox-completion-mode)
 8. [Go process-per-module and externalize an event](#8-go-process-per-module-and-externalize-an-event)
     - [Durable local SHM default](#durable-local-shm-default)
@@ -72,12 +73,17 @@ schema, not on each other. This is the pattern that keeps module coupling low.
 
 ```
 myapp/
-├── contracts/
-│   └── events.py          # OrderPlaced, StockReserved  (shared vocabulary)
+├── contracts/             # shared vocabulary
+│   ├── __init__.py
+│   └── events.py          # OrderPlaced, StockReserved
 ├── orders/                # publishes OrderPlaced
 ├── inventory/             # listens for OrderPlaced, publishes StockReserved
 └── notifications/         # listens for StockReserved
 ```
+
+Every module directory needs an `__init__.py`, `contracts/` included —
+discovery walks subpackages, so a directory without one is a namespace package
+and is skipped silently.
 
 ```python
 # myapp/contracts/events.py
@@ -222,7 +228,7 @@ the business transaction.
 Install the extra and select the adapter:
 
 ```bash
-pip install 'modulith[postgres]'
+pip install 'modupy[postgres]'
 ```
 
 ```toml
@@ -246,9 +252,12 @@ request so `publish()` calls inside it are captured by the outbox:
 
 ```python
 # myapp/main.py
-from modulith.adapters.postgres_outbox import PostgresPublicationStore, bind_session
+from modulith.adapters.postgres_outbox import (
+    PostgresPublicationStore,
+    bind_session,
+    unbind_session,
+)
 from modulith.builtin import outbox
-from modulith.builtin.outbox import _current_session
 from modulith.serializers import JsonEventSerializer
 from myapp.contracts.events import OrderPlaced, StockReserved
 
@@ -269,7 +278,7 @@ async def get_db():
         try:
             yield session
         finally:
-            _current_session.reset(token)
+            unbind_session(token)
 ```
 
 Now a `publish()` inside a bound transaction is persisted atomically with your
@@ -278,6 +287,36 @@ data: a rollback discards the event (no ghosts), a commit guarantees delivery
 delivery is at-least-once, **listeners must be idempotent**. Inspect the queue
 with `modulith outbox status`; a persistently-failing publication is
 dead-lettered after 10 attempts.
+
+### Coordinating concurrent sweepers
+
+Every process that wires the outbox runs its own retry loop against the same
+table. `claim_strategy` decides how those sweepers stay off each other's rows:
+
+| `claim_strategy` | Behaviour |
+|---|---|
+| `"lease"` (default) | claim a batch in one committed transaction, renew the lease while dispatching, fence the completion write on the claim token |
+| `"advisory_lock"` | hold a Postgres advisory lock per row for the dispatch. Rejected at `configure()` on a non-Postgres store |
+| `"none"` | no coordination — two sweepers may dispatch the same row. Warns at `configure()` |
+
+```python
+outbox.configure(
+    store=store,
+    serializer=serializer,
+    claim_strategy="lease",     # default
+    claim_lease_seconds=60.0,   # must exceed your slowest listener
+    claim_batch_size=100,       # rows claimed per sweep
+)
+```
+
+A lease shorter than a listener's runtime expires mid-dispatch and lets a peer
+legitimately reclaim the row — a duplicate delivery, not a bug. Raise
+`claim_lease_seconds` rather than lowering it to chase latency.
+
+The default strategy needs the lease columns, which arrive in migration
+`0003_outbox_claim_leases`: migrate to `head`, not to `0001_initial`. These are
+`outbox.configure()` keyword arguments, not pyproject keys — see the note under
+recipe 7 about `[tool.modulith.outbox_options]`.
 
 ---
 
@@ -343,9 +382,13 @@ class StockReserved:
     order_id: str
 ```
 
-Run it under the supervisor + reverse proxy:
+Run it under the supervisor + reverse proxy. Both extras are required here even
+if single-process mode never needed them: `cli` provides the `modulith` command,
+and `fastapi` provides the FastAPI + uvicorn that the reverse proxy and every
+worker subprocess are built from:
 
 ```bash
+pip install 'modupy[fastapi,cli]'
 modulith run myapp.main:app --topology=processes
 ```
 
@@ -354,7 +397,35 @@ backoff), and the reverse proxy routes each request to the right worker by URL
 prefix. In single-process topology `@externalized` is an inert marker, so you can
 add it before you need multi-process and it costs nothing until then.
 
-For Redis Streams, install `modulith[redis]` and set
+**Expose each module's HTTP routes as `router` on the module package.** A worker
+mounts the `router` attribute of the module package it hosts — `myapp.orders` —
+under `/<module>`, and the proxy forwards `/orders/...` to that worker. A router
+defined one level down (`myapp/orders/api.py`) is invisible to the worker unless
+the package re-exports it: the worker still starts, `/health` still reports
+`ready`, and every route 404s. Re-export it:
+
+```python
+# myapp/orders/__init__.py
+from myapp.orders.api import router as router   # the alias marks a deliberate re-export
+```
+
+Put that import at the *bottom* of `__init__.py` if `api.py` imports back from
+the package (e.g. the `place_order` of recipe 3) — the name it needs must exist
+before the import runs. Declare routes relative to the router root
+(`@router.post("")`) so one mount convention serves both topologies: with
+`app.include_router(router, prefix="/orders")` in `myapp/main.py` and with the
+worker's `/orders` mount, `POST /orders` is the same URL either way. A module
+with no `router` is a listener-only worker — it consumes events and serves only
+`/health`.
+
+The proxy's `/_modulith/*` actuator routes (topology, liveness, health) are a
+separate matter from your module routes: `modulith run` binds
+`0.0.0.0`, and the default `actuator_mode="auto"` refuses to serve them
+unauthenticated off loopback — with no `MODULITH_ACTUATOR_TOKEN` set they are
+left unmounted and startup logs a warning. Export a token if you want them; see
+[DEPLOYMENT.md §Actuator Access](DEPLOYMENT.md#actuator-access-_modulith).
+
+For Redis Streams, install `modupy[redis]` and set
 `broker = "redis-streams"` explicitly.
 
 ### Durable local SHM default
@@ -402,7 +473,7 @@ relational database. Bare `@externalized` events need only configuration
 changes; intentionally scheme-pinned targets must be updated.
 
 ```bash
-pip install 'modulith[database]'
+pip install 'modupy[database]'
 ```
 
 An explicit database broker may still use an embedded SQLite file for a small
@@ -441,7 +512,12 @@ With `broker = "database"`, a bare `@externalized` event's default target is
 `database:{event-fqn}`; pin one explicitly with
 `@externalized(target="database:orders.placed")` exactly as with Redis. Every
 `broker_options` key is env-overridable via `MODULITH_BROKER_<KEY>` (e.g.
-`MODULITH_BROKER_URL`, `MODULITH_BROKER_POLL_INTERVAL_MS`).
+`MODULITH_BROKER_URL`, `MODULITH_BROKER_POLL_INTERVAL_MS`), and the env var
+wins over the pyproject value. That is also how a worker process gets its
+connection URL: `modulith run --topology processes` resolves
+`broker_options` once in the supervisor and forwards each key into every
+worker's environment under that name, because a worker re-bootstraps from
+scratch and cannot re-derive the table itself.
 
 ### No-subscriber and orphan-replay policies
 
@@ -465,8 +541,6 @@ delivery rows for configured groups).
 targets are declared: `declare_module(broker_targets=...)`,
 `[tool.modulith.subscriptions]`, or `@listener(broker_targets=...)`. Static
 `@externalized(target=...)` destinations are always inferred.
-`MODULITH_BROKER_URL`) — which is how each worker process receives its
-connection URL.
 
 The broker creates its `broker_message` / `broker_subscription` tables
 automatically on first use; to manage the schema explicitly instead, they ship
@@ -482,7 +556,7 @@ with the same crash-recovery and dead-lettering as the Redis broker; see
 **Goal:** assert that publishing one event causes the expected downstream event,
 without `sleep`s or real infrastructure.
 
-The `modulith` pytest plugin (installed with `modulith[test]`) ships fixtures
+The `modulith` pytest plugin (installed with `modupy[test]`) ships fixtures
 that reset the runtime per test and capture what was published.
 
 Capture and assert directly with the `modulith_app` fixture:
@@ -501,6 +575,8 @@ async def test_order_reserves_stock(modulith_app):
 Or use the fluent `scenario` fixture for trigger-then-expect flows:
 
 ```python
+from myapp.contracts.events import OrderPlaced, StockReserved
+
 def test_order_flow(scenario):
     (
         scenario
@@ -524,10 +600,11 @@ subprocess.
 **Goal:** stop new cross-module boundary violations from merging, without having
 to fix every existing one first.
 
-Run the AST boundary verifier in CI. On a clean codebase, fail on any violation:
+Run the AST boundary verifier in CI. Bare `verify` fails on ERROR-severity
+violations only; opt in to WARNINGs when you want the stricter gate:
 
 ```bash
-modulith verify                       # exit 1 on any violation
+modulith verify                       # exit 1 on ERROR-severity violations
 modulith verify --fail-on-warnings    # also fail on WARNING-severity findings
 ```
 
@@ -540,13 +617,15 @@ modulith verify --mode=ratchet
 
 The baseline is count-aware: it records existing violations by a stable hash, so
 you can enforce "no new violations" while paying down the old ones over time. Add
-the check to CI (exit code `0` = clean, `1` = violations/user error, `2` =
-internal error):
+the check to CI (exit code `0` = clean, `1` = violations or a bad flag *value*,
+`2` = an internal error or a CLI usage error such as an unknown option — click's
+convention). `--fail-on-warnings` makes the gate cover every new violation, not
+just the ERROR-severity ones:
 
 ```yaml
 # .github/workflows/ci.yml
-- run: pip install 'modulith[cli]'
-- run: modulith verify --mode=ratchet
+- run: pip install 'modupy[cli]'
+- run: modulith verify --mode=ratchet --fail-on-warnings
 ```
 
 `modulith doctor` complements this with operational + architectural health
@@ -608,6 +687,6 @@ Events targeting `my-scheme:destination` (via `@externalized`) now route to your
 broker. Full worked examples ship in
 [`examples/naming_convention_verifier.py`](../examples/naming_convention_verifier.py)
 and [`examples/redis_streams_broker.py`](../examples/redis_streams_broker.py).
-The complete extension contract — all 12 hookspecs and 4 protocols — is in
+The complete extension contract — all 13 hookspecs and 5 protocols — is in
 [ARCHITECTURE.md §5](ARCHITECTURE.md#5-the-plugin-contract) and
 [SPEC.md Part IV](../SPEC.md).

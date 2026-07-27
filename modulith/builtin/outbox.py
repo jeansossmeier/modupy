@@ -20,7 +20,7 @@ Critical correctness properties:
      workers' retry loops CAN dispatch the same row concurrently. With
      ``claim_strategy="lease"`` (default) or ``"advisory_lock"``, the store's
      claim/lock fencing closes that cross-process window for the retry sweep.
-     ``claim_strategy="none"`` keeps the pre-Task-4 behavior (SKIP LOCKED
+     ``claim_strategy="none"`` opts out of that fencing (SKIP LOCKED
      narrows but does not close it) — which is why property #3 still holds
      and listeners must be idempotent under that mode.
 
@@ -79,9 +79,12 @@ logger = logging.getLogger("modulith.outbox")
 # consumer would dead-letter every event as poison.
 _WIRE_SERIALIZER = JsonEventSerializer()
 
-# The current transaction's session, set by adapter integration code
-# (``bind_session``). The plugin only reads it to decide whether a publish
-# is transactional; the adapter's ``save`` uses it to enlist the record.
+# The current transaction's session. Private, and deliberately absent from
+# ``__all__``: the supported way to bind and release one is
+# ``modulith.adapters.postgres_outbox.bind_session`` / ``unbind_session``,
+# which restore the previous value on exit so nested binds don't clobber the
+# outer session. The plugin only reads this to decide whether a publish is
+# transactional; the adapter's ``save`` uses it to enlist the record.
 _current_session: ContextVar[Any | None] = ContextVar("_modulith_current_session", default=None)
 
 # Module-level state. Bound during configure().
@@ -95,7 +98,7 @@ _retry_stale_seconds: float = 30.0
 _retry_loop_enabled: bool = True
 _retry_task: asyncio.Task[None] | None = None
 
-# Task 4 claim coordination (see modulith._claims). Bound in configure().
+# Claim coordination (see modulith._claims). Bound in configure().
 # Default ``"lease"``; third-party stores without ClaimingStore fall back to
 # the original find_incomplete path at sweep time (capability duck-typing).
 _claim_strategy: str = DEFAULT_CLAIM_STRATEGY
@@ -163,8 +166,8 @@ def _resolve_dead_letter_threshold(store: Any, configured: int | None) -> int:
     ``PostgresPublicationStore`` writes an ``is_dead_lettered`` flag from ITS
     OWN threshold at ``save()`` time) plus a ``dead_letter_after_attempts_
     explicit`` marker. Stores without either attribute (the in-memory test
-    double, pre-Task-4 third-party stores) simply defer entirely to this
-    plugin's value — unchanged behavior for them.
+    double, third-party stores with no threshold of their own) simply defer
+    entirely to this plugin's value — unchanged behavior for them.
 
     Precedence: if BOTH sides were explicitly set and disagree, that is a
     genuine misconfiguration — fail loudly here rather than silently picking
@@ -452,12 +455,15 @@ async def persist_broker_route(event: Any, target: str) -> EventPublication:
 
 
 def _resolve_listener(publication: EventPublication, event: Any) -> Any:
-    """Find the registered handler whose qualname matches the publication."""
+    """Find the registered handler whose qualname matches the publication.
+
+    Only reached for a publication whose event type is registered, which
+    cannot be true without a bound bus — so the bus is never None here.
+    """
     from .. import runtime as _rt
 
     bus = _rt._runtime.event_bus
-    if bus is None:
-        return None
+    assert bus is not None
     for handler in bus.listeners_for(type(event)):
         if _listener_id(handler) == publication.listener:
             return handler
@@ -729,6 +735,10 @@ async def _dispatch_broker_route(publication: EventPublication) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Largest exponent ``2.0 ** n`` accepts before overflowing a float64.
+_MAX_BACKOFF_EXPONENT = 1023
+
+
 def _backoff_elapsed(publication: EventPublication) -> bool:
     """True when enough time has passed since publish to retry this record.
 
@@ -751,7 +761,16 @@ def _backoff_elapsed(publication: EventPublication) -> bool:
         # the tz). Interpret naive as UTC instead of letting the naive/aware
         # subtraction below raise TypeError and kill the sweep.
         anchor = anchor.replace(tzinfo=UTC)
-    backoff = min(2.0 ** (publication.attempt_count - 1), _max_retry_backoff_seconds)
+    # Cap the exponent BEFORE exponentiating. ``2.0 ** 1024`` overflows the
+    # float range and raises OverflowError, and that raise escapes the whole
+    # sweep cycle rather than skipping one row — a permanent head-of-line
+    # block, since the offending row sorts first (oldest last attempt) on the
+    # very next cycle. Reachable whenever ``dead_letter_after_attempts`` is set
+    # high enough for a row to keep accumulating attempts past 1024. 1023 is
+    # the largest non-overflowing exponent and ``2.0 ** 1023`` already dwarfs
+    # any finite backoff cap, so the min() below is unchanged.
+    exponent = min(publication.attempt_count - 1, _MAX_BACKOFF_EXPONENT)
+    backoff = min(2.0**exponent, _max_retry_backoff_seconds)
     age = (datetime.now(UTC) - anchor).total_seconds()
     return age >= backoff
 
@@ -769,7 +788,7 @@ async def _sweep(older_than: timedelta) -> None:
     (listener raised, broker rejected) still record attempts and can
     dead-letter.
 
-    Claim strategy (Task 4) selects the concurrency path:
+    The configured claim strategy selects the concurrency path:
       * lease + ClaimingStore → claim_batch, renew during dispatch, fence
       * advisory_lock + AdvisoryLockingStore → try_lock around dispatch
       * none, or missing capability → original find_incomplete path
@@ -807,7 +826,8 @@ async def _sweep_unclaimed(older_than: timedelta, *, runtime_ready: bool) -> Non
 
 
 async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
-    """Lease mode: claim a batch, renew during dispatch, fence complete/fail."""
+    """Lease mode: claim a batch, re-arm each row's lease before its turn,
+    renew during dispatch, fence complete/fail."""
     assert _store is not None
     claimed = await _store.claim_batch(  # type: ignore[attr-defined]
         owner=_claim_owner,
@@ -837,7 +857,18 @@ async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
             if pub.claim_token:
                 await _store.renew_claim(pub.id, pub.claim_token, 0.0)  # type: ignore[attr-defined]
             continue
-        await _dispatch_with_lease_renewal(pub)
+        # ``claim_batch`` stamps ONE shared expiry on the whole batch, but the
+        # rows dispatch serially: a slow head of the batch can leave the tail's
+        # lease expired before its turn, and a peer sweeper reclaims it. Re-arm
+        # this row's lease immediately before dispatching it, and dispatch only
+        # while the row is still ours — a lost re-arm means the peer owns the
+        # row now, so delivering it here would be a second delivery under a
+        # dead lease.
+        still_ours = not pub.claim_token or await _store.renew_claim(  # type: ignore[attr-defined]
+            pub.id, pub.claim_token, _claim_lease_seconds
+        )
+        if still_ours:
+            await _dispatch_with_lease_renewal(pub)
 
 
 async def _sweep_advisory(older_than: timedelta, *, runtime_ready: bool) -> None:
@@ -1031,7 +1062,8 @@ async def force_retry(publication_id: UUID) -> None:
     available: ``find_incomplete``/``find_dead_lettered`` are both capped
     windows (LIMIT 100), so scanning them could never reach a targeted row
     sitting further back in a large backlog. Stores without ``find_by_id``
-    (pre-Task-4 third-party stores) fall back to the bounded scan.
+    (third-party stores implementing only the paged finders) fall back to the
+    bounded scan.
     """
     assert _store is not None
     finder = getattr(_store, "find_by_id", None)
@@ -1075,12 +1107,13 @@ async def list_dead_lettered() -> list[EventPublication]:
     retry window isn't starved). Stores without it fall back to partitioning the
     incomplete set by the attempt threshold.
 
-    Pages through the store's keyset-pagination capability (Task 4:
-    ``find_dead_lettered(after=..., limit=...)``) so a backlog past a single
-    100-row page is fully returned rather than silently truncated — a
-    pre-Task-4 third-party store whose ``find_dead_lettered()`` takes no
-    arguments raises ``TypeError`` on the first paginated call, which is
-    caught to fall back to its single unbounded/capped result unchanged.
+    Pages through the store's keyset-pagination capability
+    (``find_dead_lettered(after=..., limit=...)``) so a backlog past a single
+    100-row page is fully returned rather than silently truncated. A
+    third-party store predating that signature — ``find_dead_lettered()``
+    taking no arguments — raises ``TypeError`` on the first paginated call,
+    which is caught to fall back to its single unbounded/capped result
+    unchanged.
     """
     assert _store is not None
     finder = getattr(_store, "find_dead_lettered", None)
@@ -1159,7 +1192,6 @@ def _reset_for_testing() -> None:
 
 
 __all__ = [
-    "_current_session",  # exported for adapters to bind
     "configure",
     "force_retry",
     "list_dead_lettered",

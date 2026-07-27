@@ -187,6 +187,48 @@ def test_isolated_marker_runs_in_subprocess() -> None:
     assert os.environ.get("MODULITH_ISOLATED_SUBPROCESS") == "1"
 
 
+def test_isolated_marker_survives_a_parent_run_under_coverage(tmp_path) -> None:
+    """The isolated child re-runs a single nodeid. Forwarding the parent's
+    ``--cov*`` options unchanged made pytest-cov re-apply the parent's
+    ``--cov-fail-under`` to that one test's coverage, so the child exited 1
+    and the marker failed for any downstream project whose CI runs
+    ``pytest --cov``. Modelled as a downstream project: a normal test covers
+    the package fully (the parent's own gate passes), and an isolated test
+    alone would never reach the threshold."""
+    import subprocess
+    import sys
+
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text(
+        "def used():\n    return 1\n\n\ndef also_used():\n    return 2\n", encoding="utf-8"
+    )
+    (tmp_path / "test_downstream.py").write_text(
+        "import os\n"
+        "import pytest\n"
+        "import pkg\n"
+        "\n"
+        "def test_covers_everything():\n"
+        "    assert pkg.used() == 1\n"
+        "    assert pkg.also_used() == 2\n"
+        "\n"
+        "@pytest.mark.modulith_isolated\n"
+        "def test_isolated():\n"
+        "    assert os.environ.get('MODULITH_ISOLATED_SUBPROCESS') == '1'\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "--cov=pkg", "--cov-fail-under=100"],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "2 passed" in completed.stdout
+
+
 @pytest.mark.modulith_no_outbox
 def test_no_outbox_marker_disables_outbox_configuration() -> None:
     from modulith.builtin import outbox
@@ -197,12 +239,12 @@ def test_no_outbox_marker_disables_outbox_configuration() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ModulithTestApp.reset() — public API (A11-r3-154)
+# ModulithTestApp.reset() — public API
 # ---------------------------------------------------------------------------
 
 
 def test_modulith_test_app_reset_clears_captured_state(modulith_app) -> None:
-    """A11-r3-154: reset() is public API — it must clear both captured lists
+    """reset() is public API — it must clear both captured lists
     (published events and listener dispatches) so a test can reuse one handle
     across phases."""
     _isolate()

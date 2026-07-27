@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/jeansossmeier/modupy/security/advisories/new
+    about: Report privately via a GitHub security advisory. Never in a public issue.
+  - name: Question or usage help
+    url: https://github.com/jeansossmeier/modupy/discussions
+    about: Ask in Discussions. Check docs/COOKBOOK.md first — it covers the common recipes.

@@ -1,0 +1,32 @@
+# Dependency update automation.
+#
+# Every optional dependency in pyproject.toml carries an upper bound (a future
+# major can break an adapter contract without warning), so those bounds have to
+# be raised by hand after testing against the new major. Dependabot's job here
+# is to surface that a new major exists — it opens the PR, CI says whether the
+# bump is safe.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for routine patch/minor bumps; majors stay separate so each gets
+      # its own CI run and its own upper-bound decision.
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    labels:
+      - "dependencies"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"

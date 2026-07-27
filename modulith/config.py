@@ -139,6 +139,23 @@ class Configuration:
         return key in self.explicit_keys
 
 
+# Broker defaults already announced in this process. One boot resolves the
+# same configuration more than once — the CLI resolves it to place the topology
+# and Runtime.ensure_bootstrapped() resolves it again — so announcing on every
+# call printed one decision repeatedly before the first worker started.
+# The key is the decision, not the call, so a reload that lands somewhere
+# different is still announced.
+_announced_broker_defaults: set[str] = set()
+
+
+def _announce_broker_default(decision: str, message: str, *args: object) -> None:
+    """Warn about an auto-selected broker the first time it is selected."""
+    if decision in _announced_broker_defaults:
+        return
+    _announced_broker_defaults.add(decision)
+    logger.warning(message, *args)
+
+
 def load_configuration(**overrides: Any) -> Configuration:
     """Build a Configuration from all available sources.
 
@@ -169,13 +186,16 @@ def load_configuration(**overrides: Any) -> Configuration:
         configured_url = _configured_broker_url(explicit.get("broker_options"))
         explicit["broker"] = "database" if configured_url is not None else "shm"
         if configured_url is not None:
-            logger.warning(
+            redacted = _redact_broker_url(configured_url)
+            _announce_broker_default(
+                f"database:{redacted}",
                 "topology='processes' with a broker URL but no broker "
                 "name \u2014 inferring the 'database' adapter for %s.",
-                _redact_broker_url(configured_url),
+                redacted,
             )
         else:
-            logger.warning(
+            _announce_broker_default(
+                "shm",
                 "topology='processes' with no broker configured \u2014 defaulting to "
                 "the durable SHM broker with embedded SQLite (file '%s' in a "
                 "private per-user state directory). Set "
@@ -410,7 +430,7 @@ def _read_pyproject() -> dict[str, Any]:
     subscriptions) so users can write idiomatic TOML without hitting the
     "unknown config key" guard.
 
-    Loud-error contract (user decision, W2):
+    Loud-error contract:
       * A pyproject.toml that fails to parse — including the duplicate-key
         collision TOML raises when one key is written as both a scalar and
         a table — raises ConfigurationError. Silently skipping it would
@@ -425,8 +445,8 @@ def _read_pyproject() -> dict[str, Any]:
         ``workers``) raises with a "did you mean" hint; a subtable naming
         a scalar option raises too.
 
-    Only genuinely unknown subtables — plus the reserved ``verify`` table,
-    which Phase 1 will add — are dropped silently: the bootstrap must
+    Only genuinely unknown subtables — plus the reserved ``verify`` table
+    (see ``_RESERVED_SUBTABLES``) — are dropped silently: the bootstrap must
     succeed against a future-compatible pyproject even if the running
     modulith version doesn't yet recognize every option.
     """
@@ -634,7 +654,7 @@ def _read_env_vars() -> dict[str, Any]:
 
 
 def _validate_outbox_options(options: dict[str, Any]) -> None:
-    """Validate the Task-4 claim-strategy keys of [tool.modulith.outbox_options]
+    """Validate the claim-strategy keys of [tool.modulith.outbox_options]
     when present. Other keys in that table are intentionally NOT validated
     here — outbox_options is a forward-compatible passthrough (see
     _read_pyproject); only these three have runtime behavior gated on them

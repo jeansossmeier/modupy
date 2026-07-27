@@ -59,8 +59,7 @@ def test_collect_imports(make_fake_app) -> None:
     assert ("fakeapp.orders.helpers", ("util",)) in targets
     # TYPE_CHECKING-only imports are collected but tagged type_only, so the
     # boundary rules (1, 3, 4) still see them while cycle detection skips
-    # them (A10-r1-34 / A10-r3-146 — the guard must not be an
-    # encapsulation escape hatch).
+    # them (the guard must not be an encapsulation escape hatch).
     guarded = [r for r in records if r.target_module == "fakeapp.secret"]
     assert len(guarded) == 1
     assert guarded[0].type_only
@@ -335,8 +334,8 @@ def test_baseline_roundtrip(tmp_path: Path) -> None:
 
 
 def test_load_baseline_missing_file_returns_empty(tmp_path: Path) -> None:
-    # W3 R3-F2: the baseline is a fingerprint -> count mapping (count-aware
-    # ratchet); a missing file grandfathers nothing.
+    # The baseline is a fingerprint -> count mapping (count-aware ratchet);
+    # a missing file grandfathers nothing.
     assert load_baseline(tmp_path / "nope.json") == {}
 
 
@@ -366,7 +365,7 @@ def test_verifier_registered_as_builtin() -> None:
 
 
 # ---------------------------------------------------------------------------
-# regression: rule 4 runtime-vs-type discrimination, rule 5 __tablename__ (audit)
+# regression: rule 4 runtime-vs-type discrimination, rule 5 __tablename__
 # ---------------------------------------------------------------------------
 
 

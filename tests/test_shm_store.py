@@ -542,6 +542,53 @@ async def test_claim_batches_bound_aggregate_payload_and_leave_remaining_rows_cl
         await store.close()
 
 
+def test_claim_sizes_the_batch_before_reading_any_payload(tmp_path: Path) -> None:
+    """The byte budget is applied over LENGTH(), then the row query is capped
+    to what it affords — so a claim that can only take one of many due
+    candidates reads exactly one payload instead of the whole LIMIT window.
+    Reading first and discarding afterwards made every poll of a large-payload
+    backlog copy the entire window through SQLite's ORDER BY sorter."""
+    max_payload_bytes = 4096
+    store = SqliteQueueStore(
+        str(tmp_path / "sized-claim.db"),
+        synchronous="NORMAL",
+        completion_mode="delete",
+        orphan_retention_seconds=86400.0,
+        retry_backoff_base_seconds=0.05,
+        retry_backoff_cap_seconds=5.0,
+        max_payload_bytes=max_payload_bytes,
+        max_store_bytes=1024 * 1024,
+    )
+    try:
+        store.subscribe(["events.Created"], "g1")
+        for index in range(6):
+            store.publish(
+                "events.Created",
+                b"x" * max_payload_bytes,
+                {"event_type": "events.Created"},
+                f"publication-{index}",
+            )
+
+        statements: list[str] = []
+        store._conn.set_trace_callback(statements.append)
+        try:
+            batch = store.claim("g1", 100, "worker-1", 60.0)
+        finally:
+            store._conn.set_trace_callback(None)
+
+        assert [row["message_id"] for row in batch] == ["publication-0"]
+        # sqlite3's trace callback expands bound parameters, so the LIMIT the
+        # row query actually ran with is visible here.
+        sized = [text for text in statements if "LENGTH(p.payload)" in text]
+        loaded = [text for text in statements if "d.last_error, p.*" in text]
+        assert len(sized) == 1
+        assert len(loaded) == 1
+        assert "LIMIT 100" in sized[0]
+        assert "LIMIT 1" in loaded[0]
+    finally:
+        store.close()
+
+
 async def test_stale_reclaim_increments_generation_and_fences_old_owner(
     tmp_path: Path,
 ) -> None:

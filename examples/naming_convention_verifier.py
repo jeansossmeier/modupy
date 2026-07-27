@@ -5,7 +5,7 @@ Demonstrates the aggregate-hook shape — multiple plugins implement
 violation report. Built-in rules and this rule both run; a module
 with both boundary issues and naming issues reports all of them.
 
-Package this as ``modulith-naming-rules`` with entry point:
+Package this as ``modupy-naming-rules`` with entry point:
 
     [project.entry-points."modulith"]
     naming_rules = "modulith_naming_rules.plugin"
@@ -52,6 +52,15 @@ def modulith_verify_module(
         # the @event decorator. Real implementation would use a more
         # robust check (e.g. registration in a per-module event list).
         if not getattr(obj, "__modulith_event__", False):
+            continue
+
+        # Only flag events this module actually defines. Cross-module events
+        # live in the shared contracts package and get imported into the
+        # namespace of every module that uses them, so without this check one
+        # badly-named event is reported once per importer — each time blaming
+        # a module that cannot rename it.
+        owner = getattr(obj, "__module__", "")
+        if owner != module.package and not owner.startswith(module.package + "."):
             continue
 
         if not _looks_past_tense(name):

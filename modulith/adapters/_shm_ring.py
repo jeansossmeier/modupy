@@ -10,6 +10,7 @@ from __future__ import annotations
 import mmap
 import os
 import struct
+import sys
 import tempfile
 import time
 from contextlib import suppress
@@ -25,29 +26,27 @@ _SLOT_STRUCT = struct.Struct("<QQ")
 _SEQUENCE_MASK = (1 << 64) - 1
 _ATTACH_ATTEMPTS = 10
 _ATTACH_DELAY_SECONDS = 0.01
-
-# Kept temporarily for callers that used this constant to size payload slots.
-_SLOT_META_SIZE = _SLOT_SIZE
+_NATIVE_LITTLE_ENDIAN = sys.byteorder == "little"
 
 
 class ShmRing:
     """A non-authoritative ring of durable-sequence hints.
 
-    ``slot_size`` and ``write_lock`` remain accepted only so existing
-    constructors can move to this notifier before their broker wiring changes.
+    Hints only: a slot holds a sequence number and its complement, never a
+    payload, claim, cursor or consumer-group. Publishers call ``notify`` after
+    the durable store has committed; consumers call ``read_hints`` to skip
+    ahead of their safety poll. Losing every hint costs latency, never a
+    message.
     """
 
     def __init__(
         self,
         name: str | os.PathLike[str],
         capacity: int,
-        slot_size: int | None = None,
         *,
         create: bool = False,
-        write_lock: object | None = None,
         enabled: bool = True,
     ) -> None:
-        del slot_size, write_lock
         if capacity < 1:
             raise ValueError("capacity must be >= 1")
 
@@ -80,11 +79,6 @@ class ShmRing:
     def available(self) -> bool:
         return not self._closed and self._mapping is not None
 
-    @property
-    def max_payload_size(self) -> int:
-        """Compatibility value: payloads never belong in the hint file."""
-        return 0
-
     def notify(self, durable_sequence: int) -> bool:
         """Publish one sequence hint, returning False on any notifier failure."""
         mapping = self._mapping
@@ -106,20 +100,16 @@ class ShmRing:
         except (BufferError, OSError, ValueError, struct.error):
             return False
 
-    def read_hints(
-        self,
-        after_sequence: int = -1,
-        through_sequence: int | None = None,
-    ) -> list[int]:
-        """Return intact hints in the caller's authoritative sequence window."""
+    def read_hints(self, after_sequence: int = -1) -> list[int]:
+        """Return every intact hint newer than the caller's cursor, ascending."""
         mapping = self._mapping
         if not self.available or mapping is None:
-            return []
-        if through_sequence is not None and through_sequence <= after_sequence:
             return []
 
         hints: list[int] = []
         try:
+            if _NATIVE_LITTLE_ENDIAN and self._nothing_newer(mapping, after_sequence):
+                return []
             for index in range(self._capacity):
                 offset = _HEADER_SIZE + index * _SLOT_SIZE
                 sequence, complement = _SLOT_STRUCT.unpack(mapping[offset : offset + _SLOT_SIZE])
@@ -127,11 +117,33 @@ class ShmRing:
                     continue
                 if sequence % self._capacity != index or sequence <= after_sequence:
                     continue
-                if through_sequence is None or sequence <= through_sequence:
-                    hints.append(sequence)
+                hints.append(sequence)
         except (BufferError, OSError, ValueError, struct.error):
             return []
         return sorted(hints)
+
+    def _nothing_newer(self, mapping: mmap.mmap, after_sequence: int) -> bool:
+        """Rule out the whole ring in one strided pass over the sequence words.
+
+        An idle consumer re-reads the ring every few milliseconds for the whole
+        length of its safety poll, and the per-slot ``unpack`` below costs
+        O(capacity) each time — enough to keep a worker process busy doing
+        nothing at the default capacity, and enough to stall its event loop at
+        the largest accepted one. No slot can yield a hint above
+        ``after_sequence`` if no sequence word exceeds it, so this pass answers
+        the idle case without touching the slower path.
+
+        Only valid on a little-endian host: the slot layout is explicitly
+        little-endian while ``memoryview.cast`` reads native words.
+        """
+        end = _HEADER_SIZE + self._capacity * _SLOT_SIZE
+        words = memoryview(mapping)[_HEADER_SIZE:end].cast("Q")
+        peak = max(words[0::2])
+        if peak > after_sequence:
+            # A never-notified ring is all zeros, which a cursor of -1 cannot
+            # rule out on sequence words alone; its complements settle it.
+            return peak == 0 and max(words[1::2]) == 0
+        return True
 
     def close(self) -> None:
         """Close this process's handles; repeated calls are safe."""
@@ -152,19 +164,6 @@ class ShmRing:
         if self._closed and self._created:
             with suppress(OSError):
                 self._path.unlink(missing_ok=True)
-
-    # The old broker must spill to its durable store until it adopts notify().
-    def write(self, *_: object, **__: object) -> bool:
-        return False
-
-    def claim(self, *_: object, **__: object) -> list[tuple[int, bytes, bytes, int]]:
-        return []
-
-    def ack(self, *_: object, **__: object) -> None:
-        pass
-
-    def renew(self, *_: object, **__: object) -> bool:
-        return False
 
     def _create_atomically(self) -> bool:
         """Install a fully initialized private file without replacing a peer."""
@@ -187,6 +186,19 @@ class ShmRing:
                 mapping.flush()
             os.fsync(file_descriptor)
             os.link(temporary_name, self._path)
+            # Drop the temporary name here rather than leaving it to the
+            # ``finally`` clause. Between the link and the unlink the inode
+            # carries two names, and a peer worker starting at the same moment
+            # rejects a hint file with st_nlink != 1 outright (see
+            # _state_path._validate_regular_file, which treats extra links as a
+            # possible hijack) — a hard startup failure caused entirely by this
+            # process's own scratch name. Unlinking on the success path leaves
+            # only the two adjacent syscalls exposed instead of also spanning
+            # the descriptor close below; link-then-unlink is the tightest a
+            # create that must not clobber a peer can get.
+            with suppress(OSError):
+                os.unlink(temporary_name)
+                temporary_name = ""
             return True
         except (FileExistsError, OSError):
             return False

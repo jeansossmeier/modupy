@@ -8,9 +8,14 @@
 # The durable outbox and database-broker profiles use SQLite by default;
 # this compose file is only for Postgres outbox or Redis broker modes.
 #
+# Both services carry throwaway demo credentials that are committed to this
+# repo, so their ports are published on 127.0.0.1 only — never widen that to
+# 0.0.0.0 on a shared network.
+#
 # Usage:
 #   docker-compose up -d
-#   Set MODULITH_DB_URL or REDIS_URL in .env, then run the app.
+#   Export MODULITH_DB_URL or REDIS_URL into your shell (see .env.example),
+#   then run the app.
 
 
 services:
@@ -22,7 +27,7 @@ services:
       POSTGRES_PASSWORD: modulith
       POSTGRES_DB: modulith
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       # Named volume so `docker compose down` doesn't wipe the durable outbox
       # data mode C is demonstrating — see the README's down-vs-stop note.
@@ -36,10 +41,13 @@ services:
   redis:
     # Pinned 2026-07-14: re-pinning after testing is the deliberate update path.
     image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    # The image's default config has no password and protected-mode is inert
+    # once the port is published, so require one explicitly.
+    command: ["redis-server", "--requirepass", "modulith"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli ping"]
+      test: ["CMD-SHELL", "redis-cli -a modulith ping"]
       interval: 10s
       timeout: 5s
       retries: 5

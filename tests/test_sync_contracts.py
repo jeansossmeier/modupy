@@ -1,7 +1,7 @@
 """Behavioral regression tests for modulith/sync.py.
 
-Each test cites the audit finding id it reproduces. Written failing-first
-against the pre-fix code (strict TDD; verified red on the base revision).
+Each test names the failure mode it reproduces. Written failing-first
+against code that did not yet have the fix (strict TDD; verified red first).
 
 NOTE: no `from __future__ import annotations` — these tests use @listener with
 locally-defined event classes, whose annotations must stay real objects (same
@@ -33,12 +33,12 @@ def _reset_runtime():
 
 
 # ---------------------------------------------------------------------------
-# A3-r3-131 / S1-r2-104 — timeout must cancel the underlying dispatch
+# Timeout must cancel the underlying dispatch
 # ---------------------------------------------------------------------------
 
 
 def test_publish_sync_timeout_cancels_underlying_dispatch() -> None:
-    """A3-r3-131 / S1-r2-104: after publish_sync() raises TimeoutError, the
+    """After publish_sync() raises TimeoutError, the
     submitted dispatch must be cancelled — not left running (or hanging)
     forever on the shared persistent daemon-thread loop."""
     configure(package="synccancel", auto_discover=False)
@@ -65,12 +65,12 @@ def test_publish_sync_timeout_cancels_underlying_dispatch() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A3-r2-76 — nested publish_sync must not exhaust the shared executor
+# Nested publish_sync must not exhaust the shared executor
 # ---------------------------------------------------------------------------
 
 
 def test_nested_publish_sync_from_sync_listeners_does_not_exhaust_pool() -> None:
-    """A3-r2-76: sync listeners that call publish_sync() for a follow-up event
+    """Sync listeners that call publish_sync() for a follow-up event
     (saga-style) used to share the daemon loop's single bounded executor with
     the nested dispatch; with as many concurrent outer dispatches as the pool
     has workers, every nested publish deadlocked until its timeout. Nested
@@ -125,7 +125,7 @@ def test_nested_publish_sync_from_sync_listeners_does_not_exhaust_pool() -> None
 
 
 # ---------------------------------------------------------------------------
-# S1-r4-194 — publish_sync during bootstrap must fail fast, not deadlock
+# publish_sync during bootstrap must fail fast, not deadlock
 # ---------------------------------------------------------------------------
 
 
@@ -148,7 +148,7 @@ _IMPORT_TIME_PUBLISH_MODULE = """
 
 
 # ---------------------------------------------------------------------------
-# Task 6 (runtime-sync) — nested dispatch: ContextVar propagation, cancellation,
+# Nested dispatch: ContextVar propagation, cancellation,
 # timeout typing, and bounded thread lifetime
 # ---------------------------------------------------------------------------
 
@@ -240,7 +240,7 @@ def test_nested_dispatch_threads_do_not_linger_after_repeated_timeouts() -> None
 
 
 def test_publish_sync_at_import_time_during_bootstrap_fails_fast(make_fake_app) -> None:
-    """S1-r4-194: publish_sync() called from module code imported by discovery
+    """publish_sync() called from module code imported by discovery
     (the bootstrap thread holds the runtime lock) used to block the whole
     bootstrap until the timeout expired, then surface as a misleading
     TimeoutError. It must fail immediately with a clear RuntimeError."""

@@ -29,12 +29,19 @@ What the framework does with this — split across two surfaces by cost:
     2. Validates that every type in `publishes` is defined in the package
        namespace. Catches dead code and renamed events.
 
-  AST boundary verifier (`builtin/verifier.py`, optional — runs via the
-  ``modulith verify`` CLI / pre-commit, NOT during bootstrap):
+  AST boundary verifier (`builtin/verifier.py` — runs via the ``modulith
+  verify`` CLI / pre-commit, and at bootstrap only when
+  ``strict_boundaries`` is enabled):
     3. Validates that cross-module imports match `declared_dependencies`
        and that table access respects `owns_tables`. These need static
-       analysis of the source tree, so they deliberately live outside the
-       hot bootstrap path — run the verifier in CI to enforce them.
+       analysis of the whole source tree, which is why the default
+       (``strict_boundaries = false``) keeps them off the startup path
+       entirely: bootstrap runs no scan and emits no warning, and CI runs
+       the verifier instead. Enabling ``strict_boundaries`` buys fail-fast
+       startup at the price of parsing every source file on every process
+       start, and a violation then aborts bootstrap with
+       ``ConfigurationError`` — single-process ``modulith dev`` being the
+       one warn-only exception.
 
   Documentation + audit (read-only consumers):
     4. Feeds the documentation generator. The Application Module Canvas
@@ -220,9 +227,9 @@ def _listener_location(func: Callable[..., Any]) -> str | None:
     """Best-effort ``file:line`` of a listener's definition site.
 
     SPEC 5.4 promises manifest-verification failures 'with a clear error
-    and file:line' (A4-r1-11). Returns None for objects the inspect module
-    cannot resolve (builtins, C extensions) — the error stays useful
-    without a location rather than failing the failure path.
+    and file:line'. Returns None for objects the inspect module cannot
+    resolve (builtins, C extensions) — the error stays useful without a
+    location rather than failing the failure path.
     """
     try:
         source_file = inspect.getsourcefile(func)
@@ -288,7 +295,7 @@ def _publishes_errors(manifest: Manifest, mod: Any) -> list[str]:
     for name in manifest.publishes:
         # getattr with a sentinel (not hasattr) so that an event class
         # explicitly bound to None — e.g. a failed conditional import —
-        # gets flagged too, not just a missing name (A4-r2-81).
+        # gets flagged too, not just a missing name.
         value = getattr(mod, name, _MISSING)
         if value is _MISSING:
             errors.append(

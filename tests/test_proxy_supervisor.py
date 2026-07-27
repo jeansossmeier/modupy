@@ -1,9 +1,10 @@
-"""Regression tests for proxy + supervisor audit findings.
+"""Regression tests for the reverse proxy and the supervisor that fronts it.
 
-Each test cites the audit finding id it reproduces. The proxy tests drive the
-real ASGI app through ``httpx.ASGITransport`` (no sockets, no mocks of the
-code under test); supervisor lifecycle tests spawn real subprocesses and are
-marked ``integration`` like the rest of the lifecycle suite.
+Each test states the behaviour it pins and why getting it wrong is harmful.
+The proxy tests drive the real ASGI app through ``httpx.ASGITransport`` (no
+sockets, no mocks of the code under test); supervisor lifecycle tests spawn
+real subprocesses and are marked ``integration`` like the rest of the
+lifecycle suite.
 """
 
 from __future__ import annotations
@@ -33,15 +34,16 @@ from modulith.supervisor import (
     derive_specs_from_config,
     run_supervised,
 )
+
 from conftest import _free_port
 
 # ---------------------------------------------------------------------------
-# A8-r1-25 — body-size cap must be enforced while streaming, not after
+# Body-size cap must be enforced while streaming, not after
 # ---------------------------------------------------------------------------
 
 
 async def test_proxy_aborts_oversized_chunked_body_before_buffering_it() -> None:
-    """A8-r1-25: a chunked upload (no Content-Length) must be rejected with
+    """A chunked upload (no Content-Length) must be rejected with
     413 as soon as the accumulated size exceeds max_request_body_bytes —
     without first materializing the whole body in memory."""
     upstream = FastAPI()
@@ -79,7 +81,7 @@ async def test_proxy_aborts_oversized_chunked_body_before_buffering_it() -> None
 
 
 # ---------------------------------------------------------------------------
-# A8-r2-93 / S3-r1-62 — build_request failures must not escape as raw 500s
+# build_request failures must not escape as raw 500s
 # ---------------------------------------------------------------------------
 
 
@@ -95,10 +97,10 @@ def _echo_upstream() -> FastAPI:
 
 @pytest.mark.parametrize("encoded", ["%00", "%7f"])
 async def test_proxy_forwards_percent_encoded_control_bytes_upstream(encoded: str) -> None:
-    """Task 7 (supersedes A8-r2-93): building the upstream URL from
+    """Building the upstream URL from
     ``request.url.path`` (already percent-*decoded*) made httpx.build_request
-    raise InvalidURL for a decoded non-printable byte — an uncaught 500.
-    Task 7 forwards the client's exact raw, still-encoded bytes
+    raise InvalidURL for a decoded non-printable byte — an uncaught 500. The
+    proxy forwards the client's exact raw, still-encoded bytes
     (``scope["raw_path"]``) instead, so httpx never sees a decoded control
     byte and the request reaches the upstream intact — which is the correct
     reverse-proxy behavior (let the backend decide), not a 400 rejection."""
@@ -120,7 +122,7 @@ async def test_proxy_forwards_percent_encoded_control_bytes_upstream(encoded: st
 
 
 async def test_proxy_maps_non_ascii_header_bytes_to_clean_400() -> None:
-    """S3-r1-62: a forwarded header carrying a raw non-ASCII octet (latin-1
+    """A forwarded header carrying a raw non-ASCII octet (latin-1
     decoded by the ASGI server) makes build_request raise UnicodeEncodeError
     outside the try/except — an unhandled 500. Must be a clean 400 instead."""
     proxy_app = create_proxy_app(
@@ -162,12 +164,12 @@ async def test_proxy_maps_non_ascii_header_bytes_to_clean_400() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A8-r4-181 — /_modulith/health must fan out concurrently, not sequentially
+# /_modulith/health must fan out concurrently, not sequentially
 # ---------------------------------------------------------------------------
 
 
 async def test_health_actuator_checks_backends_concurrently() -> None:
-    """A8-r4-181: the health fan-out awaited each backend in a plain for
+    """The health fan-out awaited each backend in a plain for
     loop, so total latency scaled O(N * per-backend latency). Rendezvous
     barrier: every /health handler waits until ALL checks have arrived, then
     answers ok. Sequential checks can never rendezvous (the first would block
@@ -206,12 +208,12 @@ async def test_health_actuator_checks_backends_concurrently() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A8-r1-28 — actuator token comparison (behavioral regression)
+# Actuator token comparison (behavioral regression)
 # ---------------------------------------------------------------------------
 
 
 def test_actuator_token_rejects_wrong_and_partial_tokens() -> None:
-    """A8-r1-28: the comparison moved from `==` to hmac.compare_digest (the
+    """The comparison moved from `==` to hmac.compare_digest (the
     timing property itself is not testable deterministically); this pins the
     behavioral contract — wrong, prefix-matching, and absent tokens are all
     401, the exact token is 200."""
@@ -243,7 +245,7 @@ def test_actuator_token_rejects_wrong_and_partial_tokens() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A8-r1-27 — actuator token must be reachable from a real config surface
+# Actuator token must be reachable from a real config surface
 # ---------------------------------------------------------------------------
 
 
@@ -259,7 +261,7 @@ class _NoopSupervisor(Supervisor):
 
 
 async def test_run_supervised_wires_actuator_token_from_env(monkeypatch) -> None:
-    """A8-r1-27: create_proxy_app's actuator_token existed but no production
+    """create_proxy_app's actuator_token existed but no production
     call path could ever set it — run_supervised built the proxy without it,
     leaving actuator endpoints permanently unauthenticated. The
     MODULITH_ACTUATOR_TOKEN env var must reach the proxy app."""
@@ -285,7 +287,7 @@ async def test_run_supervised_wires_actuator_token_from_env(monkeypatch) -> None
 
 
 async def test_run_supervised_without_token_leaves_actuator_open(monkeypatch) -> None:
-    """A8-r1-27 (companion): no env var, no kwarg → actuator stays open, the
+    """Companion: no env var, no kwarg → actuator stays open, the
     documented default."""
     monkeypatch.delenv("MODULITH_ACTUATOR_TOKEN", raising=False)
     captured: dict[str, Any] = {}
@@ -306,12 +308,12 @@ async def test_run_supervised_without_token_leaves_actuator_open(monkeypatch) ->
 
 
 # ---------------------------------------------------------------------------
-# A8-r3-141 — a 0/negative worker count must fail loudly, not collide ports
+# A 0/negative worker count must fail loudly, not collide ports
 # ---------------------------------------------------------------------------
 
 
 def test_derive_specs_rejects_zero_worker_count(make_fake_app) -> None:
-    """A8-r3-141: derive_specs_from_config advanced the port counter by the
+    """derive_specs_from_config advanced the port counter by the
     raw (unclamped) count while _instance_plan clamps to max(1, count) — a
     workers.<module>=0 entry silently assigned two modules the same port.
     Loud-config-error contract: reject counts < 1 at derivation time."""
@@ -322,7 +324,7 @@ def test_derive_specs_rejects_zero_worker_count(make_fake_app) -> None:
 
 
 def test_derive_specs_rejects_negative_worker_count(make_fake_app) -> None:
-    """A8-r3-141: a negative count ran the port counter *backward*, assigning
+    """A negative count ran the port counter *backward*, assigning
     a later module a port before an earlier one. Must raise instead."""
     make_fake_app({"a": "", "b": "", "c": ""})
 
@@ -331,7 +333,7 @@ def test_derive_specs_rejects_negative_worker_count(make_fake_app) -> None:
 
 
 def test_derive_specs_rejects_non_positive_default_count(make_fake_app) -> None:
-    """A8-r3-141: the shared `default` count gets the same >= 1 validation."""
+    """The shared `default` count gets the same >= 1 validation."""
     make_fake_app({"orders": ""})
 
     with pytest.raises(ValueError, match="default"):
@@ -339,13 +341,73 @@ def test_derive_specs_rejects_non_positive_default_count(make_fake_app) -> None:
 
 
 # ---------------------------------------------------------------------------
-# A8-r1-29 — completed log-forwarder tasks must not accumulate until stop()
+# A deployment that exposes no router at all must say so before it starts
+# ---------------------------------------------------------------------------
+
+
+_ROUTER_IN_SUBMODULE = """
+    from fastapi import APIRouter
+
+    router = APIRouter()
+
+    @router.get("/ping")
+    async def ping() -> dict[str, bool]:
+        return {"pong": True}
+"""
+
+
+def test_derive_specs_warns_when_no_module_exposes_a_router(make_fake_app, caplog) -> None:
+    """Workers mount ``<module>.router`` and nothing else, so an app that keeps
+    its APIRouter in ``<module>/api.py`` without re-exporting it starts a full
+    set of healthy workers that 404 every request. This process is the only one
+    that sees every module, so it is where "this deployment serves no HTTP"
+    can be said — and it must be said at WARNING, since neither the CLI nor
+    uvicorn gives the root logger a handler for INFO."""
+    make_fake_app(
+        {"orders": "", "inventory": ""},
+        extra_files={"orders/api.py": _ROUTER_IN_SUBMODULE},
+    )
+    caplog.set_level("INFO", logger="modulith.supervisor")
+
+    specs = derive_specs_from_config({"package": "fakeapp"})
+
+    assert [s.module_name for s in specs] == ["inventory", "orders"]
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "modulith.supervisor" and r.levelname == "WARNING"
+    ]
+    assert any("'router'" in m and "orders" in m and "404" in m for m in warnings), (
+        f"a deployment with no HTTP surface started silently: {caplog.text}"
+    )
+
+
+def test_derive_specs_does_not_warn_when_a_module_exposes_a_router(make_fake_app, caplog) -> None:
+    """A listener-only module alongside a routed one is a legitimate shape —
+    reporting it at WARNING would train operators to ignore the warning that
+    matters. It stays at INFO, naming both sides."""
+    make_fake_app({"orders": _ROUTER_IN_SUBMODULE, "inventory": ""})
+    caplog.set_level("INFO", logger="modulith.supervisor")
+
+    derive_specs_from_config({"package": "fakeapp"})
+
+    supervisor_logs = [r for r in caplog.records if r.name == "modulith.supervisor"]
+    assert [r.getMessage() for r in supervisor_logs if r.levelname == "WARNING"] == []
+    assert any(
+        "inventory" in r.getMessage() and "orders" in r.getMessage()
+        for r in supervisor_logs
+        if r.levelname == "INFO"
+    ), caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Completed log-forwarder tasks must not accumulate until stop()
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.real_process
 async def test_log_forwarder_tasks_are_pruned_when_worker_exits() -> None:
-    """A8-r1-29: every (re)spawn appended two log-forwarder tasks to
+    """Every (re)spawn appended two log-forwarder tasks to
     Supervisor._log_tasks and nothing removed finished entries outside
     stop() — a crash-looping worker grew the list without bound. Completed
     forwarders must drop out of the tracking collection on their own."""
@@ -364,13 +426,13 @@ async def test_log_forwarder_tasks_are_pruned_when_worker_exits() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A8-r5-213 — a worker respawned during stop() must still get SIGTERM
+# A worker respawned during stop() must still get SIGTERM
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.real_process
 async def test_worker_respawned_during_stop_still_gets_sigterm() -> None:
-    """A8-r5-213: stop()'s SIGTERM cascade is a one-shot snapshot of
+    """stop()'s SIGTERM cascade is a one-shot snapshot of
     self._processes. A monitor that is *inside* _spawn (respawning a crashed
     worker) when stop() runs registers its process after the snapshot — that
     worker was never SIGTERM'd, the monitor blocked on it for the full
@@ -422,14 +484,14 @@ async def test_worker_respawned_during_stop_still_gets_sigterm() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A8-r1-26 — SIGKILL of the supervisor must not orphan worker processes
+# SIGKILL of the supervisor must not orphan worker processes
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.real_process
 @pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG is Linux-only")
 async def test_workers_die_when_supervisor_is_sigkilled(tmp_path: Path) -> None:
-    """A8-r1-26: workers were spawned with no parent-death signal, so a
+    """Workers were spawned with no parent-death signal, so a
     SIGKILL'd (OOM-killed) supervisor orphaned them; the orphan kept its
     statically-assigned port bound and permanently blocked the module's
     restart under a fresh supervisor. With PR_SET_PDEATHSIG the worker must
@@ -495,7 +557,7 @@ async def test_workers_die_when_supervisor_is_sigkilled(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Task 7 — socket-level proxy tests
+# Socket-level proxy tests
 #
 # Every other proxy test drives the ASGI app in-process via ASGITransport,
 # which never exercises a real HTTP/1.1 wire parser. These tests run the
@@ -575,7 +637,7 @@ def _raw_echo_upstream() -> Any:
 
 @pytest.mark.real_process
 async def test_proxy_preserves_duplicate_headers_and_raw_path_over_real_sockets() -> None:
-    """Task 7: real end-to-end proof (not ASGITransport) that the proxy (a)
+    """Real end-to-end proof (not ASGITransport) that the proxy (a)
     preserves every occurrence of a repeated header name and (b) forwards an
     encoded-slash path segment (``%2F``) as the exact bytes the client sent,
     rather than the decoded (and therefore re-segmented) path."""
@@ -611,7 +673,7 @@ async def test_proxy_preserves_duplicate_headers_and_raw_path_over_real_sockets(
 
 @pytest.mark.real_process
 async def test_proxy_actuator_reachable_over_real_sockets() -> None:
-    """Task 7: sanity check that the actuator endpoints themselves — not just
+    """Sanity check that the actuator endpoints themselves — not just
     the catch-all proxy route — work over a genuine TCP round trip."""
     proxy_port = _free_port()
     proxy_app = create_proxy_app([RoutingRule(prefix="/orders", backend_url="http://127.0.0.1:1")])
@@ -627,12 +689,12 @@ async def test_proxy_actuator_reachable_over_real_sockets() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Task 7 — liveness vs readiness must be genuinely distinct
+# Liveness vs readiness must be genuinely distinct
 # ---------------------------------------------------------------------------
 
 
 async def test_liveness_stays_ok_while_readiness_reports_degraded() -> None:
-    """Task 7: /_modulith/live must answer 200 regardless of backend health —
+    """/_modulith/live must answer 200 regardless of backend health —
     it only asserts "this proxy process is up" — while /_modulith/health (the
     readiness contract) reports 503 for the exact same unreachable backend.
     A single combined endpoint could never express both contracts at once."""
@@ -650,7 +712,7 @@ async def test_liveness_stays_ok_while_readiness_reports_degraded() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Task 7 — _resolve_actuator: every actuator_mode branch
+# _resolve_actuator: every actuator_mode branch
 # ---------------------------------------------------------------------------
 
 
@@ -684,18 +746,29 @@ def test_resolve_actuator_auto_stays_open_on_loopback_dev() -> None:
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "10.0.0.5"])
-def test_resolve_actuator_auto_requires_token_on_non_loopback_host(host: str) -> None:
-    from modulith.config import ConfigurationError
+def test_resolve_actuator_auto_unmounts_on_non_loopback_host_without_token(
+    host: str, caplog: Any
+) -> None:
+    """``auto`` never serves an unauthenticated actuator off-machine — but it
+    leaves it unmounted instead of refusing the whole application a start:
+    ``modulith run`` binds 0.0.0.0 by default, so raising here made every
+    documented production invocation unstartable. Nothing is exposed either
+    way; ``actuator_mode='token'`` is the opt-in to a hard failure."""
+    caplog.set_level("WARNING", logger="modulith.supervisor")
 
-    with pytest.raises(ConfigurationError, match="non-loopback host"):
-        _resolve_actuator(mode="auto", production=False, host=host, token=None)
+    enabled, token = _resolve_actuator(mode="auto", production=False, host=host, token=None)
+
+    assert (enabled, token) == (False, None)
+    assert "MODULITH_ACTUATOR_TOKEN" in caplog.text
 
 
-def test_resolve_actuator_auto_requires_token_in_production_even_on_loopback() -> None:
-    from modulith.config import ConfigurationError
+def test_resolve_actuator_auto_unmounts_in_production_even_on_loopback(caplog: Any) -> None:
+    caplog.set_level("WARNING", logger="modulith.supervisor")
 
-    with pytest.raises(ConfigurationError, match="production=True"):
-        _resolve_actuator(mode="auto", production=True, host="127.0.0.1", token=None)
+    enabled, token = _resolve_actuator(mode="auto", production=True, host="127.0.0.1", token=None)
+
+    assert (enabled, token) == (False, None)
+    assert "MODULITH_ACTUATOR_TOKEN" in caplog.text
 
 
 def test_resolve_actuator_auto_accepts_token_in_production() -> None:
@@ -704,13 +777,13 @@ def test_resolve_actuator_auto_accepts_token_in_production() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Task 7 — oversized worker log lines must not silence log forwarding
+# Oversized worker log lines must not silence log forwarding
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.real_process
 async def test_forward_logs_drains_oversized_line_without_dying(caplog: Any) -> None:
-    """Task 7: a single log line longer than StreamReader's buffer limit
+    """A single log line longer than StreamReader's buffer limit
     raises ValueError from readline() — _forward_logs must log a truncation
     notice and keep forwarding subsequent lines, not silently stop forwarding
     forever after the first oversized line."""
@@ -740,14 +813,14 @@ async def test_forward_logs_drains_oversized_line_without_dying(caplog: Any) -> 
 
 
 # ---------------------------------------------------------------------------
-# Task 7 — worker environment precedence
+# Worker environment precedence
 # ---------------------------------------------------------------------------
 
 
 def test_build_worker_env_spec_env_overrides_inherited_but_not_identity_vars(
     monkeypatch,
 ) -> None:
-    """Task 7: precedence must be inherited os.environ < spec.env < the three
+    """Precedence must be inherited os.environ < spec.env < the three
     reserved identity vars — spec.env can override an inherited var, but can
     never override MODULITH_MODULE/MODULITH_APP_PACKAGE/MODULITH_TOPOLOGY."""
     monkeypatch.setenv("SHARED_VAR", "from-os-environ")

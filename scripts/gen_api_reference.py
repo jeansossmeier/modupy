@@ -20,6 +20,7 @@ stale reference.
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import enum
 import inspect
@@ -101,9 +102,15 @@ EXCLUDED = {"__version__"}
 
 
 def _anchor(text: str) -> str:
-    """GitHub-style anchor slug for a heading."""
+    """GitHub-style anchor slug for a heading.
+
+    Underscores are kept: GitHub's slugger strips punctuation but treats ``_``
+    as a word character, so ``publish_sync`` anchors at ``#publish_sync``.
+    Dropping it here emitted TOC links (``#publishsync``) that resolve to
+    nothing.
+    """
     slug = text.lower()
-    slug = "".join(ch if ch.isalnum() or ch in " -" else "" for ch in slug)
+    slug = "".join(ch if ch.isalnum() or ch in " -_" else "" for ch in slug)
     return slug.replace(" ", "-")
 
 
@@ -364,9 +371,20 @@ def render_api_reference() -> str:
 
 
 def main(argv: list[str]) -> int:
-    check = "--check" in argv[1:]
+    # argparse rather than a membership test on argv: an unrecognized token
+    # (`--checks`, `--check --verbose`, `-c`) must exit 2 instead of silently
+    # falling through to the write branch. A CI step that drifted to a typo'd
+    # flag would otherwise regenerate the file in the workspace and exit 0,
+    # turning the staleness gate below into a permanent no-op.
+    parser = argparse.ArgumentParser(prog=Path(argv[0]).name, description=__doc__)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 1 if the committed reference is stale instead of rewriting it",
+    )
+    args = parser.parse_args(argv[1:])
     rendered = render_api_reference()
-    if check:
+    if args.check:
         if not OUTPUT_PATH.exists():
             print(f"{OUTPUT_PATH} does not exist — run: python {argv[0]}", file=sys.stderr)
             return 1

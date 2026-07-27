@@ -1,6 +1,6 @@
 """Tests for `modulith doctor` — the operational/architectural health check.
 
-``run_doctor()`` bootstraps the app and runs five independent checks against
+``run_doctor()`` bootstraps the app and runs six independent checks against
 *real* runtime state (real discovery, real AST scanning of the discovered
 modules' source, the real outbox API). Each check is exercised through the
 public ``run_doctor()`` entrypoint against a fake app shaped to trigger the
@@ -24,6 +24,7 @@ import pytest
 from typer.testing import CliRunner
 
 from modulith import EventPublication, configure
+from modulith.adapters._shm_ring import ShmRing
 from modulith.builtin import outbox
 from modulith.cli import app
 from modulith.doctor import (
@@ -191,7 +192,7 @@ def test_split_readiness_high_when_event_driven(make_fake_app) -> None:
 
 def test_split_readiness_warns_on_direct_coupling(make_fake_app) -> None:
     # orders reaches directly into inventory's public API (no events at all).
-    # A9-r4-183: readiness is an informational maturity metric (SPEC/
+    # Readiness is an informational maturity metric (SPEC/
     # MIGRATION_GUIDE frame it as "are you ready to split?"), so a low score
     # caps at "warn" — it must never fail the doctor CI gate on its own.
     make_fake_app({"orders": "from fakeapp.inventory import thing\n", "inventory": "thing = 1\n"})
@@ -386,6 +387,98 @@ def test_listener_registration_error_when_declared_listener_missing(make_fake_ap
 
 
 # ---------------------------------------------------------------------------
+# SHM notifier
+# ---------------------------------------------------------------------------
+
+
+class _RingBroker:
+    """A Broker whose only interesting feature is the hint ring it carries.
+
+    ``ShmBroker`` holds its notifier as ``_ring``; the doctor check duck-types
+    on that rather than importing the adapter, so this stands in for it while
+    the ring itself stays a real ``ShmRing``.
+    """
+
+    def __init__(self, ring: ShmRing) -> None:
+        self._ring = ring
+
+    async def publish(
+        self, target: str, payload: bytes, headers: dict[str, str] | None = None
+    ) -> None:  # pragma: no cover - the doctor check never publishes
+        pass
+
+    async def close(self) -> None:
+        self._ring.close()
+
+
+def _register_ring(ring: ShmRing) -> None:
+    """Attach a hint-ring-carrying broker to the bootstrapped runtime."""
+    from modulith.runtime import _runtime
+
+    _runtime.ensure_bootstrapped()
+    registry = _runtime.broker_registry
+    assert registry is not None
+    registry.register("shm", _RingBroker(ring))
+
+
+def test_shm_notifier_ok_when_no_shm_broker_is_registered(make_fake_app) -> None:
+    """The check must stay silent for the (overwhelmingly common) deployments
+    that use a different broker or none at all."""
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp")
+
+    report = run_doctor()
+
+    check = _check(report, "shm notifier")
+    assert check.status == "ok"
+    assert "no shm broker" in check.summary
+
+
+def test_shm_notifier_ok_when_the_hint_ring_attached(make_fake_app, tmp_path) -> None:
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp")
+    ring = ShmRing(tmp_path / "attached.hint", 64, create=True)
+    assert ring.available  # premise: a genuinely live notifier
+    _register_ring(ring)
+
+    try:
+        report = run_doctor()
+    finally:
+        ring.close()
+
+    check = _check(report, "shm notifier")
+    assert check.status == "ok"
+    assert "1 hint ring(s) attached" in check.summary
+
+
+def test_shm_notifier_warns_when_the_hint_ring_could_not_attach(make_fake_app, tmp_path) -> None:
+    """A hint file is never re-created and attaching demands an exact capacity
+    match, so raising ``shm_capacity`` on a deployment whose file already
+    exists leaves the notifier permanently dead: delivery still works (SQLite
+    is authoritative) but every consumer drops to its safety poll. The only
+    trace used to be a single WARNING at broker construction, invisible to
+    anyone looking at an already-running process."""
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp")
+    path = tmp_path / "capacity-mismatch.hint"
+    existing = ShmRing(path, 64, create=True)  # the file the deployment already has
+    after_capacity_change = ShmRing(path, 128, create=True)
+    assert not after_capacity_change.available
+    _register_ring(after_capacity_change)
+
+    try:
+        report = run_doctor()
+    finally:
+        after_capacity_change.close()
+        existing.close()
+
+    check = _check(report, "shm notifier")
+    assert check.status == "warn"
+    assert any("capacity=128" in d for d in check.details)
+    assert any(str(path) in d for d in check.details)
+
+
+# ---------------------------------------------------------------------------
 # Report rendering
 # ---------------------------------------------------------------------------
 
@@ -566,7 +659,7 @@ def test_outbox_health_errors_on_large_dead_letter_pile(make_fake_app) -> None:
 
 
 def test_split_readiness_ok_at_80_percent(make_fake_app) -> None:
-    """A9-r1-32: MIGRATION_GUIDE documents '80%+' as split-ready — the 80%
+    """MIGRATION_GUIDE documents '80%+' as split-ready — the 80%
     boundary must be inclusive 'ok', not 'warn'."""
     make_fake_app(
         {
@@ -589,7 +682,7 @@ def test_split_readiness_ok_at_80_percent(make_fake_app) -> None:
 
 
 def test_split_readiness_names_microservice_tier_at_95_percent(make_fake_app) -> None:
-    """A9-r1-32: MIGRATION_GUIDE's 95%+ 'microservice-ready' tier must be
+    """MIGRATION_GUIDE's 95%+ 'microservice-ready' tier must be
     visible in the report, distinct from plain 80%+ split-readiness."""
     make_fake_app(
         {
@@ -714,7 +807,7 @@ def test_outbox_health_check_is_bounded_by_a_timeout(make_fake_app, monkeypatch)
 
 
 def test_doctor_cli_passes_with_low_readiness_score(make_fake_app, monkeypatch) -> None:
-    """A9-r4-183: a low readiness score is an informational maturity signal —
+    """A low readiness score is an informational maturity signal —
     it renders as 'warn' and must not fail the doctor CI gate on its own."""
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app({"orders": "from fakeapp.inventory import thing\n", "inventory": "thing = 1\n"})

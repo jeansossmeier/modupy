@@ -31,9 +31,11 @@ Consumer groups are **per consuming module** (``modulith-<module>``) so that an
 event consumed by several modules reaches all of them — a single shared group
 would hand each message to only one module.
 
-Dispatch is via the in-memory bus directly (not ``runtime.publish``) so a
-consumed event is delivered to local listeners WITHOUT being re-routed back to
-the broker — that would be an infinite loop.
+Dispatch goes through ``Runtime.dispatch_local`` (not ``runtime.publish``) so a
+consumed event reaches local listeners — firing the same per-listener
+lifecycle hooks an in-memory publish does, so worker processes are not a
+telemetry blind spot — WITHOUT being re-routed back to the broker, which would
+be an infinite loop.
 """
 
 from __future__ import annotations
@@ -45,6 +47,7 @@ from typing import Any
 from .config import ConfigurationError
 from .manifest import get_manifest
 from .protocols import ConsumerHealth
+from .runtime import _runtime
 
 logger = logging.getLogger("modulith.consumer")
 
@@ -55,7 +58,7 @@ _MAX_DELIVERY_ATTEMPTS = 5
 
 # Capped exponential backoff for consecutive broker read()/reclaim() failures.
 # Without it, a downed Redis triggered an unbounded busy-retry loop (~281
-# failures/sec measured, audit A7-r1-23) that — when the broker raised
+# failures/sec measured) that — when the broker raised
 # synchronously — never even yielded to the event loop, starving every other
 # coroutine in the process. 0.05s, 0.1s, 0.2s, … capped at 5s.
 _BACKOFF_BASE_S = 0.05
@@ -94,7 +97,7 @@ class BrokerConsumer:
         self._targets = list(targets)
         # Real Redis treats XREADGROUP BLOCK 0 as "block forever awaiting new
         # entries" (the opposite of the immediate-return some test fakes
-        # modeled, audit S3-r3-163) — a non-positive value would hang a worker
+        # modeled) — a non-positive value would hang a worker
         # indefinitely, so it never reaches the broker.
         if poll_block_ms <= 0:
             logger.warning(
@@ -110,7 +113,7 @@ class BrokerConsumer:
         self._health = ConsumerHealth(ready=False, status="stopped")
         self._health_failures: dict[tuple[str, str], str] = {}
         # Consecutive broker read()/reclaim() failures — drives the capped
-        # exponential backoff (audit A7-r1-23). Reset on any broker success.
+        # exponential backoff. Reset on any broker success.
         self._consecutive_failures = 0
         # Fallback for third-party brokers without durable delivery metadata.
         # Redis Streams provides the authoritative count in its PEL, which
@@ -156,8 +159,8 @@ class BrokerConsumer:
         """Cancel the loop and wait for it to unwind.
 
         Never raises: a task that already died with a real exception (not
-        CancelledError) would otherwise re-raise it here at shutdown time
-        (audit A7-r1-22) — it is logged instead.
+        CancelledError) would otherwise re-raise it here at shutdown time —
+        it is logged instead.
         """
         self._stopping = True
         if self._task is not None:
@@ -230,37 +233,61 @@ class BrokerConsumer:
         while True:
             if self._stopping:
                 return
+            # No per-target _stopping check: stop() also cancels this task, so
+            # the in-flight reads below raise CancelledError and unwind
+            # immediately — the top-of-loop check handles the rest.
             for target in self._targets:
-                # No per-target _stopping check: stop() also cancels this task,
-                # so the in-flight read below raises CancelledError and unwinds
-                # immediately — the top-of-loop check handles the rest.
                 await self._reclaim(target)
-                try:
-                    messages = await self._broker.read(
-                        target,
-                        consumer=self._consumer_name,
-                        group=self._group,
-                        block_ms=self._poll_block_ms,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # a transient broker read error must not kill the loop
-                    self._mark_broker_failure("read", target, exc)
-                    logger.exception("broker read failed for %s", target)
-                    await self._recover_after_broker_failure(target, exc)
+            # Read every subscribed stream CONCURRENTLY. Each read blocks
+            # server-side for up to poll_block_ms, so awaiting them one after
+            # another made an idle worker's delivery latency scale with its
+            # stream count — an event landing just after its own stream was
+            # polled waited (N-1) * poll_block_ms for the cycle to come back
+            # around (~9s for a module listening to 10 event types on the 1s
+            # default). Concurrently, idle latency is one poll_block_ms no
+            # matter how many streams there are, at the cost of holding one
+            # broker connection per stream for the duration of the block.
+            batches = await asyncio.gather(*(self._read(target) for target in self._targets))
+            # Dispatch stays sequential: only the *waiting* is parallel, so a
+            # slow listener on one stream still cannot interleave with another.
+            for target, messages in zip(self._targets, batches, strict=True):
+                if messages is None:
                     continue
-                self._consecutive_failures = 0
-                self._mark_broker_recovered("read", target)
                 try:
                     await self._handle(target, messages)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    # Safety net (audit A7-r1-22): _dispatch_one guards its own
+                    # Safety net: _dispatch_one guards its own
                     # broker calls, but ANY escaped per-batch exception would
                     # otherwise kill this task permanently and silently. The
                     # unacked remainder stays pending and is retried via reclaim.
                     logger.exception("message handling failed for %s — loop continues", target)
+
+    async def _read(self, target: str) -> Any:
+        """One blocking read, or None when the broker failed (already handled).
+
+        A transient read error must not kill the poll loop, so it is logged,
+        recorded against health, and followed by the capped backoff — the same
+        recovery ``_reclaim`` uses.
+        """
+        try:
+            messages = await self._broker.read(
+                target,
+                consumer=self._consumer_name,
+                group=self._group,
+                block_ms=self._poll_block_ms,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._mark_broker_failure("read", target, exc)
+            logger.exception("broker read failed for %s", target)
+            await self._recover_after_broker_failure(target, exc)
+            return None
+        self._consecutive_failures = 0
+        self._mark_broker_recovered("read", target)
+        return messages
 
     async def _reclaim(self, target: str) -> None:
         """Recover and re-dispatch pending messages idle past the threshold."""
@@ -283,7 +310,7 @@ class BrokerConsumer:
         # never ACK'd) yet no longer exist in the stream — MAXLEN trimmed them
         # out from under the PEL. They are PERMANENTLY LOST (at-least-once is
         # violated for them), so surface the loss loudly instead of silently
-        # discarding the tuple element (audit A7-r1-21).
+        # discarding the tuple element.
         claimed = result[1] if result and len(result) > 1 else []
         deleted = result[2] if result and len(result) > 2 else []
         if deleted:
@@ -307,7 +334,7 @@ class BrokerConsumer:
         deleted from the stream (7.0+ moves these to the ``deleted`` reply
         element instead). There is nothing to dispatch for a nil row — skip
         it so one nil entry cannot kill the consumer task and crash-loop
-        worker startup (W3 R2-01).
+        worker startup.
         """
         nil_entries = 0
         for entry in claimed:
@@ -333,11 +360,11 @@ class BrokerConsumer:
         * NOGROUP means the broker lost the stream/consumer-group state (e.g.
           Redis restarted without a snapshot). ``ensure_group`` was previously
           issued exactly once at ``start()``, so a recovered-but-empty Redis
-          stalled consumption permanently and silently (audit A7-r2-91) —
+          stalled consumption permanently and silently —
           re-issue it here so the next read()/reclaim() can succeed. A failure
           to re-create (broker still down) is logged and retried next cycle.
         * Sleep with capped exponential backoff so an outage degrades to
-          periodic retries instead of a CPU-bound spin (audit A7-r1-23). The
+          periodic retries instead of a CPU-bound spin. The
           sleep also guarantees the loop yields control even when the broker
           raises synchronously, so this task can never starve the event loop.
         """
@@ -396,7 +423,7 @@ class BrokerConsumer:
             return
 
         try:
-            await self._bus.publish(event)
+            await _runtime.dispatch_local(event, self._bus)
         except Exception:
             attempts = await self._failed_delivery_attempts(target, mid, key)
             if attempts is None:
@@ -425,7 +452,7 @@ class BrokerConsumer:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # Broker-side blip must not kill the loop (audit A7-r1-22). The
+            # Broker-side blip must not kill the loop. The
             # un-ACK'd message stays pending → redelivered via reclaim; the
             # listener side must be idempotent anyway (at-least-once contract).
             self._mark_broker_failure("ack", target, exc)
@@ -469,7 +496,7 @@ class BrokerConsumer:
         """dead_letter via the broker, never letting a broker blip escape.
 
         A raise from broker.dead_letter() previously propagated out of the
-        consumer task and killed the whole loop permanently (audit A7-r1-22).
+        consumer task and killed the whole loop permanently.
         On failure the message stays pending (dead_letter ACKs only on
         success), so reclaim redelivers it and dead-lettering is retried; the
         attempt counter is only cleared on success so the retry dead-letters

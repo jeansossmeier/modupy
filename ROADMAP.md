@@ -14,17 +14,19 @@ The plugin contract, configuration, auto-discovery, and in-memory
 event bus. The minimum that proves the architecture works.
 
 - [x] `modulith/__init__.py` — public API exports
-- [x] `modulith/types.py` — `ModuleInfo`, `EventPublication`, `Violation`
+- [x] `modulith/types.py` — `ModuleInfo`, `EventPublication`, `EventPublishReceipt`,
+      `Violation`, `ViolationSeverity`
 - [x] `modulith/protocols.py` — driver protocols
-- [x] `modulith/hooks.py` — the hookspecs (12 as of the DB-broker consumer contract)
+- [x] `modulith/hooks.py` — the hookspecs (13 as of the DB-broker consumer contract)
 - [x] `modulith/markers.py` — `@hookimpl` re-export
-- [x] `modulith/brokers.py` — `BrokerRegistry`
+- [x] `modulith/brokers.py` — `BrokerRegistry`, `ConsumerRegistry`, `ConsumerSpec`
 - [x] `modulith/manager.py` — plugin manager factory
 - [x] `modulith/config.py` — configuration loading + validation
 - [x] `modulith/discovery.py` — application package detection
 - [x] `modulith/event_bus.py` — `InMemoryEventBus`
 - [x] `modulith/runtime.py` — runtime singleton with lazy bootstrap
-- [x] `modulith/decorators.py` — `@event`, `@listener`, `publish`, `configure`
+- [x] `modulith/decorators.py` — `@event`, `@listener`, `@externalized`, `publish`,
+      `configure`, `bootstrap`
 - [x] `modulith/builtin/discovery.py` — default subpackage walker
 - [x] `tests/test_*.py` — full suite green (`pytest`, `mypy --strict`, `ruff`)
 - [x] `examples/redis_streams_broker.py` — reference broker implementation
@@ -42,7 +44,7 @@ The minimum scope where modulith provides value over "FastAPI plus folders."
 - [x] `tests/test_sync.py` — sync publish, sync listeners, mixed flows
 
 ### Manifests (Gap 4)
-- [x] `modulith/manifest.py` — `declare_module()` API, `Manifest` dataclass
+- [x] `modulith/manifest.py` — `declare_module()` / `get_manifest()` API, `Manifest` dataclass
 - [x] `modulith/runtime.py` — verify_manifest at startup
 - [x] `tests/test_manifest.py` — declared-vs-registered checks
 
@@ -141,11 +143,16 @@ The differentiator. Makes "modulith now, microservices later" credible.
 - [x] `modulith/_worker.py` — per-module FastAPI app generator
 - [x] `modulith/supervisor.py` — process orchestration with crash recovery
 - [x] `modulith/proxy.py` — reverse proxy for routing requests to workers
+- [x] `modulith/adapters/shm_broker.py` — stdlib-only durable local broker
+      (SQLite-authoritative, mmap hint ring); the default when
+      `topology = "processes"` and no broker is configured
 - [x] Cross-process event integration (events flow through broker when topology != "single")
 - [x] Topology configuration in pyproject + CLI flags
 - [x] Health check propagation
 - [x] Graceful shutdown cascade
-- [ ] Documentation: deployment patterns, scaling stories — touched by [`examples/demo_app`](examples/demo_app); dedicated guide pending
+- [x] Documentation: deployment patterns, scaling stories — [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
+      (Docker + Kubernetes topologies, scaling strategies, health probes,
+      operational playbooks); [`examples/demo_app`](examples/demo_app) is the runnable version
 
 ### Phase 3 kill criteria
 
@@ -158,47 +165,15 @@ The differentiator. Makes "modulith now, microservices later" credible.
 
 ## Phase 4 — Ecosystem Adapters (ongoing, post-v1)
 
-- [x] Database broker (`modulith[database]`) — Postgres / MySQL / SQLite as the
+- [x] Database broker (`modupy[database]`) — Postgres / MySQL / SQLite as the
       cross-module transport (no Redis required); fan-out subscriptions, `FOR
       UPDATE SKIP LOCKED` claims, age/count prune, and an embedded-SQLite-file
       bootstrap. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §8.4.
-- [ ] Kafka broker (`modulith[kafka]`)
-- [ ] RabbitMQ broker (`modulith[rabbitmq]`)
-- [ ] MongoDB outbox store (`modulith[mongo]`)
-- [ ] AWS SQS broker (`modulith[sqs]`)
+- [ ] Kafka broker (`modupy[kafka]`)
+- [ ] RabbitMQ broker (`modupy[rabbitmq]`)
+- [ ] MongoDB outbox store (`modupy[mongo]`)
+- [ ] AWS SQS broker (`modupy[sqs]`)
 - [ ] Subinterpreter topology (when 3.13 ecosystem ready)
 - [ ] Django integration (separate package: `django-modulith`)
 
 These are demand-driven. Ship them when users actually ask, not before.
-
----
-
-## Total budget
-
-| Phase | Duration | Cumulative |
-|---|---|---|
-| Phase 0 | (done) | 0 |
-| Phase 1 | 4-6 weeks | 4-6 weeks |
-| Phase 2 | 2-3 weeks | 6-9 weeks |
-| Phase 3 | 3-4 weeks | 9-13 weeks |
-
-**Realistic v1 ship: 3 months from Phase 1 start.**
-**Extension to v2: 3-4 months total.**
-
-The honest expectation: the dominant failure mode for projects of this
-scope is shipping nothing. Every phase has independent value: Phase 1
-shipping alone is a real product. Each phase's kill criterion is a
-real off-ramp, not a formality.
-
----
-
-## Decisions to revisit at each phase boundary
-
-1. **Internal-first or open-source-first?** Recommendation in SPEC.md
-   §17.3 is internal-first. Reconsider at start of each phase based on
-   what the team actually needs.
-2. **Is the addressable market real?** Adoption signal at Phase 1 ship
-   determines whether Phase 2 happens.
-3. **Is process-per-module worth the complexity?** Phase 3 is the
-   biggest commitment; if no one's asking by Phase 2, defer.
-4. **What's the next adapter?** Demand-driven. Watch what users ask for.

@@ -152,7 +152,7 @@ plugin. There are three distinct extension mechanisms, chosen by shape (SPEC
 
 ### 5.1 Hookspecs (many plugins, results combined)
 
-`modulith/hooks.py` declares **12 hookspecs** — the stable, versioned contract.
+`modulith/hooks.py` declares **13 hookspecs** — the stable, versioned contract.
 Adding a hook is fine; changing an existing signature breaks every published
 plugin. Three shapes:
 
@@ -162,17 +162,20 @@ plugin. Three shapes:
   `modulith_discover_modules`, `modulith_resolve_event_target`.
 - **Side-effect** (return `None`): every plugin runs for effect —
   `modulith_after_module_load`, `modulith_before_event_published`,
-  `modulith_after_event_published`, `modulith_on_listener_dispatch`,
-  `modulith_on_listener_complete`, `modulith_on_listener_error`,
-  `modulith_register_brokers`, `modulith_register_consumers`.
+  `modulith_after_event_published`, `modulith_on_publish_error`,
+  `modulith_on_listener_dispatch`, `modulith_on_listener_complete`,
+  `modulith_on_listener_error`, `modulith_register_brokers`,
+  `modulith_register_consumers`.
 
 Plugins implement a hook with `@hookimpl` (from `modulith.markers`) and are
 discovered via the `modulith` entry-point group in their `pyproject.toml`.
 
 ### 5.2 Driver protocols (exactly one wins)
 
-`modulith/protocols.py` defines four `runtime_checkable` protocols —
-`PublicationStore`, `EventSerializer`, `Broker`, `Consumer`. Stores and
+`modulith/protocols.py` defines the `runtime_checkable` driver contracts —
+`PublicationStore`, `EventSerializer`, `Broker`, `Consumer` — plus
+`HealthAwareConsumer`, the optional capability a consumer may add so worker
+readiness checks can query it. Stores and
 serializers are "one wins" drivers: exactly one is active per app, wired
 **explicitly** at startup via
 `modulith.builtin.outbox.configure(store, serializer)`. There is no
@@ -200,8 +203,9 @@ per-listener observe hooks (`on_listener_dispatch` / `_complete` / `_error`)
 are documented as observers that *never gate* dispatch. The manager enforces
 this: exceptions raised by those hook implementations are logged and swallowed.
 A failing span exporter or a broken alerting plugin can therefore never mask a
-listener's own outcome, and — crucially — can never kill the outbox retry loop
-(this was a class of CRITICAL bug the audit hardened against).
+listener's own outcome, and — crucially — can never kill the outbox retry loop:
+an unshielded observer exception propagating out of the retry task would stall
+delivery for every pending publication in the table, not just the one it hit.
 
 ---
 
@@ -224,7 +228,12 @@ listeners by `type(event)` and dispatches to **all** listeners for that type
      persisted as `EventPublication` rows inside the business transaction and
      dispatched after commit (§7).
    - **In-memory path** — otherwise: dispatch directly to the bus now.
-3. Wrap each listener invocation in the lifecycle hooks
+3. On success fire `modulith_after_event_published`. On a failure between the
+   two publish hooks (outbox persist, event serialization, an inline broker
+   route) fire `modulith_on_publish_error` instead and re-raise — the after
+   hook is scoped to a successful publish, so the error hook is where a plugin
+   closes the span it opened in step 1.
+4. Wrap each listener invocation in the lifecycle hooks
    (`on_listener_dispatch` → listener → `on_listener_complete`/`_error`).
 
 ### The four contexts, one API
@@ -266,7 +275,7 @@ only if** that transaction commits.
   SQLAlchemy `after_commit` listener that schedules delivery of the rows queued
   during that transaction. Broker routing is **commit-gated** for the same
   reason: inside a transaction `publish()` must not touch the broker, because a
-  rollback can't un-send a message (a CRITICAL invariant the audit enforced).
+  rollback can't un-send a message.
 
 ### 7.2 Retry loop, backoff, dead-lettering
 
@@ -298,13 +307,43 @@ physical effect:
 ### 7.4 The Postgres adapter
 
 **SPEC §10.1.** `PostgresPublicationStore` is built on portable SQLAlchemy 2.0
-Core/ORM with asyncpg, shipped in `modulith[postgres]` with an Alembic
-migration (`0001_initial`). Concurrent sweepers claim rows with `FOR UPDATE SKIP
-LOCKED` (which *narrows* — does not eliminate — cross-process double-dispatch;
-listeners must still be idempotent). Timestamps are normalized to UTC-aware on
-write because SQLite (used by the fast test suite against the same code path)
-loses tz. The default suite runs this adapter against in-memory SQLite; the
-integration suite runs it against a real `postgres:16` via testcontainers.
+Core/ORM with asyncpg, shipped in `modupy[postgres]` with packaged Alembic
+revisions. Always migrate to `head` (`alembic upgrade head` against the
+packaged `alembic.ini` — see [MIGRATION_GUIDE.md](../MIGRATION_GUIDE.md), the
+outbox migration step): `0001_initial` alone is **not** enough for the shipped
+default, because the lease columns (`claim_owner`, `claim_token`,
+`claim_until`) arrive in `0003_outbox_claim_leases` and the claim/scan indexes
+in `0005_outbox_scan_indexes`. Against a `0001`-shaped schema the lease claim
+query fails on the missing column, and because each sweep is exception-shielded
+(a transient store error must cost one sweep, not the whole retry loop) the
+process keeps running: the symptom is "nothing is ever delivered" plus a
+`outbox sweep failed` traceback repeating once per retry interval.
+
+Timestamps are normalized to UTC-aware on write because SQLite (used by the
+fast test suite against the same code path) loses tz. The default suite runs
+this adapter against in-memory SQLite; the integration suite runs it against a
+real `postgres:16` via testcontainers.
+
+**Concurrent sweepers.** Two processes running the retry loop against one
+outbox table are coordinated by `outbox.configure(claim_strategy=...)`
+(`modulith/_claims.py`); the shipped default is `"lease"`:
+
+| `claim_strategy` | How it coordinates | Cost |
+|---|---|---|
+| `"lease"` (default) | `claim_batch()` selects `FOR UPDATE SKIP LOCKED`, writes `claim_owner`/`claim_token`/`claim_until` and **commits before dispatch**; the lease renews at one third of `claim_lease_seconds` while dispatch is in flight, and completion/failure writes are fenced on `claim_token` so an expired claimant cannot clobber a newer one | one extra write per claimed batch |
+| `"advisory_lock"` | a per-publication `pg_try_advisory_lock` held for the duration of the dispatch. Postgres-only — a non-Postgres store rejects it at `configure()` | no extra write, but a held connection per in-flight row |
+| `"none"` | no coordination; two sweepers CAN dispatch the same row. Logged as a warning at `configure()` so the tradeoff is visible | none |
+
+Tuning knobs: `claim_lease_seconds` (default 60 — must exceed your slowest
+listener, or the lease expires mid-dispatch and a peer legitimately reclaims
+the row) and `claim_batch_size` (default 100 rows per claim).
+
+Note what `FOR UPDATE SKIP LOCKED` does and does not buy on its own: under
+`"none"` and `"advisory_lock"` the row locks taken by the sweep query are
+released when that query's transaction ends, *before* dispatch begins, so they
+do not partition work across processes. Only `claim_batch()` — which locks and
+writes the claim in one transaction — does. Either way delivery stays
+at-least-once and **listeners must be idempotent**.
 
 ### 7.5 Serialization
 
@@ -357,9 +396,15 @@ creates the consumer group (`XGROUP CREATE`, idempotent), reads new messages
 with `XREADGROUP`, `XACK`s on success, and reclaims messages a crashed consumer
 left pending via `XAUTOCLAIM` past an idle threshold — the at-least-once
 recovery path. Messages lacking an `event_type` header, or that exhaust
-handling, go to a bounded dead-letter stream. (The audit hardened several
-CRITICALs here: `XAUTOCLAIM` deleted-id handling, `NOGROUP` recovery, and
-never `XACK`-ing without a successful dispatch.)
+handling, go to a bounded dead-letter stream. Three details carry the
+at-least-once guarantee here. A message is never `XACK`ed without a successful
+dispatch. `XAUTOCLAIM`'s third reply element lists pending ids a `MAXLEN` trim
+removed from under the PEL — those *are* permanently lost, so the consumer logs
+them at ERROR rather than discarding the element silently (this is the failure
+mode an undersized `max_stream_len` produces). And a `NOGROUP` error — a Redis
+that restarted without its snapshot — re-issues `ensure_group` instead of
+stalling consumption forever, since the group is otherwise created exactly once
+at `start()`.
 
 ### 8.4 The database broker and consumer
 
@@ -367,7 +412,7 @@ never `XACK`-ing without a successful dispatch.)
 Redis-free cross-process transport that uses a relational database as the
 message queue — one `database` scheme whose dialect (Postgres / MySQL / SQLite)
 is inferred from the SQLAlchemy URL, mirroring how the "postgres" outbox adapter
-is itself dialect-aware. Distributed via `modulith[database]` (async SQLAlchemy +
+is itself dialect-aware. Distributed via `modupy[database]` (async SQLAlchemy +
 `asyncpg`/`aiomysql`/`aiosqlite`); SQLAlchemy is lazy-imported so an app that
 never selects it pays nothing. SQLite doubles as a zero-infrastructure bootstrap
 broker — an embedded file (or `:memory:`) that needs no server at all.
@@ -406,8 +451,12 @@ visibility (`available_at`), the reclaim cutoff (`claimed_at`), the retry
 backoff, and the prune age — is both stamped and compared against the **database
 server clock** (`now()` on Postgres, `UTC_TIMESTAMP(6)` on MySQL), so producers
 and competing consumers on different hosts can't skew each other's reclaim or
-visibility windows. SQLite stays on the process clock (single-host — the file is
-the host — and finer-grained than its second-resolution `CURRENT_TIMESTAMP`).
+visibility windows. SQLite is on the database clock too — every timestamp is a
+`SELECT strftime('%Y-%m-%d %H:%M:%f','now')` round-trip, using `strftime`
+rather than `CURRENT_TIMESTAMP` to keep millisecond instead of second
+resolution. That keeps one authoritative clock on every dialect (retained-
+message TTL and reclaim windows do not depend on the application clock), at the
+cost of a query per timestamp.
 
 *Retention.* Terminal rows (`done`/`dead`) accumulate, so the consumer runs a
 background prune when a retention knob is set: by age (`retention_age_seconds`,
@@ -556,13 +605,13 @@ for the full contract.
 |---|---|
 | Public API | `modulith/__init__.py`, `decorators.py`, `sync.py` |
 | Runtime & config | `runtime.py`, `config.py`, `manifest.py` |
-| Discovery | `builtin/discovery.py` |
+| Discovery | `discovery.py` (which package is the app), `builtin/discovery.py` (which subpackages are modules) |
 | Plugin system | `hooks.py`, `markers.py`, `manager.py`, `protocols.py`, `types.py` |
 | Event bus | `event_bus.py` |
-| Outbox | `builtin/outbox.py`, `adapters/postgres_outbox.py` |
+| Outbox | `builtin/outbox.py`, `adapters/postgres_outbox.py`, `_claims.py`, `serializers.py` |
 | Brokers | `brokers.py`, `adapters/redis_broker.py`, `adapters/db_broker.py`, `adapters/shm_broker.py`, `adapters/_shm_*.py`, `_consumer.py` |
 | Process topology | `_worker.py`, `supervisor.py`, `proxy.py` |
-| Verification & tooling | `builtin/verifier.py`, `builtin/audit.py`, `builtin/docs.py`, `cli.py` |
+| Verification & tooling | `builtin/verifier.py`, `builtin/docs.py`, `audit.py`, `doctor.py`, `cli.py` |
 | Observability & testing | `builtin/observability.py`, `testing.py` |
 
 For the design rationale behind any of these, the corresponding SPEC part is the

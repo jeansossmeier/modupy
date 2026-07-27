@@ -19,14 +19,14 @@ The package also exports `__version__` (the installed package version).
   - [`event`](#event)
   - [`listener`](#listener)
   - [`publish`](#publish)
-  - [`publish_sync`](#publishsync)
+  - [`publish_sync`](#publish_sync)
   - [`PublishSyncTimeout`](#publishsynctimeout)
   - [`configure`](#configure)
   - [`bootstrap`](#bootstrap)
   - [`externalized`](#externalized)
 - [Manifests](#manifests)
-  - [`declare_module`](#declaremodule)
-  - [`get_manifest`](#getmanifest)
+  - [`declare_module`](#declare_module)
+  - [`get_manifest`](#get_manifest)
   - [`Manifest`](#manifest)
 - [Configuration](#configuration)
   - [`Configuration`](#configuration-1)
@@ -53,7 +53,7 @@ The package also exports `__version__` (the installed package version).
 - [Plugin authoring](#plugin-authoring)
   - [`hookimpl`](#hookimpl)
 - [Plugin manager (advanced)](#plugin-manager-advanced)
-  - [`create_plugin_manager`](#createpluginmanager)
+  - [`create_plugin_manager`](#create_plugin_manager)
 
 ## Application API
 
@@ -171,7 +171,7 @@ listener), which propagates out of publish_sync unchanged — on Python
 3.11+ ``concurrent.futures.TimeoutError`` IS ``TimeoutError``, so
 without the dedicated type the two were indistinguishable and the
 testing plugin's scenario runner swallowed real application failures
-as budget overruns (W3 R4-W3-01). Subclasses TimeoutError, so existing
+as budget overruns. Subclasses TimeoutError, so existing
 ``except TimeoutError`` handlers keep working.
 
 ### `configure`

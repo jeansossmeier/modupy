@@ -85,7 +85,7 @@ def _publish_spans(exporter: InMemorySpanExporter) -> list[Any]:
 async def test_durable_persist_failure_ends_publish_span_with_error(
     span_exporter: InMemorySpanExporter,
 ) -> None:
-    """W3 R4-W3-02: an outbox persist failure between the paired publish
+    """An outbox persist failure between the paired publish
     hooks must still end the publish span (exported, status ERROR, exception
     recorded) and reset the ContextVar."""
     configure(package="modulith_w3r4obs_metatest", auto_discover=False)
@@ -113,7 +113,7 @@ async def test_durable_persist_failure_ends_publish_span_with_error(
 async def test_direct_broker_route_failure_ends_publish_span_with_error(
     span_exporter: InMemorySpanExporter,
 ) -> None:
-    """W3 R4-W3-02 (companion): the direct path's inline broker-route failure
+    """The direct path's inline broker-route failure
     fires between the same paired hooks — the span must end there too."""
     configure(
         package="modulith_w3r4obs_metatest",

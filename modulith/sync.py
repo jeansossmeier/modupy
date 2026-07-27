@@ -37,7 +37,7 @@ class PublishSyncTimeout(TimeoutError):
     3.11+ ``concurrent.futures.TimeoutError`` IS ``TimeoutError``, so
     without the dedicated type the two were indistinguishable and the
     testing plugin's scenario runner swallowed real application failures
-    as budget overruns (W3 R4-W3-01). Subclasses TimeoutError, so existing
+    as budget overruns. Subclasses TimeoutError, so existing
     ``except TimeoutError`` handlers keep working.
     """
 
@@ -170,8 +170,8 @@ def publish_sync(event: Any, *, timeout: float | None = 30.0) -> None:
             # The dispatch COMPLETED by raising this very exception — on 3.11+
             # FuturesTimeoutError is TimeoutError, so a listener's own
             # TimeoutError lands in this handler too. That is an application
-            # failure, not a budget overrun: surface it unchanged
-            # (W3 R4-W3-01). Identity — not ``done()`` alone — is the
+            # failure, not a budget overrun: surface it unchanged.
+            # Identity — not ``done()`` alone — is the
             # discriminator: an expired wait raises a FRESH bare TimeoutError
             # that is never the future's stored exception, so even when the
             # dispatch completes inside the race window between budget expiry
@@ -260,8 +260,8 @@ def _run_nested_dispatch(
     except FuturesTimeoutError as exc:
         if done.done() and not done.cancelled() and done.exception() is exc:
             # The nested dispatch completed by raising this very TimeoutError
-            # — an application failure, not the budget (W3 R4-W3-01). Same
-            # identity discrimination as publish_sync's own wait: the bare
+            # — an application failure, not the budget. Same identity
+            # discrimination as publish_sync's own wait: the bare
             # TimeoutError an expired wait raises is never the future's stored
             # exception, so a genuine overrun converts to PublishSyncTimeout
             # even when the dispatch completes inside the race window between
@@ -269,7 +269,15 @@ def _run_nested_dispatch(
             raise
         loop = state["loop"]
         task = state["task"]
-        loop.call_soon_threadsafe(task.cancel)
+        try:
+            loop.call_soon_threadsafe(task.cancel)
+        except RuntimeError:
+            # The nested loop finished and closed itself in the window between
+            # the wait expiring and this cancellation, so there is nothing left
+            # to bound. Without this guard call_soon_threadsafe's "Event loop is
+            # closed" RuntimeError escapes and the caller gets that instead of
+            # PublishSyncTimeout. The budget was still overrun either way.
+            pass
         logger.warning(
             "publish_sync timeout after %s s for %s (nested dispatch)",
             timeout,

@@ -6,6 +6,7 @@ import asyncio
 import logging
 from typing import Any, cast
 
+from ..runtime import _runtime
 from ._consumer_protocol import PollingBroker
 
 _MAX_LEASE_EXTENSION_FACTOR = 10.0
@@ -171,7 +172,16 @@ class DeliveryDispatch:
             await self._dead_letter(row_id, f"deserialize failed: {exc}", target)
             return
         try:
-            await self._bus.publish(event)
+            # Runtime.dispatch_local, not bus.publish: a message consumed from
+            # another process must fire the same per-listener lifecycle hooks
+            # (modulith_on_listener_dispatch / _error / _complete) an in-memory
+            # publish does, or every listener invocation in a worker process is
+            # a telemetry blind spot and a plugin alerting on
+            # modulith_on_listener_error never sees a cross-process failure. It
+            # deliberately skips the *publish* hooks and broker routing: this
+            # process did not publish the event, and re-routing it to the
+            # target it was just consumed from is an infinite redelivery loop.
+            await _runtime.dispatch_local(event, self._bus)
         except asyncio.CancelledError:
             task = asyncio.current_task()
             if self._should_stop() or (task is not None and task.cancelling() > 0):

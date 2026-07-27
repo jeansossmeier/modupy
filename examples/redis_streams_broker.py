@@ -1,20 +1,20 @@
 """Example adapter: Redis Streams broker.
 
 This file shows the complete authoring experience for a third-party
-broker adapter. Published as ``modulith-redis-streams``, the package
+broker adapter. Published as ``modupy-redis-streams``, the package
 declares its entry point in pyproject.toml:
 
     [project.entry-points."modulith"]
     redis_streams = "modulith_redis_streams.adapter"
 
-After ``pip install modulith-redis-streams``, application code uses it
+After ``pip install modupy-redis-streams``, application code uses it
 without any registration boilerplate:
 
     from dataclasses import dataclass
     from modulith import event, externalized
 
     @event
-    @externalized("redis-streams-example:my-stream")
+    @externalized(target="redis-streams-example:my-stream")
     @dataclass
     class OrderShipped:
         order_id: str
@@ -58,7 +58,11 @@ class RedisStreamsBroker:
         # install this adapter never pay the import cost.
         import redis.asyncio as redis
 
-        self._client = redis.from_url(url)  # type: ignore[no-untyped-call]  # redis-py 6.x from_url is unannotated
+        # redis-py < 7 leaves from_url unannotated, so the call needs
+        # no-untyped-call silenced; 7.x annotates it, which instead makes that
+        # ignore unused. The `redis` extra supports both (>=5.0,<8.0), so
+        # unused-ignore is listed alongside to stay --strict-clean on either.
+        self._client = redis.from_url(url)  # type: ignore[no-untyped-call,unused-ignore]
 
     async def publish(
         self,

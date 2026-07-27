@@ -21,6 +21,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.mysql import DATETIME as MySQLDateTime
+from sqlalchemy.dialects.mysql import LONGBLOB as MySQLLongBlob
 
 # revision identifiers, used by Alembic.
 revision: str = "0002_broker_message"
@@ -47,6 +48,12 @@ _CLAIMED_BY_LEN = 255
 # db_broker.broker_schema()'s `ts` type exactly (drift tests enforce it).
 _TS = sa.DateTime(timezone=True).with_variant(MySQLDateTime(fsp=6), "mysql", "mariadb")
 
+# Payload type that holds a full-size publish on every dialect — plain
+# LargeBinary compiles to MySQL/MariaDB BLOB (65,535 bytes), far below the
+# broker's payload cap, so an oversized INSERT fails with error 1406. Inert on
+# Postgres/SQLite. Mirrors db_broker.broker_schema()'s `payload_type` exactly.
+_PAYLOAD = sa.LargeBinary().with_variant(MySQLLongBlob(), "mysql", "mariadb")
+
 
 def upgrade() -> None:
     op.create_table(
@@ -65,7 +72,7 @@ def upgrade() -> None:
         # Nullable so a publish with no event_type header (or a poison row)
         # dead-letters at the consumer rather than failing at INSERT.
         sa.Column("event_type", sa.String(_EVENT_TYPE_LEN), nullable=True),
-        sa.Column("payload", sa.LargeBinary(), nullable=False),
+        sa.Column("payload", _PAYLOAD, nullable=False),
         sa.Column("headers", sa.Text(), nullable=True),
         sa.Column("status", sa.String(_STATUS_LEN), nullable=False, server_default="pending"),
         sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"),

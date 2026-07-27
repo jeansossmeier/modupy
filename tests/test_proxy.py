@@ -10,9 +10,12 @@ the response, all in-process.
 
 from __future__ import annotations
 
+import warnings
+
 import httpx
 import pytest
 from fastapi import FastAPI, Request
+from fastapi.responses import RedirectResponse
 from fastapi.testclient import TestClient
 
 from modulith.proxy import RoutingRule, _match_rule, create_proxy_app
@@ -68,6 +71,17 @@ def _upstream_app() -> FastAPI:
     async def host_header(request: Request) -> dict[str, str]:
         return {"host": request.headers.get("host", "")}
 
+    # Registered WITH a trailing slash so requesting it without one triggers
+    # Starlette's default redirect_slashes — the absolute-URL redirect a real
+    # worker emits against the loopback authority it sees as its Host.
+    @up.get("/orders/items/")
+    async def items() -> dict[str, bool]:
+        return {"items": True}
+
+    @up.get("/orders/offsite")
+    async def offsite() -> RedirectResponse:
+        return RedirectResponse("https://auth.example.com/login", status_code=302)
+
     @up.get("/orders/slow")
     async def slow_response() -> dict[str, str]:
         import asyncio
@@ -106,6 +120,61 @@ def test_proxy_returns_404_for_unmatched_path(proxy_app) -> None:
     with TestClient(proxy_app) as client:
         resp = client.get("/inventory/thing")
     assert resp.status_code == 404
+
+
+def test_proxy_schema_builds_without_duplicate_operation_ids(proxy_app) -> None:
+    """Building the proxy's OpenAPI document must not warn.
+
+    FastAPI assigns one operation id per route but emits one operation per
+    method, so a multi-method catch-all left in the schema collides with
+    itself and warns on every process-per-module boot — noise a first-time
+    user sees before their own logs.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        schema = proxy_app.openapi()
+    assert "/{path}" not in schema["paths"]
+
+
+@pytest.mark.parametrize("path", ["/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"])
+def test_proxy_does_not_serve_its_own_docs_routes(proxy_app, path) -> None:
+    """The proxy must not answer FastAPI's stock schema/docs paths.
+
+    They would be registered ahead of the catch-all, so a schema describing
+    only the proxy's own actuator routes — never the application's — would be
+    served at ``/openapi.json``, with a Swagger UI rendered over it at
+    ``/docs``. A client generator pointed at the public port would emit an
+    empty client and report success. These paths must instead fall through to
+    the catch-all and answer like any other unrouted path.
+    """
+    with TestClient(proxy_app) as client:
+        resp = client.get(path)
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": f"no worker route for {path!r}"}
+
+
+def test_proxy_does_not_shadow_a_module_named_docs() -> None:
+    """A module whose prefix is ``/docs`` must still reach its worker.
+
+    ``/docs`` is an ordinary URL prefix a module is free to own. If the proxy
+    registers FastAPI's stock docs UI there, the worker never sees the request
+    and the module's routes disappear from the public port with no error
+    anywhere.
+    """
+    upstream = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+    @upstream.get("/docs")
+    async def docs_root() -> dict[str, str]:
+        return {"served_by": "worker"}
+
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=upstream))
+    app = create_proxy_app(
+        [RoutingRule(prefix="/docs", backend_url="http://docs-worker")], client=client
+    )
+    with TestClient(app) as test_client:
+        resp = test_client.get("/docs")
+    assert resp.status_code == 200
+    assert resp.json() == {"served_by": "worker"}
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +228,7 @@ def test_actuator_token_guards_metadata_endpoints(proxy_app) -> None:
 
 
 # ---------------------------------------------------------------------------
-# regression: Host rewrite + broadened transport-error mapping (audit)
+# regression: Host rewrite + broadened transport-error mapping
 # ---------------------------------------------------------------------------
 
 
@@ -171,6 +240,29 @@ def test_proxy_rewrites_host_to_upstream_authority(proxy_app) -> None:
     assert resp.status_code == 200
     assert resp.json()["host"] == "orders-worker"
     assert resp.json()["host"] != "api.example.com"
+
+
+def test_proxy_makes_a_backend_redirect_client_followable(proxy_app) -> None:
+    # Because the client's Host is dropped, the worker builds absolute URLs
+    # against its own loopback authority — Starlette's trailing-slash redirect
+    # being the common one. Forwarded verbatim, that Location is unfollowable
+    # by the client and discloses the internal worker. The proxy forwards the
+    # full path, so stripping the backend authority is the correct rewrite.
+    with TestClient(proxy_app) as client:
+        resp = client.get("/orders/items", follow_redirects=False)
+
+    assert resp.status_code == 307
+    assert resp.headers["location"] == "/orders/items/"
+
+
+def test_proxy_leaves_an_external_redirect_alone(proxy_app) -> None:
+    # Only the backend's own authority is stripped — rewriting a redirect to
+    # a third party (an OAuth provider, a CDN) would break it.
+    with TestClient(proxy_app) as client:
+        resp = client.get("/orders/offsite", follow_redirects=False)
+
+    assert resp.status_code == 302
+    assert resp.headers["location"] == "https://auth.example.com/login"
 
 
 class _FailingClient:
@@ -214,9 +306,9 @@ def test_proxy_maps_all_transport_errors_to_502(exc: Exception) -> None:
 
 class _BuildRequestFailingClient:
     """httpx-shaped client whose build_request() itself raises — the call path
-    the passthrough _FailingClient above structurally never exercises (audit
-    S3-r1-63): its build_request never raised, so no test could reach the
-    proxy's build_request guard."""
+    the passthrough _FailingClient above structurally never exercises: its
+    build_request never raised, so no test could reach the proxy's
+    build_request guard."""
 
     def __init__(self, exc: Exception) -> None:
         self._exc = exc
@@ -288,11 +380,10 @@ def test_proxy_succeeds_with_slow_upstream() -> None:
 
 
 def test_proxy_maps_redirect_loop_to_502(caplog) -> None:
-    """S3-r3-162 (W2 RESIDUALS item 7): httpx.TooManyRedirects is a
-    RequestError sibling of TransportError — with an injected
-    follow_redirects=True client (the documented seam) a redirect-looping
-    backend escaped the TransportError-only mapping as a raw 500, violating
-    the never-uncaught-500 contract. It must map to 502."""
+    """httpx.TooManyRedirects is a RequestError sibling of TransportError —
+    with an injected follow_redirects=True client (the documented seam) a
+    redirect-looping backend escaped the TransportError-only mapping as a raw
+    500, violating the never-uncaught-500 contract. It must map to 502."""
     caplog.set_level("WARNING", logger="modulith.proxy")
 
     def _always_redirect(request: httpx.Request) -> httpx.Response:
@@ -434,7 +525,7 @@ def test_proxy_exhausts_connect_retry_budget_then_502() -> None:
 
 
 # ---------------------------------------------------------------------------
-# mid-stream backend death — _safe_stream (S3-r2-123)
+# mid-stream backend death — _safe_stream
 # ---------------------------------------------------------------------------
 
 
@@ -474,7 +565,7 @@ class _DiesMidStreamClient:
 
 
 def test_proxy_aborts_stream_when_backend_dies_mid_response(caplog) -> None:
-    """Task 7 (supersedes S3-r2-123): once headers are sent, a mid-stream
+    """Once headers are sent, a mid-stream
     TransportError can't become a 502 — but silently ending the stream and
     answering 200 with a partial body (the old behavior) fabricates a
     successful response the client has no way to know is truncated. It must

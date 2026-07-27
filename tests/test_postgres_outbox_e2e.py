@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from modulith import EventPublication, event
@@ -347,6 +347,115 @@ async def test_purge_completed_removes_old_rows(pg_engine) -> None:
         ).scalar_one()
         assert remaining == 2
     await store.dispose()
+
+
+async def test_purge_completed_trims_the_archive_table(pg_engine) -> None:
+    """``completion_mode='archive'`` MOVES the row out of the primary table, so
+    a purge that only swept the primary table could never trim the archive: it
+    would report a truthful-looking 0 while the archive grew without bound."""
+
+    async def handler(evt: OutboxEvent) -> None:
+        return None
+
+    _bootstrap().register(OutboxEvent, handler)
+    store = PostgresPublicationStore(engine=pg_engine)
+    outbox.configure(store, JsonEventSerializer(), completion_mode="archive", start_loop=False)
+
+    pub = _pub(1, handler)
+    await store.save(pub)
+    await store.archive(pub.id)  # stamps completed_at and moves the row
+
+    sessionmaker = async_sessionmaker(pg_engine)
+
+    async def archived_rows() -> int:
+        async with sessionmaker() as s:
+            return int(
+                (
+                    await s.execute(select(func.count()).select_from(EventPublicationArchiveRow))
+                ).scalar_one()
+            )
+
+    assert await archived_rows() == 1
+    assert await store.purge_completed(timedelta(days=365)) == 0  # still inside retention
+    assert await archived_rows() == 1
+
+    assert await store.purge_completed(timedelta(0)) == 1
+    assert await archived_rows() == 0
+    await store.dispose()
+
+
+@pytest.mark.parametrize("fenced_write", ["complete_claim", "fail_claim"])
+async def test_fenced_write_loses_to_a_peer_reclaim_it_did_not_see(
+    pg_engine, fenced_write: str
+) -> None:
+    """A fenced write must lose to a claim a peer took over WHILE the write was
+    in flight — not only to one that was already stale when it started.
+
+    The interleave is forced deterministically: a third transaction holds the
+    row lock, the fenced write blocks on it, and the peer's takeover commits
+    before the lock is released. A read-then-check-then-write pair passes its
+    token check on the pre-takeover snapshot and then clobbers the peer's live
+    lease; a conditional write (or a locked read) sees the new claim.
+    """
+
+    async def handler(evt: OutboxEvent) -> None:
+        return None
+
+    _bootstrap().register(OutboxEvent, handler)
+    store = PostgresPublicationStore(engine=pg_engine)
+    await store.save(_pub(1, handler))
+    (claim,) = await store.claim_batch(
+        owner="worker-a", batch_size=1, lease_seconds=60.0, older_than=timedelta(0)
+    )
+    assert claim.claim_token is not None
+
+    sessionmaker = async_sessionmaker(pg_engine)
+    async with sessionmaker() as holder:
+        locked = await holder.get(EventPublicationRow, claim.id, with_for_update=True)
+        assert locked is not None
+
+        if fenced_write == "complete_claim":
+            write = asyncio.create_task(store.complete_claim(claim.id, claim.claim_token, "update"))
+        else:
+            claim.attempt_count = 1
+            claim.last_error = "boom"
+            write = asyncio.create_task(store.fail_claim(claim, claim.claim_token))
+
+        await _wait_until_blocked_on_a_lock(pg_engine)
+        # A peer sweeper takes the row over while the fenced write is blocked.
+        locked.claim_owner = "worker-b"
+        locked.claim_token = "peer-token"
+        locked.claim_until = datetime.now(UTC) + timedelta(hours=1)
+        await holder.commit()
+
+    assert await write is False
+    async with sessionmaker() as s:
+        row = await s.get(EventPublicationRow, claim.id)
+        assert row is not None
+        assert row.claim_token == "peer-token"  # the peer's lease survived
+        assert row.completed_at is None
+        assert row.attempt_count == 0
+    await store.dispose()
+
+
+async def _wait_until_blocked_on_a_lock(engine) -> None:
+    """Poll pg_stat_activity until some backend is waiting on a lock.
+
+    Bounded, and never a bare sleep-and-hope: the fenced write must have
+    actually reached the database and blocked before the peer takes over, or
+    the interleave under test would not happen at all.
+    """
+    async with engine.connect() as conn:
+        for _ in range(500):
+            waiting = (
+                await conn.execute(
+                    text("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'")
+                )
+            ).scalar_one()
+            if waiting:
+                return
+            await asyncio.sleep(0.01)
+    raise AssertionError("no backend ever blocked on the row lock")
 
 
 async def test_force_retry_redelivers_dead_lettered(pg_engine) -> None:

@@ -10,6 +10,35 @@ from typing import Any
 from ._shm_schema import immediate_transaction
 from ._shm_types import ClaimToken, require_consumer_name
 
+# Due pending work and reclaimable stale claims, oldest first. ``d.id`` makes
+# the ordering total, so the same prefix of rows comes back for any LIMIT.
+_CLAIM_CANDIDATES = """
+    FROM shm_delivery AS d
+    JOIN shm_publication AS p ON p.id=d.publication_id
+    WHERE d.consumer_group=? AND d.available_at<=?
+      AND (
+        d.status='pending'
+        OR (d.status='claimed' AND d.claimed_at<=?)
+      )
+    ORDER BY d.available_at, p.sequence, d.id
+    LIMIT ?
+    """
+
+# ``p.sequence`` belongs to the joined table, so no index on shm_delivery can
+# satisfy the ORDER BY and SQLite always sorts through a temp B-tree. Sizing
+# the batch over LENGTH() keeps the payloads out of that sorter — SQLite reads
+# a blob's length from its header without touching the overflow pages — so the
+# rows the byte budget is about to reject are never materialized.
+_CLAIM_SIZES_SQL = (
+    "SELECT LENGTH(p.payload) AS payload_bytes, "
+    "LENGTH(CAST(p.headers AS BLOB)) AS headers_bytes" + _CLAIM_CANDIDATES
+)
+
+_CLAIM_ROWS_SQL = (
+    "SELECT d.id AS delivery_id, d.claim_generation, "
+    "d.attempts, d.last_error, p.*" + _CLAIM_CANDIDATES
+)
+
 
 def claim(
     conn: sqlite3.Connection,
@@ -24,33 +53,13 @@ def claim(
     now = time.time()
     cutoff = now - reclaim_stale_seconds
     claimed: list[dict[str, Any]] = []
-    claimed_bytes = 0
     with immediate_transaction(conn):
-        rows = conn.execute(
-            """
-            SELECT d.id AS delivery_id, d.claim_generation,
-                   d.attempts, d.last_error, p.*
-            FROM shm_delivery AS d
-            JOIN shm_publication AS p ON p.id=d.publication_id
-            WHERE d.consumer_group=? AND d.available_at<=?
-              AND (
-                d.status='pending'
-                OR (d.status='claimed' AND d.claimed_at<=?)
-              )
-            ORDER BY d.available_at, p.sequence, d.id
-            LIMIT ?
-            """,
-            (group, now, cutoff, limit),
-        )
+        parameters = (group, now, cutoff, limit)
+        affordable = _affordable_rows(conn, parameters, max_claim_bytes)
+        if not affordable:
+            return claimed
+        rows = conn.execute(_CLAIM_ROWS_SQL, (*parameters[:3], affordable))
         for row in rows:
-            headers = row["headers"]
-            row_bytes = len(row["payload"]) + (
-                len(str(headers).encode("utf-8")) if headers is not None else 0
-            )
-            # One row must always make progress, even when its headers put the
-            # aggregate above the payload-derived claim budget.
-            if claimed and claimed_bytes + row_bytes > max_claim_bytes:
-                break
             generation = int(row["claim_generation"]) + 1
             conn.execute(
                 """
@@ -62,8 +71,26 @@ def claim(
                 (now, consumer_name, generation, row["delivery_id"]),
             )
             claimed.append(_claimed_row(row, group, consumer_name, generation))
-            claimed_bytes += row_bytes
     return claimed
+
+
+def _affordable_rows(
+    conn: sqlite3.Connection,
+    parameters: tuple[str, float, float, int],
+    max_claim_bytes: int,
+) -> int:
+    """How many leading candidate rows fit the claim's byte budget."""
+    affordable = 0
+    total = 0
+    for row in conn.execute(_CLAIM_SIZES_SQL, parameters):
+        row_bytes = row["payload_bytes"] + (row["headers_bytes"] or 0)
+        # One row must always make progress, even when its headers put the
+        # aggregate above the payload-derived claim budget.
+        if affordable and total + row_bytes > max_claim_bytes:
+            break
+        affordable += 1
+        total += row_bytes
+    return affordable
 
 
 def renew_claims(

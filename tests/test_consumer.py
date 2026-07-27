@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 
 import modulith.manifest as manifest_module
-from modulith import Configuration, ConfigurationError, Manifest, configure, event
+from modulith import Configuration, ConfigurationError, Manifest, configure, event, hookimpl
 from modulith._consumer import BrokerConsumer, consumer_targets
 from modulith.event_bus import InMemoryEventBus
 from modulith.protocols import Consumer, ConsumerHealth, HealthAwareConsumer
@@ -63,21 +63,20 @@ class FakeConsumerBroker:
     """In-memory stand-in for the broker's consumer surface (no Redis).
 
     Holds queued messages per stream; ``read`` hands out (and clears) up to
-    ``count`` new messages per call — real XREADGROUP caps delivery at COUNT
-    (audit S3-r1-65) — and rejects ``block_ms <= 0`` loudly (real Redis BLOCK 0
-    blocks forever; BrokerConsumer clamps to >=1ms — audit A7-r2-92);
-    ``ack``/``dead_letter`` are recorded; ``reclaim`` serves entries staged in
-    ``pending``, honoring ``min_idle_ms`` like real XAUTOCLAIM (audit
-    S3-r2-120) and — mirroring ``RedisStreamsBroker.reclaim`` post-RESIDUALS —
+    ``count`` new messages per call — real XREADGROUP caps delivery at COUNT —
+    and rejects ``block_ms <= 0`` loudly (real Redis BLOCK 0 blocks forever;
+    BrokerConsumer clamps to >=1ms); ``ack``/``dead_letter`` are recorded;
+    ``reclaim`` serves entries staged in ``pending``, honoring ``min_idle_ms``
+    like real XAUTOCLAIM and — mirroring ``RedisStreamsBroker.reclaim`` —
     draining the FULL idle backlog per call (the real adapter follows the
     XAUTOCLAIM cursor until ``0-0``; ``count`` is its internal page size, not
     a result cap). A staged pending entry defaults to idle-forever (a crashed
     peer's message); set ``pending_idle_ms`` per (target, mid) to model a
     freshly-delivered in-flight message. A staged ``None`` entry models
     Redis < 7.0 XAUTOCLAIM returning nil for a pending entry deleted from the
-    stream (W3 R2-01). Ids staged in ``lost`` are returned once via
+    stream. Ids staged in ``lost`` are returned once via
     XAUTOCLAIM's third (deleted) element — the trimmed-while-pending loss
-    channel (audit S3-r3-160).
+    channel.
     """
 
     def __init__(self) -> None:
@@ -116,16 +115,16 @@ class FakeConsumerBroker:
     ) -> Any:
         if block_ms <= 0:
             raise NotImplementedError(
-                "XREADGROUP BLOCK 0 blocks forever on real Redis (audit "
-                "A7-r2-92) — BrokerConsumer clamps poll_block_ms to >=1; the "
-                "fake rejects a non-positive block loudly instead of modeling it."
+                "XREADGROUP BLOCK 0 blocks forever on real Redis, so "
+                "BrokerConsumer clamps poll_block_ms to >=1; the fake "
+                "rejects a non-positive block loudly instead of modeling it."
             )
         queued = self.streams.get(target, [])
         if not queued:
             await asyncio.sleep(block_ms / 1000)  # mimic XREADGROUP BLOCK so the loop yields
             return []
-        # Real XREADGROUP delivers at most COUNT entries per call (audit
-        # S3-r1-65) — the remainder stays queued for the next read.
+        # Real XREADGROUP delivers at most COUNT entries per call — the
+        # remainder stays queued for the next read.
         delivered, self.streams[target] = queued[:count], queued[count:]
         return [(target, delivered)]
 
@@ -141,12 +140,11 @@ class FakeConsumerBroker:
         min_idle_ms: int,
         count: int = 100,
     ) -> Any:
-        # Real XAUTOCLAIM only claims entries idle >= min_idle_time (audit
-        # S3-r2-120). The real adapter pages at COUNT but follows the cursor
-        # until 0-0 — one reclaim() call drains the FULL idle backlog
-        # (RESIDUALS multi-page-drain contract), so the fake ignores ``count``
-        # as a result cap. Staged ``None`` entries (Redis < 7.0 nil rows) are
-        # handed back once, like real nil claim results.
+        # Real XAUTOCLAIM only claims entries idle >= min_idle_time. The real
+        # adapter pages at COUNT but follows the cursor until 0-0 — one
+        # reclaim() call drains the FULL idle backlog, so the fake ignores
+        # ``count`` as a result cap. Staged ``None`` entries (Redis < 7.0 nil
+        # rows) are handed back once, like real nil claim results.
         claimed: list[tuple[str, dict[bytes, bytes]] | None] = []
         kept: list[tuple[str, dict[bytes, bytes]] | None] = []
         for entry in self.pending.get(target, []):
@@ -834,8 +832,8 @@ async def test_reclaim_retries_pending_while_worker_stays_alive() -> None:
 
 @pytest.mark.asyncio
 async def test_fake_read_caps_delivery_at_count() -> None:
-    """Real XREADGROUP delivers at most COUNT entries per call (audit
-    S3-r1-65) — the old fake drained the whole backlog in one read."""
+    """Real XREADGROUP delivers at most COUNT entries per call — the old fake
+    drained the whole backlog in one read."""
     broker = FakeConsumerBroker()
     for i in range(3):
         broker.deliver("t", f'{{"n": {i}}}'.encode(), {"event_type": "X"})
@@ -849,7 +847,7 @@ async def test_fake_read_caps_delivery_at_count() -> None:
 
 @pytest.mark.asyncio
 async def test_reclaim_does_not_steal_fresh_in_flight_messages() -> None:
-    """The consumer's reclaim must honor min_idle_ms (audit S3-r2-120): a
+    """The consumer's reclaim must honor min_idle_ms: a
     freshly-delivered message a live peer is still processing is NOT
     redispatched; once idle past the threshold, it is."""
     received: list[int] = []
@@ -892,7 +890,7 @@ async def test_reclaim_does_not_steal_fresh_in_flight_messages() -> None:
 
 @pytest.mark.asyncio
 async def test_fake_reclaim_drains_full_idle_backlog_per_call() -> None:
-    """W3 R2-02: the real adapter follows XAUTOCLAIM's cursor until ``0-0`` —
+    """The real adapter follows XAUTOCLAIM's cursor until ``0-0`` —
     one ``reclaim()`` call recovers the FULL idle-pending backlog (``count``
     is the adapter-internal page size, not a result cap). The fake mirrors
     that multi-page-drain contract; only entries still fresh (idle below
@@ -916,7 +914,7 @@ async def test_fake_reclaim_drains_full_idle_backlog_per_call() -> None:
 @pytest.mark.asyncio
 async def test_reclaim_surfaces_trimmed_pending_ids_as_lost(caplog) -> None:
     """XAUTOCLAIM's third element reports pending ids trimmed out of the
-    stream — permanently lost messages (audit S3-r3-160). The consumer must
+    stream — permanently lost messages. The consumer must
     surface the loss loudly and drop its retry bookkeeping, not dispatch or
     dead-letter them."""
     bus = InMemoryEventBus()
@@ -937,7 +935,7 @@ async def test_reclaim_surfaces_trimmed_pending_ids_as_lost(caplog) -> None:
 
 @pytest.mark.asyncio
 async def test_reclaim_survives_nil_claimed_entries() -> None:
-    """W3 R2-01: XAUTOCLAIM on Redis < 7.0 returns nil for pending entries
+    """XAUTOCLAIM on Redis < 7.0 returns nil for pending entries
     deleted from the stream. A nil row must be skipped defensively — the
     entries after it are still reclaimed and dispatched, and the consumer
     does not crash."""
@@ -966,7 +964,7 @@ async def test_reclaim_survives_nil_claimed_entries() -> None:
 
 @pytest.mark.asyncio
 async def test_consumer_loop_stays_alive_across_nil_claimed_entries() -> None:
-    """W3 R2-01: a nil claimed entry during the periodic reclaim must not kill
+    """A nil claimed entry during the periodic reclaim must not kill
     the consumer task — later messages are still consumed."""
     received: list[int] = []
 
@@ -992,6 +990,110 @@ async def test_consumer_loop_stays_alive_across_nil_claimed_entries() -> None:
         await consumer.stop()
 
     assert received == [23]
+
+
+@pytest.mark.asyncio
+async def test_every_subscribed_stream_is_polled_concurrently() -> None:
+    """Idle delivery latency must not scale with the subscribed stream count.
+
+    Each read blocks server-side for up to ``poll_block_ms``, so awaiting the
+    targets one after another made an event landing just after its own stream
+    was polled wait ``(N-1) * poll_block_ms`` for the cycle to come back
+    around. The reads therefore overlap: every stream is in flight at once.
+    """
+
+    class ConcurrencyTrackingBroker(FakeConsumerBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inflight = 0
+            self.max_inflight = 0
+
+        async def read(self, target: str, **kwargs: Any) -> Any:
+            self.inflight += 1
+            self.max_inflight = max(self.max_inflight, self.inflight)
+            try:
+                return await super().read(target, **kwargs)
+            finally:
+                self.inflight -= 1
+
+    broker = ConcurrencyTrackingBroker()
+    consumer = _make_consumer(broker, InMemoryEventBus(), targets=["a", "b", "c"])
+
+    await consumer.start()
+    try:
+        await _until(lambda: broker.max_inflight == 3)
+    finally:
+        await consumer.stop()
+
+    assert broker.max_inflight == 3
+
+
+@pytest.mark.asyncio
+async def test_consumer_dispatch_fires_the_per_listener_lifecycle_hooks() -> None:
+    """A worker process must not be a telemetry blind spot.
+
+    The hookspec scopes ``modulith_on_listener_dispatch`` / ``_error`` /
+    ``_complete`` to every ``(event, listener)`` pair unconditionally, but
+    dispatching a consumed message straight through ``bus.publish`` bypassed the
+    runtime — so every listener invocation in a worker was untraced and a plugin
+    using ``modulith_on_listener_error`` for alerting never saw a cross-process
+    listener failure. The *publish* hooks stay out: this process did not publish
+    the event.
+    """
+
+    class _Capture:
+        def __init__(self) -> None:
+            self.dispatched: list[str] = []
+            self.completed: list[str] = []
+            self.published: list[Any] = []
+
+        @hookimpl
+        def modulith_on_listener_dispatch(
+            self, event: Any, listener_name: str, publication: Any
+        ) -> None:
+            self.dispatched.append(listener_name)
+
+        @hookimpl
+        def modulith_on_listener_complete(
+            self, event: Any, listener_name: str, publication: Any, exception: Any
+        ) -> None:
+            self.completed.append(listener_name)
+
+        @hookimpl
+        def modulith_after_event_published(self, event: Any, publication: Any) -> None:
+            self.published.append(event)
+
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    capture = _Capture()
+    broker = FakeConsumerBroker()
+    _runtime._reset_for_testing()
+    try:
+        configure(package="hooktest", auto_discover=False)
+        _runtime._extra_plugins.append(capture)
+        _runtime.ensure_bootstrapped()
+
+        bus = InMemoryEventBus()
+        bus.register(CrossEvent, handler)
+        consumer = _make_consumer(broker, bus, targets=["t"])
+
+        fqn = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+        fields = {
+            b"data": JsonEventSerializer().serialize(CrossEvent(value=5)),
+            b"h:event_type": fqn.encode(),
+        }
+        await consumer._dispatch_one("t", b"1-0", fields)
+    finally:
+        _runtime._reset_for_testing()
+
+    assert received == [5]
+    assert [name.split(".")[-1] for name in capture.dispatched] == ["handler"]
+    assert [name.split(".")[-1] for name in capture.completed] == ["handler"]
+    assert capture.published == []
+    assert broker.acked == [("t", "1-0")]
 
 
 # ---------------------------------------------------------------------------

@@ -2,35 +2,37 @@
 #
 # The presence of [tool.modulith] here lets the CLI auto-detect the
 # application package when you run `modulith verify` / `modulith info` /
-# `modulith docs` from this directory.
+# `modulith docs` from this directory. The CLI also puts the directory holding
+# this file on sys.path, so the uninstalled `shop` package imports without any
+# PYTHONPATH prefix.
 
 [project]
 name = "modulith-demo-shop"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["modulith[fastapi,cli]"]
+dependencies = ["modupy[fastapi,cli]"]
 
 [project.optional-dependencies]
 # Durable transactional outbox (Postgres-backed, or SQLite for zero-infra).
 # Combines outbox delivery reliability with single-process or multi-process topology.
-durable = ["modulith[postgres]", "aiosqlite"]
+durable = ["modupy[postgres]", "aiosqlite"]
 
 # Cross-process via Redis Streams broker.
 # Requires redis-streams to be enabled in [tool.modulith].
-redis = ["modulith[redis]"]
+redis = ["modupy[redis]"]
 
 # Cross-process via relational database broker (Postgres/MySQL/SQLite).
 # Zero-infra default uses SQLite; Postgres uses the same outbox DB.
-database = ["modulith[database]", "aiosqlite"]
+database = ["modupy[database]", "aiosqlite"]
 
 # OpenTelemetry auto-instrumentation for distributed tracing.
-otel = ["modulith[otel]"]
+otel = ["modupy[otel]"]
 
 # Test suite dependencies (pytest, pytest-asyncio, mock DBs).
-test = ["modulith[test]", "pytest", "pytest-asyncio"]
+test = ["modupy[test]", "pytest", "pytest-asyncio"]
 
 # All features (all brokers, observability, test infrastructure).
-all = ["modulith[fastapi,cli,postgres,redis,database,otel,test]", "aiosqlite"]
+all = ["modupy[fastapi,cli,postgres,redis,database,otel,test]", "aiosqlite"]
 
 [tool.modulith]
 package = "shop"
@@ -76,7 +78,7 @@ package = "shop"
 # broker = "redis-streams"
 # topology = "processes"
 # [tool.modulith.broker_options]
-# url = "redis://localhost:6379"
+# url = "redis://:modulith@localhost:6379"
 # stream_prefix = "modulith.demo"
 
 # --- Per-module concurrency (optional) ---

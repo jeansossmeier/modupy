@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import signal
 import sys
@@ -26,11 +27,13 @@ import pytest
 from modulith.supervisor import (
     Supervisor,
     WorkerSpec,
+    _env_flag,
     _RestartPolicy,
     _rules_from_specs,
     derive_specs_from_config,
     run_supervised,
 )
+
 from conftest import _free_port
 
 # Trivial worker commands — stand in for the real uvicorn worker.
@@ -72,6 +75,20 @@ def test_derive_specs_respects_worker_counts_and_port_gaps(make_fake_app) -> Non
     assert by_name["inventory"].port == 9001
     assert by_name["orders"].port == 9002
     assert sorted(s.port for s in specs) == [9001, 9002]
+
+
+def test_derive_specs_skips_the_contracts_package(make_fake_app) -> None:
+    """The contracts package holds shared types, not a module: it exposes no
+    router and no listeners, so a worker for it hosts nothing while shifting
+    every real module's port by one and publishing a dead /contracts prefix
+    on the proxy."""
+    make_fake_app({"orders": "", "inventory": "", "contracts": ""})
+
+    specs = derive_specs_from_config({"package": "fakeapp"})
+
+    assert {s.module_name for s in specs} == {"orders", "inventory"}
+    assert {s.port for s in specs} == {9001, 9002}
+    assert "/contracts" not in {r.prefix for r in _rules_from_specs(specs)}
 
 
 def test_derive_specs_isolate_filters_modules(make_fake_app) -> None:
@@ -138,12 +155,7 @@ async def test_run_supervised_starts_serves_then_stops() -> None:
 
     specs = [WorkerSpec("orders", "app", 9001), WorkerSpec("inventory", "app", 9002)]
 
-    # actuator_mode="open": this test's concern is the start/serve/stop
-    # orchestration, not actuator security — "0.0.0.0" would otherwise trip
-    # the auto-mode non-loopback guard (Task 7) and raise ConfigurationError.
-    await run_supervised(
-        specs, "0.0.0.0", 8000, supervisor=sup, serve=fake_serve, actuator_mode="open"
-    )
+    await run_supervised(specs, "0.0.0.0", 8000, supervisor=sup, serve=fake_serve)
 
     assert sup.events == ["start", "serve", "stop"]
     assert captured["host"] == "0.0.0.0"
@@ -174,7 +186,7 @@ async def test_run_supervised_stops_even_when_serve_raises() -> None:
 
 
 async def test_run_supervised_stops_workers_when_start_fails_partway() -> None:
-    """S3-r3-161 (W2 RESIDUALS item 8): ``await sup.start()`` used to sit
+    """``await sup.start()`` used to sit
     OUTSIDE the try/finally guarding serve_fn, and Supervisor.start() has no
     mid-loop rollback — a partial-spawn failure (e.g. 3rd of 5 workers fails)
     never triggered sup.stop(), orphaning the already-spawned workers.
@@ -207,7 +219,7 @@ async def test_run_supervised_stops_workers_when_start_fails_partway() -> None:
 
 @pytest.mark.real_process
 async def test_run_supervised_reaps_partial_spawn_of_real_workers() -> None:
-    """S3-r3-161 (W2 RESIDUALS item 8), real-subprocess form: the 2nd of two
+    """Real-subprocess form of the partial-spawn reap: the 2nd of two
     workers fails to spawn (nonexistent binary) partway through start() —
     the worker spawned before the failure must be reaped, not orphaned."""
     specs = [WorkerSpec("alpha", "fakeapp", 9001), WorkerSpec("bad", "fakeapp", 9002)]
@@ -262,6 +274,113 @@ async def test_run_supervised_reaps_workers_on_sigterm_during_start_window() -> 
     assert all(p.returncode is not None for p in sup._processes.values())
 
 
+@pytest.mark.real_process
+async def test_run_supervised_stands_down_once_serve_fn_owns_the_signal() -> None:
+    """uvicorn takes SIGTERM/SIGINT over with ``signal.signal()``, which does
+    NOT displace run_supervised's ``add_signal_handler`` registration — both
+    callbacks fire on one signal. Cancelling the task at that point throws
+    into ``Server.main_loop`` before ``Server.shutdown()`` ever runs: listening
+    sockets stay open, in-flight requests die mid-response with a 500, and the
+    lifespan shutdown is skipped. Once serve_fn owns the signal, our handler
+    must let serve_fn finish on its own terms."""
+    sup = _FakeSupervisor()
+    handled: list[str] = []
+
+    async def serve_like_uvicorn(app: object, host: str, port: int) -> None:
+        previous = signal.signal(signal.SIGTERM, lambda *_: handled.append("serve_fn"))
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+            # Long enough for the loop to dispatch a still-armed asyncio
+            # signal callback — the stale cancel would land right here.
+            await asyncio.sleep(0.2)
+            sup.events.append("drained")
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+    await run_supervised(
+        [WorkerSpec("orders", "app", 9001)],
+        "127.0.0.1",
+        8000,
+        supervisor=sup,
+        serve=serve_like_uvicorn,
+    )
+
+    assert handled == ["serve_fn"]  # serve_fn's own handler ran
+    assert sup.events == ["start", "drained", "stop"]  # serve_fn was not cancelled
+
+
+async def test_run_supervised_honors_the_proxy_body_cap_env_var(monkeypatch) -> None:
+    """create_proxy_app's 10 MiB request-body cap is otherwise unreachable
+    from ``modulith run``: no flag, no pyproject key, no env var, so an app
+    with larger uploads has to abandon the CLI and hand-roll the supervisor."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("MODULITH_PROXY_MAX_BODY_BYTES", "4")
+    captured: dict[str, object] = {}
+
+    async def capture_serve(app: object, host: str, port: int) -> None:
+        captured["app"] = app
+
+    await run_supervised(
+        [WorkerSpec("orders", "app", 9001)],
+        "127.0.0.1",
+        8000,
+        supervisor=_FakeSupervisor(),
+        serve=capture_serve,
+    )
+
+    with TestClient(captured["app"]) as client:
+        resp = client.post("/orders/echo", content=b"over-the-cap")
+
+    assert resp.status_code == 413
+
+
+async def test_run_supervised_rejects_a_non_numeric_proxy_body_cap(monkeypatch) -> None:
+    """A garbage cap is user error with an actionable message, not a crash."""
+    from modulith.config import ConfigurationError
+
+    monkeypatch.setenv("MODULITH_PROXY_MAX_BODY_BYTES", "10MB")
+
+    async def never_serve(app: object, host: str, port: int) -> None:
+        pytest.fail("must not serve with an unusable body cap")
+
+    with pytest.raises(ConfigurationError, match="positive integer"):
+        await run_supervised([], "127.0.0.1", 8000, supervisor=_FakeSupervisor(), serve=never_serve)
+
+
+async def test_run_supervised_rejects_an_unparseable_production_flag(monkeypatch) -> None:
+    """MODULITH_PRODUCTION must be parsed as strictly here as it is in
+    ``load_configuration()``. The supervisor used its own lenient reader, so
+    a typo like "ture" hard-failed application config yet silently resolved
+    to False in this process — quietly dropping the production-only actuator
+    hardening. A typo must never turn a security posture off in silence."""
+    from modulith.config import ConfigurationError
+
+    monkeypatch.setenv("MODULITH_PRODUCTION", "ture")
+
+    async def never_serve(app: object, host: str, port: int) -> None:
+        pytest.fail("must not serve with an unparseable MODULITH_PRODUCTION")
+
+    with pytest.raises(ConfigurationError, match="MODULITH_PRODUCTION"):
+        await run_supervised([], "127.0.0.1", 8000, supervisor=_FakeSupervisor(), serve=never_serve)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, False), ("", False), ("1", True), ("true", True), ("YES", True), ("no", False)],
+)
+def test_env_flag_mirrors_the_configuration_boolean_parser(monkeypatch, raw, expected) -> None:
+    """Strictness must not come at the cost of the documented spellings:
+    _env_flag accepts exactly what load_configuration() accepts (1/true/yes,
+    case-insensitive) and treats unset or empty as False."""
+    if raw is None:
+        monkeypatch.delenv("MODULITH_PRODUCTION", raising=False)
+    else:
+        monkeypatch.setenv("MODULITH_PRODUCTION", raw)
+
+    assert _env_flag("MODULITH_PRODUCTION") is expected
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle (real subprocesses)
 # ---------------------------------------------------------------------------
@@ -290,6 +409,66 @@ async def test_worker_count_spawns_replicas() -> None:
         assert len(sup._processes) == 2
     finally:
         await sup.stop()
+
+
+@pytest.mark.real_process
+async def test_replica_logs_are_prefixed_with_the_instance_name(caplog) -> None:
+    """Multiplexed output must be attributable to a single replica. Prefixing
+    with the module name makes all N replicas of one module indistinguishable
+    in the supervisor's stdout, while the crash/restart messages next to them
+    are keyed by instance — so an operator cannot match a traceback to the
+    instance the restart breaker is counting."""
+
+    def talkative_builder(spec: WorkerSpec, port: int) -> list[str]:
+        return [
+            sys.executable,
+            "-c",
+            f"import time; print('listening on {port}', flush=True); time.sleep(30)",
+        ]
+
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", 9001, worker_count=2)],
+        command_builder=talkative_builder,
+    )
+    with caplog.at_level(logging.INFO, logger="modulith.supervisor"):
+        try:
+            await sup.start()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if sum("listening on" in r.getMessage() for r in caplog.records) >= 2:
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            await sup.stop()
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert "[orders-0] listening on 9001" in messages
+    assert "[orders-1] listening on 9002" in messages
+    assert any(m.startswith("spawned worker 'orders-0'") for m in messages)
+    assert any(m.startswith("spawned worker 'orders-1'") for m in messages)
+
+
+@pytest.mark.real_process
+async def test_single_worker_logs_keep_the_bare_module_name(caplog) -> None:
+    """The instance name equals the module name when worker_count == 1, so the
+    replica-aware prefix must not change single-worker output."""
+
+    def talkative_builder(spec: WorkerSpec, port: int) -> list[str]:
+        return [sys.executable, "-c", "import time; print('up', flush=True); time.sleep(30)"]
+
+    sup = Supervisor([WorkerSpec("orders", "fakeapp", 9001)], command_builder=talkative_builder)
+    with caplog.at_level(logging.INFO, logger="modulith.supervisor"):
+        try:
+            await sup.start()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if any("[orders] up" == r.getMessage() for r in caplog.records):
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            await sup.stop()
+
+    assert "[orders] up" in [r.getMessage() for r in caplog.records]
 
 
 @pytest.mark.real_process
@@ -450,6 +629,47 @@ async def test_stop_sigkills_only_the_worker_still_alive_at_timeout() -> None:
 
 
 @pytest.mark.real_process
+async def test_failed_respawn_retries_under_backoff_and_trips_the_breaker(caplog) -> None:
+    """A respawn that raises (fork EAGAIN under pid/thread pressure, ENOMEM,
+    EMFILE on the pipes) used to kill the monitor task outright. Nothing
+    retrieved the exception — the strong ref in _monitor_tasks suppresses
+    asyncio's "never retrieved" warning and stop() gathers it away — so the
+    module silently stopped being supervised with "restarting in Ns" as the
+    last thing an operator saw: no ERROR log, no _failed_instances entry, no
+    further respawn ever. The failure must run through the same backoff and
+    crash-loop breaker as a crash does."""
+    caplog.set_level("ERROR", logger="modulith.supervisor")
+    calls: list[int] = []
+
+    def flaky_builder(spec: WorkerSpec, port: int) -> list[str]:
+        calls.append(port)
+        if len(calls) > 1:  # every respawn after the initial spawn fails
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+        return _CRASH
+
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", 9001)],
+        command_builder=flaky_builder,
+        restart_initial_delay=0.01,
+        restart_max_delay=0.01,
+        max_restarts=3,
+        restart_healthy_uptime=5.0,
+    )
+    try:
+        await sup.start()
+        for _ in range(300):  # bounded poll — no fixed-sleep synchronization
+            await asyncio.sleep(0.01)
+            if "orders" in sup._failed_instances:
+                break
+
+        assert "orders" in sup._failed_instances
+        assert len(calls) > 1  # the failing respawn was retried, not swallowed
+        assert any(r.levelname == "ERROR" for r in caplog.records)
+    finally:
+        await sup.stop()
+
+
+@pytest.mark.real_process
 async def test_crash_loop_gives_up_after_max_restarts() -> None:
     """An always-crashing worker is abandoned once the breaker trips (#33).
 
@@ -491,13 +711,13 @@ async def test_crash_loop_gives_up_after_max_restarts() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _serve_uvicorn — the real production proxy server (S3-r2-121)
+# _serve_uvicorn — the real production proxy server
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.real_process
 async def test_run_supervised_default_serve_binds_real_uvicorn() -> None:
-    """S3-r2-121: with no ``serve=`` override, run_supervised must serve the
+    """With no ``serve=`` override, run_supervised must serve the
     proxy via the real ``_serve_uvicorn`` — the production default behind
     ``modulith run``/``dev`` (cli.py calls run_supervised with no override) —
     and actually be reachable over HTTP on the requested port.

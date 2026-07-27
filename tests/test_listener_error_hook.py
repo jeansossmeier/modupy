@@ -1,5 +1,5 @@
-"""A raising modulith_on_listener_error hookimpl (A1-r1-1)
-must never mask the listener's own exception or skip the paired
+"""A raising modulith_on_listener_error hookimpl must never mask the
+listener's own exception or skip the paired
 modulith_on_listener_complete call.
 
 Two dispatch paths fire these hooks — the in-memory path
@@ -69,7 +69,7 @@ class _RaisingErrorHookPlugin:
 
 
 async def test_raising_error_hook_preserves_original_and_fires_complete() -> None:
-    """A1-r1-1 (in-memory path): the listener's ValueError propagates — not
+    """In-memory path: the listener's ValueError propagates — not
     the hook's RuntimeError — and modulith_on_listener_complete still fires,
     carrying the listener's own exception."""
     plugin = _RaisingErrorHookPlugin()
@@ -89,7 +89,7 @@ async def test_raising_error_hook_preserves_original_and_fires_complete() -> Non
 
 
 async def test_raising_error_hook_does_not_escape_durable_dispatch() -> None:
-    """A1-r1-1 (durable-path twin site, outbox._dispatch_publication): a
+    """Durable-path twin site (outbox._dispatch_publication): a
     raising error hookimpl must not propagate out of the after-commit
     dispatch, must not skip modulith_on_listener_complete, and must not
     prevent the failed attempt from being recorded for retry."""

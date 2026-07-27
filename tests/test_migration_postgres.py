@@ -14,7 +14,9 @@ Provisioned by the shared ``postgres_url`` fixture (testcontainers Postgres or
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from alembic import command
@@ -82,6 +84,12 @@ def test_alembic_upgrade_head_on_real_postgres(clean_pg) -> None:
     assert _TABLES[1] in tables
     indexes = {ix["name"] for ix in insp.get_indexes("event_publications")}
     assert "idx_pending" in indexes
+    # The sweep indexes exist only in the migrations — the ORM metadata cannot
+    # express the partial expression index, so the column-metadata drift guards
+    # below are blind to them dropping out of the chain.
+    assert "ix_event_publications_claim_order" in indexes
+    archive_indexes = {ix["name"] for ix in insp.get_indexes("event_publications_archive")}
+    assert "ix_event_publications_archive_completed_at" in archive_indexes
 
 
 def test_migration_columns_match_orm_on_real_postgres(clean_pg) -> None:
@@ -173,8 +181,50 @@ def test_alembic_downgrade_base_on_real_postgres(clean_pg) -> None:
     assert "broker_retained_delivery" not in tables
 
 
+def test_downgrade_0003_preserves_long_last_error(clean_pg) -> None:
+    """Rolling 0003 back must not narrow ``last_error`` and abort.
+
+    ``builtin/outbox._record_failure`` stores up to 500 characters there. While
+    0003's downgrade mirrored its upgrade with an ``ALTER ... TYPE VARCHAR(255)``,
+    any deployment that had recorded a longer failure could not roll back at
+    all: Postgres raises StringDataRightTruncation and the whole downgrade
+    transaction aborts. The conversion is now deliberately one-way, so the
+    column keeps its Text width and the stored value survives intact.
+    """
+    url, engine = clean_pg
+    cfg = _cfg(url)
+    command.upgrade(cfg, "0003_outbox_claim_leases")
+
+    long_error = "x" * 500
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO event_publications "
+                "(id, event_type, payload, listener, published_at, attempt_count, last_error) "
+                "VALUES (CAST(:id AS uuid), :event_type, :payload, :listener, "
+                "CAST(:published_at AS timestamptz), 1, :last_error)"
+            ),
+            {
+                "id": str(uuid4()),
+                "event_type": "orders.OrderPlaced",
+                "payload": b"{}",
+                "listener": "inventory.on_order_placed",
+                "published_at": datetime.now(UTC).isoformat(),
+                "last_error": long_error,
+            },
+        )
+
+    command.downgrade(cfg, "0002_broker_message")
+
+    columns = {c["name"] for c in inspect(engine).get_columns("event_publications")}
+    assert "claim_owner" not in columns  # the revision's own columns did come off
+    with engine.connect() as conn:
+        stored = conn.execute(text("SELECT last_error FROM event_publications")).scalar_one()
+    assert stored == long_error
+
+
 def test_migration_column_metadata_matches_orm_on_real_postgres(clean_pg) -> None:
-    """A6-r3-136: the name-set comparison above is blind to type/nullable/
+    """The name-set comparison above is blind to type/nullable/
     server_default drift — the exact bug class this file's docstring cites
     (boolean server_default rendered as integer 0). Compare full column
     metadata of the migrated schema against a schema created straight from

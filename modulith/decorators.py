@@ -22,7 +22,7 @@ from __future__ import annotations
 import functools
 import inspect
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Any, TypeVar, overload
 
 from .runtime import _runtime
 
@@ -118,9 +118,16 @@ def _resolve_event_type(func: Callable[..., Any], target: Callable[..., Any]) ->
         # (e.g. an event class nested in a function) are invisible here — that
         # is an inherent PEP 563 limitation, surfaced as a clear TypeError
         # rather than a downstream ``str has no attribute __name__`` crash.
+        #
+        # ONLY this annotation is evaluated. inspect.get_annotations(eval_str=True)
+        # evaluates the whole dict — return type and every other parameter — so
+        # a TYPE_CHECKING-only import on a second parameter (the sanctioned way
+        # to break a runtime import cycle; see builtin.verifier) raised NameError
+        # here and got reported as an unresolvable *event* annotation, blaming
+        # the wrong parameter and rejecting a listener the bus would have called
+        # perfectly well (it invokes handlers with the event alone).
         try:
-            resolved = inspect.get_annotations(target, eval_str=True)
-            annotation = resolved.get(first.name, annotation)
+            annotation = eval(annotation, getattr(target, "__globals__", {}))
         except (NameError, AttributeError, SyntaxError) as exc:
             raise TypeError(
                 f"@listener {func.__qualname__!r} annotates its event parameter "
@@ -161,6 +168,21 @@ def _normalize_listener_targets(targets: object) -> tuple[str, ...]:
             )
         normalized.append(f"{scheme.strip()}:{destination.strip()}")
     return tuple(normalized)
+
+
+# Both call forms are overloaded so a decorated function keeps its own
+# signature downstream. With only the ``-> Any`` implementation signature,
+# type checkers erased every ``@listener`` function to ``Any`` — silently
+# disabling all checking on calls to it despite the shipped ``py.typed`` — and
+# the parameterized form tripped ``untyped-decorator`` under ``mypy --strict``.
+# ``register`` returns the original undecorated ``handler``, so ``F -> F`` is
+# exact rather than a convenient lie.
+@overload
+def listener(func: F) -> F: ...
+
+
+@overload
+def listener(*, broker_targets: list[str] | tuple[str, ...] = ()) -> Callable[[F], F]: ...
 
 
 def listener(

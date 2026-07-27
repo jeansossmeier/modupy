@@ -13,7 +13,13 @@ BrokerRegistry in modulith.brokers handles dispatch. Its consumer-side
 mirror is the Consumer protocol (one wins per scheme), built per module
 by a factory in the ConsumerRegistry — see modulith.brokers.
 
-All four protocols use ``runtime_checkable`` so applications can do
+HealthAwareConsumer is an optional fifth protocol layered on Consumer: a
+consumer that implements ``health()`` drives the worker's ``/health``
+endpoint, and one that does not always answers ``status: "unknown"`` with a
+200, so its readiness probe can never fail. Implement it on any consumer
+adapter whose liveness a deployment needs to act on.
+
+All five protocols use ``runtime_checkable`` so applications can do
 ``isinstance(thing, PublicationStore)`` for diagnostics, but adapters
 do **not** need to inherit from these — duck typing via Protocol is the
 intended pattern.
@@ -104,8 +110,11 @@ class PublicationStore(Protocol):
     async def delete(self, publication_id: UUID) -> None:
         """Hard-delete a publication record.
 
-        Called when the completion mode is DELETE. Also used by the
-        purge maintenance job for archive entries past their retention.
+        Called on exactly one path: completing a publication while the
+        configured completion mode is DELETE, one row at a time. Bulk
+        retention trimming is NOT routed here — ``modulith outbox purge``
+        goes through the separate, optional ``purge_completed(older_than)``
+        store capability, which stores may omit entirely.
         """
         ...
 
