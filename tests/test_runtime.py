@@ -421,6 +421,57 @@ async def test_in_memory_dispatch_hook_publications_carry_real_payload() -> None
         assert b'"x":7' in payload, f"{name} hook got payload {payload!r}"
 
 
+def test_is_builtin_plugin_module() -> None:
+    """The builtin-module classifier is exact: it recognizes the package's
+    own modules — and nothing that merely borrows its name. The old
+    ``startswith("modulith.")`` check let a plugin physically placed under
+    a ``modulith.*`` name masquerade as built-in and silently starve it of
+    payload bytes; ``modulith`` is a regular package, so only its own
+    directories can be real top-level subpackages."""
+    from modulith.runtime import _is_builtin_plugin_module
+
+    assert _is_builtin_plugin_module("modulith")
+    assert _is_builtin_plugin_module("modulith.runtime")
+    assert _is_builtin_plugin_module("modulith.builtin.outbox")
+    assert _is_builtin_plugin_module("modulith.adapters.db_broker")
+    # External by construction:
+    assert not _is_builtin_plugin_module("")
+    assert not _is_builtin_plugin_module("builtins")
+    assert not _is_builtin_plugin_module("modulith_extras.thing")
+    assert not _is_builtin_plugin_module("modulith.plugins.custom")
+    assert not _is_builtin_plugin_module("myapp.plugins.audit")
+
+
+async def test_payload_produced_for_modulith_named_external_hookimpl() -> None:
+    """A third-party hookimpl that merely names its module ``modulith.*``
+    (never a real top-level subpackage of this regular package) must still
+    receive real payload bytes. The old prefix check classified it as a
+    built-in, silently handing its dead-letter/audit logic ``b""``."""
+    payloads: list[bytes] = []
+
+    class _Spoofed:
+        @hookimpl
+        def modulith_after_event_published(self, event: Any, publication: Any) -> None:
+            payloads.append(publication.payload)
+
+    _Spoofed.modulith_after_event_published.__module__ = "modulith.plugins.custom"
+
+    configure(package="spoofedpayload", auto_discover=False)
+    _runtime._extra_plugins.append(_Spoofed())
+
+    @event
+    @dataclass(frozen=True)
+    class Probe:
+        x: int
+
+    from modulith import publish
+
+    await publish(Probe(x=9))
+
+    assert payloads, "hooks never fired"
+    assert b'"x":9' in payloads[0], f"got payload {payloads[0]!r}"
+
+
 # ---------------------------------------------------------------------------
 # shutdown() must drain the store's in-flight dispatch tasks
 # ---------------------------------------------------------------------------

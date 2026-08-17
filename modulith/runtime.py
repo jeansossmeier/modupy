@@ -13,12 +13,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import pkgutil
 import threading
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
+
+import modulith
 
 from .brokers import BrokerRegistry, ConsumerRegistry
 from .config import Configuration, ConfigurationError, load_configuration
@@ -46,6 +49,29 @@ _PUBLICATION_HOOKS = (
     "modulith_on_listener_error",
     "modulith_on_listener_complete",
 )
+
+# Every top-level name in the ``modulith`` package, as a dotted prefix
+# (``modulith.builtin``, ``modulith.adapters``, …). Used to tell a
+# hookimpl shipped with this package from a third-party one: ``modulith``
+# is a regular package, so its ``__path__`` is its own directory alone —
+# no external code can ever become a real top-level subpackage of it.
+# ``pkgutil.iter_modules`` lists without importing anything, so computing
+# this has no import side effects (no SQLAlchemy, no adapters).
+_BUILTIN_PLUGIN_PREFIXES = tuple(
+    sorted(f"modulith.{m.name}" for m in pkgutil.iter_modules(modulith.__path__))
+)
+
+
+def _is_builtin_plugin_module(name: str) -> bool:
+    """True when a hookimpl's ``__module__`` belongs to the modulith package.
+
+    Matches the package itself and any module under a real top-level
+    subpackage. A third-party plugin that merely *names* itself after the
+    package (``modulith_extras.*``, or even ``modulith.plugins.custom``)
+    is external by this test — its dotted path is not one of the
+    package's own directories.
+    """
+    return name == "modulith" or name.startswith(_BUILTIN_PLUGIN_PREFIXES)
 
 
 class Runtime:
@@ -357,7 +383,7 @@ class Runtime:
             return False
         for hook_name in _PUBLICATION_HOOKS:
             for impl in getattr(pm.hook, hook_name).get_hookimpls():
-                if not (impl.function.__module__ or "").startswith("modulith."):
+                if not _is_builtin_plugin_module(impl.function.__module__ or ""):
                     return True
         return False
 
