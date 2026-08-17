@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..config import DEFAULT_SHM_MAX_PAYLOAD_BYTES, DEFAULT_SHM_MAX_STORE_BYTES
+from ..config import DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_SHM_MAX_STORE_BYTES
 from . import _shm_claims, _shm_completion, _shm_publications
 from ._shm_schema import open_database
 from ._shm_types import ClaimToken, PublishResult
@@ -24,7 +24,7 @@ class SqliteQueueStore:
         orphan_retention_seconds: float,
         retry_backoff_base_seconds: float,
         retry_backoff_cap_seconds: float,
-        max_payload_bytes: int = DEFAULT_SHM_MAX_PAYLOAD_BYTES,
+        max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
         max_store_bytes: int = DEFAULT_SHM_MAX_STORE_BYTES,
     ) -> None:
         self._conn = open_database(path, synchronous, max_store_bytes)

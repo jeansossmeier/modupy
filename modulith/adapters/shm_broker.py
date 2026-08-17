@@ -42,10 +42,10 @@ from ..config import (
     _SHM_MAX_DELIVERY_ATTEMPTS,
     _SHM_MAX_DISPATCH_CONCURRENCY,
     _SHM_MAX_HINT_CAPACITY,
-    _SHM_MAX_PAYLOAD_BYTES,
+    MAX_PAYLOAD_BYTES,
     _SHM_MAX_STORE_BYTES,
     DEFAULT_SHM_BROKER_DB_FILENAME,
-    DEFAULT_SHM_MAX_PAYLOAD_BYTES,
+    DEFAULT_MAX_PAYLOAD_BYTES,
     DEFAULT_SHM_MAX_STORE_BYTES,
     _validate_shm_broker_options,
 )
@@ -164,7 +164,7 @@ class ShmBroker:
         completion_mode: str = _DEFAULT_COMPLETION_MODE,
         create: bool = True,
         synchronous: str = _DEFAULT_SQLITE_SYNCHRONOUS,
-        max_payload_bytes: int = DEFAULT_SHM_MAX_PAYLOAD_BYTES,
+        max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
         max_store_bytes: int = DEFAULT_SHM_MAX_STORE_BYTES,
     ) -> None:
         capacity = _validated_hint_capacity(capacity)
@@ -172,7 +172,7 @@ class ShmBroker:
         max_payload_bytes = _bounded_positive_int(
             max_payload_bytes,
             "max_payload_bytes",
-            _SHM_MAX_PAYLOAD_BYTES,
+            MAX_PAYLOAD_BYTES,
         )
         max_store_bytes = _bounded_positive_int(
             max_store_bytes,
@@ -679,10 +679,10 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
     max_payload_bytes = _bounded_positive_int(
         _option_or_default(
             _opt_int(_broker_opt(opts, "max_payload_bytes", "MAX_PAYLOAD_BYTES")),
-            DEFAULT_SHM_MAX_PAYLOAD_BYTES,
+            DEFAULT_MAX_PAYLOAD_BYTES,
         ),
         "max_payload_bytes",
-        _SHM_MAX_PAYLOAD_BYTES,
+        MAX_PAYLOAD_BYTES,
     )
     max_store_bytes = _bounded_positive_int(
         _option_or_default(

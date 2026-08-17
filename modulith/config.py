@@ -34,9 +34,9 @@ _SHM_MAX_HINT_CAPACITY = 1_000_000
 _SHM_MAX_CLAIM_BATCH_SIZE = 10_000
 _SHM_MAX_DISPATCH_CONCURRENCY = 1_000
 _SHM_MAX_DELIVERY_ATTEMPTS = 10_000
-DEFAULT_SHM_MAX_PAYLOAD_BYTES = 16 * 1024**2
+DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024**2
 DEFAULT_SHM_MAX_STORE_BYTES = 1024**3
-_SHM_MAX_PAYLOAD_BYTES = 1024**3
+MAX_PAYLOAD_BYTES = 1024**3
 _SHM_MAX_STORE_BYTES = 1024**4
 
 
@@ -298,7 +298,7 @@ def _validate_shm_broker_options(options: dict[str, Any]) -> None:
     _validate_shm_int_option(
         options,
         "max_payload_bytes",
-        maximum=_SHM_MAX_PAYLOAD_BYTES,
+        maximum=MAX_PAYLOAD_BYTES,
     )
     _validate_shm_int_option(
         options,

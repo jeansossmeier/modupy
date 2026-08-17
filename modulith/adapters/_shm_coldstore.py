@@ -7,7 +7,7 @@ from functools import partial
 from typing import Any, cast
 
 from ..config import (
-    DEFAULT_SHM_MAX_PAYLOAD_BYTES,
+    DEFAULT_MAX_PAYLOAD_BYTES,
     DEFAULT_SHM_MAX_STORE_BYTES,
     _validate_shm_broker_options,
 )
@@ -31,7 +31,7 @@ class ShmColdStore(SerialStoreExecutor):
         orphan_retention_seconds: float = 86400.0,
         retry_backoff_base_seconds: float = 0.05,
         retry_backoff_cap_seconds: float = 5.0,
-        max_payload_bytes: int = DEFAULT_SHM_MAX_PAYLOAD_BYTES,
+        max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
         max_store_bytes: int = DEFAULT_SHM_MAX_STORE_BYTES,
     ) -> None:
         synchronous = synchronous.upper()

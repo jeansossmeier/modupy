@@ -77,7 +77,7 @@ from modulith import (
     hookimpl,
 )
 
-from ..config import _SHM_MAX_PAYLOAD_BYTES, DEFAULT_SHM_MAX_PAYLOAD_BYTES
+from ..config import MAX_PAYLOAD_BYTES, DEFAULT_MAX_PAYLOAD_BYTES
 
 logger = logging.getLogger("modulith.adapters.redis")
 
@@ -120,7 +120,7 @@ class RedisStreamsBroker:
         consumer_group: str | None = None,
         max_stream_len: int = _DEFAULT_MAXLEN,
         dlq_max_stream_len: int | None = None,
-        max_payload_bytes: int = DEFAULT_SHM_MAX_PAYLOAD_BYTES,
+        max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
         client: Any | None = None,
     ) -> None:
         if client is not None:
@@ -151,11 +151,11 @@ class RedisStreamsBroker:
         )
         if (
             type(max_payload_bytes) is not int
-            or not 1 <= max_payload_bytes <= _SHM_MAX_PAYLOAD_BYTES
+            or not 1 <= max_payload_bytes <= MAX_PAYLOAD_BYTES
         ):
             raise ConfigurationError(
                 f"max_payload_bytes must be an integer between 1 and "
-                f"{_SHM_MAX_PAYLOAD_BYTES}, got {max_payload_bytes!r}"
+                f"{MAX_PAYLOAD_BYTES}, got {max_payload_bytes!r}"
             )
         self._max_payload_bytes = max_payload_bytes
 
@@ -405,7 +405,7 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
             or _DEFAULT_MAXLEN
         ),
         dlq_max_stream_len=int(dlq_maxlen) if dlq_maxlen is not None else None,
-        max_payload_bytes=int(opts.get("max_payload_bytes") or DEFAULT_SHM_MAX_PAYLOAD_BYTES),
+        max_payload_bytes=int(opts.get("max_payload_bytes") or DEFAULT_MAX_PAYLOAD_BYTES),
     )
     registry.register(_REDIS_SCHEME, broker)
     logger.info("registered redis-streams broker (prefix=%s)", broker._stream_prefix)
