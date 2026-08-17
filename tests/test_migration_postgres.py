@@ -88,6 +88,8 @@ def test_alembic_upgrade_head_on_real_postgres(clean_pg) -> None:
     # express the partial expression index, so the column-metadata drift guards
     # below are blind to them dropping out of the chain.
     assert "ix_event_publications_claim_order" in indexes
+    # The MySQL-only sibling must not leak onto Postgres.
+    assert "ix_event_publications_pending_scan" not in indexes
     archive_indexes = {ix["name"] for ix in insp.get_indexes("event_publications_archive")}
     assert "ix_event_publications_archive_completed_at" in archive_indexes
 

@@ -49,11 +49,15 @@ def test_alembic_upgrade_creates_schema(tmp_path: Path) -> None:
     assert "event_publications" in tables
     assert "event_publications_archive" in tables
     assert "idx_pending" in _objects(db, "index")
-    # 0005's archive-purge index. Its sibling ``ix_event_publications_claim_order``
-    # is deliberately absent here: that one is a functional + partial index, which
-    # 0005 creates only on Postgres (MySQL/MariaDB express neither), so SQLite
-    # never gets it. tests/test_migration_postgres.py asserts the Postgres half.
+    # 0005's archive-purge index. Its siblings ``ix_event_publications_claim_order``
+    # and ``ix_event_publications_pending_scan`` are deliberately absent here:
+    # the first is a functional + partial index 0005 creates only on Postgres,
+    # the second a plain composite index only on MySQL/MariaDB — SQLite never
+    # gets either. tests/test_migration_postgres.py asserts the Postgres half;
+    # tests/test_migration_mysql.py asserts the MySQL half.
     assert "ix_event_publications_archive_completed_at" in _objects(db, "index")
+    assert "ix_event_publications_claim_order" not in _objects(db, "index")
+    assert "ix_event_publications_pending_scan" not in _objects(db, "index")
 
 
 def test_alembic_upgrade_creates_broker_schema(tmp_path: Path) -> None:
@@ -336,4 +340,11 @@ def test_alembic_offline_mode_emits_mysql_ddl_without_a_connection(capsys) -> No
     assert "payload BLOB NOT NULL" not in ddl
     assert ddl.count("MODIFY payload LONGBLOB NOT NULL") == 2
     assert "idx_pending" in ddl
+    # MySQL cannot express 0005's Postgres functional+partial claim index, so
+    # it gets a plain composite index on the pending predicate instead — both
+    # sweep queries filter on these columns, and the leading ``completed_at``
+    # narrows the scan to pending rows.
+    assert "ix_event_publications_pending_scan" in ddl
+    # The Postgres half must NOT leak onto MySQL.
+    assert "ix_event_publications_claim_order" not in ddl
     assert "CREATE TABLE broker_subscription (" in ddl

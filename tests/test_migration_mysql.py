@@ -93,7 +93,7 @@ def _snapshot(engine, tables: list[str]) -> dict[str, dict[str, tuple[str, bool,
 
 def test_alembic_upgrade_head_on_real_mysql(clean_mysql) -> None:
     """The real migration applies cleanly to MySQL and creates both outbox
-    tables plus the pending-rows index — the exact command production runs."""
+    tables plus the pending-rows indexes — the exact command production runs."""
     url, engine = clean_mysql
     command.upgrade(_cfg(url), "head")
 
@@ -103,6 +103,13 @@ def test_alembic_upgrade_head_on_real_mysql(clean_mysql) -> None:
     assert _TABLES[1] in tables
     indexes = {ix["name"] for ix in insp.get_indexes("event_publications")}
     assert "idx_pending" in indexes
+    # 0005's MySQL half: MySQL cannot express the Postgres functional+partial
+    # claim index, so the sweep gets a plain composite index on the pending
+    # predicate instead. The Postgres-only name must not appear.
+    assert "ix_event_publications_pending_scan" in indexes
+    assert "ix_event_publications_claim_order" not in indexes
+    archive_indexes = {ix["name"] for ix in insp.get_indexes("event_publications_archive")}
+    assert "ix_event_publications_archive_completed_at" in archive_indexes
 
 
 def test_alembic_upgrade_head_creates_broker_schema_on_real_mysql(clean_mysql) -> None:

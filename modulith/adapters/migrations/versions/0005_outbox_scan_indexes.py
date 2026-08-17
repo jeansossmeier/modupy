@@ -19,6 +19,11 @@ depends_on: str | Sequence[str] | None = None
 
 _CLAIM_INDEX = "ix_event_publications_claim_order"
 _ARCHIVE_INDEX = "ix_event_publications_archive_completed_at"
+# MySQL/MariaDB sibling of the claim index: a plain composite index that
+# narrows the sweep's scan to pending rows. No functional or partial index
+# exists there, so the ``coalesce`` ORDER BY stays a filesort — but over the
+# small pending set instead of the whole table, payload bytes and all.
+_MYSQL_PENDING_INDEX = "ix_event_publications_pending_scan"
 
 # The exact ORDER BY expression and the leading filter shared by
 # ``find_incomplete`` and ``claim_batch`` (adapters/postgres_outbox.py). The
@@ -38,6 +43,11 @@ def _is_postgres() -> bool:
     return op.get_context().dialect.name == "postgresql"
 
 
+def _is_mysql_family() -> bool:
+    """Whether this run targets MySQL or MariaDB."""
+    return op.get_context().dialect.name in {"mysql", "mariadb"}
+
+
 def upgrade() -> None:
     # Expression index: both sweep queries end in ``ORDER BY <expr> LIMIT n``,
     # and no index on a plain column can serve that ordering, so without this
@@ -53,6 +63,17 @@ def upgrade() -> None:
             [sa.text(_CLAIM_ORDER)],
             postgresql_where=sa.text(_CLAIM_PREDICATE),
         )
+    elif _is_mysql_family():
+        # MySQL/MariaDB instead get a plain composite index on the pending
+        # predicate's columns. Leading with ``completed_at`` (the selective
+        # ``IS NULL``) narrows the scan to pending rows only; the filesort by
+        # ``coalesce(last_attempt_at, published_at)`` then runs over that
+        # small set instead of the whole table.
+        op.create_index(
+            _MYSQL_PENDING_INDEX,
+            "event_publications",
+            ["completed_at", "is_dead_lettered"],
+        )
 
     # ``purge_completed`` deletes from the archive by ``completed_at``. The
     # archive is append-only until that purge runs, so it is the one outbox
@@ -65,3 +86,5 @@ def downgrade() -> None:
     op.drop_index(_ARCHIVE_INDEX, table_name="event_publications_archive")
     if _is_postgres():
         op.drop_index(_CLAIM_INDEX, table_name="event_publications")
+    elif _is_mysql_family():
+        op.drop_index(_MYSQL_PENDING_INDEX, table_name="event_publications")
