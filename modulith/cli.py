@@ -27,12 +27,14 @@ modulith follows rather than fighting the framework.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import os
 import re
 import shutil
 import sys
+import tomllib
 import traceback
 from collections import defaultdict
 from datetime import timedelta
@@ -984,6 +986,88 @@ def doctor() -> None:
     typer.echo(render_report(report))
     if report.overall_status == "error":
         raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# modulith openapi — build-time OpenAPI aggregation across worker modules
+# ---------------------------------------------------------------------------
+
+
+def _project_version() -> str | None:
+    """Read ``[project].version`` from the nearest pyproject.toml, if any."""
+    pyproject = _find_pyproject()
+    if pyproject is None:
+        return None
+    try:
+        with pyproject.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    version = data.get("project", {}).get("version")
+    return str(version) if version else None
+
+
+@app.command()
+def openapi(
+    output: Path = typer.Option(Path("openapi.json"), help="Where to write the merged spec"),
+    title: str | None = typer.Option(None, help="Spec title (default: the app package name)"),
+    api_version: str | None = typer.Option(
+        None, help="Spec version (default: [project].version, else 0.0.0)"
+    ),
+) -> None:
+    """Aggregate every module's OpenAPI document into one build-time spec.
+
+    Each worker process (see ``modulith._worker.create_app``) only ever
+    serves its own module's document — there is no single running process
+    with the whole application's surface. This command builds that surface
+    offline: importing each module, generating its document in isolation,
+    and merging them (schema names prefixed per module to avoid collisions)
+    into one JSON file suitable for a gateway, an API portal, or
+    client-generation tooling.
+    """
+    from . import openapi as openapi_module
+
+    rt = _bootstrap_or_exit()
+    cfg = rt.config
+    assert cfg is not None  # ensure_bootstrapped guarantees this
+
+    docs: dict[str, dict[str, Any]] = {}
+    skipped: list[str] = []
+    for info in sorted(rt.modules, key=lambda m: m.name):
+        if info.name == cfg.contracts_module:
+            continue
+        module = importlib.import_module(info.package)
+        doc = openapi_module.build_module_openapi(info.name, module)
+        if doc is None:
+            skipped.append(info.name)
+            continue
+        docs[info.name] = doc
+
+    if not docs:
+        typer.echo("error: no module exposes a router — nothing to document", err=True)
+        raise typer.Exit(code=1)
+
+    merged, warnings = openapi_module.merge_openapi(
+        docs,
+        title=title or cfg.package or "modulith",
+        version=api_version or _project_version() or "0.0.0",
+    )
+    for warning in warnings:
+        typer.echo(f"warning: {warning}", err=True)
+
+    try:
+        output.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        typer.echo(
+            f"error: could not write OpenAPI document to {output} ({exc}). "
+            "Create the directory or pass a writable --output path.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
+
+    typer.echo(f"wrote OpenAPI for {len(docs)} module(s) to {output}")
+    if skipped:
+        typer.echo(f"skipped (no router): {', '.join(skipped)}")
 
 
 # ---------------------------------------------------------------------------
