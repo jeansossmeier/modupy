@@ -51,6 +51,14 @@ _INCOMPLETE_BACKLOG_THRESHOLD = 1000
 # timeout as an error instead.
 _OUTBOX_HEALTH_TIMEOUT = 10.0
 
+# Same rationale for the live Redis backlog query — an unresponsive server
+# falls back to the static verdict (see _check_redis_retention) instead of
+# hanging. Ratio thresholds (backlog / max_stream_len) are heuristics: an
+# undersized window is a slow-building risk, not a hard cutoff.
+_REDIS_BACKLOG_TIMEOUT = 10.0
+_REDIS_BACKLOG_WARN_RATIO = 0.5
+_REDIS_BACKLOG_ERROR_RATIO = 0.9
+
 
 # ---------------------------------------------------------------------------
 # Health report aggregation
@@ -616,13 +624,38 @@ def _check_single_host_broker(rt: Runtime) -> HealthCheck:
 # ---------------------------------------------------------------------------
 
 
-def _check_redis_retention(rt: Runtime) -> HealthCheck:
-    """Warn when a redis-streams broker's retention window is undersized.
+async def _redis_backlog(client: Any, prefix: str) -> int:
+    """Return the worst per-stream (pending + lag) backlog across the
+    broker's own streams, ignoring its dead-letter streams.
 
-    Static sizing check: reads the broker's configured ``max_stream_len``
-    and flags it against the adapter's own default. A live backlog check
-    against the running server is a separate, timeout-bounded query and is
-    not part of this function.
+    Not XINFO STREAM's ``length``: a healthy MAXLEN-bounded stream sits at
+    ~max_stream_len permanently, so that would flag every busy deployment.
+    Loss risk instead tracks un-acked (consumer-group pending) plus
+    undelivered (server-side lag) entries against the configured cap — the
+    entries actually at risk of being trimmed before they're processed.
+    """
+    backlog = 0
+    async for raw_key in client.scan_iter(match=f"{prefix}.*", _type="STREAM"):
+        key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+        if key.endswith(".dead"):
+            continue  # bounded independently (dlq_max_stream_len); expected to run near cap
+        for group in await client.xinfo_groups(key):
+            pending = group.get("pending") or 0
+            lag = group.get("lag") or 0
+            backlog = max(backlog, pending + lag)
+    return backlog
+
+
+def _check_redis_retention(rt: Runtime) -> HealthCheck:
+    """Warn when a redis-streams broker's retention window is undersized,
+    then (if a client is available) tighten that verdict with a live query.
+
+    Static: reads the broker's configured ``max_stream_len`` and flags it
+    against the adapter's own default. Live: queries the actual pending+lag
+    backlog and escalates to warn/error as it approaches the cap — bounded
+    by a timeout so an unresponsive server can't hang `doctor` forever, and
+    any exception (including "no server reachable") falls back to the
+    static verdict alone rather than failing the check.
     """
     cfg = rt.config
     if cfg is None or cfg.broker != "redis-streams":
@@ -636,20 +669,47 @@ def _check_redis_retention(rt: Runtime) -> HealthCheck:
 
     from .adapters.redis_broker import _DEFAULT_MAXLEN
 
+    details: list[str] = []
     if maxlen >= _DEFAULT_MAXLEN:
-        return HealthCheck("redis retention", "ok", f"max_stream_len={maxlen}")
-
-    reclaim_min_idle_ms = (cfg.broker_options or {}).get("reclaim_min_idle_ms", 60_000)
-    return HealthCheck(
-        "redis retention",
-        "warn",
-        f"max_stream_len={maxlen} is below the {_DEFAULT_MAXLEN} default",
-        [
+        status = "ok"
+        summary = f"max_stream_len={maxlen}"
+    else:
+        reclaim_min_idle_ms = (cfg.broker_options or {}).get("reclaim_min_idle_ms", 60_000)
+        status = "warn"
+        summary = f"max_stream_len={maxlen} is below the {_DEFAULT_MAXLEN} default"
+        details.append(
             "size max_stream_len >= publish_rate x (consumer_downtime + "
             f"processing_latency + reclaim_min_idle_ms={reclaim_min_idle_ms}) — an "
             "undersized retention window silently drops still-pending entries."
-        ],
-    )
+        )
+
+    client = getattr(broker, "_client", None)
+    prefix = getattr(broker, "_stream_prefix", None)
+    if client is not None and prefix is not None:
+        import asyncio
+
+        try:
+            backlog = asyncio.run(
+                asyncio.wait_for(_redis_backlog(client, prefix), timeout=_REDIS_BACKLOG_TIMEOUT)
+            )
+        except Exception as exc:
+            details.append(f"live backlog check skipped: {exc}")
+        else:
+            ratio = backlog / maxlen if maxlen else 0.0
+            if ratio >= _REDIS_BACKLOG_ERROR_RATIO:
+                status = "error"
+                details.append(
+                    f"live backlog is {ratio:.0%} of max_stream_len={maxlen} "
+                    f"({backlog} pending+lag) — entries are at imminent risk of being trimmed"
+                )
+            elif ratio >= _REDIS_BACKLOG_WARN_RATIO:
+                if status != "error":
+                    status = "warn"
+                details.append(
+                    f"live backlog is {ratio:.0%} of max_stream_len={maxlen} ({backlog} pending+lag)"
+                )
+
+    return HealthCheck("redis retention", status, summary, details)
 
 
 # ---------------------------------------------------------------------------

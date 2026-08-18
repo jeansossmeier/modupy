@@ -1070,3 +1070,127 @@ def test_redis_retention_warns_for_low_maxlen(make_fake_app) -> None:
     check = _check(report, "redis retention")
     assert check.status == "warn"
     assert any("reclaim_min_idle_ms=60000" in d for d in check.details)
+
+
+# ---------------------------------------------------------------------------
+# Redis retention — live backlog
+# ---------------------------------------------------------------------------
+
+
+class _FakeRedisScanClient:
+    """A minimal async Redis double exposing only the two commands the live
+    backlog check issues: SCAN (via ``scan_iter``) to enumerate streams, and
+    XINFO GROUPS per stream for pending/lag counts. Mirrors the hand-rolled
+    ``FakeRedis`` convention in test_redis_broker.py rather than depending on
+    the (not installed) ``fakeredis`` package."""
+
+    def __init__(self, streams: dict[str, list[dict]]) -> None:
+        self._streams = streams
+
+    async def scan_iter(self, *, match: str, _type: str = "STREAM"):
+        for key in self._streams:
+            yield key.encode()
+
+    async def xinfo_groups(self, key: bytes | str) -> list[dict]:
+        name = key.decode() if isinstance(key, bytes) else key
+        return self._streams[name]
+
+    async def aclose(self) -> None:  # pragma: no cover - broker teardown only
+        pass
+
+
+class _RaisingRedisClient:
+    """Simulates a connection failure on the very first Redis command."""
+
+    async def scan_iter(self, *, match: str, _type: str = "STREAM"):
+        raise ConnectionError("connection refused")
+        yield  # pragma: no cover - unreachable; keeps this an async generator
+
+    async def aclose(self) -> None:  # pragma: no cover - broker teardown only
+        pass
+
+
+def _register_fake_redis_broker(
+    client, *, max_stream_len: int, stream_prefix: str = "modulith.events"
+):
+    """Bootstrap, then swap the real redis-streams broker for one wrapping a
+    fake client — the real one (built lazily by ``modulith_register_brokers``,
+    no eager connection) is harmless but must be replaced to control both
+    ``_max_stream_len`` and what the live backlog query sees."""
+    from modulith.adapters.redis_broker import RedisStreamsBroker
+    from modulith.runtime import _runtime
+
+    _runtime.ensure_bootstrapped()
+    registry = _runtime.broker_registry
+    assert registry is not None
+    registry.unregister("redis-streams")
+    broker = RedisStreamsBroker(
+        client=client, stream_prefix=stream_prefix, max_stream_len=max_stream_len
+    )
+    registry.register("redis-streams", broker)
+    return broker
+
+
+def test_redis_retention_live_warns_at_sixty_percent_backlog(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", topology="processes", broker="redis-streams")
+    client = _FakeRedisScanClient(
+        {"modulith.events.orders": [{"name": "modulith", "pending": 600, "lag": 0}]}
+    )
+    _register_fake_redis_broker(client, max_stream_len=1000)
+
+    report = run_doctor()
+
+    check = _check(report, "redis retention")
+    assert check.status == "warn"
+    assert any("60%" in d for d in check.details)
+
+
+def test_redis_retention_live_errors_at_near_full_backlog(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", topology="processes", broker="redis-streams")
+    client = _FakeRedisScanClient(
+        {"modulith.events.orders": [{"name": "modulith", "pending": 950, "lag": 0}]}
+    )
+    _register_fake_redis_broker(client, max_stream_len=1000)
+
+    report = run_doctor()
+
+    check = _check(report, "redis retention")
+    assert check.status == "error"
+
+
+def test_redis_retention_live_ok_when_query_fails(make_fake_app) -> None:
+    """A connection failure during the live check must not fail the doctor
+    CI gate on its own — the static maxlen sizing check already ran and
+    passed, so the check falls back to that result plus a note."""
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", topology="processes", broker="redis-streams")
+    _register_fake_redis_broker(_RaisingRedisClient(), max_stream_len=10_000)
+
+    report = run_doctor()
+
+    check = _check(report, "redis retention")
+    assert check.status == "ok"
+    assert any("skipped" in d for d in check.details)
+
+
+def test_redis_retention_live_ignores_dead_letter_stream(make_fake_app) -> None:
+    """The DLQ stream (``<stream>.dead``) is bounded independently and is
+    expected to run near its own cap — counting it against the primary
+    stream's backlog would falsely flag every deployment with any dead
+    letters at all."""
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", topology="processes", broker="redis-streams")
+    client = _FakeRedisScanClient(
+        {
+            "modulith.events.orders": [{"name": "modulith", "pending": 100, "lag": 0}],
+            "modulith.events.orders.dead": [{"name": "modulith", "pending": 9500, "lag": 0}],
+        }
+    )
+    _register_fake_redis_broker(client, max_stream_len=10_000)
+
+    report = run_doctor()
+
+    check = _check(report, "redis retention")
+    assert check.status == "ok"
