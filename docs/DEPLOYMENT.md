@@ -110,6 +110,17 @@ app that wires the outbox inside a FastAPI lifespan instead (as
 `examples/demo_app` does) gets "no store wired" from the CLI even while the
 server is up; inspect that outbox through the running app.
 
+**Per-module Postgres schema.** To keep a module's outbox and broker tables in a DB schema named after the module (see [per-module DB schema ownership](COOKBOOK.md) in the Cookbook), pass `schema_translate_map` to the engine before handing it to `PostgresPublicationStore` — the store takes the app's engine and saves through the app's bound session, so the map applies to every statement it issues, no store-level code change needed:
+
+```python
+async_engine = create_async_engine(
+    "postgresql+asyncpg://user:pass@localhost/mydb"
+).execution_options(schema_translate_map={None: "orders"})
+store = PostgresPublicationStore(engine=async_engine)
+```
+
+For the database broker, set the schema via `[tool.modulith.broker_options].schema` or the `MODULITH_BROKER_SCHEMA` environment variable (Postgres only — other dialects log a warning and ignore it). Migrations follow the same schema with `-x schema=<name>` or `MODULITH_DB_SCHEMA` (see [Migration Guide](../MIGRATION_GUIDE.md) Step 5).
+
 ---
 
 ## Process-Per-Module Topology
@@ -344,45 +355,25 @@ spec:
                   key: url
 ```
 
-### Process-Per-Module StatefulSet
+### Process-Per-Module: Generated Manifests
 
-For deployments where workers need persistent local state or a stable identity:
+`modulith k8s-manifest` generates one Deployment + Service per module discovered under `--topology processes`, plus a single Ingress fanning out `/<module>` paths to each module's Service:
 
-```yaml
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: myapp-workers
-spec:
-  serviceName: myapp-workers
-  replicas: 3
-  template:
-    spec:
-      containers:
-        - name: worker
-          image: myapp:1.0.0
-          ports:
-            - containerPort: 8000
-          env:
-            - name: MODULITH_BROKER
-              value: "database"
-            - name: MODULITH_BROKER_URL
-              valueFrom:
-                secretKeyRef:
-                  name: broker-creds
-                  key: url
-            # Required by the probes below: on a 0.0.0.0 bind the actuator is
-            # only mounted when a token is configured.
-            - name: MODULITH_ACTUATOR_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: actuator-creds
-                  key: token
-          # Each pod gets a stable hostname for assignment:
-          # myapp-workers-0.myapp-workers.default.svc.cluster.local
+```bash
+modulith k8s-manifest --output k8s/modulith.yaml --image myapp:1.0.0 --namespace prod
 ```
 
-Or with a custom controller that assigns modules per pod (more advanced—document as a separate guide if needed).
+Options: `--output` (default `modulith-k8s.yaml`, `-` for stdout), `--image` (default `<package>:latest`), `--namespace`, `--port` (default `8000`, the port every worker container listens on), `--host` (Ingress host).
+
+Each Deployment's `replicas` comes from that module's `[tool.modulith.workers]` count. Containers run `python -m uvicorn modulith._worker:create_app --factory --host 0.0.0.0 --port <port>`, with `MODULITH_MODULE`, `MODULITH_APP_PACKAGE`, `MODULITH_TOPOLOGY=processes`, and `MODULITH_BROKER` set directly, plus every `broker_options` key as `MODULITH_BROKER_<KEY>`. The broker connection URL is never embedded in the manifest — `MODULITH_BROKER_URL` (and `REDIS_URL` for `redis-streams`) reads from a `secretKeyRef` against a `<package>-broker` Secret, key `url`, that you create once per cluster/namespace:
+
+```bash
+kubectl create secret generic myapp-broker --from-literal=url=<broker connection URL>
+```
+
+Each container also references an optional `<package>-env` Secret via `envFrom` (`optional: true`) for any additional variables (e.g. `MODULITH_DB_URL`) without editing the generated manifest. Readiness uses `httpGet /health`; liveness uses `tcpSocket` on the container port (an HTTP liveness probe would crash-loop a healthy pod whose broker is temporarily down, since `/health` returns 503 in that case). No `resources` or Secret objects are emitted — re-applying the manifest must never clobber real secrets.
+
+`modulith k8s-manifest` refuses to generate manifests for a broker that cannot be shared across pods: `memory`, `shm`, or `database` pointed at a `sqlite://` URL. Configure `database` with a networked URL (`postgresql://`, `mysql://`) or `redis-streams` first.
 
 ---
 
@@ -521,7 +512,7 @@ Three consequences worth knowing:
 - **It cannot be both fresh and cheap.** Fanning out to every worker per request puts an N-worker round trip on a public endpoint; caching serves a schema that silently lags a rolling deploy.
 - **Rollouts have no good answer.** While a worker is respawning, its schema is unavailable — a per-module URL simply returns 502 for that one module, while a merged document must either omit a whole module's API without saying so or fail as a whole.
 
-If you need one document, build it where those answers are yours to make: run an aggregator over the per-module schemas, or keep a checked-in schema generated from the single-process app.
+If you need one document, build it where those answers are yours to make: `modulith openapi` imports every module, generates its document in isolation, and merges them into one build-time spec — every `components.schemas` key is prefixed `<module>_` so identically-named models from different modules never collide, and the unprefixed `/health` path is excluded (it would collide across every module). Options: `--output` (default `openapi.json`), `--title` (default: the app package name), `--api-version` (default: `[project].version` from the nearest `pyproject.toml`, else `0.0.0`). Alternatively, keep a checked-in schema generated from the single-process app.
 
 Single-process topology is unaffected — modulith adds no HTTP routes there, so `/docs` is whatever your own FastAPI app configures.
 
@@ -566,6 +557,8 @@ readinessProbe:
 ```
 
 In single-process topology there is no proxy and no actuator: modulith adds no HTTP routes, so probe whatever endpoint your own app exposes.
+
+**Per-worker-pod probes (generated manifests).** The manifests `modulith k8s-manifest` generates probe each worker pod directly rather than through the proxy: readiness is `httpGet /health` on the container port, and liveness is a `tcpSocket` check on the same port. `/health` returns 503 while that worker's broker consumer isn't ready, which readiness correctly treats as not-yet-serving; liveness intentionally does not use `httpGet`, since a worker whose broker connection is temporarily down would otherwise get killed and restarted for no reason.
 
 ### Event Metrics
 
@@ -633,10 +626,10 @@ Modulith's supervisor handles SIGTERM and drains listeners before exit.
    - Modules now run in separate workers
    - Code doesn't change; listeners stay `@listener` decorated
 
-4. **Extract microservice** — Move one module to a separate FastAPI app
-   - Other modules send events via the broker
-   - The extracted service subscribes and acts
-   - Code is nearly identical; just remove the `@listener` decorator and hook the broker SDK directly
+4. **Extract microservice** — `modulith extract <module>` scaffolds a standalone service
+   - Copies the module plus its contracts into `--output` (default `<module>-service/`) and generates a `pyproject.toml`, `Dockerfile`, `README.md`, and `.env.example` to run it against `modulith._worker:create_app`
+   - Blocked (exit 1) by the module's own outbound boundary violations or tables it shares with another module — `--force` overrides either and records what it overrode in the generated README; a non-empty `--output` directory is never overridable
+   - Other modules keep sending events via the broker; the extracted service subscribes and acts. The outbox is not auto-wired (the app's `main.py` is not copied), so code the worker imports must call `outbox.configure()` itself
 
 This path is why modulith exists: **every module is a potential microservice, but you pay that cost only when it's profitable.**
 

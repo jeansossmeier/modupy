@@ -422,7 +422,13 @@ modulith verify --mode=ratchet    # boundary checks for CI
 modulith docs                     # generate Mermaid diagrams + canvas
 modulith audit                    # analyze existing codebase for migration
                                   # (writes MIGRATION.md; --output to change)
-modulith doctor                   # operational + architectural health
+modulith extract <module>         # scaffold a standalone service from one
+                                  # module (pyproject, Dockerfile, README)
+modulith k8s-manifest             # generate per-module Deployment/Service +
+                                  # one Ingress for --topology=processes
+modulith openapi                  # merge every module's OpenAPI doc into one
+                                  # build-time spec (schemas prefixed per module)
+modulith doctor                   # nine operational + architectural health checks
 modulith outbox status            # outbox metrics (needs a durable outbox —
                                   # the default 'memory' store has nothing to
                                   # report and exits 1)

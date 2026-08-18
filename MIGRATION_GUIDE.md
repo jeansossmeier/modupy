@@ -220,6 +220,12 @@ MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
 fails with "No 'script_location' key found" because there is no
 alembic.ini in your project root.)
 
+To put the outbox tables in a Postgres schema named after a module instead of
+`public`, add `-x schema=<name>` (or set `MODULITH_DB_SCHEMA`) — Postgres only;
+other dialects log a warning and ignore it. This is separate from, but usually
+paired with, the database broker's own `broker_options.schema` /
+`MODULITH_BROKER_SCHEMA` knob.
+
 Wire your SQLAlchemy session to modulith:
 ```python
 # app/main.py
@@ -374,10 +380,22 @@ service:
 3. The remaining monolith publishes to a broker; the new service consumes
 4. Database split happens here — usually the hardest part
 
-Modulith doesn't help you with the database split (that's a real
-data migration project) but the contracts module and the events
-already give you the API boundary. You're extracting infrastructure,
-not code.
+`modulith extract <module>` scaffolds step 1-3's plumbing — it copies the
+module plus its contracts into a standalone service tree with a generated
+`pyproject.toml`, `Dockerfile`, and `README.md` — but it refuses (exit 1,
+overridable with `--force`) when the module still shares a table with
+another module, since that's exactly the coupling a process split can't
+paper over. If a `ForeignKey("table.col")` string literal exists somewhere in
+your codebase pointing at a table another module owns, `modulith verify`
+surfaces it as a `data-ownership` warning; run `modulith verify
+--update-baseline` to grandfather existing findings the same way you would
+any other ratcheted violation (Step 3), then work through them before or
+after extraction.
+
+Modulith doesn't do the database split for you (that's a real data
+migration project) but the contracts module, the events, and now
+`modulith extract` give you the API boundary and the scaffolding. You're
+extracting infrastructure, not code.
 
 ---
 

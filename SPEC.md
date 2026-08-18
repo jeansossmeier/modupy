@@ -544,7 +544,7 @@ The built-in verifier in `modulith/builtin/verifier.py` ships these rules:
 2. **No cyclic dependencies** — the module dependency graph must be a DAG
 3. **Declared dependencies match observed** — if a manifest declares `declared_dependencies=["payments"]`, only those modules may be imported (when manifest is present)
 4. **Events flow through contracts module** — cross-module type imports must come from `myapp.contracts.*`, not from another module's package
-5. **Module data ownership** — when manifests declare `owns_tables=[...]`, queries against another module's tables are violations
+5. **Module data ownership** — when manifests declare `owns_tables=[...]`, queries against another module's tables are violations, including a `ForeignKey("table.col")` string literal pointing at a table another module owns; a module with a non-empty `owns_tables` also gets a warning for any table it defines but omits from that list, so the manifest stays a complete inventory
 
 ### 8.2 The AST-Based Verifier
 
@@ -593,10 +593,14 @@ Output is Markdown. Teams can run it on Friday afternoon, generate a baseline, h
 `modulith doctor` reports operational and architectural health:
 
 - **Boundary health**: violation count, baseline drift over the last N commits
-- **Process-split readiness**: percentage of cross-module interactions that are events vs direct calls (the "are you ready to split this module?" metric)
+- **Process-split readiness**: percentage of cross-module interactions that are events vs direct calls (the "are you ready to split this module?" metric), plus per-module counts of cross-module table references and of tables not prefixed with the module's name — the "microservice-ready" tier requires zero cross-module table references
 - **Schema drift**: events whose field definitions (name, annotation, default — fingerprinted via AST) changed since the last doctor run. The check is an unconditional fingerprint diff against a cache file (`.modulith-schemas.json`): it flags *every* definition change as the cue to version consciously — it does not read or compare any `schema_version` attribute
 - **Outbox health**: dead-lettered count, oldest incomplete event age
 - **Listener registration coverage**: declared listeners vs actually-registered listeners
+- **SHM notifier**: whether each SHM broker's hint ring actually attached (a `shm_capacity` change on an existing hint file leaves the notifier dead — delivery still works, only slower)
+- **Actuator token**: under `topology = "processes"`, whether the actuator would start unmounted (`auto` mode, no `MODULITH_ACTUATOR_TOKEN`, non-loopback bind) or refuse to start (`token` mode, no token)
+- **Single-host broker**: a per-host broker (`shm`, or `database` on embedded SQLite) configured under a detected container runtime — a warning under Docker, an error under Kubernetes when `production = true`
+- **Redis retention**: a `redis-streams` `max_stream_len` below the safe minimum, tightened by a live pending+lag backlog query when a client is reachable
 
 Same machinery as `modulith doctor` in Spring Modulith's spirit but expanded to operational concerns.
 
@@ -1066,7 +1070,7 @@ From the brutal-truth analysis. Each gap has a concrete mitigation.
 
 ### Gap 2: The "modulith now, microservices later" promise has a hidden cliff
 
-**Mitigation:** module-level data ownership rules ([§8.1](#81-the-default-rules)) + `modulith doctor` ([§8.5](#85-the-doctor-command)). Users see their split-readiness as a number. We document the cliff explicitly: "no rewrites for the messaging layer; database boundaries are a separate decision."
+**Mitigation:** module-level data ownership rules ([§8.1](#81-the-default-rules)) + `modulith doctor` ([§8.5](#85-the-doctor-command)). Users see their split-readiness as a number. We document the cliff explicitly: "no rewrites for the messaging layer; database boundaries are a separate decision." Tooling now closes part of that data half: `doctor`'s process-split readiness check counts cross-module table references (not just imports) and reports tables not prefixed with their owning module's name; the verifier's `data-ownership` rule detects `ForeignKey("table.col")` string literals pointing at another module's table, not just `Table()`/`__tablename__` declarations; a per-module Postgres schema knob (`broker_options.schema`/`MODULITH_BROKER_SCHEMA` for the broker, `-x schema=`/`MODULITH_DB_SCHEMA` for migrations) gives modules physically separate storage; and `modulith extract` refuses (without `--force`) to scaffold a module that still shares a table with another module. What remains manual: actually moving a shared table's data to its owning module, and choosing the schema-vs-prefix convention per table — the tooling detects and reports the coupling, it does not resolve it.
 
 ### Gap 3: The async assumption is hostile to existing FastAPI codebases
 

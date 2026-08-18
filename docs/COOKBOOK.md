@@ -218,6 +218,18 @@ at bootstrap. Note the distinction on `declared_dependencies`: **omitting it**
 (the default `None`) leaves the verifier's dependency rule off; an **explicit
 empty list** means "depends on nothing" (deny-all, contracts excepted).
 
+**Per-module DB schema ownership.** Every table a module defines belongs in
+its `owns_tables` list. The table's name then carries the module as either a
+prefix (`inventory_stock_levels`) or a DB schema (`inventory.stock_levels`) —
+`owns_tables` itself always holds the bare table name (`stock_levels`); a DB
+schema is where the table lives, not part of its identity. If a module
+declares a non-empty `owns_tables`, the verifier's `data-ownership` rule warns
+on any table the module defines (`Table("x")` or `__tablename__`) but doesn't
+list — the manifest is meant to stay a complete inventory of the module's
+data. `modulith doctor`'s process-split readiness check separately reports,
+per module, how many defined tables aren't prefixed with the module's name —
+informational, not a failure.
+
 ---
 
 ## 6. Enable the durable Postgres outbox
@@ -317,6 +329,41 @@ The default strategy needs the lease columns, which arrive in migration
 `0003_outbox_claim_leases`: migrate to `head`, not to `0001_initial`. These are
 `outbox.configure()` keyword arguments, not pyproject keys — see the note under
 recipe 7 about `[tool.modulith.outbox_options]`.
+
+### Putting the outbox in a per-module schema
+
+To keep a module's outbox tables in a Postgres schema named after the module
+(see recipe 5's per-module DB schema ownership convention), set a
+`schema_translate_map` on the engine before passing it to
+`PostgresPublicationStore` — no store-level configuration exists because the
+store just uses whatever engine it's given:
+
+```python
+async_engine = create_async_engine(db_url).execution_options(
+    schema_translate_map={None: "orders"}
+)
+store = PostgresPublicationStore(engine=async_engine)
+```
+
+Run the migration against the same schema with `-x schema=<name>` or
+`MODULITH_DB_SCHEMA`:
+
+```bash
+MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
+  alembic -c "$(python -c 'import modulith.adapters, pathlib; print(pathlib.Path(modulith.adapters.__file__).parent / "alembic.ini")')" \
+  upgrade head -x schema=orders
+```
+
+This is Postgres-only; `alembic`'s `--sql` offline mode combined with a schema
+exits with an error, since there's no live connection to carry the
+translation map.
+
+The database broker (recipe 8) takes the equivalent knob on its own engine:
+`[tool.modulith.broker_options].schema`, or the environment variable
+`MODULITH_BROKER_SCHEMA` (which wins, like every other `broker_options` key).
+It must match `^[A-Za-z_][A-Za-z0-9_]*$` and, like the outbox knob above, only
+applies on the Postgres dialect — on any other dialect it's logged and
+ignored.
 
 ---
 
