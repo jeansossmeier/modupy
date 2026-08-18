@@ -77,7 +77,7 @@ from modulith import (
     hookimpl,
 )
 
-from ..config import MAX_PAYLOAD_BYTES, DEFAULT_MAX_PAYLOAD_BYTES
+from ..config import DEFAULT_MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES
 
 logger = logging.getLogger("modulith.adapters.redis")
 
@@ -149,10 +149,7 @@ class RedisStreamsBroker:
         self._dlq_max_stream_len = (
             dlq_max_stream_len if dlq_max_stream_len is not None else max_stream_len * 10
         )
-        if (
-            type(max_payload_bytes) is not int
-            or not 1 <= max_payload_bytes <= MAX_PAYLOAD_BYTES
-        ):
+        if type(max_payload_bytes) is not int or not 1 <= max_payload_bytes <= MAX_PAYLOAD_BYTES:
             raise ConfigurationError(
                 f"max_payload_bytes must be an integer between 1 and "
                 f"{MAX_PAYLOAD_BYTES}, got {max_payload_bytes!r}"

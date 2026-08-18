@@ -42,11 +42,11 @@ from ..config import (
     _SHM_MAX_DELIVERY_ATTEMPTS,
     _SHM_MAX_DISPATCH_CONCURRENCY,
     _SHM_MAX_HINT_CAPACITY,
-    MAX_PAYLOAD_BYTES,
     _SHM_MAX_STORE_BYTES,
-    DEFAULT_SHM_BROKER_DB_FILENAME,
     DEFAULT_MAX_PAYLOAD_BYTES,
+    DEFAULT_SHM_BROKER_DB_FILENAME,
     DEFAULT_SHM_MAX_STORE_BYTES,
+    MAX_PAYLOAD_BYTES,
     _validate_shm_broker_options,
 )
 from ._polling_consumer import PollingConsumer
