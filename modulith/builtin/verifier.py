@@ -596,19 +596,22 @@ def _check_declared_dependencies(
 # ---------------------------------------------------------------------------
 
 
-def _collect_table_refs(module: ModuleInfo) -> list[tuple[str, str]]:
-    """Find table references; return (table_name, location).
+def _collect_table_refs(module: ModuleInfo) -> list[tuple[str, str, str]]:
+    """Find table references; return (table_name, location, kind).
 
-    Detects both SQLAlchemy Core ``Table("name")`` calls and the declarative
-    ORM ``__tablename__ = "name"`` assignment (the dominant pattern). Mirrors
-    ``modulith.audit._string_table_refs`` so the two agree on
-    what counts as a table reference — without it, ownership violations on
-    declarative models went undetected.
+    ``kind`` is ``"define"`` for a table the module establishes (SQLAlchemy
+    Core ``Table("name")`` or the declarative ORM ``__tablename__ = "name"``
+    assignment — the dominant patterns) and ``"reference"`` for a table the
+    module merely points at (a ``ForeignKey("[schema.]table.column")``
+    string literal — the schema-qualified form resolves to the table via its
+    second-to-last dotted segment). Mirrors ``modulith.audit._string_table_refs``
+    so the two agree on what counts as a table reference — without it,
+    ownership violations on declarative models went undetected.
     """
     root = _package_dir(module.package)
     if root is None:
         return []
-    refs: list[tuple[str, str]] = []
+    refs: list[tuple[str, str, str]] = []
     for path in sorted(root.rglob("*.py")):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -622,10 +625,17 @@ def _collect_table_refs(module: ModuleInfo) -> list[tuple[str, str]]:
                     if isinstance(func, ast.Name)
                     else (func.attr if isinstance(func, ast.Attribute) else None)
                 )
+                location = f"{_portable_path(path, module)}:{node.lineno}"
                 if name == "Table" and node.args:
                     first = node.args[0]
                     if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                        refs.append((first.value, f"{_portable_path(path, module)}:{node.lineno}"))
+                        refs.append((first.value, location, "define"))
+                elif name == "ForeignKey" and node.args:
+                    first = node.args[0]
+                    if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                        parts = first.value.split(".")
+                        if len(parts) >= 2:
+                            refs.append((parts[-2], location, "reference"))
             elif isinstance(node, ast.Assign):
                 for target in node.targets:
                     if (
@@ -635,9 +645,31 @@ def _collect_table_refs(module: ModuleInfo) -> list[tuple[str, str]]:
                         and isinstance(node.value.value, str)
                     ):
                         refs.append(
-                            (node.value.value, f"{_portable_path(path, module)}:{node.lineno}")
+                            (
+                                node.value.value,
+                                f"{_portable_path(path, module)}:{node.lineno}",
+                                "define",
+                            )
                         )
     return refs
+
+
+def _table_owners(all_modules: list[ModuleInfo]) -> dict[str, set[str]]:
+    """Table name -> set of module names declaring ownership via manifest.
+
+    Two manifests claiming the same table is a manifest-authoring conflict
+    that must be surfaced, not silently resolved last-write-wins — hence a
+    *set* of claimants per table rather than a single owner.
+    """
+    from modulith.manifest import all_manifests
+
+    owners_of: dict[str, set[str]] = {}
+    pkg_to_name = {m.package: m.name for m in all_modules}
+    for pkg, manifest in all_manifests().items():
+        owner_name = pkg_to_name.get(pkg, pkg.rsplit(".", 1)[-1])
+        for table in manifest.owns_tables:
+            owners_of.setdefault(table, set()).add(owner_name)
+    return owners_of
 
 
 def _check_data_ownership(
@@ -646,26 +678,12 @@ def _check_data_ownership(
 ) -> list[Violation]:
     """Rule 5: flag references to tables owned by another module (warning).
 
-    Ownership is tracked as table -> *set* of declaring modules: two
-    manifests claiming the same table is a manifest-authoring conflict that
-    must be surfaced, not silently resolved last-write-wins — which both
-    hid the conflict and falsely flagged the first-declared owner
-    as the offender. A module that co-declared ownership is never flagged for
-    referencing the table; the conflict itself is reported instead.
+    A module that co-declared ownership of a conflicted table is never
+    flagged for referencing it; the conflict itself is reported instead.
     """
-    from modulith.manifest import all_manifests
-
-    manifests = all_manifests()
-    if not manifests:
+    owners_of = _table_owners(all_modules)
+    if not owners_of:
         return []
-
-    # table name -> set of module names declaring ownership
-    owners_of: dict[str, set[str]] = {}
-    pkg_to_name = {m.package: m.name for m in all_modules}
-    for pkg, manifest in manifests.items():
-        owner_name = pkg_to_name.get(pkg, pkg.rsplit(".", 1)[-1])
-        for table in manifest.owns_tables:
-            owners_of.setdefault(table, set()).add(owner_name)
 
     violations: list[Violation] = []
     for table, claimants in sorted(owners_of.items()):
@@ -684,7 +702,7 @@ def _check_data_ownership(
                 )
             )
 
-    for table, location in _collect_table_refs(module):
+    for table, location, _kind in _collect_table_refs(module):
         owners = owners_of.get(table)
         if owners is None or module.name in owners:
             continue

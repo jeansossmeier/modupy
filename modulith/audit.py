@@ -278,7 +278,12 @@ def _find_cross_module_imports(
 
 
 def _string_table_refs(tree: ast.Module) -> set[str]:
-    """Table names referenced in a module via ``Table("x")`` or ``__tablename__``."""
+    """Table names referenced in a module via ``Table("x")``, ``__tablename__``,
+    or a ``ForeignKey("[schema.]table.column")`` string literal.
+
+    Mirrors ``modulith.builtin.verifier._collect_table_refs`` so the audit and
+    the boundary verifier agree on what counts as a table reference.
+    """
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
@@ -294,6 +299,12 @@ def _string_table_refs(tree: ast.Module) -> set[str]:
                 first = node.args[0]
                 if isinstance(first, ast.Constant) and isinstance(first.value, str):
                     names.add(first.value)
+            elif fname == "ForeignKey" and node.args:
+                first = node.args[0]
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    parts = first.value.split(".")
+                    if len(parts) >= 2:
+                        names.add(parts[-2])
         elif isinstance(node, ast.Assign):
             for target in node.targets:
                 if (

@@ -215,7 +215,13 @@ def _check_split_readiness(rt: Runtime) -> HealthCheck:
     process split; ``publish()`` calls are the event-shaped interactions
     that survive it.
     """
-    from .builtin.verifier import _collect_imports, _configured_contracts_module, _owning_module
+    from .builtin.verifier import (
+        _collect_imports,
+        _collect_table_refs,
+        _configured_contracts_module,
+        _owning_module,
+        _table_owners,
+    )
 
     modules = rt.modules
     contracts_module = _configured_contracts_module()
@@ -237,6 +243,21 @@ def _check_split_readiness(rt: Runtime) -> HealthCheck:
         direct_total += direct
         publish_total += _count_publish_calls(rt, module)
 
+    # Cross-module table references (a shared table another module owns)
+    # are a coupling the import/publish ratio can't see: the modules never
+    # import each other, yet the tables can't split cleanly across processes.
+    owners_of = _table_owners(modules)
+    table_refs_by_module: dict[str, int] = {}
+    cross_module_table_refs = 0
+    for module in modules:
+        count = 0
+        for table, _location, _kind in _collect_table_refs(module):
+            owners = owners_of.get(table)
+            if owners and module.name not in owners:
+                count += 1
+        table_refs_by_module[module.name] = count
+        cross_module_table_refs += count
+
     total = direct_total + publish_total
     if total == 0:
         return HealthCheck("process-split readiness", "ok", "no cross-module interactions detected")
@@ -249,13 +270,23 @@ def _check_split_readiness(rt: Runtime) -> HealthCheck:
     # CI gate, and a low score is the framework's own recommended starting
     # state for a migration, not a defect.
     if score >= 95:
-        status, tier = "ok", " — microservice-ready"
+        if cross_module_table_refs == 0:
+            status, tier = "ok", " — microservice-ready"
+        else:
+            # The event ratio alone qualifies for microservice-ready, but a
+            # shared table still couples the modules at the data layer.
+            status, tier = "ok", " — process-split ready (shared tables block extraction)"
     elif score >= 80:
         status, tier = "ok", " — process-split ready"
     else:
         status, tier = "warn", ""
     top = sorted(direct_by_module.items(), key=lambda kv: -kv[1])[:5]
     details = [f"{name}: {n} direct cross-module import(s)" for name, n in top if n]
+    details.extend(
+        f"{name}: {n} cross-module table reference(s)"
+        for name, n in sorted(table_refs_by_module.items(), key=lambda kv: -kv[1])[:5]
+        if n
+    )
     return HealthCheck(
         "process-split readiness",
         status,
