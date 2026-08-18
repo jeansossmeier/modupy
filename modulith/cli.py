@@ -912,6 +912,106 @@ def docs(
 
 
 # ---------------------------------------------------------------------------
+# modulith extract — scaffold a standalone service from one module
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def extract(
+    module: str = typer.Argument(..., help="Module to extract into its own service"),
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        help="Directory to write the extracted service (default: <module>-service)",
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Extract despite boundary violations or shared tables"
+    ),
+) -> None:
+    """Scaffold a standalone service (pyproject, Dockerfile, README) from one module.
+
+    Copies the module plus its contracts into --output and generates the
+    files needed to run it as its own process via
+    ``modulith._worker:create_app``. Exit codes: 0 on success, 1 on an
+    unknown module, boundary violations / shared tables not overridden by
+    --force, or a non-empty --output directory (never overridable).
+    """
+    from .extract import extraction_blockers, write_extraction
+
+    rt = _bootstrap_or_exit()
+    known = {m.name for m in rt.modules}
+    if module not in known:
+        available = ", ".join(sorted(known)) if known else "(none discovered)"
+        typer.echo(f"error: unknown module {module!r}. Available modules: {available}", err=True)
+        raise typer.Exit(code=1)
+
+    if output is None:
+        output = Path(f"{module}-service")
+    if output.exists() and any(output.iterdir()):
+        typer.echo(f"error: --output {output} already exists and is not empty", err=True)
+        raise typer.Exit(code=1)
+
+    cfg = rt.config
+    assert cfg is not None and cfg.package is not None  # guaranteed by _bootstrap_or_exit
+
+    violations = _collect_violations(rt)
+    blockers = extraction_blockers(rt, module, violations)
+
+    target = next(m for m in rt.modules if m.name == module)
+    inbound = sorted(
+        {
+            other.name
+            for other in rt.modules
+            if other.name != module
+            for record in verifier._collect_imports(other)
+            if record.target_module == target.package
+            or record.target_module.startswith(target.package + ".")
+        }
+    )
+    if inbound:
+        typer.echo(f"note: also imported by: {', '.join(inbound)}")
+
+    if blockers and not force:
+        typer.echo("error: extraction blocked:", err=True)
+        for blocker in blockers:
+            typer.echo(f"  {blocker}", err=True)
+        typer.echo("Pass --force to extract anyway.", err=True)
+        raise typer.Exit(code=1)
+
+    package_dir = verifier._package_dir(cfg.package)
+    if package_dir is None:
+        typer.echo(f"error: could not resolve package directory for {cfg.package!r}", err=True)
+        raise typer.Exit(code=1)
+
+    helpers = sorted(
+        {
+            record.target_module
+            for record in verifier._collect_imports(target)
+            if (
+                record.target_module == cfg.package
+                or record.target_module.startswith(cfg.package + ".")
+            )
+            and verifier._owning_module(record.target_module, rt.modules) is None
+            and record.target_module != f"{cfg.package}.{cfg.contracts_module}"
+            and not record.target_module.startswith(f"{cfg.package}.{cfg.contracts_module}.")
+        }
+    )
+
+    notes = blockers if (blockers and force) else []
+    written = write_extraction(
+        cfg=cfg,
+        module=module,
+        package_dir=package_dir,
+        output=output,
+        helpers=helpers,
+        notes=notes,
+    )
+    typer.echo(f"extracted {module!r} to {output} ({len(written)} file(s)):")
+    for name in written:
+        typer.echo(f"  {name}")
+
+
+# ---------------------------------------------------------------------------
 # modulith audit — analyze an existing codebase
 # ---------------------------------------------------------------------------
 
