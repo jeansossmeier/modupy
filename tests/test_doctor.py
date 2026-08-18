@@ -205,6 +205,50 @@ def test_split_readiness_warns_on_direct_coupling(make_fake_app) -> None:
     assert any("orders" in d for d in check.details)
 
 
+def test_split_readiness_shared_tables_block_microservice_tier(make_fake_app) -> None:
+    # A ForeignKey into a table owned by another module is cross-module
+    # coupling the import/publish ratio can't see on its own — at 100%
+    # event-driven the report would otherwise call this "microservice-ready"
+    # while a shared table still blocks a clean extraction.
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event, publish
+                import sqlalchemy as sa
+
+                customer_id = sa.Column(sa.ForeignKey("customers.id"))
+
+                @event
+                @dataclass(frozen=True)
+                class OrderPlaced:
+                    order_id: str
+
+                async def place(order_id: str) -> None:
+                    await publish(OrderPlaced(order_id=order_id))
+            """,
+            "customers": "",
+        },
+        extra_files={
+            "customers/_manifest.py": """
+                from modulith.manifest import declare_module
+
+                declare_module(owns_tables=["customers"])
+            """
+        },
+    )
+    configure(package="fakeapp")
+
+    report = run_doctor()
+
+    check = _check(report, "process-split readiness")
+    assert check.status == "ok"
+    assert "100%" in check.summary
+    assert "process-split ready" in check.summary
+    assert "microservice-ready" not in check.summary
+    assert any("1 cross-module table reference(s)" in d for d in check.details)
+
+
 # ---------------------------------------------------------------------------
 # Schema drift
 # ---------------------------------------------------------------------------

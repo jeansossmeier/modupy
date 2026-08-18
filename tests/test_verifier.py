@@ -442,5 +442,97 @@ def test_data_ownership_flags_declarative_tablename(make_fake_app) -> None:
         manifest_module._reset_for_testing()
 
 
+# ---------------------------------------------------------------------------
+# regression: F2 cross-module DB coupling via ForeignKey string literals
+# ---------------------------------------------------------------------------
+
+
+def test_data_ownership_flags_foreign_key_string_literal(make_fake_app) -> None:
+    # Rule 5 must detect a table referenced via a SQLAlchemy ``ForeignKey``
+    # string literal, not only ``Table("x")``/``__tablename__`` definitions.
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+    make_fake_app(
+        {
+            "customers": "",
+            "orders": """
+                import sqlalchemy as sa
+
+                customer_id = sa.Column(sa.ForeignKey("customers.id"))
+            """,
+        }
+    )
+    manifest_module._manifests["fakeapp.customers"] = manifest_module.Manifest(
+        package="fakeapp.customers", owns_tables=("customers",)
+    )
+    try:
+        mods = [_module("customers"), _module("orders")]
+        violations = verifier.modulith_verify_module(_module("orders"), mods)
+        ownership = [v for v in violations if v.rule == "data-ownership"]
+        assert len(ownership) == 1
+        assert "customers" in ownership[0].message
+        assert ownership[0].location is not None
+        assert ownership[0].location.rsplit(":", 1)[-1].isdigit()
+    finally:
+        manifest_module._reset_for_testing()
+
+
+def test_data_ownership_flags_schema_qualified_foreign_key(make_fake_app) -> None:
+    # A schema-qualified FK target ("schema.table.column") must resolve to
+    # the table name (second-to-last dotted segment), not the full string.
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+    make_fake_app(
+        {
+            "customers": "",
+            "orders": """
+                import sqlalchemy as sa
+
+                customer_id = sa.Column(sa.ForeignKey("crm.customers.id"))
+            """,
+        }
+    )
+    manifest_module._manifests["fakeapp.customers"] = manifest_module.Manifest(
+        package="fakeapp.customers", owns_tables=("customers",)
+    )
+    try:
+        mods = [_module("customers"), _module("orders")]
+        violations = verifier.modulith_verify_module(_module("orders"), mods)
+        ownership = [v for v in violations if v.rule == "data-ownership"]
+        assert len(ownership) == 1
+        assert "customers" in ownership[0].message
+    finally:
+        manifest_module._reset_for_testing()
+
+
+def test_data_ownership_ignores_foreign_key_within_owning_module(make_fake_app) -> None:
+    # A module referencing, via ForeignKey, a table it owns itself is not a
+    # violation — only cross-module references are flagged.
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+    make_fake_app(
+        {
+            "customers": """
+                import sqlalchemy as sa
+
+                parent_id = sa.Column(sa.ForeignKey("customers.id"))
+            """,
+        }
+    )
+    manifest_module._manifests["fakeapp.customers"] = manifest_module.Manifest(
+        package="fakeapp.customers", owns_tables=("customers",)
+    )
+    try:
+        mods = [_module("customers")]
+        violations = verifier.modulith_verify_module(_module("customers"), mods)
+        ownership = [v for v in violations if v.rule == "data-ownership"]
+        assert ownership == []
+    finally:
+        manifest_module._reset_for_testing()
+
+
 # Keep ImportRecord referenced for import-time coverage of the dataclass.
 assert ImportRecord is not None

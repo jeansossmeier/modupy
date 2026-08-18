@@ -147,6 +147,66 @@ def test_detects_tables_shared_across_modules(tmp_path: Path) -> None:
     assert "stock" not in result.shared_tables
 
 
+def test_shared_tables_include_foreign_key_references(tmp_path: Path) -> None:
+    """A ``ForeignKey("customers.id")`` string literal in one module,
+    pointing at a table ``__tablename__``-defined in another, is
+    cross-module table coupling — the same signal as two modules both
+    calling ``Table("x")`` directly."""
+    root = tmp_path / "myapp"
+    _write(root, "__init__.py", "")
+    _write(
+        root,
+        "customers/models.py",
+        """
+        from sqlalchemy.orm import DeclarativeBase
+
+        class Base(DeclarativeBase):
+            pass
+
+        class Customer(Base):
+            __tablename__ = "customers"
+        """,
+    )
+    _write(root, "customers/__init__.py", "")
+    _write(
+        root,
+        "orders/models.py",
+        """
+        import sqlalchemy as sa
+
+        customer_id = sa.Column(sa.ForeignKey("customers.id"))
+        """,
+    )
+    _write(root, "orders/__init__.py", "")
+
+    result = audit_codebase(root)
+
+    assert result.shared_tables == ["customers"]
+
+    no_fk_root = tmp_path / "noref"
+    _write(no_fk_root, "__init__.py", "")
+    _write(
+        no_fk_root,
+        "customers/models.py",
+        """
+        from sqlalchemy.orm import DeclarativeBase
+
+        class Base(DeclarativeBase):
+            pass
+
+        class Customer(Base):
+            __tablename__ = "customers"
+        """,
+    )
+    _write(no_fk_root, "customers/__init__.py", "")
+    _write(no_fk_root, "orders/__init__.py", "")
+
+    no_fk_result = audit_codebase(no_fk_root)
+
+    # Readiness formula is deliberately untouched by table coupling.
+    assert result.readiness_score == no_fk_result.readiness_score
+
+
 # ---------------------------------------------------------------------------
 # Listener candidates
 # ---------------------------------------------------------------------------
