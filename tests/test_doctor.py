@@ -904,3 +904,381 @@ def test_doctor_cli_passes_with_low_readiness_score(make_fake_app, monkeypatch) 
 
     assert result.exit_code == 0, result.output
     assert "⚠ process-split readiness" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Actuator token
+# ---------------------------------------------------------------------------
+
+
+def test_actuator_check_ok_for_single_process_topology(make_fake_app) -> None:
+    """The actuator proxy only exists under topology='processes' — nothing to
+    warn about for the default single-process topology."""
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp")
+
+    report = run_doctor()
+
+    check = _check(report, "actuator token")
+    assert check.status == "ok"
+
+
+def test_actuator_check_ok_when_mode_is_disabled(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+    configure(
+        package="fakeapp", topology="processes", broker="testbroker", actuator_mode="disabled"
+    )
+
+    report = run_doctor()
+
+    check = _check(report, "actuator token")
+    assert check.status == "ok"
+
+
+def test_actuator_check_ok_when_mode_is_open(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", topology="processes", broker="testbroker", actuator_mode="open")
+
+    report = run_doctor()
+
+    check = _check(report, "actuator token")
+    assert check.status == "ok"
+
+
+def test_actuator_check_ok_when_token_is_configured(make_fake_app, monkeypatch) -> None:
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_ACTUATOR_TOKEN", "s3cret")
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+
+    report = run_doctor()
+
+    check = _check(report, "actuator token")
+    assert check.status == "ok"
+
+
+def test_actuator_check_warns_when_token_mode_has_no_token(make_fake_app, monkeypatch) -> None:
+    make_fake_app({"orders": ""})
+    monkeypatch.delenv("MODULITH_ACTUATOR_TOKEN", raising=False)
+    configure(package="fakeapp", topology="processes", broker="testbroker", actuator_mode="token")
+
+    report = run_doctor()
+
+    check = _check(report, "actuator token")
+    assert check.status == "warn"
+    assert "refuse to start" in check.summary
+
+
+def test_actuator_check_warns_when_auto_mode_has_no_token(make_fake_app, monkeypatch) -> None:
+    """'auto' mode with no token leaves /_modulith/* unmounted under the
+    conditions 'modulith run' hits by default (0.0.0.0 bind) — the doctor
+    check must name both, since 'refuse to start' would be the wrong fix here
+    (the app *starts*; only the actuator proxy is skipped)."""
+    make_fake_app({"orders": ""})
+    monkeypatch.delenv("MODULITH_ACTUATOR_TOKEN", raising=False)
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+
+    report = run_doctor()
+
+    check = _check(report, "actuator token")
+    assert check.status == "warn"
+    assert "UNMOUNTED" in check.summary
+    assert "0.0.0.0" in check.summary
+
+
+# ---------------------------------------------------------------------------
+# Single-host broker
+# ---------------------------------------------------------------------------
+
+
+def test_single_host_broker_ok_for_single_process_topology(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp")
+
+    report = run_doctor()
+
+    check = _check(report, "single-host broker")
+    assert check.status == "ok"
+
+
+def test_single_host_broker_ok_for_host_independent_broker(make_fake_app, monkeypatch) -> None:
+    """A broker scheme that isn't the embedded-sqlite 'database' or 'shm' is
+    host-independent — even under a detected container runtime, there is
+    nothing to warn about."""
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+
+    report = run_doctor()
+
+    check = _check(report, "single-host broker")
+    assert check.status == "ok"
+
+
+def test_single_host_broker_warns_for_sqlite_under_kubernetes(
+    make_fake_app, monkeypatch, tmp_path
+) -> None:
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+    configure(
+        package="fakeapp",
+        topology="processes",
+        broker="database",
+        broker_options={"url": f"sqlite+aiosqlite:///{tmp_path}/test.db"},
+    )
+
+    report = run_doctor()
+
+    check = _check(report, "single-host broker")
+    assert check.status == "warn"
+
+
+def test_single_host_broker_errors_for_sqlite_under_kubernetes_in_production(
+    make_fake_app, monkeypatch, tmp_path
+) -> None:
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+    configure(
+        package="fakeapp",
+        topology="processes",
+        broker="database",
+        broker_options={"url": f"sqlite+aiosqlite:///{tmp_path}/test.db"},
+        production=True,
+        outbox="memory",
+    )
+
+    report = run_doctor()
+
+    check = _check(report, "single-host broker")
+    assert check.status == "error"
+
+
+def test_single_host_broker_warns_for_sqlite_under_docker_marker(
+    make_fake_app, monkeypatch, tmp_path
+) -> None:
+    from modulith import doctor as doctor_module
+
+    make_fake_app({"orders": ""})
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    marker = tmp_path / "dockerenv-marker"
+    marker.write_text("")
+    monkeypatch.setattr(doctor_module, "_CONTAINER_MARKERS", (marker,))
+    monkeypatch.setattr(doctor_module, "_CGROUP_PATH", tmp_path / "no-such-cgroup-file")
+    configure(
+        package="fakeapp",
+        topology="processes",
+        broker="database",
+        broker_options={"url": f"sqlite+aiosqlite:///{tmp_path}/test.db"},
+    )
+
+    report = run_doctor()
+
+    check = _check(report, "single-host broker")
+    assert check.status == "warn"
+
+
+def test_single_host_broker_ok_when_no_container_runtime_detected(
+    make_fake_app, monkeypatch, tmp_path
+) -> None:
+    """Neutralise all three detection sources — env, marker files, and the
+    cgroup path — since CI itself may run inside a container and would
+    otherwise leak a false positive into this negative test."""
+    from modulith import doctor as doctor_module
+
+    make_fake_app({"orders": ""})
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    monkeypatch.setattr(doctor_module, "_CONTAINER_MARKERS", ())
+    monkeypatch.setattr(doctor_module, "_CGROUP_PATH", tmp_path / "no-such-cgroup-file")
+    configure(
+        package="fakeapp",
+        topology="processes",
+        broker="database",
+        broker_options={"url": f"sqlite+aiosqlite:///{tmp_path}/test.db"},
+    )
+
+    report = run_doctor()
+
+    check = _check(report, "single-host broker")
+    assert check.status == "ok"
+
+
+def test_single_host_broker_warns_for_shm_under_container(
+    make_fake_app, monkeypatch, tmp_path
+) -> None:
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+    configure(
+        package="fakeapp",
+        topology="processes",
+        broker="shm",
+        broker_options={"state_dir": str(tmp_path)},
+    )
+
+    report = run_doctor()
+
+    check = _check(report, "single-host broker")
+    assert check.status == "warn"
+
+
+# ---------------------------------------------------------------------------
+# Redis retention
+# ---------------------------------------------------------------------------
+
+
+def test_redis_retention_ok_when_broker_is_not_redis(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp")
+
+    report = run_doctor()
+
+    check = _check(report, "redis retention")
+    assert check.status == "ok"
+
+
+def test_redis_retention_ok_for_default_maxlen(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", topology="processes", broker="redis-streams")
+
+    report = run_doctor()
+
+    check = _check(report, "redis retention")
+    assert check.status == "ok"
+
+
+def test_redis_retention_warns_for_low_maxlen(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+    configure(
+        package="fakeapp",
+        topology="processes",
+        broker="redis-streams",
+        broker_options={"max_stream_len": 100},
+    )
+
+    report = run_doctor()
+
+    check = _check(report, "redis retention")
+    assert check.status == "warn"
+    assert any("reclaim_min_idle_ms=60000" in d for d in check.details)
+
+
+# ---------------------------------------------------------------------------
+# Redis retention — live backlog
+# ---------------------------------------------------------------------------
+
+
+class _FakeRedisScanClient:
+    """A minimal async Redis double exposing only the two commands the live
+    backlog check issues: SCAN (via ``scan_iter``) to enumerate streams, and
+    XINFO GROUPS per stream for pending/lag counts. Mirrors the hand-rolled
+    ``FakeRedis`` convention in test_redis_broker.py rather than depending on
+    the (not installed) ``fakeredis`` package."""
+
+    def __init__(self, streams: dict[str, list[dict]]) -> None:
+        self._streams = streams
+
+    async def scan_iter(self, *, match: str, _type: str = "STREAM"):
+        for key in self._streams:
+            yield key.encode()
+
+    async def xinfo_groups(self, key: bytes | str) -> list[dict]:
+        name = key.decode() if isinstance(key, bytes) else key
+        return self._streams[name]
+
+    async def aclose(self) -> None:  # pragma: no cover - broker teardown only
+        pass
+
+
+class _RaisingRedisClient:
+    """Simulates a connection failure on the very first Redis command."""
+
+    async def scan_iter(self, *, match: str, _type: str = "STREAM"):
+        raise ConnectionError("connection refused")
+        yield  # pragma: no cover - unreachable; keeps this an async generator
+
+    async def aclose(self) -> None:  # pragma: no cover - broker teardown only
+        pass
+
+
+def _register_fake_redis_broker(
+    client, *, max_stream_len: int, stream_prefix: str = "modulith.events"
+):
+    """Bootstrap, then swap the real redis-streams broker for one wrapping a
+    fake client — the real one (built lazily by ``modulith_register_brokers``,
+    no eager connection) is harmless but must be replaced to control both
+    ``_max_stream_len`` and what the live backlog query sees."""
+    from modulith.adapters.redis_broker import RedisStreamsBroker
+    from modulith.runtime import _runtime
+
+    _runtime.ensure_bootstrapped()
+    registry = _runtime.broker_registry
+    assert registry is not None
+    registry.unregister("redis-streams")
+    broker = RedisStreamsBroker(
+        client=client, stream_prefix=stream_prefix, max_stream_len=max_stream_len
+    )
+    registry.register("redis-streams", broker)
+    return broker
+
+
+def test_redis_retention_live_warns_at_sixty_percent_backlog(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", topology="processes", broker="redis-streams")
+    client = _FakeRedisScanClient(
+        {"modulith.events.orders": [{"name": "modulith", "pending": 600, "lag": 0}]}
+    )
+    _register_fake_redis_broker(client, max_stream_len=1000)
+
+    report = run_doctor()
+
+    check = _check(report, "redis retention")
+    assert check.status == "warn"
+    assert any("60%" in d for d in check.details)
+
+
+def test_redis_retention_live_errors_at_near_full_backlog(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", topology="processes", broker="redis-streams")
+    client = _FakeRedisScanClient(
+        {"modulith.events.orders": [{"name": "modulith", "pending": 950, "lag": 0}]}
+    )
+    _register_fake_redis_broker(client, max_stream_len=1000)
+
+    report = run_doctor()
+
+    check = _check(report, "redis retention")
+    assert check.status == "error"
+
+
+def test_redis_retention_live_ok_when_query_fails(make_fake_app) -> None:
+    """A connection failure during the live check must not fail the doctor
+    CI gate on its own — the static maxlen sizing check already ran and
+    passed, so the check falls back to that result plus a note."""
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", topology="processes", broker="redis-streams")
+    _register_fake_redis_broker(_RaisingRedisClient(), max_stream_len=10_000)
+
+    report = run_doctor()
+
+    check = _check(report, "redis retention")
+    assert check.status == "ok"
+    assert any("skipped" in d for d in check.details)
+
+
+def test_redis_retention_live_ignores_dead_letter_stream(make_fake_app) -> None:
+    """The DLQ stream (``<stream>.dead``) is bounded independently and is
+    expected to run near its own cap — counting it against the primary
+    stream's backlog would falsely flag every deployment with any dead
+    letters at all."""
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", topology="processes", broker="redis-streams")
+    client = _FakeRedisScanClient(
+        {
+            "modulith.events.orders": [{"name": "modulith", "pending": 100, "lag": 0}],
+            "modulith.events.orders.dead": [{"name": "modulith", "pending": 9500, "lag": 0}],
+        }
+    )
+    _register_fake_redis_broker(client, max_stream_len=10_000)
+
+    report = run_doctor()
+
+    check = _check(report, "redis retention")
+    assert check.status == "ok"

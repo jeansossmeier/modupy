@@ -12,6 +12,9 @@ Output sections:
   4. Outbox health — incomplete/dead-letter counts
   5. Listener registration — declared vs actually registered
   6. SHM notifier — whether each SHM broker's hint ring attached
+  7. Actuator token — missing bearer token on a multi-process actuator proxy
+  8. Single-host broker — a per-host broker (shm/sqlite) under a container runtime
+  9. Redis retention — stream max_stream_len sizing and live backlog risk
 
 Each section either reports OK with summary stats or surfaces problems.
 A check that raises is reported as an error rather than aborting the run,
@@ -24,6 +27,7 @@ import ast
 import hashlib
 import json
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,6 +50,14 @@ _INCOMPLETE_BACKLOG_THRESHOLD = 1000
 # not hang `modulith doctor` forever — bound the query and report the
 # timeout as an error instead.
 _OUTBOX_HEALTH_TIMEOUT = 10.0
+
+# Same rationale for the live Redis backlog query — an unresponsive server
+# falls back to the static verdict (see _check_redis_retention) instead of
+# hanging. Ratio thresholds (backlog / max_stream_len) are heuristics: an
+# undersized window is a slow-building risk, not a hard cutoff.
+_REDIS_BACKLOG_TIMEOUT = 10.0
+_REDIS_BACKLOG_WARN_RATIO = 0.5
+_REDIS_BACKLOG_ERROR_RATIO = 0.9
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +113,9 @@ def run_doctor() -> HealthReport:
         ("outbox health", _check_outbox_health),
         ("listener registration", _check_listener_registration),
         ("shm notifier", _check_shm_notifier),
+        ("actuator token", _check_actuator_token),
+        ("single-host broker", _check_single_host_broker),
+        ("redis retention", _check_redis_retention),
     ]
 
     checks: list[HealthCheck] = []
@@ -523,6 +538,226 @@ def _check_shm_notifier(rt: Runtime) -> HealthCheck:
         f"{len(detached)} of {len(detached) + attached} shm broker(s) have no working notifier",
         detached,
     )
+
+
+# ---------------------------------------------------------------------------
+# Actuator token
+# ---------------------------------------------------------------------------
+
+
+def _check_actuator_token(rt: Runtime) -> HealthCheck:
+    """Warn when a multi-process deployment would start with a token gap.
+
+    Mirrors the branches ``supervisor._resolve_actuator`` takes without
+    importing or calling it: that function raises for
+    ``actuator_mode='token'`` and logs to a handler-less root logger for
+    ``'auto'``, neither of which belongs in a read-only diagnostic.
+
+    ``run_doctor()`` only sees the pyproject/env configuration, not
+    ``modulith run``'s ``--topology``/``--host`` flags — a deployment that
+    overrides ``--host`` away from the ``run`` command's ``0.0.0.0`` default
+    is a known blind spot, named in the warning text below.
+    """
+    cfg = rt.config
+    if cfg is None or cfg.topology != "processes":
+        return HealthCheck("actuator token", "ok", "single-process topology, no actuator proxy")
+
+    mode = cfg.actuator_mode
+    if mode in ("disabled", "open"):
+        return HealthCheck("actuator token", "ok", f"actuator_mode={mode!r}")
+
+    token = os.environ.get("MODULITH_ACTUATOR_TOKEN") or None
+    if token:
+        return HealthCheck("actuator token", "ok", f"actuator_mode={mode!r}, token configured")
+
+    if mode == "token":
+        return HealthCheck(
+            "actuator token",
+            "warn",
+            "actuator_mode='token' with no MODULITH_ACTUATOR_TOKEN configured — "
+            "modulith run --topology processes will refuse to start (ConfigurationError)",
+        )
+
+    # "auto"
+    return HealthCheck(
+        "actuator token",
+        "warn",
+        "actuator_mode='auto' with no MODULITH_ACTUATOR_TOKEN configured — "
+        "/_modulith/* is left UNMOUNTED (404) when production=True or the proxy "
+        "binds a non-loopback host; 'modulith run' binds 0.0.0.0 by default",
+        [
+            "k8s liveness/readiness probes on those paths will fail. Known limit: "
+            "doctor only sees pyproject/env configuration, not 'modulith run "
+            "--topology/--host' flags. Set MODULITH_ACTUATOR_TOKEN, or "
+            "actuator_mode='open' to serve it unauthenticated."
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Single-host broker
+# ---------------------------------------------------------------------------
+
+# Module constants so tests can monkeypatch every detection source — CI
+# itself often runs inside a container, so a negative test must be able to
+# neutralise all three independently of what the real host happens to be.
+_CONTAINER_MARKERS = (Path("/.dockerenv"), Path("/run/.containerenv"))
+_CGROUP_PATH = Path("/proc/1/cgroup")
+
+
+def _container_runtime() -> str | None:
+    """Best-effort detection of the container runtime hosting this process."""
+    if os.environ.get("KUBERNETES_SERVICE_HOST"):
+        return "kubernetes"
+    if any(marker.exists() for marker in _CONTAINER_MARKERS):
+        return "docker"
+    try:
+        cgroup_text = _CGROUP_PATH.read_text(encoding="utf-8")
+    except OSError:
+        cgroup_text = ""
+    if "kubepods" in cgroup_text:
+        return "kubernetes"
+    if "docker" in cgroup_text or "containerd" in cgroup_text:
+        return "docker"
+    return None
+
+
+def _check_single_host_broker(rt: Runtime) -> HealthCheck:
+    """Warn/error when a per-host broker is configured under a container
+    runtime that routinely schedules each module onto a different host.
+
+    Complementary to the production+database+no-URL guard in
+    ``config.py``'s ``_validate`` — that guard only fires with no URL at
+    all; this check fires even with an explicit *local file* URL, and also
+    covers ``broker='shm'``, which the config-time guard never sees.
+    """
+    cfg = rt.config
+    if cfg is None or cfg.topology != "processes":
+        return HealthCheck("single-host broker", "ok", "single-process topology")
+
+    local = cfg.broker == "shm"
+    if not local and cfg.broker == "database":
+        registry = rt.broker_registry
+        broker = registry.get("database") if registry is not None else None
+        local = bool(getattr(broker, "_is_sqlite", False))
+
+    if not local:
+        return HealthCheck("single-host broker", "ok", f"broker={cfg.broker!r} is host-independent")
+
+    runtime = _container_runtime()
+    if runtime is None:
+        return HealthCheck(
+            "single-host broker", "ok", f"broker={cfg.broker!r}, no container runtime detected"
+        )
+
+    detail = (
+        f"broker={cfg.broker!r} keeps its state in a local file — per-module pods on "
+        "different hosts can't share it, so cross-module events are never delivered. "
+        "Use broker='database' with a Postgres/MySQL URL, or broker='redis-streams'."
+    )
+    if runtime == "kubernetes":
+        status = "error" if cfg.production else "warn"
+        summary = f"broker={cfg.broker!r} is single-host but running under kubernetes"
+    else:
+        status = "warn"
+        summary = (
+            f"broker={cfg.broker!r} is single-host but running under docker — a single "
+            "container or compose volume can be a legitimate single-host deployment"
+        )
+    return HealthCheck("single-host broker", status, summary, [detail])
+
+
+# ---------------------------------------------------------------------------
+# Redis retention
+# ---------------------------------------------------------------------------
+
+
+async def _redis_backlog(client: Any, prefix: str) -> int:
+    """Return the worst per-stream (pending + lag) backlog across the
+    broker's own streams, ignoring its dead-letter streams.
+
+    Not XINFO STREAM's ``length``: a healthy MAXLEN-bounded stream sits at
+    ~max_stream_len permanently, so that would flag every busy deployment.
+    Loss risk instead tracks un-acked (consumer-group pending) plus
+    undelivered (server-side lag) entries against the configured cap — the
+    entries actually at risk of being trimmed before they're processed.
+    """
+    backlog = 0
+    async for raw_key in client.scan_iter(match=f"{prefix}.*", _type="STREAM"):
+        key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+        if key.endswith(".dead"):
+            continue  # bounded independently (dlq_max_stream_len); expected to run near cap
+        for group in await client.xinfo_groups(key):
+            pending = group.get("pending") or 0
+            lag = group.get("lag") or 0
+            backlog = max(backlog, pending + lag)
+    return backlog
+
+
+def _check_redis_retention(rt: Runtime) -> HealthCheck:
+    """Warn when a redis-streams broker's retention window is undersized,
+    then (if a client is available) tighten that verdict with a live query.
+
+    Static: reads the broker's configured ``max_stream_len`` and flags it
+    against the adapter's own default. Live: queries the actual pending+lag
+    backlog and escalates to warn/error as it approaches the cap — bounded
+    by a timeout so an unresponsive server can't hang `doctor` forever, and
+    any exception (including "no server reachable") falls back to the
+    static verdict alone rather than failing the check.
+    """
+    cfg = rt.config
+    if cfg is None or cfg.broker != "redis-streams":
+        return HealthCheck("redis retention", "ok", "broker is not redis-streams")
+
+    registry = rt.broker_registry
+    broker = registry.get("redis-streams") if registry is not None else None
+    maxlen = getattr(broker, "_max_stream_len", None)
+    if maxlen is None:
+        return HealthCheck("redis retention", "ok", "redis-streams broker not registered")
+
+    from .adapters.redis_broker import _DEFAULT_MAXLEN
+
+    details: list[str] = []
+    if maxlen >= _DEFAULT_MAXLEN:
+        status = "ok"
+        summary = f"max_stream_len={maxlen}"
+    else:
+        reclaim_min_idle_ms = (cfg.broker_options or {}).get("reclaim_min_idle_ms", 60_000)
+        status = "warn"
+        summary = f"max_stream_len={maxlen} is below the {_DEFAULT_MAXLEN} default"
+        details.append(
+            "size max_stream_len >= publish_rate x (consumer_downtime + "
+            f"processing_latency + reclaim_min_idle_ms={reclaim_min_idle_ms}) — an "
+            "undersized retention window silently drops still-pending entries."
+        )
+
+    client = getattr(broker, "_client", None)
+    prefix = getattr(broker, "_stream_prefix", None)
+    if client is not None and prefix is not None:
+        import asyncio
+
+        try:
+            backlog = asyncio.run(
+                asyncio.wait_for(_redis_backlog(client, prefix), timeout=_REDIS_BACKLOG_TIMEOUT)
+            )
+        except Exception as exc:
+            details.append(f"live backlog check skipped: {exc}")
+        else:
+            ratio = backlog / maxlen if maxlen else 0.0
+            if ratio >= _REDIS_BACKLOG_ERROR_RATIO:
+                status = "error"
+                details.append(
+                    f"live backlog is {ratio:.0%} of max_stream_len={maxlen} "
+                    f"({backlog} pending+lag) — entries are at imminent risk of being trimmed"
+                )
+            elif ratio >= _REDIS_BACKLOG_WARN_RATIO:
+                if status != "error":
+                    status = "warn"
+                details.append(
+                    f"live backlog is {ratio:.0%} of max_stream_len={maxlen} ({backlog} pending+lag)"
+                )
+
+    return HealthCheck("redis retention", status, summary, details)
 
 
 # ---------------------------------------------------------------------------
