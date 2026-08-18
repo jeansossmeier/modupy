@@ -965,6 +965,72 @@ def audit(
 
 
 # ---------------------------------------------------------------------------
+# modulith k8s-manifest — Kubernetes Deployment/Service/Ingress generator
+# ---------------------------------------------------------------------------
+
+
+@app.command("k8s-manifest")
+def k8s_manifest(
+    output: Path = typer.Option(Path("modulith-k8s.yaml"), help="Output path, or '-' for stdout"),
+    image: str | None = typer.Option(None, help="Container image (default: '<package>:latest')"),
+    namespace: str | None = typer.Option(None, help="Kubernetes namespace for every object"),
+    port: int = typer.Option(8000, help="Container port every worker listens on"),
+    host: str | None = typer.Option(None, help="Ingress host"),
+) -> None:
+    """Generate Kubernetes Deployment/Service/Ingress manifests.
+
+    One Deployment + Service per module discovered in the process-per-module
+    topology, plus a single Ingress fanning out ``/<module>`` paths to each
+    module's Service. The broker connection URL is never embedded in the
+    manifest — see the generated header comment for the ``kubectl create
+    secret`` commands to run once per cluster/namespace.
+    """
+    from . import k8s
+
+    _runtime.configure(topology="processes")
+    rt = _bootstrap_or_exit()
+    cfg = rt.config
+    assert cfg is not None  # ensure_bootstrapped guarantees this
+
+    from .supervisor import derive_specs_from_config
+
+    specs = derive_specs_from_config(
+        {
+            "package": cfg.package,
+            "workers": dict(cfg.workers),
+            "contracts_module": cfg.contracts_module,
+        }
+    )
+    if not specs:
+        typer.echo("no modules discovered", err=True)
+        raise typer.Exit(code=1)
+
+    resolved_image = image or f"{k8s.k8s_name(cfg.package or '')}:latest"
+    try:
+        manifest = k8s.render_manifests(
+            cfg, specs, image=resolved_image, port=port, namespace=namespace, host=host
+        )
+    except ConfigurationError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+
+    if str(output) == "-":
+        typer.echo(manifest, nl=False)
+        return
+
+    try:
+        output.write_text(manifest, encoding="utf-8")
+    except OSError as exc:
+        typer.echo(
+            f"error: could not write manifest to {output} ({exc}). "
+            "Create the directory or pass a writable --output path.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
+    typer.echo(f"wrote {len(specs)} module manifest(s) to {output}")
+
+
+# ---------------------------------------------------------------------------
 # modulith doctor — operational health check
 # ---------------------------------------------------------------------------
 
