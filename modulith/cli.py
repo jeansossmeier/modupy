@@ -971,9 +971,9 @@ def audit(
 def doctor() -> None:
     """Report architectural and operational health.
 
-    Runs six checks — boundary health, process-split readiness, schema
-    drift, outbox health, listener registration, and the SHM notifier — and
-    prints a report.
+    Runs nine checks — boundary health, process-split readiness, schema
+    drift, outbox health, listener registration, the SHM notifier, actuator
+    token, single-host broker, and redis retention — and prints a report.
     Exits 1 if any check reports an error, so it doubles as a CI gate
     (warnings are reported but pass); 2 on unexpected internal errors.
     """
