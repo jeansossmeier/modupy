@@ -838,6 +838,9 @@ def test_redis_broker_delivery_options_must_be_positive_integers(
         ("expected_consumer_groups", ["not", "a", "dict"]),
         ("expected_consumer_groups", {"orders": []}),
         ("expected_consumer_groups", {"": ["group-a"]}),
+        ("schema", "bad-name"),
+        ("schema", "1leading_digit"),
+        ("schema", ""),
     ],
 )
 def test_database_broker_options_are_validated_before_adapter_construction(
@@ -862,11 +865,13 @@ def test_database_broker_options_accept_documented_valid_values() -> None:
             "no_subscriber_wait_poll_interval_ms": 100.0,
             "orphan_retention_seconds": 86400.0,
             "expected_consumer_groups": {"orders": ["billing", "shipping"]},
+            "schema": "mod_test",
         },
     )
 
     assert cfg.broker == "database"
     assert cfg.broker_options["completion_mode"] == "mark"
+    assert cfg.broker_options["schema"] == "mod_test"
 
 
 # ----- env var handling -------------------------------------------------------

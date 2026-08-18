@@ -111,6 +111,49 @@ async def test_tz_aware_timestamp_and_bytea_round_trip(engine) -> None:
     assert found.last_attempt_at == ts
 
 
+async def test_schema_translate_map_recipe_isolates_outbox_tables(postgres_url: str) -> None:
+    """An app-built engine carrying ``execution_options(schema_translate_map=
+    ...)`` routes the outbox's Core tables into a target schema without any
+    change to this adapter — ``postgres_outbox.py`` never references a schema
+    itself, so the translation is entirely the caller's responsibility."""
+    from sqlalchemy import inspect, text
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.schema import CreateSchema
+
+    schema = "orders"
+    admin_engine = create_async_engine(postgres_url)
+    engine = create_async_engine(postgres_url).execution_options(
+        schema_translate_map={None: schema}
+    )
+
+    def _table_names(sync_conn, schema_name: str):
+        return set(inspect(sync_conn).get_table_names(schema=schema_name))
+
+    try:
+        async with admin_engine.begin() as conn:
+            await conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        async with engine.begin() as conn:
+            await conn.execute(CreateSchema(schema, if_not_exists=True))
+            await conn.run_sync(postgres_outbox.Base.metadata.create_all)
+
+        store = PostgresPublicationStore(engine=engine)
+        pub = _pub(99)
+        await store.save(pub)
+        (found,) = await store.find_incomplete(timedelta(0))
+        assert found.id == pub.id
+
+        async with admin_engine.connect() as conn:
+            scoped = await conn.run_sync(_table_names, schema)
+            public = await conn.run_sync(_table_names, "public")
+        assert "event_publications" in scoped
+        assert "event_publications" not in public
+    finally:
+        async with admin_engine.begin() as conn:
+            await conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        await engine.dispose()
+        await admin_engine.dispose()
+
+
 # ---------------------------------------------------------------------------
 # transactional atomicity on the real dialect — #59
 # ---------------------------------------------------------------------------

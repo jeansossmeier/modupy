@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -246,6 +247,28 @@ async def test_publish_fans_out_one_row_per_subscribed_group_only(engine: Any) -
     assert len(rows_b) == 1
     assert rows_a[0]["consumer_group"] == "modulith-inventory"
     assert rows_b[0]["consumer_group"] == "modulith-billing"
+
+
+async def test_sqlite_engine_options_schema_is_ignored_with_warning(
+    engine: Any, caplog: Any
+) -> None:
+    """schema is a PostgreSQL-only knob; on any other dialect the broker must
+    warn and run unscoped rather than silently accepting an option it cannot
+    honor."""
+    with caplog.at_level(logging.WARNING, logger="modulith.adapters.db"):
+        broker = DatabaseBroker(engine=engine, engine_options={"schema": "x"})
+
+    assert broker._schema is None
+    assert any("schema" in record.getMessage() for record in caplog.records)
+
+    await broker.subscribe(["fakeapp.orders.WidgetCreated"], "modulith-inventory")
+    serializer = JsonEventSerializer()
+    payload = serializer.serialize(WidgetCreated(name="w1"))
+    event_type = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    await broker.publish("fakeapp.orders.WidgetCreated", payload, {"event_type": event_type})
+
+    rows = await broker.claim_batch("modulith-inventory", batch_size=10, consumer_name="c1")
+    assert len(rows) == 1
 
 
 async def test_publish_zero_subscribers_raises_without_writing_rows(engine: Any) -> None:

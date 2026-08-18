@@ -143,9 +143,9 @@ from modulith import (
 )
 
 from ..config import (
-    MAX_PAYLOAD_BYTES,
     DEFAULT_BROKER_DB_FILENAME,
     DEFAULT_MAX_PAYLOAD_BYTES,
+    MAX_PAYLOAD_BYTES,
 )
 from ._polling_consumer import PollingConsumer
 from ._state_path import resolve_state_file
@@ -865,9 +865,25 @@ class DatabaseBroker:
             )
         # Real SQLAlchemy engines always expose a dialect. Minimal injected
         # engines without one retain the adapter's historical SQLite behavior.
-        self._is_sqlite = getattr(getattr(self._engine, "dialect", None), "name", "sqlite") == (
-            "sqlite"
-        )
+        dialect_name = getattr(getattr(self._engine, "dialect", None), "name", "sqlite")
+        self._is_sqlite = dialect_name == "sqlite"
+        schema = _broker_opt(engine_options or {}, "schema", "SCHEMA")
+        if schema and dialect_name == "postgresql":
+            self._schema = schema
+            # execution_options() on an (Async)Engine returns a new facade
+            # sharing the same connection pool, never a fresh pool of its own
+            # — safe to rebind without disturbing anything already checked
+            # out against self._engine.
+            self._engine = self._engine.execution_options(schema_translate_map={None: schema})
+        else:
+            if schema:
+                logger.warning(
+                    "engine_options schema=%r is only supported on PostgreSQL; "
+                    "ignoring it for the %r dialect",
+                    schema,
+                    dialect_name,
+                )
+            self._schema = None
         self._schema_ready = False
         self._schema_lock = asyncio.Lock()
 
@@ -931,6 +947,10 @@ class DatabaseBroker:
             async def create_schema() -> None:
                 async def create() -> None:
                     async with self._engine.begin() as conn:
+                        if self._schema:
+                            from sqlalchemy.schema import CreateSchema
+
+                            await conn.execute(CreateSchema(self._schema, if_not_exists=True))
                         await conn.run_sync(metadata.create_all)
 
                 if deadline is None:

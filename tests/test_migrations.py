@@ -6,9 +6,12 @@ The migration is dialect-portable, so we run it on SQLite — the same
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
+from typing import Any
 
+import pytest
 from alembic import command
 from alembic.config import Config
 
@@ -348,3 +351,31 @@ def test_alembic_offline_mode_emits_mysql_ddl_without_a_connection(capsys) -> No
     # The Postgres half must NOT leak onto MySQL.
     assert "ix_event_publications_claim_order" not in ddl
     assert "CREATE TABLE broker_subscription (" in ddl
+
+
+def test_alembic_upgrade_with_schema_env_var_warns_and_ignores_on_sqlite(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    """schema is a PostgreSQL-only knob; on SQLite the migration must still
+    succeed against the default (unqualified) tables, with a warning that the
+    option was ignored rather than silently accepted."""
+    db = tmp_path / "outbox.db"
+    monkeypatch.setenv("MODULITH_DB_SCHEMA", "mod_test")
+    with caplog.at_level(logging.WARNING, logger="modulith.adapters.migrations.env"):
+        command.upgrade(_cfg(db), "head")
+
+    assert any("schema" in record.getMessage() for record in caplog.records)
+    tables = _objects(db, "table")
+    assert "event_publications" in tables
+    assert "broker_subscription" in tables
+
+
+def test_alembic_offline_mode_with_schema_env_var_exits(tmp_path: Path, monkeypatch: Any) -> None:
+    """Offline (``--sql``) mode never opens a live connection, so it cannot
+    apply a schema translation — a schema request there must fail loudly
+    rather than silently emit unqualified DDL."""
+    db = tmp_path / "offline.db"
+    monkeypatch.setenv("MODULITH_DB_SCHEMA", "mod_test")
+    with pytest.raises(SystemExit):
+        command.upgrade(_cfg(db), "head", sql=True)
+    assert not db.exists()

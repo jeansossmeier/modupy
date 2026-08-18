@@ -18,6 +18,7 @@ import difflib
 import logging
 import math
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -709,6 +710,7 @@ def _validate_redis_broker_options(options: dict[str, Any]) -> None:
 _DATABASE_COMPLETION_MODES = frozenset({"delete", "mark"})
 _DATABASE_NO_SUBSCRIBER_POLICIES = frozenset({"error", "store", "wait"})
 _DATABASE_ORPHAN_REPLAY_POLICIES = frozenset({"ttl_all_groups", "first_groups", "expected_groups"})
+_DATABASE_SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _validate_database_broker_options(options: dict[str, Any]) -> None:
@@ -753,6 +755,13 @@ def _validate_database_broker_options(options: dict[str, Any]) -> None:
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ConfigurationError(
                 f"broker_options.busy_timeout_ms must be a positive integer, got {value!r}"
+            )
+    if "schema" in options:
+        value = options["schema"]
+        if type(value) is not str or not _DATABASE_SCHEMA_RE.match(value):
+            raise ConfigurationError(
+                "broker_options.schema must be a valid unquoted SQL identifier "
+                f"(letters, digits, underscore, not starting with a digit), got {value!r}"
             )
     for name in (
         "no_subscriber_wait_timeout_seconds",
