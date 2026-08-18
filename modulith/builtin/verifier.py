@@ -680,9 +680,17 @@ def _check_data_ownership(
 
     A module that co-declared ownership of a conflicted table is never
     flagged for referencing it; the conflict itself is reported instead.
+
+    A module that declares a non-empty ``owns_tables`` is also held to it: any
+    table it *defines* but does not list is flagged, so the manifest stays a
+    complete inventory of the module's data. Modules with an empty
+    ``owns_tables`` opted out and get no such warning.
     """
+    from modulith.manifest import get_manifest
+
     owners_of = _table_owners(all_modules)
     if not owners_of:
+        # No manifest anywhere declares owns_tables, so neither check can fire.
         return []
 
     violations: list[Violation] = []
@@ -702,7 +710,25 @@ def _check_data_ownership(
                 )
             )
 
-    for table, location, _kind in _collect_table_refs(module):
+    manifest = get_manifest(module.package)
+    declared: frozenset[str] = (
+        frozenset(manifest.owns_tables) if manifest is not None else frozenset()
+    )
+
+    for table, location, kind in _collect_table_refs(module):
+        if declared and kind == "define" and table not in declared:
+            violations.append(
+                Violation(
+                    rule="data-ownership",
+                    message=(
+                        f"{module.name} defines table {table!r} but does not declare it "
+                        f"in owns_tables. Declare it or move it to its owning module."
+                    ),
+                    module=module.name,
+                    severity=ViolationSeverity.WARNING,
+                    location=location,
+                )
+            )
         owners = owners_of.get(table)
         if owners is None or module.name in owners:
             continue

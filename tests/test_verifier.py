@@ -534,5 +534,107 @@ def test_data_ownership_ignores_foreign_key_within_owning_module(make_fake_app) 
         manifest_module._reset_for_testing()
 
 
+# ---------------------------------------------------------------------------
+# Rule 5, declared-inventory half: a table a module defines but omits from owns_tables
+# ---------------------------------------------------------------------------
+
+
+def test_data_ownership_warns_when_defined_table_not_declared_in_owns_tables(make_fake_app) -> None:
+    # When a module declares owns_tables and defines a table that is NOT in
+    # that list, it should produce a WARNING.
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+    make_fake_app(
+        {
+            "orders": """
+                from sqlalchemy.orm import DeclarativeBase
+
+                class Base(DeclarativeBase):
+                    pass
+
+                class OrderLineItem(Base):
+                    __tablename__ = "order_lines"
+            """,
+        }
+    )
+    manifest_module._manifests["fakeapp.orders"] = manifest_module.Manifest(
+        package="fakeapp.orders", owns_tables=("orders",)
+    )
+    try:
+        mods = [_module("orders")]
+        violations = verifier.modulith_verify_module(_module("orders"), mods)
+        ownership = [v for v in violations if v.rule == "data-ownership"]
+        assert len(ownership) == 1
+        assert ownership[0].severity is ViolationSeverity.WARNING
+        assert "order_lines" in ownership[0].message
+        assert "does not declare it in owns_tables" in ownership[0].message
+    finally:
+        manifest_module._reset_for_testing()
+
+
+def test_data_ownership_no_warning_for_empty_owns_tables(make_fake_app) -> None:
+    # A module with empty/default owns_tables should not generate the "does not
+    # declare" warning, even if it defines tables. The verifier should remain
+    # silent for modules that haven't opted into ownership declarations.
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+    make_fake_app(
+        {
+            "orders": """
+                from sqlalchemy.orm import DeclarativeBase
+
+                class Base(DeclarativeBase):
+                    pass
+
+                class OrderLineItem(Base):
+                    __tablename__ = "order_lines"
+            """,
+        }
+    )
+    # Manifest with empty owns_tables (or no manifest at all)
+    manifest_module._manifests["fakeapp.orders"] = manifest_module.Manifest(
+        package="fakeapp.orders", owns_tables=()
+    )
+    try:
+        mods = [_module("orders")]
+        violations = verifier.modulith_verify_module(_module("orders"), mods)
+        ownership = [v for v in violations if v.rule == "data-ownership"]
+        # No "does not declare" warnings for modules with empty owns_tables
+        undeclared = [v for v in ownership if "does not declare it in owns_tables" in v.message]
+        assert len(undeclared) == 0
+    finally:
+        manifest_module._reset_for_testing()
+
+
+def test_data_ownership_warns_for_table_via_core_table_call(make_fake_app) -> None:
+    # Also test the Core Table("name") pattern with undeclared ownership.
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+    make_fake_app(
+        {
+            "orders": """
+                from sqlalchemy import Table, Column, Integer
+                metadata = None
+                t = Table("order_lines", metadata, Column("id", Integer))
+            """,
+        }
+    )
+    manifest_module._manifests["fakeapp.orders"] = manifest_module.Manifest(
+        package="fakeapp.orders", owns_tables=("orders",)
+    )
+    try:
+        mods = [_module("orders")]
+        violations = verifier.modulith_verify_module(_module("orders"), mods)
+        ownership = [v for v in violations if v.rule == "data-ownership"]
+        undeclared = [v for v in ownership if "does not declare it in owns_tables" in v.message]
+        assert len(undeclared) == 1
+        assert "order_lines" in undeclared[0].message
+    finally:
+        manifest_module._reset_for_testing()
+
+
 # Keep ImportRecord referenced for import-time coverage of the dataclass.
 assert ImportRecord is not None

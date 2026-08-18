@@ -249,18 +249,33 @@ def _check_split_readiness(rt: Runtime) -> HealthCheck:
     owners_of = _table_owners(modules)
     table_refs_by_module: dict[str, int] = {}
     cross_module_table_refs = 0
+    # Tables a module defines without its own name as prefix are legal today
+    # but become an extraction chore later (they collide in a shared schema);
+    # surfaced as an informational line, never a status change.
+    unprefixed_by_module: dict[str, int] = {}
     for module in modules:
         count = 0
-        for table, _location, _kind in _collect_table_refs(module):
+        for table, _location, kind in _collect_table_refs(module):
             owners = owners_of.get(table)
             if owners and module.name not in owners:
                 count += 1
+            if kind == "define" and not table.startswith(f"{module.name}_"):
+                unprefixed_by_module[module.name] = unprefixed_by_module.get(module.name, 0) + 1
         table_refs_by_module[module.name] = count
         cross_module_table_refs += count
+    naming_details = [
+        f"{name}: {n} table(s) not prefixed {name}_"
+        for name, n in sorted(unprefixed_by_module.items())
+    ]
 
     total = direct_total + publish_total
     if total == 0:
-        return HealthCheck("process-split readiness", "ok", "no cross-module interactions detected")
+        return HealthCheck(
+            "process-split readiness",
+            "ok",
+            "no cross-module interactions detected",
+            naming_details,
+        )
 
     score = round(100 * publish_total / total)
     # MIGRATION_GUIDE.md's documented milestones are inclusive: 80%+ = ready
@@ -287,6 +302,8 @@ def _check_split_readiness(rt: Runtime) -> HealthCheck:
         for name, n in sorted(table_refs_by_module.items(), key=lambda kv: -kv[1])[:5]
         if n
     )
+    details.extend(naming_details)
+
     return HealthCheck(
         "process-split readiness",
         status,

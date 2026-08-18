@@ -249,6 +249,50 @@ def test_split_readiness_shared_tables_block_microservice_tier(make_fake_app) ->
     assert any("1 cross-module table reference(s)" in d for d in check.details)
 
 
+def test_split_readiness_details_unprefixed_tables(make_fake_app) -> None:
+    # When a module defines tables without the module prefix, the details
+    # should include an informational line: "<mod>: N table(s) not prefixed <mod>_"
+    make_fake_app(
+        {
+            "orders": """
+                from sqlalchemy import Integer, String
+                from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+                class Base(DeclarativeBase):
+                    pass
+
+                class OrderRow(Base):
+                    __tablename__ = "order_items"  # not prefixed with orders_
+                    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+                class OrderDetailRow(Base):
+                    __tablename__ = "order_details"  # not prefixed
+                    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+            """,
+            "inventory": """
+                from sqlalchemy import Integer
+                from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+                class Base(DeclarativeBase):
+                    pass
+
+                class StockRow(Base):
+                    __tablename__ = "inventory_stock"  # correctly prefixed
+                    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+            """,
+        }
+    )
+    configure(package="fakeapp")
+
+    report = run_doctor()
+
+    check = _check(report, "process-split readiness")
+    # Should have details for orders with 2 unprefixed tables
+    assert any("orders" in d and "2 table(s) not prefixed orders_" in d for d in check.details)
+    # Should NOT have details for inventory (all tables are correctly prefixed)
+    assert not any("inventory" in d and "not prefixed" in d for d in check.details)
+
+
 # ---------------------------------------------------------------------------
 # Schema drift
 # ---------------------------------------------------------------------------
