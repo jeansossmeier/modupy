@@ -57,6 +57,10 @@ def _drop(engine) -> None:
     with engine.begin() as conn:
         for tbl in (*_TABLES, *_BROKER_TABLES, "alembic_version"):
             conn.execute(text(f"DROP TABLE IF EXISTS {tbl} CASCADE"))
+        # Schema-scoped migration tests (MODULITH_DB_SCHEMA) leave their
+        # tables in a dedicated schema rather than public — drop it too so a
+        # prior run never leaks into the next.
+        conn.execute(text("DROP SCHEMA IF EXISTS mod_test CASCADE"))
 
 
 @pytest.fixture
@@ -223,6 +227,34 @@ def test_downgrade_0003_preserves_long_last_error(clean_pg) -> None:
     with engine.connect() as conn:
         stored = conn.execute(text("SELECT last_error FROM event_publications")).scalar_one()
     assert stored == long_error
+
+
+def test_alembic_upgrade_head_with_schema_env_var_scopes_all_tables(clean_pg, monkeypatch) -> None:
+    """MODULITH_DB_SCHEMA routes both the outbox/broker tables and
+    ``alembic_version`` into a dedicated schema, stays idempotent across a
+    second upgrade, and downgrade base leaves that schema empty."""
+    url, engine = clean_pg
+    monkeypatch.setenv("MODULITH_DB_SCHEMA", "mod_test")
+    cfg = _cfg(url)
+
+    command.upgrade(cfg, "head")
+
+    scoped_tables = set(inspect(engine).get_table_names(schema="mod_test"))
+    assert _TABLES[0] in scoped_tables
+    assert "broker_subscription" in scoped_tables
+    assert "alembic_version" in scoped_tables
+    public_tables = set(inspect(engine).get_table_names(schema="public"))
+    assert _TABLES[0] not in public_tables
+    assert "alembic_version" not in public_tables
+
+    command.upgrade(cfg, "head")  # idempotent re-run, no already-exists error
+    assert set(inspect(engine).get_table_names(schema="mod_test")) == scoped_tables
+
+    command.downgrade(cfg, "base")
+    # downgrade base clears the version row but — same as the unscoped
+    # Postgres/SQLite downgrade tests above — never drops alembic_version
+    # itself; only the migrated tables are gone.
+    assert set(inspect(engine).get_table_names(schema="mod_test")) <= {"alembic_version"}
 
 
 def test_migration_column_metadata_matches_orm_on_real_postgres(clean_pg) -> None:

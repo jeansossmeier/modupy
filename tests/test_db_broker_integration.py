@@ -202,6 +202,68 @@ async def _got(delivered: list[str]) -> bool:
     return delivered == ["w1"]
 
 
+async def test_schema_engine_option_isolates_broker_tables_on_postgres(
+    postgres_url: str,
+) -> None:
+    """schema routes the broker's tables into a dedicated Postgres schema,
+    leaving public untouched, while publish/claim/dispatch still round-trips
+    end to end through that schema."""
+    from sqlalchemy import inspect, text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    schema = "mod_broker"
+    admin_engine = create_async_engine(postgres_url)
+
+    def _table_names(sync_conn: Any, schema_name: str) -> set[str]:
+        return set(inspect(sync_conn).get_table_names(schema=schema_name))
+
+    try:
+        async with admin_engine.begin() as conn:
+            await conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+
+        broker = DatabaseBroker(url=postgres_url, engine_options={"schema": schema})
+        try:
+            await broker._ensure_schema()
+
+            async with admin_engine.connect() as conn:
+                scoped = await conn.run_sync(_table_names, schema)
+                public = await conn.run_sync(_table_names, "public")
+            assert {"broker_message", "broker_subscription"} <= scoped
+            assert public.isdisjoint({"broker_message", "broker_subscription"})
+
+            delivered: list[str] = []
+
+            async def handler(evt: WidgetCreated) -> None:
+                delivered.append(evt.name)
+
+            bus = InMemoryEventBus()
+            bus.register(WidgetCreated, handler)
+            serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+            consumer = DatabaseConsumer(
+                broker=broker,
+                bus=bus,
+                serializer=serializer,
+                consumer_name="inventory:1",
+                group="modulith-inventory",
+                targets=[_TARGET],
+                poll_interval_s=0.05,
+            )
+            await consumer.start()
+            try:
+                payload = serializer.serialize(WidgetCreated(name="w1"))
+                await broker.publish(_TARGET, payload, {"event_type": _EVENT_TYPE})
+                await _until(lambda: _got(delivered))
+                assert delivered == ["w1"]
+            finally:
+                await consumer.stop()
+        finally:
+            await broker.close()
+    finally:
+        async with admin_engine.begin() as conn:
+            await conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        await admin_engine.dispose()
+
+
 # ---------------------------------------------------------------------------
 # FOR UPDATE SKIP LOCKED — competing consumers partition the backlog
 # ---------------------------------------------------------------------------
