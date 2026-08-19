@@ -29,8 +29,6 @@ from modulith.serializers import JsonEventSerializer
 
 pytestmark = [pytest.mark.integration]
 
-_PREFIX = "modulith.cpe2e"
-
 
 @event
 @dataclass(frozen=True)
@@ -69,13 +67,13 @@ async def _until(predicate, *, timeout: float = 8.0, interval: float = 0.02) -> 
         raise AssertionError("condition not met within timeout")
 
 
-def _start_producer_runtime(redis_url: str) -> None:
+def _start_producer_runtime(redis_url: str, redis_key_prefix: str) -> None:
     """Bring up a process-topology runtime whose broker is a real Redis."""
     configure(
         package="cpe2e",
         topology="processes",
         broker="redis-streams",
-        broker_options={"url": redis_url, "stream_prefix": _PREFIX},
+        broker_options={"url": redis_url, "stream_prefix": redis_key_prefix},
         auto_discover=False,
     )
     _runtime.ensure_bootstrapped()
@@ -84,8 +82,12 @@ def _start_producer_runtime(redis_url: str) -> None:
     assert "redis-streams" in _runtime.broker_registry.schemes()
 
 
-def _make_consumer(redis_url: str, target: str, sink: list[int]) -> BrokerConsumer:
-    broker = RedisStreamsBroker(url=redis_url, stream_prefix=_PREFIX, consumer_group="modulith-x")
+def _make_consumer(
+    redis_url: str, redis_key_prefix: str, target: str, sink: list[int]
+) -> BrokerConsumer:
+    broker = RedisStreamsBroker(
+        url=redis_url, stream_prefix=redis_key_prefix, consumer_group="modulith-x"
+    )
     bus = InMemoryEventBus()
 
     async def handler(evt) -> None:
@@ -110,15 +112,15 @@ def _make_consumer(redis_url: str, target: str, sink: list[int]) -> BrokerConsum
 
 
 async def test_runtime_publish_routes_through_real_redis_to_consumer(
-    redis_url, redis_client
+    redis_url, redis_client, redis_key_prefix
 ) -> None:
     """An event with no local listener, published through the live runtime in
     process topology, is delivered to a real consumer over real Redis."""
     target = f"{RemoteOnlyEvent.__module__}.{RemoteOnlyEvent.__qualname__}"
     received: list[int] = []
-    consumer = _make_consumer(redis_url, target, received)
+    consumer = _make_consumer(redis_url, redis_key_prefix, target, received)
 
-    _start_producer_runtime(redis_url)
+    _start_producer_runtime(redis_url, redis_key_prefix)
     try:
         await consumer.start()  # group ready before we publish
         await publish(RemoteOnlyEvent(value=3))  # routed to the broker by the runtime
@@ -129,15 +131,17 @@ async def test_runtime_publish_routes_through_real_redis_to_consumer(
         await _runtime.shutdown()
 
 
-async def test_externalized_event_fans_out_locally_and_over_redis(redis_url, redis_client) -> None:
+async def test_externalized_event_fans_out_locally_and_over_redis(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
     """A bare @externalized event with a local listener is dispatched in-process
     AND routed to the broker — both the local listener and a remote consumer
     receive it."""
     target = f"{FannedOutEvent.__module__}.{FannedOutEvent.__qualname__}"
     remote_received: list[int] = []
-    consumer = _make_consumer(redis_url, target, remote_received)
+    consumer = _make_consumer(redis_url, redis_key_prefix, target, remote_received)
 
-    _start_producer_runtime(redis_url)
+    _start_producer_runtime(redis_url, redis_key_prefix)
 
     local_received: list[int] = []
 

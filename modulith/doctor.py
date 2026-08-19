@@ -285,6 +285,18 @@ def _check_split_readiness(rt: Runtime) -> HealthCheck:
 
     total = direct_total + publish_total
     if total == 0:
+        if cross_module_table_refs:
+            table_details = [
+                f"{name}: {n} cross-module table reference(s)"
+                for name, n in sorted(table_refs_by_module.items(), key=lambda kv: -kv[1])[:5]
+                if n
+            ]
+            return HealthCheck(
+                "process-split readiness",
+                "warn",
+                "cross-module table coupling detected with no import/event interactions",
+                table_details + naming_details,
+            )
         return HealthCheck(
             "process-split readiness",
             "ok",
@@ -573,7 +585,7 @@ def _check_actuator_token(rt: Runtime) -> HealthCheck:
     if mode == "token":
         return HealthCheck(
             "actuator token",
-            "warn",
+            "error",
             "actuator_mode='token' with no MODULITH_ACTUATOR_TOKEN configured — "
             "modulith run --topology processes will refuse to start (ConfigurationError)",
         )
@@ -603,10 +615,22 @@ def _check_actuator_token(rt: Runtime) -> HealthCheck:
 # neutralise all three independently of what the real host happens to be.
 _CONTAINER_MARKERS = (Path("/.dockerenv"), Path("/run/.containerenv"))
 _CGROUP_PATH = Path("/proc/1/cgroup")
+_CONTAINER_RUNTIME_ENV = "MODULITH_CONTAINER_RUNTIME"
 
 
 def _container_runtime() -> str | None:
     """Best-effort detection of the container runtime hosting this process."""
+    override = os.environ.get(_CONTAINER_RUNTIME_ENV, "").strip().lower()
+    if override in {"kubernetes", "k8s"}:
+        return "kubernetes"
+    if override in {"docker", "containerd", "podman"}:
+        return "docker"
+    if override:
+        logger.warning(
+            "ignoring invalid %s=%r; expected kubernetes, docker, containerd, or podman",
+            _CONTAINER_RUNTIME_ENV,
+            override,
+        )
     if os.environ.get("KUBERNETES_SERVICE_HOST"):
         return "kubernetes"
     if any(marker.exists() for marker in _CONTAINER_MARKERS):
@@ -647,7 +671,13 @@ def _check_single_host_broker(rt: Runtime) -> HealthCheck:
     runtime = _container_runtime()
     if runtime is None:
         return HealthCheck(
-            "single-host broker", "ok", f"broker={cfg.broker!r}, no container runtime detected"
+            "single-host broker",
+            "ok",
+            f"broker={cfg.broker!r}, no container runtime detected",
+            [
+                f"Markerless cgroup-v2/rootless deployments can set "
+                f"{_CONTAINER_RUNTIME_ENV}=kubernetes or docker."
+            ],
         )
 
     detail = (

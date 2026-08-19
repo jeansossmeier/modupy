@@ -119,7 +119,15 @@ async_engine = create_async_engine(
 store = PostgresPublicationStore(engine=async_engine)
 ```
 
-For the database broker, set the schema via `[tool.modulith.broker_options].schema` or the `MODULITH_BROKER_SCHEMA` environment variable (Postgres only — other dialects log a warning and ignore it). Migrations follow the same schema with `-x schema=<name>` or `MODULITH_DB_SCHEMA` (see [Migration Guide](../MIGRATION_GUIDE.md) Step 5).
+For the database broker, set the schema via
+`[tool.modulith.broker_options].schema` or `MODULITH_BROKER_SCHEMA` (Postgres
+only; other dialects warn and ignore it). Migrations use
+`MODULITH_DB_SCHEMA` or the packaged command's global `-x` option before
+`upgrade`: `alembic -c <packaged-alembic.ini> -x schema=orders upgrade head`.
+Schema identifiers receive the same validation through every entry point.
+Enabling a named migration schema does not move data and refuses to abandon
+existing Modulith tables or Alembic history in `public`; see
+[Migration Guide](../MIGRATION_GUIDE.md) Step 5.
 
 ---
 
@@ -363,17 +371,38 @@ spec:
 modulith k8s-manifest --output k8s/modulith.yaml --image myapp:1.0.0 --namespace prod
 ```
 
-Options: `--output` (default `modulith-k8s.yaml`, `-` for stdout), `--image` (default `<package>:latest`), `--namespace`, `--port` (default `8000`, the port every worker container listens on), `--host` (Ingress host).
+Options: `--output` (default `modulith-k8s.yaml`, `-` for stdout), `--image`
+(default `<package>:latest`), `--namespace`, `--port` (default `8000`, valid
+range 1–65535), and `--host` (Ingress host). Object names are normalized to
+RFC-1123 labels; long names keep a readable prefix plus a stable hash, and
+invalid or colliding names fail generation.
 
-Each Deployment's `replicas` comes from that module's `[tool.modulith.workers]` count. Containers run `python -m uvicorn modulith._worker:create_app --factory --host 0.0.0.0 --port <port>`, with `MODULITH_MODULE`, `MODULITH_APP_PACKAGE`, `MODULITH_TOPOLOGY=processes`, and `MODULITH_BROKER` set directly, plus every `broker_options` key as `MODULITH_BROKER_<KEY>`. The broker connection URL is never embedded in the manifest — `MODULITH_BROKER_URL` (and `REDIS_URL` for `redis-streams`) reads from a `secretKeyRef` against a `<package>-broker` Secret, key `url`, that you create once per cluster/namespace:
+Each Deployment's `replicas` comes from that module's
+`[tool.modulith.workers]` count. Containers run
+`python -m uvicorn modulith._worker:create_app --factory --host 0.0.0.0
+--port <port>`. The manifest sets module, package, topology, broker, and
+`MODULITH_CONTRACTS_MODULE` explicitly. It emits only database broker options
+with a supported `MODULITH_BROKER_*` contract and Redis options with their
+established `MODULITH_CONSUMER_GROUP`, `MODULITH_STREAM_PREFIX`, and
+`MODULITH_STREAM_MAXLEN` names; unknown or credential-like options are omitted.
+The broker URL is never embedded: `MODULITH_BROKER_URL` (and `REDIS_URL` for
+Redis) reads key `url` from the generated `<package>-broker` Secret reference:
 
 ```bash
-kubectl create secret generic myapp-broker --from-literal=url=<broker connection URL>
+kubectl create secret generic myapp-broker \
+  --from-literal=url=<broker connection URL> --namespace prod
 ```
 
-Each container also references an optional `<package>-env` Secret via `envFrom` (`optional: true`) for any additional variables (e.g. `MODULITH_DB_URL`) without editing the generated manifest. Readiness uses `httpGet /health`; liveness uses `tcpSocket` on the container port (an HTTP liveness probe would crash-loop a healthy pod whose broker is temporarily down, since `/health` returns 503 in that case). No `resources` or Secret objects are emitted — re-applying the manifest must never clobber real secrets.
+The manifest comments include the selected namespace in both Secret-creation
+commands. Each container also references an optional `<package>-env` Secret via
+`envFrom` for additional variables such as `MODULITH_DB_URL`. Readiness uses
+`httpGet /health`; liveness uses `tcpSocket` so a temporary broker outage does
+not crash-loop a healthy pod. No `resources` or Secret objects are emitted.
 
 `modulith k8s-manifest` refuses to generate manifests for a broker that cannot be shared across pods: `memory`, `shm`, or `database` pointed at a `sqlite://` URL. Configure `database` with a networked URL (`postgresql://`, `mysql://`) or `redis-streams` first.
+
+The generator imports the configured application modules to derive workers.
+Run it only against trusted source in the build environment.
 
 ---
 
@@ -512,7 +541,17 @@ Three consequences worth knowing:
 - **It cannot be both fresh and cheap.** Fanning out to every worker per request puts an N-worker round trip on a public endpoint; caching serves a schema that silently lags a rolling deploy.
 - **Rollouts have no good answer.** While a worker is respawning, its schema is unavailable — a per-module URL simply returns 502 for that one module, while a merged document must either omit a whole module's API without saying so or fail as a whole.
 
-If you need one document, build it where those answers are yours to make: `modulith openapi` imports every module, generates its document in isolation, and merges them into one build-time spec — every `components.schemas` key is prefixed `<module>_` so identically-named models from different modules never collide, and the unprefixed `/health` path is excluded (it would collide across every module). Options: `--output` (default `openapi.json`), `--title` (default: the app package name), `--api-version` (default: `[project].version` from the nearest `pyproject.toml`, else `0.0.0`). Alternatively, keep a checked-in schema generated from the single-process app.
+If you need one document, build it where those answers are yours to make:
+`modulith openapi` imports every module, generates its document in isolation,
+and prefixes each `components.schemas` key with `<module>_`. Exact duplicates
+are deduplicated, but incompatible paths, components, top-level metadata,
+schema-key collisions, and duplicate operation IDs fail generation rather than
+discarding a definition. Install `modupy[fastapi]`; without FastAPI the command
+exits with that actionable installation instruction. Options: `--output`
+(default `openapi.json`), `--title` (default: the app package name), and
+`--api-version` (default: `[project].version`, else `0.0.0`). Because generation
+imports application modules, run it only against trusted source. Alternatively,
+keep a checked-in schema generated from the single-process app.
 
 Single-process topology is unaffected — modulith adds no HTTP routes there, so `/docs` is whatever your own FastAPI app configures.
 

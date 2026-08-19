@@ -56,6 +56,7 @@ from modulith.adapters.db_broker import (
     _create_engine,
     _delivery_message_id,
     _is_already_exists,
+    _is_pg_namespace_unique_race,
     _is_sqlite_locked,
     _is_sqlite_url,
     _make_db_consumer,
@@ -1292,6 +1293,25 @@ def _spawn_db_claim_then_exit(
             await broker.close()
 
     asyncio.run(run())
+
+
+class _PostgresSchemaOptionEngine:
+    dialect = SimpleNamespace(name="postgresql")
+
+    def execution_options(self, **_options: Any) -> _PostgresSchemaOptionEngine:
+        return self
+
+
+@pytest.mark.parametrize("from_env", [False, True])
+def test_database_broker_rejects_invalid_schema_from_direct_options_and_env(
+    monkeypatch: Any, from_env: bool
+) -> None:
+    options = {} if from_env else {"schema": "valid_name\n"}
+    if from_env:
+        monkeypatch.setenv("MODULITH_BROKER_SCHEMA", "valid_name\n")
+
+    with pytest.raises(ConfigurationError, match="schema"):
+        DatabaseBroker(engine=_PostgresSchemaOptionEngine(), engine_options=options)
 
 
 async def test_spawned_claimant_crash_preserves_durability(tmp_path: Path) -> None:
@@ -3692,6 +3712,51 @@ class _SchemaRaceEngine:
         return _RaceBegin(self._conn)
 
 
+class _PostgresNamespaceRaceError(Exception):
+    sqlstate = "23505"
+    diag = SimpleNamespace(constraint_name="pg_namespace_nspname_index")
+
+
+class _PostgresNamespaceRaceConn:
+    def __init__(self) -> None:
+        self.schema_attempts = 0
+        self.create_all_calls = 0
+
+    async def execute(self, _statement: Any) -> None:
+        self.schema_attempts += 1
+        if self.schema_attempts == 1:
+            from sqlalchemy.exc import IntegrityError
+
+            raise IntegrityError("CREATE SCHEMA", {}, _PostgresNamespaceRaceError())
+
+    async def run_sync(self, _fn: Any) -> None:
+        self.create_all_calls += 1
+
+
+class _PostgresNamespaceRaceEngine:
+    dialect = SimpleNamespace(name="postgresql")
+
+    def __init__(self) -> None:
+        self.conn = _PostgresNamespaceRaceConn()
+
+    def execution_options(self, **_options: Any) -> _PostgresNamespaceRaceEngine:
+        return self
+
+    def begin(self) -> _PostgresNamespaceRaceBegin:
+        return _PostgresNamespaceRaceBegin(self.conn)
+
+
+class _PostgresNamespaceRaceBegin:
+    def __init__(self, conn: _PostgresNamespaceRaceConn) -> None:
+        self._conn = conn
+
+    async def __aenter__(self) -> _PostgresNamespaceRaceConn:
+        return self._conn
+
+    async def __aexit__(self, *_args: Any) -> bool:
+        return False
+
+
 def test_is_already_exists_matches_concurrent_create_errors() -> None:
     from sqlalchemy.exc import OperationalError, ProgrammingError
 
@@ -3703,6 +3768,57 @@ def test_is_already_exists_matches_concurrent_create_errors() -> None:
     )
     assert not _is_already_exists(OperationalError("s", {}, Exception("no such table: x")))
     assert not _is_already_exists(ValueError("unrelated"))
+
+
+def test_pg_namespace_unique_race_classifier_is_exact() -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    namespace_race = IntegrityError("s", {}, _PostgresNamespaceRaceError())
+    asyncpg_error = _PostgresNamespaceRaceError()
+    asyncpg_wrapper = type("AsyncpgIntegrityError", (Exception,), {"sqlstate": "23505"})()
+    asyncpg_wrapper.__cause__ = asyncpg_error
+    wrapped_namespace_race = IntegrityError("s", {}, asyncpg_wrapper)
+    other_constraint = IntegrityError(
+        "s",
+        {},
+        type(
+            "OtherUniqueViolation",
+            (Exception,),
+            {
+                "sqlstate": "23505",
+                "diag": SimpleNamespace(constraint_name="application_table_key"),
+            },
+        )(),
+    )
+    other_code = IntegrityError(
+        "s",
+        {},
+        type(
+            "OtherIntegrityError",
+            (Exception,),
+            {
+                "sqlstate": "23503",
+                "diag": SimpleNamespace(constraint_name="pg_namespace_nspname_index"),
+            },
+        )(),
+    )
+
+    assert _is_pg_namespace_unique_race(namespace_race) is True
+    assert _is_pg_namespace_unique_race(wrapped_namespace_race) is True
+    assert _is_pg_namespace_unique_race(other_constraint) is False
+    assert _is_pg_namespace_unique_race(other_code) is False
+    assert _is_pg_namespace_unique_race(RuntimeError("pg_namespace_nspname_index")) is False
+
+
+async def test_ensure_schema_reconciles_postgres_namespace_unique_race() -> None:
+    engine = _PostgresNamespaceRaceEngine()
+    broker = DatabaseBroker(engine=engine, engine_options={"schema": "mod_test"})
+
+    await broker._ensure_schema()
+
+    assert engine.conn.schema_attempts == 2
+    assert engine.conn.create_all_calls == 1
+    assert broker._schema_ready is True
 
 
 async def test_ensure_schema_tolerates_concurrent_create() -> None:

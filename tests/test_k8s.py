@@ -9,7 +9,9 @@ CLI tests drive the ``k8s-manifest`` command end-to-end through
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 
 import pytest
 import yaml
@@ -55,6 +57,43 @@ def test_k8s_name_lowercases_and_hyphenates_underscores() -> None:
     assert k8s_name("Orders") == "orders"
 
 
+@pytest.mark.parametrize(
+    ("raw_name", "expected"),
+    [
+        ("orders.api", "orders-api"),
+        ("--orders__api--", "orders-api"),
+        ("Café", "cafe"),
+    ],
+)
+def test_k8s_name_normalizes_rfc1123_edge_cases(raw_name: str, expected: str) -> None:
+    assert k8s_name(raw_name) == expected
+
+
+def test_k8s_name_hashes_unicode_only_name_stably() -> None:
+    first = k8s_name("订单")
+    second = k8s_name("订单")
+
+    assert first == second
+    assert first != k8s_name("支付")
+    assert re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", first)
+
+
+def test_k8s_name_truncates_with_stable_hash() -> None:
+    raw_name = "orders-" + ("a" * 80)
+    expected_hash = hashlib.sha256(raw_name.encode()).hexdigest()[:10]
+
+    name = k8s_name(raw_name)
+
+    assert len(name) == 63
+    assert name == f"{raw_name[:52]}-{expected_hash}"
+
+
+@pytest.mark.parametrize("raw_name", ["", "---", "..."])
+def test_k8s_name_rejects_empty_generated_name(raw_name: str) -> None:
+    with pytest.raises(ConfigurationError, match="Kubernetes"):
+        k8s_name(raw_name)
+
+
 # ---------------------------------------------------------------------------
 # render_manifests — document kinds and shape
 # ---------------------------------------------------------------------------
@@ -92,7 +131,9 @@ def test_render_manifests_command_targets_worker_factory_on_all_interfaces() -> 
 
 
 def test_render_manifests_env_has_module_identity_vars() -> None:
-    text = render_manifests(_cfg(), _two_module_specs(), image="shop:dev")
+    text = render_manifests(
+        _cfg(contracts_module="fakeapp.contracts"), _two_module_specs(), image="shop:dev"
+    )
 
     by_kind = _docs_by_kind(text)
     orders = next(d for d in by_kind["Deployment"] if d["metadata"]["name"] == "fakeapp-orders")
@@ -103,6 +144,7 @@ def test_render_manifests_env_has_module_identity_vars() -> None:
     assert env_by_name["MODULITH_APP_PACKAGE"]["value"] == "fakeapp"
     assert env_by_name["MODULITH_TOPOLOGY"]["value"] == "processes"
     assert env_by_name["MODULITH_BROKER"]["value"] == "database"
+    assert env_by_name["MODULITH_CONTRACTS_MODULE"]["value"] == "fakeapp.contracts"
 
 
 def test_render_manifests_readiness_and_liveness_probes() -> None:
@@ -174,6 +216,25 @@ def test_render_manifests_namespace_and_host_present_when_passed() -> None:
     assert by_kind["Ingress"][0]["spec"]["rules"][0]["host"] == "api.example.com"
 
 
+@pytest.mark.parametrize(
+    "namespace",
+    [
+        "Prod",
+        "prod_namespace",
+        "prod\nmetadata:\n  name: injected",
+        "prod\x00evil",
+    ],
+)
+def test_render_manifests_rejects_invalid_namespace(namespace: str) -> None:
+    with pytest.raises(ConfigurationError, match=r"namespace.*RFC-1123"):
+        render_manifests(
+            _cfg(),
+            [WorkerSpec("orders", "fakeapp", 9001)],
+            image="shop:dev",
+            namespace=namespace,
+        )
+
+
 def test_render_manifests_underscore_module_name_becomes_hyphenated_resource() -> None:
     specs = [WorkerSpec(module_name="order_items", package="fakeapp", port=9001)]
     text = render_manifests(_cfg(), specs, image="shop:dev")
@@ -206,10 +267,15 @@ def test_render_manifests_database_broker_without_url_renders() -> None:
     assert len(by_kind["Deployment"]) == 2
 
 
-def test_render_manifests_broker_options_passthrough_includes_redis_alias() -> None:
+def test_render_manifests_redis_options_use_consumable_aliases() -> None:
     cfg = _cfg(
         broker="redis-streams",
-        broker_options={"url": "redis://example/0", "stream_prefix": "wf"},
+        broker_options={
+            "url": "redis://example/0",
+            "stream_prefix": "wf",
+            "consumer_group": "workers",
+            "max_stream_len": 5000,
+        },
     )
     text = render_manifests(cfg, [WorkerSpec("orders", "fakeapp", 9001)], image="shop:dev")
 
@@ -217,21 +283,72 @@ def test_render_manifests_broker_options_passthrough_includes_redis_alias() -> N
     container = by_kind["Deployment"][0]["spec"]["template"]["spec"]["containers"][0]
     env_by_name = {e["name"]: e for e in container["env"]}
 
-    assert env_by_name["MODULITH_BROKER_STREAM_PREFIX"]["value"] == "wf"
     assert env_by_name["MODULITH_STREAM_PREFIX"]["value"] == "wf"
+    assert env_by_name["MODULITH_CONSUMER_GROUP"]["value"] == "workers"
+    assert env_by_name["MODULITH_STREAM_MAXLEN"]["value"] == "5000"
+    assert "MODULITH_BROKER_STREAM_PREFIX" not in env_by_name
+    assert "MODULITH_BROKER_CONSUMER_GROUP" not in env_by_name
+    assert "MODULITH_BROKER_MAX_STREAM_LEN" not in env_by_name
 
 
 def test_render_manifests_broker_options_json_encodes_structured_values() -> None:
-    cfg = _cfg(broker_options={"expected_consumer_groups": {"a.B": ["inventory"]}})
+    cfg = _cfg(
+        broker_options={
+            "expected_consumer_groups": {"a.B": ["inventory"]},
+            "schema": "tenant_orders",
+        }
+    )
     text = render_manifests(cfg, [WorkerSpec("orders", "fakeapp", 9001)], image="shop:dev")
 
     by_kind = _docs_by_kind(text)
     container = by_kind["Deployment"][0]["spec"]["template"]["spec"]["containers"][0]
     env_by_name = {e["name"]: e for e in container["env"]}
 
+    assert env_by_name["MODULITH_BROKER_SCHEMA"]["value"] == "tenant_orders"
     assert json.loads(env_by_name["MODULITH_BROKER_EXPECTED_CONSUMER_GROUPS"]["value"]) == {
         "a.B": ["inventory"]
     }
+
+
+def test_render_manifests_drops_unknown_and_credential_like_broker_options() -> None:
+    cfg = _cfg(
+        broker_options={
+            "URL": "postgresql://admin:db-password-value@example/db",
+            "DsN": "postgresql://admin:dsn-password-value@example/db",
+            "password": "hunter2",
+            "api_token": "token-value",
+            "custom": "arbitrary-value",
+            "completion_mode": "mark",
+            "COMPLETION_MODE": "delete",
+        }
+    )
+    text = render_manifests(cfg, [WorkerSpec("orders", "fakeapp", 9001)], image="shop:dev")
+
+    by_kind = _docs_by_kind(text)
+    container = by_kind["Deployment"][0]["spec"]["template"]["spec"]["containers"][0]
+    env_names = [entry["name"] for entry in container["env"]]
+
+    assert len(env_names) == len(set(env_names))
+    assert env_names.count("MODULITH_BROKER_COMPLETION_MODE") == 1
+    for secret in (
+        "db-password-value",
+        "dsn-password-value",
+        "hunter2",
+        "token-value",
+        "arbitrary-value",
+    ):
+        assert secret not in text
+
+
+def test_render_manifests_drops_mixed_case_allowlisted_broker_option() -> None:
+    cfg = _cfg(broker_options={"Completion_Mode": "mark"})
+
+    text = render_manifests(cfg, [WorkerSpec("orders", "fakeapp", 9001)], image="shop:dev")
+
+    by_kind = _docs_by_kind(text)
+    container = by_kind["Deployment"][0]["spec"]["template"]["spec"]["containers"][0]
+    env_names = {entry["name"] for entry in container["env"]}
+    assert "MODULITH_BROKER_COMPLETION_MODE" not in env_names
 
 
 def test_render_manifests_k8s_name_collision_raises() -> None:
@@ -242,6 +359,41 @@ def test_render_manifests_k8s_name_collision_raises() -> None:
 
     with pytest.raises(ConfigurationError, match="order"):
         render_manifests(_cfg(), specs, image="shop:dev")
+
+
+@pytest.mark.parametrize("port", [0, -1, 65536])
+def test_render_manifests_rejects_invalid_port(port: int) -> None:
+    with pytest.raises(ConfigurationError, match="port"):
+        render_manifests(_cfg(), _two_module_specs(), image="shop:dev", port=port)
+
+
+def test_render_manifests_long_composite_names_are_valid_and_distinct() -> None:
+    package = "shop." + ("a" * 55)
+    specs = [
+        WorkerSpec(module_name=f"orders-{suffix}", package=package, port=9001)
+        for suffix in ("east", "west")
+    ]
+
+    text = render_manifests(_cfg(package=package), specs, image="shop:dev")
+
+    names = [doc["metadata"]["name"] for doc in _docs_by_kind(text)["Deployment"]]
+    assert len(names) == len(set(names))
+    assert all(
+        len(name) <= 63 and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", name)
+        for name in names
+    )
+
+
+def test_render_manifests_secret_commands_include_namespace() -> None:
+    text = render_manifests(
+        _cfg(), [WorkerSpec("orders", "fakeapp", 9001)], image="shop:dev", namespace="prod"
+    )
+
+    secret_commands = [
+        line for line in text.splitlines() if line.startswith("#   kubectl create secret")
+    ]
+    assert len(secret_commands) == 2
+    assert all("--namespace prod" in command for command in secret_commands)
 
 
 # ---------------------------------------------------------------------------

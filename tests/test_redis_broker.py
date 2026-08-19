@@ -783,10 +783,11 @@ def test_env_var_overrides_broker_options(make_fake_app, monkeypatch) -> None:
 
 
 @pytest.mark.integration
-async def test_integration_publish_and_consume_roundtrip(redis_url, redis_client) -> None:
-    # redis_client flushes the DB before/after this test for cross-suite isolation.
+async def test_integration_publish_and_consume_roundtrip(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
     broker = RedisStreamsBroker(
-        url=redis_url, stream_prefix="modulith.test", consumer_group="itest"
+        url=redis_url, stream_prefix=redis_key_prefix, consumer_group="itest"
     )
     stream = "roundtrip"
     try:

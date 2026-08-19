@@ -30,7 +30,12 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .builtin.verifier import CONTRACTS_MODULE, _file_package, _ImportCollector
+from .builtin.verifier import (
+    CONTRACTS_MODULE,
+    _file_package,
+    _ImportCollector,
+    _table_refs_from_tree,
+)
 
 logger = logging.getLogger("modulith.audit")
 
@@ -278,43 +283,7 @@ def _find_cross_module_imports(
 
 
 def _string_table_refs(tree: ast.Module) -> set[str]:
-    """Table names referenced in a module via ``Table("x")``, ``__tablename__``,
-    or a ``ForeignKey("[schema.]table.column")`` string literal.
-
-    Mirrors ``modulith.builtin.verifier._collect_table_refs`` so the audit and
-    the boundary verifier agree on what counts as a table reference.
-    """
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func = node.func
-            fname = (
-                func.id
-                if isinstance(func, ast.Name)
-                else func.attr
-                if isinstance(func, ast.Attribute)
-                else None
-            )
-            if fname == "Table" and node.args:
-                first = node.args[0]
-                if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                    names.add(first.value)
-            elif fname == "ForeignKey" and node.args:
-                first = node.args[0]
-                if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                    parts = first.value.split(".")
-                    if len(parts) >= 2:
-                        names.add(parts[-2])
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                if (
-                    isinstance(target, ast.Name)
-                    and target.id == "__tablename__"
-                    and isinstance(node.value, ast.Constant)
-                    and isinstance(node.value.value, str)
-                ):
-                    names.add(node.value.value)
-    return names
+    return {name for name, _line, _kind in _table_refs_from_tree(tree)}
 
 
 def _find_shared_tables(root: Path, files: list[Path]) -> list[str]:

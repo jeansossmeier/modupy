@@ -146,6 +146,7 @@ from ..config import (
     DEFAULT_BROKER_DB_FILENAME,
     DEFAULT_MAX_PAYLOAD_BYTES,
     MAX_PAYLOAD_BYTES,
+    _validate_sql_schema,
 )
 from ._polling_consumer import PollingConsumer
 from ._state_path import resolve_state_file
@@ -439,6 +440,30 @@ def _is_already_exists(exc: BaseException) -> bool:
     orig = getattr(exc, "orig", None)
     message = (str(orig) if orig is not None else str(exc)).lower()
     return "already exists" in message
+
+
+def _is_pg_namespace_unique_race(exc: BaseException) -> bool:
+    """True only for PostgreSQL's concurrent CREATE SCHEMA unique race."""
+    from sqlalchemy.exc import IntegrityError
+
+    if not isinstance(exc, IntegrityError):
+        return False
+    orig = getattr(exc, "orig", None)
+    cause = getattr(orig, "__cause__", None)
+    sqlstate = (
+        getattr(orig, "sqlstate", None)
+        or getattr(orig, "pgcode", None)
+        or getattr(cause, "sqlstate", None)
+    )
+    diag = getattr(orig, "diag", None)
+    cause_diag = getattr(cause, "diag", None)
+    constraint = (
+        getattr(orig, "constraint_name", None)
+        or getattr(diag, "constraint_name", None)
+        or getattr(cause, "constraint_name", None)
+        or getattr(cause_diag, "constraint_name", None)
+    )
+    return sqlstate == "23505" and constraint == "pg_namespace_nspname_index"
 
 
 def _supports_skip_locked(engine: Any) -> bool:
@@ -868,6 +893,8 @@ class DatabaseBroker:
         dialect_name = getattr(getattr(self._engine, "dialect", None), "name", "sqlite")
         self._is_sqlite = dialect_name == "sqlite"
         schema = _broker_opt(engine_options or {}, "schema", "SCHEMA")
+        if schema is not None:
+            schema = _validate_sql_schema(schema, option_name="schema")
         if schema and dialect_name == "postgresql":
             self._schema = schema
             # execution_options() on an (Async)Engine returns a new facade
@@ -976,7 +1003,7 @@ class DatabaseBroker:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    if _is_already_exists(exc):
+                    if _is_already_exists(exc) or _is_pg_namespace_unique_race(exc):
                         logger.debug("broker schema create raced with a peer — reconciling")
                         try:
                             await create_schema()

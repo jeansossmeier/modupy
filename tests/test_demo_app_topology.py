@@ -295,18 +295,17 @@ async def test_demo_app_worker_routes_are_isolated_per_module(tmp_path: Path) ->
 async def test_demo_app_two_hop_cross_process_delivery_over_redis_broker(
     redis_url: str,
     redis_client: object,
+    redis_key_prefix: str,
 ) -> None:
-    """The same real demo shop, same three processes, same two-hop chain — but
-    delivered over **Redis Streams** instead of the SQLite broker (the demo's
-    ``docker compose up redis`` / ``MODULITH_BROKER=redis-streams`` mode).
+    """Deliver the demo's two-hop chain through Redis Streams across three processes.
 
-    ``redis_client`` is requested only for its flush-before/after hygiene; the
-    workers reach Redis themselves via ``REDIS_URL``."""
+    ``redis_client`` owns namespaced cleanup; workers connect through ``REDIS_URL``.
+    """
     specs = _demo_specs(
         {
             "MODULITH_BROKER": "redis-streams",
             "REDIS_URL": redis_url,
-            "MODULITH_STREAM_PREFIX": "modulith.demo.topo",
+            "MODULITH_STREAM_PREFIX": redis_key_prefix,
         }
     )
     await _assert_two_hop_over_proxy(specs)

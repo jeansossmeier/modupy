@@ -15,6 +15,7 @@ which defaults are active.
 from __future__ import annotations
 
 import difflib
+import keyword
 import logging
 import math
 import os
@@ -46,6 +47,20 @@ class ConfigurationError(Exception):
 
     Always carries an actionable message — what went wrong and how to fix it.
     """
+
+
+def _validate_contracts_module(value: object) -> str:
+    """Validate and return an importable dotted module name."""
+    if (
+        type(value) is not str
+        or not value
+        or any(not part.isidentifier() or keyword.iskeyword(part) for part in value.split("."))
+    ):
+        raise ConfigurationError(
+            "contracts_module must be a non-empty dot-separated Python module name "
+            f"without keywords, got {value!r}"
+        )
+    return value
 
 
 # Valid values for enum-like fields. Adapter names beyond the built-in set
@@ -134,6 +149,9 @@ class Configuration:
     # Tracks which keys were explicitly set vs got their default value.
     # Used by safety checks (e.g. "production + default outbox = error").
     explicit_keys: frozenset[str] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        _validate_contracts_module(self.contracts_module)
 
     def is_explicit(self, key: str) -> bool:
         """True if the user explicitly set this key (vs accepting default)."""
@@ -710,7 +728,16 @@ def _validate_redis_broker_options(options: dict[str, Any]) -> None:
 _DATABASE_COMPLETION_MODES = frozenset({"delete", "mark"})
 _DATABASE_NO_SUBSCRIBER_POLICIES = frozenset({"error", "store", "wait"})
 _DATABASE_ORPHAN_REPLAY_POLICIES = frozenset({"ttl_all_groups", "first_groups", "expected_groups"})
-_DATABASE_SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SQL_SCHEMA_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _validate_sql_schema(value: object, *, option_name: str) -> str:
+    if type(value) is not str or _SQL_SCHEMA_RE.fullmatch(value) is None:
+        raise ConfigurationError(
+            f"{option_name} must be a valid unquoted SQL identifier "
+            f"(letters, digits, underscore, not starting with a digit), got {value!r}"
+        )
+    return value
 
 
 def _validate_database_broker_options(options: dict[str, Any]) -> None:
@@ -757,12 +784,7 @@ def _validate_database_broker_options(options: dict[str, Any]) -> None:
                 f"broker_options.busy_timeout_ms must be a positive integer, got {value!r}"
             )
     if "schema" in options:
-        value = options["schema"]
-        if type(value) is not str or not _DATABASE_SCHEMA_RE.match(value):
-            raise ConfigurationError(
-                "broker_options.schema must be a valid unquoted SQL identifier "
-                f"(letters, digits, underscore, not starting with a digit), got {value!r}"
-            )
+        _validate_sql_schema(options["schema"], option_name="broker_options.schema")
     for name in (
         "no_subscriber_wait_timeout_seconds",
         "no_subscriber_wait_poll_interval_ms",
@@ -823,6 +845,8 @@ def _validate(data: dict[str, Any]) -> None:
                 f"{field_name} must be {expected}, got "
                 f"{type(data[field_name]).__name__}: {data[field_name]!r}"
             )
+    if "contracts_module" in data:
+        _validate_contracts_module(data["contracts_module"])
 
     # Dict-typed fields must actually be tables. A scalar here is a natural
     # typo (forgetting the [tool.modulith.outbox_options] table header) that

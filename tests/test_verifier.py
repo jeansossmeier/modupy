@@ -534,6 +534,106 @@ def test_data_ownership_ignores_foreign_key_within_owning_module(make_fake_app) 
         manifest_module._reset_for_testing()
 
 
+def test_table_ref_collection_resolves_sqlalchemy_aliases_constraints_and_annotations(
+    make_fake_app,
+) -> None:
+    make_fake_app(
+        {
+            "orders": """
+                import sqlalchemy as sa
+                import sqlalchemy.schema as schema
+                from sqlalchemy import schema as imported_schema
+                from sqlalchemy import ForeignKeyConstraint as FKC
+                from sqlalchemy import Table as SATable
+                from sqlalchemy.schema import ForeignKey as FK
+
+                direct = sa.Table("orders", metadata)
+                module_alias = schema.Table("invoices", metadata)
+                imported_module_alias = imported_schema.Table("receipts", metadata)
+                symbol_alias = SATable("shipments", metadata)
+                foreign_key = FK("crm.customers.id")
+                constraint = FKC(["customer_id"], ["crm.customers.id"])
+                keyword_table = sa.Table(name="returns", metadata=metadata)
+                keyword_foreign_key = FK(column="crm.accounts.id")
+                keyword_constraint = FKC(
+                    columns=("customer_id", "account_id"),
+                    refcolumns=("crm.customers.id", "crm.accounts.id"),
+                )
+
+                class AuditRow:
+                    __tablename__: str = "audit_log"
+            """
+        }
+    )
+
+    refs = verifier._collect_table_refs(_module("orders"))
+
+    assert [(table, kind) for table, _location, kind in refs] == [
+        ("orders", "define"),
+        ("invoices", "define"),
+        ("receipts", "define"),
+        ("shipments", "define"),
+        ("customers", "reference"),
+        ("customers", "reference"),
+        ("returns", "define"),
+        ("accounts", "reference"),
+        ("customers", "reference"),
+        ("accounts", "reference"),
+        ("audit_log", "define"),
+    ]
+    assert all(location.startswith("fakeapp/orders/__init__.py:") for _, location, _ in refs)
+
+
+def test_table_ref_collection_ignores_unrelated_same_named_callables_without_path_work(
+    make_fake_app, monkeypatch
+) -> None:
+    make_fake_app(
+        {
+            "orders": """
+                from helpers import ForeignKey, Table
+                import factory
+
+                local = Table("customers", metadata)
+                remote = factory.ForeignKey("customers.id")
+            """
+        }
+    )
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("portable paths are only computed for SQLAlchemy matches")
+
+    monkeypatch.setattr(verifier, "_portable_path", fail_if_called)
+
+    assert verifier._collect_table_refs(_module("orders")) == []
+
+
+def test_data_ownership_flags_foreign_key_constraint_alias(make_fake_app) -> None:
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+    make_fake_app(
+        {
+            "customers": "",
+            "orders": """
+                from sqlalchemy import ForeignKeyConstraint as FKC
+
+                customer_fk = FKC(["customer_id"], ["crm.customers.id"])
+            """,
+        }
+    )
+    manifest_module._manifests["fakeapp.customers"] = manifest_module.Manifest(
+        package="fakeapp.customers", owns_tables=("customers",)
+    )
+    try:
+        mods = [_module("customers"), _module("orders")]
+        violations = verifier.modulith_verify_module(_module("orders"), mods)
+        ownership = [violation for violation in violations if violation.rule == "data-ownership"]
+        assert len(ownership) == 1
+        assert "customers" in ownership[0].message
+    finally:
+        manifest_module._reset_for_testing()
+
+
 # ---------------------------------------------------------------------------
 # Rule 5, declared-inventory half: a table a module defines but omits from owns_tables
 # ---------------------------------------------------------------------------

@@ -220,7 +220,7 @@ async def _stop_and_assert_workers_gone(supervisor: Supervisor, ports: tuple[int
 
 
 async def test_two_real_workers_route_http_and_deliver_cross_process_event(
-    tmp_path, redis_url, redis_client
+    tmp_path, redis_url, redis_client, redis_key_prefix
 ) -> None:
     _write_app(tmp_path)
     orders_port = _free_port()
@@ -229,7 +229,7 @@ async def test_two_real_workers_route_http_and_deliver_cross_process_event(
     worker_env = {
         "MODULITH_BROKER": "redis-streams",
         "REDIS_URL": redis_url,
-        "MODULITH_STREAM_PREFIX": "modulith.topo",
+        "MODULITH_STREAM_PREFIX": redis_key_prefix,
         "PYTHONPATH": f"{tmp_path}{os.pathsep}{_REPO_ROOT}",
     }
     specs = [

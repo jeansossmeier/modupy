@@ -16,6 +16,7 @@ from alembic import command
 from alembic.config import Config
 
 import modulith.adapters as adapters_pkg
+from modulith import ConfigurationError
 
 MIGRATIONS = Path(adapters_pkg.__file__).parent / "migrations"
 
@@ -378,4 +379,16 @@ def test_alembic_offline_mode_with_schema_env_var_exits(tmp_path: Path, monkeypa
     monkeypatch.setenv("MODULITH_DB_SCHEMA", "mod_test")
     with pytest.raises(SystemExit):
         command.upgrade(_cfg(db), "head", sql=True)
+    assert not db.exists()
+
+
+def test_alembic_rejects_invalid_schema_before_opening_a_connection(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    db = tmp_path / "invalid-schema.db"
+    monkeypatch.setenv("MODULITH_DB_SCHEMA", "valid_name\n")
+
+    with pytest.raises(ConfigurationError, match="schema"):
+        command.upgrade(_cfg(db), "head", sql=True)
+
     assert not db.exists()

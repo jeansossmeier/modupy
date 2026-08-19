@@ -11,15 +11,17 @@ via ``typer.testing.CliRunner``.
 
 from __future__ import annotations
 
+import builtins
 import importlib
 import json
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from typer.testing import CliRunner
 
 from modulith.cli import app as cli_app
-from modulith.openapi import build_module_openapi, merge_openapi
+from modulith.openapi import OpenAPIMergeError, build_module_openapi, merge_openapi
 
 runner = CliRunner()
 
@@ -65,6 +67,16 @@ _INVENTORY_SOURCE = """
     @router.post("/items")
     def create_item(item: Item) -> Item:
         return item
+"""
+
+_DUPLICATE_OPERATION_ID_SOURCE = """
+    from fastapi import APIRouter
+
+    router = APIRouter()
+
+    @router.get("/items", operation_id="sharedOperation")
+    def list_items() -> list[str]:
+        return []
 """
 
 
@@ -119,7 +131,7 @@ def test_merge_openapi_prefixes_schemas_and_rewrites_refs_and_info(make_fake_app
     assert orders_doc is not None
     assert inventory_doc is not None
 
-    merged, warnings = merge_openapi(
+    merged = merge_openapi(
         {"orders": orders_doc, "inventory": inventory_doc},
         title="fakeapp",
         version="1.2.3",
@@ -137,10 +149,67 @@ def test_merge_openapi_prefixes_schemas_and_rewrites_refs_and_info(make_fake_app
 
     assert '"#/components/schemas/Item"' not in json.dumps(merged)
     assert merged["info"] == {"title": "fakeapp", "version": "1.2.3"}
-    assert not warnings
 
 
-def test_merge_openapi_path_collision_keeps_first_and_warns() -> None:
+def test_merge_openapi_rewrites_only_schema_reference_fields() -> None:
+    schema_ref = "#/components/schemas/Item"
+    doc: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "orders", "version": "0.0.0"},
+        "paths": {
+            "/items": {
+                "get": {
+                    "operationId": "getItem",
+                    "description": schema_ref,
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "oneOf": [{"$ref": schema_ref}],
+                                        "discriminator": {
+                                            "propertyName": "kind",
+                                            "mapping": {"item": schema_ref},
+                                        },
+                                    },
+                                    "example": schema_ref,
+                                    "examples": {"sample": {"value": {"$ref": schema_ref}}},
+                                }
+                            },
+                        }
+                    },
+                }
+            }
+        },
+        "components": {
+            "schemas": {
+                "Item": {
+                    "type": "object",
+                    "description": schema_ref,
+                    "example": {"$ref": schema_ref},
+                }
+            }
+        },
+    }
+
+    merged = merge_openapi({"orders": doc}, title="t", version="1")
+
+    operation = merged["paths"]["/items"]["get"]
+    media_type = operation["responses"]["200"]["content"]["application/json"]
+    assert media_type["schema"]["oneOf"][0]["$ref"] == "#/components/schemas/orders_Item"
+    assert (
+        media_type["schema"]["discriminator"]["mapping"]["item"]
+        == "#/components/schemas/orders_Item"
+    )
+    assert operation["description"] == schema_ref
+    assert media_type["example"] == schema_ref
+    assert media_type["examples"]["sample"]["value"]["$ref"] == schema_ref
+    assert merged["components"]["schemas"]["orders_Item"]["description"] == schema_ref
+    assert merged["components"]["schemas"]["orders_Item"]["example"]["$ref"] == schema_ref
+
+
+def test_merge_openapi_rejects_conflicting_path_items() -> None:
     doc_a: dict[str, Any] = {
         "openapi": "3.1.0",
         "info": {"title": "a", "version": "0.0.0"},
@@ -154,15 +223,29 @@ def test_merge_openapi_path_collision_keeps_first_and_warns() -> None:
         "components": {},
     }
 
-    merged, warnings = merge_openapi({"a": doc_a, "b": doc_b}, title="t", version="1")
-
-    assert merged["paths"]["/shared"]["get"]["summary"] == "from a"
-    collision_warnings = [w for w in warnings if "path collision" in w]
-    assert len(collision_warnings) == 1
-    assert "/shared" in collision_warnings[0]
+    with pytest.raises(OpenAPIMergeError, match=r"path collision.*'/shared'"):
+        merge_openapi({"a": doc_a, "b": doc_b}, title="t", version="1")
 
 
-def test_merge_openapi_differing_security_schemes_warns_and_keeps_first() -> None:
+def test_merge_openapi_rejects_final_schema_key_collision() -> None:
+    doc_a: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "a", "version": "0.0.0"},
+        "paths": {},
+        "components": {"schemas": {"b_Item": {"type": "string"}}},
+    }
+    doc_a_b: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "a_b", "version": "0.0.0"},
+        "paths": {},
+        "components": {"schemas": {"Item": {"type": "integer"}}},
+    }
+
+    with pytest.raises(OpenAPIMergeError, match=r"schema key collision.*a_b_Item"):
+        merge_openapi({"a": doc_a, "a_b": doc_a_b}, title="t", version="1")
+
+
+def test_merge_openapi_rejects_incompatible_non_schema_components() -> None:
     doc_a: dict[str, Any] = {
         "openapi": "3.1.0",
         "info": {"title": "a", "version": "0.0.0"},
@@ -178,10 +261,174 @@ def test_merge_openapi_differing_security_schemes_warns_and_keeps_first() -> Non
         "components": {"securitySchemes": {"apiKey": {"type": "http", "scheme": "bearer"}}},
     }
 
-    merged, warnings = merge_openapi({"a": doc_a, "b": doc_b}, title="t", version="1")
+    with pytest.raises(OpenAPIMergeError, match=r"components\.securitySchemes\.'apiKey'"):
+        merge_openapi({"a": doc_a, "b": doc_b}, title="t", version="1")
 
-    assert merged["components"]["securitySchemes"]["apiKey"]["type"] == "apiKey"
-    assert any("securitySchemes" in w and "apiKey" in w for w in warnings)
+
+def test_merge_openapi_rejects_duplicate_operation_ids() -> None:
+    def doc(path: str) -> dict[str, Any]:
+        return {
+            "openapi": "3.1.0",
+            "info": {"title": path, "version": "0.0.0"},
+            "paths": {
+                path: {
+                    "get": {
+                        "operationId": "sharedOperation",
+                        "responses": {"200": {"description": "ok"}},
+                    }
+                }
+            },
+        }
+
+    with pytest.raises(OpenAPIMergeError, match=r"duplicate operationId.*sharedOperation"):
+        merge_openapi({"a": doc("/a"), "b": doc("/b")}, title="t", version="1")
+
+
+@pytest.mark.parametrize(
+    ("section_name", "component"),
+    [
+        (
+            "callbacks",
+            {
+                "onEvent": {
+                    "{$request.body#/callbackUrl}": {
+                        "post": {
+                            "operationId": "sharedOperation",
+                            "responses": {"200": {"description": "ok"}},
+                        }
+                    }
+                }
+            },
+        ),
+        (
+            "pathItems",
+            {
+                "Reusable": {
+                    "post": {
+                        "operationId": "sharedOperation",
+                        "responses": {"200": {"description": "ok"}},
+                    }
+                }
+            },
+        ),
+    ],
+)
+def test_merge_openapi_checks_operation_ids_in_reusable_components(
+    section_name: str, component: dict[str, Any]
+) -> None:
+    doc: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "a", "version": "0.0.0"},
+        "paths": {
+            "/items": {
+                "get": {
+                    "operationId": "sharedOperation",
+                    "responses": {"200": {"description": "ok"}},
+                }
+            }
+        },
+        "components": {section_name: component},
+    }
+
+    with pytest.raises(OpenAPIMergeError, match=r"duplicate operationId.*sharedOperation"):
+        merge_openapi({"a": doc}, title="t", version="1")
+
+
+def test_merge_openapi_preserves_compatible_top_level_metadata() -> None:
+    security: list[dict[str, list[str]]] = [{"apiKey": []}]
+    servers = [{"url": "https://api.example.test"}]
+    doc_a: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "a", "version": "0.0.0"},
+        "paths": {},
+        "security": security,
+        "servers": servers,
+        "tags": [{"name": "shared"}],
+        "webhooks": {
+            "orderCreated": {
+                "post": {
+                    "operationId": "orderCreated",
+                    "responses": {"200": {"description": "ok"}},
+                }
+            }
+        },
+        "x-brand": {"name": "Example"},
+    }
+    doc_b: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "b", "version": "0.0.0"},
+        "paths": {},
+        "security": security,
+        "servers": servers,
+        "tags": [{"name": "shared"}, {"name": "inventory"}],
+        "webhooks": {
+            "stockChanged": {
+                "post": {
+                    "operationId": "stockChanged",
+                    "responses": {"200": {"description": "ok"}},
+                }
+            }
+        },
+        "x-brand": {"name": "Example"},
+    }
+
+    merged = merge_openapi({"a": doc_a, "b": doc_b}, title="t", version="1")
+
+    assert merged["security"] == security
+    assert merged["servers"] == servers
+    assert merged["tags"] == [{"name": "shared"}, {"name": "inventory"}]
+    assert set(merged["webhooks"]) == {"orderCreated", "stockChanged"}
+    assert merged["x-brand"] == {"name": "Example"}
+
+
+@pytest.mark.parametrize(
+    ("field", "first", "second"),
+    [
+        ("openapi", "3.1.0", "3.0.3"),
+        ("security", [{"apiKey": []}], [{"oauth": []}]),
+        ("servers", [{"url": "https://a.test"}], [{"url": "https://b.test"}]),
+        ("x-brand", {"name": "A"}, {"name": "B"}),
+    ],
+)
+def test_merge_openapi_rejects_conflicting_top_level_metadata(
+    field: str, first: Any, second: Any
+) -> None:
+    doc_a: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "a", "version": "0.0.0"},
+        "paths": {},
+        field: first,
+    }
+    doc_b: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "b", "version": "0.0.0"},
+        "paths": {},
+        field: second,
+    }
+
+    with pytest.raises(OpenAPIMergeError, match=f"top-level {field!r}"):
+        merge_openapi({"a": doc_a, "b": doc_b}, title="t", version="1")
+
+
+def test_merge_openapi_does_not_import_fastapi(monkeypatch) -> None:
+    doc: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "a", "version": "0.0.0"},
+        "paths": {},
+        "security": "not-a-security-requirement-list",
+    }
+    real_import = builtins.__import__
+
+    def import_without_fastapi(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "fastapi" or name.startswith("fastapi."):
+            raise AssertionError("merge_openapi imported an optional dependency")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_fastapi)
+
+    merged = merge_openapi({"a": doc}, title="t", version="1")
+
+    assert merged["security"] == "not-a-security-requirement-list"
 
 
 # ---------------------------------------------------------------------------
@@ -245,3 +492,68 @@ def test_cli_openapi_unwritable_output_path_is_clean_user_error(
     assert result.exit_code == 1
     assert "could not write" in result.output
     assert "Traceback" not in result.output
+
+
+def test_cli_openapi_missing_fastapi_is_actionable(make_fake_app, monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": _ORDERS_SOURCE})
+    output = tmp_path / "openapi.json"
+    real_import = builtins.__import__
+
+    def import_without_fastapi(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "fastapi.openapi.models":
+            raise ModuleNotFoundError("No module named 'fastapi'", name="fastapi")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_fastapi)
+
+    result = runner.invoke(cli_app, ["openapi", "--output", str(output)])
+
+    assert result.exit_code == 1
+    assert "pip install 'modupy[fastapi]'" in result.output
+    assert "Traceback" not in result.output
+    assert not output.exists()
+
+
+def test_cli_openapi_validates_final_document_shape(make_fake_app, monkeypatch, tmp_path) -> None:
+    from modulith import openapi as openapi_module
+
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    output = tmp_path / "openapi.json"
+    invalid_doc: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "orders", "version": "0.0.0"},
+        "paths": {},
+        "security": "not-a-security-requirement-list",
+    }
+    monkeypatch.setattr(
+        openapi_module,
+        "build_module_openapi",
+        lambda _module_name, _module: invalid_doc,
+    )
+
+    result = runner.invoke(cli_app, ["openapi", "--output", str(output)])
+
+    assert result.exit_code == 1
+    assert "invalid merged OpenAPI document" in result.output
+    assert "Traceback" not in result.output
+    assert not output.exists()
+
+
+def test_cli_openapi_merge_error_is_actionable(make_fake_app, monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {
+            "orders": _DUPLICATE_OPERATION_ID_SOURCE,
+            "inventory": _DUPLICATE_OPERATION_ID_SOURCE,
+        }
+    )
+    output = tmp_path / "openapi.json"
+
+    result = runner.invoke(cli_app, ["openapi", "--output", str(output)])
+
+    assert result.exit_code == 1
+    assert "duplicate operationId" in result.output
+    assert "Traceback" not in result.output
+    assert not output.exists()

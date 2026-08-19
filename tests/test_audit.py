@@ -207,6 +207,48 @@ def test_shared_tables_include_foreign_key_references(tmp_path: Path) -> None:
     assert result.readiness_score == no_fk_result.readiness_score
 
 
+def test_shared_tables_match_verifier_sqlalchemy_ast_forms(tmp_path: Path) -> None:
+    root = tmp_path / "myapp"
+    _write(root, "__init__.py", "")
+    _write(
+        root,
+        "customers/models.py",
+        """
+        import sqlalchemy as sa
+        from sqlalchemy import Table as SATable
+
+        metadata = sa.MetaData()
+        customers = SATable(name="customers", metadata=metadata)
+        accounts = SATable(name="accounts", metadata=metadata)
+        regions = SATable(name="regions", metadata=metadata)
+
+        class AuditRow:
+            __tablename__: str = "audit_log"
+        """,
+    )
+    _write(root, "customers/__init__.py", "")
+    _write(
+        root,
+        "orders/models.py",
+        """
+        from sqlalchemy import ForeignKeyConstraint as FKC
+        from sqlalchemy.schema import ForeignKey as FK
+
+        customer_id = FK(column="crm.customers.id")
+        audit_id = FK(column="audit_log.id")
+        account_region = FKC(
+            columns=("account_id", "region_id"),
+            refcolumns=("crm.accounts.id", "crm.regions.id"),
+        )
+        """,
+    )
+    _write(root, "orders/__init__.py", "")
+
+    result = audit_codebase(root)
+
+    assert result.shared_tables == ["accounts", "audit_log", "customers", "regions"]
+
+
 # ---------------------------------------------------------------------------
 # Listener candidates
 # ---------------------------------------------------------------------------

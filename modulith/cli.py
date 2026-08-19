@@ -936,7 +936,7 @@ def extract(
     files needed to run it as its own process via
     ``modulith._worker:create_app``. Exit codes: 0 on success, 1 on an
     unknown module, boundary violations / shared tables not overridden by
-    --force, or a non-empty --output directory (never overridable).
+    --force, or an existing/unsafe --output path (never overridable).
     """
     from .extract import extraction_blockers, write_extraction
 
@@ -949,9 +949,6 @@ def extract(
 
     if output is None:
         output = Path(f"{module}-service")
-    if output.exists() and any(output.iterdir()):
-        typer.echo(f"error: --output {output} already exists and is not empty", err=True)
-        raise typer.Exit(code=1)
 
     cfg = rt.config
     assert cfg is not None and cfg.package is not None  # guaranteed by _bootstrap_or_exit
@@ -1000,14 +997,18 @@ def extract(
     )
 
     notes = blockers if (blockers and force) else []
-    written = write_extraction(
-        cfg=cfg,
-        module=module,
-        package_dir=package_dir,
-        output=output,
-        helpers=helpers,
-        notes=notes,
-    )
+    try:
+        written = write_extraction(
+            cfg=cfg,
+            module=module,
+            package_dir=package_dir,
+            output=output,
+            helpers=helpers,
+            notes=notes,
+        )
+    except (OSError, ValueError) as exc:
+        typer.echo(f"error: could not extract to {output}: {exc}", err=True)
+        raise typer.Exit(code=1) from None
     typer.echo(f"extracted {module!r} to {output} ({len(written)} file(s)):")
     for name in written:
         typer.echo(f"  {name}")
@@ -1193,6 +1194,17 @@ def openapi(
     """
     from . import openapi as openapi_module
 
+    try:
+        from fastapi.openapi.models import OpenAPI as FastAPIOpenAPI
+    except ImportError as exc:
+        typer.echo(
+            "error: OpenAPI generation requires FastAPI. "
+            "Install it with: pip install 'modupy[fastapi]' "
+            f"({exc})",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
+
     rt = _bootstrap_or_exit()
     cfg = rt.config
     assert cfg is not None  # ensure_bootstrapped guarantees this
@@ -1213,13 +1225,21 @@ def openapi(
         typer.echo("error: no module exposes a router — nothing to document", err=True)
         raise typer.Exit(code=1)
 
-    merged, warnings = openapi_module.merge_openapi(
-        docs,
-        title=title or cfg.package or "modulith",
-        version=api_version or _project_version() or "0.0.0",
-    )
-    for warning in warnings:
-        typer.echo(f"warning: {warning}", err=True)
+    try:
+        merged = openapi_module.merge_openapi(
+            docs,
+            title=title or cfg.package or "modulith",
+            version=api_version or _project_version() or "0.0.0",
+        )
+        try:
+            FastAPIOpenAPI(**merged)
+        except ValueError as exc:
+            raise openapi_module.OpenAPIMergeError(
+                f"invalid merged OpenAPI document: {exc}"
+            ) from None
+    except openapi_module.OpenAPIMergeError as exc:
+        typer.echo(f"error: could not merge OpenAPI documents: {exc}", err=True)
+        raise typer.Exit(code=1) from None
 
     try:
         output.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")

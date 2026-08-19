@@ -24,10 +24,12 @@ import os
 from typing import Any
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool, text
+from alembic.script import ScriptDirectory
+from sqlalchemy import engine_from_config, inspect, pool, text
 
 from modulith.adapters.db_broker import broker_schema
 from modulith.adapters.postgres_outbox import Base
+from modulith.config import _validate_sql_schema
 
 logger = logging.getLogger("modulith.adapters.migrations.env")
 
@@ -47,7 +49,40 @@ def _resolve_url() -> str:
 
 def _resolve_schema() -> str | None:
     x_args = context.get_x_argument(as_dictionary=True)
-    return x_args.get("schema") or os.environ.get("MODULITH_DB_SCHEMA") or None
+    schema = x_args.get("schema") or os.environ.get("MODULITH_DB_SCHEMA") or None
+    if schema is None:
+        return None
+    return _validate_sql_schema(schema, option_name="schema")
+
+
+def _guard_named_schema_transition(connection: Any, schema: str) -> None:
+    """Refuse a named target while managed tables remain in ``public``."""
+    if schema == "public":
+        return
+    inspector = inspect(connection)
+
+    managed_tables = {
+        table.name for metadata in target_metadata for table in metadata.sorted_tables
+    }
+    public_tables = set(inspector.get_table_names(schema="public"))
+    existing = sorted(public_tables & managed_tables)
+    if "alembic_version" in public_tables:
+        revision_ids = {
+            revision.revision for revision in ScriptDirectory.from_config(config).walk_revisions()
+        }
+        public_revisions = set(
+            connection.execute(text("SELECT version_num FROM public.alembic_version")).scalars()
+        )
+        if public_revisions & revision_ids:
+            existing.append("alembic_version")
+    if existing:
+        names = ", ".join(existing)
+        raise SystemExit(
+            f"schema={schema!r} was enabled while public contains Modulith tables/history "
+            f"({names}). Refusing to create a second migration history or move data "
+            "automatically. Back up the database, explicitly migrate and verify those "
+            "tables in the named schema, then rerun the migration."
+        )
 
 
 def run_migrations_offline() -> None:
@@ -76,6 +111,10 @@ def run_migrations_online() -> None:
         configure_kwargs: dict[str, Any] = {}
         if schema:
             if connection.dialect.name == "postgresql":
+                # Inspector catalog reads autobegin a transaction. Finish it
+                # before Alembic opens the transaction that owns migration DDL.
+                with connection.begin():
+                    _guard_named_schema_transition(connection, schema)
                 connection = connection.execution_options(schema_translate_map={None: schema})
                 configure_kwargs["version_table_schema"] = schema
             else:

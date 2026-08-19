@@ -596,18 +596,116 @@ def _check_declared_dependencies(
 # ---------------------------------------------------------------------------
 
 
-def _collect_table_refs(module: ModuleInfo) -> list[tuple[str, str, str]]:
-    """Find table references; return (table_name, location, kind).
+_SQLALCHEMY_TABLE_SYMBOLS = frozenset({"Table", "ForeignKey", "ForeignKeyConstraint"})
+_SQLALCHEMY_TABLE_MODULES = frozenset({"schema", "sql"})
 
-    ``kind`` is ``"define"`` for a table the module establishes (SQLAlchemy
-    Core ``Table("name")`` or the declarative ORM ``__tablename__ = "name"``
-    assignment — the dominant patterns) and ``"reference"`` for a table the
-    module merely points at (a ``ForeignKey("[schema.]table.column")``
-    string literal — the schema-qualified form resolves to the table via its
-    second-to-last dotted segment). Mirrors ``modulith.audit._string_table_refs``
-    so the two agree on what counts as a table reference — without it,
-    ownership violations on declarative models went undetected.
-    """
+
+def _dotted_ast_name(node: ast.expr) -> list[str] | None:
+    if isinstance(node, ast.Name):
+        return [node.id]
+    if isinstance(node, ast.Attribute):
+        prefix = _dotted_ast_name(node.value)
+        return [*prefix, node.attr] if prefix is not None else None
+    return None
+
+
+def _literal_strings(node: ast.expr | None) -> list[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, ast.List | ast.Tuple | ast.Set):
+        return [value for element in node.elts for value in _literal_strings(element)]
+    return []
+
+
+class _TableRefCollector(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.refs: list[tuple[str, int, str]] = []
+        self.module_aliases: dict[str, str] = {}
+        self.symbol_aliases: dict[str, str] = {}
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name == "sqlalchemy" or alias.name.startswith("sqlalchemy."):
+                local_name = alias.asname or alias.name.split(".", 1)[0]
+                imported_module = alias.name if alias.asname else "sqlalchemy"
+                self.module_aliases[local_name] = imported_module
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if (
+            node.level
+            or not node.module
+            or not (node.module == "sqlalchemy" or node.module.startswith("sqlalchemy."))
+        ):
+            return
+        for alias in node.names:
+            if alias.name in _SQLALCHEMY_TABLE_SYMBOLS:
+                self.symbol_aliases[alias.asname or alias.name] = alias.name
+            elif node.module == "sqlalchemy" and alias.name in _SQLALCHEMY_TABLE_MODULES:
+                self.module_aliases[alias.asname or alias.name] = f"sqlalchemy.{alias.name}"
+
+    def _resolved_symbol(self, node: ast.expr) -> str | None:
+        parts = _dotted_ast_name(node)
+        if not parts:
+            return None
+        if len(parts) == 1:
+            return self.symbol_aliases.get(parts[0])
+        imported_module = self.module_aliases.get(parts[0])
+        if imported_module is None:
+            return None
+        resolved = ".".join((imported_module, *parts[1:]))
+        symbol = resolved.rsplit(".", 1)[-1]
+        return symbol if symbol in _SQLALCHEMY_TABLE_SYMBOLS else None
+
+    @staticmethod
+    def _argument(node: ast.Call, index: int, keyword: str) -> ast.expr | None:
+        if len(node.args) > index:
+            return node.args[index]
+        return next((item.value for item in node.keywords if item.arg == keyword), None)
+
+    def _append(self, table: str, node: ast.Call | ast.Assign | ast.AnnAssign, kind: str) -> None:
+        self.refs.append((table, node.lineno, kind))
+
+    def visit_Call(self, node: ast.Call) -> None:
+        symbol = self._resolved_symbol(node.func)
+        if symbol == "Table":
+            for table in _literal_strings(self._argument(node, 0, "name")):
+                self._append(table, node, "define")
+        elif symbol == "ForeignKey":
+            for target in _literal_strings(self._argument(node, 0, "column")):
+                parts = target.split(".")
+                if len(parts) >= 2:
+                    self._append(parts[-2], node, "reference")
+        elif symbol == "ForeignKeyConstraint":
+            for target in _literal_strings(self._argument(node, 1, "refcolumns")):
+                parts = target.split(".")
+                if len(parts) >= 2:
+                    self._append(parts[-2], node, "reference")
+        self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        if any(
+            isinstance(target, ast.Name) and target.id == "__tablename__" for target in node.targets
+        ):
+            for table in _literal_strings(node.value):
+                self._append(table, node, "define")
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if isinstance(node.target, ast.Name) and node.target.id == "__tablename__":
+            for table in _literal_strings(node.value):
+                self._append(table, node, "define")
+        self.generic_visit(node)
+
+
+def _table_refs_from_tree(tree: ast.Module) -> list[tuple[str, int, str]]:
+    """Return table references as ``(name, line, kind)`` without importing source."""
+    collector = _TableRefCollector()
+    collector.visit(tree)
+    return collector.refs
+
+
+def _collect_table_refs(module: ModuleInfo) -> list[tuple[str, str, str]]:
+    """Return best-effort SQLAlchemy references as ``(name, location, kind)`` tuples."""
     root = _package_dir(module.package)
     if root is None:
         return []
@@ -617,40 +715,11 @@ def _collect_table_refs(module: ModuleInfo) -> list[tuple[str, str, str]]:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         except (SyntaxError, UnicodeDecodeError):
             continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                func = node.func
-                name = (
-                    func.id
-                    if isinstance(func, ast.Name)
-                    else (func.attr if isinstance(func, ast.Attribute) else None)
-                )
-                location = f"{_portable_path(path, module)}:{node.lineno}"
-                if name == "Table" and node.args:
-                    first = node.args[0]
-                    if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                        refs.append((first.value, location, "define"))
-                elif name == "ForeignKey" and node.args:
-                    first = node.args[0]
-                    if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                        parts = first.value.split(".")
-                        if len(parts) >= 2:
-                            refs.append((parts[-2], location, "reference"))
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if (
-                        isinstance(target, ast.Name)
-                        and target.id == "__tablename__"
-                        and isinstance(node.value, ast.Constant)
-                        and isinstance(node.value.value, str)
-                    ):
-                        refs.append(
-                            (
-                                node.value.value,
-                                f"{_portable_path(path, module)}:{node.lineno}",
-                                "define",
-                            )
-                        )
+        portable_path: str | None = None
+        for table, line, kind in _table_refs_from_tree(tree):
+            if portable_path is None:
+                portable_path = _portable_path(path, module)
+            refs.append((table, f"{portable_path}:{line}", kind))
     return refs
 
 

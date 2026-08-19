@@ -1102,16 +1102,16 @@ async def test_consumer_dispatch_fires_the_per_listener_lifecycle_hooks() -> Non
 
 
 @pytest.mark.integration
-async def test_integration_publish_then_consume_roundtrip(redis_url, redis_client) -> None:
+async def test_integration_publish_then_consume_roundtrip(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
     """Real Redis: publish to a stream, then the consumer reads, deserializes,
     and dispatches it to a local listener (the genuine cross-process path).
-
-    ``redis_client`` flushes the DB around the test for isolation.
     """
     from modulith.adapters.redis_broker import RedisStreamsBroker
 
     target = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
-    broker = RedisStreamsBroker(url=redis_url, stream_prefix="modulith.itest", consumer_group="g")
+    broker = RedisStreamsBroker(url=redis_url, stream_prefix=redis_key_prefix, consumer_group="g")
 
     received: list[int] = []
 

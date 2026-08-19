@@ -24,6 +24,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
+from uuid import uuid4
 
 import pytest
 
@@ -59,19 +60,52 @@ async def broker_engine(request: Any) -> Any:
     whole test.
     """
     url = request.getfixturevalue(f"{request.param}_url")
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import SQLAlchemyError
     from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.schema import CreateSchema, DropSchema
 
-    engine = create_async_engine(url)
+    if request.param == "mysql":
+        database = make_url(url).database
+        assert database is not None and database.startswith("modupy_test_")
+
+    admin_engine = create_async_engine(url)
+    schema = f"modupy_broker_{uuid4().hex}" if request.param == "postgres" else None
+    engine = (
+        admin_engine.execution_options(schema_translate_map={None: schema})
+        if schema is not None
+        else admin_engine
+    )
     metadata, _, _ = broker_schema()
+    if schema is not None:
+        try:
+            async with admin_engine.begin() as conn:
+                await conn.execute(CreateSchema(schema))
+        except SQLAlchemyError as exc:
+            await admin_engine.dispose()
+            pytest.skip(
+                "PostgreSQL broker tests require CREATE SCHEMA privilege to protect "
+                f"the supplied database ({type(exc).__name__})"
+            )
+    else:
+        async with engine.begin() as conn:
+            await conn.run_sync(metadata.drop_all)
     async with engine.begin() as conn:
-        await conn.run_sync(metadata.drop_all)
         await conn.run_sync(metadata.create_all)
     try:
         yield engine
     finally:
-        async with engine.begin() as conn:
-            await conn.run_sync(metadata.drop_all)
-        await engine.dispose()
+        try:
+            if schema is not None:
+                async with admin_engine.begin() as conn:
+                    await conn.execute(DropSchema(schema, if_exists=True, cascade=True))
+            else:
+                async with engine.begin() as conn:
+                    await conn.run_sync(metadata.drop_all)
+        finally:
+            await engine.dispose()
+            if admin_engine is not engine:
+                await admin_engine.dispose()
 
 
 async def _row_count(engine: Any, table: Any) -> int:
@@ -89,6 +123,46 @@ async def _all_ids(engine: Any) -> set[str]:
     async with engine.connect() as conn:
         result = await conn.execute(select(message.c.id))
         return {row[0] for row in result}
+
+
+async def test_postgres_concurrent_first_bootstrap_creates_complete_schema(
+    postgres_url: str,
+) -> None:
+    from sqlalchemy import inspect
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.schema import DropSchema
+
+    schema = f"modupy_bootstrap_{uuid4().hex}"
+    metadata, _, _ = broker_schema()
+    expected_tables = {table.name for table in metadata.sorted_tables}
+    brokers = [
+        DatabaseBroker(url=postgres_url, engine_options={"schema": schema}) for _ in range(8)
+    ]
+    admin_engine = create_async_engine(postgres_url)
+
+    try:
+        results = await asyncio.gather(
+            *(
+                broker.subscribe([f"app.orders.Event{index}"], f"group-{index}")
+                for index, broker in enumerate(brokers)
+            ),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+
+        assert failures == []
+        async with admin_engine.connect() as conn:
+            tables = set(
+                await conn.run_sync(
+                    lambda sync_conn: inspect(sync_conn).get_table_names(schema=schema)
+                )
+            )
+        assert tables == expected_tables
+    finally:
+        await asyncio.gather(*(broker.close() for broker in brokers))
+        async with admin_engine.begin() as conn:
+            await conn.execute(DropSchema(schema, if_exists=True, cascade=True))
+        await admin_engine.dispose()
 
 
 async def _insert(
@@ -208,19 +282,26 @@ async def test_schema_engine_option_isolates_broker_tables_on_postgres(
     """schema routes the broker's tables into a dedicated Postgres schema,
     leaving public untouched, while publish/claim/dispatch still round-trips
     end to end through that schema."""
-    from sqlalchemy import inspect, text
+    from sqlalchemy import inspect
     from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.schema import CreateSchema, DropSchema
 
-    schema = "mod_broker"
+    schema = f"mod_broker_{uuid4().hex}"
+    sentinel_schema = f"mod_sentinel_{uuid4().hex}"
+    expected_tables = {
+        "broker_message",
+        "broker_retained_delivery",
+        "broker_retained_message",
+        "broker_subscription",
+    }
     admin_engine = create_async_engine(postgres_url)
 
     def _table_names(sync_conn: Any, schema_name: str) -> set[str]:
         return set(inspect(sync_conn).get_table_names(schema=schema_name))
 
+    async with admin_engine.begin() as conn:
+        await conn.execute(CreateSchema(sentinel_schema))
     try:
-        async with admin_engine.begin() as conn:
-            await conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
-
         broker = DatabaseBroker(url=postgres_url, engine_options={"schema": schema})
         try:
             await broker._ensure_schema()
@@ -228,8 +309,16 @@ async def test_schema_engine_option_isolates_broker_tables_on_postgres(
             async with admin_engine.connect() as conn:
                 scoped = await conn.run_sync(_table_names, schema)
                 public = await conn.run_sync(_table_names, "public")
-            assert {"broker_message", "broker_subscription"} <= scoped
-            assert public.isdisjoint({"broker_message", "broker_subscription"})
+            assert scoped == expected_tables
+            assert public.isdisjoint(expected_tables)
+
+            await asyncio.gather(
+                broker.subscribe([_TARGET], "modulith-inventory"),
+                broker.subscribe([_TARGET], "modulith-inventory"),
+                broker.subscribe([_TARGET], "modulith-inventory"),
+            )
+            _, subscription, _ = broker_schema()
+            assert await _row_count(broker.engine, subscription) == 1
 
             delivered: list[str] = []
 
@@ -259,9 +348,18 @@ async def test_schema_engine_option_isolates_broker_tables_on_postgres(
         finally:
             await broker.close()
     finally:
-        async with admin_engine.begin() as conn:
-            await conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        await admin_engine.dispose()
+        try:
+            async with admin_engine.begin() as conn:
+                await conn.execute(DropSchema(schema, if_exists=True, cascade=True))
+            async with admin_engine.connect() as conn:
+                schemas = await conn.run_sync(
+                    lambda sync_conn: inspect(sync_conn).get_schema_names()
+                )
+            assert sentinel_schema in schemas
+        finally:
+            async with admin_engine.begin() as conn:
+                await conn.execute(DropSchema(sentinel_schema, if_exists=True, cascade=True))
+            await admin_engine.dispose()
 
 
 # ---------------------------------------------------------------------------

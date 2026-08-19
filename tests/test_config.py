@@ -94,8 +94,8 @@ def test_contracts_module_defaults_to_convention() -> None:
 
 def test_contracts_module_override() -> None:
     """The convention is a default, not a hardcode — it can be overridden."""
-    cfg = load_configuration(package="x", contracts_module="shared")
-    assert cfg.contracts_module == "shared"
+    cfg = load_configuration(package="x", contracts_module="shared.kernel")
+    assert cfg.contracts_module == "shared.kernel"
     assert cfg.is_explicit("contracts_module")
 
 
@@ -109,6 +109,39 @@ def test_contracts_module_from_env(monkeypatch) -> None:
     monkeypatch.setenv("MODULITH_CONTRACTS_MODULE", "kernel")
     cfg = load_configuration(package="x")
     assert cfg.contracts_module == "kernel"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "/shared",
+        r"shared\kernel",
+        "shared/kernel",
+        "shared..kernel",
+        ".shared",
+        "shared.",
+        "shared\nkernel",
+        "shared.class",
+    ],
+)
+def test_contracts_module_rejects_non_importable_names(value: str) -> None:
+    with pytest.raises(ConfigurationError, match="contracts_module"):
+        load_configuration(package="x", contracts_module=value)
+
+
+def test_contracts_module_from_pyproject_rejects_path(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text('[tool.modulith]\ncontracts_module = "../outside"\n')
+
+    with pytest.raises(ConfigurationError, match="contracts_module"):
+        load_configuration()
+
+
+def test_contracts_module_from_env_rejects_keyword(monkeypatch) -> None:
+    monkeypatch.setenv("MODULITH_CONTRACTS_MODULE", "shared.class")
+
+    with pytest.raises(ConfigurationError, match="contracts_module"):
+        load_configuration(package="x")
 
 
 # ----- Environment variables -------------------------------------------------
@@ -841,6 +874,7 @@ def test_redis_broker_delivery_options_must_be_positive_integers(
         ("schema", "bad-name"),
         ("schema", "1leading_digit"),
         ("schema", ""),
+        ("schema", "valid_name\n"),
     ],
 )
 def test_database_broker_options_are_validated_before_adapter_construction(

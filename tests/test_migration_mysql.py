@@ -27,6 +27,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import make_url
 
 import modulith.adapters as adapters_pkg
 
@@ -69,7 +70,7 @@ def _drop(engine) -> None:
 
 @pytest.fixture
 def clean_mysql(mysql_url: str):
-    """A sync pymysql engine on a schema with no outbox/alembic tables."""
+    """Yield a sync pymysql engine on a disposable database with no managed tables."""
     url = _sync_url(mysql_url)
     engine = create_engine(url)
     _drop(engine)
@@ -89,6 +90,16 @@ def _snapshot(engine, tables: list[str]) -> dict[str, dict[str, tuple[str, bool,
         }
         for table in tables
     }
+
+
+def test_mysql_migrations_use_disposable_database(clean_mysql) -> None:
+    url, engine = clean_mysql
+    database = make_url(url).database
+
+    assert database is not None
+    assert database.startswith("modupy_test_")
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT DATABASE()")).scalar_one().startswith("modupy_test_")
 
 
 def test_alembic_upgrade_head_on_real_mysql(clean_mysql) -> None:

@@ -27,8 +27,6 @@ from modulith.serializers import JsonEventSerializer
 
 pytestmark = [pytest.mark.integration]
 
-_PREFIX = "modulith.e2e"
-
 
 @event
 @dataclass(frozen=True)
@@ -37,8 +35,14 @@ class StreamEvent:
 
 
 _TARGET = f"{StreamEvent.__module__}.{StreamEvent.__qualname__}"
-_STREAM = f"{_PREFIX}.{_TARGET}"
-_DLQ = f"{_STREAM}.dead"
+
+
+def _stream(redis_key_prefix: str) -> str:
+    return f"{redis_key_prefix}.{_TARGET}"
+
+
+def _dlq(redis_key_prefix: str) -> str:
+    return f"{_stream(redis_key_prefix)}.dead"
 
 
 async def _until(predicate, *, timeout: float = 8.0, interval: float = 0.02) -> None:
@@ -65,9 +69,9 @@ async def _until_async(coro_predicate, *, timeout: float = 10.0, interval: float
         raise AssertionError("condition not met within timeout")
 
 
-def _broker(redis_url: str, **kwargs) -> RedisStreamsBroker:
+def _broker(redis_url: str, redis_key_prefix: str, **kwargs) -> RedisStreamsBroker:
     return RedisStreamsBroker(
-        url=redis_url, stream_prefix=_PREFIX, consumer_group="default", **kwargs
+        url=redis_url, stream_prefix=redis_key_prefix, consumer_group="default", **kwargs
     )
 
 
@@ -103,11 +107,11 @@ async def _publish(broker, value: int) -> None:
 
 
 async def test_running_consumer_receives_event_published_after_start(
-    redis_url, redis_client
+    redis_url, redis_client, redis_key_prefix
 ) -> None:
     """The canonical cross-process path: the consumer loop is already running
     (group created, blocking read active) when the producer publishes."""
-    broker = _broker(redis_url)
+    broker = _broker(redis_url, redis_key_prefix)
     received: list[int] = []
     consumer = _consumer(broker, group="modulith-mod", name="c:1", sink=received)
     try:
@@ -124,10 +128,12 @@ async def test_running_consumer_receives_event_published_after_start(
 # ---------------------------------------------------------------------------
 
 
-async def test_message_published_before_group_is_delivered(redis_url, redis_client) -> None:
+async def test_message_published_before_group_is_delivered(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
     """XGROUP CREATE at id ``0`` delivers the pre-existing backlog. A regression
     to ``$`` would silently drop these on real Redis while passing the fake."""
-    broker = _broker(redis_url)
+    broker = _broker(redis_url, redis_key_prefix)
     received: list[int] = []
     consumer = _consumer(broker, group="modulith-mod", name="c:1", sink=received)
     try:
@@ -144,10 +150,12 @@ async def test_message_published_before_group_is_delivered(redis_url, redis_clie
 # ---------------------------------------------------------------------------
 
 
-async def test_unacked_message_reclaimed_by_peer_consumer(redis_url, redis_client) -> None:
+async def test_unacked_message_reclaimed_by_peer_consumer(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
     """Consumer A reads a message and crashes before ACK; consumer B (same
     group) reclaims the pending entry via XAUTOCLAIM and delivers it."""
-    broker = _broker(redis_url)
+    broker = _broker(redis_url, redis_key_prefix)
     group = "modulith-mod"
     await broker.ensure_group(_TARGET, group)
     await _publish(broker, 5)
@@ -171,15 +179,18 @@ async def test_unacked_message_reclaimed_by_peer_consumer(redis_url, redis_clien
 # ---------------------------------------------------------------------------
 
 
-async def test_poison_message_missing_header_is_dead_lettered(redis_url, redis_client) -> None:
+async def test_poison_message_missing_header_is_dead_lettered(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
     """A message lacking the ``event_type`` header is routed to ``<stream>.dead``
     and acked on the source stream — it cannot block the consumer forever."""
-    broker = _broker(redis_url)
+    broker = _broker(redis_url, redis_key_prefix)
+    dlq = _dlq(redis_key_prefix)
     received: list[int] = []
     consumer = _consumer(broker, group="modulith-mod", name="c:1", sink=received)
 
     async def dlq_ready() -> bool:
-        return await redis_client.xlen(_DLQ) == 1
+        return await redis_client.xlen(dlq) == 1
 
     try:
         await broker.ensure_group(_TARGET, "modulith-mod")
@@ -187,15 +198,18 @@ async def test_poison_message_missing_header_is_dead_lettered(redis_url, redis_c
         await consumer.start()
         await _until_async(dlq_ready)
         assert received == []  # never dispatched to a listener
-        assert await redis_client.xlen(_DLQ) == 1
+        assert await redis_client.xlen(dlq) == 1
     finally:
         await consumer.stop()
         await broker.close()
 
 
-async def test_dead_letter_retry_after_interruption_is_idempotent(redis_url, redis_client) -> None:
+async def test_dead_letter_retry_after_interruption_is_idempotent(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
     """Replaying a completed transfer cannot append a second original message."""
-    broker = _broker(redis_url)
+    broker = _broker(redis_url, redis_key_prefix)
+    dlq = _dlq(redis_key_prefix)
     group = "modulith-mod"
     try:
         await broker.ensure_group(_TARGET, group)
@@ -210,8 +224,8 @@ async def test_dead_letter_retry_after_interruption_is_idempotent(redis_url, red
         await broker.dead_letter(_TARGET, message_id, fields, group)
         await broker.dead_letter(_TARGET, message_id, fields, group)
 
-        assert await redis_client.xlen(_DLQ) == 1
-        [(_dead_id, dead_fields)] = await redis_client.xrange(_DLQ)
+        assert await redis_client.xlen(dlq) == 1
+        [(_dead_id, dead_fields)] = await redis_client.xrange(dlq)
         assert dead_fields[b"h:source_message_id"] == message_id.encode()
         assert dead_fields[b"h:source_group"] == group.encode()
     finally:
@@ -219,11 +233,12 @@ async def test_dead_letter_retry_after_interruption_is_idempotent(redis_url, red
 
 
 async def test_repeated_dispatch_failures_dead_letter_on_real_redis(
-    redis_url, redis_client
+    redis_url, redis_client, redis_key_prefix
 ) -> None:
     """A listener that always raises exhausts the delivery budget; the message is
     routed to the DLQ rather than redelivered forever."""
-    broker = _broker(redis_url)
+    broker = _broker(redis_url, redis_key_prefix)
+    dlq = _dlq(redis_key_prefix)
     bus = InMemoryEventBus()
 
     async def boom(evt: StreamEvent) -> None:
@@ -242,14 +257,14 @@ async def test_repeated_dispatch_failures_dead_letter_on_real_redis(
     )
 
     async def dlq_ready() -> bool:
-        return await redis_client.xlen(_DLQ) == 1
+        return await redis_client.xlen(dlq) == 1
 
     try:
         await broker.ensure_group(_TARGET, "modulith-mod")
         await _publish(broker, 1)
         await consumer.start()
         await _until_async(dlq_ready)
-        assert await redis_client.xlen(_DLQ) == 1
+        assert await redis_client.xlen(dlq) == 1
     finally:
         await consumer.stop()
         await broker.close()
@@ -260,15 +275,17 @@ async def test_repeated_dispatch_failures_dead_letter_on_real_redis(
 # ---------------------------------------------------------------------------
 
 
-async def test_same_group_delivers_each_message_exactly_once(redis_url, redis_client) -> None:
+async def test_same_group_delivers_each_message_exactly_once(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
     """Two consumers in ONE group share the stream — each message is delivered to
     exactly one of them (no duplication).
 
     A production reclaim idle (60s) is used so healthy peers don't XAUTOCLAIM each
     other's in-flight messages — reclaim is for crash recovery, not steady state.
     """
-    broker_a = _broker(redis_url)
-    broker_b = _broker(redis_url)
+    broker_a = _broker(redis_url, redis_key_prefix)
+    broker_b = _broker(redis_url, redis_key_prefix)
     got_a: list[int] = []
     got_b: list[int] = []
     c_a = _consumer(
@@ -292,11 +309,13 @@ async def test_same_group_delivers_each_message_exactly_once(redis_url, redis_cl
         await broker_b.close()
 
 
-async def test_distinct_groups_each_receive_every_message(redis_url, redis_client) -> None:
+async def test_distinct_groups_each_receive_every_message(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
     """Two consumers in DIFFERENT groups (the per-consuming-module pattern) each
     receive every published event — the fan-out the design depends on."""
-    broker_inv = _broker(redis_url)
-    broker_notif = _broker(redis_url)
+    broker_inv = _broker(redis_url, redis_key_prefix)
+    broker_notif = _broker(redis_url, redis_key_prefix)
     got_inv: list[int] = []
     got_notif: list[int] = []
     c_inv = _consumer(broker_inv, group="modulith-inventory", name="i:1", sink=got_inv)
@@ -318,15 +337,15 @@ async def test_distinct_groups_each_receive_every_message(redis_url, redis_clien
 # ---------------------------------------------------------------------------
 
 
-async def test_stream_is_trimmed_to_maxlen(redis_url, redis_client) -> None:
+async def test_stream_is_trimmed_to_maxlen(redis_url, redis_client, redis_key_prefix) -> None:
     """A bounded stream does not grow without limit: publishing far more than
     ``max_stream_len`` messages leaves the stream trimmed well below the total."""
-    broker = _broker(redis_url, max_stream_len=10)
+    broker = _broker(redis_url, redis_key_prefix, max_stream_len=10)
     try:
         total = 500
         for v in range(total):
             await _publish(broker, v)
-        length = await redis_client.xlen(_STREAM)
+        length = await redis_client.xlen(_stream(redis_key_prefix))
         assert 0 < length < total  # MAXLEN ~ enforced (approximate trimming)
     finally:
         await broker.close()

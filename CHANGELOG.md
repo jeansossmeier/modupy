@@ -9,12 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-08-19
+
 ### Added
 
-- `modulith extract <module>` — scaffold a standalone service (`pyproject.toml`, `Dockerfile`, `README.md`, `.env.example`) from one module, ready to run against `modulith._worker:create_app`; refuses (exit 1, `--force` to override) on the module's own outbound boundary violations or tables it shares with another module
-- `modulith k8s-manifest` — generate one Deployment + Service per module plus a single Ingress for the process-per-module topology, with the broker connection URL left out of the manifest in favor of a `<package>-broker` Secret; refuses to generate for a broker that can't be shared across pods (`memory`, `shm`, or `database` with a `sqlite://` URL)
-- `modulith openapi` — merge every module's OpenAPI document into one build-time spec, with `components.schemas` keys prefixed per module so identically-named models never collide
-- `modulith doctor` — three new checks: **actuator token** (warns when a multi-process deployment would start with the actuator unmounted or refusing to start), **single-host broker** (warns/errors when a per-host broker like `shm` or SQLite is configured under a detected container runtime), **redis retention** (warns when a redis-streams broker's `max_stream_len` is undersized, tightened by a live pending+lag query when a client is reachable)
+- `modulith extract <module>` — scaffold a wheel-buildable standalone service (`pyproject.toml`, `Dockerfile`, `README.md`, `.env.example`) from one module; boundary/shared-table blockers require `--force`, while unsafe output paths and escaping source symlinks are always rejected
+- `modulith k8s-manifest` — generate RFC-1123-safe Deployment, Service, and Ingress names; validate ports; pass the contracts module and supported broker settings; reference connection secrets without embedding credentials
+- `modulith openapi` — merge module OpenAPI documents into one build-time spec, prefix schema names, and reject incompatible collisions or duplicate operation IDs
+- `modulith doctor` — three new checks: **actuator token** (including an error when token mode lacks a token), **single-host broker**, and **redis retention**; process-split readiness also reports table-only cross-module coupling
 - Per-module Postgres schema — `broker_options.schema` / `MODULITH_BROKER_SCHEMA` for the database broker, and alembic `-x schema=` / `MODULITH_DB_SCHEMA` for migrations, applied via `schema_translate_map` so `Table`/`MetaData` definitions stay unchanged
 
 ### Changed
@@ -22,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `modulith doctor`'s process-split readiness check now also counts cross-module table references (a coupling direct imports can't see) and reports, per module, tables not prefixed with the module's own name; the "microservice-ready" tier now additionally requires zero cross-module table references, otherwise the headline reads "process-split ready (shared tables block extraction)" instead
 - The verifier's `data-ownership` rule now detects `ForeignKey("table.col")` string literals referencing another module's table, not just `Table()`/`__tablename__` declarations, and warns when a module with a non-empty `owns_tables` defines a table it doesn't declare there
 - `modulith audit`'s shared-table detection now also follows `ForeignKey` string literals, mirroring the verifier
+- SQL schema identifiers are validated consistently through configuration, environment variables, Alembic `-x`, and direct database-broker construction
+- Enabling a named migration schema now refuses to abandon existing Modulith tables or Alembic history in `public`; data movement remains an explicit operator migration
+- Artifact generators import application modules and therefore require trusted source; `openapi` reports an actionable `modupy[fastapi]` installation error when FastAPI is unavailable
 
 ## [0.9.0] — 2026-07-22
 

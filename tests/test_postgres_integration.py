@@ -6,17 +6,16 @@ points this adapter is tuned for: ``FOR UPDATE SKIP LOCKED`` row-claiming,
 tz-aware ``TIMESTAMPTZ``, ``BYTEA`` payloads, and the ``WHERE completed_at IS
 NULL`` partial index. A regression in any of those ships green on SQLite.
 
-These tests close that gap against a live Postgres provisioned by the shared
-``postgres_url``/``pg_engine`` fixtures (conftest): a throwaway testcontainers
-Postgres when Docker is available, or ``MODULITH_TEST_POSTGRES_URL`` when set —
-otherwise skipped, so the suite stays green without Docker.
+The shared ``postgres_url`` and ``pg_engine`` fixtures create a disposable
+database and schema from either ``MODULITH_TEST_POSTGRES_URL`` or a
+testcontainers instance, so these tests never alter the supplied database.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select
@@ -80,6 +79,25 @@ def _pub(value: int, **overrides) -> EventPublication:
     return EventPublication(**defaults)
 
 
+async def test_postgres_url_uses_uuid_disposable_database(postgres_url: str) -> None:
+    from sqlalchemy import text
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    database = make_url(postgres_url).database
+    assert database is not None
+    prefix = "modupy_test_"
+    assert database.startswith(prefix)
+    assert UUID(hex=database.removeprefix(prefix)).hex == database.removeprefix(prefix)
+
+    engine = create_async_engine(postgres_url)
+    try:
+        async with engine.connect() as connection:
+            assert await connection.scalar(text("SELECT current_database()")) == database
+    finally:
+        await engine.dispose()
+
+
 def _bootstrap_with_listener() -> None:
     _runtime.configure(package="pgint", auto_discover=False)
     _runtime.ensure_bootstrapped()
@@ -116,11 +134,13 @@ async def test_schema_translate_map_recipe_isolates_outbox_tables(postgres_url: 
     ...)`` routes the outbox's Core tables into a target schema without any
     change to this adapter — ``postgres_outbox.py`` never references a schema
     itself, so the translation is entirely the caller's responsibility."""
-    from sqlalchemy import inspect, text
+    from sqlalchemy import inspect
     from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.schema import CreateSchema
+    from sqlalchemy.schema import CreateSchema, DropSchema
 
-    schema = "orders"
+    schema = f"orders_{uuid4().hex}"
+    sentinel_schema = f"orders_sentinel_{uuid4().hex}"
+    expected_tables = {"event_publications", "event_publications_archive"}
     admin_engine = create_async_engine(postgres_url)
     engine = create_async_engine(postgres_url).execution_options(
         schema_translate_map={None: schema}
@@ -129,11 +149,11 @@ async def test_schema_translate_map_recipe_isolates_outbox_tables(postgres_url: 
     def _table_names(sync_conn, schema_name: str):
         return set(inspect(sync_conn).get_table_names(schema=schema_name))
 
+    async with admin_engine.begin() as conn:
+        await conn.execute(CreateSchema(sentinel_schema))
     try:
-        async with admin_engine.begin() as conn:
-            await conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
         async with engine.begin() as conn:
-            await conn.execute(CreateSchema(schema, if_not_exists=True))
+            await conn.execute(CreateSchema(schema))
             await conn.run_sync(postgres_outbox.Base.metadata.create_all)
 
         store = PostgresPublicationStore(engine=engine)
@@ -145,13 +165,22 @@ async def test_schema_translate_map_recipe_isolates_outbox_tables(postgres_url: 
         async with admin_engine.connect() as conn:
             scoped = await conn.run_sync(_table_names, schema)
             public = await conn.run_sync(_table_names, "public")
-        assert "event_publications" in scoped
-        assert "event_publications" not in public
+        assert scoped == expected_tables
+        assert public.isdisjoint(expected_tables)
     finally:
-        async with admin_engine.begin() as conn:
-            await conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        await engine.dispose()
-        await admin_engine.dispose()
+        try:
+            async with admin_engine.begin() as conn:
+                await conn.execute(DropSchema(schema, if_exists=True, cascade=True))
+            async with admin_engine.connect() as conn:
+                schemas = await conn.run_sync(
+                    lambda sync_conn: inspect(sync_conn).get_schema_names()
+                )
+            assert sentinel_schema in schemas
+        finally:
+            async with admin_engine.begin() as conn:
+                await conn.execute(DropSchema(sentinel_schema, if_exists=True, cascade=True))
+            await engine.dispose()
+            await admin_engine.dispose()
 
 
 # ---------------------------------------------------------------------------

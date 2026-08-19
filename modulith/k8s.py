@@ -25,35 +25,89 @@ an operator wants injected without editing the generated manifest::
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+import shlex
+import unicodedata
 from urllib.parse import urlsplit
 
 from .config import Configuration, ConfigurationError, _configured_broker_url
 from .supervisor import _REDIS_BROKER_ENV_ALIASES, WorkerSpec
 
-# Fixed key inside the <package>-broker Secret — see the module docstring's
-# kubectl create secret example. Independent of whatever key name a local
-# pyproject.toml uses ("url" or "dsn"): the manifest never embeds a URL, so
-# the Secret's key is a generator-wide convention, not a passthrough of it.
+# Generated manifests always read broker credentials from this Secret key.
 _BROKER_SECRET_KEY = "url"
 
-# broker_options keys carrying a connection string are never forwarded as a
-# literal env var (that would put a credential in the manifest); they are
-# replaced by the secretKeyRef wiring in _env_lines instead.
 _URL_LIKE_OPTION_KEYS = frozenset({"url", "dsn"})
 
 _SINGLE_HOST_BROKERS = frozenset({"memory", "shm"})
+
+# Forward only documented database option env vars; credentials stay in a Secret.
+_DATABASE_BROKER_OPTION_KEYS = frozenset(
+    {
+        "batch_size",
+        "busy_timeout_ms",
+        "completion_mode",
+        "dispatch_concurrency",
+        "expected_consumer_groups",
+        "max_delivery_attempts",
+        "max_overflow",
+        "max_payload_bytes",
+        "no_subscriber_policy",
+        "no_subscriber_wait_poll_interval_ms",
+        "no_subscriber_wait_timeout_seconds",
+        "orphan_replay_policy",
+        "orphan_retention_seconds",
+        "poll_interval_ms",
+        "pool_size",
+        "prune_interval_seconds",
+        "reclaim_stale_seconds",
+        "retention_age_seconds",
+        "retention_count",
+        "schema",
+        "sqlite_synchronous",
+        "state_dir",
+    }
+)
+
+# Redis accepts these established names; its other options lack an environment contract.
+_REDIS_OPTION_ENV_NAMES = {
+    "consumer_group": _REDIS_BROKER_ENV_ALIASES["MODULITH_BROKER_CONSUMER_GROUP"],
+    "max_stream_len": _REDIS_BROKER_ENV_ALIASES["MODULITH_BROKER_MAX_STREAM_LEN"],
+    "stream_prefix": _REDIS_BROKER_ENV_ALIASES["MODULITH_BROKER_STREAM_PREFIX"],
+}
+
+_RFC1123_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_K8S_NAME_MAX_LENGTH = 63
+_K8S_HASH_LENGTH = 10
 
 
 def k8s_name(name: str) -> str:
     """Normalize a package/module name into an RFC-1123 DNS label.
 
-    Kubernetes object names must be lowercase alphanumerics and ``-``.
-    Python package/module names use identifier rules (letters, digits,
-    underscores), so the only translation needed is lowercasing and
-    turning underscores into hyphens.
+    Long names retain a readable prefix and a stable hash suffix so distinct
+    inputs do not collapse merely because Kubernetes limits labels to 63 bytes.
     """
-    return name.lower().replace("_", "-")
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:_K8S_HASH_LENGTH]
+    ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    normalized = re.sub(r"[^a-z0-9]+", "-", ascii_name.lower()).strip("-")
+
+    if not normalized:
+        if any(character.isalnum() for character in name):
+            normalized = f"x-{digest}"
+        else:
+            raise ConfigurationError(
+                f"{name!r} cannot produce a non-empty Kubernetes RFC-1123 name"
+            )
+
+    if len(normalized) > _K8S_NAME_MAX_LENGTH:
+        prefix_length = _K8S_NAME_MAX_LENGTH - _K8S_HASH_LENGTH - 1
+        prefix = normalized[:prefix_length].rstrip("-")
+        normalized = f"{prefix}-{digest}"
+
+    if not _RFC1123_LABEL.fullmatch(normalized):
+        raise ConfigurationError(f"{name!r} cannot produce a valid Kubernetes RFC-1123 name")
+    return normalized
 
 
 def _is_sqlite_url(url: str) -> bool:
@@ -82,12 +136,16 @@ def render_manifests(
 
     One Deployment + Service per spec, plus a single Ingress routing
     ``/<module_name>`` to each module's Service. Raises
-    ``ConfigurationError`` when ``cfg.broker`` cannot be shared across
-    pods (``memory``, ``shm``, or a ``database`` broker pointed at a
-    sqlite:// URL — both are single-host storage, unreachable from a
-    sibling pod), or when two module names normalize to the same
-    Kubernetes resource name via ``k8s_name``.
+    ``ConfigurationError`` for invalid ports or names, resource-name
+    collisions, or brokers that cannot be shared across pods.
     """
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ConfigurationError(f"port must be an integer from 1 to 65535, got {port!r}")
+    if namespace is not None and not _RFC1123_LABEL.fullmatch(namespace):
+        raise ConfigurationError(
+            f"namespace {namespace!r} must be an RFC-1123 DNS label of at most 63 characters"
+        )
+
     if cfg.broker in _SINGLE_HOST_BROKERS:
         raise ConfigurationError(
             f"the {cfg.broker!r} broker only works within a single process/host and "
@@ -106,40 +164,62 @@ def render_manifests(
                 "(postgresql://, mysql://) before generating manifests"
             )
 
-    pkg_name = k8s_name(cfg.package or "")
-    names: dict[str, str] = {}
+    package = cfg.package or ""
+    pkg_name = k8s_name(package)
+    resource_names: dict[str, str] = {}
+    modules_by_resource_name: dict[str, str] = {}
     for spec in specs:
-        name = f"{pkg_name}-{k8s_name(spec.module_name)}"
-        if name in names and names[name] != spec.module_name:
+        module_name = k8s_name(spec.module_name)
+        name = k8s_name(f"{pkg_name}-{module_name}")
+        if name in modules_by_resource_name:
             raise ConfigurationError(
-                f"modules {names[name]!r} and {spec.module_name!r} both normalize to "
-                f"the Kubernetes resource name {name!r} — rename one of them"
+                f"modules {modules_by_resource_name[name]!r} and {spec.module_name!r} "
+                f"both normalize to the Kubernetes resource name {name!r} — rename one of them"
             )
-        names[name] = spec.module_name
+        modules_by_resource_name[name] = spec.module_name
+        resource_names[spec.module_name] = name
 
+    broker_secret_name = k8s_name(f"{pkg_name}-broker")
+    env_secret_name = k8s_name(f"{pkg_name}-env")
+    namespace_arg = f" --namespace {shlex.quote(namespace)}" if namespace is not None else ""
     header = (
         "# Generated by `modulith k8s-manifest`.\n"
         "#\n"
         f"# Before applying, create the broker connection Secret:\n"
-        f"#   kubectl create secret generic {pkg_name}-broker "
-        f"--from-literal={_BROKER_SECRET_KEY}=<broker connection URL>\n"
+        f"#   kubectl create secret generic {broker_secret_name} "
+        f"--from-literal={_BROKER_SECRET_KEY}=<broker connection URL>{namespace_arg}\n"
         "#\n"
         "# Optionally, create an env Secret for any extra variables a module needs\n"
         "# (referenced with `optional: true`, so it is never required):\n"
-        f"#   kubectl create secret generic {pkg_name}-env --from-literal=SOME_KEY=value\n"
+        f"#   kubectl create secret generic {env_secret_name} "
+        f"--from-literal=SOME_KEY=value{namespace_arg}\n"
     )
 
     documents = [header.rstrip("\n")]
     for spec in specs:
-        name = f"{pkg_name}-{k8s_name(spec.module_name)}"
+        name = resource_names[spec.module_name]
         documents.append(
             _deployment(
-                cfg, spec, image=image, port=port, name=name, pkg_name=pkg_name, namespace=namespace
+                cfg,
+                spec,
+                image=image,
+                port=port,
+                name=name,
+                broker_secret_name=broker_secret_name,
+                env_secret_name=env_secret_name,
+                namespace=namespace,
             )
         )
         documents.append(_service(spec, port=port, name=name, namespace=namespace))
     documents.append(
-        _ingress(specs, names, port=port, pkg_name=pkg_name, namespace=namespace, host=host)
+        _ingress(
+            specs,
+            resource_names,
+            port=port,
+            pkg_name=pkg_name,
+            namespace=namespace,
+            host=host,
+        )
     )
     return "\n---\n".join(documents) + "\n"
 
@@ -160,44 +240,44 @@ def _metadata_lines(*, indent: str, name: str, namespace: str | None, extra: str
     return "\n".join(lines)
 
 
-def _env_lines(cfg: Configuration, spec: WorkerSpec, pkg_name: str) -> list[str]:
-    """Build the container's ``env:`` entries, indented under the ``env:`` key.
-
-    ``env:`` itself sits at column 10 (a sibling of ``image:``/``command:``
-    inside the container mapping); each list item's ``-`` therefore goes two
-    columns deeper (12), with the item's own keys two deeper still (14).
-    """
-    entries: list[tuple[str, str]] = [
-        ("MODULITH_MODULE", f"              value: {_yaml_str(spec.module_name)}"),
-        ("MODULITH_APP_PACKAGE", f"              value: {_yaml_str(spec.package)}"),
-        ("MODULITH_TOPOLOGY", '              value: "processes"'),
-        ("MODULITH_BROKER", f"              value: {_yaml_str(cfg.broker)}"),
-    ]
+def _env_lines(cfg: Configuration, spec: WorkerSpec, broker_secret_name: str) -> list[str]:
+    """Build container env entries while keeping broker credentials in a Secret."""
+    entries: dict[str, str] = {
+        "MODULITH_MODULE": f"              value: {_yaml_str(spec.module_name)}",
+        "MODULITH_APP_PACKAGE": f"              value: {_yaml_str(spec.package)}",
+        "MODULITH_TOPOLOGY": '              value: "processes"',
+        "MODULITH_BROKER": f"              value: {_yaml_str(cfg.broker)}",
+        "MODULITH_CONTRACTS_MODULE": (f"              value: {_yaml_str(cfg.contracts_module)}"),
+    }
 
     secret_ref = (
         "              valueFrom:\n"
         "                secretKeyRef:\n"
-        f"                  name: {_yaml_str(f'{pkg_name}-broker')}\n"
+        f"                  name: {_yaml_str(broker_secret_name)}\n"
         f"                  key: {_yaml_str(_BROKER_SECRET_KEY)}"
     )
     url_vars = ["MODULITH_BROKER_URL"]
     if cfg.broker == "redis-streams":
         url_vars.append(_REDIS_BROKER_ENV_ALIASES["MODULITH_BROKER_URL"])
     for var_name in url_vars:
-        entries.append((var_name, secret_ref))
+        entries[var_name] = secret_ref
 
     for key, value in sorted((cfg.broker_options or {}).items()):
+        if type(key) is not str or key != key.lower():
+            continue
         if key in _URL_LIKE_OPTION_KEYS:
             continue
-        env_key = f"MODULITH_BROKER_{key.upper()}"
+        if cfg.broker == "database" and key in _DATABASE_BROKER_OPTION_KEYS:
+            env_key = f"MODULITH_BROKER_{key.upper()}"
+        elif cfg.broker == "redis-streams" and key in _REDIS_OPTION_ENV_NAMES:
+            env_key = _REDIS_OPTION_ENV_NAMES[key]
+        else:
+            continue
         rendered = json.dumps(value) if isinstance(value, (dict, list)) else str(value)
-        entries.append((env_key, f"              value: {_yaml_str(rendered)}"))
-        if cfg.broker == "redis-streams" and env_key in _REDIS_BROKER_ENV_ALIASES:
-            alias = _REDIS_BROKER_ENV_ALIASES[env_key]
-            entries.append((alias, f"              value: {_yaml_str(rendered)}"))
+        entries[env_key] = f"              value: {_yaml_str(rendered)}"
 
     lines: list[str] = []
-    for var_name, snippet in entries:
+    for var_name, snippet in entries.items():
         lines.append(f"            - name: {_yaml_str(var_name)}")
         lines.append(snippet)
     return lines
@@ -210,11 +290,12 @@ def _deployment(
     image: str,
     port: int,
     name: str,
-    pkg_name: str,
+    broker_secret_name: str,
+    env_secret_name: str,
     namespace: str | None,
 ) -> str:
     """Render one Deployment document."""
-    env_block = "\n".join(_env_lines(cfg, spec, pkg_name))
+    env_block = "\n".join(_env_lines(cfg, spec, broker_secret_name))
     metadata = _metadata_lines(
         indent="  ",
         name=name,
@@ -254,7 +335,7 @@ spec:
 {env_block}
           envFrom:
             - secretRef:
-                name: {_yaml_str(f"{pkg_name}-env")}
+                name: {_yaml_str(env_secret_name)}
                 optional: true
           readinessProbe:
             httpGet:
@@ -284,7 +365,7 @@ spec:
 
 def _ingress(
     specs: list[WorkerSpec],
-    names: dict[str, str],
+    resource_names: dict[str, str],
     *,
     port: int,
     pkg_name: str,
@@ -292,10 +373,9 @@ def _ingress(
     host: str | None,
 ) -> str:
     """Render the single Ingress document routing to every module's Service."""
-    by_module = {module_name: name for name, module_name in names.items()}
     path_entries = []
     for spec in sorted(specs, key=lambda s: s.module_name):
-        name = by_module[spec.module_name]
+        name = resource_names[spec.module_name]
         path_entries.append(
             f"""          - path: /{spec.module_name}
             pathType: Prefix
@@ -315,7 +395,9 @@ def _ingress(
     rule_lines.append("        paths:")
     rule_lines.append(paths_block)
     rules_block = "\n".join(rule_lines)
-    metadata = _metadata_lines(indent="  ", name=f"{pkg_name}-ingress", namespace=namespace)
+    metadata = _metadata_lines(
+        indent="  ", name=k8s_name(f"{pkg_name}-ingress"), namespace=namespace
+    )
     return f"""apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

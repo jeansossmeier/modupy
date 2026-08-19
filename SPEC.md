@@ -438,7 +438,7 @@ In `modulith/config.py`. Resolution order (highest priority first):
 
 Every *scalar* `Configuration` field has a `MODULITH_<KEY>` env var equivalent: `MODULITH_PACKAGE`, `MODULITH_CONTRACTS_MODULE`, `MODULITH_OUTBOX`, `MODULITH_TOPOLOGY`, `MODULITH_BROKER`, `MODULITH_PRODUCTION`, `MODULITH_AUTO_DISCOVER`, `MODULITH_OBSERVABILITY`, `MODULITH_VERIFY_MANIFESTS`. Booleans accept `1`/`true`/`yes` and `0`/`false`/`no` (case-insensitive); any other non-empty value raises `ConfigurationError`. The dict-typed fields (`outbox_options`, `broker_options`, `workers`) have **no generic** env var — they come from the `[tool.modulith.*]` subtables in pyproject.toml. Adapter-specific env vars are separate contracts: SHM and database options use `MODULITH_BROKER_<KEY>`, Redis Streams reads `REDIS_URL`, `MODULITH_CONSUMER_GROUP`, `MODULITH_STREAM_PREFIX`, and `MODULITH_STREAM_MAXLEN`, and the packaged alembic runner reads `MODULITH_DB_URL`.
 
-Validation happens before construction. Unknown keys raise `ConfigurationError` with the list of valid keys (catches typos). Production mode + default memory outbox raises (forces explicit opt-in for unsafe defaults). Process topology defaults to local `shm`; an URL/DSN without an explicit broker selects `database`. Explicit `shm` accepts filesystem paths only and rejects DSNs and SQLAlchemy/network URLs.
+Validation happens before construction. Unknown keys raise `ConfigurationError` with the list of valid keys (catches typos). Production mode + default memory outbox raises (forces explicit opt-in for unsafe defaults). Process topology defaults to local `shm`; an URL/DSN without an explicit broker selects `database`. Explicit `shm` accepts filesystem paths only and rejects DSNs and SQLAlchemy/network URLs. SQL schema names must be portable unquoted identifiers at every entry point: loaded configuration, broker environment overrides, direct `DatabaseBroker` construction, `MODULITH_DB_SCHEMA`, and Alembic `-x schema=...`.
 
 The `explicit_keys: frozenset[str]` field tracks which values were set vs defaulted. Used by the production safety check.
 
@@ -593,12 +593,12 @@ Output is Markdown. Teams can run it on Friday afternoon, generate a baseline, h
 `modulith doctor` reports operational and architectural health:
 
 - **Boundary health**: violation count, baseline drift over the last N commits
-- **Process-split readiness**: percentage of cross-module interactions that are events vs direct calls (the "are you ready to split this module?" metric), plus per-module counts of cross-module table references and of tables not prefixed with the module's name — the "microservice-ready" tier requires zero cross-module table references
+- **Process-split readiness**: percentage of cross-module interactions that are events vs direct calls (the "are you ready to split this module?" metric), plus per-module counts of cross-module table references and of tables not prefixed with the module's name — table-only coupling reports a warning even when there are no import/event interactions, and the "microservice-ready" tier requires zero cross-module table references
 - **Schema drift**: events whose field definitions (name, annotation, default — fingerprinted via AST) changed since the last doctor run. The check is an unconditional fingerprint diff against a cache file (`.modulith-schemas.json`): it flags *every* definition change as the cue to version consciously — it does not read or compare any `schema_version` attribute
 - **Outbox health**: dead-lettered count, oldest incomplete event age
 - **Listener registration coverage**: declared listeners vs actually-registered listeners
 - **SHM notifier**: whether each SHM broker's hint ring actually attached (a `shm_capacity` change on an existing hint file leaves the notifier dead — delivery still works, only slower)
-- **Actuator token**: under `topology = "processes"`, whether the actuator would start unmounted (`auto` mode, no `MODULITH_ACTUATOR_TOKEN`, non-loopback bind) or refuse to start (`token` mode, no token)
+- **Actuator token**: under `topology = "processes"`, whether the actuator would start unmounted (`auto` mode, no `MODULITH_ACTUATOR_TOKEN`, non-loopback bind) or refuse to start (`token` mode, no token, reported as an error)
 - **Single-host broker**: a per-host broker (`shm`, or `database` on embedded SQLite) configured under a detected container runtime — a warning under Docker, an error under Kubernetes when `production = true`
 - **Redis retention**: a `redis-streams` `max_stream_len` below the safe minimum, tightened by a live pending+lag backlog query when a client is reachable
 
@@ -961,6 +961,9 @@ modulith run APP_MODULE [--topology=single|processes] [--workers=JSON] [--host=H
 modulith verify [--mode=strict|ratchet] [--baseline=PATH] [--update-baseline] [--fail-on-warnings]
 modulith docs [--output-dir=DIR]
 modulith audit [PATH] [--output=FILE]
+modulith extract MODULE [--output=DIR] [--force]
+modulith k8s-manifest [--output=FILE] [--image=IMAGE] [--namespace=NAME] [--port=PORT]
+modulith openapi [--output=FILE] [--title=TITLE] [--api-version=VERSION]
 modulith doctor
 modulith outbox status
 modulith outbox retry <id>
@@ -970,6 +973,17 @@ modulith info  # show detected config, modules, plugins
 ```
 
 `dev` and `run` take a required positional `APP_MODULE` (the ASGI app, e.g. `myapp.main:app`); `audit` takes an optional positional `PATH` (the codebase root, default `.`).
+
+`extract`, `k8s-manifest`, and `openapi` bootstrap and import configured
+application modules to derive artifacts; they are build-time tools for trusted
+source. Extraction writes a wheel-buildable project through a staging
+directory and rejects output symlinks, output inside the source package,
+non-empty targets, and source symlinks that escape the package. Kubernetes
+names are RFC-1123 labels with stable hashes for long inputs, ports must be
+1–65535, only supported broker environment contracts are emitted, and the
+contracts module is passed explicitly. OpenAPI generation requires the
+`fastapi` extra and rejects incompatible collisions or duplicate operation IDs
+instead of silently discarding definitions.
 
 ### Exit codes
 
@@ -1071,6 +1085,11 @@ From the brutal-truth analysis. Each gap has a concrete mitigation.
 ### Gap 2: The "modulith now, microservices later" promise has a hidden cliff
 
 **Mitigation:** module-level data ownership rules ([§8.1](#81-the-default-rules)) + `modulith doctor` ([§8.5](#85-the-doctor-command)). Users see their split-readiness as a number. We document the cliff explicitly: "no rewrites for the messaging layer; database boundaries are a separate decision." Tooling now closes part of that data half: `doctor`'s process-split readiness check counts cross-module table references (not just imports) and reports tables not prefixed with their owning module's name; the verifier's `data-ownership` rule detects `ForeignKey("table.col")` string literals pointing at another module's table, not just `Table()`/`__tablename__` declarations; a per-module Postgres schema knob (`broker_options.schema`/`MODULITH_BROKER_SCHEMA` for the broker, `-x schema=`/`MODULITH_DB_SCHEMA` for migrations) gives modules physically separate storage; and `modulith extract` refuses (without `--force`) to scaffold a module that still shares a table with another module. What remains manual: actually moving a shared table's data to its owning module, and choosing the schema-vs-prefix convention per table — the tooling detects and reports the coupling, it does not resolve it.
+
+Enabling a named migration schema does not move existing data. If the target
+has no Alembic history while `public` contains Modulith tables or history, the
+migration refuses to create a second history until operators back up,
+explicitly move and verify the data, and rerun it.
 
 ### Gap 3: The async assumption is hostile to existing FastAPI codebases
 

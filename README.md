@@ -386,7 +386,10 @@ environment on top. The SHM broker honors `MODULITH_BROKER_STATE_DIR`,
 key from `MODULITH_BROKER_<KEY>` (e.g. `MODULITH_BROKER_URL`,
 `MODULITH_BROKER_POLL_INTERVAL_MS`) — this is how a process-per-module worker
 receives its connection URL; and the packaged alembic migration runner reads
-`MODULITH_DB_URL` (see [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md), Step 5).
+`MODULITH_DB_URL` and optional `MODULITH_DB_SCHEMA` (see
+[MIGRATION_GUIDE.md](MIGRATION_GUIDE.md), Step 5). Schema names are validated
+as portable unquoted SQL identifiers whether they enter through configuration,
+environment variables, Alembic `-x`, or direct database-broker construction.
 
 Two env vars have no `[tool.modulith]` counterpart at all.
 `MODULITH_PROXY_MAX_BODY_BYTES` raises the reverse proxy's request-body cap
@@ -434,6 +437,17 @@ modulith outbox status            # outbox metrics (needs a durable outbox —
                                   # report and exits 1)
 modulith info                     # show detected config
 ```
+
+`extract`, `k8s-manifest`, and `openapi` import the configured application and
+its module packages to build artifacts. Run them only against trusted source.
+Extraction emits a wheel-buildable project and rejects output symlinks, output
+paths inside the source package, non-empty targets, and source symlinks that
+escape the package. OpenAPI generation requires `modupy[fastapi]` and fails
+rather than discarding incompatible collisions or duplicate operation IDs.
+
+`doctor` reports table-only cross-module coupling even when no import or event
+interaction exists. Missing credentials in `actuator_mode="token"` are an
+error because process topology refuses to start in that state.
 
 The CLI requires the `cli` extra (`pip install 'modupy[cli]'`) and is a
 progressive enhancement, not a requirement. Plain `uvicorn myapp.main:app`

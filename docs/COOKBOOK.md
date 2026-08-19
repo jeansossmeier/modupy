@@ -351,7 +351,7 @@ Run the migration against the same schema with `-x schema=<name>` or
 ```bash
 MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
   alembic -c "$(python -c 'import modulith.adapters, pathlib; print(pathlib.Path(modulith.adapters.__file__).parent / "alembic.ini")')" \
-  upgrade head -x schema=orders
+  -x schema=orders upgrade head
 ```
 
 This is Postgres-only; `alembic`'s `--sql` offline mode combined with a schema
@@ -361,9 +361,15 @@ translation map.
 The database broker (recipe 8) takes the equivalent knob on its own engine:
 `[tool.modulith.broker_options].schema`, or the environment variable
 `MODULITH_BROKER_SCHEMA` (which wins, like every other `broker_options` key).
-It must match `^[A-Za-z_][A-Za-z0-9_]*$` and, like the outbox knob above, only
-applies on the Postgres dialect — on any other dialect it's logged and
-ignored.
+It must be a portable unquoted SQL identifier. Validation is identical through
+configuration, environment variables, Alembic `-x`, and direct broker
+construction. Like the outbox knob above, it applies only on Postgres; other
+dialects log a warning and ignore it.
+
+Enabling a named migration schema never moves existing data. If the target has
+no Alembic history while `public` contains Modulith tables or history, the
+migration refuses to create a second history. Back up the database, explicitly
+move and verify the tables, then rerun the command.
 
 ---
 
@@ -677,6 +683,9 @@ just the ERROR-severity ones:
 
 `modulith doctor` complements this with operational + architectural health
 checks (outbox health, boundary health, split-readiness) for a running app.
+Table-only cross-module coupling is a split-readiness warning even without
+imports or event interactions; `actuator_mode="token"` without
+`MODULITH_ACTUATOR_TOKEN` is an error because process topology will not start.
 
 ---
 

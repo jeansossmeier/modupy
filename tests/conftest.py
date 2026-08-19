@@ -26,6 +26,7 @@ import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from textwrap import dedent
+from uuid import uuid4
 
 import pytest
 
@@ -172,24 +173,9 @@ def fake_app(make_fake_app: Callable[..., str]) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Integration fixtures: real Postgres / Redis via testcontainers
-# ---------------------------------------------------------------------------
-#
-# These back the ``@pytest.mark.integration`` suite. Each provides a reachable
-# service URL with a three-step resolution that keeps the default ``pytest``
-# run fast and Docker-free while letting the integration suite run anywhere
-# Docker is present:
-#
-#   1. An explicit ``MODULITH_TEST_*_URL`` env var (CI pointing at a managed
-#      service, or a developer's already-running container) — used as-is.
-#   2. A throwaway testcontainers container, started once per session, when
-#      Docker and the ``testcontainers`` package are both available.
-#   3. ``pytest.skip`` — so a machine with neither Docker nor the env var
-#      still collects and runs the unit suite green.
-#
-# Container images are pinned (overridable via env) so a registry change can
-# never silently shift the Postgres/Redis version a test ran against.
+# Integration fixtures prefer explicit service URLs, fall back to pinned
+# testcontainers images, and skip when neither is available. Database tests
+# create disposable databases; Redis tests remove only their namespaced keys.
 
 _PG_IMAGE = os.environ.get("MODULITH_TEST_POSTGRES_IMAGE", "postgres:16-alpine")
 _REDIS_IMAGE = os.environ.get("MODULITH_TEST_REDIS_IMAGE", "redis:7-alpine")
@@ -217,15 +203,10 @@ def _docker_available() -> bool:
 
 @pytest.fixture(scope="session")
 def postgres_url() -> Iterator[str]:
-    """A reachable Postgres URL (asyncpg driver) for integration tests.
-
-    Yields ``MODULITH_TEST_POSTGRES_URL`` when set, else a throwaway
-    testcontainers Postgres, else skips. Session-scoped: one container serves
-    every Postgres integration test in the run.
-    """
+    """Yield an isolated disposable PostgreSQL URL using the asyncpg driver."""
     env_url = os.environ.get("MODULITH_TEST_POSTGRES_URL")
     if env_url:
-        yield env_url
+        yield from _disposable_postgres_database(env_url)
         return
     try:
         from testcontainers.postgres import PostgresContainer
@@ -234,23 +215,55 @@ def postgres_url() -> Iterator[str]:
     if not _docker_available():
         pytest.skip("Docker unavailable and MODULITH_TEST_POSTGRES_URL unset")
     with PostgresContainer(_PG_IMAGE, driver="asyncpg") as pg:
-        yield pg.get_connection_url()
+        yield from _disposable_postgres_database(pg.get_connection_url())
+
+
+def _disposable_postgres_database(base_url: str) -> Iterator[str]:
+    """Yield a disposable database without altering the supplied database."""
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import SQLAlchemyError
+
+    source_url = make_url(base_url)
+    admin_url = source_url.set(drivername="postgresql+psycopg")
+    async_url = source_url.set(drivername="postgresql+asyncpg")
+    database_name = f"modupy_test_{uuid4().hex}"
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    created = False
+    try:
+        try:
+            with admin_engine.connect() as conn:
+                conn.execute(text(f'CREATE DATABASE "{database_name}"'))
+            created = True
+        except SQLAlchemyError as exc:
+            pytest.skip(
+                "PostgreSQL integration tests require CREATEDB privilege to protect "
+                f"the supplied database ({type(exc).__name__})"
+            )
+
+        yield async_url.set(database=database_name).render_as_string(hide_password=False)
+    finally:
+        try:
+            if created:
+                with admin_engine.connect() as conn:
+                    conn.execute(
+                        text(
+                            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                            "WHERE datname = :database_name AND pid <> pg_backend_pid()"
+                        ),
+                        {"database_name": database_name},
+                    )
+                    conn.execute(text(f'DROP DATABASE IF EXISTS "{database_name}"'))
+        finally:
+            admin_engine.dispose()
 
 
 @pytest.fixture(scope="session")
 def mysql_url() -> Iterator[str]:
-    """A reachable MySQL URL (aiomysql driver) for integration tests.
-
-    Yields ``MODULITH_TEST_MYSQL_URL`` when set, else a throwaway
-    testcontainers MySQL 8, else skips. Session-scoped: one container serves
-    every MySQL integration test in the run. The ``dialect="aiomysql"`` arg
-    makes ``get_connection_url()`` return a ``mysql+aiomysql://`` URL (the
-    async driver the DB broker uses), matching how ``postgres_url`` selects
-    asyncpg.
-    """
+    """Yield an isolated disposable MySQL URL using the aiomysql driver."""
     env_url = os.environ.get("MODULITH_TEST_MYSQL_URL")
     if env_url:
-        yield env_url
+        yield from _disposable_mysql_database(env_url)
         return
     try:
         from testcontainers.mysql import MySqlContainer
@@ -259,7 +272,46 @@ def mysql_url() -> Iterator[str]:
     if not _docker_available():
         pytest.skip("Docker unavailable and MODULITH_TEST_MYSQL_URL unset")
     with MySqlContainer(_MYSQL_IMAGE, dialect="aiomysql") as mysql:
-        yield mysql.get_connection_url()
+        from sqlalchemy.engine import make_url
+
+        admin_url = make_url(mysql.get_connection_url()).set(
+            username="root",
+            password=mysql.root_password,
+        )
+        yield from _disposable_mysql_database(admin_url.render_as_string(hide_password=False))
+
+
+def _disposable_mysql_database(base_url: str) -> Iterator[str]:
+    """Yield a disposable database without altering the supplied database."""
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import SQLAlchemyError
+
+    async_url = make_url(base_url)
+    sync_driver = f"{async_url.get_backend_name()}+pymysql"
+    admin_url = async_url.set(drivername=sync_driver)
+    database_name = f"modupy_test_{uuid4().hex}"
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    created = False
+    try:
+        try:
+            with admin_engine.connect() as conn:
+                conn.execute(text(f"CREATE DATABASE `{database_name}`"))
+            created = True
+        except SQLAlchemyError as exc:
+            pytest.skip(
+                "MySQL integration tests require CREATE DATABASE privilege to protect "
+                f"the supplied database ({type(exc).__name__})"
+            )
+
+        yield async_url.set(database=database_name).render_as_string(hide_password=False)
+    finally:
+        try:
+            if created:
+                with admin_engine.connect() as conn:
+                    conn.execute(text(f"DROP DATABASE IF EXISTS `{database_name}`"))
+        finally:
+            admin_engine.dispose()
 
 
 @pytest.fixture(scope="session")
@@ -287,38 +339,56 @@ def redis_url() -> Iterator[str]:
 
 @pytest.fixture
 async def pg_engine(postgres_url: str):
-    """A real-Postgres async engine with a freshly-created outbox schema.
-
-    Drops and recreates the outbox tables around each test so the shared
-    session container stays clean between tests (the suite runs serially).
-    """
+    """Yield a real PostgreSQL engine isolated to a disposable schema."""
+    from sqlalchemy.exc import SQLAlchemyError
     from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.schema import CreateSchema, DropSchema
 
     from modulith.adapters.postgres_outbox import Base
 
-    engine = create_async_engine(postgres_url)
+    schema = f"modupy_outbox_{uuid4().hex}"
+    admin_engine = create_async_engine(postgres_url)
+    engine = admin_engine.execution_options(schema_translate_map={None: schema})
+    try:
+        async with admin_engine.begin() as conn:
+            await conn.execute(CreateSchema(schema))
+    except SQLAlchemyError as exc:
+        await admin_engine.dispose()
+        pytest.skip(
+            "PostgreSQL integration tests require CREATE SCHEMA privilege to protect "
+            f"the supplied database ({type(exc).__name__})"
+        )
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
     try:
         yield engine
     finally:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all)
-        await engine.dispose()
+        try:
+            async with admin_engine.begin() as conn:
+                await conn.execute(DropSchema(schema, if_exists=True, cascade=True))
+        finally:
+            await engine.dispose()
+            await admin_engine.dispose()
 
 
 @pytest.fixture
-async def redis_client(redis_url: str):
-    """A real-Redis async client, flushed before and after each test."""
+def redis_key_prefix() -> str:
+    """Namespace keys for one real-Redis integration test."""
+    return f"modupy.test.{uuid4().hex}"
+
+
+@pytest.fixture
+async def redis_client(redis_url: str, redis_key_prefix: str):
+    """Yield a real Redis client and remove only this test's namespaced keys."""
     import redis.asyncio as redis
 
     client = redis.Redis.from_url(redis_url)
-    await client.flushdb()
     try:
         yield client
     finally:
         try:
-            await client.flushdb()
+            keys = [key async for key in client.scan_iter(match=f"{redis_key_prefix}*")]
+            if keys:
+                await client.delete(*keys)
         finally:
             await client.aclose()

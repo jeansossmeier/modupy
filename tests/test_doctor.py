@@ -249,6 +249,33 @@ def test_split_readiness_shared_tables_block_microservice_tier(make_fake_app) ->
     assert any("1 cross-module table reference(s)" in d for d in check.details)
 
 
+def test_split_readiness_reports_table_only_cross_module_coupling(make_fake_app) -> None:
+    make_fake_app(
+        {
+            "orders": """
+                import sqlalchemy as sa
+
+                customer_id = sa.Column(sa.ForeignKey("customers.id"))
+            """,
+            "customers": "",
+        },
+        extra_files={
+            "customers/_manifest.py": """
+                from modulith.manifest import declare_module
+
+                declare_module(owns_tables=["customers"])
+            """
+        },
+    )
+    configure(package="fakeapp")
+
+    check = _check(run_doctor(), "process-split readiness")
+
+    assert check.status == "warn"
+    assert "table coupling" in check.summary
+    assert any("1 cross-module table reference(s)" in detail for detail in check.details)
+
+
 def test_split_readiness_details_unprefixed_tables(make_fake_app) -> None:
     # When a module defines tables without the module prefix, the details
     # should include an informational line: "<mod>: N table(s) not prefixed <mod>_"
@@ -956,7 +983,7 @@ def test_actuator_check_ok_when_token_is_configured(make_fake_app, monkeypatch) 
     assert check.status == "ok"
 
 
-def test_actuator_check_warns_when_token_mode_has_no_token(make_fake_app, monkeypatch) -> None:
+def test_actuator_check_errors_when_token_mode_has_no_token(make_fake_app, monkeypatch) -> None:
     make_fake_app({"orders": ""})
     monkeypatch.delenv("MODULITH_ACTUATOR_TOKEN", raising=False)
     configure(package="fakeapp", topology="processes", broker="testbroker", actuator_mode="token")
@@ -964,7 +991,7 @@ def test_actuator_check_warns_when_token_mode_has_no_token(make_fake_app, monkey
     report = run_doctor()
 
     check = _check(report, "actuator token")
-    assert check.status == "warn"
+    assert check.status == "error"
     assert "refuse to start" in check.summary
 
 
@@ -1086,6 +1113,7 @@ def test_single_host_broker_ok_when_no_container_runtime_detected(
 
     make_fake_app({"orders": ""})
     monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    monkeypatch.delenv("MODULITH_CONTAINER_RUNTIME", raising=False)
     monkeypatch.setattr(doctor_module, "_CONTAINER_MARKERS", ())
     monkeypatch.setattr(doctor_module, "_CGROUP_PATH", tmp_path / "no-such-cgroup-file")
     configure(
@@ -1099,6 +1127,31 @@ def test_single_host_broker_ok_when_no_container_runtime_detected(
 
     check = _check(report, "single-host broker")
     assert check.status == "ok"
+
+
+def test_single_host_broker_honors_explicit_container_runtime_override(
+    make_fake_app, monkeypatch, tmp_path
+) -> None:
+    from modulith import doctor as doctor_module
+
+    make_fake_app({"orders": ""})
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    monkeypatch.setenv("MODULITH_CONTAINER_RUNTIME", "kubernetes")
+    monkeypatch.setattr(doctor_module, "_CONTAINER_MARKERS", ())
+    monkeypatch.setattr(doctor_module, "_CGROUP_PATH", tmp_path / "markerless-cgroup-v2")
+    configure(
+        package="fakeapp",
+        topology="processes",
+        broker="database",
+        broker_options={"url": f"sqlite+aiosqlite:///{tmp_path}/test.db"},
+        production=True,
+        outbox="memory",
+    )
+
+    check = _check(run_doctor(), "single-host broker")
+
+    assert check.status == "error"
+    assert "kubernetes" in check.summary
 
 
 def test_single_host_broker_warns_for_shm_under_container(
@@ -1137,6 +1190,7 @@ def test_redis_retention_ok_when_broker_is_not_redis(make_fake_app) -> None:
 def test_redis_retention_ok_for_default_maxlen(make_fake_app) -> None:
     make_fake_app({"orders": ""})
     configure(package="fakeapp", topology="processes", broker="redis-streams")
+    _register_fake_redis_broker(_FakeRedisScanClient({}), max_stream_len=10_000)
 
     report = run_doctor()
 
@@ -1152,6 +1206,7 @@ def test_redis_retention_warns_for_low_maxlen(make_fake_app) -> None:
         broker="redis-streams",
         broker_options={"max_stream_len": 100},
     )
+    _register_fake_redis_broker(_FakeRedisScanClient({}), max_stream_len=100)
 
     report = run_doctor()
 

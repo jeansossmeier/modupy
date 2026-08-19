@@ -14,6 +14,7 @@ Provisioned by the shared ``postgres_url`` fixture (testcontainers Postgres or
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -22,6 +23,9 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.schema import CreateSchema, DropSchema
 
 import modulith.adapters as adapters_pkg
 
@@ -57,16 +61,48 @@ def _drop(engine) -> None:
     with engine.begin() as conn:
         for tbl in (*_TABLES, *_BROKER_TABLES, "alembic_version"):
             conn.execute(text(f"DROP TABLE IF EXISTS {tbl} CASCADE"))
-        # Schema-scoped migration tests (MODULITH_DB_SCHEMA) leave their
-        # tables in a dedicated schema rather than public — drop it too so a
-        # prior run never leaks into the next.
-        conn.execute(text("DROP SCHEMA IF EXISTS mod_test CASCADE"))
+
+
+@pytest.fixture(scope="module")
+def migration_postgres_url(postgres_url: str) -> Iterator[str]:
+    """Run destructive migration checks only inside a disposable database."""
+    admin_url = make_url(_sync_url(postgres_url))
+    database_name = f"modupy_migration_{uuid4().hex}"
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    database_created = False
+    try:
+        try:
+            with admin_engine.connect() as conn:
+                conn.execute(text(f'CREATE DATABASE "{database_name}"'))
+            database_created = True
+        except SQLAlchemyError as exc:
+            pytest.skip(
+                "PostgreSQL migration tests require CREATEDB privilege to protect "
+                f"the supplied database; temporary database creation failed ({type(exc).__name__})"
+            )
+
+        test_url = admin_url.set(database=database_name).render_as_string(hide_password=False)
+        yield test_url
+    finally:
+        try:
+            if database_created:
+                with admin_engine.connect() as conn:
+                    conn.execute(
+                        text(
+                            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                            "WHERE datname = :database_name AND pid <> pg_backend_pid()"
+                        ),
+                        {"database_name": database_name},
+                    )
+                    conn.execute(text(f'DROP DATABASE IF EXISTS "{database_name}"'))
+        finally:
+            admin_engine.dispose()
 
 
 @pytest.fixture
-def clean_pg(postgres_url: str):
-    """A sync psycopg engine on a schema with no outbox/alembic tables."""
-    url = _sync_url(postgres_url)
+def clean_pg(migration_postgres_url: str):
+    """Yield a sync psycopg engine on a disposable database with no managed tables."""
+    url = migration_postgres_url
     engine = create_engine(url)
     _drop(engine)
     try:
@@ -76,10 +112,34 @@ def clean_pg(postgres_url: str):
         engine.dispose()
 
 
+@pytest.fixture
+def isolated_pg_schema(clean_pg):
+    """Provide a unique schema and prove cleanup preserves an unrelated one."""
+    _, engine = clean_pg
+    schema = f"mod_test_{uuid4().hex}"
+    sentinel_schema = f"mod_sentinel_{uuid4().hex}"
+    with engine.begin() as conn:
+        conn.execute(CreateSchema(sentinel_schema))
+    try:
+        yield schema
+    finally:
+        try:
+            with engine.begin() as conn:
+                conn.execute(DropSchema(schema, if_exists=True, cascade=True))
+            assert sentinel_schema in inspect(engine).get_schema_names()
+        finally:
+            with engine.begin() as conn:
+                conn.execute(DropSchema(sentinel_schema, if_exists=True, cascade=True))
+
+
 def test_alembic_upgrade_head_on_real_postgres(clean_pg) -> None:
     """The real migration applies cleanly to Postgres and creates both tables
     plus the partial pending-rows index."""
     url, engine = clean_pg
+    with engine.connect() as conn:
+        database_name = conn.execute(text("SELECT current_database()")).scalar_one()
+    assert database_name.startswith("modupy_migration_")
+
     command.upgrade(_cfg(url), "head")
 
     insp = inspect(engine)
@@ -229,32 +289,108 @@ def test_downgrade_0003_preserves_long_last_error(clean_pg) -> None:
     assert stored == long_error
 
 
-def test_alembic_upgrade_head_with_schema_env_var_scopes_all_tables(clean_pg, monkeypatch) -> None:
+def test_alembic_upgrade_head_with_schema_env_var_scopes_all_tables(
+    clean_pg, isolated_pg_schema, monkeypatch
+) -> None:
     """MODULITH_DB_SCHEMA routes both the outbox/broker tables and
     ``alembic_version`` into a dedicated schema, stays idempotent across a
     second upgrade, and downgrade base leaves that schema empty."""
     url, engine = clean_pg
-    monkeypatch.setenv("MODULITH_DB_SCHEMA", "mod_test")
+    schema = isolated_pg_schema
+    monkeypatch.setenv("MODULITH_DB_SCHEMA", schema)
     cfg = _cfg(url)
+    expected_tables = {*_TABLES, *_BROKER_TABLES, "alembic_version"}
 
     command.upgrade(cfg, "head")
 
-    scoped_tables = set(inspect(engine).get_table_names(schema="mod_test"))
-    assert _TABLES[0] in scoped_tables
-    assert "broker_subscription" in scoped_tables
-    assert "alembic_version" in scoped_tables
+    scoped_tables = set(inspect(engine).get_table_names(schema=schema))
+    assert scoped_tables == expected_tables
     public_tables = set(inspect(engine).get_table_names(schema="public"))
-    assert _TABLES[0] not in public_tables
-    assert "alembic_version" not in public_tables
+    assert public_tables.isdisjoint(expected_tables)
 
     command.upgrade(cfg, "head")  # idempotent re-run, no already-exists error
-    assert set(inspect(engine).get_table_names(schema="mod_test")) == scoped_tables
+    assert set(inspect(engine).get_table_names(schema=schema)) == scoped_tables
 
     command.downgrade(cfg, "base")
     # downgrade base clears the version row but — same as the unscoped
     # Postgres/SQLite downgrade tests above — never drops alembic_version
     # itself; only the migrated tables are gone.
-    assert set(inspect(engine).get_table_names(schema="mod_test")) <= {"alembic_version"}
+    assert set(inspect(engine).get_table_names(schema=schema)) <= {"alembic_version"}
+
+
+def test_enabling_named_schema_refuses_to_abandon_public_migration_history(
+    clean_pg, isolated_pg_schema, monkeypatch
+) -> None:
+    url, engine = clean_pg
+    cfg = _cfg(url)
+    command.upgrade(cfg, "head")
+    monkeypatch.setenv("MODULITH_DB_SCHEMA", isolated_pg_schema)
+
+    with pytest.raises(SystemExit, match="public"):
+        command.upgrade(cfg, "head")
+
+    public_tables = set(inspect(engine).get_table_names(schema="public"))
+    assert {*_TABLES, *_BROKER_TABLES, "alembic_version"} <= public_tables
+    assert isolated_pg_schema not in inspect(engine).get_schema_names()
+
+
+def test_named_schema_guard_ignores_unrelated_public_alembic_history(
+    clean_pg, isolated_pg_schema, monkeypatch
+) -> None:
+    url, engine = clean_pg
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) PRIMARY KEY)"))
+        conn.execute(text("INSERT INTO alembic_version VALUES ('unrelated_revision')"))
+    monkeypatch.setenv("MODULITH_DB_SCHEMA", isolated_pg_schema)
+
+    command.upgrade(_cfg(url), "head")
+
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+            "unrelated_revision"
+        )
+    assert {*_TABLES, *_BROKER_TABLES, "alembic_version"} == set(
+        inspect(engine).get_table_names(schema=isolated_pg_schema)
+    )
+
+
+def test_named_schema_guard_rejects_modulith_public_alembic_history(
+    clean_pg, isolated_pg_schema, monkeypatch
+) -> None:
+    """A packaged revision identifies otherwise table-only history as managed."""
+    url, engine = clean_pg
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) PRIMARY KEY)"))
+        conn.execute(text("INSERT INTO alembic_version VALUES ('0001_initial')"))
+    monkeypatch.setenv("MODULITH_DB_SCHEMA", isolated_pg_schema)
+
+    with pytest.raises(SystemExit, match="alembic_version"):
+        command.upgrade(_cfg(url), "head")
+
+    assert isolated_pg_schema not in inspect(engine).get_schema_names()
+
+
+def test_named_schema_guard_rejects_public_tables_with_stale_target_history(
+    clean_pg, isolated_pg_schema, monkeypatch
+) -> None:
+    from modulith.adapters.db_broker import broker_schema
+    from modulith.adapters.postgres_outbox import Base
+
+    url, engine = clean_pg
+    cfg = _cfg(url)
+    monkeypatch.setenv("MODULITH_DB_SCHEMA", isolated_pg_schema)
+    command.stamp(cfg, "head")
+
+    Base.metadata.create_all(engine)
+    broker_schema()[0].create_all(engine)
+
+    with pytest.raises(SystemExit, match="public"):
+        command.upgrade(cfg, "head")
+
+    target_tables = set(inspect(engine).get_table_names(schema=isolated_pg_schema))
+    assert target_tables == {"alembic_version"}
+    public_tables = set(inspect(engine).get_table_names(schema="public"))
+    assert {*_TABLES, *_BROKER_TABLES} <= public_tables
 
 
 def test_migration_column_metadata_matches_orm_on_real_postgres(clean_pg) -> None:

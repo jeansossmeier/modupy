@@ -182,8 +182,10 @@ After a few migrations:
 modulith doctor
 ```
 shows your "process-split readiness" score climbing. At 80%+ you could
-realistically split a module out into its own process. At 95%+ you
-could realistically extract one to a microservice.
+start evaluating a process split, but the percentage is not a release gate:
+table-only cross-module coupling produces a warning even when there are no
+import or event interactions, and any shared-table dependency still blocks
+safe extraction.
 
 ## Step 5 — Enable the transactional outbox (production-grade delivery)
 
@@ -225,6 +227,21 @@ To put the outbox tables in a Postgres schema named after a module instead of
 other dialects log a warning and ignore it. This is separate from, but usually
 paired with, the database broker's own `broker_options.schema` /
 `MODULITH_BROKER_SCHEMA` knob.
+
+Alembic's `-x` is a global option and must precede the command:
+
+```bash
+MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
+  alembic -c "$(python -c 'import modulith.adapters, pathlib; print(pathlib.Path(modulith.adapters.__file__).parent / "alembic.ini")')" \
+  -x schema=orders upgrade head
+```
+
+Schema names must be portable unquoted SQL identifiers. The same validation
+applies to configuration, environment variables, Alembic `-x`, and direct
+database-broker construction. Enabling a named schema does not move data: if
+`public` already contains Modulith tables or Alembic history and the target has
+no history, migration stops until you back up, explicitly move and verify the
+tables, then rerun it.
 
 Wire your SQLAlchemy session to modulith:
 ```python
@@ -382,7 +399,7 @@ service:
 
 `modulith extract <module>` scaffolds step 1-3's plumbing — it copies the
 module plus its contracts into a standalone service tree with a generated
-`pyproject.toml`, `Dockerfile`, and `README.md` — but it refuses (exit 1,
+wheel-buildable `pyproject.toml`, `Dockerfile`, and `README.md` — but it refuses (exit 1,
 overridable with `--force`) when the module still shares a table with
 another module, since that's exactly the coupling a process split can't
 paper over. If a `ForeignKey("table.col")` string literal exists somewhere in
@@ -391,6 +408,12 @@ surfaces it as a `data-ownership` warning; run `modulith verify
 --update-baseline` to grandfather existing findings the same way you would
 any other ratcheted violation (Step 3), then work through them before or
 after extraction.
+
+Extraction imports the configured application and module packages, so run it
+only against trusted source. It stages output before publishing it and rejects
+non-empty targets, output symlinks, output inside the source package, and
+source symlinks that escape the package; `--force` does not bypass these path
+safety rules.
 
 Modulith doesn't do the database split for you (that's a real data
 migration project) but the contracts module, the events, and now
