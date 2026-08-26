@@ -844,16 +844,8 @@ class Runtime:
             # application module (see modulith/builtin/verifier.py) on every
             # process start, which the CLI gate pays once per pipeline run.
             #
-            # Exception: single-process `modulith dev` is warn-only regardless of
-            # strict_boundaries (README's "interactive development contract is
-            # inviolable"). The dev CLI signals this via MODULITH_DEV_WARN_ONLY in
-            # the environment — an env var, not an in-memory flag, because it must
-            # survive uvicorn's --reload fork, which re-imports the app (and
-            # re-triggers this same lazy bootstrap) in a subprocess that shares
-            # the parent's environment but none of its Python state. Ignored
-            # under ``production`` — `modulith dev` never runs there, so a value
-            # inherited from a container image or a copied shell profile has no
-            # legitimate producer and must not disarm the gate.
+            # Single-process `modulith dev` uses this marker so it survives
+            # uvicorn's reload child. It must not weaken process topology.
             if config.strict_boundaries:
                 from .builtin import verifier
                 from .config import ConfigurationError
@@ -872,7 +864,9 @@ class Runtime:
                         for v in violations
                     )
                     warn_only = (
-                        os.environ.get("MODULITH_DEV_WARN_ONLY") == "1" and not config.production
+                        config.topology == "single"
+                        and os.environ.get("MODULITH_DEV_WARN_ONLY") == "1"
+                        and not config.production
                     )
                     if warn_only:
                         logger.warning(

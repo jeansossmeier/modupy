@@ -11,6 +11,10 @@ permissions:
   contents: read
 
 jobs:
+  ci:
+    name: full CI matrix
+    uses: ./.github/workflows/ci.yml
+
   test:
     name: pytest (Python 3.11)
     runs-on: ubuntu-latest
@@ -75,7 +79,7 @@ jobs:
         # after the fact, when the release is already immutable on PyPI.
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          # Headings use the Keep a Changelog form `## [0.9.0] — date`; accept a
+          # Headings use the Keep a Changelog form `## [version] — date`; accept a
           # bare or v-prefixed variant too so a style change here is not a
           # release-blocking surprise.
           if ! grep -qE "^#+ +\[?v?${tag//./\\.}\]?([^0-9.]|$)" CHANGELOG.md; then
@@ -182,12 +186,12 @@ jobs:
       - name: Upload distributions
         uses: actions/upload-artifact@v4
         with:
-          name: dist
+          name: release-dist
           path: dist/
           retention-days: 14
 
   publish:
-    needs: [test, build]
+    needs: [ci, test, build]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -195,7 +199,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          name: release-dist
           path: dist/
 
       - uses: pypa/gh-action-pypi-publish@release/v1

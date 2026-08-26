@@ -739,7 +739,7 @@ Startup failure modes for the cross-process broker are deliberately loud:
 
 ## Part X — Built-in Adapters
 
-Each adapter ships as an optional *extra* of the single `modulith` distribution so dependencies stay optional. `pip install 'modupy[postgres]'` pulls in the SQLAlchemy adapter; without it, the outbox can't use Postgres but everything else works. (Splitting adapters into separately-published packages remains a possible later move — see [Part XVI](#part-xvi--file-inventory) — but is not the shipped model.)
+Each adapter ships as an optional *extra* of the single `modupy` distribution so dependencies stay optional. `pip install 'modupy[postgres]'` pulls in the SQLAlchemy adapter; without it, the outbox can't use Postgres but everything else works. (Splitting adapters into separately-published packages remains a possible later move — see [Part XVI](#part-xvi--file-inventory) — but is not the shipped model.)
 
 ### 10.1 Postgres Outbox Store
 
@@ -1284,7 +1284,7 @@ per-file plan is omitted rather than maintained here in parallel.
 ### Separate packages (re-scoped: shipped as extras)
 
 The original plan floated separately-published packages. The shipped decision
-is **extras of the single `modulith` distribution** (see Part X): the test
+is **extras of the single `modupy` distribution** (see Part X): the test
 plugin is `modupy[test]` (standalone `pytest-modulith` remains a possible
 v2 split), the Postgres outbox is `modupy[postgres]`, the Redis broker is
 `modupy[redis]`. A Kafka adapter (whether extra or package) is Phase 4.

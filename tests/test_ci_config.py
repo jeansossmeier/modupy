@@ -31,6 +31,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+RELEASE_YML = REPO_ROOT / ".github" / "workflows" / "release.yml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 
 
@@ -564,9 +565,8 @@ def test_api_reference_generator_rejects_unknown_flags() -> None:
 
 def _release_workflow() -> dict[Any, Any]:
     """Parse the release.yml workflow."""
-    release_path = REPO_ROOT / ".github" / "workflows" / "release.yml"
-    assert release_path.exists(), "release.yml must exist"
-    workflow = yaml.safe_load(release_path.read_text(encoding="utf-8"))
+    assert RELEASE_YML.exists(), "release.yml must exist"
+    workflow = yaml.safe_load(RELEASE_YML.read_text(encoding="utf-8"))
     assert isinstance(workflow, dict)
     return workflow
 
@@ -599,6 +599,21 @@ def test_release_has_test_build_publish_jobs() -> None:
     assert "test" in jobs, "release.yml must define a test job"
     assert "build" in jobs, "release.yml must define a build job"
     assert "publish" in jobs, "release.yml must define a publish job"
+    assert "ci" in jobs, "release.yml must define the reusable full-CI job"
+
+
+def test_ci_workflow_can_run_as_a_reusable_release_gate() -> None:
+    """The full CI matrix must be callable from the release workflow."""
+    workflow = yaml.safe_load(_ci_text())
+    assert isinstance(workflow, dict)
+    triggers = workflow.get(True)
+    assert isinstance(triggers, dict)
+    assert "workflow_call" in triggers
+
+    release = _release_workflow()
+    jobs = release.get("jobs")
+    assert isinstance(jobs, dict)
+    assert jobs["ci"] == {"name": "full CI matrix", "uses": "./.github/workflows/ci.yml"}
 
 
 def test_release_publish_job_has_oidc_permission() -> None:
@@ -640,8 +655,8 @@ def test_release_publish_job_uses_pypa_action() -> None:
     )
 
 
-def test_release_publish_job_needs_test_and_build() -> None:
-    """publish job must depend on test and build jobs."""
+def test_release_publish_job_needs_full_ci_test_and_build() -> None:
+    """publish must wait for the full CI gate and release-local checks."""
     workflow = _release_workflow()
     jobs = workflow.get("jobs")
     assert isinstance(jobs, dict)
@@ -652,8 +667,50 @@ def test_release_publish_job_needs_test_and_build() -> None:
 
     if isinstance(needs, str):
         needs = [needs]
-    assert "test" in needs and "build" in needs, (
-        "publish job must depend on both test and build jobs (needs: [test, build])"
+    assert {"ci", "test", "build"} <= set(needs), "publish job must depend on ci, test, and build"
+
+
+def test_release_artifact_is_distinct_from_reusable_ci_artifact() -> None:
+    """The publish job must consume the release build, not CI's artifact."""
+    release = _release_workflow()
+    jobs = release.get("jobs")
+    assert isinstance(jobs, dict)
+    release_build = jobs.get("build")
+    publish = jobs.get("publish")
+    assert isinstance(release_build, dict)
+    assert isinstance(publish, dict)
+
+    uploads = [
+        step
+        for step in release_build.get("steps", [])
+        if isinstance(step, dict)
+        and isinstance(step.get("uses"), str)
+        and step["uses"].startswith("actions/upload-artifact@")
+    ]
+    downloads = [
+        step
+        for step in publish.get("steps", [])
+        if isinstance(step, dict)
+        and isinstance(step.get("uses"), str)
+        and step["uses"].startswith("actions/download-artifact@")
+    ]
+    assert len(uploads) == len(downloads) == 1
+    upload_name = uploads[0].get("with", {}).get("name")
+    download_name = downloads[0].get("with", {}).get("name")
+    assert upload_name == download_name == "release-dist"
+    assert upload_name != "dist"
+
+
+def test_release_publish_has_no_unconditional_success_override() -> None:
+    """A failed required job must prevent the publish job from running."""
+    release = _release_workflow()
+    jobs = release.get("jobs")
+    assert isinstance(jobs, dict)
+    publish = jobs.get("publish")
+    assert isinstance(publish, dict)
+    assert publish.get("if") != "always()"
+    assert all(
+        step.get("if") != "always()" for step in publish.get("steps", []) if isinstance(step, dict)
     )
 
 

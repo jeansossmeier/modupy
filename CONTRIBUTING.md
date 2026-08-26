@@ -73,7 +73,7 @@ have been migrated. To change a shipped column, add a new revision carrying the
 
 Revisions `0001`–`0005` predate the first release and were edited in place while
 nothing had shipped — which is why `0003` widens `payload` on tables that `0001`
-already creates. That latitude ends at 0.9.0.
+already creates. That latitude ends at 0.10.0.
 
 New revisions need a MySQL check, not just Postgres and SQLite: plain
 `sa.LargeBinary()` compiles to MySQL `BLOB`, capped at 65,535 bytes, and an

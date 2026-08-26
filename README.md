@@ -207,13 +207,18 @@ configures itself.
 
 ### Install
 
+Install the quickstart dependencies:
+
 ```bash
-pip install 'modupy[fastapi,cli]'  # what the quickstart needs: FastAPI, uvicorn, the CLI
-pip install modupy                 # framework only — pluggy is its single dependency
-pip install 'modupy[postgres]'     # adds Postgres outbox
-pip install 'modupy[database]'     # adds the database broker (Postgres/MySQL/SQLite)
-pip install 'modupy[all]'          # everything
+pip install 'modupy[fastapi,cli]'
 ```
+
+Choose one different installation when the quickstart dependencies are not needed:
+
+- `pip install modupy` — framework only; pluggy is its single dependency
+- `pip install 'modupy[postgres]'` — adds the Postgres outbox
+- `pip install 'modupy[database]'` — adds the database broker
+- `pip install 'modupy[all]'` — installs everything
 
 Plain `pip install modupy` deliberately resolves to two packages, `modupy` and
 `pluggy`: the framework does not pick your web layer for you. The `fastapi`
@@ -395,8 +400,8 @@ Two env vars have no `[tool.modulith]` counterpart at all.
 `MODULITH_PROXY_MAX_BODY_BYTES` raises the reverse proxy's request-body cap
 under `--topology processes` (10 MiB by default; the proxy buffers each body
 in memory, and a non-positive-integer value is a configuration error).
-`MODULITH_DEV_WARN_ONLY=1` downgrades `strict_boundaries` to warnings outside
-production — see the `strict_boundaries` note in the CLI section below.
+`MODULITH_DEV_WARN_ONLY=1` is an internal marker set by single-process
+`modulith dev`; process topology and production ignore it.
 
 For `topology = "processes"`, an omitted broker defaults to the stdlib-only
 `shm` adapter. If `broker_options.url`/`dsn` or its environment equivalent is
@@ -484,9 +489,8 @@ boundary violation (ERROR or WARNING) in `modulith verify`, `modulith run`,
 and `modulith dev --topology=processes`. Note: single-process `modulith dev`
 remains warn-only regardless of `strict_boundaries` (its interactive
 development contract is inviolable). It signals that to the runtime by
-setting `MODULITH_DEV_WARN_ONLY=1`, which survives uvicorn's `--reload` fork;
-exporting it yourself makes any non-production run warn-only, and
-`production = true` ignores it.
+setting `MODULITH_DEV_WARN_ONLY=1`, which survives uvicorn's `--reload` fork.
+Process topology and `modulith run` ignore this marker; do not set it manually.
 
 ---
 

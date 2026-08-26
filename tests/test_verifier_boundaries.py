@@ -1321,6 +1321,30 @@ def test_strict_boundaries_warn_only_env_var_downgrades_raise_to_warning(
     )
 
 
+def test_strict_boundaries_warn_only_env_var_does_not_affect_process_topology(
+    make_fake_app, monkeypatch
+) -> None:
+    """The dev-only marker must never weaken process-topology enforcement."""
+    from modulith.runtime import _runtime
+
+    monkeypatch.setenv("MODULITH_DEV_WARN_ONLY", "1")
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.inventory import _internal
+            """,
+            "inventory": "",
+        },
+        extra_files={
+            "inventory/_internal/__init__.py": "# private submodule\n",
+        },
+    )
+    _runtime.configure(package="fakeapp", topology="processes", strict_boundaries=True)
+
+    with pytest.raises(ConfigurationError, match="no-internal-imports"):
+        _runtime.ensure_bootstrapped()
+
+
 def test_strict_boundaries_warn_only_env_var_does_not_affect_other_values(
     make_fake_app, monkeypatch
 ) -> None:

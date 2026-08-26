@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - SQL schema identifiers are validated consistently through configuration, environment variables, Alembic `-x`, and direct database-broker construction
 - Enabling a named migration schema now refuses to abandon existing Modulith tables or Alembic history in `public`; data movement remains an explicit operator migration
 - Artifact generators import application modules and therefore require trusted source; `openapi` reports an actionable `modupy[fastapi]` installation error when FastAPI is unavailable
+- `MODULITH_DEV_WARN_ONLY` is limited to single-process `modulith dev`; process topology and `modulith run` continue enforcing strict boundaries
 
 ## [0.9.0] — 2026-07-22
 

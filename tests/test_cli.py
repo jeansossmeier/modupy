@@ -182,6 +182,8 @@ def test_dev_invokes_uvicorn_with_reload(monkeypatch):
 def test_run_invokes_uvicorn_without_reload(monkeypatch):
     captured: dict[str, object] = {}
 
+    monkeypatch.setenv("MODULITH_DEV_WARN_ONLY", "1")
+
     def fake_execvp(file: str, args: list[str]) -> None:
         captured["file"] = file
         captured["args"] = args
@@ -193,6 +195,7 @@ def test_run_invokes_uvicorn_without_reload(monkeypatch):
     assert result.exit_code == 0, result.output
     assert captured["file"] == "uvicorn"
     assert "--reload" not in captured["args"]
+    assert "MODULITH_DEV_WARN_ONLY" not in os.environ
 
 
 # ---------------------------------------------------------------------------
@@ -1303,6 +1306,7 @@ def test_dev_processes_topology_strict_boundaries_still_raises(make_fake_app, mo
     fast on a boundary violation under strict_boundaries=True."""
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     monkeypatch.setenv("MODULITH_STRICT_BOUNDARIES", "1")
+    monkeypatch.setenv("MODULITH_DEV_WARN_ONLY", "1")
     make_fake_app(
         {"orders": "from fakeapp.inventory._internal import secret\n", "inventory": ""},
         extra_files={"inventory/_internal.py": "secret = 1\n"},
@@ -1313,6 +1317,7 @@ def test_dev_processes_topology_strict_boundaries_still_raises(make_fake_app, mo
 
     assert result.exit_code == 1
     assert "boundary violations detected" in result.stderr
+    assert "MODULITH_DEV_WARN_ONLY" not in os.environ
 
 
 def test_verify_warning_only_violations_pass_unless_fail_on_warnings(
