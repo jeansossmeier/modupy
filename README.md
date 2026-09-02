@@ -5,12 +5,66 @@
 [![Python Versions](https://img.shields.io/pypi/pyversions/modupy)](https://pypi.org/project/modupy/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-> A Python framework for the modular monolith pattern. Module structure
-> with enforced boundaries, event-driven communication between modules,
-> transactional outbox for crash-safe delivery, and an optional
-> process-per-module runtime when you outgrow a single process.
+> **The modular monolith for Python: start as one process, grow into
+> process-per-module, extract a service only when it pays.** Modules with
+> enforced boundaries, events instead of cross-module calls, a transactional
+> outbox for crash-safe delivery, and a supervisor that runs the very same
+> code one-process-per-module when a module outgrows the rest.
 >
 > Inspired by [Spring Modulith](https://spring.io/projects/spring-modulith).
+
+---
+
+## Start small. Grow without the rewrite.
+
+Every stage below runs the same application code. What changes between them
+is a line of `pyproject.toml` or a CLI flag: listeners stay `@listener`, URLs
+stay identical, and nothing is rewritten for the messaging layer.
+
+**Day one: one process, zero infrastructure.** `pip install modupy` brings in
+exactly one dependency, `pluggy`. Modules are subpackages of your app; they
+talk through `@event`, `@listener` and `publish()`; you run
+`uvicorn myapp.main:app` as you always have. Boundaries are checked by static
+AST analysis at load time, and `modulith verify` fails CI on boundary
+violations. Broker and outbox are in-memory, so there is nothing to provision.
+
+**Durable: one config line.** `outbox = "postgres"` (or MySQL / SQLite) makes
+the outbox transactional: events are stored durably and delivered
+at-least-once after commit, and process crashes and transaction rollbacks
+stay consistent. The Alembic migrations ship inside the package.
+
+**Process-per-module: one flag, still one host.**
+`modulith run myapp.main:app --topology=processes` gives each module its own
+process behind a single reverse-proxy port. The supervisor restarts crashed
+workers with exponential backoff and a crash-loop breaker, and the default
+SHM broker is a stdlib-only SQLite queue, so still no extra service to run.
+One hot module? `[tool.modulith.workers] reports = 4`.
+
+**Multi-host: swap the broker.** `broker = "redis-streams"` or
+`broker = "database"` (Postgres / MySQL) carries events across machines.
+`modulith k8s-manifest` emits a Deployment and Service per module plus one
+Ingress, `modulith openapi` merges every module's spec into one document,
+`modulith doctor` runs nine operational and architectural checks, and the
+`otel` extra adds an OpenTelemetry span per publication and per listener
+dispatch.
+
+**Microservice: only when it pays.** `modulith extract <module>` scaffolds a
+standalone service from one module: its package tree plus `pyproject.toml`,
+`Dockerfile`, `README.md` and `.env.example`. The rest of the monolith keeps
+publishing through the broker and the extracted service subscribes; you wire
+its outbox yourself. Extraction refuses a module with outbound boundary
+violations or tables shared with another module unless you pass `--force`,
+and the generated README records what you overrode.
+
+Adopting on an existing codebase? `modulith audit` writes a `MIGRATION.md`
+for it, and `modulith verify --mode=ratchet` baselines today's violations and
+forbids new ones.
+
+Where this stands, honestly: **pre-1.0 alpha**. Breaking changes may land in
+0.x minor releases and are always listed in [CHANGELOG.md](CHANGELOG.md).
+Every push runs ~1,770 hermetic tests on Python 3.11, 3.12 and 3.13 (Linux,
+with the SHM broker additionally on macOS and Windows) plus 91 integration
+tests against real Postgres, MySQL and Redis containers.
 
 ---
 
@@ -555,7 +609,7 @@ against fakes:
 
 ```bash
 pip install -e '.[test]'
-pytest                     # ~1,400 tests, no external services
+pytest                     # ~1,770 tests, no external services
 ```
 
 The **integration suite** exercises the real adapters end-to-end — a real
