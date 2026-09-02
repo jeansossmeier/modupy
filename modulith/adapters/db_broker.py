@@ -932,6 +932,12 @@ class DatabaseBroker:
         self._schema_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
             weakref.WeakKeyDictionary()
         )
+        # Cross-loop usage detector for _write(), the chokepoint every
+        # publish/subscribe/claim/ack/fail/dead_letter/prune call routes
+        # through: a weakref.ref to the first loop seen, same eviction
+        # rationale as _schema_locks above.
+        self._used_loop_ref: weakref.ReferenceType[asyncio.AbstractEventLoop] | None = None
+        self._cross_loop_warned = False
 
     @property
     def engine(self) -> Any:
@@ -952,6 +958,33 @@ class DatabaseBroker:
             lock = asyncio.Lock()
             self._schema_locks[loop] = lock
         return lock
+
+    def _check_cross_loop_usage(self) -> None:
+        """Warn once when this broker's engine is used from a second loop.
+
+        Behaviour is unchanged either way: SQLAlchemy's ``AsyncAdaptedQueue``
+        binds to whichever loop first blocks on it, so under pool exhaustion a
+        later loop raises ``RuntimeError: <Queue ...> is bound to a different
+        event loop`` from deep inside SQLAlchemy. This surfaces the hazard
+        early instead of leaving it to that opaque failure.
+        """
+        loop = asyncio.get_running_loop()
+        if self._used_loop_ref is None:
+            self._used_loop_ref = weakref.ref(loop)
+            return
+        if self._cross_loop_warned:
+            return
+        bound_loop = self._used_loop_ref()
+        if bound_loop is not None and bound_loop is not loop:
+            logger.warning(
+                "DatabaseBroker engine first used on one event loop is now used "
+                "from another; once the connection pool is exhausted SQLAlchemy "
+                "raises 'Queue is bound to a different event loop'. Keep every "
+                "publish on one loop (do not mix `await publish()` with "
+                "`publish_sync()` on this broker) or size pool_size/max_overflow "
+                "for the cross-loop concurrency."
+            )
+            self._cross_loop_warned = True
 
     async def _broker_tables_present(self, *, deadline: float | None = None) -> bool:
         """True only when every table in broker metadata is queryable."""
@@ -1092,6 +1125,7 @@ class DatabaseBroker:
         and the caller should not see the outcome change with it. Exhausting
         ``_SQLITE_BUSY_MAX_RETRIES`` first keeps raising the driver's own error.
         """
+        self._check_cross_loop_usage()
         if not self._is_sqlite:
             async with self._engine.begin() as conn:
                 return await operation(conn)

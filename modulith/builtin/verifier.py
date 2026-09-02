@@ -61,6 +61,20 @@ logger = logging.getLogger("modulith.verifier")
 # hardcode — the actual name is read from config (see _configured_contracts_module).
 CONTRACTS_MODULE = "contracts"
 
+# All rule names emitted by this module. Used to validate configured
+# disabled_rules and warn about typos/unknown rule names.
+RULE_NAMES: frozenset[str] = frozenset(
+    {
+        "parse-error",
+        "no-internal-imports",
+        "use-contracts",
+        "undeclared-dependency",
+        "data-ownership",
+        "contracts-is-sink",
+        "no-cyclic-dependency",
+    }
+)
+
 
 def _configured_contracts_module() -> str:
     """The configured contracts-module name, or the default convention.
@@ -84,10 +98,8 @@ def _configured_disabled_rules() -> frozenset[str]:
     """The rule names disabled via runtime config, or none.
 
     Mirrors ``_configured_contracts_module``: read lazily from the runtime
-    config so ``[tool.modulith.verify].disabled_rules`` is honored the
-    moment that field starts landing on ``Configuration``, with no hookspec
-    change needed. ``getattr`` with a default keeps this forward-compatible
-    with today's runtime, which doesn't parse the field yet.
+    config so ``[tool.modulith.verify].disabled_rules`` is honored.
+    Logs a warning for any configured rule names not in RULE_NAMES.
     """
     try:
         from ..runtime import _runtime
@@ -97,7 +109,13 @@ def _configured_disabled_rules() -> frozenset[str]:
         return frozenset()
     if cfg is None:
         return frozenset()
-    return frozenset(getattr(cfg, "verify_disabled_rules", ()) or ())
+    disabled = frozenset(cfg.verify_disabled_rules)
+    unknown = disabled - RULE_NAMES
+    if unknown:
+        unknown_str = ", ".join(sorted(unknown))
+        known_str = ", ".join(sorted(RULE_NAMES))
+        logger.warning(f"disabled_rules names no known rule: {unknown_str} (known: {known_str})")
+    return disabled
 
 
 # ---------------------------------------------------------------------------

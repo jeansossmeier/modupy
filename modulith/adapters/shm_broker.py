@@ -326,8 +326,16 @@ class ShmBroker:
         batch_size: int,
         consumer_name: str,
         reclaim_stale_seconds: float = _DEFAULT_RECLAIM_STALE_S,
+        max_attempts: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Atomically claim durable work, including abandoned stale claims."""
+        """Atomically claim durable work, including abandoned stale claims.
+
+        When ``max_attempts`` is given, a stale-claim reclaim bumps the
+        row's ``attempts`` and, once that meets or exceeds the cap,
+        dead-letters it instead of redelivering it -- the same accounting
+        the database broker applies, needed because a consumer that crashes
+        mid-dispatch never reaches ``fail()`` to run the cap itself.
+        """
         batch_size = _bounded_positive_int(
             batch_size,
             "batch_size",
@@ -338,6 +346,7 @@ class ShmBroker:
             limit=batch_size,
             consumer_name=consumer_name,
             reclaim_stale_seconds=reclaim_stale_seconds,
+            max_attempts=max_attempts,
         )
 
     async def renew_claims(self, row_ids: list[str], *, consumer_name: str) -> int:

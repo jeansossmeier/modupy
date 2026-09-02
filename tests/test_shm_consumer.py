@@ -207,12 +207,14 @@ class _PublishAfterEmptyClaimBroker(ShmBroker):
         batch_size: int,
         consumer_name: str,
         reclaim_stale_seconds: float = 60.0,
+        max_attempts: int | None = None,
     ) -> list[dict[str, Any]]:
         rows = await super().claim_batch(
             group,
             batch_size=batch_size,
             consumer_name=consumer_name,
             reclaim_stale_seconds=reclaim_stale_seconds,
+            max_attempts=max_attempts,
         )
         if rows or not self._publications:
             return rows
@@ -378,7 +380,7 @@ async def test_shm_idle_backoff_resets_after_delivery(
     )
     try:
         await instance.subscribe([TARGET], GROUP)
-        await consumer._run()
+        await asyncio.wait_for(consumer._run(), timeout=30.0)
 
         assert delivered == ["reset"]
         assert consumer.delays == [0.02, 0.02]
@@ -900,8 +902,11 @@ async def test_real_poll_loop_reclaims_after_one_shot_ack_failure(
         assert delivered == [event_value]
 
         # The running poll loop, not a direct dispatch call, reclaims the stale row.
+        # The poll loop always passes its configured max_attempts to claim_batch,
+        # and that cap now reaches the SQLite claim layer (previously discarded),
+        # so this reclaim is accounted as a real attempt: attempts goes to 1.
         await _until(lambda: delivered == [event_value, event_value], timeout=2.0)
-        await _until(lambda: _delivery_state(instance) == [("done", 0)], timeout=1.0)
+        await _until(lambda: _delivery_state(instance) == [("done", 1)], timeout=1.0)
         await _until(lambda: consumer.health() == ConsumerHealth(True, "ready"), timeout=1.0)
     finally:
         await consumer.stop()

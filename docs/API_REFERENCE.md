@@ -334,6 +334,7 @@ Mutating it after the runtime starts would create inconsistent state.
 - `observability: bool | None` = `None`
 - `verify_manifests: bool` = `True`
 - `strict_boundaries: bool` = `False`
+- `verify_disabled_rules: tuple[str, ...]` = `()`
 - `explicit_keys: frozenset[str]` (default factory)
 
 **Methods:**
@@ -513,9 +514,9 @@ and repeated ``stop()`` (shutdown paths are not always ordered).
 **Methods:**
 
 - `async def start(self) -> None:`
-  — Begin consuming: set up any server-side state, recover pending
+  — Begin consuming: set up any server-side state, recover pending work, and launch the background poll loop. No-op safe when the module subscribes to nothing.
 - `async def stop(self) -> None:`
-  — Stop the poll loop and release resources. Must never raise — a
+  — Stop the poll loop and release resources. Must never raise — a consumer that already died is logged, not re-raised, at shutdown.
 
 ## Broker registry
 

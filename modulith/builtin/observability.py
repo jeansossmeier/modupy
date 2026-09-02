@@ -248,9 +248,10 @@ def _detect_calling_module() -> str:
             except ValueError:
                 break
             name = str(frame.f_globals.get("__name__", ""))
-            if (name == app_package or name.startswith(app_package + ".")) and not name.startswith(
-                "modulith"
-            ):
+            is_modulith_internal = name == "modulith" or name.startswith("modulith.")
+            if (
+                name == app_package or name.startswith(app_package + ".")
+            ) and not is_modulith_internal:
                 return name
             depth += 1
     except Exception:  # pragma: no cover - detection is best-effort only

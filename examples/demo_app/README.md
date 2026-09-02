@@ -192,7 +192,7 @@ directory itself, exactly as mode A does.)
 ```bash
 modulith info      # detected package, modules, manifests, plugins
 modulith verify    # boundary checks — this demo passes clean
-modulith docs      # Mermaid architecture + event-flow diagrams + module canvases
+modulith docs      # Mermaid architecture + event-flow diagrams + module canvases → writes into docs/modulith/ (gitignored)
 modulith doctor    # health check on wired drivers and stores
 ```
 

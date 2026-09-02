@@ -14,6 +14,13 @@ from ._shm_types import PublishResult
 
 _PUBLISH_PRUNE_LIMIT = 100
 
+# idx_shm_publication_expiry backs the prune scan (see
+# _prune_expired_empty_publications), but it still touches every expired
+# orphan row up to its LIMIT on each run. Gating it to a cadence instead of
+# running it on every publish call bounds how often that cost is paid; the
+# caller (SqliteQueueStore) tracks the cadence and passes prune_due.
+PRUNE_EVERY_N_PUBLISHES = 100
+
 
 def spill(
     conn: sqlite3.Connection,
@@ -58,13 +65,15 @@ def publish(
     retention_seconds: float,
     max_payload_bytes: int,
     max_store_bytes: int,
+    prune_due: bool = True,
 ) -> PublishResult:
     """Atomically persist one replayable publication and current deliveries."""
     _ensure_payload_size(payload, max_payload_bytes)
     now = time.time()
     try:
         with immediate_transaction(conn):
-            _prune_expired_empty_publications(conn, now, _PUBLISH_PRUNE_LIMIT)
+            if prune_due:
+                _prune_expired_empty_publications(conn, now, _PUBLISH_PRUNE_LIMIT)
             publication, inserted = _insert_publication(
                 conn,
                 publication_id or str(uuid4()),

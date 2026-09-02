@@ -16,6 +16,7 @@ warning). The OTel-absent path is verified by flipping ``_OTEL_AVAILABLE``.
 from __future__ import annotations
 
 import asyncio
+import importlib
 
 import pytest
 from opentelemetry.sdk.trace import TracerProvider
@@ -273,6 +274,38 @@ async def test_publish_span_carries_calling_module(make_fake_app, span_exporter)
 
     (publish_span,) = _spans_by_name(span_exporter, "modulith.event.publish")
     assert publish_span.attributes["event.module"] == "fakeapp.orders"
+
+
+async def test_publish_span_carries_calling_module_for_modulith_prefixed_app_package(
+    make_fake_app, span_exporter
+) -> None:
+    """An application package whose name merely starts with the literal
+    string ``"modulith"`` (but isn't the modulith package itself) must still
+    be detected as the calling module, not excluded as an internal frame."""
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event, publish
+
+                @event
+                @dataclass(frozen=True)
+                class ModAppPing:
+                    n: int
+
+                async def go() -> None:
+                    await publish(ModAppPing(n=1))
+            """
+        },
+        package_name="modulithapp",
+    )
+    configure(package="modulithapp")
+    orders = importlib.import_module("modulithapp.orders")
+
+    await orders.go()
+
+    (publish_span,) = _spans_by_name(span_exporter, "modulith.event.publish")
+    assert publish_span.attributes["event.module"] == "modulithapp.orders"
 
 
 def test_publish_span_event_module_falls_back_to_unknown(span_exporter) -> None:

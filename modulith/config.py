@@ -146,6 +146,12 @@ class Configuration:
     # the application starts.
     strict_boundaries: bool = False
 
+    # Rule names skipped by the built-in verifier, from
+    # [tool.modulith.verify].disabled_rules. Read via getattr with a default
+    # by modulith/builtin/verifier.py, so consumers written before this field
+    # existed keep working unchanged.
+    verify_disabled_rules: tuple[str, ...] = ()
+
     # Tracks which keys were explicitly set vs got their default value.
     # Used by safety checks (e.g. "production + default outbox = error").
     explicit_keys: frozenset[str] = field(default_factory=frozenset)
@@ -190,6 +196,8 @@ def load_configuration(**overrides: Any) -> Configuration:
 
     # Validate before constructing — fail fast on typos and bad values.
     _validate(explicit)
+    if "verify_disabled_rules" in explicit:
+        explicit["verify_disabled_rules"] = tuple(explicit["verify_disabled_rules"])
     broker_options = explicit.get("broker_options")
     if (
         isinstance(broker_options, dict) and "shm_slot_size" in broker_options
@@ -432,6 +440,9 @@ _SUBTABLE_FIELD = {
 # Subtables reserved for future modulith versions. These are the ONLY
 # subtable names that are dropped silently — a documented no-op so a
 # future-compatible pyproject still bootstraps on today's modulith.
+# "verify" is a partial exception: its disabled_rules key is already wired
+# to Configuration.verify_disabled_rules (see _read_pyproject); every other
+# key in that subtable (mode, baseline, ...) remains a silent no-op.
 _RESERVED_SUBTABLES = frozenset({"verify"})
 
 
@@ -505,6 +516,13 @@ def _read_pyproject() -> dict[str, Any]:
         if not isinstance(value, dict):
             # Scalar: pass through. _validate catches unknown scalar keys.
             result[key] = value
+            continue
+        if key == "verify":
+            # Reserved subtable (see _RESERVED_SUBTABLES), but disabled_rules
+            # is the one key already wired to a Configuration field — everything
+            # else in [tool.modulith.verify] stays a silent forward-compat no-op.
+            if "disabled_rules" in value:
+                result["verify_disabled_rules"] = value["disabled_rules"]
             continue
         field_name = _resolve_subtable(key, already_mapped=set(result))
         if field_name is not None:
@@ -594,17 +612,20 @@ def _is_broker_target(value: object) -> bool:
 
 
 def _env_str(name: str) -> str | None:
-    """Return the env var's value, or None when it is unset OR empty.
+    """Return the env var's value, or None when it is unset, empty, or whitespace-only.
 
     Empty-string-is-unset is a documented contract, not an accident of
     truthiness: templated deployments commonly render ``MODULITH_X=""``
     when the source variable is missing (e.g. ``MODULITH_PRODUCTION=
     ${DEPLOY_ENV_IS_PROD}`` with the interpolation variable unset), and
     honoring "" as an explicit value would inject nonsense config such as
-    ``package=""``.
+    ``package=""``. Whitespace-only values (``MODULITH_X="   "``) get the
+    same treatment, matching ``_env_bool``'s existing stripped comparison —
+    a value is never returned verbatim without first checking it holds
+    something other than whitespace.
     """
     val = os.environ.get(name)
-    if val is None or val == "":
+    if val is None or val.strip() == "":
         return None
     return val
 
@@ -885,6 +906,16 @@ def _validate(data: dict[str, Any]) -> None:
                     "workers must map string module names to positive integer "
                     f"counts; got {module_name!r}: {count!r}"
                 )
+
+    if "verify_disabled_rules" in data:
+        disabled_rules = data["verify_disabled_rules"]
+        if not isinstance(disabled_rules, (list, tuple)) or any(
+            type(rule) is not str for rule in disabled_rules
+        ):
+            raise ConfigurationError(
+                "[tool.modulith.verify].disabled_rules must be a list of rule-name "
+                f"strings, got {disabled_rules!r}"
+            )
 
     subscriptions = data.get("subscriptions")
     if subscriptions is not None:

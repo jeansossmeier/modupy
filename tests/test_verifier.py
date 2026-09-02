@@ -890,5 +890,90 @@ def test_data_ownership_define_conflict_message_says_defines_not_references(
         manifest_module._reset_for_testing()
 
 
+# ---------------------------------------------------------------------------
+# RULE_NAMES constant: must enumerate all rule literals in the module
+# ---------------------------------------------------------------------------
+
+
+def test_rule_names_matches_actual_rules() -> None:
+    """RULE_NAMES constant should match every rule literal in the module."""
+    import inspect
+    import re
+
+    source = inspect.getsource(verifier)
+    rule_literals = set(re.findall(r'rule="([^"]+)"', source))
+
+    assert rule_literals == verifier.RULE_NAMES, (
+        f"RULE_NAMES mismatch: {rule_literals} != {verifier.RULE_NAMES}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# disabled_rules validation: warn about unknown rule names
+# ---------------------------------------------------------------------------
+
+
+def test_disabled_rules_logs_warning_for_unknown_rule(make_fake_app, monkeypatch, caplog) -> None:
+    """Unknown rule names in disabled_rules should produce a warning."""
+    import logging
+    from unittest.mock import MagicMock
+
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.inventory._internal.store import Repo
+            """,
+            "inventory": "",
+        }
+    )
+    mods = [_module("orders"), _module("inventory")]
+
+    # Mock the runtime config to return unknown rule names
+    mock_cfg = MagicMock()
+    mock_cfg.verify_disabled_rules = ("use-contract", "unknown-rule")
+    mock_runtime = MagicMock()
+    mock_runtime.config = mock_cfg
+    monkeypatch.setattr("modulith.runtime._runtime", mock_runtime, raising=False)
+
+    with caplog.at_level(logging.WARNING):
+        verifier.modulith_verify_module(_module("orders"), mods)
+
+    # Check that a warning was logged with the unknown rule names
+    assert any(
+        "disabled_rules names no known rule" in record.message for record in caplog.records
+    ), f"Expected warning about unknown rules, got: {[r.message for r in caplog.records]}"
+
+
+def test_disabled_rules_no_warning_for_known_rule(make_fake_app, monkeypatch, caplog) -> None:
+    """Known rule names should not produce warnings."""
+    import logging
+    from unittest.mock import MagicMock
+
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.inventory._internal.store import Repo
+            """,
+            "inventory": "",
+        }
+    )
+    mods = [_module("orders"), _module("inventory")]
+
+    # Mock the runtime config to return a known rule name
+    mock_cfg = MagicMock()
+    mock_cfg.verify_disabled_rules = ("no-internal-imports",)
+    mock_runtime = MagicMock()
+    mock_runtime.config = mock_cfg
+    monkeypatch.setattr("modulith.runtime._runtime", mock_runtime, raising=False)
+
+    with caplog.at_level(logging.WARNING):
+        verifier.modulith_verify_module(_module("orders"), mods)
+
+    # Check that no warning was logged
+    assert not any(
+        "disabled_rules names no known rule" in record.message for record in caplog.records
+    ), f"Unexpected warning for known rule, got: {[r.message for r in caplog.records]}"
+
+
 # Keep ImportRecord referenced for import-time coverage of the dataclass.
 assert ImportRecord is not None

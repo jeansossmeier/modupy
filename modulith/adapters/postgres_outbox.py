@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -360,6 +361,11 @@ class PostgresPublicationStore:
             dead_letter_after_attempts if dead_letter_after_attempts is not None else 10
         )
         self._inflight: set[asyncio.Task[None]] = set()
+        # Cross-loop usage detector for _open_session(), the chokepoint every
+        # read/write method routes through: a weakref.ref to the first loop
+        # seen, mirroring db_broker.py's DatabaseBroker._used_loop_ref.
+        self._used_loop_ref: weakref.ReferenceType[asyncio.AbstractEventLoop] | None = None
+        self._cross_loop_warned = False
         # FOR UPDATE SKIP LOCKED is a Postgres row-claim optimization; SQLite
         # (tests) has no row locking and would reject the clause, so gate on it.
         self._supports_skip_locked = engine.dialect.name == "postgresql"
@@ -392,6 +398,38 @@ class PostgresPublicationStore:
         sa_event.listen(Session, "after_soft_rollback", _discard_pending_on_rollback)
         _hook_installed = True
 
+    def _check_cross_loop_usage(self) -> None:
+        """Warn once when this store's engine is used from a second loop.
+
+        Behaviour is unchanged either way: SQLAlchemy's ``AsyncAdaptedQueue``
+        binds to whichever loop first blocks on it, so under pool exhaustion a
+        later loop raises ``RuntimeError: <Queue ...> is bound to a different
+        event loop`` from deep inside SQLAlchemy. This surfaces the hazard
+        early instead of leaving it to that opaque failure.
+        """
+        loop = asyncio.get_running_loop()
+        if self._used_loop_ref is None:
+            self._used_loop_ref = weakref.ref(loop)
+            return
+        if self._cross_loop_warned:
+            return
+        bound_loop = self._used_loop_ref()
+        if bound_loop is not None and bound_loop is not loop:
+            logger.warning(
+                "PostgresPublicationStore engine first used on one event loop is "
+                "now used from another; once the connection pool is exhausted "
+                "SQLAlchemy raises 'Queue is bound to a different event loop'. "
+                "Keep every save/dispatch on one loop or size "
+                "pool_size/max_overflow for the cross-loop concurrency."
+            )
+            self._cross_loop_warned = True
+
+    def _open_session(self) -> Any:
+        """The single chokepoint every read/write method opens a session
+        through — see ``_check_cross_loop_usage``."""
+        self._check_cross_loop_usage()
+        return self._sessionmaker()
+
     async def save(self, publication: EventPublication) -> None:
         """Persist a publication.
 
@@ -417,7 +455,7 @@ class PostgresPublicationStore:
             sync_session.info.setdefault("_modulith_pending", []).append(publication.id)
             return
 
-        async with self._sessionmaker() as s:
+        async with self._open_session() as s:
             existing = await s.get(EventPublicationRow, publication.id)
             if existing is None:
                 s.add(_pub_to_row(publication, dead=dead))
@@ -433,7 +471,7 @@ class PostgresPublicationStore:
             await s.commit()
 
     async def mark_complete(self, publication_id: UUID) -> None:
-        async with self._sessionmaker() as s:
+        async with self._open_session() as s:
             row = await s.get(EventPublicationRow, publication_id)
             if row is not None:
                 row.completed_at = datetime.now(UTC)
@@ -471,7 +509,7 @@ class PostgresPublicationStore:
         plugin's correctness properties).
         """
         cutoff = datetime.now(UTC) - older_than
-        async with self._sessionmaker() as s:
+        async with self._open_session() as s:
             stmt = (
                 select(EventPublicationRow)
                 .where(
@@ -493,7 +531,7 @@ class PostgresPublicationStore:
             return [_row_to_pub(r) for r in rows]
 
     async def archive(self, publication_id: UUID) -> None:
-        async with self._sessionmaker() as s:
+        async with self._open_session() as s:
             row = await s.get(EventPublicationRow, publication_id)
             if row is None:
                 return
@@ -514,7 +552,7 @@ class PostgresPublicationStore:
             await s.commit()
 
     async def delete(self, publication_id: UUID) -> None:
-        async with self._sessionmaker() as s:
+        async with self._open_session() as s:
             row = await s.get(EventPublicationRow, publication_id)
             if row is not None:
                 await s.delete(row)
@@ -523,12 +561,25 @@ class PostgresPublicationStore:
     # ----- Duck-typed maintenance extensions used by the outbox plugin -----
 
     async def count_completed(self) -> int:
-        async with self._sessionmaker() as s:
+        async with self._open_session() as s:
             stmt = (
                 select(func.count())
                 .select_from(EventPublicationRow)
                 .where(EventPublicationRow.completed_at.is_not(None))
             )
+            return int((await s.execute(stmt)).scalar_one())
+
+    async def count_archived(self) -> int:
+        """Count rows moved to the archive table (``completion_mode="archive"``).
+
+        The archive table holds only delivered publications (see
+        ``EventPublicationArchiveRow`` — nothing writes to it except
+        ``archive``/``complete_claim(mode="archive")``), so no
+        ``completed_at`` filter is needed, matching ``count_completed``'s
+        unfiltered count of the primary table.
+        """
+        async with self._open_session() as s:
+            stmt = select(func.count()).select_from(EventPublicationArchiveRow)
             return int((await s.execute(stmt)).scalar_one())
 
     async def count_open(self) -> int:
@@ -538,7 +589,7 @@ class PostgresPublicationStore:
         of truth for operational dashboards/doctor, which must see the real
         backlog (e.g. 50k stuck rows) rather than a capped sample.
         """
-        async with self._sessionmaker() as s:
+        async with self._open_session() as s:
             stmt = (
                 select(func.count())
                 .select_from(EventPublicationRow)
@@ -551,7 +602,7 @@ class PostgresPublicationStore:
 
     async def count_dead_lettered(self) -> int:
         """Count incomplete publications that have exhausted their retry budget."""
-        async with self._sessionmaker() as s:
+        async with self._open_session() as s:
             stmt = (
                 select(func.count())
                 .select_from(EventPublicationRow)
@@ -580,7 +631,7 @@ class PostgresPublicationStore:
         OFFSET would double up or skip rows if a dead-letter table changes
         between pages; keyset pagination does not).
         """
-        async with self._sessionmaker() as s:
+        async with self._open_session() as s:
             stmt = select(EventPublicationRow).where(
                 EventPublicationRow.completed_at.is_(None),
                 EventPublicationRow.is_dead_lettered.is_(True),
@@ -614,7 +665,7 @@ class PostgresPublicationStore:
         in a large backlog it sits, rather than only the rows that happen to
         fall in the current page.
         """
-        async with self._sessionmaker() as s:
+        async with self._open_session() as s:
             row = await s.get(EventPublicationRow, publication_id)
             return _row_to_pub(row) if row is not None else None
 
@@ -643,7 +694,7 @@ class PostgresPublicationStore:
         now = datetime.now(UTC)
         cutoff = now - older_than
         until = now + timedelta(seconds=lease_seconds)
-        async with self._sessionmaker() as s:
+        async with self._open_session() as s:
             stmt = (
                 select(EventPublicationRow)
                 .where(
@@ -690,7 +741,7 @@ class PostgresPublicationStore:
         lease and blocking every other sweeper from picking it up sooner.
         """
         until = datetime.now(UTC) + timedelta(seconds=lease_seconds)
-        async with self._sessionmaker() as s:
+        async with self._open_session() as s:
             stmt = (
                 update(EventPublicationRow)
                 .where(
@@ -715,7 +766,7 @@ class PostgresPublicationStore:
         keyed on the primary key alone — would then clobber the new claimant's
         lease. Holding the lock instead makes that peer skip the row, because
         ``claim_batch`` selects ``FOR UPDATE SKIP LOCKED``."""
-        async with self._sessionmaker() as s:
+        async with self._open_session() as s:
             row = await s.get(EventPublicationRow, publication_id, with_for_update=True)
             if row is None or row.claim_token != token:
                 return False
@@ -753,7 +804,7 @@ class PostgresPublicationStore:
         which a peer's ``claim_batch`` commits a new claim that the write then
         clobbers. Rowcount 0 means the row is gone or the peer owns it."""
         dead = publication.attempt_count >= self.dead_letter_after_attempts
-        async with self._sessionmaker() as s:
+        async with self._open_session() as s:
             stmt = (
                 update(EventPublicationRow)
                 .where(
@@ -793,9 +844,17 @@ class PostgresPublicationStore:
             )
         lock_key = publication_id.int & 0x7FFFFFFFFFFFFFFF  # fit signed bigint
         conn = await self._engine.connect()
-        got = (
-            await conn.execute(text("SELECT pg_try_advisory_lock(:key)"), {"key": lock_key})
-        ).scalar()
+        try:
+            # AUTOCOMMIT: the lock query would otherwise autobegin a
+            # transaction that stays open for the whole dispatch this handle
+            # is held across, sitting idle-in-transaction on real Postgres.
+            conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+            got = (
+                await conn.execute(text("SELECT pg_try_advisory_lock(:key)"), {"key": lock_key})
+            ).scalar()
+        except BaseException:
+            await conn.close()
+            raise
         if not got:
             await conn.close()
             return None
@@ -823,7 +882,7 @@ class PostgresPublicationStore:
         """
         cutoff = datetime.now(UTC) - older_than
         purged = 0
-        async with self._sessionmaker() as s:
+        async with self._open_session() as s:
             for table in (EventPublicationRow, EventPublicationArchiveRow):
                 stmt = delete(table).where(
                     table.completed_at.is_not(None),
@@ -845,7 +904,7 @@ class PostgresPublicationStore:
         """
         token = _current_session.set(None)
         try:
-            async with self._sessionmaker() as s:
+            async with self._open_session() as s:
                 row = await s.get(EventPublicationRow, publication_id)
                 pub = _row_to_pub(row) if row is not None else None
             if pub is not None:
@@ -865,9 +924,33 @@ class PostgresPublicationStore:
             _current_session.reset(token)
 
     async def wait_for_dispatch(self) -> None:
-        """Await all in-flight after-commit dispatch tasks (test/shutdown aid)."""
+        """Await all in-flight after-commit dispatch tasks (test/shutdown aid).
+
+        Cross-loop safe: a task in ``_inflight`` may live on a different
+        event loop than the one this coroutine runs on —
+        ``_schedule_after_commit_dispatch`` creates the after-commit task on
+        whatever loop is running at commit time, which can be sync.py's
+        persistent daemon-thread loop. Handing such a task to
+        ``asyncio.gather()`` raises ("Task ... attached to a different
+        loop"), so a same-loop task is gathered normally and a foreign-loop
+        one is drained by polling ``task.done()`` instead — the same
+        technique ``modulith.builtin.outbox.shutdown()`` uses for the retry
+        task.
+        """
         while self._inflight:
-            await asyncio.gather(*list(self._inflight), return_exceptions=True)
+            try:
+                running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            pending = list(self._inflight)
+            same_loop = [task for task in pending if task.get_loop() is running]
+            foreign_loop = [task for task in pending if task.get_loop() is not running]
+            awaitables: list[Any] = []
+            if same_loop:
+                awaitables.append(asyncio.gather(*same_loop, return_exceptions=True))
+            awaitables.extend(_poll_until_done(task) for task in foreign_loop)
+            if awaitables:
+                await asyncio.gather(*awaitables)
 
     async def dispose(self) -> None:
         """Drain in-flight dispatches and deactivate this store.
@@ -962,6 +1045,13 @@ def _reset_for_testing() -> None:
         sa_event.remove(Session, "after_commit", _schedule_after_commit_dispatch)
         sa_event.remove(Session, "after_soft_rollback", _discard_pending_on_rollback)
         _hook_installed = False
+
+
+async def _poll_until_done(task: asyncio.Task[None]) -> None:
+    """Wait for a foreign-loop task without awaiting it directly (that raises
+    "Task ... attached to a different loop"). Used by ``wait_for_dispatch``."""
+    while not task.done():
+        await asyncio.sleep(0.01)
 
 
 def _cancel_task_threadsafe(task: asyncio.Task[None]) -> None:

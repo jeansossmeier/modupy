@@ -19,10 +19,8 @@ from fastapi import APIRouter
 from modulith import listener, publish
 from shop.contracts.events import OrderPlaced, StockReserved
 
-# Toy state the demo can inspect. Dev-inspection-only: bounded (not the
-# source of truth in durable mode — that's the outbox's own table) so a
-# long-running process doesn't grow this list unboundedly.
 reserved: deque[StockReserved] = deque(maxlen=1000)
+_reserved_order_ids: set[str] = set()
 
 router = APIRouter()
 
@@ -36,10 +34,11 @@ async def reserve_stock(event: OrderPlaced) -> None:
     once), so a redelivered OrderPlaced must not reserve stock (or publish
     StockReserved) twice.
     """
-    if any(evt.order_id == event.order_id for evt in reserved):
+    if event.order_id in _reserved_order_ids:
         return
     evt = StockReserved(order_id=event.order_id)
     reserved.append(evt)
+    _reserved_order_ids.add(event.order_id)
     await publish(evt)
 
 

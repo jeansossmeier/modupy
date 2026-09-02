@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from modulith import ConfigurationError
+from modulith.adapters import _shm_publications
 from modulith.adapters._shm_coldstore import ShmColdStore
 from modulith.adapters._shm_store import ClaimToken, PublishResult, SqliteQueueStore
 
@@ -405,7 +406,11 @@ async def test_delete_ack_tombstone_survives_restart_without_blocking_new_group(
         conn.execute("UPDATE shm_publication SET retained_until=0 WHERE id='publication-1'")
         conn.commit()
         conn.close()
-        await restarted.publish("events.Other", b"{}", publication_id="other")
+        # Pruning is cadence-gated (see test_publish_prunes_on_a_bounded_cadence_
+        # not_every_call), so reaching the cadence boundary -- not one publish --
+        # is what removes the now-expired, delivery-free publication-1 row.
+        for index in range(_shm_publications.PRUNE_EVERY_N_PUBLISHES):
+            await restarted.publish("events.Other", b"{}", publication_id=f"other-{index}")
 
         assert (
             _rows(
@@ -445,21 +450,79 @@ async def test_expired_no_subscriber_publication_is_not_replayed(
         await store.close()
 
 
-async def test_later_publish_prunes_expired_delivery_free_publication(
+async def test_expired_empty_publication_is_pruned_at_the_cadence_boundary(
     tmp_path: Path,
 ) -> None:
+    """Pruning is gated to a bounded publish cadence rather than running as a
+    full-table scan on every single publish, so an expired orphan survives
+    until the cadence boundary (never earlier) and is gone once it is
+    reached (never indefinitely). This supersedes the previous expectation
+    that the very next publish always pruned -- that was exactly the
+    unconditional per-publish scan the cadence gate replaces."""
     path = tmp_path / "publish-prune.db"
     store = ShmColdStore(str(path), orphan_retention_seconds=0.01)
     try:
         await store.publish("events.Created", b"old", publication_id="expired")
         await asyncio.sleep(0.02)
 
+        cadence = _shm_publications.PRUNE_EVERY_N_PUBLISHES
+        for index in range(cadence - 2):
+            await store.publish(
+                "events.Created",
+                b"filler",
+                publication_id=f"filler-{index}",
+            )
+        before_boundary = {row["id"] for row in _rows(path, "SELECT id FROM shm_publication")}
+        assert "expired" in before_boundary
+
         await store.publish("events.Created", b"new", publication_id="retained")
 
-        rows = _rows(path, "SELECT id FROM shm_publication ORDER BY sequence")
-        assert [row["id"] for row in rows] == ["retained"]
+        rows = {row["id"] for row in _rows(path, "SELECT id FROM shm_publication")}
+        assert "expired" not in rows
+        assert "retained" in rows
     finally:
         await store.close()
+
+
+def test_publish_prunes_on_a_bounded_cadence_not_every_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full-table prune scan running on every publish call makes publish
+    latency grow with store size. It must instead run at most once per
+    cadence window, proven here by counting real invocations rather than
+    timing them."""
+    calls: list[float] = []
+    original_prune = _shm_publications._prune_expired_empty_publications
+
+    def _counting_prune(conn: sqlite3.Connection, now: float, limit: int) -> None:
+        calls.append(now)
+        original_prune(conn, now, limit)
+
+    monkeypatch.setattr(
+        _shm_publications,
+        "_prune_expired_empty_publications",
+        _counting_prune,
+    )
+
+    store = SqliteQueueStore(
+        str(tmp_path / "cadence.db"),
+        synchronous="NORMAL",
+        completion_mode="delete",
+        orphan_retention_seconds=86400.0,
+        retry_backoff_base_seconds=0.05,
+        retry_backoff_cap_seconds=5.0,
+    )
+    try:
+        store.subscribe(["events.Created"], "g1")
+        windows = 3
+        total_publishes = _shm_publications.PRUNE_EVERY_N_PUBLISHES * windows
+        for index in range(total_publishes):
+            store.publish("events.Created", b"{}", None, f"publication-{index}")
+
+        assert len(calls) == windows
+    finally:
+        store.close()
 
 
 async def test_concurrent_claims_partition_rows_without_duplicates(
@@ -547,8 +610,10 @@ def test_claim_sizes_the_batch_before_reading_any_payload(tmp_path: Path) -> Non
     """The byte budget is applied over LENGTH(), then the row query is capped
     to what it affords — so a claim that can only take one of many due
     candidates reads exactly one payload instead of the whole LIMIT window.
-    Reading first and discarding afterwards made every poll of a large-payload
-    backlog copy the entire window through SQLite's ORDER BY sorter."""
+    The size check runs once per delivery-status branch (pending and
+    stale-claimed) instead of once as a combined OR query, so each branch's
+    LIMIT lands directly on its own indexed range scan rather than forcing a
+    merge over the whole backlog before a single combined LIMIT can apply."""
     max_payload_bytes = 4096
     store = SqliteQueueStore(
         str(tmp_path / "sized-claim.db"),
@@ -578,16 +643,69 @@ def test_claim_sizes_the_batch_before_reading_any_payload(tmp_path: Path) -> Non
             store._conn.set_trace_callback(None)
 
         assert [row["message_id"] for row in batch] == ["publication-0"]
-        # sqlite3's trace callback expands bound parameters, so the LIMIT the
-        # row query actually ran with is visible here.
+        # sqlite3's trace callback expands bound parameters, so the LIMIT each
+        # query actually ran with is visible here.
         sized = [text for text in statements if "LENGTH(p.payload)" in text]
         loaded = [text for text in statements if "d.last_error, p.*" in text]
-        assert len(sized) == 1
+        assert len(sized) == 2
+        assert all("LIMIT 100" in text for text in sized)
         assert len(loaded) == 1
-        assert "LIMIT 100" in sized[0]
         assert "LIMIT 1" in loaded[0]
     finally:
         store.close()
+
+
+def test_claim_cost_does_not_scale_with_pending_backlog_size(
+    tmp_path: Path,
+) -> None:
+    """claim() must stay bounded by its own batch size as the pending
+    backlog grows, because each delivery-status branch is queried with its
+    own indexed LIMIT instead of materializing the whole backlog through a
+    cross-branch sort before a single combined LIMIT can apply.
+
+    Measured as SQLite VM instruction steps via set_progress_handler rather
+    than wall-clock time: a deterministic proxy for work done, immune to
+    machine/CI load (this suite's SHM lane also runs on windows-latest and
+    macos runners, where a timing-based bound is flaky)."""
+
+    def _claim_vm_steps(backlog: int) -> int:
+        store = SqliteQueueStore(
+            str(tmp_path / f"scale-{backlog}.db"),
+            synchronous="NORMAL",
+            completion_mode="delete",
+            orphan_retention_seconds=86400.0,
+            retry_backoff_base_seconds=0.05,
+            retry_backoff_cap_seconds=5.0,
+        )
+        try:
+            store.subscribe(["events.Created"], "g1")
+            for index in range(backlog):
+                store.publish(
+                    "events.Created",
+                    b"x",
+                    None,
+                    f"publication-{index}",
+                )
+            steps = [0]
+
+            def _count_step() -> int:
+                steps[0] += 1
+                return 0
+
+            store._conn.set_progress_handler(_count_step, 1)
+            try:
+                store.claim("g1", 10, "worker-1", 60.0)
+            finally:
+                store._conn.set_progress_handler(None, 0)
+            return steps[0]
+        finally:
+            store.close()
+
+    small = _claim_vm_steps(300)
+    large = _claim_vm_steps(6000)
+    # A 20x backlog growth must not translate into anywhere close to 20x
+    # VM-step cost; an O(backlog) scan/sort would show roughly linear growth.
+    assert large < small * 3 + 50
 
 
 async def test_stale_reclaim_increments_generation_and_fences_old_owner(
@@ -931,5 +1049,70 @@ def test_prune_removes_a_row_completed_on_the_same_clock_tick_as_the_prune_call(
             "SELECT publication_id, consumer_group FROM shm_completion_tombstone",
         )
         assert [tuple(item) for item in tombstones] == [("publication-1", "g1")]
+    finally:
+        store.close()
+
+
+def _index_names(conn: sqlite3.Connection) -> set[str]:
+    return {
+        str(row["name"])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+    }
+
+
+def _new_store(path: Path) -> SqliteQueueStore:
+    return SqliteQueueStore(
+        str(path),
+        synchronous="NORMAL",
+        completion_mode="delete",
+        orphan_retention_seconds=86400.0,
+        retry_backoff_base_seconds=0.05,
+        retry_backoff_cap_seconds=5.0,
+    )
+
+
+def test_fresh_shm_store_has_publication_expiry_index(tmp_path: Path) -> None:
+    store = _new_store(tmp_path / "fresh.db")
+    try:
+        assert "idx_shm_publication_expiry" in _index_names(store._conn)
+    finally:
+        store.close()
+
+
+def test_shm_store_missing_expiry_index_is_backfilled_on_next_open(tmp_path: Path) -> None:
+    path = tmp_path / "backfill.db"
+    store = _new_store(path)
+    store.close()
+
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("DROP INDEX idx_shm_publication_expiry")
+    conn.commit()
+    assert "idx_shm_publication_expiry" not in _index_names(conn)
+    conn.close()
+
+    reopened = _new_store(path)
+    try:
+        assert "idx_shm_publication_expiry" in _index_names(reopened._conn)
+    finally:
+        reopened.close()
+
+
+def test_prune_expired_publications_query_uses_expiry_index(tmp_path: Path) -> None:
+    store = _new_store(tmp_path / "prune-plan.db")
+    try:
+        statements: list[str] = []
+        store._conn.set_trace_callback(statements.append)
+        try:
+            _shm_publications._prune_expired_empty_publications(store._conn, time.time(), 100)
+        finally:
+            store._conn.set_trace_callback(None)
+        prune_sql = next(
+            statement for statement in statements if "DELETE FROM shm_publication" in statement
+        )
+        plan = " | ".join(
+            str(row["detail"]) for row in store._conn.execute(f"EXPLAIN QUERY PLAN {prune_sql}")
+        )
+        assert "idx_shm_publication_expiry" in plan
     finally:
         store.close()

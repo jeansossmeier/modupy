@@ -70,6 +70,25 @@ def test_render_methods_block_includes_def_keyword():
     assert "`async def async_method(self) -> None:`" in rendered
 
 
+def test_render_methods_block_keeps_full_first_sentence_across_line_wrap():
+    """The one-line summary took only the first PHYSICAL line of the
+    docstring (``doc.strip().splitlines()[0]``), so a first sentence wrapped
+    onto a second physical line — as ``Consumer.stop`` in
+    modulith/protocols.py does — was cut off mid-sentence, silently dropping
+    the rest of the safety contract."""
+
+    class Sample:
+        def stop(self) -> None:
+            """Stop the poll loop and release resources. Must never raise —
+            a consumer that already died is logged, not re-raised, at
+            shutdown.
+            """
+
+    rendered = "\n".join(gen_api_reference._render_methods_block(Sample))
+    assert "Must never raise — a consumer that already died is logged" in rendered
+    assert "Must never raise — a\n" not in rendered
+
+
 # ---------------------------------------------------------------------------
 # Stable, namespaced (collision-safe) anchors
 # ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import threading
 import time
 from typing import Any
 
@@ -187,3 +188,36 @@ def test_dispatch_raised_timeouterror_still_propagates_unchanged(
 
     assert excinfo.value is app_error
     assert not isinstance(excinfo.value, PublishSyncTimeout)
+
+
+def test_new_event_loop_startup_failure_does_not_hang_loop_ready_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """asyncio.new_event_loop() failing (e.g. fd exhaustion under load) must
+    not leave the caller blocked on the unbounded loop_ready.wait(): the
+    worker's startup exception must reach the caller promptly, well inside
+    the requested budget, instead of the caller hanging forever because
+    loop_ready.set() was never reached."""
+
+    def failing_new_event_loop() -> asyncio.AbstractEventLoop:
+        raise OSError("fd exhaustion")
+
+    monkeypatch.setattr(asyncio, "new_event_loop", failing_new_event_loop)
+
+    async def noop() -> None:
+        pass
+
+    outcome: dict[str, BaseException] = {}
+
+    def call() -> None:
+        try:
+            _run_nested_dispatch(noop(), _Ping(), 5.0)
+        except BaseException as exc:  # relaying across the thread boundary
+            outcome["exc"] = exc
+
+    caller = threading.Thread(target=call, daemon=True)
+    caller.start()
+    caller.join(timeout=1.0)
+
+    assert not caller.is_alive(), "caller blocked past its budget instead of failing promptly"
+    assert isinstance(outcome.get("exc"), OSError)

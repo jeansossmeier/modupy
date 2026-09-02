@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -425,6 +426,57 @@ async def test_reset_for_testing_cancels_inflight_dispatch_tasks(engine: Any) ->
 
 
 # ---------------------------------------------------------------------------
+# wait_for_dispatch() must be cross-loop safe
+# ---------------------------------------------------------------------------
+
+
+async def test_wait_for_dispatch_is_cross_loop_safe(engine: Any) -> None:
+    """wait_for_dispatch() handed a foreign-loop Task straight to
+    asyncio.gather() and crashed with "Task ... attached to a different
+    loop" — _schedule_after_commit_dispatch creates the after-commit task on
+    whatever loop is running at commit time, which can be sync.py's
+    persistent daemon-thread loop, while Runtime.shutdown() awaits
+    wait_for_dispatch() from the app's main loop. The sibling
+    modulith.builtin.outbox.shutdown() already guards its own cross-loop task
+    by polling task.done() instead of awaiting/gathering it directly;
+    wait_for_dispatch() must drain a foreign-loop task the same way."""
+    store = PostgresPublicationStore(engine=engine)
+
+    foreign_loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=foreign_loop.run_forever, daemon=True)
+    thread.start()
+
+    completed = threading.Event()
+
+    async def foreign_work() -> None:
+        await asyncio.sleep(0.05)
+        completed.set()
+
+    created = threading.Event()
+    holder: list[asyncio.Task[None]] = []
+
+    def _create_on_foreign_loop() -> None:
+        task = foreign_loop.create_task(foreign_work())
+        task.add_done_callback(store._inflight.discard)
+        holder.append(task)
+        created.set()
+
+    foreign_loop.call_soon_threadsafe(_create_on_foreign_loop)
+    assert created.wait(timeout=2), "failed to schedule the foreign-loop task"
+    store._inflight.add(holder[0])
+
+    try:
+        await asyncio.wait_for(store.wait_for_dispatch(), timeout=5)
+    finally:
+        foreign_loop.call_soon_threadsafe(foreign_loop.stop)
+        thread.join(timeout=2)
+        foreign_loop.close()
+
+    assert completed.is_set(), "wait_for_dispatch returned before the foreign-loop task finished"
+    assert store._inflight == set()
+
+
+# ---------------------------------------------------------------------------
 # Non-UTC-aware timestamps must round-trip as the same instant
 # ---------------------------------------------------------------------------
 
@@ -468,6 +520,33 @@ async def test_non_utc_aware_timestamps_round_trip_as_same_instant(engine: Any) 
 
 
 # ---------------------------------------------------------------------------
+# status() must count archived publications as completed
+# ---------------------------------------------------------------------------
+
+
+async def test_status_counts_archived_publications_as_completed(engine: Any) -> None:
+    """Under completion_mode='archive', a delivered publication's row moves
+    out of the primary table (see PostgresPublicationStore.archive), so
+    count_completed() alone reports zero forever. status() must also read
+    count_archived() to report the true completed total."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), completion_mode="archive", start_loop=False)
+    _bootstrap_with_listener(record)
+
+    pubs = [_pub(i) for i in range(3)]
+    for pub in pubs:
+        await store.save(pub)
+    for pub in pubs:
+        await outbox._dispatch_publication(pub)
+
+    assert received == [0, 1, 2]
+    status = await outbox.status()
+
+    assert status["completed"] == 3
+    assert status["incomplete"] == 0
+
+
+# ---------------------------------------------------------------------------
 # Missing SQLAlchemy must fail with an actionable ImportError
 # ---------------------------------------------------------------------------
 
@@ -505,3 +584,66 @@ def test_missing_sqlalchemy_raises_helpful_import_error() -> None:
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+
+
+# ---------------------------------------------------------------------------
+# Cross-event-loop engine usage: warn once, never raise
+# ---------------------------------------------------------------------------
+
+
+def _run_on_new_loop(coro_factory: Any) -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(coro_factory())
+    finally:
+        loop.close()
+
+
+_CROSS_LOOP_MSG = "bound to a different event loop"
+
+
+async def test_store_used_from_two_loops_warns_once(engine: Any, caplog) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    try:
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.postgres"):
+            await store.count_open()
+
+            thread = threading.Thread(target=_run_on_new_loop, args=(store.count_open,))
+            thread.start()
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+        warnings = [r for r in caplog.records if _CROSS_LOOP_MSG in r.getMessage()]
+        assert len(warnings) == 1, f"expected exactly one cross-loop warning, got: {caplog.records}"
+    finally:
+        await store.dispose()
+
+
+async def test_store_used_twice_same_loop_logs_nothing(engine: Any, caplog) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    try:
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.postgres"):
+            await store.count_open()
+            await store.count_open()
+
+        warnings = [r for r in caplog.records if _CROSS_LOOP_MSG in r.getMessage()]
+        assert warnings == []
+    finally:
+        await store.dispose()
+
+
+async def test_store_cross_loop_warning_fires_once_per_instance(engine: Any, caplog) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    try:
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.postgres"):
+            await store.count_open()
+            for _ in range(2):
+                thread = threading.Thread(target=_run_on_new_loop, args=(store.count_open,))
+                thread.start()
+                thread.join(timeout=10)
+                assert not thread.is_alive()
+
+        warnings = [r for r in caplog.records if _CROSS_LOOP_MSG in r.getMessage()]
+        assert len(warnings) == 1, f"expected exactly one cross-loop warning, got: {caplog.records}"
+    finally:
+        await store.dispose()

@@ -27,8 +27,17 @@ MODULITH_BROKER=memory uvicorn myapp.main:app --workers 1
 
 Add persistence without splitting processes: publish events atomically with your domain transaction.
 
-In `myapp/main.py`:
+In `myapp/main.py`, keep `outbox.configure()` at module import time (the CLI
+outbox tooling below depends on that — see **Outbox operations**), but add a
+lifespan whose only job is teardown: a bare module-scope `outbox.configure()`
+with no matching `outbox.shutdown()` leaves the retry loop and the DB
+engine's connection pool running until the process is killed, relying
+entirely on the crash-recovery sweep on next start instead of a graceful
+drain:
 ```python
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
 from modulith import configure
 from modulith.builtin import outbox
 from modulith.adapters.postgres_outbox import PostgresPublicationStore
@@ -50,7 +59,20 @@ outbox.configure(
 )
 configure(outbox="postgres")
 
-app = ... # your FastAPI or ASGI app
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # Teardown order matters: drain/unregister the store's after-commit hook
+    # (store.dispose) BEFORE outbox.shutdown() stops the retry loop, and
+    # dispose the engine LAST — both prior steps still need it to flush
+    # in-flight dispatches and run the retry loop's final sweep.
+    await store.dispose()
+    await outbox.shutdown()
+    await async_engine.dispose()
+
+
+app = FastAPI(lifespan=lifespan)  # or your own ASGI app with an equivalent shutdown hook
 ```
 
 Then run:
@@ -69,6 +91,16 @@ MODULITH_OUTBOX=postgres uvicorn myapp.main:app --workers 1
 - Listeners must be idempotent (at-least-once delivery)
 - Single point of failure: the database
 - Ideal for: critical transactional workflows where losing an event is unacceptable
+
+**One event loop per engine.** Drive one `PostgresPublicationStore`/outbox
+`AsyncEngine` from a single event loop. `await publish()` on the app loop and
+`publish_sync()` (which runs on a daemon-thread loop — see below) share the
+same engine across two loops; once the connection pool is exhausted,
+SQLAlchemy raises `RuntimeError: <Queue> is bound to a different event
+loop` (SQLite's forced `pool_size=1` hits this on the first concurrent
+publish; Postgres/MySQL only under load). modulith logs one warning the
+first time a second loop uses the engine. Keep publishes on one loop, or
+size `pool_size`/`max_overflow` for the cross-loop concurrency.
 
 **Listeners and durability:**
 - The outbox persists only the **first hop** of events (e.g., `orders` → `inventory`).
@@ -121,9 +153,13 @@ store = PostgresPublicationStore(engine=async_engine)
 
 For the database broker, set the schema via
 `[tool.modulith.broker_options].schema` or `MODULITH_BROKER_SCHEMA` (Postgres
-only; other dialects warn and ignore it). Migrations use
-`MODULITH_DB_SCHEMA` or the packaged command's global `-x` option before
-`upgrade`: `alembic -c <packaged-alembic.ini> -x schema=orders upgrade head`.
+only; other dialects warn and ignore it). When neither is set, the broker
+falls back to `MODULITH_DB_SCHEMA` — the same variable the migrations
+read — so the runtime tracks whatever schema was migrated by default; an
+explicit `broker_options.schema`/`MODULITH_BROKER_SCHEMA` still wins over
+that fallback. Migrations use `MODULITH_DB_SCHEMA` or the packaged command's
+global `-x` option before `upgrade`:
+`alembic -c <packaged-alembic.ini> -x schema=orders upgrade head`.
 Schema identifiers receive the same validation through every entry point.
 Enabling a named migration schema does not move data and refuses to abandon
 existing Modulith tables or Alembic history in `public`; see
@@ -143,6 +179,16 @@ export MODULITH_ACTUATOR_TOKEN="$(openssl rand -hex 32)"
 
 See [Actuator Access](#actuator-access-_modulith).
 
+**Forwarding headers.** The reverse proxy overwrites `X-Forwarded-For`,
+`X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-Port` from the
+connection it accepted, and strips any client-supplied `Forwarded` or
+`X-Real-IP` — a client cannot spoof its own IP, scheme, host, or port to a
+worker. Behind a TLS-terminating ingress or load balancer, this means the
+proxy itself sees the ingress as the client unless you configure trust: set
+uvicorn's `FORWARDED_ALLOW_IPS` (env var, e.g. the ingress CIDR or `*` when
+the proxy is reachable only through the ingress) on the proxy process so
+`request.client`/scheme reflect the real client before this overwrite runs.
+
 ### A. SQLite Database Broker (Zero Infrastructure)
 
 ```bash
@@ -153,6 +199,12 @@ MODULITH_BROKER=database \
 ```
 
 > **Single-host only.** All workers must access the same SQLite file, so this mode works only on a single machine (or a shared filesystem volume). For multi-host deployments, use Postgres or Redis instead.
+
+Adopting the packaged Alembic migrations after the broker has already
+self-bootstrapped its own tables is supported: `alembic upgrade head` stamps
+cleanly over a database the broker created, since migrations `0002` and
+`0004` inspect the schema first and skip any table/index that already
+exists rather than failing on a duplicate.
 
 **What changes:**
 - Each module runs in its own worker process.
@@ -165,6 +217,12 @@ MODULITH_BROKER=database \
 - Single database (SQLite or Postgres) is the inter-process broker
 - Each module is independently restartable
 - Ideal for: single-host deployments where process isolation improves fault tolerance and independent restartability without requiring external infrastructure
+
+Drive one `db_broker` `AsyncEngine` from a single event loop, for the same
+reason as the outbox's `PostgresPublicationStore` above: mixing an app-loop
+publish with `publish_sync()`'s daemon-thread loop shares the engine across
+loops and eventually raises `RuntimeError: <Queue> is bound to a different
+event loop` once the connection pool is exhausted.
 
 **Configuration:**
 
@@ -256,6 +314,10 @@ MODULITH_BROKER=database \
 ```
 
 Uses the `broker_message` and `broker_subscription` tables with `FOR UPDATE SKIP LOCKED` claims for lock-free fan-out. Supports multi-host deployments.
+
+As with the SQLite broker above, running `alembic upgrade head` after the
+broker has already self-bootstrapped is supported — migrations `0002` and
+`0004` skip tables/indexes that already exist rather than failing.
 
 **Tuning:**
 
@@ -373,9 +435,14 @@ modulith k8s-manifest --output k8s/modulith.yaml --image myapp:1.0.0 --namespace
 
 Options: `--output` (default `modulith-k8s.yaml`, `-` for stdout), `--image`
 (default `<package>:latest`), `--namespace`, `--port` (default `8000`, valid
-range 1–65535), and `--host` (Ingress host). Object names are normalized to
-RFC-1123 labels; long names keep a readable prefix plus a stable hash, and
-invalid or colliding names fail generation.
+range 1–65535), and `--host` (Ingress host). Deployment and Service object
+names are normalized to RFC-1123 labels (`fakeapp-order-items`); long names
+keep a readable prefix plus a stable hash, and invalid or colliding names
+fail generation. The Ingress path is **not** normalized — it is the raw
+module name (`/order_items`), matching the worker's own mount point. A
+module name that is not a dotted Python identifier is rejected before any
+manifest is generated, since the worker imports it as a module and serves it
+under `/<module_name>`.
 
 Each Deployment's `replicas` comes from that module's
 `[tool.modulith.workers]` count. Containers run
@@ -576,6 +643,12 @@ curl -H "Authorization: Bearer $MODULITH_ACTUATOR_TOKEN" http://localhost:8000/_
 # Fans out to every worker's /health. 200 when all are ok, 503 otherwise.
 ```
 
+Each module reports one of three states: `ok`, `unreachable` (a replica is
+mid-restart-backoff), or `failed (given up)` (the crash-loop breaker has
+given up on every replica). `failed (given up)` is only reported once every
+replica of that module is unreachable — a module with even one healthy
+replica reports `ok`.
+
 In Kubernetes, probe headers are static strings — template the token in from the same secret the container reads, or set `MODULITH_ACTUATOR_MODE=open` if the port is only reachable inside the cluster and you accept unauthenticated topology/health:
 
 ```yaml
@@ -647,7 +720,11 @@ lifecycle:
       command: ["/bin/sh", "-c", "sleep 5"]  # wait for in-flight requests
 ```
 
-Modulith's supervisor handles SIGTERM and drains listeners before exit.
+Modulith's supervisor handles SIGTERM and drains listeners before exit — on
+POSIX. Windows has no signal delivery on `subprocess.Popen` (`terminate()`
+is an immediate `TerminateProcess`, with no softer step for a worker's
+lifespan to trap), and the `PDEATHSIG` orphan protection that stops a
+hard-killed supervisor from leaving workers behind is Linux-only.
 
 ---
 

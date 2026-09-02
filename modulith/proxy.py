@@ -23,9 +23,11 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from itertools import cycle
 from typing import Any
 
 # These are imported at module level (not lazily) so FastAPI's get_type_hints
@@ -38,14 +40,60 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger("modulith.proxy")
 DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
+_DOWN_RETRY_SECONDS = 5.0
+
+
+def _empty_backend_cycle() -> Iterator[str]:
+    return iter(())
 
 
 @dataclass(frozen=True)
 class RoutingRule:
-    """One URL-prefix → backend-port mapping."""
+    """One URL-prefix → backend-port mapping, one entry per module replica.
+
+    ``backend_url`` is always the first replica — kept so single-replica
+    construction (``RoutingRule(prefix, backend_url)``) and the
+    ``/_modulith/topology`` listing are unaffected. ``backend_urls`` holds
+    every replica (defaults to just ``backend_url`` when omitted);
+    ``next_backend()`` round-robins across whichever of them aren't
+    currently marked down — no weights, no stickiness.
+    """
 
     prefix: str  # e.g. "/orders"
-    backend_url: str  # e.g. "http://127.0.0.1:9001"
+    backend_url: str  # e.g. "http://127.0.0.1:9001" (first replica)
+    backend_urls: tuple[str, ...] = ()
+    _cycle: Iterator[str] = field(default_factory=_empty_backend_cycle, repr=False, compare=False)
+    _down: dict[str, float] = field(default_factory=dict, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        urls = self.backend_urls or (self.backend_url,)
+        object.__setattr__(self, "backend_urls", urls)
+        object.__setattr__(self, "_cycle", cycle(urls))
+
+    def next_backend(self) -> str:
+        """Round-robin over every replica not currently marked down.
+
+        Falls back to the full replica set once every one of them is marked
+        down — proxying a doomed request (which still answers 502) beats a
+        proxy that permanently refuses a module the moment its whole fleet
+        blips.
+        """
+        now = time.monotonic()
+        for _ in range(len(self.backend_urls)):
+            candidate = next(self._cycle)
+            if candidate in self._down:
+                marked_at = self._down[candidate]
+                if now - marked_at < _DOWN_RETRY_SECONDS:
+                    continue
+                del self._down[candidate]
+            return candidate
+        return next(self._cycle)
+
+    def mark_down(self, url: str) -> None:
+        self._down[url] = time.monotonic()
+
+    def mark_up(self, url: str) -> None:
+        self._down.pop(url, None)
 
 
 def _match_rule(path: str, rules: list[RoutingRule]) -> RoutingRule | None:
@@ -72,6 +120,7 @@ def create_proxy_app(
     timeout: httpx.Timeout | None = None,
     connect_retry_attempts: int = 5,
     connect_retry_backoff: float = 0.2,
+    failed_instances: Callable[[], frozenset[str]] | None = None,
 ) -> FastAPI:
     """Build the reverse-proxy ASGI app.
 
@@ -99,6 +148,12 @@ def create_proxy_app(
     ``run_supervised``) unmounts ``/_modulith/*`` entirely — those paths fall
     through to the catch-all proxy handler and answer the same 404 as any
     other unmatched path, so the actuator's existence isn't even revealed.
+
+    ``failed_instances`` (optional) is a callable returning the instance
+    names a supervisor's crash-loop breaker has permanently given up on
+    (e.g. ``Supervisor.failed_instances``) — ``/_modulith/health`` uses it to
+    report such a module as ``"failed (given up)"`` instead of the generic
+    ``"unreachable"`` a worker mid-restart-backoff also produces.
     """
     owns_client = client is None
     if timeout is None:
@@ -164,22 +219,47 @@ def create_proxy_app(
 
         @app.get("/_modulith/health", response_model=None)
         async def health(request: Request) -> dict[str, Any] | JSONResponse:
-            """Readiness: aggregates every worker's own ``/health``.
+            """Readiness: aggregates every replica's own ``/health``.
 
-            Returns 503 when any backend is unhealthy/unreachable — a
-            standard readiness contract (orchestrators stop routing traffic
-            to a 503 instance) that a constant 200 could never express.
+            A module is ``ok`` if at least one of its replicas answers
+            healthy (the proxy already round-robins request traffic to only
+            the surviving ones); it's ``unhealthy``/``unreachable`` only once
+            every replica is down. A module whose crash-loop breaker has
+            given up on all its replicas (``failed_instances``) is reported
+            as ``"failed (given up)"`` instead of the generic
+            ``"unreachable"`` a worker mid-restart-backoff also produces.
+
+            Returns 503 when any module is not ``ok`` — a standard readiness
+            contract (orchestrators stop routing traffic to a 503 instance)
+            that a constant 200 could never express.
             """
             denied = _actuator_auth_response(request)
             if denied is not None:
                 return denied
 
             async def check_one(rule: RoutingRule) -> tuple[str, str]:
-                try:
-                    resp = await http_client.get(rule.backend_url + "/health", timeout=2.0)
-                    return rule.prefix, "ok" if resp.status_code == 200 else "unhealthy"
-                except Exception:
-                    return rule.prefix, "unreachable"
+                async def check_backend(url: str) -> str:
+                    try:
+                        resp = await http_client.get(url + "/health", timeout=2.0)
+                    except Exception:
+                        rule.mark_down(url)
+                        return "unreachable"
+                    if resp.status_code == 200:
+                        rule.mark_up(url)
+                        return "ok"
+                    rule.mark_down(url)
+                    return "unhealthy"
+
+                statuses = await asyncio.gather(*(check_backend(url) for url in rule.backend_urls))
+                if "ok" in statuses:
+                    return rule.prefix, "ok"
+                if "unhealthy" in statuses:
+                    return rule.prefix, "unhealthy"
+                if failed_instances is not None and _module_has_given_up(
+                    rule.prefix, failed_instances()
+                ):
+                    return rule.prefix, "failed (given up)"
+                return rule.prefix, "unreachable"
 
             # Concurrent fan-out: total latency ~max(per-backend latency), not
             # the sum — a sequential loop scales O(N * per-backend timeout).
@@ -207,6 +287,11 @@ def create_proxy_app(
                 {"detail": f"no worker route for {request.url.path!r}"}, status_code=404
             )
 
+        # One backend per request, round-robin across every replica of this
+        # module (skipping any marked down by a failed health check or a
+        # prior connect failure) — see RoutingRule.next_backend().
+        backend = rule.next_backend()
+
         # scope["raw_path"]/["query_string"] carry the exact bytes the client
         # sent, still percent-encoded. request.url.path/.query are built from
         # scope["path"] — already percent-*decoded* per the ASGI spec — so an
@@ -215,7 +300,7 @@ def create_proxy_app(
         # turned into a real "/" and change how many segments the upstream
         # sees. Forwarding the raw bytes preserves the client's exact request.
         raw_path = request.scope.get("raw_path") or request.url.path.encode("utf-8")
-        upstream = rule.backend_url + raw_path.decode("latin-1")
+        upstream = backend + raw_path.decode("latin-1")
         query_string = request.scope.get("query_string", b"")
         if query_string:
             upstream += "?" + query_string.decode("latin-1")
@@ -237,15 +322,33 @@ def create_proxy_app(
             chunks.append(chunk)
         body = b"".join(chunks)
         # Build from .raw (a list, not a dict) so a client sending the same
-        # header twice (e.g. two Cookie lines, or multi-valued
-        # X-Forwarded-For) forwards both — dict(request.headers) keeps only
-        # one of any repeated name and silently drops the rest.
+        # header twice (e.g. two Cookie lines) forwards both — dict(request.
+        # headers) keeps only one of any repeated name and silently drops the
+        # rest.
         fwd_headers = _filter_headers(_header_pairs(request.headers.raw))
         # Drop the client's Host so httpx sets it to the loopback worker's
         # authority. Forwarding the external Host (e.g. api.example.com) makes
         # workers behave as if internet-facing for URL generation / vhost /
         # Host-allowlist logic — a reverse-proxy correctness/security smell.
-        fwd_headers = [(k, v) for k, v in fwd_headers if k.lower() != "host"]
+        # Also drop any client-supplied forwarding headers: workers spawned by
+        # the supervisor bind loopback-only and trust X-Forwarded-* from that
+        # peer unconditionally (uvicorn's proxy_headers/forwarded_allow_ips
+        # defaults), so an unfiltered client value would let any caller spoof
+        # its own IP, scheme, host and port to every module. Overwrite with
+        # values the proxy itself observed on this connection instead.
+        fwd_headers = [
+            (k, v) for k, v in fwd_headers if k.lower() not in _DROPPED_FORWARDING_HEADERS
+        ]
+        client_host = request.client.host if request.client is not None else ""
+        port = request.url.port or (443 if request.url.scheme == "https" else 80)
+        fwd_headers.extend(
+            [
+                ("x-forwarded-for", client_host),
+                ("x-forwarded-proto", request.url.scheme),
+                ("x-forwarded-host", request.headers.get("host", "")),
+                ("x-forwarded-port", str(port)),
+            ]
+        )
         try:
             upstream_req = http_client.build_request(
                 method=request.method,
@@ -277,9 +380,10 @@ def create_proxy_app(
                 # bytes were sent — safe to retry any method. Bounded budget,
                 # then fall through to 502.
                 if attempt + 1 >= attempts:
+                    rule.mark_down(backend)
                     logger.warning(
                         "backend %s unreachable after %d connect attempts for %s: %s",
-                        rule.backend_url,
+                        backend,
                         attempts,
                         _without_query(upstream),
                         exc,
@@ -293,9 +397,10 @@ def create_proxy_app(
                 # unresponsive), ReadError/ReadTimeout/RemoteProtocolError (worker
                 # died mid-handshake). All mean "backend unavailable" → 502, never
                 # an uncaught 500.
+                rule.mark_down(backend)
                 logger.warning(
                     "backend %s unreachable for %s: %s",
-                    rule.backend_url,
+                    backend,
                     _without_query(upstream),
                     exc,
                 )
@@ -314,7 +419,8 @@ def create_proxy_app(
                     exc,
                 )
                 return JSONResponse({"detail": "backend error"}, status_code=502)
-            # success: build + return the streaming response
+            # success: this backend answered — clear any prior down-marking.
+            rule.mark_up(backend)
             response = StreamingResponse(
                 _safe_stream(upstream_resp, _without_query(upstream)),
                 status_code=upstream_resp.status_code,
@@ -352,6 +458,21 @@ HOP_BY_HOP_HEADERS = frozenset(
         "trailers",
         "transfer-encoding",
         "upgrade",
+    }
+)
+
+# Client-supplied forwarding/identity headers, dropped and re-derived from the
+# proxy's own view of the connection (see the comment in ``proxy()``) — a
+# worker must never see a value an external caller chose for these.
+_DROPPED_FORWARDING_HEADERS = frozenset(
+    {
+        "host",
+        "x-forwarded-for",
+        "x-forwarded-proto",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "forwarded",
+        "x-real-ip",
     }
 )
 
@@ -425,6 +546,19 @@ def _body_too_large(request: Request, limit: int | None) -> JSONResponse | None:
 def _without_query(url: str) -> str:
     """Remove query strings before logging so credentials are not persisted."""
     return url.partition("?")[0]
+
+
+def _module_has_given_up(prefix: str, failed: frozenset[str]) -> bool:
+    """Whether any instance backing ``prefix`` is in the breaker's give-up set.
+
+    Only consulted once every replica has already failed its live ``/health``
+    probe (see ``check_one``), so this only ever upgrades an already-total
+    ``"unreachable"`` into the more informative ``"failed (given up)"`` — it
+    never masks a module that still has a healthy or merely-restarting
+    replica.
+    """
+    module_name = prefix.lstrip("/")
+    return any(name == module_name or name.startswith(f"{module_name}-") for name in failed)
 
 
 async def _safe_stream(resp: Any, upstream: str) -> AsyncIterator[bytes]:

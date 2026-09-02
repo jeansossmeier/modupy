@@ -231,7 +231,17 @@ def _run_nested_dispatch(
     ctx = contextvars.copy_context()
 
     def _run_on_fresh_loop() -> None:
-        loop = asyncio.new_event_loop()
+        try:
+            loop = asyncio.new_event_loop()
+        except BaseException as exc:
+            # loop_ready.set() must fire even here: without it, a startup
+            # failure (e.g. fd exhaustion) leaves the caller's loop_ready.wait()
+            # blocked forever, before it ever reaches done.result(timeout=...)
+            # where the caller's actual budget is meant to apply.
+            coro.close()
+            done.set_exception(exc)
+            loop_ready.set()
+            return
         asyncio.set_event_loop(loop)
         state["loop"] = loop
         try:
@@ -254,7 +264,15 @@ def _run_nested_dispatch(
         target=ctx.run, args=(_run_on_fresh_loop,), name="modulith-sync-nested", daemon=True
     )
     thread.start()
-    loop_ready.wait()
+    if not loop_ready.wait(timeout=timeout):
+        logger.warning(
+            "publish_sync timeout after %s s for %s (nested dispatch never started)",
+            timeout,
+            type(event).__name__,
+        )
+        raise PublishSyncTimeout(
+            f"publish_sync({type(event).__name__}) did not complete within {timeout}s"
+        )
     try:
         done.result(timeout=timeout)
     except FuturesTimeoutError as exc:

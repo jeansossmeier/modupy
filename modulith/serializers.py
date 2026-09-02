@@ -23,6 +23,7 @@ import dataclasses
 import importlib
 import json
 import logging
+import os
 import sys
 import types
 import typing
@@ -33,6 +34,8 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Union
 from uuid import UUID
+
+from .config import DEFAULT_MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES, ConfigurationError
 
 __all__ = ["JsonEventSerializer"]
 
@@ -148,6 +151,36 @@ def _to_jsonable_typed(obj: Any, hint: Any) -> Any:
             for field in dataclasses.fields(obj)
         }
     return _to_jsonable(obj)
+
+
+def _resolve_max_payload_bytes(broker_options: dict[str, Any] | None) -> int:
+    """Resolve a consume-side payload cap with the same precedence every
+    broker adapter uses for its own write-side cap (``MODULITH_BROKER_
+    MAX_PAYLOAD_BYTES`` env var, else ``broker_options["max_payload_bytes"]``,
+    else ``DEFAULT_MAX_PAYLOAD_BYTES``) — see db_broker.py's ``_broker_opt``/
+    ``_opt_int``, redis_broker.py's env-or-opts chain, and shm_broker.py's own.
+    A consumer resolving the cap any other way can dead-letter a payload the
+    broker it reads from already accepted.
+
+    Also enforces the same ``1..MAX_PAYLOAD_BYTES`` range every broker adapter
+    validates its own cap against (db_broker.py's ``_positive_int`` plus its
+    ``> MAX_PAYLOAD_BYTES`` check, redis_broker.py's range check,
+    shm_broker.py's ``_bounded_positive_int``) — an unbounded resolver could
+    hand a consumer a cap no broker adapter would ever accept for itself.
+    """
+    opts = broker_options or {}
+    value = os.environ.get("MODULITH_BROKER_MAX_PAYLOAD_BYTES") or opts.get("max_payload_bytes")
+    if value is None:
+        return DEFAULT_MAX_PAYLOAD_BYTES
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError(f"max_payload_bytes must be an integer, got {value!r}") from exc
+    if not 1 <= resolved <= MAX_PAYLOAD_BYTES:
+        raise ConfigurationError(
+            f"max_payload_bytes must be an integer from 1 to {MAX_PAYLOAD_BYTES}, got {value!r}"
+        )
+    return resolved
 
 
 def _resolve_class(fqcn: str) -> type:
@@ -379,15 +412,40 @@ class JsonEventSerializer:
     the fail-open configuration surfaces both to a developer running with
     default warning filters and to a deployment that captures logs but not
     warnings.
+
+    ``max_payload_bytes`` re-checks the same cap every broker adapter's
+    ``publish()`` already enforces (default 16 MiB — ``config.py``'s
+    ``DEFAULT_MAX_PAYLOAD_BYTES``). That cap is a write-side guard only:
+    ``deserialize`` is the sole place bytes from a broker/outbox row become a
+    Python object, and it is the last chokepoint every consume path shares —
+    without a check here, a row larger than the configured cap (written by
+    another process, another host, or a legitimately large configuration) is
+    parsed in full, however large it is.
+
+    Passing an explicit ``max_payload_bytes`` fixes the cap for this instance.
+    Leaving it ``None`` (the default) defers resolution to the first
+    ``deserialize`` call, via the same ``_resolve_max_payload_bytes`` env/
+    ``broker_options``/default precedence the broker adapters use, read from
+    whatever ``Configuration`` is loaded at that moment — never at
+    construction time, since module-level instances (the outbox wire
+    serializer, an application's own default-constructed serializer) are
+    built before any configuration is loaded. The resolved value is cached on
+    the instance after the first call.
     """
 
-    def __init__(self, *, allowed_event_types: Iterable[str | type] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        allowed_event_types: Iterable[str | type] | None = None,
+        max_payload_bytes: int | None = None,
+    ) -> None:
         self._allowed_event_types = (
             None
             if allowed_event_types is None
             else {_event_type_name(event_type) for event_type in allowed_event_types}
         )
         self._unrestricted_use_announced = False
+        self._max_payload_bytes: int | None = max_payload_bytes
 
     def serialize(self, event: Any) -> bytes:
         """Encode an event instance to JSON bytes.
@@ -416,7 +474,25 @@ class JsonEventSerializer:
         are coerced too, using the class-level annotations merged with
         ``__init__``'s parameter annotations — previously this path
         silently left datetime/UUID/Decimal fields as raw strings.
+
+        ``data`` is untrusted at this boundary (see the class docstring's
+        ``max_payload_bytes``): its size is checked before ``decode``/
+        ``json.loads`` ever run, so an oversized broker/outbox row is
+        rejected instead of allocated and parsed in full.
         """
+        if self._max_payload_bytes is None:
+            from .runtime import _runtime
+
+            cfg = _runtime.config
+            self._max_payload_bytes = _resolve_max_payload_bytes(
+                cfg.broker_options if cfg is not None else None
+            )
+        if len(data) > self._max_payload_bytes:
+            raise ConfigurationError(
+                f"deserialize payload is {len(data)} bytes, exceeding "
+                f"max_payload_bytes={self._max_payload_bytes}. Refusing to "
+                "decode a payload larger than the configured cap."
+            )
         if self._allowed_event_types is not None and event_type not in self._allowed_event_types:
             raise ValueError(f"event type {event_type!r} is not in the allowed event types")
         if self._allowed_event_types is None and not self._unrestricted_use_announced:

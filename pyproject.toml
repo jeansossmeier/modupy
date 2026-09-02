@@ -3,8 +3,9 @@
 # This is the project metadata and build configuration. It defines:
 #   - Package metadata (name, version, description, license, authors)
 #   - Runtime dependencies (just pluggy, intentionally minimal)
-#   - Optional extras (postgres, redis, otel, fastapi, cli, test, integration,
-#     all, dev — no kafka extra: the adapter is unshipped, see the NOTE below)
+#   - Optional extras (postgres, redis, database, otel, fastapi, cli, test,
+#     integration, all, dev — no kafka extra: the adapter is unshipped, see
+#     the NOTE below)
 #   - The `modulith` console script entry point
 #   - The `modulith` plugin entry point group for third-party plugins
 #   - Tool configurations (pytest, ruff, mypy)
@@ -85,11 +86,12 @@ postgres = [
 
 # Redis Streams broker. An explicit networked alternative to the local SHM
 # default used by process-per-module mode.
-# redis-py 5/6/7 are API-compatible for the commands the adapter uses
-# (XADD/XREADGROUP/XAUTOCLAIM/XACK and aclose()); upper bound tracks the next
+# redis-py 5.0.1/6/7 are API-compatible for the commands the adapter uses
+# (XADD/XREADGROUP/XAUTOCLAIM/XACK and aclose()); floor excludes 5.0.0, which
+# has close() but not aclose() (added in 5.0.1); upper bound tracks the next
 # unverified major.
 redis = [
-    "redis>=5.0,<8.0",
+    "redis>=5.0.1,<8.0",
 ]
 
 # Database broker (relational DB as cross-module transport — Redis-free
@@ -248,9 +250,6 @@ modulith = "modulith.testing"
 
 [tool.hatch.build.targets.wheel]
 packages = ["modulith"]
-include = [
-    "/modulith/py.typed",
-]
 
 [tool.hatch.build.targets.sdist]
 # Keep reproducible analysis output and private broker state out even when a
@@ -474,7 +473,7 @@ ignore_missing_imports = true
 [tool.modulith.verify]
 # mode = "strict"            # "strict" for new projects, "ratchet" for migration
 # baseline = ".modulith-baseline.json"
-# disabled_rules = []        # rule names to skip, e.g. ["uses-contracts-module"]
+# disabled_rules = []        # rule names to skip, e.g. ["use-contracts"]
 
 # NOTE: the options subtable is `outbox_options` (NOT `outbox` — that
 # spelling is the top-level string key selecting the adapter, and a legacy

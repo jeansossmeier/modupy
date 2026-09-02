@@ -4202,3 +4202,62 @@ async def test_prune_loop_survives_prune_failure(engine: Any) -> None:
         await _until_async(_pruned_twice)  # survived the first failure, kept pruning
     finally:
         await consumer.stop()
+
+
+# ---------------------------------------------------------------------------
+# Cross-event-loop engine usage: warn once, never raise
+# ---------------------------------------------------------------------------
+
+
+def _run_on_new_loop(coro_factory: Any) -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(coro_factory())
+    finally:
+        loop.close()
+
+
+_CROSS_LOOP_MSG = "bound to a different event loop"
+
+
+async def test_broker_used_from_two_loops_warns_once(engine: Any, caplog: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    with caplog.at_level(logging.WARNING, logger="modulith.adapters.db"):
+        await broker.subscribe(["t1"], "g1")
+
+        thread = threading.Thread(
+            target=_run_on_new_loop, args=(lambda: broker.subscribe(["t2"], "g2"),)
+        )
+        thread.start()
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    warnings = [r for r in caplog.records if _CROSS_LOOP_MSG in r.getMessage()]
+    assert len(warnings) == 1, f"expected exactly one cross-loop warning, got: {caplog.records}"
+
+
+async def test_broker_used_twice_same_loop_logs_nothing(engine: Any, caplog: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    with caplog.at_level(logging.WARNING, logger="modulith.adapters.db"):
+        await broker.subscribe(["t1"], "g1")
+        await broker.subscribe(["t1"], "g1")
+
+    warnings = [r for r in caplog.records if _CROSS_LOOP_MSG in r.getMessage()]
+    assert warnings == []
+
+
+async def test_broker_cross_loop_warning_fires_once_per_instance(engine: Any, caplog: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    with caplog.at_level(logging.WARNING, logger="modulith.adapters.db"):
+        await broker.subscribe(["t0"], "g0")
+        for i in range(2):
+            thread = threading.Thread(
+                target=_run_on_new_loop,
+                args=(lambda i=i: broker.subscribe([f"t{i + 1}"], f"g{i + 1}"),),
+            )
+            thread.start()
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+    warnings = [r for r in caplog.records if _CROSS_LOOP_MSG in r.getMessage()]
+    assert len(warnings) == 1, f"expected exactly one cross-loop warning, got: {caplog.records}"

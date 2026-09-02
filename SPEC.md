@@ -436,7 +436,7 @@ In `modulith/config.py`. Resolution order (highest priority first):
 3. `[tool.modulith]` section in pyproject.toml
 4. Hardcoded defaults
 
-Every *scalar* `Configuration` field has a `MODULITH_<KEY>` env var equivalent: `MODULITH_PACKAGE`, `MODULITH_CONTRACTS_MODULE`, `MODULITH_OUTBOX`, `MODULITH_TOPOLOGY`, `MODULITH_BROKER`, `MODULITH_PRODUCTION`, `MODULITH_AUTO_DISCOVER`, `MODULITH_OBSERVABILITY`, `MODULITH_VERIFY_MANIFESTS`. Booleans accept `1`/`true`/`yes` and `0`/`false`/`no` (case-insensitive); any other non-empty value raises `ConfigurationError`. The dict-typed fields (`outbox_options`, `broker_options`, `workers`) have **no generic** env var — they come from the `[tool.modulith.*]` subtables in pyproject.toml. Adapter-specific env vars are separate contracts: SHM and database options use `MODULITH_BROKER_<KEY>`, Redis Streams reads `REDIS_URL`, `MODULITH_CONSUMER_GROUP`, `MODULITH_STREAM_PREFIX`, and `MODULITH_STREAM_MAXLEN`, and the packaged alembic runner reads `MODULITH_DB_URL`.
+Every *scalar* `Configuration` field has a `MODULITH_<KEY>` env var equivalent: `MODULITH_PACKAGE`, `MODULITH_CONTRACTS_MODULE`, `MODULITH_OUTBOX`, `MODULITH_TOPOLOGY`, `MODULITH_BROKER`, `MODULITH_PRODUCTION`, `MODULITH_AUTO_DISCOVER`, `MODULITH_OBSERVABILITY`, `MODULITH_VERIFY_MANIFESTS`, `MODULITH_SUBSCRIPTION_SOURCE`, `MODULITH_ACTUATOR_MODE`, `MODULITH_STRICT_BOUNDARIES`. Booleans accept `1`/`true`/`yes` and `0`/`false`/`no` (case-insensitive); any other non-empty value raises `ConfigurationError`. The dict-typed fields (`outbox_options`, `broker_options`, `workers`) have **no generic** env var — they come from the `[tool.modulith.*]` subtables in pyproject.toml. Adapter-specific env vars are separate contracts: SHM and database options use `MODULITH_BROKER_<KEY>`, Redis Streams reads `REDIS_URL`, `MODULITH_CONSUMER_GROUP`, `MODULITH_STREAM_PREFIX`, and `MODULITH_STREAM_MAXLEN`, and the packaged alembic runner reads `MODULITH_DB_URL`.
 
 Validation happens before construction. Unknown keys raise `ConfigurationError` with the list of valid keys (catches typos). Production mode + default memory outbox raises (forces explicit opt-in for unsafe defaults). Process topology defaults to local `shm`; an URL/DSN without an explicit broker selects `database`. Explicit `shm` accepts filesystem paths only and rejects DSNs and SQLAlchemy/network URLs. SQL schema names must be portable unquoted identifiers at every entry point: loaded configuration, broker environment overrides, direct `DatabaseBroker` construction, `MODULITH_DB_SCHEMA`, and Alembic `-x schema=...`.
 
@@ -581,7 +581,7 @@ Same pattern as `mypy --strict` rolling out gradually. The baseline diff in git 
 
 `modulith audit` analyzes an existing codebase non-destructively:
 
-- Proposed module structure based on observed imports and folder layout
+- Proposed module structure based on folder layout
 - List of cross-module imports that would become violations
 - List of shared database tables that need ownership decisions
 - Modulith-readiness score (0-100): percentage of cross-module interactions that go through events vs direct calls
@@ -592,10 +592,10 @@ Output is Markdown. Teams can run it on Friday afternoon, generate a baseline, h
 
 `modulith doctor` reports operational and architectural health:
 
-- **Boundary health**: violation count, baseline drift over the last N commits
+- **Boundary health**: violation count, baseline drift
 - **Process-split readiness**: percentage of cross-module interactions that are events vs direct calls (the "are you ready to split this module?" metric), plus per-module counts of cross-module table references and of tables not prefixed with the module's name — table-only coupling reports a warning even when there are no import/event interactions, and the "microservice-ready" tier requires zero cross-module table references
 - **Schema drift**: events whose field definitions (name, annotation, default — fingerprinted via AST) changed since the last doctor run. The check is an unconditional fingerprint diff against a cache file (`.modulith-schemas.json`): it flags *every* definition change as the cue to version consciously — it does not read or compare any `schema_version` attribute
-- **Outbox health**: dead-lettered count, oldest incomplete event age
+- **Outbox health**: incomplete, completed, and dead-lettered counts
 - **Listener registration coverage**: declared listeners vs actually-registered listeners
 - **SHM notifier**: whether each SHM broker's hint ring actually attached (a `shm_capacity` change on an existing hint file leaves the notifier dead — delivery still works, only slower)
 - **Actuator token**: under `topology = "processes"`, whether the actuator would start unmounted (`auto` mode, no `MODULITH_ACTUATOR_TOKEN`, non-loopback bind) or refuse to start (`token` mode, no token, reported as an error)
@@ -686,7 +686,7 @@ Usage:
 ```bash
 modulith run app.main --topology=processes
 modulith run app.main --workers='{"reports": 4, "default": 1}'
-modulith dev app.main --isolate=reports  # only reports gets its own process
+modulith dev app.main --isolate=reports  # only reports runs; every other module is not started (its routes 404 through the proxy)
 ```
 
 ### 9.4 The Reverse Proxy
@@ -1347,7 +1347,7 @@ dependencies = ["pluggy>=1.3"]
 
 [project.optional-dependencies]
 postgres = ["sqlalchemy>=2.0", "asyncpg>=0.29", "alembic>=1.13"]
-redis = ["redis>=5.0"]
+redis = ["redis>=5.0.1"]
 database = ["sqlalchemy>=2.0", "asyncpg>=0.29", "aiomysql>=0.2", "aiosqlite>=0.19", "..."]
 # local SHM broker has no extra; it is stdlib-only
 # no kafka extra — the adapter is Phase 4, unshipped (§10.3)

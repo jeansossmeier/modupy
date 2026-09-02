@@ -4,15 +4,17 @@ Provides fixtures for testing applications built with modulith without
 the global-state nightmares that come with Python's import system and
 asyncio loops.
 
-Distributed in two ways:
-  1. As `modupy[test]` extra in v1 — included with main package.
-  2. Eventually as `pytest-modulith` standalone in v2 — separate release
-     cadence, smaller install for users who only test.
-
 Registered as a pytest plugin via the `pytest11` entry point in
-pyproject.toml, under the entry-point name `modulith`. Once `pip install
-modupy[test]` runs, fixtures are available in any test without imports —
-do not add `pytest_plugins = ["modulith.testing"]` to a conftest.py: pytest
+pyproject.toml, under the entry-point name `modulith`. That entry point is
+unconditional — fixtures and markers load in any pytest run where modupy
+is installed, regardless of which extras were requested at install time.
+The `modupy[test]` extra only adds the libraries the fixtures need (e.g.
+`httpx` for `modulith_app`'s test client); it does not gate registration.
+Eventually the plugin may move into a standalone `pytest-modulith`
+distribution (v2) — separate release cadence, smaller install for users
+who only test — but the fixture/marker names will stay identical.
+
+Do not add `pytest_plugins = ["modulith.testing"]` to a conftest.py: pytest
 would try to register this already-registered module a second time, under
 a different name, and abort the whole session. To disable the plugin, use
 `-p no:modulith` (the entry-point name), not the module path.

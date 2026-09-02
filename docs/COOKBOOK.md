@@ -158,7 +158,7 @@ def send_receipt(event: OrderPlaced) -> None:   # sync listener, runs in a threa
     mailer.send(event.customer_id, event.order_id)
 ```
 
-Two sharp edges (both from `wrap_sync_listener`'s contract):
+Three sharp edges (the first two from `wrap_sync_listener`'s contract):
 
 - Only **synchronous** SQLAlchemy sessions work inside a sync listener's
   executor thread. An `AsyncSession` needs SQLAlchemy's greenlet bridge — use an
@@ -166,6 +166,12 @@ Two sharp edges (both from `wrap_sync_listener`'s contract):
 - Multiple sync listeners for one event run **concurrently on separate
   threads**, each with a copy of the caller's context. Share only thread-safe
   resources; give each listener its own session/lock.
+- `publish_sync()` runs on its own persistent daemon-thread loop. If the
+  outbox or database broker is also driven with `await publish()` on the
+  app's own loop, the same `AsyncEngine` is shared across two loops; once its
+  connection pool is exhausted, SQLAlchemy raises `RuntimeError: <Queue> is
+  bound to a different event loop`. Keep publishes for one engine on one
+  loop, or size `pool_size`/`max_overflow` for the cross-loop concurrency.
 
 `publish_sync()` takes a `timeout` (default 30s) and raises `PublishSyncTimeout`
 if a listener deadlocks. Do **not** call it from inside async code on the loop's
@@ -299,6 +305,12 @@ data: a rollback discards the event (no ghosts), a commit guarantees delivery
 delivery is at-least-once, **listeners must be idempotent**. Inspect the queue
 with `modulith outbox status`; a persistently-failing publication is
 dead-lettered after 10 attempts.
+
+On shutdown, drain the retry loop instead of letting the process die mid-flight
+— call `store.dispose()`, then `outbox.shutdown()`, then dispose the engine, in
+that order, from an ASGI lifespan or equivalent shutdown hook. See
+[DEPLOYMENT.md's Durable Single-Process recipe](DEPLOYMENT.md#durable-single-process-outbox-pattern)
+for the full pattern.
 
 ### Coordinating concurrent sweepers
 
@@ -609,8 +621,12 @@ with the same crash-recovery and dead-lettering as the Redis broker; see
 **Goal:** assert that publishing one event causes the expected downstream event,
 without `sleep`s or real infrastructure.
 
-The `modulith` pytest plugin (installed with `modupy[test]`) ships fixtures
-that reset the runtime per test and capture what was published.
+The `modulith` pytest plugin ships fixtures that reset the runtime per test
+and capture what was published. It registers through the `pytest11` entry
+point and loads in any pytest run where `modupy` is installed — the
+`modupy[test]` extra only adds the libraries the fixtures need, it does not
+gate registration. Disable it in an unrelated suite with `pytest -p
+no:modulith`.
 
 Capture and assert directly with the `modulith_app` fixture:
 

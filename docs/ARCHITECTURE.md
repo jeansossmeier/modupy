@@ -248,6 +248,11 @@ listeners by `type(event)` and dispatches to **all** listeners for that type
   deadlocks and raises `PublishSyncTimeout` — a subclass of `TimeoutError` that
   is deliberately distinct from a `TimeoutError` raised *by* a listener, so the
   framework never swallows a genuine application failure as a budget overrun.
+  That persistent daemon-thread loop is a second event loop: an outbox/database
+  broker `AsyncEngine` also driven by `await publish()` on the app loop is then
+  shared across both, and once its connection pool is exhausted SQLAlchemy
+  raises `RuntimeError: <Queue> is bound to a different event loop` (see
+  DEPLOYMENT.md's outbox and database-broker sections).
 - **Sync listeners** run in the event loop's default executor
   (`wrap_sync_listener`). Two sharp edges: only *synchronous* SQLAlchemy
   sessions work in an executor thread (an `AsyncSession` needs the greenlet
@@ -313,11 +318,16 @@ packaged `alembic.ini` — see [MIGRATION_GUIDE.md](../MIGRATION_GUIDE.md), the
 outbox migration step): `0001_initial` alone is **not** enough for the shipped
 default, because the lease columns (`claim_owner`, `claim_token`,
 `claim_until`) arrive in `0003_outbox_claim_leases` and the claim/scan indexes
-in `0005_outbox_scan_indexes`. Against a `0001`-shaped schema the lease claim
-query fails on the missing column, and because each sweep is exception-shielded
-(a transient store error must cost one sweep, not the whole retry loop) the
-process keeps running: the symptom is "nothing is ever delivered" plus a
-`outbox sweep failed` traceback repeating once per retry interval.
+in `0005_outbox_scan_indexes`. Against a `0001`-shaped schema the blast
+radius is not confined to delivery: `EventPublicationRow` maps
+`claim_owner`/`claim_token`/`claim_until` unconditionally, so `save()`'s
+bound-session path enlists a row naming those columns in the caller's own
+session, and the caller's business `commit()` — not just the sweep — fails
+outright on the missing column. The sweep's own claim query fails the same
+way and is exception-shielded (a transient store error must cost one sweep,
+not the whole retry loop), so a process that only reads the outbox degrades
+to "nothing is ever delivered" plus a repeating `outbox sweep failed`
+traceback; but any publish inside a bound transaction aborts that write.
 
 Timestamps are normalized to UTC-aware on write because SQLite (used by the
 fast test suite against the same code path) loses tz. The default suite runs
@@ -331,7 +341,7 @@ outbox table are coordinated by `outbox.configure(claim_strategy=...)`
 | `claim_strategy` | How it coordinates | Cost |
 |---|---|---|
 | `"lease"` (default) | `claim_batch()` selects `FOR UPDATE SKIP LOCKED`, writes `claim_owner`/`claim_token`/`claim_until` and **commits before dispatch**; the lease renews at one third of `claim_lease_seconds` while dispatch is in flight, and completion/failure writes are fenced on `claim_token` so an expired claimant cannot clobber a newer one | one extra write per claimed batch |
-| `"advisory_lock"` | a per-publication `pg_try_advisory_lock` held for the duration of the dispatch. Postgres-only — a non-Postgres store rejects it at `configure()` | no extra write, but a held connection per in-flight row |
+| `"advisory_lock"` | a per-publication `pg_try_advisory_lock` held for the duration of the dispatch. Postgres-only — a non-Postgres store rejects it at `configure()` | no extra write, but a held AUTOCOMMIT connection (no open transaction) per in-flight row, closed on any lock-query error |
 | `"none"` | no coordination; two sweepers CAN dispatch the same row. Logged as a warning at `configure()` so the tradeoff is visible | none |
 
 Tuning knobs: `claim_lease_seconds` (default 60 — must exceed your slowest
@@ -437,7 +447,13 @@ dispatch failures increment `attempts` with capped backoff and dead-letter after
 `max_delivery_attempts` (default 5). A worker that crashes between claim and ack
 leaves its row `claimed`; the next claim reclaims it once `claimed_at` is older
 than `reclaim_stale_seconds` (default 60) — the DB analogue of the Redis
-`XAUTOCLAIM` recovery, and what keeps delivery at-least-once across a crash.
+`XAUTOCLAIM` recovery, and what keeps delivery at-least-once across a crash;
+that same claim-time reclaim now enforces `max_delivery_attempts` too — a row
+reclaimed past the cap is dead-lettered directly instead of redelivered
+forever, since a crashed/wedged consumer never reaches `fail()` to run the
+cap itself. Idle polling backoff never narrows below the configured
+`poll_interval_ms`: it grows exponentially while the queue is empty but is
+capped at `max(poll_interval, 0.5s)`.
 
 *Completions are owner-guarded.* `ack` / `fail` / `dead_letter` are each a
 compare-and-swap on `status='claimed' AND claimed_by=<this consumer>`: a late
@@ -500,7 +516,10 @@ Subscriptions are persisted. Every publication is retained for 24 hours, so
 groups that register after publication receive one replay before expiry instead
 of losing the startup race. Claims use owner and generation fencing. Delivery
 is at-least-once: a process crash after listener completion but before the
-fenced ack commits can cause the listener to run again.
+fenced ack commits can cause the listener to run again. A stale-claim reclaim
+enforces `max_delivery_attempts` too — a row reclaimed past the cap is
+dead-lettered directly instead of redelivered forever, since a crashed
+consumer never reaches `fail()` to run the cap itself.
 
 The broker is local-host only. Its canonical `state_dir`, `sqlite_path`, and
 `hint_path` resolve to absolute, package-namespaced paths under a private
@@ -512,7 +531,12 @@ OS failure or power loss.
 
 Resource limits are enforced before and inside the authoritative store.
 `max_payload_bytes` defaults to 16 MiB (maximum 1 GiB) and rejects oversized
-payloads before opening a publish transaction. `max_store_bytes` defaults to
+payloads before opening a publish transaction — but that is a write-side
+guard only. `JsonEventSerializer.deserialize` re-checks the same cap on
+every consume, since it is the sole chokepoint where broker/outbox bytes
+become a Python object; an oversized row is dead-lettered instead of parsed.
+The consumer resolves its cap lazily on first deserialize, from the same
+env/`broker_options` precedence the broker uses. `max_store_bytes` defaults to
 1 GiB (maximum 1 TiB) and sets SQLite `max_page_count`; page exhaustion rejects
 the publish and rolls back, applying backpressure without corrupting existing
 rows. Both accept `MODULITH_BROKER_*` environment overrides. The legacy
@@ -564,13 +588,20 @@ Runtime*):
 - **The supervisor** (`modulith/supervisor.py`): spawns one uvicorn subprocess
   per worker spec, forwards each worker's logs, and monitors them. Crash
   recovery restarts a dead worker with **exponential backoff (1s→60s)** plus a
-  crash-loop breaker; on shutdown it `SIGTERM`s all workers, waits, then
-  `SIGKILL`s stragglers, and uses `PDEATHSIG` so orphaned workers die with the
-  supervisor.
+  crash-loop breaker. On shutdown: POSIX `SIGTERM`s all workers, waits, then
+  `SIGKILL`s stragglers; Windows has no signal delivery on `subprocess.Popen`
+  — `terminate()`/`kill()` both call `TerminateProcess`, an immediate,
+  unmaskable hard kill with no graceful pass, so the SIGKILL step there is
+  skipped as a no-op rather than run twice. `PDEATHSIG` (so orphaned workers
+  die with a SIGKILL'd/crashed supervisor) is Linux-only; on any other
+  platform a hard-killed supervisor can orphan workers holding their
+  statically-assigned ports, and the supervisor logs a warning once at
+  startup when that protection is unavailable.
 - **The reverse proxy** (`modulith/proxy.py`): a FastAPI ASGI app that routes
   each request to the right worker by **URL prefix** (longest prefix wins),
   strips hop-by-hop headers before forwarding, strips query strings from logs so
-  credentials aren't persisted, bounds request/response bodies, aggregates
+  credentials aren't persisted, bounds request bodies (no response-body cap
+  exists — the response streams through unbounded), aggregates
   worker `/health` into a single readiness signal, and supports an optional
   bearer token on its actuator surface.
 

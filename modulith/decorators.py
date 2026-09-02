@@ -218,7 +218,13 @@ def listener(
         # functools.wraps chains can hide an async target behind a sync wrapper.
         unwrapped = inspect.unwrap(handler)
         target_is_async = inspect.iscoroutinefunction(unwrapped)
-        event_type = _resolve_event_type(handler, unwrapped)
+        resolve_target = unwrapped
+        if not target_is_async:
+            call = getattr(unwrapped, "__call__", None)  # noqa: B004
+            if call is not None and inspect.iscoroutinefunction(call):
+                target_is_async = True
+                resolve_target = call
+        event_type = _resolve_event_type(handler, resolve_target)
         registered: Callable[..., Any]
 
         if target_is_async and inspect.iscoroutinefunction(handler):

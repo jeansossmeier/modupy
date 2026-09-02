@@ -9,13 +9,20 @@ dependency cost. The Redis broker adapter imports its backend library
 lazily inside ``__init__``; the Postgres outbox adapter imports SQLAlchemy
 at module import time (its ORM schema classes need it) but raises an
 ImportError pointing at the ``modupy[postgres]`` extra when it is
-missing.
+missing. ``db_broker`` and ``shm_broker`` are registered as BUILTIN
+plugins (loaded at every bootstrap, see
+``modulith.manager.BUILTIN_PLUGINS``), so unlike postgres_outbox they
+never import SQLAlchemy at module scope — every import is lazy, inside a
+function.
 
 Shipped adapters:
   - postgres_outbox.py  — PublicationStore for Postgres + SQLAlchemy
   - redis_broker.py     — Broker for Redis Streams
+  - db_broker.py        — Broker for Postgres/MySQL/SQLite (modupy[database])
+  - shm_broker.py       — Broker backed by SQLite + mmap, stdlib only, no extra
 
-Each ships as an extra: pip install modupy[postgres], etc.
+Each ships as an extra: pip install modupy[postgres], etc. (shm_broker
+needs no extra at all.)
 
 Planned (NOT shipped — no module, no extra): a Kafka Broker adapter
 (roadmap Phase 4; see SPEC §10.3). It is deliberately not advertised in

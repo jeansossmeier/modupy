@@ -209,6 +209,7 @@ class PollingConsumer(DeliveryDispatch):
                     batch_size=self._batch_size,
                     consumer_name=self._consumer_name,
                     reclaim_stale_seconds=self._reclaim_stale_seconds,
+                    max_attempts=self._max_attempts,
                 )
             except asyncio.CancelledError:
                 raise
@@ -228,7 +229,7 @@ class PollingConsumer(DeliveryDispatch):
             if self._idle_backoff:
                 delay = min(
                     delay * (2.0 ** min(idle_empty_streak - 1, 5)),
-                    _IDLE_BACKOFF_CAP_S,
+                    max(self._poll_interval_s, _IDLE_BACKOFF_CAP_S),
                 )
                 delay += random.uniform(0.0, min(0.05, delay * 0.25))
             await self._wait_when_idle(delay)

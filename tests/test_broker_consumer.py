@@ -15,6 +15,7 @@ from typing import Any
 
 from modulith import event
 from modulith._consumer import BrokerConsumer
+from modulith.adapters._polling_consumer import PollingConsumer
 from modulith.event_bus import InMemoryEventBus
 from modulith.serializers import JsonEventSerializer
 
@@ -400,3 +401,136 @@ async def test_nonpositive_poll_block_ms_is_clamped() -> None:
     assert all(call["block_ms"] >= 1 for call in broker.read_calls), (
         "BLOCK 0 must never reach the broker"
     )
+
+
+# ---------------------------------------------------------------------------
+# PollingConsumer: idle backoff must never narrow below the configured poll
+# interval, and its configured max_attempts must reach claim_batch()
+# ---------------------------------------------------------------------------
+
+
+class FakePollingBroker:
+    """PollingBroker-conforming fake recording every claim_batch() call."""
+
+    def __init__(self) -> None:
+        self.claim_batch_calls: list[dict[str, Any]] = []
+
+    async def subscribe(self, targets: list[str], group: str) -> None:
+        return None
+
+    async def claim_batch(
+        self,
+        group: str,
+        *,
+        batch_size: int,
+        consumer_name: str,
+        reclaim_stale_seconds: float,
+        max_attempts: int | None = None,
+    ) -> list[dict[str, Any]]:
+        self.claim_batch_calls.append(
+            {
+                "group": group,
+                "batch_size": batch_size,
+                "consumer_name": consumer_name,
+                "reclaim_stale_seconds": reclaim_stale_seconds,
+                "max_attempts": max_attempts,
+            }
+        )
+        return []
+
+    async def renew_claims(self, row_ids: list[str], *, consumer_name: str) -> int:
+        return 0
+
+    async def ack(self, row_id: str, *, consumer_name: str) -> None:
+        return None
+
+    async def fail(self, row_id: str, error: str, *, consumer_name: str, max_attempts: int) -> None:
+        return None
+
+    async def dead_letter(self, row_id: str, error: str, *, consumer_name: str) -> None:
+        return None
+
+    async def prune(
+        self, *, retention_age_seconds: float | None, retention_count: int | None
+    ) -> int:
+        return 0
+
+
+def _make_polling_consumer(
+    broker: FakePollingBroker,
+    *,
+    poll_interval_s: float,
+    max_attempts: int,
+    idle_wait: Any,
+) -> PollingConsumer:
+    return PollingConsumer(
+        broker=broker,
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="worker-1",
+        group="workers",
+        targets=["t"],
+        poll_interval_s=poll_interval_s,
+        batch_size=10,
+        dispatch_concurrency=1,
+        max_attempts=max_attempts,
+        reclaim_stale_seconds=30.0,
+        prune_interval_s=None,
+        retention_age_seconds=None,
+        retention_count=None,
+        logger=logging.getLogger("test.polling_consumer"),
+        scheme="fake",
+        idle_backoff=True,
+        idle_wait=idle_wait,
+    )
+
+
+async def test_idle_backoff_never_narrows_below_configured_poll_interval() -> None:
+    """The clamp applied ``_IDLE_BACKOFF_CAP_S=0.5`` to the BASE interval too,
+    so a configured poll_interval_ms >= 500 was silently narrowed to 0.5s on
+    the very first idle poll instead of only capping backoff GROWTH above the
+    configured cadence."""
+    delays: list[float] = []
+
+    async def fake_idle_wait(delay: float) -> None:
+        delays.append(delay)
+        await asyncio.sleep(0)
+
+    broker = FakePollingBroker()
+    consumer = _make_polling_consumer(
+        broker, poll_interval_s=5.0, max_attempts=3, idle_wait=fake_idle_wait
+    )
+
+    await consumer.start()
+    try:
+        await _until(lambda: len(delays) >= 1)
+    finally:
+        await consumer.stop()
+
+    assert delays[0] >= 5.0, (
+        f"first idle wait must honor the configured 5s poll interval, got {delays[0]}"
+    )
+
+
+async def test_polling_consumer_passes_max_attempts_to_claim_batch() -> None:
+    """PollingConsumer already tracks ``max_attempts`` for dispatch-failure
+    dead-lettering (_delivery_dispatch.py's fail() call), but nothing wired
+    it into claim_batch() -- so a broker's reclaim-time cap (db_broker's
+    claim_batch ``max_attempts`` kwarg) never saw the consumer's configured
+    value and stayed permanently inert."""
+    broker = FakePollingBroker()
+
+    async def fake_idle_wait(delay: float) -> None:
+        await asyncio.sleep(0)
+
+    consumer = _make_polling_consumer(
+        broker, poll_interval_s=0.01, max_attempts=7, idle_wait=fake_idle_wait
+    )
+
+    await consumer.start()
+    try:
+        await _until(lambda: broker.claim_batch_calls)
+    finally:
+        await consumer.stop()
+
+    assert broker.claim_batch_calls[0]["max_attempts"] == 7

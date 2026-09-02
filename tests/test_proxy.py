@@ -71,6 +71,17 @@ def _upstream_app() -> FastAPI:
     async def host_header(request: Request) -> dict[str, str]:
         return {"host": request.headers.get("host", "")}
 
+    @up.get("/orders/xfwd")
+    async def xfwd_headers(request: Request) -> dict[str, str]:
+        return {
+            "x-forwarded-for": request.headers.get("x-forwarded-for", ""),
+            "x-forwarded-proto": request.headers.get("x-forwarded-proto", ""),
+            "x-forwarded-host": request.headers.get("x-forwarded-host", ""),
+            "x-forwarded-port": request.headers.get("x-forwarded-port", ""),
+            "forwarded": request.headers.get("forwarded", ""),
+            "x-real-ip": request.headers.get("x-real-ip", ""),
+        }
+
     # Registered WITH a trailing slash so requesting it without one triggers
     # Starlette's default redirect_slashes — the absolute-URL redirect a real
     # worker emits against the loopback authority it sees as its Host.
@@ -240,6 +251,40 @@ def test_proxy_rewrites_host_to_upstream_authority(proxy_app) -> None:
     assert resp.status_code == 200
     assert resp.json()["host"] == "orders-worker"
     assert resp.json()["host"] != "api.example.com"
+
+
+async def test_proxy_overwrites_spoofed_forwarded_headers() -> None:
+    # A client-controlled X-Forwarded-* must never reach a worker verbatim —
+    # workers spawned by the supervisor trust it from the loopback proxy.
+    upstream = _upstream_app()
+    upstream_client = httpx.AsyncClient(transport=httpx.ASGITransport(app=upstream))
+    rules = [RoutingRule(prefix="/orders", backend_url="http://orders-worker")]
+    proxy_app = create_proxy_app(rules, client=upstream_client)
+
+    transport = httpx.ASGITransport(app=proxy_app, client=("203.0.113.5", 51000))
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://public.example.com"
+    ) as proxy_client:
+        resp = await proxy_client.get(
+            "/orders/xfwd",
+            headers={
+                "x-forwarded-for": "1.2.3.4",
+                "x-forwarded-proto": "http",
+                "x-forwarded-host": "evil.example.com",
+                "x-forwarded-port": "9999",
+                "forwarded": "for=9.9.9.9",
+                "x-real-ip": "9.9.9.9",
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["x-forwarded-for"] == "203.0.113.5"
+    assert body["x-forwarded-proto"] == "https"
+    assert body["x-forwarded-host"] == "public.example.com"
+    assert body["x-forwarded-port"] == "443"
+    assert body["forwarded"] == ""
+    assert body["x-real-ip"] == ""
 
 
 def test_proxy_makes_a_backend_redirect_client_followable(proxy_app) -> None:

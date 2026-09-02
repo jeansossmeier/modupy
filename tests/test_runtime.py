@@ -541,6 +541,50 @@ async def test_reset_for_testing_clears_outbox_state_and_cancels_retry_task() ->
     assert task.cancelled() or task.done()
 
 
+async def test_teardown_test_resources_never_cancels_retry_task_directly() -> None:
+    """When a loop is running, _teardown_test_resources must not call
+    retry_task.cancel() directly — that is a non-threadsafe mutation on a
+    task that may live on another thread's loop (sync.py's daemon loop).
+    outbox._reset_for_testing(), which always runs next, already performs the
+    same cancellation through the threadsafe outbox._cancel_retry_task()."""
+    from modulith.builtin import outbox
+
+    class _FakeForeignLoop:
+        def __init__(self) -> None:
+            self.threadsafe_calls: list[Any] = []
+
+        def call_soon_threadsafe(self, callback: Any) -> None:
+            self.threadsafe_calls.append(callback)
+
+    class _FakeForeignTask:
+        def __init__(self, loop: _FakeForeignLoop) -> None:
+            self._loop = loop
+            self.direct_cancel_calls = 0
+
+        def done(self) -> bool:
+            return False
+
+        def cancel(self) -> bool:
+            self.direct_cancel_calls += 1
+            return True
+
+        def get_loop(self) -> _FakeForeignLoop:
+            return self._loop
+
+    fake_loop = _FakeForeignLoop()
+    fake_task = _FakeForeignTask(fake_loop)
+    outbox._retry_task = fake_task  # type: ignore[assignment]
+
+    rt = Runtime()
+    try:
+        rt._teardown_test_resources()
+    finally:
+        outbox._reset_for_testing()
+
+    assert fake_task.direct_cancel_calls == 0
+    assert fake_loop.threadsafe_calls == [fake_task.cancel]
+
+
 # ---------------------------------------------------------------------------
 # A failed bootstrap must close provisional brokers
 # ---------------------------------------------------------------------------

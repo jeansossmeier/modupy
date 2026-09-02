@@ -366,7 +366,14 @@ accepts filesystem paths only and rejects DSNs and SQLAlchemy/network URLs.
 `max_store_bytes` defaults to 1 GiB (maximum 1 TiB). Oversized payloads fail
 before a SQLite transaction starts; a full store applies publish backpressure
 through SQLite `max_page_count`. Legacy `shm_slot_size` is deprecated and
-ignored because hint slots contain fixed-size sequences.
+ignored because hint slots contain fixed-size sequences. `max_payload_bytes`
+is not just a publish-side cap: `JsonEventSerializer.deserialize` re-checks
+it on every consume, dead-lettering an oversized broker/outbox row instead of
+parsing it, and resolves its default lazily on first use (env
+`MODULITH_BROKER_MAX_PAYLOAD_BYTES` → `[tool.modulith.broker_options]
+.max_payload_bytes` → 16 MiB, matching the brokers' own precedence) from
+whichever `broker_options` the consumer's process loaded — an explicit value
+passed to the serializer still wins.
 
 The database broker reads `[tool.modulith.broker_options]` too: `url`/`dsn`
 (the SQLAlchemy URL — its dialect selects Postgres, MySQL, or SQLite),

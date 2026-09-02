@@ -228,6 +228,41 @@ def test_render_documentation_produces_files(make_fake_app, tmp_path: Path) -> N
     assert (out / "modules" / "orders.md").exists()
 
 
+# ---------------------------------------------------------------------------
+# Cross-platform encoding
+# ---------------------------------------------------------------------------
+
+
+def test_render_documentation_writes_utf8_explicitly(
+    make_fake_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every generated artifact must be written with an explicit ``utf-8``
+    encoding, not the platform-default fallback (``locale.getpreferredencoding()``
+    — cp1252 on Windows), which would raise ``UnicodeEncodeError`` or mangle
+    non-ASCII content."""
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+    make_fake_app({"orders": ""})
+    out = tmp_path / "docs"
+
+    recorded_encodings: list[str | None] = []
+    original_write_text = Path.write_text
+
+    def _recording_write_text(self: Path, data: str, *args: object, **kwargs: object) -> int:
+        recorded_encodings.append(kwargs.get("encoding"))  # type: ignore[arg-type]
+        return original_write_text(self, data, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "write_text", _recording_write_text)
+    try:
+        docs.modulith_render_documentation([_module("orders")], str(out))
+    finally:
+        manifest_module._reset_for_testing()
+
+    assert recorded_encodings, "expected write_text to be called"
+    assert all(enc == "utf-8" for enc in recorded_encodings), recorded_encodings
+
+
 def test_docs_registered_as_builtin() -> None:
     from modulith import create_plugin_manager
 

@@ -55,8 +55,16 @@ def claim(
     consumer_name: str,
     reclaim_stale_seconds: float,
     max_claim_bytes: int,
+    max_attempts: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Atomically claim due pending work and abandoned stale claims."""
+    """Atomically claim due pending work and abandoned stale claims.
+
+    When ``max_attempts`` is given, a stale-claim reclaim bumps ``attempts``
+    and, once that meets or exceeds the cap, dead-letters the row instead of
+    redelivering it -- the same accounting ``db_broker.claim_batch`` applies,
+    needed because a consumer that crashes mid-dispatch never reaches
+    ``fail()`` to run the cap itself.
+    """
     consumer_name = require_consumer_name(consumer_name)
     now = time.time()
     cutoff = now - reclaim_stale_seconds
@@ -67,19 +75,52 @@ def claim(
         if not affordable:
             return claimed
         rows_by_id = _fetch_needed_rows(conn, group, now, cutoff, affordable)
-        for candidate in affordable:
-            row = rows_by_id[candidate[1]]
+        for branch, delivery_id, _row_bytes in affordable:
+            row = rows_by_id[delivery_id]
+            is_stale_reclaim = branch == "stale" and max_attempts is not None
+            if (
+                is_stale_reclaim
+                and max_attempts is not None
+                and int(row["attempts"]) + 1 >= max_attempts
+            ):
+                conn.execute(
+                    """
+                    UPDATE shm_delivery
+                    SET status='dead', attempts=attempts+1, claimed_at=NULL,
+                        claimed_by=NULL, last_error=?
+                    WHERE id=?
+                    """,
+                    (
+                        f"reclaimed {max_attempts} times without completing "
+                        "(consumer crashed or wedged mid-dispatch)",
+                        delivery_id,
+                    ),
+                )
+                continue
             generation = int(row["claim_generation"]) + 1
-            conn.execute(
-                """
-                UPDATE shm_delivery
-                SET status='claimed', claimed_at=?, claimed_by=?,
-                    claim_generation=?
-                WHERE id=?
-                """,
-                (now, consumer_name, generation, row["delivery_id"]),
-            )
-            claimed.append(_claimed_row(row, group, consumer_name, generation))
+            if is_stale_reclaim:
+                conn.execute(
+                    """
+                    UPDATE shm_delivery
+                    SET status='claimed', claimed_at=?, claimed_by=?,
+                        claim_generation=?, attempts=attempts+1
+                    WHERE id=?
+                    """,
+                    (now, consumer_name, generation, delivery_id),
+                )
+                attempts = int(row["attempts"]) + 1
+            else:
+                conn.execute(
+                    """
+                    UPDATE shm_delivery
+                    SET status='claimed', claimed_at=?, claimed_by=?,
+                        claim_generation=?
+                    WHERE id=?
+                    """,
+                    (now, consumer_name, generation, delivery_id),
+                )
+                attempts = int(row["attempts"])
+            claimed.append(_claimed_row(row, group, consumer_name, generation, attempts))
     return claimed
 
 
@@ -215,6 +256,7 @@ def _claimed_row(
     group: str,
     consumer_name: str,
     generation: int,
+    attempts: int,
 ) -> dict[str, Any]:
     token = ClaimToken(int(row["delivery_id"]), generation)
     headers = row["headers"]
@@ -228,7 +270,7 @@ def _claimed_row(
         "payload": bytes(row["payload"]),
         "headers": json.loads(headers) if headers else None,
         "status": "claimed",
-        "attempts": int(row["attempts"]),
+        "attempts": attempts,
         "sequence": int(row["sequence"]),
         "claimed_by": consumer_name,
         "claim_generation": generation,

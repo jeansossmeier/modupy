@@ -38,6 +38,190 @@ from modulith.supervisor import (
 from conftest import _free_port
 
 # ---------------------------------------------------------------------------
+# Replica round-robin: every replica gets HTTP traffic and a health check
+# ---------------------------------------------------------------------------
+
+
+def _replica_upstream(served_by: str) -> FastAPI:
+    up = FastAPI()
+
+    @up.get("/orders/ping")
+    async def ping() -> dict[str, str]:
+        return {"served_by": served_by}
+
+    @up.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    return up
+
+
+async def test_proxy_round_robins_across_two_replicas() -> None:
+    """`_rules_from_specs` used to emit only the first replica's port, so a
+    module running two worker processes never got traffic on the second —
+    the proxy must alternate requests across every replica of one module."""
+    client = httpx.AsyncClient(
+        mounts={
+            "http://replica-a": httpx.ASGITransport(app=_replica_upstream("a")),
+            "http://replica-b": httpx.ASGITransport(app=_replica_upstream("b")),
+        }
+    )
+    rule = RoutingRule(
+        prefix="/orders",
+        backend_url="http://replica-a",
+        backend_urls=("http://replica-a", "http://replica-b"),
+    )
+    proxy_app = create_proxy_app([rule], client=client)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+    ) as proxy_client:
+        served = [(await proxy_client.get("/orders/ping")).json()["served_by"] for _ in range(4)]
+
+    assert served == ["a", "b", "a", "b"]
+
+
+def _dead_transport() -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    return httpx.MockTransport(handler)
+
+
+async def test_dead_replica_is_skipped_once_its_health_check_fails() -> None:
+    """A replica that fails its own `/_modulith/health` probe must be
+    skipped by the round-robin, not just reported — otherwise a module with
+    one dead replica out of two still sends every other request into a 502."""
+    client = httpx.AsyncClient(
+        mounts={
+            "http://replica-a": httpx.ASGITransport(app=_replica_upstream("a")),
+            "http://replica-b": _dead_transport(),
+        }
+    )
+    rule = RoutingRule(
+        prefix="/orders",
+        backend_url="http://replica-a",
+        backend_urls=("http://replica-a", "http://replica-b"),
+    )
+    proxy_app = create_proxy_app([rule], client=client)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+    ) as proxy_client:
+        health = await proxy_client.get("/_modulith/health")
+        served = [(await proxy_client.get("/orders/ping")).json()["served_by"] for _ in range(3)]
+
+    assert health.json()["backends"]["/orders"] == "ok"  # replica-a keeps the module up
+    assert served == ["a", "a", "a"]  # replica-b is dead, so every request lands on replica-a
+
+
+async def test_down_marking_expires_after_retry_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A replica marked down must be retried after the expiration window,
+    even if other replicas are healthy — otherwise a restarted replica
+    is excluded forever in a two-replica setup."""
+    now = [1000.0]
+
+    def mock_monotonic() -> float:
+        return now[0]
+
+    monkeypatch.setattr("time.monotonic", mock_monotonic)
+
+    rule = RoutingRule(
+        prefix="/orders",
+        backend_url="http://replica-a",
+        backend_urls=("http://replica-a", "http://replica-b"),
+    )
+
+    rule.mark_down("http://replica-b")
+
+    backend = rule.next_backend()
+    assert backend == "http://replica-a"
+
+    backend = rule.next_backend()
+    assert backend == "http://replica-a"
+
+    now[0] = 1000.0 + 5.0 + 0.1
+
+    backend = rule.next_backend()
+    assert backend == "http://replica-b"
+
+
+async def test_down_marking_during_retry_interval_skips_replica(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replica marked down within the retry window must still be skipped."""
+    now = [1000.0]
+
+    def mock_monotonic() -> float:
+        return now[0]
+
+    monkeypatch.setattr("time.monotonic", mock_monotonic)
+
+    rule = RoutingRule(
+        prefix="/orders",
+        backend_url="http://replica-a",
+        backend_urls=("http://replica-a", "http://replica-b"),
+    )
+
+    rule.mark_down("http://replica-b")
+
+    backend = rule.next_backend()
+    assert backend == "http://replica-a"
+
+    now[0] = 1000.0 + 2.0
+
+    backend = rule.next_backend()
+    assert backend == "http://replica-a"
+
+
+async def test_all_replicas_down_still_returns_one() -> None:
+    """Even when all replicas are marked down and all are expired,
+    next_backend() must return one (fallback behavior)."""
+    rule = RoutingRule(
+        prefix="/orders",
+        backend_url="http://replica-a",
+        backend_urls=("http://replica-a", "http://replica-b"),
+    )
+
+    rule.mark_down("http://replica-a")
+    rule.mark_down("http://replica-b")
+
+    backend = rule.next_backend()
+    assert backend in ("http://replica-a", "http://replica-b")
+
+
+async def test_health_reports_failed_given_up_module_distinctly() -> None:
+    """A module whose crash-loop breaker has permanently given up must read
+    differently from one merely mid-restart-backoff — both otherwise report
+    the same generic "unreachable" from a bare connection failure."""
+    rules = [RoutingRule(prefix="/orders", backend_url="http://127.0.0.1:59999")]
+    proxy_app = create_proxy_app(
+        rules,
+        client=httpx.AsyncClient(),
+        failed_instances=lambda: frozenset({"orders"}),
+    )
+
+    with TestClient(proxy_app) as client:
+        resp = client.get("/_modulith/health")
+
+    assert resp.status_code == 503
+    assert resp.json()["backends"]["/orders"] == "failed (given up)"
+
+
+async def test_health_reports_unreachable_when_not_yet_given_up() -> None:
+    """Companion: with no failed_instances wiring, the same unreachable
+    backend stays the generic "unreachable" — the distinct state only fires
+    once the breaker has actually given up."""
+    rules = [RoutingRule(prefix="/orders", backend_url="http://127.0.0.1:59999")]
+    proxy_app = create_proxy_app(rules, client=httpx.AsyncClient())
+
+    with TestClient(proxy_app) as client:
+        resp = client.get("/_modulith/health")
+
+    assert resp.json()["backends"]["/orders"] == "unreachable"
+
+
+# ---------------------------------------------------------------------------
 # Body-size cap must be enforced while streaming, not after
 # ---------------------------------------------------------------------------
 

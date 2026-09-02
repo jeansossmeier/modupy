@@ -27,16 +27,22 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE_YML = REPO_ROOT / ".github" / "workflows" / "release.yml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
+ISSUE_TEMPLATE_CONFIG = REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / "config.yml"
 
 
 def _ci_text() -> str:
     return CI_YML.read_text(encoding="utf-8")
+
+
+def _release_text() -> str:
+    return RELEASE_YML.read_text(encoding="utf-8")
 
 
 def _pyproject() -> dict[str, object]:
@@ -295,17 +301,17 @@ def test_version_fallback_literal_mirrors_pyproject() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _jobs() -> dict[str, Any]:
-    workflow = yaml.safe_load(_ci_text())
+def _jobs(text: str | None = None) -> dict[str, Any]:
+    workflow = yaml.safe_load(text if text is not None else _ci_text())
     assert isinstance(workflow, dict)
     jobs = workflow.get("jobs")
     assert isinstance(jobs, dict)
     return jobs
 
 
-def _job_steps(job_name: str) -> list[dict[str, Any]]:
+def _job_steps(job_name: str, text: str | None = None) -> list[dict[str, Any]]:
     """Return one parsed job's steps so YAML comments cannot satisfy guards."""
-    job = _jobs().get(job_name)
+    job = _jobs(text).get(job_name)
     assert isinstance(job, dict), f"ci.yml must define a `{job_name}` job"
     steps = job.get("steps")
     assert isinstance(steps, list) and steps, f"`{job_name}` job must define steps"
@@ -492,6 +498,126 @@ def test_coverage_outbox_path_is_fully_covered() -> None:
     assert has_outbox_gate, (
         "CI or coverage config must enforce 100% coverage on modulith/builtin/outbox.py"
     )
+
+
+@pytest.mark.parametrize(
+    "workflow_label,workflow_text",
+    [("ci.yml", _ci_text()), ("release.yml", _release_text())],
+)
+def test_build_job_artifact_assertions_cover_non_py_runtime_files(
+    workflow_label: str, workflow_text: str
+) -> None:
+    """The inspection `required` set must also guard alembic.ini/migrations/py.typed.
+
+    Without these, an `exclude`/`only-include` narrowing of
+    ``[tool.hatch.build.targets.wheel]`` could silently drop the packaged
+    Alembic config or the PEP 561 marker with every CI job staying green.
+    Both workflows build their own `Inspect distribution contents` step
+    (ci.yml's `build` job, release.yml's own build-and-publish job), so the
+    guard must hold identically in each.
+    """
+    inspection_scripts = [
+        step["run"]
+        for step in _job_steps("build", workflow_text)
+        if isinstance(step.get("run"), str) and step.get("name") == "Inspect distribution contents"
+    ]
+    assert len(inspection_scripts) == 1, f"{workflow_label} must have one inspection step"
+    script = inspection_scripts[0]
+    for literal in (
+        '"modulith/adapters/alembic.ini"',
+        '"modulith/adapters/migrations/env.py"',
+        '"modulith/adapters/migrations/script.py.mako"',
+        '"modulith/py.typed"',
+    ):
+        assert literal in script, f"inspection `required` set must include {literal}"
+    assert re.search(r'adapters\.glob\(\s*"migrations/versions/\*\.py"\s*\)', script), (
+        "inspection `required` set must guard every migrations/versions/*.py file"
+    )
+
+
+@pytest.mark.parametrize(
+    "workflow_label,workflow_text",
+    [("ci.yml", _ci_text()), ("release.yml", _release_text())],
+)
+def test_build_smoke_loads_the_packaged_alembic_ini(
+    workflow_label: str, workflow_text: str
+) -> None:
+    """The smoke test must drive the real alembic.ini the extract docs tell users to use.
+
+    Hand-building `Config()` and calling `set_main_option("script_location", ...)`
+    never reads `modulith/adapters/alembic.ini` from disk, so it can pass even if
+    that file (or the documented `alembic -c <path>` invocation it backs) is broken.
+    Both workflows run their own smoke test, so the guard must hold in each.
+    """
+    smoke_scripts = [
+        step["run"]
+        for step in _job_steps("build", workflow_text)
+        if isinstance(step.get("run"), str) and step.get("name") == "Smoke-test wheel installs"
+    ]
+    assert len(smoke_scripts) == 1, f"{workflow_label} must have one smoke-test step"
+    script = smoke_scripts[0]
+    assert '"alembic.ini"' in script, "smoke test must reference the packaged alembic.ini file"
+    assert re.search(r"Config\(\s*str\(\w*alembic\w*\)\s*\)", script), (
+        "smoke test must construct Config(str(<variable pointing at the packaged alembic.ini>))"
+    )
+    assert 'set_main_option("script_location"' not in script, (
+        "smoke test must rely on the packaged alembic.ini's own script_location, "
+        "not override it, or it never proves the shipped file is well-formed"
+    )
+
+
+def test_header_comment_lists_all_optional_extras() -> None:
+    """The top-of-file comment enumerating extras must not drift from reality."""
+    header = "\n".join(PYPROJECT.read_text(encoding="utf-8").splitlines()[:10])
+    for extra in _optional_dependencies():
+        assert re.search(rf"\b{re.escape(extra)}\b", header), (
+            f"pyproject.toml header comment must list the `{extra}` extra"
+        )
+
+
+def test_redis_extra_floor_supports_aclose() -> None:
+    """redis-py 5.0.0 lacks `Redis.aclose()`; RedisStreamsBroker.close() calls it."""
+    reqs = _optional_dependencies()["redis"]
+    assert any(re.match(r"redis>=5\.0\.1\b", req) for req in reqs), (
+        f"redis extra {reqs!r} must floor at >=5.0.1 (5.0.0 has close() but not aclose())"
+    )
+
+
+def test_issue_template_contact_links_do_not_point_at_discussions() -> None:
+    """Discussions is disabled on this repo; no contact_link may route there.
+
+    A user with a general question would otherwise hit a dead end: blank
+    issues are disabled, the two issue forms cover bugs/features only, and a
+    Discussions link 404s on a repo with the feature turned off.
+    """
+    config = yaml.safe_load(ISSUE_TEMPLATE_CONFIG.read_text(encoding="utf-8"))
+    assert isinstance(config, dict)
+    links = config.get("contact_links")
+    assert isinstance(links, list) and links
+    for link in links:
+        url = link.get("url", "")
+        assert "/discussions" not in url, (
+            f"contact_link {link.get('name')!r} points at {url!r}, but this "
+            "repository has Discussions disabled"
+        )
+
+
+def test_disabled_rules_example_names_a_real_verifier_rule() -> None:
+    """The commented-out `disabled_rules` example must name a rule that exists."""
+    verifier_src = (REPO_ROOT / "modulith" / "builtin" / "verifier.py").read_text(encoding="utf-8")
+    real_rules = set(re.findall(r'rule="([^"]+)"', verifier_src))
+    assert real_rules, 'expected to find rule="..." literals in verifier.py'
+    pyproject_text = PYPROJECT.read_text(encoding="utf-8")
+    example_line = next(
+        line for line in pyproject_text.splitlines() if "disabled_rules" in line and "e.g." in line
+    )
+    example_names = re.findall(r'"([^"]+)"', example_line.split("e.g.", 1)[1])
+    assert example_names, f"expected a quoted rule name in {example_line!r}"
+    for name in example_names:
+        assert name in real_rules, (
+            f"disabled_rules example names {name!r}, which is not a real verifier rule "
+            f"(real rules: {sorted(real_rules)})"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -1109,7 +1109,6 @@ class Runtime:
         from .builtin import outbox
 
         registry = self._broker_registry
-        retry_task = outbox._retry_task
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -1118,14 +1117,6 @@ class Runtime:
                     asyncio.run(registry.close_all())
                 except RuntimeError:  # pragma: no cover - loop-policy edge cases
                     logger.debug("could not close brokers during test reset", exc_info=True)
-            if retry_task is not None and not retry_task.done():
-                try:
-                    retry_task.cancel()
-                except RuntimeError:  # pragma: no cover - task's loop already closed
-                    pass
-        else:
-            if retry_task is not None and not retry_task.done():
-                retry_task.cancel()
         outbox._reset_for_testing()
 
 

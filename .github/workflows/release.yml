@@ -105,12 +105,19 @@ jobs:
           adapters = Path("modulith/adapters")
           required = {path.as_posix() for path in adapters.glob("_shm*.py")}
           required.update(
+              {path.as_posix() for path in adapters.glob("migrations/versions/*.py")}
+          )
+          required.update(
               {
                   "modulith/adapters/shm_broker.py",
                   "modulith/adapters/_state_path.py",
                   "modulith/adapters/_consumer_protocol.py",
                   "modulith/adapters/_delivery_dispatch.py",
                   "modulith/adapters/_polling_consumer.py",
+                  "modulith/adapters/alembic.ini",
+                  "modulith/adapters/migrations/env.py",
+                  "modulith/adapters/migrations/script.py.mako",
+                  "modulith/py.typed",
               }
           )
 
@@ -173,11 +180,10 @@ jobs:
           from alembic import command
           from alembic.config import Config
           import modulith.adapters as adapters_pkg
-          migrations = Path(adapters_pkg.__file__).parent / "migrations"
+          alembic_ini = Path(adapters_pkg.__file__).parent / "alembic.ini"
           with tempfile.TemporaryDirectory() as td:
               db = Path(td) / "smoke.db"
-              cfg = Config()
-              cfg.set_main_option("script_location", str(migrations))
+              cfg = Config(str(alembic_ini))
               cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db}")
               command.upgrade(cfg, "head")
               print("sqlite migration ok", db.exists())

@@ -118,6 +118,11 @@ class WorkerSpec:
     env: dict[str, str] | None = None  # additional env vars
 
 
+def _replica_ports(spec: WorkerSpec) -> list[int]:
+    """Every replica's port for one module spec, in instance order."""
+    return [spec.port + i for i in range(max(1, spec.worker_count))]
+
+
 # A command builder maps (spec, port) -> argv. Injectable so tests can spawn
 # trivial processes instead of a full uvicorn worker.
 CommandBuilder = Callable[[WorkerSpec, int], list[str]]
@@ -324,15 +329,31 @@ class Supervisor:
         """Expand specs into one (instance_name, spec, port) per replica."""
         plan: list[tuple[str, WorkerSpec, int]] = []
         for spec in self._specs:
-            for i in range(max(1, spec.worker_count)):
+            for i, port in enumerate(_replica_ports(spec)):
                 name = spec.module_name if spec.worker_count == 1 else f"{spec.module_name}-{i}"
-                plan.append((name, spec, spec.port + i))
+                plan.append((name, spec, port))
         return plan
+
+    def failed_instances(self) -> frozenset[str]:
+        """Instances the crash-loop breaker has permanently given up on.
+
+        Read by ``run_supervised``'s health wiring so ``/_modulith/health``
+        can report a definitively abandoned instance distinctly from one
+        still mid restart-backoff — see ``_failed_instances``.
+        """
+        return frozenset(self._failed_instances)
 
     async def start(self) -> None:
         """Spawn all workers and start monitoring them."""
         self._stopping = False
         self._stop_event.clear()
+        if _pdeathsig_preexec is None:
+            logger.warning(
+                "orphan protection unavailable on this platform (%s): a "
+                "SIGKILL'd/OOM-killed supervisor can leave workers running "
+                "with their ports still bound",
+                sys.platform,
+            )
         for name, spec, port in self._instance_plan():
             proc = await self._spawn(name, spec, port)
             self._monitor_tasks.append(
@@ -525,7 +546,19 @@ class Supervisor:
             logger.debug("log forwarder for %s stopped", prefix, exc_info=True)
 
     async def stop(self) -> None:
-        """Graceful shutdown: SIGTERM all workers, wait, SIGKILL stragglers.
+        """Shut down every worker; graceful only where the platform allows it.
+
+        POSIX: SIGTERM every worker (``terminate()``), wait up to
+        ``shutdown_timeout`` for monitors to observe the exit, then SIGKILL
+        any still alive — the wait gives a worker's ASGI lifespan a real
+        chance to run before the hard kill.
+
+        Windows has no signal delivery on ``subprocess.Popen``: both
+        ``terminate()`` and ``kill()`` call ``TerminateProcess`` — an
+        immediate, unmaskable hard kill with no softer first step and no
+        harder second one. The final SIGKILL pass is skipped there: it would
+        be the exact same call already made, and running it anyway would
+        misrepresent a no-op as a stronger escalation.
 
         Monitors are allowed to observe the termination and return on their own
         (so a monitor mid-respawn finishes registering its process); they're
@@ -555,10 +588,14 @@ class Supervisor:
                     task.cancel()
                 await asyncio.gather(*self._monitor_tasks, return_exceptions=True)
 
-        # Final reap: kill and wait on anything still alive (covers late respawns).
-        for proc in self._processes.values():
-            if proc.returncode is None:
-                proc.kill()
+        # Final reap: escalate anything still alive (POSIX only — see the
+        # docstring above), then wait on every tracked process (covers late
+        # respawns) so no subprocess transport is left to be
+        # garbage-collected after the loop.
+        if sys.platform != "win32":
+            for proc in self._processes.values():
+                if proc.returncode is None:
+                    proc.kill()
         await asyncio.gather(
             *(proc.wait() for proc in self._processes.values()), return_exceptions=True
         )
@@ -594,13 +631,16 @@ class Supervisor:
 
 
 def _rules_from_specs(specs: list[WorkerSpec]) -> list[RoutingRule]:
-    """Build the reverse-proxy routing table: one rule per module.
+    """Build the reverse-proxy routing table: one rule per module, carrying
+    every replica's backend.
 
-    Each module's public prefix (``/orders``) maps to its worker's loopback
-    backend (``http://127.0.0.1:9001``). When a module runs multiple replicas
-    the proxy targets the first replica's port; cross-replica load balancing
-    is a v2 enhancement (the broker already load-shares event consumption
-    across replicas via the shared consumer group).
+    Each module's public prefix (``/orders``) maps to ALL of its worker
+    replicas' loopback backends (``http://127.0.0.1:9001``, ``:9002``, ...).
+    ``RoutingRule.next_backend()`` round-robins HTTP traffic across them per
+    request, and ``/_modulith/health`` reports the module healthy if any one
+    replica is — the broker already load-shares event consumption across
+    replicas via the shared consumer group; this is what makes HTTP traffic
+    and health checks reach every replica too, not just the first.
     """
     from .proxy import RoutingRule
 
@@ -608,6 +648,7 @@ def _rules_from_specs(specs: list[WorkerSpec]) -> list[RoutingRule]:
         RoutingRule(
             prefix=f"/{spec.module_name}",
             backend_url=f"http://127.0.0.1:{spec.port}",
+            backend_urls=tuple(f"http://127.0.0.1:{port}" for port in _replica_ports(spec)),
         )
         for spec in specs
     ]
@@ -763,6 +804,7 @@ async def run_supervised(
         mode=actuator_mode, production=production, host=proxy_host, token=actuator_token
     )
 
+    sup = supervisor if supervisor is not None else Supervisor(specs)
     rules = _rules_from_specs(specs)
     proxy_app = create_proxy_app(
         rules,
@@ -771,8 +813,8 @@ async def run_supervised(
         max_request_body_bytes=_env_positive_int(
             "MODULITH_PROXY_MAX_BODY_BYTES", DEFAULT_MAX_REQUEST_BODY_BYTES
         ),
+        failed_instances=sup.failed_instances,
     )
-    sup = supervisor if supervisor is not None else Supervisor(specs)
     serve_fn = serve if serve is not None else _serve_uvicorn
 
     # A SIGTERM/SIGINT arriving after workers are spawned but before serve_fn

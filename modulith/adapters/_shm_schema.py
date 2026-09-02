@@ -21,6 +21,11 @@ _COMPLETION_TOMBSTONE_SCHEMA = """
     )
     """
 
+_PUBLICATION_EXPIRY_INDEX_SCHEMA = """
+    CREATE INDEX IF NOT EXISTS idx_shm_publication_expiry
+    ON shm_publication (retained_until, sequence)
+    """
+
 _SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS shm_publication (
@@ -70,6 +75,7 @@ _SCHEMA = (
     CREATE INDEX IF NOT EXISTS idx_shm_publication_retained
     ON shm_publication (target, retained_until)
     """,
+    _PUBLICATION_EXPIRY_INDEX_SCHEMA,
     _COMPLETION_TOMBSTONE_SCHEMA,
 )
 
@@ -151,20 +157,23 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # opener can finish migration while this connection waits for the lock.
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         _validate_version(version)
-        if version == SCHEMA_VERSION:
-            return
-        if version == 0:
-            if _table_exists(conn, "shm_message"):
-                _migrate_v0(conn)
-            elif _table_exists(conn, "shm_publication"):
+        if version != SCHEMA_VERSION:
+            if version == 0:
+                if _table_exists(conn, "shm_message"):
+                    _migrate_v0(conn)
+                elif _table_exists(conn, "shm_publication"):
+                    _migrate_v1(conn)
+                else:
+                    _create_schema(conn)
+            elif version == 1:
                 _migrate_v1(conn)
-            else:
-                _create_schema(conn)
-        elif version == 1:
-            _migrate_v1(conn)
-        elif version == 2:
-            _migrate_v2(conn)
-        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            elif version == 2:
+                _migrate_v2(conn)
+            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        # Idempotent and run on every open (not gated on a version bump) so a
+        # store already at SCHEMA_VERSION from before this index existed gets
+        # it backfilled without a schema-version migration path.
+        conn.execute(_PUBLICATION_EXPIRY_INDEX_SCHEMA)
 
 
 def _migrate_v0(conn: sqlite3.Connection) -> None:

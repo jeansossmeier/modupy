@@ -218,6 +218,24 @@ def test_sync_wrapper_around_async_listener_preserves_manifest_identity() -> Non
     assert verify_manifest(manifest, {registered}) == []
 
 
+@pytest.mark.asyncio
+async def test_listener_accepts_async_callable_class_instance() -> None:
+    received: list[E] = []
+
+    class AsyncCallableListener:
+        async def __call__(self, evt: E) -> None:
+            received.append(evt)
+
+    obj = AsyncCallableListener()
+    listener(obj)
+
+    event_instance = E()
+    registered = _runtime._pending_listeners[0][1]
+    await registered(event_instance)
+
+    assert received == [event_instance]
+
+
 @pytest.mark.parametrize(
     "broker_targets",
     [

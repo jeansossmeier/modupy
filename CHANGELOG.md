@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Database broker: schema-aware alembic revisions skip tables/indexes the broker already bootstrapped instead of erroring; a stale claim past `max_attempts` is now reclaimed, retried, and dead-lettered instead of stuck forever; the broker schema falls back to `MODULITH_DB_SCHEMA` when unset; a database broker or store used from a second event loop now warns once instead of deadlocking on schema/session setup
+- Outbox: the retry loop recreates itself if its event loop closes instead of dying silently; `shutdown()` no longer raises on an already-closed loop; lease renewal re-raises a real shutdown cancellation instead of swallowing it and hanging shutdown forever; `claim_lease_seconds` must be finite and positive; `status()` and the doctor outbox check now include archived-row counts (`count_archived`)
+- SHM broker: per-event-loop store locks evict closed loops instead of leaking; `claim_batch` respects `max_attempts` end-to-end so a reclaimed row is retried and eventually dead-lettered instead of looping forever; pruning runs every 100 publishes instead of every publish; added a backfilled expiry index and a deterministic claim-cost test
+- Redis broker/consumer: `MODULITH_BROKER_MAX_PAYLOAD_BYTES` and the dead-letter max-stream-len env var are read ahead of `broker_options`; the dead-letter script checks for an existing dedup entry before appending, so a replayed acknowledgment can no longer duplicate a dead-letter record
+- Polling consumer: idle backoff never drops below the configured poll interval, so raising `poll_interval_ms` above the previous 0.5s floor actually reduces poll frequency
+- Reverse proxy: requests round-robin across a module's healthy replica instances instead of always hitting the first one, and a replica marked down is retried after a cooldown instead of staying excluded forever
+- Supervisor: failed worker instances are now reported through `/_modulith/health`; `stop()` no longer sends a second, functionally-identical kill signal on Windows, where `terminate()` and `kill()` are the same hard stop
+- Config: a whitespace-only `MODULITH_*` env var is treated as unset, matching the empty-string contract; `[tool.modulith.verify].disabled_rules` is honored by the verifier itself (previously ignored), and an unknown rule name in it now warns
+- `sync.publish_sync`'s nested-loop dispatch bounds its `loop_ready` wait so a failure before the nested loop starts raises the documented timeout instead of hanging forever
+- `@listener`/`@event` decorators recognize an async-callable class instance (not just a plain async function) as an async handler
+- Observability hooks now match module boundaries the same way the verifier does
+- Generated docs and canvases are written as UTF-8 explicitly
+- Serializer payload cap resolves lazily from the loaded broker config at first deserialize instead of freezing a default before configuration is available
+- k8s manifest generation: the Ingress path is the raw module name (YAML-quoted) instead of a hyphenated one that could mismatch the worker's actual route prefix, and a non-identifier module name is now rejected instead of producing a broken manifest
+- `modulith extract`: a parse failure during extraction is now a blocker (`--force`-overridable) instead of silently skipped; the contracts module is exempt from the shared-table scan; a module/helper name that doesn't resolve to a real importable package is now an error instead of writing an empty extraction tree
+- Verifier: `importlib.import_module()`/`__import__()` string-literal imports now count as cross-module imports like a normal `import` statement
+- Testing plugin: the manifest registry is snapshotted and restored alongside `sys.modules` between tests, and `__all__` no longer leaks helper imports
+- `modulith dev --isolate` now states, in `--help` and on stderr, that every other discovered module is not started and its routes 404
+- Packaging: dropped a `py.typed` include that pointed at a directory the wheel doesn't ship; CI and release inspection now require `alembic.ini` and `py.typed` to be present in the built distribution
+- Raised the `redis` extra's floor to `redis>=5.0.1` (the actual tested minimum)
+- The issue template's "Question or usage help" contact link now points at a working `issues/new?labels=question` URL instead of the disabled Discussions tab
+
 ## [0.10.0] — 2026-08-19
 
 ### Added
@@ -55,7 +79,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **SQLite outbox** — The same adapter pointed at a `sqlite+aiosqlite://` URL, for zero-infrastructure deployments; there is no separate SQLite module
 - **Crash recovery** — Automatic replay of uncommitted events on restart
 - **Retry loop** — Exponential backoff with configurable max attempts and dead-letter store
-- **Idempotency guards** — Per-event deduplication via hash
 
 #### Brokers
 - **In-memory broker** — Fast, non-durable, for development and testing
@@ -66,7 +89,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - Built-in dead-letter and age-based pruning
 - **Redis Streams broker** — High-throughput, distributed
   - Consumer group management with automatic pending-entry recovery
-  - Configurable batch size and concurrency
   - Dead-letter handling for failed listeners
   - Soft import (optional dependency)
 
@@ -125,7 +147,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Input validation for configuration strings and broker URLs
 - SQL injection prevention via SQLAlchemy ORM (parameterized queries)
 - Event payload size limits to prevent unbounded memory use
-- XSS prevention in auto-generated documentation (HTML-safe Mermaid links)
 
 ### Documentation
 

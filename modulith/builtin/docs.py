@@ -167,7 +167,7 @@ def modulith_render_documentation(
 
     # Architecture overview
     arch_path = out / "architecture.mmd"
-    arch_path.write_text(_render_architecture_diagram(modules))
+    arch_path.write_text(_render_architecture_diagram(modules), encoding="utf-8")
     produced.append("architecture.mmd")
 
     # Per-module canvases
@@ -175,12 +175,12 @@ def modulith_render_documentation(
     canvases_dir.mkdir(exist_ok=True)
     for module in modules:
         canvas_path = canvases_dir / f"{module.name}.md"
-        canvas_path.write_text(_render_module_canvas(module))
+        canvas_path.write_text(_render_module_canvas(module), encoding="utf-8")
         produced.append(f"modules/{module.name}.md")
 
     # Event flow diagram
     events_path = out / "events.mmd"
-    events_path.write_text(_render_event_flow_diagram(modules))
+    events_path.write_text(_render_event_flow_diagram(modules), encoding="utf-8")
     produced.append("events.mmd")
 
     return produced

@@ -257,7 +257,7 @@ def _build_consumer(module_name: str, consumer_name: str | None = None) -> Any:
     from .brokers import ConsumerSpec
     from .config import ConfigurationError
     from .runtime import _runtime
-    from .serializers import JsonEventSerializer
+    from .serializers import JsonEventSerializer, _resolve_max_payload_bytes
 
     cfg = _runtime.config
     bus = _runtime.event_bus
@@ -291,7 +291,10 @@ def _build_consumer(module_name: str, consumer_name: str | None = None) -> Any:
         group=f"modulith-{module_name}",
         targets=tuple(targets),
         bus=bus,
-        serializer=JsonEventSerializer(allowed_event_types=bus.registered_event_types()),
+        serializer=JsonEventSerializer(
+            allowed_event_types=bus.registered_event_types(),
+            max_payload_bytes=_resolve_max_payload_bytes(cfg.broker_options),
+        ),
         broker_registry=broker_registry,
     )
     return consumer_registry.build(cfg.broker, spec)

@@ -15,8 +15,10 @@ from typing import Any, cast
 import pytest
 
 from modulith import ConfigurationError, configure
+from modulith.adapters import _shm_claims
 from modulith.adapters._shm_coldstore import ShmColdStore
 from modulith.adapters._shm_ring import _HEADER_SIZE, _SLOT_SIZE, _SLOT_STRUCT
+from modulith.adapters._shm_schema import open_database
 from modulith.adapters._shm_store import SqliteQueueStore
 from modulith.adapters.shm_broker import (
     ShmBroker,
@@ -764,3 +766,143 @@ def test_registration_hooks_ignore_non_shm_configuration(make_fake_app: Any) -> 
 
     assert "shm" not in brokers.schemes()
     assert "shm" not in consumers.schemes()
+
+
+# ---------------------------------------------------------------------------
+# _shm_claims.claim(): reclaim-time max_attempts parity with the database
+# broker -- a stale-claim reclaim past the cap dead-letters instead of
+# redelivering forever.
+# ---------------------------------------------------------------------------
+
+
+def _open_claims_db(path: Path) -> sqlite3.Connection:
+    return open_database(str(path), "NORMAL", 10_000_000)
+
+
+def _seed_claimed_delivery(
+    conn: sqlite3.Connection,
+    *,
+    group: str,
+    attempts: int,
+    claimed_at: float,
+) -> None:
+    now = time.time()
+    conn.execute(
+        "INSERT INTO shm_publication "
+        "(id, target, event_type, payload, headers, created_at, retained_until) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("pub-1", "events", "test.Event", b"payload", None, now, now + 3600),
+    )
+    conn.execute(
+        "INSERT INTO shm_delivery "
+        "(publication_id, consumer_group, status, attempts, available_at, "
+        "claimed_at, claimed_by, claim_generation, created_at) "
+        "VALUES (?, ?, 'claimed', ?, ?, ?, 'worker-1', 1, ?)",
+        ("pub-1", group, attempts, now - 10, claimed_at, now),
+    )
+
+
+def test_reclaim_dead_letters_once_max_attempts_is_exhausted(tmp_path: Path) -> None:
+    conn = _open_claims_db(tmp_path / "claims.db")
+    try:
+        _seed_claimed_delivery(conn, group="workers", attempts=1, claimed_at=time.time() - 120)
+
+        claimed = _shm_claims.claim(
+            conn,
+            "workers",
+            10,
+            "worker-2",
+            reclaim_stale_seconds=60.0,
+            max_claim_bytes=1_000_000,
+            max_attempts=2,
+        )
+
+        assert claimed == [], "a row that exhausts max_attempts must not be redelivered"
+        row = conn.execute("SELECT status, attempts, claimed_by FROM shm_delivery").fetchone()
+        assert (row["status"], row["attempts"], row["claimed_by"]) == ("dead", 2, None)
+    finally:
+        conn.close()
+
+
+def test_reclaim_below_cap_bumps_attempts_and_redelivers(tmp_path: Path) -> None:
+    conn = _open_claims_db(tmp_path / "claims.db")
+    try:
+        _seed_claimed_delivery(conn, group="workers", attempts=0, claimed_at=time.time() - 120)
+
+        claimed = _shm_claims.claim(
+            conn,
+            "workers",
+            10,
+            "worker-2",
+            reclaim_stale_seconds=60.0,
+            max_claim_bytes=1_000_000,
+            max_attempts=3,
+        )
+
+        assert len(claimed) == 1
+        assert claimed[0]["attempts"] == 1
+        row = conn.execute("SELECT status, attempts, claimed_by FROM shm_delivery").fetchone()
+        assert (row["status"], row["attempts"], row["claimed_by"]) == ("claimed", 1, "worker-2")
+    finally:
+        conn.close()
+
+
+async def test_broker_claim_batch_accepts_max_attempts_without_error(
+    broker: ShmBroker,
+) -> None:
+    """PollingConsumer._run now always passes max_attempts=... to
+    claim_batch(); ShmBroker.claim_batch must accept the keyword (protocol
+    parity) or every ShmConsumer poll iteration raises TypeError."""
+    await broker.subscribe(["events"], "workers")
+    await broker.publish("events", b"payload")
+
+    rows = await broker.claim_batch(
+        "workers", batch_size=10, consumer_name="worker", max_attempts=5
+    )
+
+    assert [row["payload"] for row in rows] == [b"payload"]
+
+
+async def test_public_claim_batch_dead_letters_after_max_attempts_stale_reclaims(
+    broker: ShmBroker,
+    tmp_path: Path,
+) -> None:
+    """The reclaim cap must reach the public ShmBroker.claim_batch surface,
+    not just the lower-level _shm_claims.claim() it is built on -- a stale
+    reclaim below the cap redelivers with attempts bumped, and the reclaim
+    that meets the cap dead-letters instead of redelivering forever."""
+    await broker.subscribe(["events"], "workers")
+    await broker.publish("events", b"payload")
+
+    first = await broker.claim_batch("workers", batch_size=1, consumer_name="worker-1")
+    assert len(first) == 1
+    assert first[0]["attempts"] == 0
+
+    below_cap = await broker.claim_batch(
+        "workers",
+        batch_size=1,
+        consumer_name="worker-2",
+        reclaim_stale_seconds=0,
+        max_attempts=2,
+    )
+    assert len(below_cap) == 1
+    assert below_cap[0]["attempts"] == 1
+
+    at_cap = await broker.claim_batch(
+        "workers",
+        batch_size=1,
+        consumer_name="worker-3",
+        reclaim_stale_seconds=0,
+        max_attempts=2,
+    )
+    assert at_cap == [], "a reclaim meeting max_attempts must dead-letter, not redeliver"
+    assert [tuple(row) for row in _delivery_rows(tmp_path / "broker.db")] == [("dead", 2, None, 2)]
+
+    never_again = await broker.claim_batch(
+        "workers",
+        batch_size=1,
+        consumer_name="worker-4",
+        reclaim_stale_seconds=0,
+        max_attempts=2,
+    )
+    assert never_again == []

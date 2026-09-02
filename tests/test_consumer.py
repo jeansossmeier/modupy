@@ -545,6 +545,56 @@ async def test_undeserializable_message_is_dead_lettered() -> None:
 
 
 @pytest.mark.asyncio
+async def test_oversized_payload_is_dead_lettered_without_deserializing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broker/outbox row larger than the configured cap must never reach
+    json.loads: it is poison, dead-lettered the same as an unresolvable
+    event_type, and the poll loop keeps running afterward."""
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError("json.loads must not run on an oversized payload")
+
+    monkeypatch.setattr("modulith.serializers.json.loads", _boom)
+
+    bus = InMemoryEventBus()
+    broker = FakeConsumerBroker()
+    consumer = BrokerConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=JsonEventSerializer(max_payload_bytes=20),
+        consumer_name="orders:1",
+        group="modulith-orders",
+        targets=["t"],
+        poll_block_ms=10,
+        reclaim_min_idle_ms=0,
+    )
+    fqn = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+    fields = {b"data": b"x" * 21, b"h:event_type": fqn.encode()}
+
+    await consumer._dispatch_one("t", b"9-0", fields)
+
+    assert broker.dead == [("t", "9-0", fields)]
+    assert broker.acked == []
+
+    # The poll loop's dispatch path survives the poison message and can still
+    # process a subsequent well-formed one — under the same cap, so restore
+    # json.loads and use a payload that fits within max_payload_bytes=10.
+    monkeypatch.undo()
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    bus.register(CrossEvent, handler)
+    ok_fields = {b"data": b'{"value":1}', b"h:event_type": fqn.encode()}
+    await consumer._dispatch_one("t", b"10-0", ok_fields)
+
+    assert received == [1]
+    assert ("t", "10-0") in broker.acked
+
+
+@pytest.mark.asyncio
 async def test_missing_event_type_header_is_dead_lettered() -> None:
     bus = InMemoryEventBus()
     broker = FakeConsumerBroker()

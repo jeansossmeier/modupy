@@ -124,6 +124,21 @@ def test_rules_from_specs_one_rule_per_module() -> None:
     }
 
 
+def test_rules_from_specs_carries_every_replica_backend() -> None:
+    """`_rules_from_specs` used to emit only the first replica's port, so a
+    multi-worker module got no HTTP traffic and no health check on any
+    replica beyond the first. It must carry every replica's backend for
+    round-robin selection and health aggregation."""
+    specs = [WorkerSpec("orders", "app", 9001, worker_count=2)]
+
+    rules = _rules_from_specs(specs)
+
+    assert len(rules) == 1
+    rule = rules[0]
+    assert rule.backend_url == "http://127.0.0.1:9001"  # first replica, unchanged
+    assert rule.backend_urls == ("http://127.0.0.1:9001", "http://127.0.0.1:9002")
+
+
 # ---------------------------------------------------------------------------
 # run_supervised — orchestration glue (supervisor + proxy), injected fakes
 # ---------------------------------------------------------------------------
@@ -141,6 +156,9 @@ class _FakeSupervisor:
 
     async def stop(self) -> None:
         self.events.append("stop")
+
+    def failed_instances(self) -> frozenset[str]:
+        return frozenset()
 
 
 async def test_run_supervised_starts_serves_then_stops() -> None:
@@ -183,6 +201,38 @@ async def test_run_supervised_stops_even_when_serve_raises() -> None:
 
     # stop() must run on the way out so workers aren't orphaned on crash.
     assert sup.events == ["start", "serve", "stop"]
+
+
+async def test_run_supervised_wires_failed_instances_into_the_health_endpoint() -> None:
+    """`Supervisor._failed_instances` is documented as "surfaced for health
+    reporting" but nothing wired it anywhere outside tests. run_supervised
+    must pass the supervisor's failed_instances() lookup through to the
+    proxy app, so /_modulith/health can tell a permanently abandoned module
+    apart from one still mid restart-backoff."""
+    from fastapi.testclient import TestClient
+
+    class _GivenUpSupervisor(_FakeSupervisor):
+        def failed_instances(self) -> frozenset[str]:
+            return frozenset({"orders"})
+
+    sup = _GivenUpSupervisor()
+    captured: dict[str, object] = {}
+
+    async def capture_serve(app: object, host: str, port: int) -> None:
+        captured["app"] = app
+
+    await run_supervised(
+        [WorkerSpec("orders", "app", 9001)],
+        "127.0.0.1",
+        8000,
+        supervisor=sup,
+        serve=capture_serve,
+    )
+
+    with TestClient(captured["app"]) as client:
+        resp = client.get("/_modulith/health")
+
+    assert resp.json()["backends"]["/orders"] == "failed (given up)"
 
 
 async def test_run_supervised_stops_workers_when_start_fails_partway() -> None:
@@ -567,7 +617,81 @@ def test_restart_policy_resets_crash_streak_after_recovery() -> None:
     assert p.on_crash(uptime=10.0, now=20.0) is not None
 
 
+class _SpyProc:
+    """Bare process double for testing stop()'s platform branching in
+    isolation — no real subprocess, no monitor tasks, no OS signal semantics."""
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.kill_called = False
+
+    def terminate(self) -> None:
+        pass  # never actually exits on its own — proves stop() doesn't rely on it
+
+    def kill(self) -> None:
+        self.kill_called = True
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        if self.returncode is None:
+            self.returncode = 0  # resolves regardless of kill(), so stop() never hangs
+        return self.returncode
+
+
+async def test_stop_escalates_to_kill_on_posix_when_process_survives_terminate(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("modulith.supervisor.sys.platform", "linux")
+    proc = _SpyProc()
+    sup = Supervisor([])
+    sup._processes["orders"] = proc  # type: ignore[assignment]
+
+    await sup.stop()
+
+    assert proc.kill_called is True
+
+
+async def test_stop_skips_the_redundant_kill_pass_on_windows(monkeypatch) -> None:
+    """subprocess.Popen.kill() is a plain alias for terminate() on Windows
+    (both call TerminateProcess) — stop()'s second pass must not pretend to
+    escalate what is already an identical, already-issued hard kill."""
+    monkeypatch.setattr("modulith.supervisor.sys.platform", "win32")
+    proc = _SpyProc()
+    sup = Supervisor([])
+    sup._processes["orders"] = proc  # type: ignore[assignment]
+
+    await sup.stop()
+
+    assert proc.kill_called is False
+
+
+async def test_start_warns_when_orphan_protection_is_unavailable(monkeypatch, caplog) -> None:
+    """`_pdeathsig_preexec` is None on any non-Linux platform — the operator
+    must be told once at startup, not left to discover it only when a
+    SIGKILL'd supervisor leaves orphaned workers holding their ports."""
+    monkeypatch.setattr("modulith.supervisor._pdeathsig_preexec", None)
+    sup = Supervisor([])
+    with caplog.at_level(logging.WARNING, logger="modulith.supervisor"):
+        await sup.start()
+
+    assert any("orphan protection" in r.getMessage() for r in caplog.records)
+
+
+async def test_start_does_not_warn_when_orphan_protection_is_available(monkeypatch, caplog) -> None:
+    monkeypatch.setattr("modulith.supervisor._pdeathsig_preexec", lambda: None)
+    sup = Supervisor([])
+    with caplog.at_level(logging.WARNING, logger="modulith.supervisor"):
+        await sup.start()
+
+    assert not any("orphan protection" in r.getMessage() for r in caplog.records)
+
+
 @pytest.mark.real_process
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="asserts a POSIX signal-encoded returncode; on Windows terminate() "
+    "is already TerminateProcess and returncode is a positive exit code",
+)
 async def test_stop_does_not_sigkill_worker_that_exits_within_grace_window() -> None:
     """A worker that dies from SIGTERM (proc.terminate()) well within
     shutdown_timeout must NOT also receive SIGKILL — escalating unconditionally
@@ -588,6 +712,11 @@ async def test_stop_does_not_sigkill_worker_that_exits_within_grace_window() -> 
 
 
 @pytest.mark.real_process
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="asserts POSIX signal-encoded returncodes; on Windows terminate() "
+    "and kill() are both TerminateProcess and cannot be told apart this way",
+)
 async def test_stop_sigkills_only_the_worker_still_alive_at_timeout() -> None:
     """With two workers — one that dies on SIGTERM, one that traps and ignores
     it — only the still-alive one is escalated to SIGKILL at shutdown_timeout;
@@ -706,6 +835,34 @@ async def test_crash_loop_gives_up_after_max_restarts() -> None:
         assert len(calls) == settled
         # Bounded: initial spawn + at most max_restarts respawns.
         assert settled <= sup._max_restarts + 1
+    finally:
+        await sup.stop()
+
+
+@pytest.mark.real_process
+async def test_failed_instances_is_surfaced_after_the_breaker_gives_up() -> None:
+    """Supervisor.failed_instances() is the read API the health wiring
+    consumes — it must reflect what _monitor_worker records internally in
+    ``_failed_instances``, not just the private attribute itself."""
+
+    def crash_builder(spec: WorkerSpec, port: int) -> list[str]:
+        return _CRASH
+
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", 9001)],
+        command_builder=crash_builder,
+        restart_initial_delay=0.01,
+        restart_max_delay=0.01,
+        max_restarts=1,
+        restart_healthy_uptime=5.0,
+    )
+    try:
+        await sup.start()
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if sup.failed_instances():
+                break
+        assert sup.failed_instances() == frozenset({"orders"})
     finally:
         await sup.stop()
 

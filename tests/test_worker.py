@@ -22,9 +22,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 import modulith._worker as worker_module
-from modulith import ConfigurationError, Consumer, ConsumerSpec
+from modulith import ConfigurationError, Consumer, ConsumerSpec, configure
 from modulith._worker import _build_consumer, create_app
 from modulith.adapters.shm_broker import ShmBroker, ShmConsumer
+from modulith.config import DEFAULT_MAX_PAYLOAD_BYTES
 from modulith.protocols import ConsumerHealth, ConsumerStatus
 from modulith.runtime import _runtime
 
@@ -528,6 +529,120 @@ def test_manifest_only_target_builds_consumer(make_fake_app, monkeypatch) -> Non
         pass
 
     assert [spec.targets for spec in built_specs] == [("events.orders",)]
+
+
+def test_consumer_serializer_defaults_to_default_max_payload_bytes(
+    make_fake_app, monkeypatch
+) -> None:
+    """A consumer built with no cap configured must still carry the same
+    16 MiB default the broker adapters fall back to — never an unbounded
+    serializer that silently disagrees with the broker's own default."""
+    built_specs: list[ConsumerSpec] = []
+
+    def build_consumer(spec: ConsumerSpec) -> Consumer:
+        built_specs.append(spec)
+        return _NoopConsumer()
+
+    make_fake_app(
+        {"orders": ""},
+        extra_files={
+            "orders/_manifest.py": """
+                from modulith import declare_module
+
+                declare_module(broker_targets=("test-noop-broker:events.orders",))
+            """
+        },
+    )
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.delenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", raising=False)
+
+    app = create_app()
+    assert _runtime.broker_registry is not None
+    assert _runtime.consumer_registry is not None
+    _runtime.broker_registry.register("test-noop-broker", _NoopBroker())
+    _runtime.consumer_registry.register("test-noop-broker", build_consumer)
+
+    with TestClient(app):
+        pass
+
+    (spec,) = built_specs
+    assert spec.serializer._max_payload_bytes == DEFAULT_MAX_PAYLOAD_BYTES
+
+
+def test_consumer_serializer_carries_configured_broker_options_cap(
+    make_fake_app, monkeypatch
+) -> None:
+    """A deployment whose broker cap is raised via broker_options must reach
+    the consumer's deserializer too — otherwise the broker accepts a payload
+    the consumer then dead-letters as oversized."""
+    built_specs: list[ConsumerSpec] = []
+
+    def build_consumer(spec: ConsumerSpec) -> Consumer:
+        built_specs.append(spec)
+        return _NoopConsumer()
+
+    make_fake_app(
+        {"orders": ""},
+        extra_files={
+            "orders/_manifest.py": """
+                from modulith import declare_module
+
+                declare_module(broker_targets=("test-noop-broker:events.orders",))
+            """
+        },
+    )
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.delenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", raising=False)
+    configure(broker_options={"max_payload_bytes": 33554432})
+
+    app = create_app()
+    assert _runtime.broker_registry is not None
+    assert _runtime.consumer_registry is not None
+    _runtime.broker_registry.register("test-noop-broker", _NoopBroker())
+    _runtime.consumer_registry.register("test-noop-broker", build_consumer)
+
+    with TestClient(app):
+        pass
+
+    (spec,) = built_specs
+    assert spec.serializer._max_payload_bytes == 33554432
+
+
+def test_consumer_serializer_carries_env_override_cap(make_fake_app, monkeypatch) -> None:
+    """MODULITH_BROKER_MAX_PAYLOAD_BYTES must reach the consumer's
+    deserializer with the same precedence it has for every broker adapter:
+    highest priority, overriding any broker_options value."""
+    built_specs: list[ConsumerSpec] = []
+
+    def build_consumer(spec: ConsumerSpec) -> Consumer:
+        built_specs.append(spec)
+        return _NoopConsumer()
+
+    make_fake_app(
+        {"orders": ""},
+        extra_files={
+            "orders/_manifest.py": """
+                from modulith import declare_module
+
+                declare_module(broker_targets=("test-noop-broker:events.orders",))
+            """
+        },
+    )
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.setenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", "1048576")
+    configure(broker_options={"max_payload_bytes": 33554432})
+
+    app = create_app()
+    assert _runtime.broker_registry is not None
+    assert _runtime.consumer_registry is not None
+    _runtime.broker_registry.register("test-noop-broker", _NoopBroker())
+    _runtime.consumer_registry.register("test-noop-broker", build_consumer)
+
+    with TestClient(app):
+        pass
+
+    (spec,) = built_specs
+    assert spec.serializer._max_payload_bytes == 1048576
 
 
 @pytest.mark.parametrize("missing_adapter", ["broker", "consumer"])

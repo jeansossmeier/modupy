@@ -8,9 +8,13 @@ import tomllib
 from pathlib import Path, PurePosixPath
 
 import pytest
+from typer.testing import CliRunner
 
 from modulith import ConfigurationError
+from modulith.cli import app
 from modulith.config import _redact_broker_url, load_configuration
+
+runner = CliRunner()
 
 
 # Reset cwd-dependent state by running each test in a tmp_path. This
@@ -813,6 +817,68 @@ def test_verify_subtable_stays_reserved_noop(tmp_path: Path) -> None:
     assert cfg.outbox == "postgres"
 
 
+def test_verify_disabled_rules_is_parsed_into_configuration(tmp_path: Path) -> None:
+    """[tool.modulith.verify].disabled_rules lands on verify_disabled_rules.
+
+    Other keys in the same subtable (e.g. mode) stay a documented no-op.
+    """
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith.verify]\nmode = "ratchet"\n'
+        'disabled_rules = ["use-contracts", "data-ownership"]\n'
+    )
+    cfg = load_configuration()
+    assert cfg.verify_disabled_rules == ("use-contracts", "data-ownership")
+
+
+def test_verify_disabled_rules_rejects_non_string_entries(tmp_path: Path) -> None:
+    """A non-string rule name must raise, not silently pass through."""
+    (tmp_path / "pyproject.toml").write_text("[tool.modulith.verify]\ndisabled_rules = [1, 2]\n")
+    with pytest.raises(ConfigurationError, match="disabled_rules"):
+        load_configuration()
+
+
+def test_verify_disabled_rules_rejects_non_list(tmp_path: Path) -> None:
+    """A scalar disabled_rules (forgot the brackets) must raise."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith.verify]\ndisabled_rules = "use-contracts"\n'
+    )
+    with pytest.raises(ConfigurationError, match="disabled_rules"):
+        load_configuration()
+
+
+def test_verify_disabled_rules_defaults_to_empty(tmp_path: Path) -> None:
+    """No [tool.modulith.verify] table at all leaves the default empty tuple."""
+    cfg = load_configuration()
+    assert cfg.verify_disabled_rules == ()
+
+
+def test_cli_verify_honors_disabled_rules_from_pyproject(make_fake_app, monkeypatch, tmp_path):
+    """End-to-end: `modulith verify` skips a rule named in disabled_rules."""
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {
+            "orders": "from fakeapp.inventory._internal import secret\n",
+            "inventory": "",
+        },
+        extra_files={"inventory/_internal.py": "secret = 1\n"},
+    )
+
+    without_setting = runner.invoke(app, ["verify"])
+    assert without_setting.exit_code == 1, without_setting.output
+    assert "no-internal-imports" in without_setting.output
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith.verify]\ndisabled_rules = ["no-internal-imports"]\n'
+    )
+
+    from modulith.runtime import _runtime
+
+    _runtime._reset_for_testing()
+    with_setting = runner.invoke(app, ["verify"])
+    assert with_setting.exit_code == 0, with_setting.output
+    assert "no-internal-imports" not in with_setting.output
+
+
 # ----- dict-typed field validation --------------------------------------------
 
 
@@ -924,6 +990,22 @@ def test_empty_string_env_vars_are_documented_as_unset(monkeypatch) -> None:
     assert cfg.outbox == "memory"
     assert not cfg.is_explicit("package")
     assert not cfg.is_explicit("topology")
+    assert not cfg.is_explicit("outbox")
+
+
+def test_whitespace_only_env_vars_are_treated_as_unset(monkeypatch) -> None:
+    """MODULITH_X="   " must follow the same unset contract as "" (see
+    test_empty_string_env_vars_are_documented_as_unset) — a templated
+    deployment can render a blank value with surrounding whitespace just as
+    easily as a truly empty string, and _env_bool already strips before
+    comparing. Without stripping, package/outbox had no secondary format
+    guard to catch it (unlike broker's dedicated blank-string check)."""
+    monkeypatch.setenv("MODULITH_PACKAGE", "   ")
+    monkeypatch.setenv("MODULITH_OUTBOX", "   ")
+    cfg = load_configuration()
+    assert cfg.package is None
+    assert cfg.outbox == "memory"
+    assert not cfg.is_explicit("package")
     assert not cfg.is_explicit("outbox")
 
 

@@ -18,8 +18,15 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from modulith.config import (
+    DEFAULT_MAX_PAYLOAD_BYTES,
+    MAX_PAYLOAD_BYTES,
+    Configuration,
+    ConfigurationError,
+)
 from modulith.protocols import EventSerializer
-from modulith.serializers import JsonEventSerializer
+from modulith.runtime import _runtime
+from modulith.serializers import JsonEventSerializer, _resolve_max_payload_bytes
 
 if TYPE_CHECKING:
     # Deliberately unimportable at runtime — mirrors an event module whose
@@ -187,11 +194,126 @@ def test_deserialize_resolves_class_from_fqcn() -> None:
     assert type(restored) is SimpleEvent
 
 
+def test_resolve_max_payload_bytes_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", raising=False)
+    assert _resolve_max_payload_bytes(None) == DEFAULT_MAX_PAYLOAD_BYTES
+    assert _resolve_max_payload_bytes({}) == DEFAULT_MAX_PAYLOAD_BYTES
+
+
+def test_resolve_max_payload_bytes_reads_broker_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", raising=False)
+    assert _resolve_max_payload_bytes({"max_payload_bytes": 33554432}) == 33554432
+
+
+def test_resolve_max_payload_bytes_env_overrides_broker_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", "1048576")
+    assert _resolve_max_payload_bytes({"max_payload_bytes": 33554432}) == 1048576
+
+
+def test_resolve_max_payload_bytes_rejects_non_integer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", raising=False)
+    with pytest.raises(ConfigurationError, match="max_payload_bytes"):
+        _resolve_max_payload_bytes({"max_payload_bytes": "not-a-number"})
+
+
+@pytest.mark.parametrize("bad_value", [0, -1, MAX_PAYLOAD_BYTES + 1])
+def test_resolve_max_payload_bytes_rejects_out_of_range(
+    monkeypatch: pytest.MonkeyPatch, bad_value: int
+) -> None:
+    monkeypatch.delenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", raising=False)
+    with pytest.raises(ConfigurationError, match="max_payload_bytes"):
+        _resolve_max_payload_bytes({"max_payload_bytes": bad_value})
+
+
+def test_default_serializer_resolves_cap_from_env_at_first_deserialize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", "10")
+    serializer = JsonEventSerializer()
+    assert serializer._max_payload_bytes is None
+
+    data = serializer.serialize(SimpleEvent(order_id="oversized-payload", quantity=1))
+    assert len(data) > 10
+
+    with pytest.raises(ConfigurationError, match="max_payload_bytes"):
+        serializer.deserialize(data, _fqcn(SimpleEvent))
+
+    assert serializer._max_payload_bytes == 10
+
+
+def test_default_serializer_resolves_cap_from_loaded_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", raising=False)
+    _runtime._config = Configuration(broker_options={"max_payload_bytes": 12})
+    try:
+        serializer = JsonEventSerializer()
+        data = serializer.serialize(SimpleEvent(order_id="x", quantity=1))
+        assert len(data) > 12
+
+        with pytest.raises(ConfigurationError, match="max_payload_bytes"):
+            serializer.deserialize(data, _fqcn(SimpleEvent))
+
+        assert serializer._max_payload_bytes == 12
+    finally:
+        _runtime._reset_for_testing()
+
+
+def test_explicit_max_payload_bytes_ignores_env_and_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", "999999999")
+    _runtime._config = Configuration(broker_options={"max_payload_bytes": 999999999})
+    try:
+        serializer = JsonEventSerializer(max_payload_bytes=10)
+        assert serializer._max_payload_bytes == 10
+
+        data = serializer.serialize(SimpleEvent(order_id="oversized-payload", quantity=1))
+        with pytest.raises(ConfigurationError, match="max_payload_bytes"):
+            serializer.deserialize(data, _fqcn(SimpleEvent))
+
+        assert serializer._max_payload_bytes == 10
+    finally:
+        _runtime._reset_for_testing()
+
+
 def test_deserialize_unknown_module_raises() -> None:
     serializer = JsonEventSerializer()
     data = serializer.serialize(SimpleEvent(order_id="z", quantity=1))
     with pytest.raises((ImportError, ModuleNotFoundError, AttributeError)):
         serializer.deserialize(data, "no.such.module.Nope")
+
+
+def test_deserialize_rejects_payload_exceeding_max_payload_bytes() -> None:
+    serializer = JsonEventSerializer(max_payload_bytes=10)
+    data = serializer.serialize(SimpleEvent(order_id="oversized-payload", quantity=1))
+    assert len(data) > 10
+
+    with pytest.raises(ConfigurationError, match="max_payload_bytes"):
+        serializer.deserialize(data, _fqcn(SimpleEvent))
+
+
+def test_deserialize_rejects_oversized_payload_before_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError("json.loads must not run on an oversized payload")
+
+    monkeypatch.setattr("modulith.serializers.json.loads", _boom)
+    serializer = JsonEventSerializer(max_payload_bytes=5)
+
+    with pytest.raises(ConfigurationError):
+        serializer.deserialize(b"x" * 6, _fqcn(SimpleEvent))
+
+
+def test_default_max_payload_bytes_rejects_payload_over_the_configured_default_cap() -> None:
+    serializer = JsonEventSerializer()
+    oversized = b"{" + b"1" * (DEFAULT_MAX_PAYLOAD_BYTES + 1) + b"}"
+
+    with pytest.raises(ConfigurationError, match="max_payload_bytes"):
+        serializer.deserialize(oversized, _fqcn(SimpleEvent))
 
 
 def test_allowlist_blocks_importable_but_unregistered_event_type() -> None:

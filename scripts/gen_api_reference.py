@@ -270,7 +270,8 @@ def _render_methods_block(obj: type) -> list[str]:
         lines.append(f"- `{prefix}{method_name}{sig}:`")
         doc = inspect.getdoc(method)
         if doc:
-            first = doc.strip().splitlines()[0]
+            first_para = doc.strip().split("\n\n", 1)[0]
+            first = " ".join(first_para.split())
             lines.append(f"  — {first}")
     lines.append("")
     return lines
