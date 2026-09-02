@@ -265,6 +265,7 @@ artifacts = [
 exclude = [
     "/.code_analyzer/**",
     "/.claude/**",
+    "/.opencode/**",
     "/graphify-out/**",
     "**/.modulith-*.db*",
     "**/.modulith-*.hints",

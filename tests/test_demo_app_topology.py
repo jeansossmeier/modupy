@@ -40,7 +40,6 @@ from pathlib import Path
 import httpx
 import pytest
 
-import modulith
 from modulith.adapters.db_broker import DatabaseBroker, broker_schema
 from modulith.proxy import create_proxy_app
 from modulith.supervisor import Supervisor, WorkerSpec, _rules_from_specs
@@ -49,14 +48,15 @@ from conftest import _free_port
 
 pytestmark = [pytest.mark.integration]
 
-# Repo root (the directory containing the ``modulith`` package) so the worker
-# subprocesses can import ``modulith`` regardless of their cwd.
-_REPO_ROOT = Path(modulith.__file__).resolve().parent.parent
+# Repo root (two levels up from this test file, never derived from
+# ``modulith.__file__``, which points into site-packages under a wheel install)
+# so the worker subprocesses can import ``modulith`` regardless of their cwd.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # The real demo app lives at examples/demo_app/shop; its parent directory is
 # what needs to be on the worker subprocesses' PYTHONPATH so ``import shop``
 # resolves.
-DEMO_ROOT = Path(modulith.__file__).resolve().parent.parent / "examples" / "demo_app"
+DEMO_ROOT = Path(__file__).resolve().parent.parent / "examples" / "demo_app"
 
 
 async def _until_async(

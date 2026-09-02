@@ -41,8 +41,6 @@ from typing import Any, NoReturn
 import httpx
 import pytest
 
-import modulith
-
 from conftest import _free_port
 
 pytestmark = [pytest.mark.integration]
@@ -50,7 +48,7 @@ pytestmark = [pytest.mark.integration]
 # The real demo app the README quickstart uses. It is deliberately NOT
 # installed into the environment — resolving it from its own directory is the
 # thing under test.
-DEMO_ROOT = Path(modulith.__file__).resolve().parent.parent / "examples" / "demo_app"
+DEMO_ROOT = Path(__file__).resolve().parent.parent / "examples" / "demo_app"
 
 # The ``modulith`` entry point an install of modupy writes next to the
 # interpreter. The interpreter's own scripts directory is searched first so a

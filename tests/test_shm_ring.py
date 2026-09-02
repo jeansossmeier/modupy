@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import stat
 import struct
+import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -308,16 +309,18 @@ def test_create_leaves_no_extra_hard_link_visible_to_a_racing_peer(
 
     The file is installed with a hard link from a private scratch name, and a
     state file carrying more than one link is rejected outright as a possible
-    hijack (_state_path._validate_regular_file). Closing the creator's
-    descriptor is the last thing that happens while the scratch name could
-    still exist, so it is the widest point of the window: sample the link
-    count there.
+    hijack (_state_path._validate_regular_file). The creator's descriptor must
+    close before the install link is ever made, so the ring path must not
+    exist yet at the moment of close; sample that directly, plus the link
+    count for the (should-never-trigger) case where it is already visible.
     """
     path = tmp_path / "racy.mmap"
     real_close = os.close
+    installed_at_close: list[bool] = []
     link_counts: list[int] = []
 
     def sampling_close(fd: int) -> None:
+        installed_at_close.append(path.exists())
         if path.exists():
             link_counts.append(path.stat().st_nlink)
         real_close(fd)
@@ -327,8 +330,71 @@ def test_create_leaves_no_extra_hard_link_visible_to_a_racing_peer(
     monkeypatch.undo()
     try:
         assert notifier.available
-        assert link_counts, "the creator never closed its descriptor"
+        assert installed_at_close, "the creator never closed its descriptor"
+        assert not any(installed_at_close), (
+            "the hint file was installed before the creator closed its descriptor"
+        )
         assert link_counts == [1] * len(link_counts)
         assert path.stat().st_nlink == 1
+    finally:
+        notifier.close()
+
+
+def test_windows_unlink_denial_while_descriptor_open_still_yields_one_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Simulates Windows refusing to drop a name whose handle is still open.
+
+    Real Windows either raises on ``os.unlink`` for an open handle or defers
+    the delete until close; both leave the temporary name's link visible for
+    as long as the descriptor stays open. Denying every unlink while any
+    mkstemp descriptor is tracked open reproduces that window locally, and
+    sampling the ring path's link count at each ``os.close`` call (before the
+    descriptor is considered closed) catches it deterministically.
+    """
+    path = tmp_path / "windows.mmap"
+    open_descriptors: set[int] = set()
+    real_mkstemp = tempfile.mkstemp
+    real_close = os.close
+    real_unlink = os.unlink
+    nlink_while_open: list[int] = []
+
+    def tracking_mkstemp(*args: Any, **kwargs: Any) -> tuple[int, str]:
+        descriptor, name = real_mkstemp(*args, **kwargs)
+        open_descriptors.add(descriptor)
+        return descriptor, name
+
+    def tracking_close(descriptor: int) -> None:
+        if path.exists():
+            nlink_while_open.append(path.stat().st_nlink)
+        open_descriptors.discard(descriptor)
+        real_close(descriptor)
+
+    def denying_unlink(name: str) -> None:
+        if open_descriptors:
+            raise PermissionError(13, "simulated Windows sharing violation")
+        real_unlink(name)
+
+    monkeypatch.setattr(tempfile, "mkstemp", tracking_mkstemp)
+    monkeypatch.setattr(os, "close", tracking_close)
+    monkeypatch.setattr(os, "unlink", denying_unlink)
+
+    notifier = ShmRing(path, capacity=4, create=True)
+    monkeypatch.undo()
+    try:
+        assert notifier.available
+        assert nlink_while_open == [], (
+            f"the ring path carried extra links while the descriptor was still "
+            f"open: {nlink_while_open}"
+        )
+        assert path.exists()
+        assert path.stat().st_nlink == 1
+        leftovers = [
+            entry.name
+            for entry in tmp_path.iterdir()
+            if entry.name.startswith(f".{path.name}.") and entry.name.endswith(".tmp")
+        ]
+        assert leftovers == []
     finally:
         notifier.close()

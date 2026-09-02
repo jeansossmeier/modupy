@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -895,3 +896,40 @@ async def test_prune_uses_completion_time_instead_of_publication_age(
         assert await store.prune(retention_age_seconds=60) == 1
     finally:
         await store.close()
+
+
+def test_prune_removes_a_row_completed_on_the_same_clock_tick_as_the_prune_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """retention_age_seconds=0 means "prunable once terminal for at least zero
+    seconds". On a coarse wall clock (observed on Windows CI), the completion
+    write and the prune read can land on the identical time.time() tick, so
+    the row must still be pruned even though the clock never advanced between
+    them."""
+    path = tmp_path / "frozen-clock.db"
+    store = SqliteQueueStore(
+        str(path),
+        synchronous="NORMAL",
+        completion_mode="mark",
+        orphan_retention_seconds=86400.0,
+        retry_backoff_base_seconds=0.05,
+        retry_backoff_cap_seconds=5.0,
+    )
+    try:
+        monkeypatch.setattr(time, "time", lambda: 1_000_000.0)
+        store.subscribe(["events.Created"], "g1")
+        store.publish("events.Created", b"{}", None, "publication-1")
+        claimed = store.claim("g1", 1, "worker", 60.0)
+        assert store.ack(claimed[0]["claim_token"], "worker", None)
+
+        assert store.prune(retention_age_seconds=0, limit=10) == 1
+
+        assert _rows(path, "SELECT status FROM shm_delivery") == []
+        tombstones = _rows(
+            path,
+            "SELECT publication_id, consumer_group FROM shm_completion_tombstone",
+        )
+        assert [tuple(item) for item in tombstones] == [("publication-1", "g1")]
+    finally:
+        store.close()

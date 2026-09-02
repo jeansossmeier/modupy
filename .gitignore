@@ -200,6 +200,9 @@ graphify-out/
 # Claude Code cache and session state
 .claude/
 
+# Local AI tool directories
+.opencode/
+
 # Private local broker state. The defaults normally live outside the project in
 # a per-user state directory; these patterns protect explicit project-local paths.
 .modulith-broker.db*

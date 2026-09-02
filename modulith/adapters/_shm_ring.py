@@ -185,6 +185,15 @@ class ShmRing:
                 )
                 mapping.flush()
             os.fsync(file_descriptor)
+            # Close before linking, not after. Windows will not drop a name
+            # whose descriptor is still open — the unlink below either raises
+            # or defers until close — so linking first would leave the
+            # temporary name (and st_nlink == 2) visible for as long as the
+            # descriptor stayed open. Data is already durable via fsync above,
+            # and link/unlink act on names, not the descriptor, so closing
+            # early changes nothing about their semantics on any platform.
+            os.close(file_descriptor)
+            file_descriptor = -1
             os.link(temporary_name, self._path)
             # Drop the temporary name here rather than leaving it to the
             # ``finally`` clause. Between the link and the unlink the inode
@@ -193,9 +202,8 @@ class ShmRing:
             # _state_path._validate_regular_file, which treats extra links as a
             # possible hijack) — a hard startup failure caused entirely by this
             # process's own scratch name. Unlinking on the success path leaves
-            # only the two adjacent syscalls exposed instead of also spanning
-            # the descriptor close below; link-then-unlink is the tightest a
-            # create that must not clobber a peer can get.
+            # only these two adjacent syscalls exposed; link-then-unlink is the
+            # tightest a create that must not clobber a peer can get.
             with suppress(OSError):
                 os.unlink(temporary_name)
                 temporary_name = ""

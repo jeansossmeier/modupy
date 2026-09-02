@@ -157,7 +157,7 @@ def prune(
                 SELECT id, publication_id, consumer_group, completed_at
                 FROM shm_delivery
                 WHERE status IN ('done', 'dead')
-                  AND completed_at IS NOT NULL AND completed_at<?
+                  AND completed_at IS NOT NULL AND completed_at<=?
                 ORDER BY completed_at, id LIMIT ?
                 """,
                 (cutoff, limit),
