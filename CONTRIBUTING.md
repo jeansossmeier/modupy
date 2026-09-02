@@ -26,7 +26,7 @@ There are two test suites. Both require the dev setup above.
 pytest -m "not integration" -v --tb=short
 ```
 
-This runs the full default suite (~1,400 tests) against in-memory SQLite,
+This runs the full default suite (~1,770 tests) against in-memory SQLite,
 temporary files, and real in-process brokers.
 
 **Integration suite** (requires Docker):
