@@ -83,6 +83,41 @@ def test_alembic_upgrade_creates_broker_schema(tmp_path: Path) -> None:
     assert "ix_broker_retained_message_target_expiry" in indexes
 
 
+async def test_alembic_upgrade_head_after_broker_self_bootstrap(tmp_path: Path) -> None:
+    """``DatabaseBroker`` self-bootstraps its tables with ``metadata.create_all``
+    on a database no migration has ever touched (the documented zero-alembic
+    broker path). Adopting the outbox afterwards runs ``upgrade head`` against
+    that same database, so the broker revisions must stamp through objects that
+    are already there instead of dying on 'table already exists' and pinning
+    ``alembic_version`` at 0001 forever."""
+    from modulith.adapters.db_broker import DatabaseBroker
+
+    db = tmp_path / "race.db"
+    broker = DatabaseBroker(url=f"sqlite+aiosqlite:///{db}")
+    try:
+        await broker.subscribe(["fakeapp.orders.WidgetCreated"], "modulith-inventory")
+    finally:
+        await broker.engine.dispose()
+
+    assert "broker_subscription" in _objects(db, "table")
+
+    command.upgrade(_cfg(db), "head")
+
+    conn = sqlite3.connect(db)
+    try:
+        versions = {r[0] for r in conn.execute("SELECT version_num FROM alembic_version")}
+    finally:
+        conn.close()
+    assert versions == {"0005_outbox_scan_indexes"}
+
+    tables = _objects(db, "table")
+    assert "event_publications" in tables
+    assert "broker_retained_delivery" in tables
+    indexes = _objects(db, "index")
+    assert "ix_broker_message_claim" in indexes
+    assert "ix_broker_retained_message_target_expiry" in indexes
+
+
 def test_outbox_claim_lease_columns_exist_in_migration_and_model(tmp_path: Path) -> None:
     from modulith.adapters.postgres_outbox import EventPublicationRow
 

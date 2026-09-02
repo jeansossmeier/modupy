@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import mmap
 import multiprocessing
 import os
@@ -398,3 +399,54 @@ def test_windows_unlink_denial_while_descriptor_open_still_yields_one_link(
         assert leftovers == []
     finally:
         notifier.close()
+
+
+def test_idle_prescan_never_reduces_over_a_capacity_sized_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The idle prescan must cost O(1), not O(capacity): a consumer whose
+    cursor is already caught up must never trigger a per-slot unpack, nor a
+    reduction (``max``) over a sequence whose length scales with capacity."""
+    small = ShmRing(tmp_path / "small.mmap", capacity=16, create=True)
+    large = ShmRing(tmp_path / "large.mmap", capacity=200_000, create=True)
+    try:
+        assert small.notify(7)
+        assert large.notify(7)
+
+        real_max = builtins.max
+        arg_lengths: list[int] = []
+
+        def counting_max(*args: Any, **kwargs: Any) -> Any:
+            if len(args) == 1:
+                try:
+                    arg_lengths.append(len(args[0]))
+                except TypeError:
+                    pass
+            return real_max(*args, **kwargs)
+
+        slot_unpacks = 0
+
+        class CountingSlotStruct:
+            def unpack(self, buffer: bytes) -> tuple[int, int]:
+                nonlocal slot_unpacks
+                slot_unpacks += 1
+                sequence, complement = shm_ring_module._SLOT_STRUCT.unpack(buffer)
+                return int(sequence), int(complement)
+
+        monkeypatch.setattr(builtins, "max", counting_max)
+        monkeypatch.setattr(shm_ring_module, "_SLOT_STRUCT", CountingSlotStruct())
+
+        assert small.read_hints(after_sequence=7) == []
+        small_lengths, arg_lengths[:] = list(arg_lengths), []
+
+        assert large.read_hints(after_sequence=7) == []
+        large_lengths = list(arg_lengths)
+
+        assert slot_unpacks == 0
+        assert not small_lengths or real_max(small_lengths) <= 2
+        assert not large_lengths or real_max(large_lengths) <= 2
+    finally:
+        monkeypatch.undo()
+        small.close()
+        large.close()

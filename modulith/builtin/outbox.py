@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import threading
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
@@ -255,9 +256,10 @@ def configure(
             f"claim_strategy must be one of {VALID_CLAIM_STRATEGIES}, got {claim_strategy!r}"
         )
     if not isinstance(claim_lease_seconds, (int, float)) or not (
-        claim_lease_seconds == claim_lease_seconds and claim_lease_seconds > 0
+        math.isfinite(claim_lease_seconds) and claim_lease_seconds > 0
     ):
-        # NaN != NaN; reject non-finite / non-positive leases.
+        # Reject NaN, +/-inf, and non-positive leases — matching
+        # config.py's _validate_outbox_options, which already does this.
         raise ValueError(
             f"claim_lease_seconds must be a positive finite number, got {claim_lease_seconds!r}"
         )
@@ -313,6 +315,12 @@ def _ensure_retry_loop() -> None:
     event loops on two OS threads could both see the slot empty and each
     spawn a retry-loop task, with the single-slot module global orphaning
     the loser (no reference, no cancellation path).
+
+    A task whose loop has since been closed (e.g. ``sync._run_nested_dispatch``
+    ran a transactional publish on a throwaway loop, then closed it) is
+    treated as absent rather than merely "not done" — it will never run
+    another step, so the ``not _retry_task.done()`` guard alone would block
+    every future retry loop for the rest of the process.
     """
     global _retry_task
     try:
@@ -320,7 +328,11 @@ def _ensure_retry_loop() -> None:
     except RuntimeError:
         return
     with _retry_task_lock:
-        if _retry_task is not None and not _retry_task.done():
+        if (
+            _retry_task is not None
+            and not _retry_task.done()
+            and not _retry_task.get_loop().is_closed()
+        ):
             return
         _retry_task = loop.create_task(_retry_loop())
 
@@ -937,7 +949,15 @@ async def _dispatch_with_lease_renewal(publication: EventPublication) -> None:
         try:
             await renew_task
         except asyncio.CancelledError:
-            pass
+            # This may be renew_task's own expected exit, or a cancellation
+            # aimed at the ENCLOSING task (e.g. outbox.shutdown()) landing at
+            # this exact suspension point. Re-raise only the latter, matching
+            # _polling_consumer.PollingConsumer._cancel's idiom — otherwise
+            # shutdown()'s cancellation is silently discarded here and its
+            # poll loop spins forever.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling() > 0:
+                raise
 
 
 async def _guarded_sweep(older_than: timedelta) -> None:
@@ -1004,16 +1024,30 @@ async def shutdown() -> None:
     if task is None:
         return
     if not task.done():
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if task.get_loop() is running:
-            task.cancel()
+        if task.get_loop().is_closed():
+            # Stranded on a closed foreign loop — it will never take another
+            # step, so cancelling or waiting for it would hang forever.
+            logger.warning(
+                "outbox retry task was stranded on a closed event loop; "
+                "clearing it without waiting for it to finish"
+            )
         else:
-            task.get_loop().call_soon_threadsafe(task.cancel)
-        while not task.done():
-            await asyncio.sleep(0.01)
+            stranded = False
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if task.get_loop() is running:
+                task.cancel()
+            else:
+                try:
+                    task.get_loop().call_soon_threadsafe(task.cancel)
+                except RuntimeError:
+                    # The loop closed between the check above and this call.
+                    stranded = True
+            if not stranded:
+                while not task.done():
+                    await asyncio.sleep(0.01)
     with _retry_task_lock:
         # Clear the slot only if no concurrent configure()/_ensure_retry_loop()
         # installed a fresh task while we awaited the cancellation.
@@ -1035,8 +1069,12 @@ async def status() -> dict[str, int]:
     operational counts (a 50k backlog would otherwise read as 100). Stores
     without those capabilities (the in-memory test double) fall back to
     partitioning the incomplete set by the attempt threshold. ``completed``
-    comes from ``count_completed``; stores that delete on completion report
-    zero, which is correct for them.
+    comes from ``count_completed`` plus the store's optional
+    ``count_archived`` (rows moved out of the primary table under
+    ``completion_mode="archive"`` are gone from ``count_completed`` by
+    construction, so a store using that mode must expose ``count_archived``
+    for its archived rows to be counted at all). Stores that delete on
+    completion report zero, which is correct for them.
     """
     assert _store is not None
     count_open = getattr(_store, "count_open", None)
@@ -1052,6 +1090,9 @@ async def status() -> dict[str, int]:
     counter = getattr(_store, "count_completed", None)
     if counter is not None:
         completed = await counter()
+    archived_counter = getattr(_store, "count_archived", None)
+    if archived_counter is not None:
+        completed += await archived_counter()
     return {"incomplete": incomplete, "completed": completed, "dead_lettered": dead}
 
 

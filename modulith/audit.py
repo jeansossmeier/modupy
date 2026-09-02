@@ -131,7 +131,7 @@ def audit_codebase(root: Path, contracts_module: str = CONTRACTS_MODULE) -> Audi
     parsed, failures = _split_by_parseability(files)
     proposed = _propose_module_structure(root, parsed)
     cross = _find_cross_module_imports(root, parsed, proposed, contracts_module)
-    shared = _find_shared_tables(root, parsed)
+    shared = _find_shared_tables(root, parsed, contracts_module)
     listeners = _find_listener_candidates(parsed)
     score = _compute_readiness_score(cross, listeners)
     return AuditResult(
@@ -286,14 +286,25 @@ def _string_table_refs(tree: ast.Module) -> set[str]:
     return {name for name, _line, _kind in _table_refs_from_tree(tree)}
 
 
-def _find_shared_tables(root: Path, files: list[Path]) -> list[str]:
-    """Tables referenced from more than one proposed module."""
+def _find_shared_tables(
+    root: Path, files: list[Path], contracts_module: str = CONTRACTS_MODULE
+) -> list[str]:
+    """Tables referenced from more than one proposed module.
+
+    The contracts module is excluded from the sharing computation, mirroring
+    the exemption ``_find_cross_module_imports`` already gives contracts
+    imports: extraction always copies the contracts module alongside the
+    extracted module (``extract.py``'s ``_populate_extraction``), so a table
+    defined/referenced only in contracts is never actually left behind.
+    """
     table_modules: dict[str, set[str]] = defaultdict(set)
     for path in files:
         tree = _parse(path)
         if tree is None:
             continue
         module = _module_of(root, path)
+        if module == contracts_module:
+            continue
         for table in _string_table_refs(tree):
             table_modules[table].add(module)
     return sorted(t for t, mods in table_modules.items() if len(mods) > 1)

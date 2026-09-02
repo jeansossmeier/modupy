@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1245,6 +1246,56 @@ async def test_orphaned_claim_is_reclaimed_after_visibility_timeout(engine: Any)
     assert reclaimed[0]["id"] == first[0]["id"]
 
 
+async def test_reclaim_counts_as_a_delivery_attempt(engine: Any) -> None:
+    """A consumer that dies (or wedges) between claim and ack never reaches
+    ``fail()``, so the reclaim itself has to burn an attempt — otherwise the
+    row is handed out forever with ``attempts`` frozen at 0 and never reaches
+    the dead-letter cap."""
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="r1", status="claimed", claimed_by="c0")
+
+    reclaimed = await broker.claim_batch(
+        "g", batch_size=10, consumer_name="c1", reclaim_stale_seconds=0.0
+    )
+
+    assert [row["id"] for row in reclaimed] == ["r1"]
+    assert reclaimed[0]["attempts"] == 1
+    assert await _fetch_row(engine, "r1") == ("claimed", 1, "c1")
+
+
+async def test_fresh_claim_does_not_count_as_a_delivery_attempt(engine: Any) -> None:
+    """Only a reclaim burns an attempt: a first delivery of a pending row must
+    leave the retry budget untouched."""
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="f1", status="pending")
+
+    claimed = await broker.claim_batch(
+        "g", batch_size=10, consumer_name="c1", reclaim_stale_seconds=0.0
+    )
+
+    assert [row["id"] for row in claimed] == ["f1"]
+    assert await _fetch_row(engine, "f1") == ("claimed", 0, "c1")
+
+
+async def test_reclaim_dead_letters_the_row_that_burned_its_last_attempt(engine: Any) -> None:
+    """A row whose reclaim exhausts ``max_attempts`` must be dead-lettered at
+    claim time and withheld from the batch — nothing on the crash/wedge path
+    ever calls ``fail()`` to apply the cap for it."""
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="p1", status="claimed", attempts=4, claimed_by="c0")
+    await _insert_ex(engine, id="ok", status="pending")
+
+    rows = await broker.claim_batch(
+        "g", batch_size=10, consumer_name="c1", reclaim_stale_seconds=0.0, max_attempts=5
+    )
+
+    assert [row["id"] for row in rows] == ["ok"]
+    assert await _fetch_row(engine, "p1") == ("dead", 5, None)
+
+
 # ---------------------------------------------------------------------------
 # Process-death durability (real crash, not simulated)
 # ---------------------------------------------------------------------------
@@ -1312,6 +1363,27 @@ def test_database_broker_rejects_invalid_schema_from_direct_options_and_env(
 
     with pytest.raises(ConfigurationError, match="schema"):
         DatabaseBroker(engine=_PostgresSchemaOptionEngine(), engine_options=options)
+
+
+def test_database_broker_schema_falls_back_to_the_migration_schema(monkeypatch: Any) -> None:
+    """Migrations target ``MODULITH_DB_SCHEMA``; without a fallback an operator
+    who sets only that knob gets a runtime broker pointed at ``public``,
+    silently creating a second untracked table set beside the migrated one."""
+    monkeypatch.delenv("MODULITH_BROKER_SCHEMA", raising=False)
+    monkeypatch.setenv("MODULITH_DB_SCHEMA", "tenant_a")
+
+    broker = DatabaseBroker(engine=_PostgresSchemaOptionEngine())
+
+    assert broker._schema == "tenant_a"
+
+
+def test_database_broker_schema_option_wins_over_the_migration_schema(monkeypatch: Any) -> None:
+    monkeypatch.setenv("MODULITH_DB_SCHEMA", "tenant_a")
+    monkeypatch.setenv("MODULITH_BROKER_SCHEMA", "tenant_b")
+
+    broker = DatabaseBroker(engine=_PostgresSchemaOptionEngine())
+
+    assert broker._schema == "tenant_b"
 
 
 async def test_spawned_claimant_crash_preserves_durability(tmp_path: Path) -> None:
@@ -3563,6 +3635,72 @@ async def test_ensure_schema_survives_concurrent_sqlite_bootstrap(tmp_path: Path
         assert not [r for r in results if isinstance(r, BaseException)], results
     finally:
         await asyncio.gather(*(broker.close() for broker in brokers), return_exceptions=True)
+
+
+class _TwoLoopSchemaConn:
+    async def run_sync(self, _fn: Any) -> None:
+        await asyncio.sleep(0.05)
+
+
+class _TwoLoopSchemaBegin:
+    def __init__(self, conn: _TwoLoopSchemaConn) -> None:
+        self._conn = conn
+
+    async def __aenter__(self) -> _TwoLoopSchemaConn:
+        return self._conn
+
+    async def __aexit__(self, *_: Any) -> bool:
+        return False
+
+
+class _TwoLoopSchemaEngine:
+    """Minimal async-engine stand-in with no real connection pool, so the
+    only cross-loop hazard it can exercise is ``DatabaseBroker._schema_lock``
+    itself. A real SQLAlchemy engine's connection pool binds its own internal
+    ``asyncio.Queue`` to whichever loop first checks out a connection and is
+    not itself safe to share across loops — using one here would mask this
+    test's target behavior behind that unrelated, separate hang."""
+
+    def __init__(self) -> None:
+        self._conn = _TwoLoopSchemaConn()
+        self.dialect = SimpleNamespace(name="sqlite")
+
+    def begin(self) -> _TwoLoopSchemaBegin:
+        return _TwoLoopSchemaBegin(self._conn)
+
+
+async def test_ensure_schema_from_two_event_loops_does_not_deadlock() -> None:
+    """DatabaseBroker._schema_lock must not bind to a single event loop.
+    _ensure_schema() is reachable from a second loop (mirroring
+    sync.publish_sync's persistent daemon-thread loop), which previously
+    raised a cross-loop RuntimeError on whichever side lost the race to bind
+    the plain ``asyncio.Lock()`` created in __init__ — or wedged that side
+    forever, since the winner's release() sets the loser's waiter future
+    directly rather than via call_soon_threadsafe."""
+    broker = DatabaseBroker(engine=_TwoLoopSchemaEngine())
+
+    other_loop = asyncio.new_event_loop()
+    other_ready = threading.Event()
+
+    def run_other_loop() -> None:
+        asyncio.set_event_loop(other_loop)
+        other_ready.set()
+        other_loop.run_forever()
+
+    other_thread = threading.Thread(target=run_other_loop, daemon=True)
+    other_thread.start()
+    try:
+        assert other_ready.wait(2.0)
+
+        other_future = asyncio.run_coroutine_threadsafe(broker._ensure_schema(), other_loop)
+        await asyncio.wait_for(broker._ensure_schema(), timeout=10.0)
+        await asyncio.wait_for(asyncio.wrap_future(other_future), timeout=10.0)
+
+        assert broker._schema_ready is True
+    finally:
+        other_loop.call_soon_threadsafe(other_loop.stop)
+        other_thread.join(timeout=5.0)
+        other_loop.close()
 
 
 async def test_broker_tables_present_requires_retained_tables(engine: Any) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import weakref
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -21,16 +22,37 @@ class SerialStoreExecutor:
             max_workers=1,
             thread_name_prefix="modulith-shm-store",
         )
-        self._operation_lock = asyncio.Lock()
+        # Keyed per running loop: an asyncio.Lock binds to the first loop that
+        # contends it and raises (or wedges the other side) for every other
+        # loop thereafter, but this object is reached from more than one loop
+        # by design (the async worker's loop and sync.publish_sync's
+        # daemon-thread loop). Each loop only needs to serialize against
+        # itself here — the single-worker executor already serializes the
+        # actual SQLite calls across loops. A weak key lets a closed loop's
+        # entry disappear once nothing else holds it — sync.py's
+        # _run_nested_dispatch creates and closes a fresh loop per call, and a
+        # plain dict would grow one dead Lock per call for the life of the
+        # process.
+        self._locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+            weakref.WeakKeyDictionary()
+        )
         self._store: SqliteQueueStore | None = None
         self._worker_thread_id: int | None = None
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
 
+    def _lock_for_running_loop(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        lock = self._locks.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[loop] = lock
+        return lock
+
     async def _call(self, method: str, *args: Any) -> Any:
         if self._closed:
             raise RuntimeError("SHM cold store is closed")
-        async with self._operation_lock:
+        async with self._lock_for_running_loop():
             if self._closed:
                 raise RuntimeError("SHM cold store is closed")
             loop = asyncio.get_running_loop()
@@ -60,7 +82,7 @@ class SerialStoreExecutor:
             raise
 
     async def _close_once(self) -> None:
-        async with self._operation_lock:
+        async with self._lock_for_running_loop():
             if self._closed:
                 return
             loop = asyncio.get_running_loop()

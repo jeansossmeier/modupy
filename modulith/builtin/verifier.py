@@ -3,6 +3,10 @@
 Walks every ``.py`` file under each application module with ``ast.parse()``,
 collects imports (and table references), and emits ``Violation``s for any
 cross-module access that breaks the rules. Source is parsed, never executed.
+``importlib.import_module(<literal>)`` and ``__import__(<literal>)`` calls
+are collected alongside static imports; a dynamically computed target
+(a variable, a call result) cannot be resolved statically and is an
+undetected residual limitation, not a guarantee.
 
 The six default rules:
   1. No cross-module *private* imports — ``myapp.orders`` cannot import from
@@ -76,6 +80,26 @@ def _configured_contracts_module() -> str:
     return cfg.contracts_module if cfg is not None else CONTRACTS_MODULE
 
 
+def _configured_disabled_rules() -> frozenset[str]:
+    """The rule names disabled via runtime config, or none.
+
+    Mirrors ``_configured_contracts_module``: read lazily from the runtime
+    config so ``[tool.modulith.verify].disabled_rules`` is honored the
+    moment that field starts landing on ``Configuration``, with no hookspec
+    change needed. ``getattr`` with a default keeps this forward-compatible
+    with today's runtime, which doesn't parse the field yet.
+    """
+    try:
+        from ..runtime import _runtime
+
+        cfg = _runtime.config
+    except Exception:  # pragma: no cover - defensive; runtime import is stable
+        return frozenset()
+    if cfg is None:
+        return frozenset()
+    return frozenset(getattr(cfg, "verify_disabled_rules", ()) or ())
+
+
 # ---------------------------------------------------------------------------
 # The hook entrypoint
 # ---------------------------------------------------------------------------
@@ -92,18 +116,32 @@ def modulith_verify_module(
     alongside and contribute their own. Cycle detection (rule 2) is global
     and runs once via ``detect_cycles`` — not here, to avoid N-fold
     duplication across per-module calls.
+
+    Each rule (other than the parse-error diagnostic) is skipped when its
+    name is in ``_configured_disabled_rules()`` — see that function's
+    docstring for the config surface this honors.
     """
     violations: list[Violation] = []
     parse_errors: list[tuple[Path, str]] = []
     imports = _collect_imports(module, parse_errors)
     contracts_module = _configured_contracts_module()
+    disabled_rules = _configured_disabled_rules()
 
     violations.extend(_check_parse_errors(module, parse_errors))
-    violations.extend(_check_no_internal_imports(module, imports, all_modules))
-    violations.extend(_check_uses_contracts_module(module, imports, all_modules, contracts_module))
-    violations.extend(_check_declared_dependencies(module, imports, all_modules, contracts_module))
-    violations.extend(_check_data_ownership(module, all_modules))
-    violations.extend(_check_contracts_is_sink(module, imports, all_modules, contracts_module))
+    if "no-internal-imports" not in disabled_rules:
+        violations.extend(_check_no_internal_imports(module, imports, all_modules))
+    if "use-contracts" not in disabled_rules:
+        violations.extend(
+            _check_uses_contracts_module(module, imports, all_modules, contracts_module)
+        )
+    if "undeclared-dependency" not in disabled_rules:
+        violations.extend(
+            _check_declared_dependencies(module, imports, all_modules, contracts_module)
+        )
+    if "data-ownership" not in disabled_rules:
+        violations.extend(_check_data_ownership(module, all_modules))
+    if "contracts-is-sink" not in disabled_rules:
+        violations.extend(_check_contracts_is_sink(module, imports, all_modules, contracts_module))
 
     return violations
 
@@ -136,14 +174,29 @@ class ImportRecord:
 
 
 def _package_dir(package: str) -> Path | None:
-    """Resolve a package's on-disk directory without executing its code."""
+    """Resolve a package's on-disk directory without executing its code.
+
+    ``find_spec`` on a dotted name (e.g. ``"myapp.orders"``) imports every
+    ancestor package for real to read its ``__path__`` — a genuine
+    execution the module docstring's "never executed" guarantee must not
+    permit. A top-level name has no ancestor, so resolving only the first
+    segment via ``find_spec`` is side-effect free; every remaining dotted
+    segment is then just a directory name checked on disk, no import
+    machinery involved.
+    """
+    parts = package.split(".")
     try:
-        spec = importlib.util.find_spec(package)
+        spec = importlib.util.find_spec(parts[0])
     except (ImportError, ModuleNotFoundError, ValueError):
         return None
     if spec is None or not spec.submodule_search_locations:
         return None
-    return Path(next(iter(spec.submodule_search_locations)))
+    directory = Path(next(iter(spec.submodule_search_locations)))
+    for part in parts[1:]:
+        directory = directory / part
+        if not directory.is_dir():
+            return None
+    return directory
 
 
 def _is_type_checking(test: ast.expr, aliases: Collection[str] = ("TYPE_CHECKING",)) -> bool:
@@ -184,6 +237,13 @@ class _ImportCollector(ast.NodeVisitor):
     ``type_only=True`` so the boundary rules (1, 3, 4) still see them —
     wrapping an import in the guard must not bypass encapsulation
     — while cycle detection (rule 2) can skip them.
+
+    ``importlib.import_module(<literal>)`` and ``__import__(<literal>)``
+    calls (plain, attribute, or aliased form) are also recorded, tagged the
+    same as a static ``import <literal>`` — a dynamic import is otherwise
+    invisible to every boundary rule. Only a string-literal argument can be
+    resolved statically; a computed target (a variable, a call result) is a
+    documented residual limitation and produces no ImportRecord.
     """
 
     def __init__(self, source_file: Path, file_package: str) -> None:
@@ -192,6 +252,8 @@ class _ImportCollector(ast.NodeVisitor):
         self.file_package = file_package
         self._tc_aliases: set[str] = {"TYPE_CHECKING"}
         self._type_only_depth = 0
+        self._importlib_aliases: set[str] = set()
+        self._import_module_aliases: set[str] = set()
 
     def visit_If(self, node: ast.If) -> None:
         if _is_type_checking(node.test, self._tc_aliases):
@@ -206,6 +268,8 @@ class _ImportCollector(ast.NodeVisitor):
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
+            if alias.name == "importlib" or alias.name.startswith("importlib."):
+                self._importlib_aliases.add(alias.asname or alias.name.split(".", 1)[0])
             self.records.append(
                 ImportRecord(
                     self.source_file,
@@ -219,6 +283,10 @@ class _ImportCollector(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         self._tc_aliases.update(_type_checking_aliases(node))
+        if not node.level and node.module == "importlib":
+            for alias in node.names:
+                if alias.name == "import_module":
+                    self._import_module_aliases.add(alias.asname or alias.name)
         target = self._resolve(node)
         names = [a.name for a in node.names]
         locals_ = [a.asname or a.name for a in node.names]
@@ -232,6 +300,38 @@ class _ImportCollector(ast.NodeVisitor):
                 type_only=self._type_only_depth > 0,
             )
         )
+
+    def visit_Call(self, node: ast.Call) -> None:
+        target = self._dynamic_import_target(node.func, node.args)
+        if target is not None:
+            self.records.append(
+                ImportRecord(
+                    self.source_file,
+                    node.lineno,
+                    target,
+                    [],
+                    local_names=[],
+                    type_only=self._type_only_depth > 0,
+                )
+            )
+        self.generic_visit(node)
+
+    def _dynamic_import_target(self, func: ast.expr, args: list[ast.expr]) -> str | None:
+        is_dynamic_import = (
+            isinstance(func, ast.Name)
+            and (func.id == "__import__" or func.id in self._import_module_aliases)
+        ) or (
+            isinstance(func, ast.Attribute)
+            and func.attr == "import_module"
+            and isinstance(func.value, ast.Name)
+            and func.value.id in self._importlib_aliases
+        )
+        if not is_dynamic_import or not args:
+            return None
+        arg = args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+        return None
 
     def _resolve(self, node: ast.ImportFrom) -> str:
         if not node.level:  # absolute import
@@ -802,14 +902,22 @@ def _check_data_ownership(
         if owners is None or module.name in owners:
             continue
         owner_text = " and ".join(sorted(owners))
+        if kind == "define":
+            message = (
+                f"{module.name} defines table {table!r}, which is already owned by "
+                f"{owner_text}'s manifest. Rename or remove the duplicate definition, "
+                f"or coordinate ownership between the modules."
+            )
+        else:
+            message = (
+                f"{module.name} references table {table!r}, owned by {owner_text}. "
+                f"Access another module's data through its events or public API "
+                f"(best-effort static check)."
+            )
         violations.append(
             Violation(
                 rule="data-ownership",
-                message=(
-                    f"{module.name} references table {table!r}, owned by {owner_text}. "
-                    f"Access another module's data through its events or public API "
-                    f"(best-effort static check)."
-                ),
+                message=message,
                 module=module.name,
                 severity=ViolationSeverity.WARNING,
                 location=location,

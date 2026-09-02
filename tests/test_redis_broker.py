@@ -18,6 +18,7 @@ The fake matches redis-py's async surface for the methods the adapter uses.
 
 from __future__ import annotations
 
+import re
 import sys
 from typing import Any
 
@@ -295,7 +296,10 @@ async def test_dead_letter_is_atomic_and_uses_original_message_identity(broker, 
 
     assert len(fake.eval_calls) == 1
     script, key_count, keys_and_args = fake.eval_calls[0]
-    assert "SET" in script and "NX" in script and "XACK" in script
+    # Dedup is guarded by an EXISTS check (not a SET...NX race) so the dedup
+    # key can only be written AFTER the XADD it guards succeeds — see
+    # test_dead_letter_xadd_failure_leaves_no_dangling_dedup_key below.
+    assert "SET" in script and "EXISTS" in script and "XACK" in script
     assert key_count == 3
     assert keys_and_args[0] == "modulith.events.orders"
     assert keys_and_args[1] == "modulith.events.orders.dead"
@@ -320,6 +324,141 @@ async def test_dead_letter_cap_is_configurable() -> None:
     await broker.dead_letter("orders", "1-0", {b"data": b"{}"})
     _script, _key_count, keys_and_args = fake.eval_calls[0]
     assert 42 in keys_and_args
+
+
+_DEAD_LETTER_CALL_RE = re.compile(r"redis\.call\('(\w+)'[^)]*\)")
+
+
+def _run_dead_letter_script(
+    script: str,
+    keys: tuple[Any, ...],
+    dedup_store: set[Any],
+    on_xadd: Any,
+    on_xack: Any,
+) -> Any:
+    """Execute ``dead_letter``'s Lua script by reading its actual call order
+    and if-guard off the script text the production code just built, rather
+    than assuming an order — no Lua runtime (lupa) is installed in this
+    environment to run the real thing. Understands only the fixed grammar
+    ``dead_letter`` ever emits: an optional guard-setting call, a single
+    ``if <guard> then ... end`` block (itself containing one inline
+    ``for ... do ... end`` loop), and one trailing unconditional call.
+    """
+    if_match = re.search(r"\bif\s+(.+?)\s+then\b", script)
+    assert if_match, "dead_letter script must contain exactly one if-guard"
+    after_then = script[if_match.end() :]
+    ends = [m.start() for m in re.finditer(r"\bend\b", after_then)]
+    assert len(ends) >= 2, "expected the for-loop's end and the if-block's end"
+    if_block_end = if_match.end() + ends[1]
+
+    calls = [(m.group(1), m.start()) for m in _DEAD_LETTER_CALL_RE.finditer(script)]
+    before = [name for name, pos in calls if pos < if_match.start()]
+    guarded = [name for name, pos in calls if if_match.end() <= pos < if_block_end]
+    after = [name for name, pos in calls if pos >= if_block_end]
+
+    dedup_key = keys[2]
+
+    def _exec(name: str) -> Any:
+        if name == "EXISTS":
+            return 1 if dedup_key in dedup_store else 0
+        if name == "SET":
+            set_src = script[script.index("redis.call('SET'") :]
+            set_src = set_src[: set_src.index(")") + 1]
+            if "NX" in set_src and dedup_key in dedup_store:
+                return None
+            dedup_store.add(dedup_key)
+            return True
+        if name == "XADD":
+            on_xadd()
+            return b"1-0"
+        if name == "XACK":
+            on_xack()
+            return 1
+        raise AssertionError(f"unhandled dead_letter script command: {name}")
+
+    guard_value: Any = None
+    for name in before:
+        guard_value = _exec(name)
+
+    guard_expr = if_match.group(1)
+    if "==" in guard_expr:
+        _, _, rhs = guard_expr.partition("==")
+        passed = guard_value == int(rhs.strip())
+    else:
+        passed = bool(guard_value)
+
+    if passed:
+        for name in guarded:
+            _exec(name)
+
+    result: Any = None
+    for name in after:
+        result = _exec(name)
+    return result
+
+
+class _XaddFailure(RuntimeError):
+    """Simulates a Redis-level XADD failure (e.g. WRONGTYPE) inside eval()."""
+
+
+class InterpretedDeadLetterRedis(FakeRedis):
+    """Genuinely executes ``dead_letter``'s Lua script (via
+    ``_run_dead_letter_script``) instead of only recording the eval call, so
+    a test can inject an XADD failure and observe the real consequence on the
+    dedup key, the source ack, and the DLQ stream — proving the ordering
+    fix, not an assumed one (#brokers-net-4)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dedup_keys: set[Any] = set()
+        self.dlq_entries: list[Any] = []
+        self.acked_ids: list[Any] = []
+        self.xadd_should_fail = False
+
+    async def eval(self, script: str, numkeys: int, *keys_and_args: Any) -> int:
+        await super().eval(script, numkeys, *keys_and_args)
+        keys = keys_and_args[:numkeys]
+        args = keys_and_args[numkeys:]
+        message_id = args[1]
+
+        def _xadd() -> None:
+            if self.xadd_should_fail:
+                raise _XaddFailure(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value"
+                )
+            self.dlq_entries.append(message_id)
+
+        def _xack() -> None:
+            self.acked_ids.append(message_id)
+
+        return _run_dead_letter_script(script, keys, self.dedup_keys, _xadd, _xack)
+
+
+async def test_dead_letter_xadd_failure_leaves_no_dangling_dedup_key() -> None:
+    """A failed DLQ append must not persist the dedup key it never earned.
+
+    Regression (#brokers-net-4): the dedup key used to be SET before the
+    guarded XADD, so an XADD failure (e.g. WRONGTYPE on ``<stream>.dead``)
+    left the dedup key behind while the source stayed pending. The consumer's
+    retry then found the dedup key already present, skipped the XADD
+    entirely, and fell through to the unconditional XACK — acking and
+    dropping the poison message with no DLQ record ever written.
+    """
+    fake = InterpretedDeadLetterRedis()
+    broker = RedisStreamsBroker(client=fake, stream_prefix="modulith.events", consumer_group="g")
+
+    fake.xadd_should_fail = True
+    with pytest.raises(_XaddFailure):
+        await broker.dead_letter("orders", "1-0", {b"data": b"{}"})
+
+    assert fake.acked_ids == []  # source must stay pending — no premature XACK
+    assert fake.dedup_keys == set()  # no dedup key survives a failed append
+
+    fake.xadd_should_fail = False
+    await broker.dead_letter("orders", "1-0", {b"data": b"{}"})
+
+    assert fake.dlq_entries == ["1-0"]  # retry actually reaches the DLQ
+    assert fake.acked_ids == ["1-0"]
 
 
 async def test_close_calls_aclose(broker, fake) -> None:
@@ -775,6 +914,58 @@ def test_env_var_overrides_broker_options(make_fake_app, monkeypatch) -> None:
     modulith_register_brokers(registry=registry)
     broker = registry.get("redis-streams")
     assert broker._consumer_group == "grp-from-env"
+
+
+def test_env_var_overrides_broker_options_for_max_payload_bytes(make_fake_app, monkeypatch) -> None:
+    """MODULITH_BROKER_MAX_PAYLOAD_BYTES must win over broker_options.
+
+    Regression: cli.py's process-topology forwarding writes every
+    broker_options key into each worker's environment as
+    MODULITH_BROKER_<KEY>, but the redis adapter never read it back for this
+    key — the forwarded override was silently dropped and the TOML/default
+    value stayed in effect.
+    """
+    make_fake_app({"orders": ""})
+    from modulith import configure
+    from modulith.runtime import _runtime
+
+    monkeypatch.setenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", "999999")
+    configure(
+        package="fakeapp",
+        broker="redis-streams",
+        broker_options={"max_payload_bytes": 111},
+    )
+    _runtime.ensure_bootstrapped()
+
+    registry = BrokerRegistry()
+    modulith_register_brokers(registry=registry)
+    broker = registry.get("redis-streams")
+    assert broker._max_payload_bytes == 999999
+
+
+def test_env_var_overrides_broker_options_for_dlq_max_stream_len(
+    make_fake_app, monkeypatch
+) -> None:
+    """MODULITH_BROKER_DLQ_MAX_STREAM_LEN must win over broker_options.
+
+    Same forwarding gap as max_payload_bytes above, for the DLQ retention cap.
+    """
+    make_fake_app({"orders": ""})
+    from modulith import configure
+    from modulith.runtime import _runtime
+
+    monkeypatch.setenv("MODULITH_BROKER_DLQ_MAX_STREAM_LEN", "424242")
+    configure(
+        package="fakeapp",
+        broker="redis-streams",
+        broker_options={"dlq_max_stream_len": 111},
+    )
+    _runtime.ensure_bootstrapped()
+
+    registry = BrokerRegistry()
+    modulith_register_brokers(registry=registry)
+    broker = registry.get("redis-streams")
+    assert broker._dlq_max_stream_len == 424242
 
 
 # ---------------------------------------------------------------------------

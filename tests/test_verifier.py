@@ -736,5 +736,159 @@ def test_data_ownership_warns_for_table_via_core_table_call(make_fake_app) -> No
         manifest_module._reset_for_testing()
 
 
+# ---------------------------------------------------------------------------
+# Rule 1/3/6: dynamic imports (importlib.import_module / __import__)
+# ---------------------------------------------------------------------------
+
+
+def test_importlib_import_module_attribute_form_is_detected(make_fake_app) -> None:
+    make_fake_app(
+        {
+            "orders": """
+                import importlib
+
+                importlib.import_module("fakeapp.inventory._internal.store")
+            """,
+            "inventory": "",
+        }
+    )
+    mods = [_module("orders"), _module("inventory")]
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    assert any(v.rule == "no-internal-imports" for v in violations)
+
+
+def test_importlib_import_module_named_form_is_detected(make_fake_app) -> None:
+    make_fake_app(
+        {
+            "orders": """
+                from importlib import import_module
+
+                import_module("fakeapp.inventory._internal.store")
+            """,
+            "inventory": "",
+        }
+    )
+    mods = [_module("orders"), _module("inventory")]
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    assert any(v.rule == "no-internal-imports" for v in violations)
+
+
+def test_dunder_import_is_detected(make_fake_app) -> None:
+    make_fake_app(
+        {
+            "orders": """
+                __import__("fakeapp.inventory._internal.store")
+            """,
+            "inventory": "",
+        }
+    )
+    mods = [_module("orders"), _module("inventory")]
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    assert any(v.rule == "no-internal-imports" for v in violations)
+
+
+def test_importlib_import_module_non_literal_argument_is_not_detected(make_fake_app) -> None:
+    # Documented residual limitation: a non-literal argument cannot be
+    # resolved statically. This must not crash — it is simply invisible,
+    # same as before the fix.
+    make_fake_app(
+        {
+            "orders": """
+                import importlib
+
+                target = "fakeapp.inventory._internal.store"
+                importlib.import_module(target)
+            """,
+            "inventory": "",
+        }
+    )
+    mods = [_module("orders"), _module("inventory")]
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    assert all(v.rule != "no-internal-imports" for v in violations)
+
+
+# ---------------------------------------------------------------------------
+# disabled_rules: forward-compatible per-rule skip, honored once config
+# starts parsing [tool.modulith.verify].disabled_rules.
+# ---------------------------------------------------------------------------
+
+
+def test_disabled_rules_skips_named_rule(make_fake_app, monkeypatch) -> None:
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.inventory._internal.store import Repo
+            """,
+            "inventory": "",
+        }
+    )
+    mods = [_module("orders"), _module("inventory")]
+
+    monkeypatch.setattr(
+        verifier, "_configured_disabled_rules", lambda: frozenset({"no-internal-imports"})
+    )
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    assert all(v.rule != "no-internal-imports" for v in violations)
+
+
+def test_disabled_rules_default_is_empty(make_fake_app) -> None:
+    assert verifier._configured_disabled_rules() == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# _package_dir: must never execute ancestor package code
+# ---------------------------------------------------------------------------
+
+
+def test_package_dir_does_not_execute_ancestor_init(make_fake_app) -> None:
+    import sys
+
+    make_fake_app(
+        {"orders": ""},
+        extra_files={"__init__.py": "raise RuntimeError('ancestor package executed')"},
+    )
+    assert "fakeapp" not in sys.modules
+
+    directory = verifier._package_dir("fakeapp.orders")
+
+    assert directory is not None
+    assert directory.name == "orders"
+    assert "fakeapp" not in sys.modules
+
+
+# ---------------------------------------------------------------------------
+# Rule 5 message wording: "defines" vs "references"
+# ---------------------------------------------------------------------------
+
+
+def test_data_ownership_define_conflict_message_says_defines_not_references(
+    make_fake_app,
+) -> None:
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+    make_fake_app(
+        {
+            "customers": "",
+            "reporting": """
+                from sqlalchemy import Table
+                t = Table("customers", metadata)
+            """,
+        }
+    )
+    manifest_module._manifests["fakeapp.customers"] = manifest_module.Manifest(
+        package="fakeapp.customers", owns_tables=("customers",)
+    )
+    try:
+        mods = [_module("customers"), _module("reporting")]
+        violations = verifier.modulith_verify_module(_module("reporting"), mods)
+        ownership = [v for v in violations if v.rule == "data-ownership"]
+        assert len(ownership) == 1
+        assert "defines" in ownership[0].message
+        assert "references" not in ownership[0].message
+    finally:
+        manifest_module._reset_for_testing()
+
+
 # Keep ImportRecord referenced for import-time coverage of the dataclass.
 assert ImportRecord is not None

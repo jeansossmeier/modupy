@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import sqlite3
 import threading
@@ -14,6 +15,7 @@ from typing import Any, cast
 import pytest
 
 from modulith import ConfigurationError, configure
+from modulith.adapters._shm_coldstore import ShmColdStore
 from modulith.adapters._shm_ring import _HEADER_SIZE, _SLOT_SIZE, _SLOT_STRUCT
 from modulith.adapters._shm_store import SqliteQueueStore
 from modulith.adapters.shm_broker import (
@@ -59,6 +61,11 @@ async def broker(tmp_path: Path) -> AsyncIterator[ShmBroker]:
         await instance.close()
         # Explicit test cleanup is separate from ordinary broker shutdown.
         instance._ring.unlink()
+
+
+async def _publish_many(broker: ShmBroker, prefix: str, count: int) -> None:
+    for index in range(count):
+        await broker.publish("events", f"{prefix}-{index}".encode())
 
 
 def _consumer_with_options(**options: Any) -> ShmConsumer:
@@ -377,6 +384,83 @@ async def test_hint_wait_times_out_and_unavailable_ring_uses_safety_delay(
     assert await broker.wait_for_hint(after_sequence=-1, safety_timeout=-1) is None
 
 
+async def test_serial_store_executor_locks_do_not_leak_across_event_loops(
+    tmp_path: Path,
+) -> None:
+    """SerialStoreExecutor._locks must not grow forever. modulith.sync's
+    _run_nested_dispatch creates and closes a fresh event loop per call, so a
+    plain dict keyed by loop object would accumulate one dead Lock per closed
+    loop for the life of a long-running process."""
+    store = ShmColdStore(str(tmp_path / "locks.db"))
+
+    def drive_once() -> None:
+        def run_on_fresh_loop() -> None:
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(store.get_subscriptions())
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=run_on_fresh_loop)
+        thread.start()
+        thread.join(timeout=5.0)
+
+    try:
+        for _ in range(3):
+            drive_once()
+        gc.collect()
+        len_after_few = len(store._locks)
+
+        for _ in range(20):
+            drive_once()
+        gc.collect()
+        len_after_many = len(store._locks)
+
+        assert len_after_many == len_after_few
+    finally:
+        await store.close()
+
+
+async def test_publish_from_two_event_loops_does_not_deadlock(tmp_path: Path) -> None:
+    """SerialStoreExecutor._operation_lock must not bind to a single event
+    loop. A broker reached from a second loop (mirroring sync.publish_sync's
+    persistent daemon-thread loop) previously wedged one side's waiter
+    forever while the other side raised a cross-loop RuntimeError."""
+    broker = ShmBroker(
+        shm_name=str(tmp_path / "two-loop.hints"),
+        db_path=str(tmp_path / "two-loop.db"),
+    )
+    await broker.subscribe(["events"], "workers")
+
+    other_loop = asyncio.new_event_loop()
+    other_ready = threading.Event()
+
+    def run_other_loop() -> None:
+        asyncio.set_event_loop(other_loop)
+        other_ready.set()
+        other_loop.run_forever()
+
+    other_thread = threading.Thread(target=run_other_loop, daemon=True)
+    other_thread.start()
+    try:
+        assert other_ready.wait(2.0)
+
+        other_future = asyncio.run_coroutine_threadsafe(
+            _publish_many(broker, "other", 20), other_loop
+        )
+        await asyncio.wait_for(_publish_many(broker, "main", 20), timeout=10.0)
+        await asyncio.wait_for(asyncio.wrap_future(other_future), timeout=10.0)
+
+        rows = await broker.claim_batch("workers", batch_size=100, consumer_name="worker")
+        assert len(rows) == 40
+    finally:
+        other_loop.call_soon_threadsafe(other_loop.stop)
+        other_thread.join(timeout=5.0)
+        other_loop.close()
+        await broker.close()
+        broker._ring.unlink()
+
+
 async def test_idle_hint_reads_answer_without_unpacking_every_slot(
     broker: ShmBroker,
     monkeypatch: pytest.MonkeyPatch,
@@ -409,17 +493,21 @@ async def test_hint_prescan_returns_exactly_what_the_per_slot_scan_returns(
     broker: ShmBroker,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The strided pre-scan is an optimisation only. It must agree with the
-    per-slot loop on every cursor, including on a ring nobody has notified:
-    all-zero slots are indistinguishable from a genuine hint of sequence 0 on
-    the sequence words alone, so the complements have to settle that case."""
+    """The header-word pre-scan is an optimisation only. It must agree with
+    the per-slot loop on every cursor, including on a ring nobody has
+    notified: all-zero slots are indistinguishable from a genuine hint of
+    sequence 0 on the header word alone, so the complements have to settle
+    that case."""
     cursors = (-1, 0, 3, 6, 7, 8)
 
     def read_all() -> dict[int, list[int]]:
         return {cursor: broker._ring.read_hints(after_sequence=cursor) for cursor in cursors}
 
     def scan_only() -> dict[int, list[int]]:
-        monkeypatch.setattr("modulith.adapters._shm_ring._NATIVE_LITTLE_ENDIAN", False)
+        monkeypatch.setattr(
+            "modulith.adapters._shm_ring.ShmRing._nothing_newer",
+            lambda self, mapping, after_sequence: False,
+        )
         try:
             return read_all()
         finally:

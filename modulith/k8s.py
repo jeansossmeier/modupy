@@ -169,6 +169,11 @@ def render_manifests(
     resource_names: dict[str, str] = {}
     modules_by_resource_name: dict[str, str] = {}
     for spec in specs:
+        if not all(part.isidentifier() for part in spec.module_name.split(".")):
+            raise ConfigurationError(
+                f"module name {spec.module_name!r} is not a dotted Python identifier; "
+                "the worker imports it as a module and serves it under /<module_name>"
+            )
         module_name = k8s_name(spec.module_name)
         name = k8s_name(f"{pkg_name}-{module_name}")
         if name in modules_by_resource_name:
@@ -376,8 +381,9 @@ def _ingress(
     path_entries = []
     for spec in sorted(specs, key=lambda s: s.module_name):
         name = resource_names[spec.module_name]
+        path = _yaml_str(f"/{spec.module_name}")
         path_entries.append(
-            f"""          - path: /{spec.module_name}
+            f"""          - path: {path}
             pathType: Prefix
             backend:
               service:

@@ -417,6 +417,41 @@ def test_audit_cli_honors_configured_contracts_module(monkeypatch, tmp_path: Pat
     assert "0 cross-module import pattern(s)" in result.output
 
 
+def test_audit_codebase_shared_tables_exempt_contracts_module(tmp_path: Path) -> None:
+    """A table defined in the contracts module travels with every extraction
+    (extract.py's ``_populate_extraction`` unconditionally copies contracts),
+    so it is never actually left behind — it must not count as a shared-table
+    blocker, matching the exemption ``_find_cross_module_imports`` already
+    gives contracts imports."""
+    root = tmp_path / "myapp"
+    _write(root, "__init__.py", "")
+    _write(root, "orders/__init__.py", "")
+    _write(root, "orders/models.py", 'from sqlalchemy import Table\nt = Table("lookup_codes")\n')
+    _write(root, "contracts/__init__.py", "")
+    _write(
+        root, "contracts/models.py", 'from sqlalchemy import Table\nt2 = Table("lookup_codes")\n'
+    )
+
+    default = audit_codebase(root)
+    assert "lookup_codes" not in default.shared_tables
+
+    root2 = tmp_path / "myapp2"
+    _write(root2, "__init__.py", "")
+    _write(root2, "orders/__init__.py", "")
+    _write(root2, "orders/models.py", 'from sqlalchemy import Table\nt = Table("lookup_codes")\n')
+    _write(root2, "shared_kernel/__init__.py", "")
+    _write(
+        root2,
+        "shared_kernel/models.py",
+        'from sqlalchemy import Table\nt2 = Table("lookup_codes")\n',
+    )
+
+    configured = audit_codebase(root2, contracts_module="shared_kernel")
+    assert "lookup_codes" not in configured.shared_tables
+    unconfigured = audit_codebase(root2)
+    assert "lookup_codes" in unconfigured.shared_tables
+
+
 def test_relative_root_scores_the_same_as_absolute_root(monkeypatch, tmp_path: Path) -> None:
     """``Path(".")`` is the CLI's default argument, so the bare
     ``modulith audit`` invocation must analyze the tree exactly as an absolute

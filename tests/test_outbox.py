@@ -123,6 +123,9 @@ class StubStore:
     async def count_completed(self) -> int:
         return sum(1 for p in self.rows.values() if p.completed_at is not None)
 
+    async def count_archived(self) -> int:
+        return len(self.archived)
+
     async def purge_completed(self, older_than: timedelta) -> int:
         now = datetime.now(UTC)
         victims = [
@@ -553,6 +556,25 @@ async def test_status_counts_incomplete_completed_dead_lettered() -> None:
 
     counts = await outbox.status()
     assert counts == {"incomplete": 1, "completed": 1, "dead_lettered": 1}
+
+
+@pytest.mark.asyncio
+async def test_status_counts_archived_publications_as_completed() -> None:
+    """completion_mode="archive" moves a delivered row out of the primary
+    table into the store's archive; status() must still count it as
+    completed via the store's optional count_archived capability, not report
+    a working outbox's throughput as zero."""
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), completion_mode="archive", start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _make_pub(record, value=1)
+    await store.save(pub)
+
+    await outbox._dispatch_publication(pub)
+
+    assert store.archived == [pub.id]
+    counts = await outbox.status()
+    assert counts == {"incomplete": 0, "completed": 1, "dead_lettered": 0}
 
 
 @pytest.mark.asyncio
@@ -1191,6 +1213,11 @@ def test_configure_rejects_invalid_lease_and_batch_values() -> None:
     with pytest.raises(ValueError, match="claim_lease_seconds"):
         outbox.configure(store, JsonEventSerializer(), claim_lease_seconds=0, start_loop=False)
 
+    with pytest.raises(ValueError, match="claim_lease_seconds"):
+        outbox.configure(
+            store, JsonEventSerializer(), claim_lease_seconds=float("inf"), start_loop=False
+        )
+
     with pytest.raises(ValueError, match="claim_batch_size"):
         outbox.configure(store, JsonEventSerializer(), claim_batch_size=True, start_loop=False)
 
@@ -1232,6 +1259,109 @@ def test_cancel_retry_task_tolerates_an_already_closed_loop(
     monkeypatch.setattr(outbox, "_retry_task", TaskOnClosedLoop())
 
     outbox._cancel_retry_task()
+
+    assert outbox._retry_task is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_retry_loop_replaces_task_stranded_on_closed_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry task left pointing at a CLOSED loop (e.g. sync.py's
+    _run_nested_dispatch ran a transactional publish on a throwaway loop and
+    then closed it) must be treated as absent, not merely "not done" — a
+    task on a closed loop will never take another step, so leaving it in the
+    slot would block every future retry loop for the rest of the process."""
+    closed_loop = asyncio.new_event_loop()
+    closed_loop.close()
+
+    class StrandedTask:
+        def done(self) -> bool:
+            return False
+
+        def get_loop(self) -> asyncio.AbstractEventLoop:
+            return closed_loop
+
+    stranded: Any = StrandedTask()
+    monkeypatch.setattr(outbox, "_retry_task", stranded)
+
+    async def fake_retry_loop() -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(outbox, "_retry_loop", fake_retry_loop)
+
+    outbox._ensure_retry_loop()
+
+    replacement = outbox._retry_task
+    assert replacement is not None
+    assert replacement is not stranded
+
+    replacement.cancel()
+    try:
+        await replacement
+    except asyncio.CancelledError:
+        pass
+    outbox._retry_task = None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_clears_task_stranded_on_a_closed_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """outbox.shutdown() must not hang or raise when the retry task is
+    stranded on an already-closed loop — it must clear the stale reference
+    instead, matching _cancel_retry_task's tolerance for the same state."""
+    closed_loop = asyncio.new_event_loop()
+    closed_loop.close()
+
+    class StrandedTask:
+        def done(self) -> bool:
+            return False
+
+        def get_loop(self) -> asyncio.AbstractEventLoop:
+            return closed_loop
+
+        def cancel(self) -> bool:
+            raise AssertionError("a task on a closed loop cannot be cancelled")
+
+    monkeypatch.setattr(outbox, "_retry_task", StrandedTask())
+
+    await asyncio.wait_for(outbox.shutdown(), timeout=1)
+
+    assert outbox._retry_task is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_tolerates_loop_closing_between_check_and_cancel_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A narrower race than the fully-closed-loop case above: the foreign
+    loop is still open when shutdown() checks ``is_closed()``, but closes by
+    the time ``call_soon_threadsafe`` actually runs. That must be tolerated
+    the same way, not left to raise RuntimeError out of shutdown()."""
+
+    class RacingLoop:
+        def is_closed(self) -> bool:
+            return False
+
+        def call_soon_threadsafe(self, callback: Any) -> None:
+            raise RuntimeError("Event loop is closed")
+
+    racing_loop = RacingLoop()
+
+    class RacingTask:
+        def done(self) -> bool:
+            return False
+
+        def get_loop(self) -> Any:
+            return racing_loop
+
+        def cancel(self) -> bool:
+            raise AssertionError("must not actually be invoked — the loop rejects it first")
+
+    monkeypatch.setattr(outbox, "_retry_task", RacingTask())
+
+    await asyncio.wait_for(outbox.shutdown(), timeout=1)
 
     assert outbox._retry_task is None
 
@@ -1373,6 +1503,32 @@ async def test_stale_failure_claim_does_not_burn_retry_budget() -> None:
     assert claimed.attempt_count == 0
     assert store.rows[claimed.id].attempt_count == 0
     assert store.rows[claimed.id].completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_lease_failure_with_valid_claim_records_attempt_and_dead_letters() -> None:
+    """A dispatch failure under a still-valid claim token records the failed
+    attempt via fail_claim (not the stale-token abandon path) and still
+    reaches the dead-letter threshold check."""
+    store = ClaimingStubStore()
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        dead_letter_after_attempts=1,
+        start_loop=False,
+    )
+    _bootstrap_with_listener(boom)
+    publication = _make_pub(boom, value=7)
+    await store.save(publication)
+    (claimed,) = await store.claim_batch(
+        owner="worker-a", batch_size=1, lease_seconds=60, older_than=timedelta(0)
+    )
+
+    await outbox._dispatch_publication(claimed)
+
+    assert store.fail_claim_calls == [(claimed.id, claimed.claim_token)]
+    assert store.rows[claimed.id].attempt_count == 1
 
 
 @pytest.mark.asyncio
@@ -1557,6 +1713,25 @@ async def test_lease_sweep_releases_dead_lettered_claim() -> None:
 
 
 @pytest.mark.asyncio
+async def test_lease_sweep_releases_early_for_row_still_in_backoff() -> None:
+    """A claimed row not yet past its backoff window must be released
+    (renewed with a 0-second lease) rather than held for the rest of the
+    lease — holding it would block every other sweeper from picking it up
+    sooner than this sweeper's own next cycle."""
+    store = ClaimingStubStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    _bootstrap_with_listener(record)
+    publication = _make_pub(record, value=1, attempt_count=1, last_attempt_at=datetime.now(UTC))
+    await store.save(publication)
+
+    await outbox._sweep(timedelta(0))
+
+    assert received == []
+    assert publication.completed_at is None
+    assert any(call[0] == publication.id and call[2] == 0 for call in store.renew_calls)
+
+
+@pytest.mark.asyncio
 async def test_malformed_tokenless_claims_skip_unsafe_rows_and_dispatch_eligible() -> None:
     store = MalformedClaimingStore()
     outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
@@ -1707,6 +1882,38 @@ async def test_lost_lease_stops_renewal_without_cancelling_dispatch() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dispatch_with_lease_renewal_propagates_outer_cancellation() -> None:
+    """A cancellation landing on the ENCLOSING task while it is suspended at
+    the finally's ``await renew_task`` must propagate, matching
+    ``_polling_consumer.PollingConsumer._cancel``'s ``cancelling() > 0``
+    re-raise — not be swallowed as if it were merely the renew task's own
+    expected exit. Otherwise ``outbox.shutdown()``'s single cancellation is
+    discarded here and its busy-poll spins forever.
+
+    None of the stub store/handler calls in this dispatch path perform a
+    real suspension, so the enclosing task's first genuine await is the
+    finally's ``await renew_task`` — a single ``asyncio.sleep(0)`` runs the
+    whole dispatch synchronously up to exactly that point.
+    """
+    store = ClaimingStubStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    _bootstrap_with_listener(record)
+    publication = _make_pub(record, value=99)
+    await store.save(publication)
+    (claimed,) = await store.claim_batch(
+        owner="worker", batch_size=1, lease_seconds=60, older_than=timedelta(0)
+    )
+
+    outer = asyncio.create_task(outbox._dispatch_with_lease_renewal(claimed))
+    await asyncio.sleep(0)
+    outer.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+    assert outer.cancelled()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_handles_running_loop_lookup_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1790,12 +1997,16 @@ async def test_force_retry_direct_lookup_ignores_missing_and_completed(
     completed = _make_pub(record, value=15)
     completed.completed_at = datetime.now(UTC)
     store.rows[completed.id] = completed
+    incomplete = _make_pub(record, value=20)
+    store.rows[incomplete.id] = incomplete
 
     with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
         await outbox.force_retry(uuid4())
         await outbox.force_retry(completed.id)
+        await outbox.force_retry(incomplete.id)
 
-    assert received == []
+    assert received == [20]
+    assert incomplete.completed_at is not None
     assert sum("not found or already complete" in item.message for item in caplog.records) == 2
 
 
@@ -1841,3 +2052,51 @@ async def test_list_dead_lettered_accepts_empty_paginated_result() -> None:
     outbox.configure(store, JsonEventSerializer(), start_loop=False)
 
     assert await outbox.list_dead_lettered() == []
+
+
+@pytest.mark.asyncio
+async def test_list_dead_lettered_pages_across_a_full_page() -> None:
+    """A backlog exceeding one page (100 rows) must page through via the
+    keyset (after=(published_at, id)) rather than stopping at the first
+    full page."""
+
+    class PagedStore(StubStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.dead: list[EventPublication] = []
+
+        async def find_dead_lettered(
+            self, *, after: tuple[datetime, UUID] | None, limit: int
+        ) -> list[EventPublication]:
+            ordered = sorted(self.dead, key=lambda p: (p.published_at, p.id))
+            if after is not None:
+                ordered = [p for p in ordered if (p.published_at, p.id) > after]
+            return ordered[:limit]
+
+    store = PagedStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    base = datetime.now(UTC) - timedelta(hours=1)
+    store.dead = [
+        _make_pub(record, value=i, attempt_count=10, published_at=base + timedelta(seconds=i))
+        for i in range(101)
+    ]
+
+    result = await outbox.list_dead_lettered()
+
+    assert {p.id for p in result} == {p.id for p in store.dead}
+    assert len(result) == 101
+
+
+@pytest.mark.asyncio
+async def test_retry_all_dead_lettered_resubmits_with_reset_state() -> None:
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), dead_letter_after_attempts=2, start_loop=False)
+    _bootstrap_with_listener(record)
+    dead = _make_pub(record, value=1, attempt_count=2, last_error="boom")
+    store.rows[dead.id] = dead
+
+    count = await outbox.retry_all_dead_lettered()
+
+    assert count == 1
+    assert received == [1]
+    assert store.rows[dead.id].completed_at is not None

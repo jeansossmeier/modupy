@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tomllib
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -228,6 +229,102 @@ def test_extract_shared_table_blocks(make_fake_app, monkeypatch, tmp_path):
 
     assert result.exit_code == 1, result.output
     assert "stock" in result.output
+
+
+def test_extract_blocked_when_shared_table_scan_has_parse_failures(
+    make_fake_app, monkeypatch, tmp_path
+):
+    """A syntax error in an unrelated file must not silently shrink the
+    shared-table scan to an empty result — the parse failure itself has to
+    surface as a blocker, since the scan's soundness can't be established."""
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "", "inventory": ""},
+        extra_files={
+            "orders/models.py": 'from sqlalchemy import Table\nstock = Table("stock")\n',
+            "inventory/models.py": 'from sqlalchemy import Table\nstock2 = Table("stock"\n',
+            "contracts/__init__.py": "",
+        },
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 1, result.output
+    assert "could not be parsed" in result.output
+    assert not out_dir.exists()
+
+
+def test_extract_contracts_table_not_treated_as_shared(make_fake_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "", "inventory": ""},
+        extra_files={
+            "orders/models.py": 'from sqlalchemy import Table\nt = Table("lookup_codes")\n',
+            "contracts/models.py": 'from sqlalchemy import Table\nt2 = Table("lookup_codes")\n',
+        },
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+
+
+def test_write_extraction_rejects_path_traversal_module_name(make_fake_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    output = tmp_path / "orders-service"
+
+    with pytest.raises(ValueError, match="module"):
+        write_extraction(
+            cfg=Configuration(package="fakeapp"),
+            module="../../evil",
+            package_dir=tmp_path / "fakeapp",
+            output=output,
+            helpers=[],
+            notes=[],
+        )
+
+    assert not output.exists()
+
+
+def test_write_extraction_rejects_absolute_module_name(make_fake_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    output = tmp_path / "orders-service"
+    canary = Path("/tmp/modulith-security1-canary")
+
+    with pytest.raises(ValueError, match="module"):
+        write_extraction(
+            cfg=Configuration(package="fakeapp"),
+            module=str(canary),
+            package_dir=tmp_path / "fakeapp",
+            output=output,
+            helpers=[],
+            notes=[],
+        )
+
+    assert not canary.exists()
+    assert not output.exists()
+
+
+def test_write_extraction_rejects_path_traversal_helper_name(make_fake_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    output = tmp_path / "orders-service"
+
+    with pytest.raises(ValueError, match="helper"):
+        write_extraction(
+            cfg=Configuration(package="fakeapp"),
+            module="orders",
+            package_dir=tmp_path / "fakeapp",
+            output=output,
+            helpers=["fakeapp.../../evil"],
+            notes=[],
+        )
+
+    assert not output.exists()
 
 
 def test_extract_nonempty_output_dir_blocks_even_with_force(make_fake_app, monkeypatch, tmp_path):
@@ -480,3 +577,22 @@ def test_extract_smoke_extracted_app_boots(make_fake_app, monkeypatch, tmp_path)
     worker_app = create_app()
 
     assert worker_app.title == "modulith-orders"
+
+
+def test_write_extraction_rejects_nonexistent_module(make_fake_app, monkeypatch, tmp_path):
+    """Extraction must validate that the module directory exists before writing."""
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    output = tmp_path / "nonexistent-service"
+
+    with pytest.raises(ValueError, match="nonexistent"):
+        write_extraction(
+            cfg=Configuration(package="fakeapp"),
+            module="nonexistent",
+            package_dir=tmp_path / "fakeapp",
+            output=output,
+            helpers=[],
+            notes=[],
+        )
+
+    assert not output.exists()

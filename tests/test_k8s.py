@@ -196,6 +196,37 @@ def test_render_manifests_ingress_paths_sorted_prefix_and_backend() -> None:
     assert orders_path["backend"]["service"]["port"]["number"] == 8000
 
 
+def test_render_manifests_rejects_module_name_that_is_not_an_identifier() -> None:
+    """The Ingress path is the raw module name (it must match the worker's
+    ``/<module>`` mount), so a name carrying YAML syntax is refused outright
+    instead of being interpolated into a manifest an operator applies as-is."""
+    evil_name = (
+        "orders\n"
+        "          - path: /evil\n"
+        "            pathType: Prefix\n"
+        "            backend:\n"
+        "              service:\n"
+        "                name: attacker-svc\n"
+        "                port:\n"
+        "                  number: 9999"
+    )
+    specs = [WorkerSpec(module_name=evil_name, package="fakeapp", port=9001)]
+
+    with pytest.raises(ConfigurationError, match="not a dotted Python identifier"):
+        render_manifests(_cfg(), specs, image="shop:dev")
+
+
+def test_render_manifests_ingress_path_is_the_raw_module_name_the_worker_mounts() -> None:
+    specs = [WorkerSpec(module_name="order_items", package="fakeapp", port=9001)]
+
+    text = render_manifests(_cfg(), specs, image="shop:dev")
+
+    by_kind = _docs_by_kind(text)
+    path = by_kind["Ingress"][0]["spec"]["rules"][0]["http"]["paths"][0]
+    assert path["path"] == "/order_items"
+    assert '"/order_items"' in text
+
+
 def test_render_manifests_namespace_and_host_absent_by_default() -> None:
     text = render_manifests(_cfg(), _two_module_specs(), image="shop:dev")
 
@@ -370,7 +401,7 @@ def test_render_manifests_rejects_invalid_port(port: int) -> None:
 def test_render_manifests_long_composite_names_are_valid_and_distinct() -> None:
     package = "shop." + ("a" * 55)
     specs = [
-        WorkerSpec(module_name=f"orders-{suffix}", package=package, port=9001)
+        WorkerSpec(module_name=f"orders_{suffix}", package=package, port=9001)
         for suffix in ("east", "west")
     ]
 

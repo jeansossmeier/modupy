@@ -34,6 +34,7 @@ class SqliteQueueStore:
         self._retry_backoff_cap_seconds = retry_backoff_cap_seconds
         self._max_payload_bytes = max_payload_bytes
         self._max_store_bytes = max_store_bytes
+        self._publishes_since_prune = 0
 
     def spill(self, messages: list[dict[str, Any]]) -> None:
         _shm_publications.spill(
@@ -50,6 +51,10 @@ class SqliteQueueStore:
         headers: dict[str, str] | None,
         publication_id: str | None,
     ) -> PublishResult:
+        self._publishes_since_prune += 1
+        prune_due = self._publishes_since_prune >= _shm_publications.PRUNE_EVERY_N_PUBLISHES
+        if prune_due:
+            self._publishes_since_prune = 0
         return _shm_publications.publish(
             self._conn,
             target,
@@ -59,6 +64,7 @@ class SqliteQueueStore:
             self._orphan_retention_seconds,
             self._max_payload_bytes,
             self._max_store_bytes,
+            prune_due,
         )
 
     def subscribe(self, targets: list[str], group: str) -> int:

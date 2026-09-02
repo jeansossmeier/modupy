@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import json
+import keyword
 import shutil
 import tempfile
 import tomllib
@@ -67,7 +68,29 @@ def extraction_blockers(rt: Runtime, module: str, violations: list[Violation]) -
             shared = own_tables & set(audit.shared_tables)
             if shared:
                 blockers.append(f"shares table(s) with another module: {', '.join(sorted(shared))}")
+            if audit.parse_failures:
+                blockers.append(
+                    f"{len(audit.parse_failures)} file(s) could not be parsed during the "
+                    "shared-table scan; results are incomplete"
+                )
     return blockers
+
+
+def _validate_module_name(value: str, *, what: str) -> None:
+    """Reject a module/helper name that is not a safe dotted Python identifier.
+
+    ``module`` (and each ``helpers`` entry) comes from ``ModuleInfo.name``/
+    import records sourced from the pluggable ``modulith_discover_modules``
+    hook — untrusted, plugin-supplied input — and is turned into a filesystem
+    path via ``Path(*value.split("."))`` before any write. An absolute-looking
+    or ``..``-carrying value would escape the intended output tree (mirrors
+    ``config._validate_contracts_module``'s treatment of the sibling field).
+    """
+    parts = value.split(".")
+    if not value or any(not part.isidentifier() or keyword.iskeyword(part) for part in parts):
+        raise ValueError(
+            f"{what} must be a non-empty dot-separated Python identifier, got {value!r}"
+        )
 
 
 def _toml_scalar(value: Any) -> str:
@@ -391,6 +414,22 @@ def write_extraction(
     Returns the paths written, relative to *output*.
     """
     assert cfg.package is not None
+    _validate_module_name(module, what="module")
+    module_path = package_dir / Path(*module.split("."))
+    if not (module_path.is_dir() and (module_path / "__init__.py").is_file()):
+        raise ValueError(f"module {module!r} does not exist as a valid Python package")
+    for helper in helpers:
+        _validate_module_name(helper, what="helper")
+        prefix = f"{cfg.package}."
+        if helper.startswith(prefix):
+            helper_rel = Path(*helper.removeprefix(prefix).split("."))
+            helper_pkg_path = package_dir / helper_rel
+            helper_file_path = package_dir / Path(str(helper_rel) + ".py")
+            if not (
+                (helper_pkg_path.is_dir() and (helper_pkg_path / "__init__.py").is_file())
+                or helper_file_path.is_file()
+            ):
+                raise ValueError(f"helper {helper!r} does not exist as a module or package")
     if package_dir.is_symlink():
         raise ValueError(f"source package {package_dir} is a symlink")
     _validate_package_initializers(package_dir, cfg.package)

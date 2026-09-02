@@ -10,7 +10,6 @@ from __future__ import annotations
 import mmap
 import os
 import struct
-import sys
 import tempfile
 import time
 from contextlib import suppress
@@ -26,7 +25,10 @@ _SLOT_STRUCT = struct.Struct("<QQ")
 _SEQUENCE_MASK = (1 << 64) - 1
 _ATTACH_ATTEMPTS = 10
 _ATTACH_DELAY_SECONDS = 0.01
-_NATIVE_LITTLE_ENDIAN = sys.byteorder == "little"
+# Inside _HEADER_STRUCT's reserved padding, ahead of the slots: the highest
+# sequence ever notified, maintained by `notify` and read by `_nothing_newer`
+# in place of an O(capacity) scan of the slots themselves.
+_MAX_SEQ_OFFSET = struct.calcsize("<8sIIQQ")
 
 
 class ShmRing:
@@ -96,6 +98,9 @@ class ShmRing:
             # previous valid pair or a mismatch that it safely discards.
             struct.pack_into("<Q", mapping, offset + 8, durable_sequence ^ _SEQUENCE_MASK)
             struct.pack_into("<Q", mapping, offset, durable_sequence)
+            peak = struct.unpack_from("<Q", mapping, _MAX_SEQ_OFFSET)[0]
+            if durable_sequence > peak:
+                struct.pack_into("<Q", mapping, _MAX_SEQ_OFFSET, durable_sequence)
             return True
         except (BufferError, OSError, ValueError, struct.error):
             return False
@@ -108,7 +113,7 @@ class ShmRing:
 
         hints: list[int] = []
         try:
-            if _NATIVE_LITTLE_ENDIAN and self._nothing_newer(mapping, after_sequence):
+            if self._nothing_newer(mapping, after_sequence):
                 return []
             for index in range(self._capacity):
                 offset = _HEADER_SIZE + index * _SLOT_SIZE
@@ -123,27 +128,20 @@ class ShmRing:
         return sorted(hints)
 
     def _nothing_newer(self, mapping: mmap.mmap, after_sequence: int) -> bool:
-        """Rule out the whole ring in one strided pass over the sequence words.
+        """Rule out the whole ring in O(1) via the header's running-max word.
 
         An idle consumer re-reads the ring every few milliseconds for the whole
-        length of its safety poll, and the per-slot ``unpack`` below costs
-        O(capacity) each time — enough to keep a worker process busy doing
-        nothing at the default capacity, and enough to stall its event loop at
-        the largest accepted one. No slot can yield a hint above
-        ``after_sequence`` if no sequence word exceeds it, so this pass answers
-        the idle case without touching the slower path.
-
-        Only valid on a little-endian host: the slot layout is explicitly
-        little-endian while ``memoryview.cast`` reads native words.
+        length of its safety poll. A per-slot (or even a per-slot-word) pass
+        costs O(capacity) each time — enough to keep a worker process busy
+        doing nothing at the default capacity, and enough to stall its event
+        loop at the largest accepted one. ``notify`` keeps a monotonically
+        increasing high-water mark in the header, so no slot can hold anything
+        newer than ``after_sequence`` if that single word does not either;
+        when it might, this falls through to the slower per-slot pass, which
+        remains authoritative (including for a never-notified, all-zero ring).
         """
-        end = _HEADER_SIZE + self._capacity * _SLOT_SIZE
-        words = memoryview(mapping)[_HEADER_SIZE:end].cast("Q")
-        peak = max(words[0::2])
-        if peak > after_sequence:
-            # A never-notified ring is all zeros, which a cursor of -1 cannot
-            # rule out on sequence words alone; its complements settle it.
-            return peak == 0 and max(words[1::2]) == 0
-        return True
+        peak = int(struct.unpack_from("<Q", mapping, _MAX_SEQ_OFFSET)[0])
+        return peak <= after_sequence
 
     def close(self) -> None:
         """Close this process's handles; repeated calls are safe."""

@@ -127,6 +127,7 @@ import logging
 import math
 import os
 import random
+import weakref
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
@@ -892,9 +893,19 @@ class DatabaseBroker:
         # engines without one retain the adapter's historical SQLite behavior.
         dialect_name = getattr(getattr(self._engine, "dialect", None), "name", "sqlite")
         self._is_sqlite = dialect_name == "sqlite"
-        schema = _broker_opt(engine_options or {}, "schema", "SCHEMA")
+        # Falling back to the migrations' own knob keeps the runtime pointed at
+        # the schema `migrations/env.py::_resolve_schema` migrated the tables
+        # into: without it, an operator who sets only MODULITH_DB_SCHEMA gets a
+        # broker that silently create_all()s a second, untracked table set in
+        # the default schema.
+        schema = (
+            _broker_opt(engine_options or {}, "schema", "SCHEMA")
+            or os.environ.get("MODULITH_DB_SCHEMA")
+            or None
+        )
         if schema is not None:
             schema = _validate_sql_schema(schema, option_name="schema")
+        self._schema: str | None
         if schema and dialect_name == "postgresql":
             self._schema = schema
             # execution_options() on an (Async)Engine returns a new facade
@@ -912,7 +923,15 @@ class DatabaseBroker:
                 )
             self._schema = None
         self._schema_ready = False
-        self._schema_lock = asyncio.Lock()
+        # Keyed per running loop, same rationale and weak-key eviction as
+        # SerialStoreExecutor._locks in _shm_executor.py: _ensure_schema is
+        # reachable from more than one event loop (publish/subscribe called
+        # from a sync-API daemon-thread loop as well as the app's own loop),
+        # and a plain asyncio.Lock() binds to whichever loop first contends
+        # it, raising or wedging every other loop thereafter.
+        self._schema_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+            weakref.WeakKeyDictionary()
+        )
 
     @property
     def engine(self) -> Any:
@@ -925,6 +944,14 @@ class DatabaseBroker:
         lock — a method call, unlike a bare attribute expression, isn't
         narrowed across the ``async with`` the second check sits inside)."""
         return self._schema_ready
+
+    def _schema_lock_for_running_loop(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        lock = self._schema_locks.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._schema_locks[loop] = lock
+        return lock
 
     async def _broker_tables_present(self, *, deadline: float | None = None) -> bool:
         """True only when every table in broker metadata is queryable."""
@@ -963,7 +990,7 @@ class DatabaseBroker:
         """
         if self._schema_is_ready():
             return
-        async with self._schema_lock:
+        async with self._schema_lock_for_running_loop():
             if self._schema_is_ready():
                 return
             metadata, _, _ = broker_schema()
@@ -1592,6 +1619,7 @@ class DatabaseBroker:
         batch_size: int,
         consumer_name: str,
         reclaim_stale_seconds: float = _DEFAULT_RECLAIM_STALE_S,
+        max_attempts: int | None = None,
     ) -> list[dict[str, Any]]:
         """Claim up to ``batch_size`` due rows for ``group``.
 
@@ -1600,10 +1628,17 @@ class DatabaseBroker:
         latter are orphans left by a consumer that crashed between claim and
         ack, so reclaiming them is what preserves at-least-once delivery across
         a consumer crash (the DB analogue of the Redis adapter's XAUTOCLAIM
-        reclaim). A reclaim re-stamps ``claimed_at``/``claimed_by``; it does NOT
-        bump ``attempts`` (a crash is not a dispatch failure), matching the
-        Redis reclaim path, so a poison row still dead-letters via the
-        dispatch-failure cap rather than being reclaimed forever.
+        reclaim).
+
+        A reclaim re-stamps ``claimed_at``/``claimed_by`` AND bumps
+        ``attempts`` — the same accounting Redis Streams applies, where
+        XAUTOCLAIM increments the entry's ``times_delivered``. It has to: a
+        consumer that crashes, is OOM-killed, or wedges past the lease cap
+        never reaches ``fail()``, so if the reclaim did not burn an attempt
+        that row would be handed out forever with ``attempts`` frozen at 0.
+        When ``max_attempts`` is given, a reclaim that exhausts it moves the
+        row straight to ``dead`` and withholds it from the batch, because
+        nothing on the crash path will run the cap in ``fail()`` for it.
 
         Postgres/MySQL: ``FOR UPDATE SKIP LOCKED`` lets concurrent consumers
         partition the backlog instead of blocking or double-claiming. SQLite
@@ -1614,6 +1649,7 @@ class DatabaseBroker:
         from sqlalchemy import and_, or_, select, update
 
         _, _, message = broker_schema()
+        cap = None if max_attempts is None else _positive_int(max_attempts, "max_attempts")
 
         async def op(conn: Any) -> list[dict[str, Any]]:
             now = await self._now(conn)
@@ -1637,14 +1673,56 @@ class DatabaseBroker:
             if _supports_skip_locked(self._engine):
                 stmt = stmt.with_for_update(skip_locked=True)
             result = await conn.execute(stmt)
-            claimed_rows = [dict(row._mapping) for row in result]
-            ids = [row["id"] for row in claimed_rows]
-            if ids:
+            rows = [dict(row._mapping) for row in result]
+
+            fresh_ids = [row["id"] for row in rows if row["status"] != "claimed"]
+            reclaimed = [row for row in rows if row["status"] == "claimed"]
+            exhausted_ids = (
+                set()
+                if cap is None
+                else {row["id"] for row in reclaimed if int(row["attempts"]) + 1 >= cap}
+            )
+            reclaimed_ids = [row["id"] for row in reclaimed if row["id"] not in exhausted_ids]
+
+            if fresh_ids:
                 await conn.execute(
                     update(message)
-                    .where(message.c.id.in_(ids))
+                    .where(message.c.id.in_(fresh_ids))
                     .values(status="claimed", claimed_at=now, claimed_by=consumer_name)
                 )
+            if reclaimed_ids:
+                await conn.execute(
+                    update(message)
+                    .where(message.c.id.in_(reclaimed_ids))
+                    .values(
+                        status="claimed",
+                        claimed_at=now,
+                        claimed_by=consumer_name,
+                        attempts=message.c.attempts + 1,
+                    )
+                )
+            if exhausted_ids:
+                await conn.execute(
+                    update(message)
+                    .where(message.c.id.in_(exhausted_ids))
+                    .values(
+                        status="dead",
+                        attempts=message.c.attempts + 1,
+                        available_at=now,
+                        claimed_at=None,
+                        claimed_by=None,
+                        last_error=(
+                            f"reclaimed {cap} times without completing "
+                            "(consumer crashed or wedged mid-dispatch)"
+                        ),
+                    )
+                )
+
+            bumped = set(reclaimed_ids)
+            claimed_rows = [row for row in rows if row["id"] not in exhausted_ids]
+            for row in claimed_rows:
+                if row["id"] in bumped:
+                    row["attempts"] = int(row["attempts"]) + 1
             return claimed_rows
 
         rows: list[dict[str, Any]] = await self._write(op)

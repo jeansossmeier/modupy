@@ -10,8 +10,12 @@ Distributed in two ways:
      cadence, smaller install for users who only test.
 
 Registered as a pytest plugin via the `pytest11` entry point in
-pyproject.toml. Once `pip install modupy[test]` runs, fixtures are
-available in any test without imports.
+pyproject.toml, under the entry-point name `modulith`. Once `pip install
+modupy[test]` runs, fixtures are available in any test without imports —
+do not add `pytest_plugins = ["modulith.testing"]` to a conftest.py: pytest
+would try to register this already-registered module a second time, under
+a different name, and abort the whole session. To disable the plugin, use
+`-p no:modulith` (the entry-point name), not the module path.
 
 Three primary fixtures:
 
@@ -25,9 +29,11 @@ Plus markers:
   @pytest.mark.modulith_no_outbox — disable outbox for this test
 """
 
-from __future__ import annotations
+from __future__ import annotations as _annotations
 
 import asyncio
+import contextlib
+import dataclasses
 import importlib
 import inspect
 import math
@@ -36,23 +42,24 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
-from concurrent.futures import Future
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import Any
-from unittest.mock import MagicMock
+import typing
+import unittest.mock
 
 import pytest
 
-from .markers import hookimpl
+from . import manifest, markers
+
+if typing.TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+    from concurrent.futures import Future
+    from typing import Any
 
 # ---------------------------------------------------------------------------
 # Fixture: modulith_app — fresh runtime per test
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclasses.dataclass
 class ModulithTestApp:
     """Test handle exposing the captured runtime state.
 
@@ -60,8 +67,8 @@ class ModulithTestApp:
     what the configuration was. Reset between tests automatically.
     """
 
-    published_events: list[Any] = field(default_factory=list)
-    listener_calls: list[tuple[str, Any]] = field(default_factory=list)
+    published_events: list[Any] = dataclasses.field(default_factory=list)
+    listener_calls: list[tuple[str, Any]] = dataclasses.field(default_factory=list)
 
     def published_events_of_type(self, event_type: type) -> list[Any]:
         """Return only events of the given type — useful for assertions."""
@@ -85,11 +92,11 @@ class _SpyPlugin:
     def __init__(self, app: ModulithTestApp) -> None:
         self._app = app
 
-    @hookimpl
+    @markers.hookimpl
     def modulith_after_event_published(self, event: Any) -> None:
         self._app.published_events.append(event)
 
-    @hookimpl
+    @markers.hookimpl
     def modulith_on_listener_dispatch(self, listener_name: str, event: Any) -> None:
         self._app.listener_calls.append((listener_name, event))
 
@@ -138,7 +145,7 @@ def modulith_app() -> Iterator[ModulithTestApp]:
 # ---------------------------------------------------------------------------
 
 
-@contextmanager
+@contextlib.contextmanager
 def _module_isolation(
     target_module: str,
     *,
@@ -160,6 +167,14 @@ def _module_isolation(
     earlier import time — silently defeating the mock. Re-importing it here
     (after the mocks are installed) re-resolves those names fresh, so it is
     already correctly bound by the time the caller's test body runs.
+
+    Manifests declared by the removed modules live in a separate registry
+    (``modulith.manifest``), not ``sys.modules`` — deleting a module doesn't
+    clear its manifest entry. Without also resetting that registry, the
+    re-import re-runs ``declare_module()`` for an already-declared package
+    and hits its "already declared" guard. So manifest entries under the
+    application package are snapshotted and cleared here too, and restored
+    alongside ``sys.modules`` on exit.
     """
     mocks = mock_modules or []
     app_package = target_module.split(".")[0]
@@ -167,6 +182,7 @@ def _module_isolation(
         ".".join(target_module.split(".")[:i]) for i in range(1, target_module.count(".") + 1)
     }
     snapshot = dict(sys.modules)
+    manifest_snapshot = dict(manifest._manifests)
 
     for name in list(sys.modules):
         if not (name == app_package or name.startswith(app_package + ".")):
@@ -175,8 +191,12 @@ def _module_isolation(
             continue
         del sys.modules[name]
 
+    for package in list(manifest._manifests):
+        if package == app_package or package.startswith(app_package + "."):
+            del manifest._manifests[package]
+
     for name in mocks:
-        sys.modules[name] = MagicMock(name=name)
+        sys.modules[name] = unittest.mock.MagicMock(name=name)
 
     importlib.import_module(target_module)
 
@@ -187,6 +207,8 @@ def _module_isolation(
             del sys.modules[name]
         for name, module in snapshot.items():
             sys.modules[name] = module
+        manifest._manifests.clear()
+        manifest._manifests.update(manifest_snapshot)
 
 
 @pytest.fixture

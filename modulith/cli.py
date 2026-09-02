@@ -647,6 +647,11 @@ def _run_process_topology(
     }
     if isolate:
         config["isolate"] = [isolate]
+        typer.echo(
+            f"modulith: --isolate={isolate!r} restricts this deployment to that module "
+            "only — every other discovered module is not started and its routes 404",
+            err=True,
+        )
 
     specs = derive_specs_from_config(config)
     if not specs:
@@ -682,7 +687,9 @@ def _run_process_topology(
 def dev(
     app_module: str = typer.Argument(..., help="ASGI app, e.g. 'myapp:app'"),
     topology: str = typer.Option("single", help="single | processes"),
-    isolate: str | None = typer.Option(None, help="Module to isolate in its own process"),
+    isolate: str | None = typer.Option(
+        None, help="Restrict the deployment to only this module (all others are not started)"
+    ),
     reload: bool = typer.Option(True, help="Reload on file changes"),
     host: str = typer.Option("127.0.0.1"),
     port: int = typer.Option(8000),
@@ -697,9 +704,11 @@ def dev(
     remains the hard CI gate). The single-process path execs uvicorn
     (optionally with ``--reload``), so the dev experience is identical to
     running uvicorn directly. The process-per-module path (``--topology
-    processes`` / ``--isolate``) runs the supervisor + reverse proxy: one
-    worker subprocess per module behind a routing proxy on ``(host, port)``.
-    (``--reload`` does not apply to the process topology in v1.)
+    processes``) runs the supervisor + reverse proxy: one worker subprocess
+    per module behind a routing proxy on ``(host, port)``. ``--isolate
+    MODULE`` also selects this path but restricts it to MODULE only — every
+    other discovered module is not started, and its routes 404 through the
+    proxy. (``--reload`` does not apply to the process topology in v1.)
 
     ``--log-level`` sets this process's root log level and is passed on to
     uvicorn (and, under the process topology, to every worker subprocess), so

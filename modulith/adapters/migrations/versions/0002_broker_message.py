@@ -17,6 +17,7 @@ Create Date: 2026-07-14
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 import sqlalchemy as sa
 from alembic import op
@@ -55,52 +56,86 @@ _TS = sa.DateTime(timezone=True).with_variant(MySQLDateTime(fsp=6), "mysql", "ma
 _PAYLOAD = sa.LargeBinary().with_variant(MySQLLongBlob(), "mysql", "mariadb")
 
 
-def upgrade() -> None:
-    op.create_table(
-        "broker_subscription",
-        sa.Column("target", sa.String(_TARGET_LEN), nullable=False),
-        sa.Column("consumer_group", sa.String(_GROUP_LEN), nullable=False),
-        sa.Column("updated_at", _TS, nullable=False),
-        sa.PrimaryKeyConstraint("target", "consumer_group"),
-    )
+def _existing() -> tuple[Any, str | None]:
+    """Reflection handle for the schema this migration is actually writing to,
+    or ``None`` offline (``--sql`` renders DDL with no connection to inspect).
 
-    op.create_table(
-        "broker_message",
-        sa.Column("id", sa.String(_ID_LEN), nullable=False),
-        sa.Column("target", sa.String(_TARGET_LEN), nullable=False),
-        sa.Column("consumer_group", sa.String(_GROUP_LEN), nullable=False),
-        # Nullable so a publish with no event_type header (or a poison row)
-        # dead-letters at the consumer rather than failing at INSERT.
-        sa.Column("event_type", sa.String(_EVENT_TYPE_LEN), nullable=True),
-        sa.Column("payload", _PAYLOAD, nullable=False),
-        sa.Column("headers", sa.Text(), nullable=True),
-        sa.Column("status", sa.String(_STATUS_LEN), nullable=False, server_default="pending"),
-        sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("available_at", _TS, nullable=False),
-        sa.Column("claimed_at", _TS, nullable=True),
-        sa.Column("claimed_by", sa.String(_CLAIMED_BY_LEN), nullable=True),
-        sa.Column("created_at", _TS, nullable=False),
-        sa.Column("last_error", sa.Text(), nullable=True),
-        sa.PrimaryKeyConstraint("id"),
-    )
+    ``db_broker.DatabaseBroker._ensure_schema`` bootstraps these same tables
+    with ``metadata.create_all`` on a database that has never run a migration —
+    a documented deployment path. Adopting the outbox later runs ``upgrade
+    head`` against that database, so every object this revision creates has to
+    be skipped when it is already there; an unguarded ``create_table`` aborts
+    the chain and pins ``alembic_version`` one revision short forever.
+    """
+    context = op.get_context()
+    if context.as_sql:
+        return None, None
+    return sa.inspect(op.get_bind()), context.version_table_schema
+
+
+def _has_table(inspector: Any, name: str, schema: str | None) -> bool:
+    return inspector is not None and inspector.has_table(name, schema=schema)
+
+
+def _index_names(inspector: Any, table: str, schema: str | None) -> set[str]:
+    return {index["name"] for index in inspector.get_indexes(table, schema=schema)}
+
+
+def upgrade() -> None:
+    inspector, schema = _existing()
+    message_exists = _has_table(inspector, "broker_message", schema)
+    message_indexes = _index_names(inspector, "broker_message", schema) if message_exists else set()
+
+    if not _has_table(inspector, "broker_subscription", schema):
+        op.create_table(
+            "broker_subscription",
+            sa.Column("target", sa.String(_TARGET_LEN), nullable=False),
+            sa.Column("consumer_group", sa.String(_GROUP_LEN), nullable=False),
+            sa.Column("updated_at", _TS, nullable=False),
+            sa.PrimaryKeyConstraint("target", "consumer_group"),
+        )
+
+    if not message_exists:
+        op.create_table(
+            "broker_message",
+            sa.Column("id", sa.String(_ID_LEN), nullable=False),
+            sa.Column("target", sa.String(_TARGET_LEN), nullable=False),
+            sa.Column("consumer_group", sa.String(_GROUP_LEN), nullable=False),
+            # Nullable so a publish with no event_type header (or a poison row)
+            # dead-letters at the consumer rather than failing at INSERT.
+            sa.Column("event_type", sa.String(_EVENT_TYPE_LEN), nullable=True),
+            sa.Column("payload", _PAYLOAD, nullable=False),
+            sa.Column("headers", sa.Text(), nullable=True),
+            sa.Column("status", sa.String(_STATUS_LEN), nullable=False, server_default="pending"),
+            sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"),
+            sa.Column("available_at", _TS, nullable=False),
+            sa.Column("claimed_at", _TS, nullable=True),
+            sa.Column("claimed_by", sa.String(_CLAIMED_BY_LEN), nullable=True),
+            sa.Column("created_at", _TS, nullable=False),
+            sa.Column("last_error", sa.Text(), nullable=True),
+            sa.PrimaryKeyConstraint("id"),
+        )
     # The competing-consumer claim path (status + due-time scan per group).
-    op.create_index(
-        "ix_broker_message_claim",
-        "broker_message",
-        ["consumer_group", "status", "available_at"],
-    )
+    if "ix_broker_message_claim" not in message_indexes:
+        op.create_index(
+            "ix_broker_message_claim",
+            "broker_message",
+            ["consumer_group", "status", "available_at"],
+        )
     # The age-based prune scan.
-    op.create_index(
-        "ix_broker_message_prune",
-        "broker_message",
-        ["status", "created_at"],
-    )
+    if "ix_broker_message_prune" not in message_indexes:
+        op.create_index(
+            "ix_broker_message_prune",
+            "broker_message",
+            ["status", "created_at"],
+        )
     # Diagnostics / by-target inspection.
-    op.create_index(
-        "ix_broker_message_target",
-        "broker_message",
-        ["target"],
-    )
+    if "ix_broker_message_target" not in message_indexes:
+        op.create_index(
+            "ix_broker_message_target",
+            "broker_message",
+            ["target"],
+        )
 
 
 def downgrade() -> None:

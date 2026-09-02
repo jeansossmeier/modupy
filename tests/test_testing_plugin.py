@@ -174,6 +174,40 @@ def test_modulith_module_reimports_target_after_mocking_siblings(
     assert sys.modules["fakeapp.orders"].VALUE == "real-inv"
 
 
+def test_modulith_module_reenters_when_target_already_declared_a_manifest(
+    make_fake_app, modulith_module
+) -> None:
+    """CHANGELOG.md advertises modulith_module as clearing manifests between
+    uses. A target module whose manifest was already declared before entering
+    isolation — an earlier import in the same process, or a second use of the
+    fixture for the same target across two tests — must reimport cleanly
+    instead of hitting declare_module's 'already declared' guard."""
+    import importlib
+
+    from modulith.manifest import get_manifest
+
+    make_fake_app(
+        {"orders": "from . import _manifest\n"},
+        extra_files={
+            "orders/_manifest.py": (
+                "from modulith.manifest import declare_module\ndeclare_module()\n"
+            ),
+        },
+    )
+    importlib.import_module("fakeapp.orders")
+    original_manifest = get_manifest("fakeapp.orders")
+    assert original_manifest is not None
+
+    with modulith_module("fakeapp.orders"):
+        pass
+
+    with modulith_module("fakeapp.orders"):
+        pass
+
+    # Restored exactly, like sys.modules — the pre-block manifest survives.
+    assert get_manifest("fakeapp.orders") is original_manifest
+
+
 # ---------------------------------------------------------------------------
 # @pytest.mark.modulith_isolated — subprocess-per-test isolation
 # ---------------------------------------------------------------------------
@@ -241,6 +275,32 @@ def test_no_outbox_marker_disables_outbox_configuration() -> None:
 # ---------------------------------------------------------------------------
 # ModulithTestApp.reset() — public API
 # ---------------------------------------------------------------------------
+
+
+def test_no_public_attribute_escapes_testing_declared_api() -> None:
+    """Mirrors modulith's own leak guard
+    (test_bootstrap_public_api.py::test_no_public_attribute_escapes_the_declared_api)
+    for modulith.testing: docs/STABILITY.md gives it the identical stability
+    promise, so a stray unaliased import (MagicMock, dataclass, ...) must not
+    show up in dir(modulith.testing)/editor completion. pytest_* names are
+    exempt: pytest discovers hook implementations by that literal name, so
+    they can't be aliased or added to __all__ without breaking hook
+    registration, and docs/STABILITY.md documents modulith.testing's surface
+    as its fixtures and classes only, not its hook-function plumbing."""
+    import types as _types
+
+    import modulith.testing
+
+    leaked = sorted(
+        name
+        for name, value in vars(modulith.testing).items()
+        if not name.startswith("_")
+        and not name.startswith("pytest_")
+        and not isinstance(value, _types.ModuleType)
+        and name not in modulith.testing.__all__
+    )
+
+    assert leaked == []
 
 
 def test_modulith_test_app_reset_clears_captured_state(modulith_app) -> None:

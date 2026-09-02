@@ -16,8 +16,10 @@ Configuration resolves env > [tool.modulith.broker] subtable > default:
   MODULITH_STREAM_PREFIX / stream_prefix   stream namespace (default "modulith.events")
   MODULITH_CONSUMER_GROUP / consumer_group consumer group name (default "modulith")
   MODULITH_STREAM_MAXLEN / max_stream_len  bounded retention per stream (default 10000)
+  MODULITH_BROKER_DLQ_MAX_STREAM_LEN /
   dlq_max_stream_len                       bounded retention for the dead-letter stream
                                             (default: max_stream_len * 10)
+  MODULITH_BROKER_MAX_PAYLOAD_BYTES /
   max_payload_bytes                        producer-side payload size cap, rejected with
                                             ConfigurationError (default 16 MiB)
   poll_block_ms                            consumer XREADGROUP block timeout, ms (default 1000)
@@ -330,9 +332,14 @@ class RedisStreamsBroker:
         stream = self._stream_name(target)
         group_name = group or self._consumer_group
         # The append and ACK must be atomic: a client timeout between XADD and
-        # XACK used to produce a duplicate DLQ record on retry. The NX key uses
-        # the original stream/group/message identity and expires with the
-        # bounded forensic retention window.
+        # XACK used to produce a duplicate DLQ record on retry. The dedup key
+        # uses the original stream/group/message identity and expires with the
+        # bounded forensic retention window. It is written only AFTER the XADD
+        # it guards succeeds — Lua's redis.call() aborts the script without
+        # rolling back prior writes, so setting it any earlier would let a
+        # failed XADD leave a dedup key with nothing behind it: the retry
+        # would then see "already deduped", skip the XADD, and fall through to
+        # the unconditional XACK below, silently dropping the payload.
         dedup_key = f"{stream}.dead.dedup.{group_name}.{message_id}"
         arguments: list[str | bytes | int] = [
             group_name,
@@ -347,11 +354,12 @@ class RedisStreamsBroker:
             arguments.extend((key, value))
         await self._client.eval(
             f"""
-            local created = redis.call('SET', KEYS[3], ARGV[2], 'NX', 'EX', {_DLQ_DEDUP_TTL_SECONDS})
-            if created then
+            local exists = redis.call('EXISTS', KEYS[3])
+            if exists == 0 then
               local command = {{KEYS[2], 'MAXLEN', '~', ARGV[3], '*'}}
               for index = 4, #ARGV do table.insert(command, ARGV[index]) end
               redis.call('XADD', unpack(command))
+              redis.call('SET', KEYS[3], ARGV[2], 'EX', {_DLQ_DEDUP_TTL_SECONDS})
             end
             return redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
             """,
@@ -389,7 +397,9 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
         return
 
     opts = cfg.broker_options or {}
-    dlq_maxlen = opts.get("dlq_max_stream_len")
+    dlq_maxlen = os.environ.get("MODULITH_BROKER_DLQ_MAX_STREAM_LEN") or opts.get(
+        "dlq_max_stream_len"
+    )
     broker = RedisStreamsBroker(
         url=os.environ.get("REDIS_URL") or opts.get("url") or _DEFAULT_URL,
         stream_prefix=(
@@ -402,7 +412,11 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
             or _DEFAULT_MAXLEN
         ),
         dlq_max_stream_len=int(dlq_maxlen) if dlq_maxlen is not None else None,
-        max_payload_bytes=int(opts.get("max_payload_bytes") or DEFAULT_MAX_PAYLOAD_BYTES),
+        max_payload_bytes=int(
+            os.environ.get("MODULITH_BROKER_MAX_PAYLOAD_BYTES")
+            or opts.get("max_payload_bytes")
+            or DEFAULT_MAX_PAYLOAD_BYTES
+        ),
     )
     registry.register(_REDIS_SCHEME, broker)
     logger.info("registered redis-streams broker (prefix=%s)", broker._stream_prefix)

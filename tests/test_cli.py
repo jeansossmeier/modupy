@@ -338,6 +338,42 @@ def test_dev_processes_topology_runs_supervisor(make_fake_app, monkeypatch):
     assert captured["port"] == 8080
 
 
+def test_dev_isolate_warns_that_every_other_module_is_dropped(make_fake_app, monkeypatch):
+    """SPEC.md's own usage line ('--isolate=reports  # only reports gets its
+    own process') reads as if the rest of the app keeps running. It does
+    not: derive_specs_from_config hard-filters to just the isolated module,
+    so every other module gets no worker and 404s through the proxy. The CLI
+    must say so instead of leaving that silent."""
+    make_fake_app({"orders": "", "inventory": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["dev", "myapp:app", "--isolate", "orders"])
+
+    assert result.exit_code == 0, result.output
+    assert {s.module_name for s in captured["specs"]} == {"orders"}
+    assert "orders" in result.stderr
+    assert "not start" in result.stderr
+
+
+def test_dev_isolate_help_states_it_excludes_other_modules():
+    """The option help previously read 'Module to isolate in its own
+    process', which implies the rest keeps running — the opposite of the
+    actual hard-filter behavior in derive_specs_from_config."""
+    result = runner.invoke(app, ["dev", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "only" in result.stdout.lower()
+
+
 def test_dev_processes_topology_uses_app_module_package_and_worker_env(make_fake_app, monkeypatch):
     """CLI-only process runs must hand package/broker config to workers.
 

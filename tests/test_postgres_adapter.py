@@ -810,3 +810,97 @@ async def test_try_lock_publication_requires_postgres_engine(engine) -> None:
 
     with pytest.raises(ConfigurationError, match=r"[Pp]ostgres"):
         await store.try_lock_publication(uuid4())
+
+
+async def test_try_lock_publication_closes_connection_on_execute_error() -> None:
+    """try_lock_publication had no try/finally around the ``SELECT
+    pg_try_advisory_lock`` execute(): a transient lock-query error (connection
+    blip, failover, statement timeout) leaked the checked-out connection back
+    to the pool on every retry. The connection must be released even when the
+    lock query itself raises."""
+
+    class _StubDialect:
+        name = "postgresql"
+
+    class _RaisingConn:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def execution_options(self, **opts: Any) -> _RaisingConn:
+            return self
+
+        async def execute(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("boom")
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class _StubEngine:
+        dialect = _StubDialect()
+
+        def __init__(self) -> None:
+            self.conn = _RaisingConn()
+
+        async def connect(self) -> Any:
+            return self.conn
+
+    engine_stub = _StubEngine()
+    store = PostgresPublicationStore(engine=engine_stub)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await store.try_lock_publication(uuid4())
+
+    assert engine_stub.conn.closed is True
+
+
+async def test_try_lock_publication_does_not_leave_an_open_transaction() -> None:
+    """``conn.execute()`` autobegins a transaction that then stays open for
+    the whole dispatch ``_sweep_advisory`` holds the lock connection across —
+    idle-in-transaction on real Postgres, blocking VACUUM and risking
+    idle_in_transaction_session_timeout killing the backend mid-dispatch. The
+    lock connection must be put in autocommit mode before the lock query so no
+    transaction is ever opened."""
+
+    class _StubDialect:
+        name = "postgresql"
+
+    class _FakeConn:
+        def __init__(self) -> None:
+            self.autocommit = False
+
+        async def execution_options(self, **opts: Any) -> _FakeConn:
+            if opts.get("isolation_level") == "AUTOCOMMIT":
+                self.autocommit = True
+            return self
+
+        async def execute(self, *args: Any, **kwargs: Any) -> Any:
+            class _Result:
+                def scalar(self_inner) -> Any:
+                    return 1
+
+            return _Result()
+
+        def in_transaction(self) -> bool:
+            return not self.autocommit
+
+        async def close(self) -> None:
+            pass
+
+    class _StubEngine:
+        dialect = _StubDialect()
+
+        def __init__(self) -> None:
+            self.conn = _FakeConn()
+
+        async def connect(self) -> Any:
+            return self.conn
+
+    engine_stub = _StubEngine()
+    store = PostgresPublicationStore(engine=engine_stub)
+
+    handle = await store.try_lock_publication(uuid4())
+
+    assert handle is not None
+    assert handle.in_transaction() is False, (
+        "advisory-lock connection left an open transaction across the dispatch it holds"
+    )
