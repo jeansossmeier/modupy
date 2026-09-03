@@ -153,6 +153,12 @@ class _AckOnceBroker(ShmBroker):
         await super().ack(row_id, consumer_name=consumer_name)
 
 
+# Windows' default timer ticks every ~15.6 ms, so a 1-2 ms heartbeat sleep can
+# overshoot a 30-60 ms lease budget in one tick and the loop exits with zero
+# renewals; 30 ms keeps every tick and the 10x budget above that granularity.
+_RENEW_WINDOW_S = 0.03
+
+
 class _RenewLoopBroker(ShmBroker):
     """Control renewal outcomes without replacing the real broker interface."""
 
@@ -548,7 +554,7 @@ async def test_cancelling_guarded_renewal_propagates_and_releases_in_flight(
         instance,
         InMemoryEventBus(),
         JsonEventSerializer(),
-        reclaim_stale_seconds=0.003,
+        reclaim_stale_seconds=_RENEW_WINDOW_S,
     )
     in_flight = {"row-1"}
     task = asyncio.create_task(
@@ -592,7 +598,7 @@ async def test_renew_loop_retries_exception_warns_on_partial_and_stops_when_empt
         instance,
         InMemoryEventBus(),
         JsonEventSerializer(),
-        reclaim_stale_seconds=0.006,
+        reclaim_stale_seconds=_RENEW_WINDOW_S,
     )
     in_flight = {"row-1"}
     task = asyncio.create_task(consumer._renew_loop(in_flight))
@@ -619,7 +625,7 @@ async def test_renew_loop_stops_extending_a_claim_at_heartbeat_deadline(
         instance,
         InMemoryEventBus(),
         JsonEventSerializer(),
-        reclaim_stale_seconds=0.003,
+        reclaim_stale_seconds=_RENEW_WINDOW_S,
     )
     in_flight = {"row-1"}
     try:
