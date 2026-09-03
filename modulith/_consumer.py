@@ -44,6 +44,7 @@ import asyncio
 import logging
 from typing import Any
 
+from ._shutdown import DEFAULT_STOP_TIMEOUT_S, cancel_and_wait
 from .config import ConfigurationError
 from .manifest import get_manifest
 from .protocols import ConsumerHealth
@@ -155,25 +156,24 @@ class BrokerConsumer:
             len(self._targets),
         )
 
-    async def stop(self) -> None:
-        """Cancel the loop and wait for it to unwind.
+    _stop_timeout_s: float = DEFAULT_STOP_TIMEOUT_S
 
-        Never raises: a task that already died with a real exception (not
-        CancelledError) would otherwise re-raise it here at shutdown time —
-        it is logged instead.
+    async def stop(self) -> None:
+        """Cancel the loop and wait for it to unwind, never longer than twice
+        ``_stop_timeout_s``.
+
+        Never raises for the task's own outcome: a task that already died with
+        a real exception is logged, and one that ignores cancellation is
+        abandoned rather than wedging shutdown.
         """
         self._stopping = True
         if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception(
-                    "consumer %r task had already died with an unexpected error",
-                    self._consumer_name,
-                )
+            await cancel_and_wait(
+                self._task,
+                timeout_s=self._stop_timeout_s,
+                logger=logger,
+                what=f"consumer {self._consumer_name!r} task",
+            )
             self._task = None
         self._health = ConsumerHealth(ready=False, status="stopped")
 

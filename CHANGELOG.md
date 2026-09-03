@@ -52,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Packaging: dropped a `py.typed` include that pointed at a directory the wheel doesn't ship; `.opencode/` is excluded from the sdist; CI and release inspection now require `alembic.ini` and `py.typed` to be present in the built distribution
 - Raised the `redis` extra's floor to `redis>=5.0.1` (the actual tested minimum)
 - The issue template's "Question or usage help" contact link now points at a working `issues/new?labels=question` URL instead of the disabled Discussions tab
+- Consumer `stop()` (database, SHM and Redis Streams consumers) can no longer hang forever on a poll task whose cancellation is absorbed — SQLAlchemy shields a cancelled connection's graceful close, and a driver that never finishes it swallowed the only cancel. `stop()` now re-cancels after 10 s and, if the task still ignores that, logs an error and abandons it after another 10 s; cancelling the stopping task itself still reaches the poll task first
 
 ## [0.9.0] — 2026-07-22
 

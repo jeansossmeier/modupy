@@ -8,6 +8,7 @@ import random
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from .._shutdown import DEFAULT_STOP_TIMEOUT_S, cancel_and_wait
 from ..protocols import ConsumerHealth
 from ._consumer_protocol import PollingBroker
 from ._delivery_dispatch import DeliveryDispatch
@@ -22,6 +23,8 @@ IdleWait = Callable[[float], Awaitable[None]]
 
 class PollingConsumer(DeliveryDispatch):
     """Store-neutral poll, health, backoff, pruning, and shutdown lifecycle."""
+
+    _stop_timeout_s: float = DEFAULT_STOP_TIMEOUT_S
 
     def __init__(
         self,
@@ -186,19 +189,12 @@ class PollingConsumer(DeliveryDispatch):
     async def _cancel(self, task: asyncio.Task[None] | None, label: str) -> None:
         if task is None:
             return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            current = asyncio.current_task()
-            if current is not None and current.cancelling() > 0:
-                raise
-        except Exception:
-            self._logger.exception(
-                "consumer %r %s task had already died",
-                self._consumer_name,
-                label,
-            )
+        await cancel_and_wait(
+            task,
+            timeout_s=self._stop_timeout_s,
+            logger=self._logger,
+            what=f"consumer {self._consumer_name!r} {label} task",
+        )
 
     async def _run(self) -> None:
         idle_empty_streak = 0

@@ -534,3 +534,103 @@ async def test_polling_consumer_passes_max_attempts_to_claim_batch() -> None:
         await consumer.stop()
 
     assert broker.claim_batch_calls[0]["max_attempts"] == 7
+
+
+# ---------------------------------------------------------------------------
+# stop() must return even when the poll task cannot be cancelled promptly
+# ---------------------------------------------------------------------------
+
+
+class _WedgedClaimBroker(FakePollingBroker):
+    """``claim_batch`` never returns and swallows the first ``absorb`` cancels —
+    the shape SQLAlchemy produces when a cancelled connection's graceful close
+    is shielded and the driver never finishes it."""
+
+    def __init__(self, *, absorb: int) -> None:
+        super().__init__()
+        self.absorb = absorb
+        self.cancels = 0
+        self.entered = asyncio.Event()
+
+    async def claim_batch(self, group: str, **kwargs: Any) -> list[dict[str, Any]]:
+        self.entered.set()
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                self.cancels += 1
+                if self.cancels > self.absorb:
+                    raise
+
+
+async def test_stop_re_cancels_a_poll_task_that_absorbed_the_first_cancel() -> None:
+    broker = _WedgedClaimBroker(absorb=1)
+    consumer = _make_polling_consumer(broker, poll_interval_s=0.01, max_attempts=3, idle_wait=None)
+    consumer._stop_timeout_s = 0.2
+    await consumer.start()
+    await asyncio.wait_for(broker.entered.wait(), timeout=2.0)
+
+    await asyncio.wait_for(consumer.stop(), timeout=5.0)
+
+    assert broker.cancels == 2
+    assert consumer.health().status == "stopped"
+
+
+async def test_stop_abandons_a_poll_task_that_never_stops(caplog) -> None:
+    broker = _WedgedClaimBroker(absorb=10**9)
+    consumer = _make_polling_consumer(broker, poll_interval_s=0.01, max_attempts=3, idle_wait=None)
+    consumer._stop_timeout_s = 0.1
+    await consumer.start()
+    await asyncio.wait_for(broker.entered.wait(), timeout=2.0)
+    task = consumer._task
+    assert task is not None
+
+    try:
+        with caplog.at_level(logging.ERROR, logger="test.polling_consumer"):
+            await asyncio.wait_for(consumer.stop(), timeout=5.0)
+
+        assert not task.done()
+        assert consumer._task is None
+        assert consumer.health().status == "stopped"
+        assert any("abandon" in record.getMessage() for record in caplog.records)
+    finally:
+        # Release the wedged task even on failure: a task that swallows every
+        # cancel would otherwise wedge the loop's own shutdown and hang pytest.
+        broker.absorb = 0
+        task.cancel()
+        await asyncio.wait({task}, timeout=2.0)
+    assert task.done()
+
+
+async def test_broker_consumer_stop_abandons_a_task_that_never_stops(caplog) -> None:
+    """Same guarantee for the Redis consumer's own stop(): it must return."""
+    consumer = _make_consumer(InjectableBroker(), targets=["t"])
+    consumer._stop_timeout_s = 0.1
+    entered = asyncio.Event()
+    absorb = {"cancels": True}
+
+    async def _wedged() -> None:
+        entered.set()
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                if not absorb["cancels"]:
+                    raise
+
+    task = asyncio.create_task(_wedged())
+    consumer._task = task
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
+
+    try:
+        with caplog.at_level(logging.ERROR, logger="modulith.consumer"):
+            await asyncio.wait_for(consumer.stop(), timeout=5.0)
+
+        assert not task.done()
+        assert consumer._task is None
+        assert any("abandon" in record.getMessage() for record in caplog.records)
+    finally:
+        absorb["cancels"] = False
+        task.cancel()
+        await asyncio.wait({task}, timeout=2.0)
+    assert task.done()

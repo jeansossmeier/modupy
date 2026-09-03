@@ -720,6 +720,11 @@ lifecycle:
       command: ["/bin/sh", "-c", "sleep 5"]  # wait for in-flight requests
 ```
 
+Consumer shutdown is bounded: a poll task whose cancellation is absorbed (a
+driver that never finishes closing a cancelled connection) is cancelled again
+after 10 s and, if it still ignores that, abandoned with an error log after
+another 10 s, so `stop()` returns within 20 s in the worst case.
+
 Modulith's supervisor handles SIGTERM and drains listeners before exit — on
 POSIX. Windows has no signal delivery on `subprocess.Popen` (`terminate()`
 is an immediate `TerminateProcess`, with no softer step for a worker's
