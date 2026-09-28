@@ -530,8 +530,14 @@ retained for `orphan_retention_seconds` (default 86400, 24 hours) and replayed
 once to every group that subscribes before expiry.
 
 Payloads over `max_payload_bytes` are rejected before a transaction starts.
-`max_store_bytes` configures SQLite `max_page_count`; a full store rejects new
-publishes until retained publications expire or the limit is raised. Because
+`max_store_bytes` configures SQLite `max_page_count`, and the file never grows
+past it. A full store rejects new publishes until retained publications expire
+or the limit is raised. Publishes are refused a small reserve early, once
+`page_count - freelist_count` would pass `max_page_count` minus 32 pages (one
+eighth of the pages below 256 pages), so consumers can still claim, ack, fail,
+dead-letter and prune their backlog while publishes are refused. A
+default-size consumer pass measured at most 7 pages of growth; stores under
+224 KiB reserve less than that. Because
 drained publications stay for the whole retention window, the store sustains
 about `max_store_bytes / (bytes per publication × orphan_retention_seconds)`
 publications per second: roughly 7/s for 1 KiB payloads and two groups with

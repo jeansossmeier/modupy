@@ -21,6 +21,19 @@ _PUBLISH_PRUNE_LIMIT = 100
 # caller (SqliteQueueStore) tracks the cadence and passes prune_due.
 PRUNE_EVERY_N_PUBLISHES = 100
 
+# Publishes stop this many pages below max_page_count so claims, acks, fails,
+# dead-letters and prunes always have room to commit and drain a backlog that
+# filled the store. A default-size consumer pass (claim 100, fail and
+# dead-letter with a 4 KiB error, ack the rest, prune) grows the file by at
+# most 7 pages at every measured store size; the reserve keeps ~4x that. Stores
+# under 256 pages give an eighth of their pages instead, so below 56 pages
+# (224 KiB at 4 KiB pages) the reserve no longer covers a full default pass.
+CONSUMER_RESERVE_PAGES = 32
+
+
+class _PublishReserveReached(Exception):
+    """The publish would eat into the pages reserved for consumer writes."""
+
 
 def spill(
     conn: sqlite3.Connection,
@@ -100,8 +113,9 @@ def publish(
                     str(row["consumer_group"]),
                     now,
                 )
-    except sqlite3.Error as error:
-        if _is_store_full(error):
+            _ensure_consumer_reserve(conn)
+    except (sqlite3.Error, _PublishReserveReached) as error:
+        if isinstance(error, _PublishReserveReached) or _is_store_full(error):
             raise ConfigurationError(
                 "SHM SQLite store is full while publishing. Every publication is "
                 f"kept for orphan_retention_seconds (currently {retention_seconds:g}) "
@@ -122,6 +136,15 @@ def _ensure_payload_size(payload: bytes, max_payload_bytes: int) -> None:
             f"SHM payload is {payload_size} bytes, exceeding "
             f"max_payload_bytes={max_payload_bytes}. Reduce the payload or increase the limit."
         )
+
+
+def _ensure_consumer_reserve(conn: sqlite3.Connection) -> None:
+    max_pages = int(conn.execute("PRAGMA max_page_count").fetchone()[0])
+    used_pages = int(conn.execute("PRAGMA page_count").fetchone()[0]) - int(
+        conn.execute("PRAGMA freelist_count").fetchone()[0]
+    )
+    if used_pages > max_pages - min(CONSUMER_RESERVE_PAGES, max_pages // 8):
+        raise _PublishReserveReached
 
 
 def _is_store_full(error: sqlite3.Error) -> bool:

@@ -206,6 +206,10 @@ defaults sustain roughly 7 publications/s; above that, every publish fails with
 shorten `orphan_retention_seconds` in `[tool.modulith.broker_options]` (or
 `MODULITH_BROKER_MAX_STORE_BYTES` / `MODULITH_BROKER_ORPHAN_RETENTION_SECONDS`).
 A group that subscribes after a publication replays it only within that window.
+Publishes stop a 32-page consumer reserve (128 KiB at 4 KiB pages) below
+`max_store_bytes`, so consumers can drain a backlog while publishes are
+refused. Strictly, the numerator above is `max_store_bytes` minus that
+reserve; at the 1 GiB default that is 0.01% and does not change the estimate.
 
 ### A. SQLite Database Broker (Zero Infrastructure)
 

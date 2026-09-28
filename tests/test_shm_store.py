@@ -266,6 +266,59 @@ def test_store_exhaustion_rolls_back_publish_with_actionable_error(tmp_path: Pat
         store.close()
 
 
+@pytest.mark.parametrize("max_store_bytes", [256 * 1024, 1024 * 1024])
+def test_consumers_drain_a_backlog_that_filled_the_store(
+    tmp_path: Path, max_store_bytes: int
+) -> None:
+    path = tmp_path / "backlog.db"
+    store = SqliteQueueStore(
+        str(path),
+        synchronous="NORMAL",
+        completion_mode="delete",
+        orphan_retention_seconds=1e-6,
+        retry_backoff_base_seconds=0.05,
+        retry_backoff_cap_seconds=5.0,
+        max_store_bytes=max_store_bytes,
+    )
+    groups = ["modulith-inventory", "modulith-notifications"]
+    try:
+        for group in groups:
+            store.subscribe(["events.Created"], group)
+        published = 0
+        with pytest.raises(ConfigurationError, match="max_store_bytes"):
+            while True:
+                store.publish(
+                    "events.Created",
+                    b'{"order_id":"%08d","total":19.99}' % published,
+                    {"event_type": "events.Created"},
+                    None,
+                )
+                published += 1
+        assert published >= 100
+        assert not store._conn.in_transaction
+
+        for group in groups:
+            consumer = f"{group}:worker-0123456789abcdef0123456789abcdef"
+            while store.group_backlog()[group]:
+                rows = store.claim(group, 100, consumer, 30.0)
+                if not rows:
+                    time.sleep(0.05)
+                    continue
+                first, *rest = rows
+                assert store.fail(first["claim_token"], "ValueError: bad payload", 3, consumer)
+                if rest:
+                    assert store.dead_letter(rest.pop()["claim_token"], "poison", consumer)
+                for row in rest:
+                    assert store.ack(row["claim_token"], consumer, None)
+                store.prune(1e-9, 1000)
+        assert store.group_backlog() == dict.fromkeys(groups, 0)
+        assert store.read_pragma("page_count") * store.read_pragma("page_size") <= max_store_bytes
+
+        store.publish("events.Created", b"{}", {"event_type": "events.Created"}, "after-drain")
+    finally:
+        store.close()
+
+
 async def test_sqlite_allocates_one_global_sequence_across_store_instances(
     tmp_path: Path,
 ) -> None:
