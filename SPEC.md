@@ -873,8 +873,13 @@ durability.
 Two byte limits bound the authoritative store. `max_payload_bytes` defaults to
 16 MiB and cannot exceed 1 GiB; payload validation occurs before the publish
 transaction. `max_store_bytes` defaults to 1 GiB and cannot exceed 1 TiB; it is
-translated to SQLite `max_page_count`, so page exhaustion rolls back and
-rejects the publish as backpressure. Both have
+translated to SQLite `max_page_count`, so the file never exceeds it. A publish
+that would leave `page_count - freelist_count` above `max_page_count` minus a
+consumer reserve (32 pages, or one eighth of the pages below 256 pages) rolls
+back and is rejected as backpressure. The reserve keeps room for claims, acks,
+fails, dead-letters and prunes, so consumers can drain a backlog that filled
+the store; a default-size consumer pass measured at most 7 pages, which stores
+under 224 KiB no longer reserve. Both have
 `MODULITH_BROKER_MAX_PAYLOAD_BYTES` / `MODULITH_BROKER_MAX_STORE_BYTES`
 overrides. `shm_slot_size` is deprecated and ignored because mmap hint slots
 are fixed-size sequence records.

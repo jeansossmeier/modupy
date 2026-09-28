@@ -52,9 +52,13 @@ dispatch.
 standalone service from one module: its package tree plus `pyproject.toml`,
 `Dockerfile`, `README.md` and `.env.example`. The rest of the monolith keeps
 publishing through the broker and the extracted service subscribes; you wire
-its outbox yourself. Extraction refuses a module with outbound boundary
-violations or tables shared with another module unless you pass `--force`,
-and the generated README records what you overrode.
+its outbox yourself. Extraction copies the package-level helpers the module
+and its contracts import, transitively. It refuses a module with outbound
+boundary violations, tables shared with another module, or imports of another
+declared module unless you pass `--force`, and the generated README records
+what you overrode. It then imports the extracted module in a subprocess and
+fails, naming the missing import, if that import fails, so the service's
+third-party dependencies must be installed.
 
 Adopting on an existing codebase? `modulith audit` writes a `MIGRATION.md`
 for it, and `modulith verify --mode=ratchet` baselines today's violations and

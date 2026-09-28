@@ -372,8 +372,8 @@ Defaults are absolute, package-namespaced paths in the platform's per-user
 state directory (`0700` directories and `0600` files on POSIX).
 `max_payload_bytes` defaults to 16 MiB (maximum 1 GiB) and rejects oversized
 messages before a publish transaction. `max_store_bytes` defaults to 1 GiB
-(maximum 1 TiB) and uses SQLite `max_page_count` to reject new writes when the
-store is full. Environment overrides are
+(maximum 1 TiB) and uses SQLite `max_page_count` as a hard bound and refuses
+publishes a small consumer reserve below it. Environment overrides are
 `MODULITH_BROKER_MAX_PAYLOAD_BYTES` and `MODULITH_BROKER_MAX_STORE_BYTES`.
 Remove legacy `shm_slot_size`; it is deprecated and ignored.
 
