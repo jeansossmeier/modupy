@@ -64,6 +64,20 @@ _SKIP_DIRS = frozenset(
     }
 )
 
+# Top-level directories that hold Python but are never the application package.
+# Only consulted when deciding whether a project root wraps a single package.
+_NON_APPLICATION_DIRS = _SKIP_DIRS | {
+    "docs",
+    "doc",
+    "scripts",
+    "examples",
+    "example",
+    "migrations",
+    "alembic",
+    "env",
+    "site-packages",
+}
+
 # Function-name prefixes that suggest an event-handler shape.
 _LISTENER_PREFIXES = ("on_", "handle_", "process_")
 
@@ -107,6 +121,57 @@ class AuditResult:
     # doesn't silently hide that some of the codebase was never analyzed.
     parse_failures: list[Path] = field(default_factory=list)
 
+    # The resolved directory whose top-level subdirectories were the module
+    # candidates.
+    audited_root: Path | None = None
+
+    @property
+    def score_applicable(self) -> bool:
+        """Whether ``readiness_score`` measures anything.
+
+        With fewer than two module candidates every import stays inside one
+        module, so the formula's 100 reflects the layout, not the coupling.
+        """
+        return len(self.proposed_modules) > 1
+
+
+def find_audit_root(path: Path) -> Path:
+    """The directory whose subdirectories should be the module candidates.
+
+    ``path`` itself when it is a package or holds several application
+    directories. A project root whose only application directory is one
+    package, or ``src/`` holding one package, resolves to that package, so a
+    bare ``modulith audit`` at the project root does not propose the whole
+    application as a single module. Tests, docs, scripts, examples,
+    migrations, virtualenvs, hidden and build directories are ignored when
+    deciding; files directly under the project root (``manage.py``) are not
+    audited once it descends.
+    """
+    root = path.resolve()
+    if (root / "__init__.py").exists():
+        return root
+    candidates = _application_dirs(root)
+    if len(candidates) != 1:
+        return root
+    only = candidates[0]
+    if only.name == "src" and not (only / "__init__.py").exists():
+        inner = _application_dirs(only)
+        return inner[0] if len(inner) == 1 else only
+    return only
+
+
+def _application_dirs(root: Path) -> list[Path]:
+    return [
+        child
+        for child in sorted(root.iterdir())
+        if child.is_dir()
+        and not child.name.startswith(".")
+        and child.name not in _NON_APPLICATION_DIRS
+        and not child.name.endswith(".egg-info")
+        and not (child / "pyvenv.cfg").exists()
+        and _iter_py_files(child)
+    ]
+
 
 def audit_codebase(root: Path, contracts_module: str = CONTRACTS_MODULE) -> AuditResult:
     """Run the full audit pipeline over a directory tree.
@@ -125,6 +190,11 @@ def audit_codebase(root: Path, contracts_module: str = CONTRACTS_MODULE) -> Audi
     ``root.name``, and a relative root like ``Path(".")`` — the CLI default —
     has an empty name, which would make every ``rootpkg.module`` import look
     external and fabricate a perfect readiness score.
+
+    ``root`` is audited as given; ``find_audit_root`` picks the application
+    package out of a project root. When the result holds a single module
+    candidate, ``score_applicable`` is False and the report withholds the
+    score.
     """
     root = root.resolve()
     files = _iter_py_files(root)
@@ -142,6 +212,7 @@ def audit_codebase(root: Path, contracts_module: str = CONTRACTS_MODULE) -> Audi
         listener_candidates=listeners,
         files_scanned=len(parsed),
         parse_failures=failures,
+        audited_root=root,
     )
 
 
@@ -359,8 +430,9 @@ def _compute_readiness_score(
     code already present (listener candidates — the patterns that convert
     cleanly to events). A codebase with no cross-module interaction at all
     is already modular, so it scores 100 — note this branch also fires for
-    an empty tree (zero files scanned), which ``render_report`` calls out
-    explicitly. Shared tables are deliberately not part of the formula; the
+    an empty tree and for a single module candidate, where no import can
+    cross a boundary; ``AuditResult.score_applicable`` is False for both and
+    ``render_report`` withholds the score. Shared tables are deliberately not part of the formula; the
     report carries a caveat when they exist.
     """
     direct = sum(count for _src, _tgt, count, _sample in cross_module_imports)
@@ -386,12 +458,11 @@ def render_report(result: AuditResult) -> str:
     lines: list[str] = ["# Modulith Audit Report", ""]
 
     # Summary
-    lines += [
-        "## Summary",
-        "",
-        f"**Readiness score: {result.readiness_score}/100**",
-        "",
-    ]
+    score = f"{result.readiness_score}/100" if result.score_applicable else "not applicable"
+    lines += ["## Summary", ""]
+    if result.audited_root is not None:
+        lines += [f"Audited root: `{result.audited_root}`", ""]
+    lines += [f"**Readiness score: {score}**", ""]
     if result.files_scanned == 0:
         lines += [
             "**Warning: no Python files were found under the audited path.** "
@@ -399,9 +470,16 @@ def render_report(result: AuditResult) -> str:
             "the path points at your codebase.",
             "",
         ]
+    warning = single_module_warning(result)
+    if warning is not None:
+        lines += [f"**Warning: {warning}**", ""]
     lines += [
-        f"Your codebase is approximately {result.readiness_score}% ready for "
-        "modulith adoption. Top blockers:",
+        (
+            f"Your codebase is approximately {result.readiness_score}% ready for "
+            "modulith adoption. Top blockers:"
+            if result.score_applicable
+            else "Top blockers:"
+        ),
         "",
         f"  - {len(result.cross_module_imports)} cross-module import pattern(s) "
         "(should become events)",
@@ -477,8 +555,22 @@ def render_report(result: AuditResult) -> str:
     return "\n".join(lines) + "\n"
 
 
+def single_module_warning(result: AuditResult) -> str | None:
+    """Why the score is withheld when the audit found one module candidate."""
+    if len(result.proposed_modules) != 1:
+        return None
+    (module,) = result.proposed_modules
+    return (
+        f"only one module candidate (`{module}`) was found, so every import stays "
+        "inside it and there are no boundaries to score. Run `modulith audit <dir>` "
+        "on the directory whose subdirectories are your intended modules."
+    )
+
+
 __all__ = [
     "AuditResult",
     "audit_codebase",
+    "find_audit_root",
     "render_report",
+    "single_module_warning",
 ]

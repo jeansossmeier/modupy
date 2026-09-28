@@ -1036,7 +1036,7 @@ def audit(
     cross-module imports that would become violations, shared tables that
     need ownership decisions, and a 0-100 readiness score.
     """
-    from .audit import audit_codebase, render_report
+    from .audit import audit_codebase, find_audit_root, render_report, single_module_warning
 
     if not path.exists():
         typer.echo(f"path does not exist: {path}", err=True)
@@ -1048,7 +1048,7 @@ def audit(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from None
 
-    result = audit_codebase(path, contracts_module=cfg.contracts_module)
+    result = audit_codebase(find_audit_root(path), contracts_module=cfg.contracts_module)
     try:
         output.write_text(render_report(result), encoding="utf-8")
     except OSError as exc:
@@ -1062,7 +1062,14 @@ def audit(
             err=True,
         )
         raise typer.Exit(code=1) from None
-    typer.echo(f"readiness score: {result.readiness_score}/100")
+    typer.echo(f"audited {result.audited_root}")
+    warning = single_module_warning(result)
+    if warning is not None:
+        typer.echo(f"warning: {warning}", err=True)
+    if result.score_applicable:
+        typer.echo(f"readiness score: {result.readiness_score}/100")
+    else:
+        typer.echo("readiness score: n/a (fewer than two module candidates)")
     typer.echo(
         f"{len(result.cross_module_imports)} cross-module import pattern(s), "
         f"{len(result.shared_tables)} shared table(s)"

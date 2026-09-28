@@ -32,13 +32,20 @@ echoes a short summary to stdout, so a redirect onto the same file
 corrupts the report it just wrote.)
 
 `modulith audit` reads your codebase non-destructively and produces a
-Markdown report:
-- A proposed module structure based on your folder layout and import patterns
+Markdown report. Run from the project root, it audits your application
+package: when the only application directory is one package (`app/`) or
+`src/` holding one package, that package's subpackages are the module
+candidates. Tests, docs, scripts, examples, migrations, virtualenvs, hidden
+and build directories are ignored when it decides. It prints the directory it
+chose; pass a path (`modulith audit app`) to pick another. The report holds:
+- A proposed module structure based on your folder layout
 - A list of cross-module imports that would become violations
 - A list of database tables that multiple parts of the code touch (these
   are your future ownership decisions)
 - A "modulith-readiness score" (0-100) based on how much of your
-  cross-module communication already goes through indirection
+  cross-module communication already goes through indirection. With only
+  one module candidate there are no boundaries to measure, so the audit
+  warns and reports the score as not applicable.
 
 Read the report with the team. Argue about the proposed module
 boundaries. The audit is a starting point, not a verdict.
