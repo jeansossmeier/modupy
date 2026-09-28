@@ -2449,6 +2449,64 @@ def test_explicitly_configured_store_wins_over_outbox_url(
     assert (outbox._store is store, postgres_outbox._active_store) == (True, None)
 
 
+_SHARED_LISTENER_CLASS_APP = {
+    "contracts": """
+        from dataclasses import dataclass
+
+        from modulith import event
+
+        RUNS: list[tuple[str, str]] = []
+
+        @event
+        @dataclass(frozen=True)
+        class OrderPlaced:
+            order_id: str
+
+        class Notifier:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            async def __call__(self, evt: OrderPlaced) -> None:
+                RUNS.append((self.name, evt.order_id))
+    """,
+    "orders": """
+        from modulith import listener
+        from fakeapp.contracts import Notifier
+
+        listener(Notifier("orders"))
+    """,
+    "billing": """
+        from modulith import listener
+        from fakeapp.contracts import RUNS, Notifier, OrderPlaced
+
+        listener(Notifier("billing"))
+
+        @listener
+        async def on_placed(evt: OrderPlaced) -> None:
+            RUNS.append(("billing.on_placed", evt.order_id))
+    """,
+}
+
+
+@pytest.mark.asyncio
+async def test_rows_of_one_listener_class_are_attributed_to_each_registering_module(
+    make_fake_app: Any,
+) -> None:
+    make_fake_app(_SHARED_LISTENER_CLASS_APP)
+    _runtime.configure(package="fakeapp")
+    _runtime.ensure_bootstrapped()
+    outbox.configure(StubStore(), JsonEventSerializer(), start_loop=False)
+    contracts = __import__("fakeapp.contracts", fromlist=["OrderPlaced"])
+
+    saved = await outbox.persist(contracts.OrderPlaced("o1"))
+
+    assert sorted(pub.listener or "" for pub in saved) == [
+        "fakeapp.billing.on_placed",
+        "fakeapp.billing:fakeapp.contracts.Notifier",
+        "fakeapp.orders:fakeapp.contracts.Notifier",
+    ]
+
+
 def test_start_without_a_bound_store_starts_nothing() -> None:
     async def scenario() -> Any:
         outbox.start()

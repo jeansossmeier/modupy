@@ -263,6 +263,7 @@ def listener(
             # the adapter's own and every instance in a module would share one
             # outbox listener id. Its class name is distinct and restart-stable.
             registered.__qualname__ = type(handler).__qualname__
+            registered.__modulith_instance_listener__ = True  # type: ignore[union-attr]
 
         registered.__modulith_broker_targets__ = normalized_targets  # type: ignore[union-attr]
         _runtime.register_listener(event_type, registered)
