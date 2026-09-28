@@ -541,7 +541,7 @@ def _broker_destination(target: object, broker_scheme: str) -> str:
 
 def consumer_targets(bus: Any, cfg: Any, module_name: str) -> list[str]:
     """Resolve one worker's ordered backend subscription destinations."""
-    event_types = bus.registered_event_types()
+    event_types = _runtime.local_event_types(bus)
     full_targets = [
         getattr(
             event_type,
@@ -561,7 +561,7 @@ def consumer_targets(bus: Any, cfg: Any, module_name: str) -> list[str]:
         declarations = tuple(
             target
             for event_type in event_types
-            for handler in bus.listeners_for(event_type)
+            for handler in _runtime.local_listeners(bus.listeners_for(event_type))
             for target in getattr(handler, "__modulith_broker_targets__", ())
         )
     else:
