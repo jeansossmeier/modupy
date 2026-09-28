@@ -326,6 +326,25 @@ async def test_dead_letter_cap_is_configurable() -> None:
     assert 42 in keys_and_args
 
 
+@pytest.mark.parametrize("option", ["max_stream_len", "dlq_max_stream_len"])
+@pytest.mark.parametrize("value", [0, -5, "abc", "0", True, 1.5])
+def test_stream_caps_reject_non_positive_or_non_integer(option: str, value: object) -> None:
+    """A zero cap makes XADD MAXLEN ~ trim every event away in the same command."""
+    with pytest.raises(ConfigurationError, match=rf"{option}.*positive integer"):
+        RedisStreamsBroker(client=FakeRedis(), **{option: value})
+
+
+async def test_stream_caps_accept_numeric_strings() -> None:
+    fake = FakeRedis()
+    broker = RedisStreamsBroker(
+        client=fake, stream_prefix="p", max_stream_len="250", dlq_max_stream_len="7"
+    )
+    await broker.publish("orders", b"{}")
+    await broker.dead_letter("orders", "1-0", {b"data": b"{}"})
+    assert fake.xadds[0][2] == 250
+    assert 7 in fake.eval_calls[0][2]
+
+
 _DEAD_LETTER_CALL_RE = re.compile(r"redis\.call\('(\w+)'[^)]*\)")
 
 
@@ -966,6 +985,46 @@ def test_env_var_overrides_broker_options_for_dlq_max_stream_len(
     modulith_register_brokers(registry=registry)
     broker = registry.get("redis-streams")
     assert broker._dlq_max_stream_len == 424242
+
+
+@pytest.mark.parametrize(
+    "env_var", ["MODULITH_STREAM_MAXLEN", "MODULITH_BROKER_DLQ_MAX_STREAM_LEN"]
+)
+@pytest.mark.parametrize("value", ["0", "-1", "abc"])
+def test_register_hook_rejects_invalid_stream_cap_env(
+    make_fake_app, monkeypatch, env_var: str, value: str
+) -> None:
+    make_fake_app({"orders": ""})
+    from modulith import configure
+    from modulith.runtime import _runtime
+
+    monkeypatch.setenv(env_var, value)
+    configure(package="fakeapp", broker="redis-streams")
+
+    with pytest.raises(ConfigurationError, match=rf"{env_var}.*positive integer"):
+        _runtime.ensure_bootstrapped()
+
+
+def test_register_hook_stream_caps_from_env_and_default(make_fake_app, monkeypatch) -> None:
+    make_fake_app({"orders": ""})
+    from modulith import configure
+    from modulith.runtime import _runtime
+
+    monkeypatch.delenv("MODULITH_BROKER_DLQ_MAX_STREAM_LEN", raising=False)
+    monkeypatch.delenv("MODULITH_STREAM_MAXLEN", raising=False)
+    configure(package="fakeapp", broker="redis-streams")
+    _runtime.ensure_bootstrapped()
+
+    registry = BrokerRegistry()
+    modulith_register_brokers(registry=registry)
+    broker = registry.get("redis-streams")
+    assert (broker._max_stream_len, broker._dlq_max_stream_len) == (10000, 100000)
+
+    monkeypatch.setenv("MODULITH_STREAM_MAXLEN", "2500")
+    registry = BrokerRegistry()
+    modulith_register_brokers(registry=registry)
+    broker = registry.get("redis-streams")
+    assert (broker._max_stream_len, broker._dlq_max_stream_len) == (2500, 25000)
 
 
 # ---------------------------------------------------------------------------
