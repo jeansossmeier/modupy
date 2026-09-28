@@ -1094,6 +1094,78 @@ async def test_advisory_lock_holds_through_dispatch() -> None:
     assert store.completed == [pub.id]
 
 
+class PeerRacingLockStore(ClaimingStubStore):
+    """Advisory-lock store whose sweep snapshot goes stale: ``find_incomplete``
+    returns copies, and a peer changes the stored row just before this
+    sweeper's lock attempt succeeds (the peer delivered and unlocked it)."""
+
+    def __init__(self, peer_action: str) -> None:
+        super().__init__(supports_advisory_lock=True)
+        self.peer_action = peer_action
+
+    async def find_incomplete(self, older_than: timedelta) -> list[EventPublication]:
+        return [replace(p) for p in await super().find_incomplete(older_than)]
+
+    async def find_by_id(self, publication_id: UUID) -> EventPublication | None:
+        return self.rows.get(publication_id)
+
+    async def try_lock_publication(self, publication_id: UUID) -> object | None:
+        row = self.rows[publication_id]
+        if self.peer_action == "completed":
+            row.completed_at = datetime.now(UTC)
+        elif self.peer_action == "dead_lettered":
+            row.attempt_count = 3
+        else:
+            del self.rows[publication_id]
+        return await super().try_lock_publication(publication_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("peer_action", ["completed", "dead_lettered", "gone"])
+async def test_advisory_sweep_rereads_row_after_locking(peer_action: str) -> None:
+    """The advisory sweep dispatches from a snapshot read before locking. A
+    peer can finish a row in between and release its lock, so after locking
+    the sweep must re-read the row, skip it when it is completed,
+    dead-lettered or gone, and still release the lock."""
+    store = PeerRacingLockStore(peer_action)
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="advisory_lock",
+        dead_letter_after_attempts=3,
+        start_loop=False,
+    )
+    _bootstrap_with_listener(record)
+    pub = _make_pub(record, value=13)
+    await store.save(pub)
+
+    await outbox._sweep(timedelta(0))
+
+    assert store.lock_calls == [pub.id]
+    assert store.locks == {}
+    assert received == []
+    assert store.completed == []
+
+
+@pytest.mark.asyncio
+async def test_advisory_sweep_dispatches_the_reread_row() -> None:
+    """When the re-read row is still pending, the sweep delivers that fresh
+    copy, so completion and failure bookkeeping act on current state."""
+    store = PeerRacingLockStore("none")
+    store.try_lock_publication = ClaimingStubStore.try_lock_publication.__get__(store)  # type: ignore[method-assign]
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _make_pub(record, value=14)
+    await store.save(pub)
+
+    await outbox._sweep(timedelta(0))
+
+    assert received == [14]
+    assert store.completed == [pub.id]
+    assert pub.completed_at is not None
+    assert store.locks == {}
+
+
 @pytest.mark.asyncio
 async def test_legacy_store_falls_back_to_find_incomplete_under_default_lease() -> None:
     """Third-party stores without ClaimingStore keep the original path."""

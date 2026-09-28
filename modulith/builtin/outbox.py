@@ -949,13 +949,34 @@ async def _sweep_advisory(older_than: timedelta, *, runtime_ready: bool) -> None
             continue
         if not _backoff_elapsed(pub):
             continue
-        handle = await _store.try_lock_publication(pub.id)  # type: ignore[attr-defined]
-        if handle is None:
-            continue  # another sweeper holds the lock — skip this cycle
-        try:
-            await _dispatch_publication(pub)
-        finally:
-            await _store.unlock_publication(handle, pub.id)  # type: ignore[attr-defined]
+        await _dispatch_under_advisory_lock(pub)
+
+
+async def _dispatch_under_advisory_lock(publication: EventPublication) -> None:
+    """Deliver ``publication`` while holding its advisory lock; skip it when
+    another dispatcher (a peer's sweep or after-commit task) holds the lock.
+
+    ``publication`` may have been read before locking, and a peer may have
+    delivered the row and released its lock since, so it is re-read under
+    the lock and delivered only if still pending. Both the advisory sweep
+    and the Postgres adapter's after-commit dispatch route through here.
+    """
+    assert _store is not None
+    store_any: Any = _store  # AdvisoryLockingStore capability
+    handle = await store_any.try_lock_publication(publication.id)
+    if handle is None:
+        return
+    try:
+        finder = getattr(_store, "find_by_id", None)
+        current = await finder(publication.id) if finder is not None else publication
+        if (
+            current is not None
+            and current.completed_at is None
+            and current.attempt_count < _dead_letter_after_attempts
+        ):
+            await _dispatch_publication(current)
+    finally:
+        await store_any.unlock_publication(handle, publication.id)
 
 
 async def _dispatch_with_lease_renewal(publication: EventPublication) -> None:

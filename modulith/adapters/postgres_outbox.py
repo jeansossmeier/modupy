@@ -316,6 +316,35 @@ def _row_to_pub(row: EventPublicationRow) -> EventPublication:
     )
 
 
+async def _try_claim_row(
+    s: AsyncSession,
+    publication_id: UUID,
+    *,
+    owner: str,
+    token: str,
+    now: datetime,
+    until: datetime,
+) -> bool:
+    """Claim one row with a conditional UPDATE that re-checks claimability
+    (incomplete, not dead-lettered, no live lease). Only a rowcount of 1
+    counts as claimed; the caller commits."""
+    result = await s.execute(
+        update(EventPublicationRow)
+        .where(
+            EventPublicationRow.id == publication_id,
+            EventPublicationRow.completed_at.is_(None),
+            EventPublicationRow.is_dead_lettered.is_(False),
+            or_(
+                EventPublicationRow.claim_until.is_(None),
+                EventPublicationRow.claim_until <= now,
+            ),
+        )
+        .values(claim_owner=owner, claim_token=token, claim_until=until)
+        .execution_options(synchronize_session=False)
+    )
+    return cast(CursorResult[Any], result).rowcount == 1
+
+
 # ---------------------------------------------------------------------------
 # The PublicationStore implementation
 # ---------------------------------------------------------------------------
@@ -751,21 +780,7 @@ class PostgresPublicationStore:
         tokens: dict[UUID, str] = {}
         for row in sorted(rows, key=lambda r: str(r.id)):
             token = uuid4().hex
-            result = await s.execute(
-                update(EventPublicationRow)
-                .where(
-                    EventPublicationRow.id == row.id,
-                    EventPublicationRow.completed_at.is_(None),
-                    EventPublicationRow.is_dead_lettered.is_(False),
-                    or_(
-                        EventPublicationRow.claim_until.is_(None),
-                        EventPublicationRow.claim_until <= now,
-                    ),
-                )
-                .values(claim_owner=owner, claim_token=token, claim_until=until)
-                .execution_options(synchronize_session=False)
-            )
-            if cast(CursorResult[Any], result).rowcount == 1:
+            if await _try_claim_row(s, row.id, owner=owner, token=token, now=now, until=until):
                 tokens[row.id] = token
         await s.commit()
         claimed: list[EventPublication] = []
@@ -776,11 +791,38 @@ class PostgresPublicationStore:
                 claimed.append(pub)
         return claimed
 
+    async def _claim_publication(
+        self, publication_id: UUID, *, owner: str, lease_seconds: float
+    ) -> EventPublication | None:
+        """Claim one row with the same lease-conditional UPDATE as
+        ``claim_batch`` and commit. Returns the claimed publication carrying
+        its ``claim_token``, or None when the row is completed, dead-lettered,
+        gone, or under another claimant's live lease."""
+        now = datetime.now(UTC)
+        until = now + timedelta(seconds=lease_seconds)
+        token = uuid4().hex
+        async with self._open_session() as s:
+            claimed = await _try_claim_row(
+                s, publication_id, owner=owner, token=token, now=now, until=until
+            )
+            await s.commit()
+            if not claimed:
+                return None
+            row = await s.get(EventPublicationRow, publication_id)
+            if row is None:
+                return None
+            pub = _row_to_pub(row)
+            pub.claim_token = token
+            return pub
+
     async def renew_claim(self, publication_id: UUID, token: str, lease_seconds: float) -> bool:
         """Extend a still-held claim's lease. Returns False (no write applied)
         if ``token`` no longer matches the row's current claim — the lease
         already expired and/or a peer sweeper reclaimed it; the caller must
-        stop dispatching and let the new claimant own it.
+        stop dispatching and let the new claimant own it. A completed row
+        also returns False, so the sweep's pre-dispatch re-arm doubles as a
+        completion check: an unfenced completion (``mark_complete``) keeps
+        the token in place.
 
         Also used by the outbox retry loop to voluntarily release a claim
         early (``lease_seconds=0.0``) when a claimed row turns out not to be
@@ -794,6 +836,7 @@ class PostgresPublicationStore:
                 .where(
                     EventPublicationRow.id == publication_id,
                     EventPublicationRow.claim_token == token,
+                    EventPublicationRow.completed_at.is_(None),
                 )
                 .values(claim_until=until)
             )
@@ -948,13 +991,38 @@ class PostgresPublicationStore:
         Runs with no bound session (cleared below) so any failure re-save in
         the plugin takes the standalone-transaction path rather than reusing
         the now-closed business session.
+
+        A row a sweep already completed is skipped. Under
+        ``claim_strategy="lease"`` the row is claimed first, exactly as a
+        sweep claims it, and delivered under that lease with renewal and
+        fenced completion; a row a sweep holds is left to that sweep. Under
+        ``"advisory_lock"`` it is delivered under the row's advisory lock,
+        through the same lock/re-read/unlock path the advisory sweep uses. The
+        claim is taken after commit, not in ``save()``, so a crashed
+        process's rows stay claimable by the next sweep right away.
         """
         token = _current_session.set(None)
         try:
             async with self._open_session() as s:
                 row = await s.get(EventPublicationRow, publication_id)
                 pub = _row_to_pub(row) if row is not None else None
-            if pub is not None:
+            if pub is not None and pub.completed_at is not None:
+                logger.debug("after-commit dispatch: publication %s already completed", pub.id)
+            elif pub is not None and outbox._claim_strategy == "lease":
+                claimed = await self._claim_publication(
+                    pub.id,
+                    owner=outbox._claim_owner,
+                    lease_seconds=outbox._claim_lease_seconds,
+                )
+                if claimed is None:
+                    logger.debug(
+                        "after-commit dispatch: publication %s is claimed elsewhere", pub.id
+                    )
+                else:
+                    await outbox._dispatch_with_lease_renewal(claimed)
+            elif pub is not None and outbox._claim_strategy == "advisory_lock":
+                await outbox._dispatch_under_advisory_lock(pub)
+            elif pub is not None:
                 await outbox._dispatch_publication(pub)
             else:
                 # The row was committed (we were queued from after_commit) yet is
