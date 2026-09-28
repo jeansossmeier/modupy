@@ -340,15 +340,19 @@ class ShmBroker:
         """
         return await self._cold.stale_targets(group, list(targets))
 
-    async def drop_group(self, group: str) -> tuple[int, int]:
+    async def drop_group(
+        self, group: str, *, targets: list[str] | tuple[str, ...] | None = None
+    ) -> tuple[int, int]:
         """Unsubscribe a retired group and delete its undelivered work.
+
+        ``targets``, when given, limits the removal to those targets.
 
         Returns ``(subscriptions, deliveries)`` removed. Publish fans out to
         every subscribed group and prune keeps any publication with an
         undelivered row, so a group whose module is gone for good pins every
         later publication until this runs (``modulith broker drop-group``).
         """
-        return await self._cold.drop_group(group)
+        return await self._cold.drop_group(group, None if targets is None else list(targets))
 
     async def claim_batch(
         self,

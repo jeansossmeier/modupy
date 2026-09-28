@@ -83,8 +83,8 @@ class SqliteQueueStore:
     def stale_targets(self, group: str, targets: list[str]) -> dict[str, int]:
         return _shm_publications.stale_targets(self._conn, group, targets)
 
-    def drop_group(self, group: str) -> tuple[int, int]:
-        return _shm_publications.drop_group(self._conn, group)
+    def drop_group(self, group: str, targets: list[str] | None = None) -> tuple[int, int]:
+        return _shm_publications.drop_group(self._conn, group, targets)
 
     def claim(
         self,

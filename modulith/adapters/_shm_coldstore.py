@@ -104,8 +104,8 @@ class ShmColdStore(SerialStoreExecutor):
     async def stale_targets(self, group: str, targets: list[str]) -> dict[str, int]:
         return cast(dict[str, int], await self._call("stale_targets", group, targets))
 
-    async def drop_group(self, group: str) -> tuple[int, int]:
-        return cast(tuple[int, int], await self._call("drop_group", group))
+    async def drop_group(self, group: str, targets: list[str] | None = None) -> tuple[int, int]:
+        return cast(tuple[int, int], await self._call("drop_group", group, targets))
 
     async def claim(
         self,

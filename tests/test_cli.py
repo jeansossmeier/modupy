@@ -1862,6 +1862,47 @@ def test_broker_drop_group_removes_a_retired_groups_backlog(make_fake_app, monke
     assert _shm_group_backlog(db_path) == {"modulith-orders": 2}
 
 
+def test_broker_drop_group_target_removes_only_that_targets_subscription_and_backlog(
+    make_fake_app, monkeypatch, tmp_path
+):
+    from modulith.adapters.shm_broker import ShmBroker, _resolve_shm_paths
+
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    _, db_path, hint_path = _resolve_shm_paths("fakeapp", {})
+
+    async def seed() -> None:
+        broker = ShmBroker(shm_name=str(hint_path), db_path=str(db_path))
+        try:
+            await broker.subscribe(["t.Stale", "t.Live"], "modulith-orders")
+            for target, count in (("t.Stale", 2), ("t.Live", 3)):
+                for _ in range(count):
+                    await broker.publish(target, b"x", {"event_type": target})
+        finally:
+            await broker.close()
+
+    asyncio.run(seed())
+
+    declined = runner.invoke(
+        app, ["broker", "drop-group", "modulith-orders", "--target", "t.Stale"], input="n\n"
+    )
+    assert declined.exit_code == 1, declined.output
+    assert _shm_group_backlog(db_path) == {"modulith-orders": 5}
+
+    from modulith.runtime import _runtime
+
+    _runtime._reset_for_testing()
+    result = runner.invoke(
+        app, ["broker", "drop-group", "modulith-orders", "--target", "t.Stale", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "1 subscription(s)" in result.output
+    assert "2 pending or claimed delivery(ies)" in result.output
+    assert _shm_group_backlog(db_path) == {"modulith-orders": 3}
+
+
 def test_broker_drop_group_asks_before_removing(make_fake_app, monkeypatch, tmp_path):
     make_fake_app({"orders": ""})
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")

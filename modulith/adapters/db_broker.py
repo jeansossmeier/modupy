@@ -2228,9 +2228,12 @@ class DatabaseBroker:
         return result
 
     @_on_owning_loop
-    async def drop_group(self, group: str) -> tuple[int, int]:
+    async def drop_group(
+        self, group: str, *, targets: list[str] | tuple[str, ...] | None = None
+    ) -> tuple[int, int]:
         """Unsubscribe a retired group and delete its undelivered rows.
 
+        ``targets``, when given, limits the removal to those targets' rows.
         Returns ``(subscriptions, rows)`` removed. Terminal rows stay for
         ``prune``. This is the cleanup behind ``modulith broker drop-group``.
         """
@@ -2240,15 +2243,18 @@ class DatabaseBroker:
         _, subscription, message = broker_schema()
 
         async def op(conn: Any) -> tuple[int, int]:
-            subscriptions = await conn.execute(
-                delete(subscription).where(subscription.c.consumer_group == group)
+            drop_subscriptions = delete(subscription).where(subscription.c.consumer_group == group)
+            drop_rows = delete(message).where(
+                message.c.consumer_group == group,
+                message.c.status.in_(("pending", "claimed")),
             )
-            rows = await conn.execute(
-                delete(message).where(
-                    message.c.consumer_group == group,
-                    message.c.status.in_(("pending", "claimed")),
+            if targets is not None:
+                drop_subscriptions = drop_subscriptions.where(
+                    subscription.c.target.in_(list(targets))
                 )
-            )
+                drop_rows = drop_rows.where(message.c.target.in_(list(targets)))
+            subscriptions = await conn.execute(drop_subscriptions)
+            rows = await conn.execute(drop_rows)
             return _rowcount(subscriptions), _rowcount(rows)
 
         removed: tuple[int, int] = await self._write(op)

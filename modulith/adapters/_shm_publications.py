@@ -272,24 +272,39 @@ def stale_targets(
     return dict(sorted(stale.items()))
 
 
-def drop_group(conn: sqlite3.Connection, group: str) -> tuple[int, int]:
+def drop_group(
+    conn: sqlite3.Connection,
+    group: str,
+    targets: list[str] | None = None,
+) -> tuple[int, int]:
     """Delete one group's subscriptions and undelivered work.
 
+    ``targets``, when given, limits the removal to those targets.
     Returns ``(subscriptions, deliveries)`` removed. Terminal rows stay for
     ``prune``; once the undelivered rows are gone, prune can reclaim the
     publications they pinned.
     """
+    if targets is None:
+        subscription_filter = delivery_filter = ""
+        names: tuple[str, ...] = ()
+    else:
+        names = tuple(targets)
+        marks = ",".join("?" * len(names))
+        subscription_filter = f" AND target IN ({marks})"
+        delivery_filter = (
+            f" AND publication_id IN (SELECT id FROM shm_publication WHERE target IN ({marks}))"
+        )
     with immediate_transaction(conn):
         subscriptions = conn.execute(
-            "DELETE FROM shm_subscription WHERE consumer_group=?",
-            (group,),
+            f"DELETE FROM shm_subscription WHERE consumer_group=?{subscription_filter}",
+            (group, *names),
         ).rowcount
         deliveries = conn.execute(
-            """
+            f"""
             DELETE FROM shm_delivery
-            WHERE consumer_group=? AND status IN ('pending', 'claimed')
+            WHERE consumer_group=? AND status IN ('pending', 'claimed'){delivery_filter}
             """,
-            (group,),
+            (group, *names),
         ).rowcount
     return subscriptions, deliveries
 

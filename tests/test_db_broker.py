@@ -4766,3 +4766,18 @@ async def test_consumer_without_targets_warns_about_its_groups_leftover_subscrip
 
 async def _async_true(value: bool) -> bool:
     return value
+
+
+async def test_drop_group_with_targets_removes_only_those_targets(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker.subscribe(["t.Stale", "t.Live"], "modulith-orders")
+    await broker.subscribe(["t.Stale"], "modulith-billing")
+    for target in ("t.Stale", "t.Stale", "t.Live"):
+        await broker.publish(target, b"x", {"event_type": target})
+
+    assert await broker.drop_group("modulith-orders", targets=["t.Stale"]) == (1, 2)
+
+    assert await broker.stale_targets("modulith-orders", []) == {"t.Live": 1}
+    assert await broker.stale_targets("modulith-billing", []) == {"t.Stale": 2}
+    await broker.publish("t.Stale", b"x", {"event_type": "t.Stale"})
+    assert await broker.stale_targets("modulith-orders", []) == {"t.Live": 1}
