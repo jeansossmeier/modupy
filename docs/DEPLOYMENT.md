@@ -862,19 +862,24 @@ Step 6 depends on the broker:
   publications; on the database broker they pile up in `broker_message`.
   `modulith run --topology processes` logs a warning at startup for each
   group that no current module derives and no consumer served in the last
-  24 hours (a subscribe or a claim), naming its backlog. A group that an
-  extracted service or another host still consumes is therefore not
+  24 hours, naming its backlog. A running consumer re-stamps its
+  subscriptions every hour even when idle, and every claim counts too, so
+  a group that an extracted service or another host still consumes is not
   reported. Once the module is gone for good, run
   `modulith broker drop-group modulith-<module>` with the same broker
-  configuration and environment as the service. It removes the group's
-  subscriptions and deletes its pending and claimed messages (they are not
-  delivered); the next prune reclaims the publications they held. It asks
-  for confirmation unless `--yes` is given, exits non-zero when the store
-  holds nothing for the group, and refuses a group that a current module
-  derives or a consumer served in the last 24 hours unless `--force` is
-  given. On the database broker's default `error` policy, a producer that
-  still publishes to a target whose only subscriber was the dropped group
-  then gets `NoSubscribersError`; step 2 stops those publishes first.
+  configuration and environment as the service. It first prints the store
+  it acts on (the SHM SQLite path, or the database URL with the password
+  masked) and exits non-zero without creating anything when that store or
+  its broker tables do not exist. It removes the group's subscriptions and
+  deletes its pending and claimed messages (they are not delivered); the
+  next prune reclaims the publications they held. It asks for confirmation
+  unless `--yes` is given, exits non-zero when the store holds nothing for
+  the group, and refuses a group that a current module derives or a
+  consumer served in the last 24 hours unless `--force` is given. Before
+  asking, it lists the targets the group is the only subscriber of: on the
+  database broker's default `error` (or `wait`) policy, a producer that
+  still publishes to one of them then gets `NoSubscribersError`; step 2
+  stops those publishes first.
   Nothing is dropped automatically: a module that is only disabled for a
   deploy gets its backlog when it returns.
 - **Redis Streams broker:** no storage cleanup is needed. Streams are

@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -2108,3 +2109,87 @@ def test_broker_drop_group_of_an_unknown_group_fails(make_fake_app, monkeypatch,
     assert result.exit_code == 1, result.output
     assert "no subscription or undelivered work" in result.output
     assert _shm_group_backlog(db_path) == {"modulith-retired": 3}
+
+
+def test_broker_drop_group_names_the_shm_store_before_confirming(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    db_path = _seed_shm_groups(tmp_path, monkeypatch, {"modulith-retired": 3})
+
+    result = runner.invoke(app, ["broker", "drop-group", "modulith-retired"], input="n\n")
+
+    assert result.exit_code == 1, result.output
+    assert f"shm broker store: {db_path}" in result.output
+    assert result.output.index(str(db_path)) < result.output.index("Drop group")
+
+
+def test_broker_drop_group_does_not_create_a_missing_shm_store(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    state_home = tmp_path / "empty-state-home"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+
+    result = runner.invoke(app, ["broker", "drop-group", "modulith-retired", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert "no shm broker store" in result.output
+    assert not state_home.exists()
+
+
+def _database_project(tmp_path: Path, monkeypatch, db_file: Path) -> str:
+    url = f"sqlite+aiosqlite:///{db_file}"
+    (tmp_path / "pyproject.toml").write_text(
+        f'[tool.modulith]\nbroker = "database"\n[tool.modulith.broker_options]\nurl = "{url}"\n'
+    )
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    return url
+
+
+def test_broker_drop_group_on_the_database_broker_names_its_store_and_sole_targets(
+    make_fake_app, monkeypatch, tmp_path
+):
+    from modulith.adapters.db_broker import DatabaseBroker
+
+    make_fake_app({"orders": ""})
+    db_file = tmp_path / "broker.db"
+    url = _database_project(tmp_path, monkeypatch, db_file)
+
+    async def seed() -> None:
+        broker = DatabaseBroker(url=url)
+        try:
+            await broker.subscribe(["t.Only", "t.Shared"], "modulith-retired")
+            await broker.subscribe(["t.Shared"], "modulith-orders")
+        finally:
+            await broker.close()
+
+    asyncio.run(seed())
+    conn = sqlite3.connect(db_file)
+    conn.execute("UPDATE broker_subscription SET updated_at='2000-01-01 00:00:00.000000'")
+    conn.commit()
+    conn.close()
+
+    result = runner.invoke(app, ["broker", "drop-group", "modulith-retired"], input="n\n")
+
+    assert result.exit_code == 1, result.output
+    assert f"database broker store: {url}" in result.output
+    assert "only subscriber of 't.Only'" in result.output
+    assert "t.Shared" not in result.output
+    assert "NoSubscribersError" in result.output
+
+
+def test_broker_drop_group_does_not_create_a_missing_database_store(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    db_file = tmp_path / "absent.db"
+    _database_project(tmp_path, monkeypatch, db_file)
+
+    result = runner.invoke(app, ["broker", "drop-group", "modulith-retired", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert "no database broker tables" in result.output
+    assert not db_file.exists()

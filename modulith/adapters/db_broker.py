@@ -2202,13 +2202,14 @@ class DatabaseBroker:
 
     @_on_owning_loop
     async def active_groups(self, *, within_seconds: float) -> set[str]:
-        """Groups a consumer subscribed or claimed for within ``within_seconds``.
+        """Groups a consumer refreshed or claimed for within ``within_seconds``.
 
-        A consumer refreshes its subscription rows' ``updated_at`` at start,
-        and every claim stamps ``claimed_at``, so a group served by any
-        deployment shows up here even when this one's modules do not derive it.
+        A running consumer re-stamps its subscription rows' ``updated_at``
+        periodically (``touch_subscriptions``) and every claim stamps
+        ``claimed_at``, so a group served by any deployment shows up here
+        even when this one's modules do not derive it. Expects the broker
+        tables to exist; it never creates them.
         """
-        await self._ensure_schema()
         from sqlalchemy import select, union
 
         _, subscription, message = broker_schema()
@@ -2227,6 +2228,87 @@ class DatabaseBroker:
 
         result: set[str] = await self._write(op)
         return result
+
+    @_on_owning_loop
+    async def touch_subscriptions(self, targets: list[str] | tuple[str, ...], group: str) -> None:
+        """Stamp ``group``'s subscriptions to ``targets`` as served right now."""
+        from sqlalchemy import update
+
+        _, subscription, _ = broker_schema()
+
+        async def op(conn: Any) -> None:
+            await conn.execute(
+                update(subscription)
+                .where(
+                    subscription.c.consumer_group == group,
+                    subscription.c.target.in_(list(targets)),
+                )
+                .values(updated_at=await self._now(conn))
+            )
+
+        await self._write(op)
+
+    @_on_owning_loop
+    async def sole_subscriber_targets(self, group: str) -> list[str]:
+        """Targets ``group`` subscribes to that no other group subscribes to."""
+        from sqlalchemy import func, select
+
+        _, subscription, _ = broker_schema()
+        held = select(subscription.c.target).where(subscription.c.consumer_group == group)
+
+        async def op(conn: Any) -> list[str]:
+            rows = await conn.execute(
+                select(subscription.c.target)
+                .where(subscription.c.target.in_(held))
+                .group_by(subscription.c.target)
+                .having(func.count() == 1)
+                .order_by(subscription.c.target)
+            )
+            return [str(row[0]) for row in rows]
+
+        result: list[str] = await self._write(op)
+        return result
+
+    @property
+    def store_location(self) -> str:
+        """The database URL this broker uses, with any password masked."""
+        return str(self._engine.url.render_as_string(hide_password=True))
+
+    @property
+    def no_subscriber_policy(self) -> str:
+        """What a publish does when its target has no subscribed group."""
+        return str(self._no_subscriber_policy)
+
+    @_on_owning_loop
+    async def has_schema(self) -> bool:
+        """Whether the broker tables exist, checked without creating anything.
+
+        A SQLite file that does not exist yet is reported absent without
+        connecting, since connecting would create it.
+        """
+        from sqlalchemy import inspect
+
+        url = self._engine.url
+        database = url.database
+        if (
+            url.get_backend_name() == "sqlite"
+            and database
+            and database != ":memory:"
+            and not database.startswith("file:")
+            and not os.path.exists(database)
+        ):
+            return False
+        _, subscription, message = broker_schema()
+        names = (subscription.name, message.name)
+        schema = self._schema
+
+        def tables_exist(connection: Any) -> bool:
+            inspector = inspect(connection)
+            return all(inspector.has_table(name, schema=schema) for name in names)
+
+        async with self._engine.connect() as conn:
+            exists: bool = await conn.run_sync(tables_exist)
+        return exists
 
     @_on_owning_loop
     async def stale_targets(
@@ -2278,8 +2360,8 @@ class DatabaseBroker:
         ``targets``, when given, limits the removal to those targets' rows.
         Returns ``(subscriptions, rows)`` removed. Terminal rows stay for
         ``prune``. This is the cleanup behind ``modulith broker drop-group``.
+        Expects the broker tables to exist; it never creates them.
         """
-        await self._ensure_schema()
         from sqlalchemy import delete
 
         _, subscription, message = broker_schema()

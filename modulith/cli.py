@@ -1405,6 +1405,48 @@ broker_app = typer.Typer(help="Broker operational commands.")
 app.add_typer(broker_app, name="broker")
 
 
+def _exit_unless_shm_store_exists() -> None:
+    """Exit 1 when the shm store drop-group would act on does not exist.
+
+    Bootstrapping the shm broker creates its state directory and SQLite
+    file, so the check has to run first, from configuration alone.
+    """
+    from .adapters.shm_broker import shm_store_path
+
+    try:
+        resolved = load_configuration(**_runtime._config_overrides)
+    except ConfigurationError:
+        return  # _bootstrap_or_exit reports it
+    if resolved.broker != "shm":
+        return
+    package = resolved.package or _detect_from_pyproject_name()
+    try:
+        path = shm_store_path(package, dict(resolved.broker_options or {}))
+    except ConfigurationError:
+        return
+    if not path.is_file():
+        typer.echo(
+            f"error: no shm broker store at {path}; nothing was removed. Run this with "
+            "the service's broker configuration (state_dir or MODULITH_BROKER_STATE_DIR).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
+def _sole_subscriber_warning(group: str, sole: list[str], broker: Any, scheme: str) -> str:
+    names = ", ".join(repr(t) for t in sole)
+    if scheme == "database" and broker.no_subscriber_policy in ("error", "wait"):
+        effect = (
+            f"under the database broker's {broker.no_subscriber_policy!r} no-subscriber "
+            "policy, every later publish to them raises NoSubscribersError"
+        )
+    elif scheme == "database":
+        effect = "later publishes to them are retained until a group subscribes"
+    else:
+        effect = "later publishes to them are stored but reach no consumer"
+    return f"warning: {group!r} is the only subscriber of {names}; after the drop, {effect}."
+
+
 @broker_app.command("drop-group")
 def broker_drop_group(
     group: str = typer.Argument(..., help="Consumer group, e.g. 'modulith-notifications'"),
@@ -1428,6 +1470,7 @@ def broker_drop_group(
     then needs no ``--force``.
     """
     _runtime.configure(topology="processes")
+    _exit_unless_shm_store_exists()
     rt = _bootstrap_or_exit()
     cfg = rt.config
     assert cfg is not None
@@ -1446,6 +1489,14 @@ def broker_drop_group(
     async def drop() -> tuple[int, int]:
         # One event loop for every call: the database broker binds its engine
         # to the loop that first used it.
+        typer.echo(f"{cfg.broker} broker store: {broker.store_location}")
+        if cfg.broker == "database" and not await broker.has_schema():
+            typer.echo(
+                f"error: no database broker tables at {broker.store_location}; "
+                "nothing was removed. Run this with the service's broker configuration.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
         if targets is None and not force and group in await _live_groups(broker, derived):
             typer.echo(
                 f"error: {group!r} belongs to a module of the current deployment or a "
@@ -1456,6 +1507,13 @@ def broker_drop_group(
                 err=True,
             )
             raise typer.Exit(code=1)
+        sole = [
+            t
+            for t in await broker.sole_subscriber_targets(group)
+            if targets is None or t in targets
+        ]
+        if sole:
+            typer.echo(_sole_subscriber_warning(group, sole, broker, cfg.broker))
         prompt = f"Drop {scope} and delete its pending and claimed messages?"
         if not yes and not typer.confirm(prompt):
             typer.echo("aborted — nothing was removed", err=True)

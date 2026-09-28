@@ -1209,6 +1209,93 @@ async def test_group_backlog_reports_undelivered_rows_of_an_unsubscribed_group(
         await broker.close()
 
 
+async def test_running_consumer_keeps_an_idle_group_live(tmp_path: Path) -> None:
+    db = tmp_path / "q.db"
+    broker = ShmBroker(shm_name=str(tmp_path / "hints"), db_path=str(db))
+    consumer = ShmConsumer(
+        broker=broker,
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="idle:1",
+        group="modulith-idle",
+        targets=["t.A"],
+        poll_interval_s=0.01,
+    )
+    consumer._subscription_refresh_s = 0.05
+    await consumer.start()
+    try:
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE shm_subscription SET updated_at=0")
+        conn.commit()
+        conn.close()
+        await asyncio.sleep(0.3)
+
+        assert await broker.active_groups(within_seconds=3600) == {"modulith-idle"}
+    finally:
+        await consumer.stop()
+        await broker.close()
+
+
+def test_opening_a_store_adds_the_subscription_refresh_column(tmp_path: Path) -> None:
+    db = tmp_path / "q.db"
+    open_database(str(db), "NORMAL", 10_000_000).close()
+    conn = sqlite3.connect(db)
+    if "updated_at" in {row[1] for row in conn.execute("PRAGMA table_info(shm_subscription)")}:
+        conn.execute("ALTER TABLE shm_subscription DROP COLUMN updated_at")
+    conn.execute("INSERT INTO shm_subscription (target, consumer_group) VALUES ('t.A', 'g')")
+    conn.commit()
+    conn.close()
+
+    open_database(str(db), "NORMAL", 10_000_000).close()
+
+    conn = sqlite3.connect(db)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(shm_subscription)")}
+    rows = conn.execute("SELECT target, consumer_group FROM shm_subscription").fetchall()
+    conn.close()
+    assert "updated_at" in columns
+    assert rows == [("t.A", "g")]
+
+
+async def test_sole_subscriber_targets_lists_targets_no_other_group_holds(
+    broker: ShmBroker,
+) -> None:
+    await broker.subscribe(["t.Only", "t.Shared", "t.Also"], "modulith-retired")
+    await broker.subscribe(["t.Shared"], "modulith-orders")
+
+    assert await broker.sole_subscriber_targets("modulith-retired") == ["t.Also", "t.Only"]
+    assert await broker.sole_subscriber_targets("modulith-orders") == []
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{}, {"sqlite_path": "custom/q.db"}, {"state_dir": "STATE", "sqlite_path": "q.db"}],
+)
+def test_shm_store_path_matches_the_opened_store_without_creating_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, options: dict[str, str]
+) -> None:
+    from modulith.adapters.shm_broker import _resolve_shm_paths, shm_store_path
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    options = {k: v.replace("STATE", str(tmp_path / "explicit")) for k, v in options.items()}
+
+    predicted = shm_store_path("fakeapp", options)
+    assert not (tmp_path / "state-home").exists()
+    assert not (tmp_path / "explicit").exists()
+
+    _, opened, _ = _resolve_shm_paths("fakeapp", options)
+    assert opened == predicted
+    assert opened.is_file()
+
+
+def test_store_location_names_the_sqlite_file(tmp_path: Path) -> None:
+    db = tmp_path / "q.db"
+    broker = ShmBroker(shm_name=str(tmp_path / "hints"), db_path=str(db))
+    try:
+        assert broker.store_location == str(db)
+    finally:
+        asyncio.run(broker.close())
+
+
 async def test_claim_batch_claims_only_the_targets_the_consumer_names(broker: ShmBroker) -> None:
     await broker.subscribe(["t.Live", "t.Stale"], "modulith-orders")
     await broker.publish("t.Stale", b"stale", {"event_type": "t.Stale"})
