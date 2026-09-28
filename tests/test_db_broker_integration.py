@@ -753,3 +753,68 @@ async def test_mysql_server_without_skip_locked_is_rejected_at_startup(
     message = str(excinfo.value)
     assert ".".join(map(str, version)) in message
     assert minimum in message
+
+
+# ---------------------------------------------------------------------------
+# Group retirement: liveness, sole subscribers and the schema probe
+# ---------------------------------------------------------------------------
+
+
+async def _age_subscriptions(engine: Any, *, days: int) -> None:
+    from sqlalchemy import update
+
+    _, subscription, _ = broker_schema()
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(subscription).values(updated_at=datetime.now(UTC) - timedelta(days=days))
+        )
+
+
+async def test_active_groups_reads_fresh_subscriptions_and_recent_claims(
+    broker_engine: Any,
+) -> None:
+    broker = DatabaseBroker(engine=broker_engine)
+    for group in ("g-subscribed", "g-claiming", "g-aged"):
+        await broker.subscribe([_TARGET], group)
+    await broker.publish(_TARGET, b"x", {"event_type": _EVENT_TYPE})
+    assert await broker.claim_batch("g-claiming", batch_size=1, consumer_name="c1")
+    await _age_subscriptions(broker_engine, days=30)
+    await broker.subscribe([_TARGET], "g-subscribed")
+
+    assert await broker.active_groups(within_seconds=3600) == {"g-subscribed", "g-claiming"}
+
+
+async def test_touch_subscriptions_brings_an_aged_group_back_into_the_window(
+    broker_engine: Any,
+) -> None:
+    broker = DatabaseBroker(engine=broker_engine)
+    await broker.subscribe([_TARGET, "t.Other"], "g")
+    await _age_subscriptions(broker_engine, days=30)
+    assert await broker.active_groups(within_seconds=3600) == set()
+
+    await broker.touch_subscriptions([_TARGET], "g")
+
+    assert await broker.active_groups(within_seconds=3600) == {"g"}
+    touched = _aware(await _subscription_updated_at(broker_engine, _TARGET, "g"))
+    untouched = _aware(await _subscription_updated_at(broker_engine, "t.Other", "g"))
+    assert untouched < touched - timedelta(days=1)
+
+
+async def test_sole_subscriber_targets_on_the_real_dialect(broker_engine: Any) -> None:
+    broker = DatabaseBroker(engine=broker_engine)
+    await broker.subscribe(["t.Only", "t.Shared", "t.Also"], "g-retired")
+    await broker.subscribe(["t.Shared"], "g-orders")
+
+    assert await broker.sole_subscriber_targets("g-retired") == ["t.Also", "t.Only"]
+    assert await broker.sole_subscriber_targets("g-orders") == []
+
+
+async def test_has_schema_reports_whether_the_broker_tables_exist(broker_engine: Any) -> None:
+    broker = DatabaseBroker(engine=broker_engine)
+    assert await broker.has_schema() is True
+
+    metadata, _, _ = broker_schema()
+    async with broker_engine.begin() as conn:
+        await conn.run_sync(metadata.drop_all)
+
+    assert await DatabaseBroker(engine=broker_engine).has_schema() is False

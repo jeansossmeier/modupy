@@ -2300,7 +2300,10 @@ class DatabaseBroker:
             return False
         _, subscription, message = broker_schema()
         names = (subscription.name, message.name)
-        schema = self._schema
+        # The inspector ignores schema_translate_map, so resolve the schema a
+        # caller-supplied engine translates the broker tables into.
+        translate = self._engine.get_execution_options().get("schema_translate_map") or {}
+        schema = self._schema or translate.get(None)
 
         def tables_exist(connection: Any) -> bool:
             inspector = inspect(connection)
