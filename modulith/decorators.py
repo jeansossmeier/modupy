@@ -245,6 +245,12 @@ def listener(
 
             registered = wrap_sync_listener(handler)
 
+        if registered is not handler and not hasattr(handler, "__qualname__"):
+            # A callable instance has no __qualname__, so functools.wraps leaves
+            # the adapter's own and every instance in a module would share one
+            # outbox listener id. Its class name is distinct and restart-stable.
+            registered.__qualname__ = type(handler).__qualname__
+
         registered.__modulith_broker_targets__ = normalized_targets  # type: ignore[union-attr]
         _runtime.register_listener(event_type, registered)
         return handler
