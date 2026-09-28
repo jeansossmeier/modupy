@@ -85,8 +85,35 @@ _WIRE_SERIALIZER = JsonEventSerializer()
 # ``modulith.adapters.postgres_outbox.bind_session`` / ``unbind_session``,
 # which restore the previous value on exit so nested binds don't clobber the
 # outer session. The plugin only reads this to decide whether a publish is
-# transactional; the adapter's ``save`` uses it to enlist the record.
+# transactional; the adapter's ``save`` uses it to enlist the record. Read it
+# through ``_bound_session()``: ``bind_session`` stores a ``_SessionBinding``
+# holder rather than the session itself.
 _current_session: ContextVar[Any | None] = ContextVar("_modulith_current_session", default=None)
+
+
+class _SessionBinding:
+    """Mutable holder ``bind_session`` puts in ``_current_session``.
+
+    A task created inside the bound scope copies the context and so shares
+    this very object. ``unbind_session`` clears ``session``, which ends the
+    binding for those tasks too: their later publishes take the unbound path
+    instead of enlisting in a session nobody will commit again.
+    """
+
+    __slots__ = ("session",)
+
+    def __init__(self, session: Any) -> None:
+        self.session: Any | None = session
+
+
+def _bound_session() -> Any | None:
+    """The session bound to the current context, or None if unbound or the
+    binding has ended."""
+    value = _current_session.get()
+    if isinstance(value, _SessionBinding):
+        return value.session
+    return value
+
 
 # Module-level state. Bound during configure().
 _store: PublicationStore | None = None

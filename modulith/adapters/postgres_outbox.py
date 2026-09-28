@@ -81,7 +81,7 @@ except ImportError as exc:  # pragma: no cover — exercised in a subprocess tes
 
 from modulith import EventPublication
 from modulith.builtin import outbox
-from modulith.builtin.outbox import _current_session
+from modulith.builtin.outbox import _bound_session, _current_session, _SessionBinding
 from modulith.config import ConfigurationError
 
 logger = logging.getLogger("modulith.adapters.postgres")
@@ -443,7 +443,7 @@ class PostgresPublicationStore:
         racing the after-commit task) must not resurrect a delivered
         publication by blanking ``completed_at``.
         """
-        session = _current_session.get()
+        session = _bound_session()
         dead = publication.attempt_count >= self.dead_letter_after_attempts
 
         if session is not None:
@@ -1047,8 +1047,13 @@ def bind_session(session: Any) -> Any:
                     yield session
                 finally:
                     unbind_session(token)
+
+    A task created with ``asyncio.create_task`` inside the bound scope shares
+    the binding until ``unbind_session``: its publishes before then enlist in
+    this session, and its publishes after then take the unbound path
+    (direct dispatch, no outbox row).
     """
-    return _current_session.set(session)
+    return _current_session.set(_SessionBinding(session))
 
 
 def unbind_session(token: Any) -> None:
@@ -1059,8 +1064,12 @@ def unbind_session(token: Any) -> None:
     (``None`` at the outermost scope, or an outer session if this bind was
     nested inside one) rather than unconditionally clearing it — the same
     guarantee ``contextvars.ContextVar.reset()`` gives, which this wraps.
+    The binding also ends for every task that inherited it.
     """
+    binding = _current_session.get()
     _current_session.reset(token)
+    if isinstance(binding, _SessionBinding):
+        binding.session = None
 
 
 # ---------------------------------------------------------------------------

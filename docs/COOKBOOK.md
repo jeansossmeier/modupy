@@ -302,7 +302,14 @@ async def get_db():
 Now a `publish()` inside a bound transaction is persisted atomically with your
 data: a rollback discards the event (no ghosts), a commit guarantees delivery
 (no losses), and listeners are retried at-least-once after commit. Because
-delivery is at-least-once, **listeners must be idempotent**. Inspect the queue
+delivery is at-least-once, **listeners must be idempotent**.
+
+A task started with `asyncio.create_task` inside the request inherits the
+binding only until `unbind_session`. Its publishes before then join the
+request's transaction. Its publishes after then are not transactional: they
+dispatch directly, with no outbox row, exactly like a publish outside any
+request. For a durable publish from such a task, open and bind a session in
+the task itself. Inspect the queue
 with `modulith outbox status`; a persistently-failing publication is
 dead-lettered after 10 attempts.
 

@@ -338,7 +338,7 @@ class Runtime:
         """
         from .builtin import outbox
 
-        return outbox._store is not None and outbox._current_session.get() is not None
+        return outbox._store is not None and outbox._bound_session() is not None
 
     async def _route_to_broker_guarded(self, event: Any, *, has_local_handler: bool) -> None:
         """``_maybe_route_to_broker`` + publish-span cleanup on failure.
