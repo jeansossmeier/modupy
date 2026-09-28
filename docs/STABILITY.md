@@ -86,7 +86,7 @@ Drivers are wired **explicitly** at startup — there is no entry-point auto-dis
 - `modulith.builtin.outbox` — `configure()`, `status()`, `force_retry()`, `list_dead_lettered()`, `retry_all_dead_lettered()`, `purge_completed()`, `shutdown()`
 - `modulith.serializers` — `JsonEventSerializer`
 
-**Stability**: weaker than the public API above, stronger than the adapter internals below. Signatures may change in a 0.x minor, but every change is documented in CHANGELOG.md with an upgrade note. Underscore-prefixed names are excluded — in particular `modulith.builtin.outbox._current_session`, which exists so adapters can bind to it; applications use `bind_session()`/`unbind_session()` from `modulith.adapters.postgres_outbox`.
+**Stability**: weaker than the public API above, stronger than the adapter internals below. Signatures may change in a 0.x minor, but every change is documented in CHANGELOG.md with an upgrade note. Underscore-prefixed names are excluded — in particular `modulith.builtin.outbox._current_session`, which exists so adapters can bind to it (it may hold a binding holder, so read the bound session through `_bound_session()` in the same module); applications use `bind_session()`/`unbind_session()` from `modulith.adapters.postgres_outbox`.
 
 ---
 
