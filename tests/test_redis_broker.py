@@ -1011,6 +1011,25 @@ def test_register_hook_rejects_invalid_stream_cap_env(
         _runtime.ensure_bootstrapped()
 
 
+@pytest.mark.parametrize("option", ["max_stream_len", "dlq_max_stream_len"])
+def test_register_hook_rejects_zero_stream_cap_in_broker_options(monkeypatch, option: str) -> None:
+    """The broker validates the cap itself, so a Configuration built without
+    ``load_configuration``'s checks still cannot slip a zero cap past it."""
+    from modulith.config import Configuration
+    from modulith.runtime import _runtime
+
+    monkeypatch.delenv("MODULITH_STREAM_MAXLEN", raising=False)
+    monkeypatch.delenv("MODULITH_BROKER_DLQ_MAX_STREAM_LEN", raising=False)
+    monkeypatch.setattr(
+        _runtime,
+        "_config",
+        Configuration(package="fakeapp", broker="redis-streams", broker_options={option: 0}),
+    )
+
+    with pytest.raises(ConfigurationError, match=rf"^{option} .*positive integer, got 0"):
+        modulith_register_brokers(registry=BrokerRegistry())
+
+
 def test_register_hook_rejects_non_numeric_max_payload_bytes_env(
     make_fake_app, monkeypatch
 ) -> None:

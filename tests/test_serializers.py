@@ -8,6 +8,7 @@ preserve dataclass equality and correctly reconstruct rich field types
 from __future__ import annotations
 
 import logging
+import sys
 import warnings
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -735,17 +736,87 @@ def test_exact_type_nested_dataclass_keeps_untagged_wire_format() -> None:
         ),
     ],
 )
-def test_subclass_tag_outside_declared_tree_is_rejected(event_type: type, payload: bytes) -> None:
+def test_subclass_tag_outside_declared_tree_is_never_instantiated(
+    event_type: type, payload: bytes
+) -> None:
     """The nested type tag is resolved only among the declared class's
-    subclasses: naming any other importable class fails without importing
-    or instantiating it."""
+    subclasses: a tag naming any other class decodes as the declared class
+    when the fields fit, and the named class is never instantiated."""
     serializer = JsonEventSerializer(allowed_event_types=[event_type])
     forged_instantiations.clear()
 
-    with pytest.raises(ValueError, match="ForgedTarget"):
-        serializer.deserialize(payload, _fqcn(event_type))
+    restored = serializer.deserialize(payload, _fqcn(event_type))
 
+    decoded = getattr(restored, "payment", None) or restored.backup
+    assert type(decoded) is BasePayment
+    assert decoded == BasePayment(amount=1)
     assert forged_instantiations == []
+
+
+def test_unimported_subclass_tag_decodes_as_declared_base_without_importing(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A consumer that never imported the subclass's module decodes a
+    field-compatible value as the declared class, warns once per tag, and
+    never imports the module the tag names."""
+    module_name = f"unimported_payments_{uuid4().hex}"
+    (tmp_path / f"{module_name}.py").write_text("raise RuntimeError('tag was imported')\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    serializer = JsonEventSerializer(allowed_event_types=[OrderPaid])
+    payload = (
+        b'{"order_id":"o","payment":{"__modulith_union_type__":"'
+        + module_name.encode()
+        + b'.Pix","value":{"amount":5}}}'
+    )
+
+    with caplog.at_level(logging.WARNING, logger="modulith.serializers"):
+        first = serializer.deserialize(payload, _fqcn(OrderPaid))
+        second = serializer.deserialize(payload, _fqcn(OrderPaid))
+
+    assert first == second == OrderPaid(order_id="o", payment=BasePayment(amount=5))
+    assert type(first.payment) is BasePayment
+    assert module_name not in sys.modules
+    warnings_for_tag = [r for r in caplog.records if f"{module_name}.Pix" in r.getMessage()]
+    assert [r.levelno for r in warnings_for_tag] == [logging.WARNING]
+
+
+def test_unimported_subclass_tag_with_extra_fields_fails_to_decode() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[OrderPaid])
+    payload = (
+        b'{"order_id":"o","payment":{"__modulith_union_type__":"elsewhere.CardOnFile",'
+        b'"value":{"amount":5,"card":"x"}}}'
+    )
+
+    with pytest.raises(TypeError, match="card"):
+        serializer.deserialize(payload, _fqcn(OrderPaid))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"alternative":"x","backup":{"__modulith_union_type__":"'
+        + __name__.encode()
+        + b'.CardPayment","value":{"amount":5,"card_last4":"1","network":"visa"}}}',
+        b'{"backup":null,"alternative":{"__modulith_union_type__":"'
+        + __name__.encode()
+        + b'.CardPayment","value":{"amount":5,"card_last4":"1","network":"visa"}}}',
+        b'{"backup":null,"alternative":{"__modulith_union_type__":"elsewhere.Gone",'
+        b'"value":{"amount":5,"network":"visa"}}}',
+    ],
+)
+def test_union_field_tagged_value_that_fails_to_reconstruct_raises(payload: bytes) -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[OrderPaidUnion])
+
+    with pytest.raises(TypeError, match="network"):
+        serializer.deserialize(payload, _fqcn(OrderPaidUnion))
+
+
+def test_union_field_tag_matching_no_member_raises() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[StringOrIntEvent])
+    payload = b'{"value":{"__modulith_union_type__":"elsewhere.Gone","value":"x"}}'
+
+    with pytest.raises(ValueError, match=r"elsewhere\.Gone"):
+        serializer.deserialize(payload, _fqcn(StringOrIntEvent))
 
 
 OrderId = NewType("OrderId", UUID)
@@ -819,3 +890,37 @@ def test_type_alias_field_deserializes_as_its_value() -> None:
 
     assert restored == original
     assert type(restored.at) is datetime
+
+
+def _pep695_event(alias_source: str) -> type:
+    namespace: dict[str, object] = {"dataclass": dataclass, "__name__": __name__}
+    source = f"{alias_source}\n@dataclass\nclass PepAliasEvent:\n    sku: SkuRef\n    maybe: SkuRef | None\n"
+    # dont_inherit: this module's postponed annotations would turn the hints
+    # into strings that never reach the alias object.
+    code = compile(source, "<pep695>", "exec", dont_inherit=True)
+    exec(code, namespace)  # PEP 695 syntax does not parse on the 3.11 floor
+    return cast(type, namespace["PepAliasEvent"])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 type statements need 3.12+")
+@pytest.mark.parametrize(
+    "alias_source",
+    [
+        "type SkuRef = Sku",  # Sku importable only for the type checker
+        "type SkuRef = SkuRef",
+        "type SkuRef = Other\ntype Other = SkuRef",
+    ],
+)
+@pytest.mark.timeout(10)
+def test_unevaluable_or_cyclic_type_alias_field_passes_through(
+    alias_source: str, monkeypatch
+) -> None:
+    event_type = _pep695_event(alias_source)
+    monkeypatch.setattr(sys.modules[__name__], "PepAliasEvent", event_type, raising=False)
+    serializer = JsonEventSerializer()
+
+    wire = serializer.serialize(event_type(sku="ABC-1", maybe="X"))
+    restored = serializer.deserialize(wire, _fqcn(event_type))
+
+    assert wire == b'{"maybe":"X","sku":"ABC-1"}'
+    assert (restored.sku, restored.maybe) == ("ABC-1", "X")
