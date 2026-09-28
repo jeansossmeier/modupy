@@ -328,6 +328,7 @@ Mutating it after the runtime starts would create inconsistent state.
 - `package: str | None` = `None`
 - `contracts_module: str` = `'contracts'`
 - `outbox: str` = `'memory'`
+- `outbox_url: str | None` = `None`
 - `topology: str` = `'single'`
 - `broker: str` = `'memory'`
 - `subscription_source: str` = `'manifest'`
