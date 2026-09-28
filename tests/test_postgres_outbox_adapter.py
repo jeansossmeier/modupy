@@ -1107,7 +1107,9 @@ async def test_background_task_publish_delivered_when_get_db_commits_after_yield
     engine: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A ``get_db`` that commits after ``yield`` commits the BackgroundTasks
-    publish too, so it is delivered and nothing is reported as discarded."""
+    publish too, so it is delivered and nothing is reported as discarded.
+    The two publishes commit separately, so their delivery order is not
+    guaranteed."""
     store = PostgresPublicationStore(engine=engine)
     outbox.configure(store, JsonEventSerializer(), start_loop=False)
     _bootstrap_with_listener(record)
@@ -1117,7 +1119,7 @@ async def test_background_task_publish_delivered_when_get_db_commits_after_yield
     await store.wait_for_dispatch()
 
     assert status == 200
-    assert received == [1, 2]
+    assert sorted(received) == [1, 2]
     assert await _completed_rows(engine) == 2
     assert _discard_warnings(caplog) == []
 
