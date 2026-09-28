@@ -65,7 +65,12 @@ Fan-out mechanism (how the producer learns the consumer groups): the
 producer process (module-isolated) never imports consumer modules, so
 consumers self-register their subscriptions in a persistent
 ``broker_subscription`` table at ``DatabaseConsumer.start()`` time (upsert,
-idempotent — never auto-deleted). ``DatabaseBroker.publish()`` looks up every
+idempotent — never auto-deleted, so a rollback still finds its backlog). A
+consumer claims only rows for the targets it currently consumes; at start it
+logs one WARNING per target its group still holds but no longer consumes
+(``stale_targets``), and ``drop_group(group, targets=...)`` — behind
+``modulith broker drop-group <group> --target <t>`` — is the only way such a
+subscription and its undelivered rows are removed. ``DatabaseBroker.publish()`` looks up every
 group subscribed to the target and inserts one ``broker_message`` row per
 group in a single transaction. With no registered group, the default ``error``
 policy raises ``NoSubscribersError`` without writing a row. ``wait`` polls in
@@ -1808,8 +1813,15 @@ class DatabaseBroker:
         consumer_name: str,
         reclaim_stale_seconds: float = _DEFAULT_RECLAIM_STALE_S,
         max_attempts: int | None = None,
+        targets: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
         """Claim up to ``batch_size`` due rows for ``group``.
+
+        ``targets``, when given, restricts the claim to rows for those
+        targets. A consumer passes the targets it currently consumes, so rows
+        fanned out through a subscription its module no longer consumes stay
+        ``pending`` for a rollback or an explicit ``drop_group(...,
+        targets=...)`` instead of being dead-lettered as undeserializable.
 
         Picks up both freshly ``pending`` rows AND rows stuck in ``claimed``
         whose ``claimed_at`` is older than ``reclaim_stale_seconds`` — the
@@ -1862,6 +1874,8 @@ class DatabaseBroker:
                 .order_by(message.c.available_at)
                 .limit(batch_size)
             )
+            if targets is not None:
+                stmt = stmt.where(message.c.target.in_(list(targets)))
             if _supports_skip_locked(self._engine):
                 stmt = stmt.with_for_update(skip_locked=True)
             result = await conn.execute(stmt)
@@ -2186,9 +2200,53 @@ class DatabaseBroker:
         return result
 
     @_on_owning_loop
-    async def drop_group(self, group: str) -> tuple[int, int]:
+    async def stale_targets(
+        self, group: str, targets: list[str] | tuple[str, ...]
+    ) -> dict[str, int]:
+        """Map each target ``group`` holds but ``targets`` omits to its backlog.
+
+        A held target is one the group subscribes to or has pending or
+        claimed rows for. The count is those undelivered rows. Nothing is
+        removed: a rollback to a release that still consumes the target
+        finds its backlog intact.
+        """
+        await self._ensure_schema()
+        from sqlalchemy import func, select
+
+        _, subscription, message = broker_schema()
+        consumed = list(targets)
+
+        async def op(conn: Any) -> dict[str, int]:
+            subscribed = await conn.execute(
+                select(subscription.c.target).where(
+                    subscription.c.consumer_group == group,
+                    subscription.c.target.not_in(consumed),
+                )
+            )
+            stale = {str(row[0]): 0 for row in subscribed}
+            counts = await conn.execute(
+                select(message.c.target, func.count())
+                .where(
+                    message.c.consumer_group == group,
+                    message.c.status.in_(("pending", "claimed")),
+                    message.c.target.not_in(consumed),
+                )
+                .group_by(message.c.target)
+            )
+            for target, count in counts:
+                stale[str(target)] = int(count)
+            return dict(sorted(stale.items()))
+
+        result: dict[str, int] = await self._write(op)
+        return result
+
+    @_on_owning_loop
+    async def drop_group(
+        self, group: str, *, targets: list[str] | tuple[str, ...] | None = None
+    ) -> tuple[int, int]:
         """Unsubscribe a retired group and delete its undelivered rows.
 
+        ``targets``, when given, limits the removal to those targets' rows.
         Returns ``(subscriptions, rows)`` removed. Terminal rows stay for
         ``prune``. This is the cleanup behind ``modulith broker drop-group``.
         """
@@ -2198,15 +2256,18 @@ class DatabaseBroker:
         _, subscription, message = broker_schema()
 
         async def op(conn: Any) -> tuple[int, int]:
-            subscriptions = await conn.execute(
-                delete(subscription).where(subscription.c.consumer_group == group)
+            drop_subscriptions = delete(subscription).where(subscription.c.consumer_group == group)
+            drop_rows = delete(message).where(
+                message.c.consumer_group == group,
+                message.c.status.in_(("pending", "claimed")),
             )
-            rows = await conn.execute(
-                delete(message).where(
-                    message.c.consumer_group == group,
-                    message.c.status.in_(("pending", "claimed")),
+            if targets is not None:
+                drop_subscriptions = drop_subscriptions.where(
+                    subscription.c.target.in_(list(targets))
                 )
-            )
+                drop_rows = drop_rows.where(message.c.target.in_(list(targets)))
+            subscriptions = await conn.execute(drop_subscriptions)
+            rows = await conn.execute(drop_rows)
             return _rowcount(subscriptions), _rowcount(rows)
 
         removed: tuple[int, int] = await self._write(op)

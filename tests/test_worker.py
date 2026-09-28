@@ -15,8 +15,10 @@ routing is a separate concern (covered with the topology/proxy work).
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import sys
+import time
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -1071,6 +1073,167 @@ def test_shm_worker_without_listeners_reconciles_previous_deployment(
         finally:
             connection.close()
         assert subscriptions == []
+
+
+def test_database_worker_without_listeners_warns_about_its_previous_subscriptions(
+    make_fake_app,
+    monkeypatch,
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from modulith.adapters.db_broker import DatabaseBroker, DatabaseConsumer
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'worker.db'}"
+
+    async def _previous_deployment() -> None:
+        engine = create_async_engine(url, poolclass=NullPool)
+        try:
+            previous = DatabaseBroker(engine=engine)
+            await previous.subscribe(["events.PreviousListener"], "modulith-orders")
+            await previous.publish("events.PreviousListener", b"{}", {"event_type": "x"})
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_previous_deployment())
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.setenv("MODULITH_BROKER", "database")
+    monkeypatch.setenv("MODULITH_BROKER_URL", url)
+    caplog.set_level("WARNING")
+
+    app = create_app()
+    with TestClient(app):
+        assert isinstance(app.state.consumer, DatabaseConsumer)
+
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if "modulith broker drop-group modulith-orders --target events.PreviousListener"
+        in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "1 undelivered" in warnings[0]
+
+
+async def _db_rows(url: str, group: str) -> list[tuple[str, str]]:
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from modulith.adapters.db_broker import broker_schema
+
+    _, _, message = broker_schema()
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                select(message.c.target, message.c.status)
+                .where(message.c.consumer_group == group)
+                .order_by(message.c.target)
+            )
+            return [(str(row[0]), str(row[1])) for row in result]
+    finally:
+        await engine.dispose()
+
+
+def test_upgraded_database_worker_leaves_a_siblings_stale_target_to_explicit_cleanup(
+    make_fake_app,
+    monkeypatch,
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The earlier release subscribed notifications to the sibling-owned NoteSent."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+    from typer.testing import CliRunner
+
+    from modulith.adapters.db_broker import DatabaseBroker, DatabaseConsumer
+    from modulith.cli import app as cli_app
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'upgrade.db'}"
+    note = "fakeapp.contracts.NoteSent"
+    payment = "fakeapp.contracts.PaymentReceived"
+    group = "modulith-notifications"
+
+    async def _previous_release_subscribes() -> None:
+        engine = create_async_engine(url, poolclass=NullPool)
+        try:
+            previous = DatabaseBroker(engine=engine)
+            await previous.subscribe([note, payment, "fakeapp.contracts.Audited"], group)
+            await previous.subscribe([note], "modulith-orders")
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_previous_release_subscribes())
+    make_fake_app(_SIBLING_IMPORT_APP, extra_files=_SHARED_LISTENERS)
+    _set_worker_env(monkeypatch, "notifications")
+    monkeypatch.setenv("MODULITH_BROKER", "database")
+    monkeypatch.setenv("MODULITH_BROKER_URL", url)
+    monkeypatch.setenv("MODULITH_BROKER_POLL_INTERVAL_MS", "10")
+    caplog.set_level("WARNING")
+
+    app = create_app()
+    contracts = sys.modules["fakeapp.contracts"]
+    serializer = JsonEventSerializer()
+    with TestClient(app):
+        assert isinstance(app.state.consumer, DatabaseConsumer)
+        assert _runtime.broker_registry is not None
+        broker = _runtime.broker_registry.get("database")
+
+        async def _publish_after_upgrade() -> None:
+            for index in range(3):
+                await broker.publish(
+                    note,
+                    serializer.serialize(contracts.NoteSent(f"n{index}")),
+                    {"event_type": note},
+                )
+            await broker.publish(
+                payment,
+                serializer.serialize(contracts.PaymentReceived("p1")),
+                {"event_type": payment},
+            )
+
+        asyncio.run(_publish_after_upgrade())
+        deadline = time.monotonic() + 5.0
+        while contracts.RUNS != ["notifications.notify_payment"]:
+            assert time.monotonic() < deadline, contracts.RUNS
+            time.sleep(0.02)
+        time.sleep(0.2)  # several more polls over the pending NoteSent rows
+        rows = asyncio.run(_db_rows(url, group))
+
+    assert [status for target, status in rows if target == note] == ["pending"] * 3
+    assert "dead" not in {status for _target, status in rows}
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if f"modulith broker drop-group {group} --target {note}" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "0 undelivered" in warnings[0]  # counted at start, before these publishes
+
+    _runtime._reset_for_testing()
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    dropped = CliRunner().invoke(
+        cli_app, ["broker", "drop-group", group, "--target", note, "--yes"]
+    )
+    assert dropped.exit_code == 0, dropped.output
+    assert "1 subscription(s)" in dropped.output
+    assert "3 pending or claimed delivery(ies)" in dropped.output
+
+    async def _publish_after_cleanup() -> None:
+        engine = create_async_engine(url, poolclass=NullPool)
+        try:
+            await DatabaseBroker(engine=engine).publish(note, b"{}", {"event_type": note})
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_publish_after_cleanup())
+    assert [row for row in asyncio.run(_db_rows(url, group)) if row[0] == note] == []
+    assert asyncio.run(_db_rows(url, "modulith-orders")) == [(note, "pending")] * 4
 
 
 # ---------------------------------------------------------------------------

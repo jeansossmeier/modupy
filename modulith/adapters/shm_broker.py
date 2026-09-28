@@ -338,15 +338,29 @@ class ShmBroker:
         """Map every subscribed group to its pending and claimed delivery count."""
         return await self._cold.group_backlog()
 
-    async def drop_group(self, group: str) -> tuple[int, int]:
+    async def stale_targets(
+        self, group: str, targets: list[str] | tuple[str, ...]
+    ) -> dict[str, int]:
+        """Map each target ``group`` holds but ``targets`` omits to its backlog.
+
+        A held target is one the group subscribes to or has pending or
+        claimed deliveries for. Nothing is removed.
+        """
+        return await self._cold.stale_targets(group, list(targets))
+
+    async def drop_group(
+        self, group: str, *, targets: list[str] | tuple[str, ...] | None = None
+    ) -> tuple[int, int]:
         """Unsubscribe a retired group and delete its undelivered work.
+
+        ``targets``, when given, limits the removal to those targets.
 
         Returns ``(subscriptions, deliveries)`` removed. Publish fans out to
         every subscribed group and prune keeps any publication with an
         undelivered row, so a group whose module is gone for good pins every
         later publication until this runs (``modulith broker drop-group``).
         """
-        return await self._cold.drop_group(group)
+        return await self._cold.drop_group(group, None if targets is None else list(targets))
 
     async def claim_batch(
         self,
@@ -356,8 +370,12 @@ class ShmBroker:
         consumer_name: str,
         reclaim_stale_seconds: float = _DEFAULT_RECLAIM_STALE_S,
         max_attempts: int | None = None,
+        targets: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
         """Atomically claim durable work, including abandoned stale claims.
+
+        ``targets``, when given, restricts the claim to those targets, so
+        deliveries for a target the consumer no longer consumes stay pending.
 
         A stale-claim reclaim bumps ``attempts`` only for a row whose
         dispatch had started (``renew_claims(..., start_dispatch=True)``);
@@ -379,6 +397,7 @@ class ShmBroker:
             consumer_name=consumer_name,
             reclaim_stale_seconds=reclaim_stale_seconds,
             max_attempts=max_attempts,
+            targets=targets,
         )
 
     async def renew_claims(

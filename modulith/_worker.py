@@ -262,9 +262,11 @@ def _build_consumer(module_name: str, consumer_name: str | None = None) -> Any:
     """Build this worker's cross-process consumer, or None when there's nothing to do.
 
     Returns None — and the worker runs HTTP-only — when topology is not
-    ``processes`` or a non-SHM module has no subscription targets. SHM still
-    builds an empty consumer so startup can remove stale subscriptions without
-    launching a poll task. A worker that needs a consumer requires both broker
+    ``processes`` or a module on another broker has no subscription targets.
+    SHM and the database broker still build an empty consumer, without a poll
+    task, so startup can warn about subscriptions and backlog the group still
+    holds from an earlier release (SHM also removes the stale subscriptions,
+    never their deliveries). A worker that needs a consumer requires both broker
     and consumer adapters so delivery cannot be silently disabled.
 
     The concrete consumer is built by the scheme's registered factory
@@ -288,7 +290,7 @@ def _build_consumer(module_name: str, consumer_name: str | None = None) -> Any:
         return None
 
     targets = consumer_targets(bus, cfg, module_name)
-    if not targets and cfg.broker != "shm":
+    if not targets and cfg.broker not in ("shm", "database"):
         return None
     if broker_registry is None or cfg.broker not in broker_registry.schemes():
         raise ConfigurationError(

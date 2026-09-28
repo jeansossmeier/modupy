@@ -1188,6 +1188,23 @@ async def test_drop_group_of_an_unknown_group_removes_nothing(broker: ShmBroker)
     assert await broker.group_backlog() == {"modulith-orders": 1}
 
 
+async def test_claim_batch_claims_only_the_targets_the_consumer_names(broker: ShmBroker) -> None:
+    await broker.subscribe(["t.Live", "t.Stale"], "modulith-orders")
+    await broker.publish("t.Stale", b"stale", {"event_type": "t.Stale"})
+    await broker.publish("t.Live", b"live", {"event_type": "t.Live"})
+
+    rows = await broker.claim_batch(
+        "modulith-orders", batch_size=10, consumer_name="orders:w", targets=["t.Live"]
+    )
+
+    assert [row["payload"] for row in rows] == [b"live"]
+    assert await broker.group_backlog() == {"modulith-orders": 2}
+    unfiltered = await broker.claim_batch(
+        "modulith-orders", batch_size=10, consumer_name="orders:w"
+    )
+    assert [row["payload"] for row in unfiltered] == [b"stale"]
+
+
 def _state_dir_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     return [
         record

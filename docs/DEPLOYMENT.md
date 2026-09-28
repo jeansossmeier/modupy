@@ -823,6 +823,41 @@ Step 6 depends on the broker:
   with a growing lag in `XINFO GROUPS`, remove it from each stream it read
   with `XGROUP DESTROY <stream> modulith-<module>`.
 
+### Stale Targets After a Listener Moves or an Upgrade
+
+A module that still exists can stop consuming a target: its last listener
+for an event moved to another module, or an upgrade changed which event
+types a worker consumes. Since the release in which a worker consumes only
+its own module's listeners, a worker no longer subscribes to event types
+that only a sibling module it imports listens to.
+
+On the SHM and database brokers, subscriptions are never removed
+automatically, and neither are the pending or claimed messages queued for
+them, so a rollback to a release that still consumes the target finds its
+backlog intact. (SHM drops the group's subscription rows for targets it no
+longer consumes when the worker starts, but keeps their queued deliveries.)
+Until you clean up:
+
+- every publish to the target still adds a message for the group;
+- the group's consumer claims only the targets it currently consumes, so
+  those messages stay pending, are never dead-lettered, and log no error;
+- each time the worker's consumer starts, it logs one WARNING per stale
+  target, naming the group, the target, its undelivered count, and the
+  cleanup command. A module left with no targets at all still starts an
+  empty consumer on these brokers, so it warns too.
+
+Once no release that consumes the target will run again, remove it:
+
+```bash
+modulith broker drop-group modulith-<module> --target <target> [--target <other>] [--yes]
+```
+
+This removes only those subscriptions and deletes their pending and
+claimed messages (they are not delivered). Later publishes to the target no
+longer reach the group. It asks for confirmation unless `--yes` is given.
+Unlike the whole-group form, it needs no `--force` for a current module's
+group.
+
 ### Recovering from Broker Failure
 
 **Database broker:**

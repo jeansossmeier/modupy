@@ -14,6 +14,10 @@ class PollingBroker(Protocol):
 
     async def subscribe(self, targets: list[str], group: str) -> None: ...
 
+    async def stale_targets(
+        self, group: str, targets: list[str] | tuple[str, ...]
+    ) -> dict[str, int]: ...
+
     async def claim_batch(
         self,
         group: str,
@@ -22,6 +26,7 @@ class PollingBroker(Protocol):
         consumer_name: str,
         reclaim_stale_seconds: float,
         max_attempts: int | None = None,
+        targets: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]: ...
 
     async def renew_claims(

@@ -422,6 +422,11 @@ class FakePollingBroker:
     async def subscribe(self, targets: list[str], group: str) -> None:
         return None
 
+    async def stale_targets(
+        self, group: str, targets: list[str] | tuple[str, ...]
+    ) -> dict[str, int]:
+        return {}
+
     async def claim_batch(
         self,
         group: str,
@@ -430,6 +435,7 @@ class FakePollingBroker:
         consumer_name: str,
         reclaim_stale_seconds: float,
         max_attempts: int | None = None,
+        targets: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
         self.claim_batch_calls.append(
             {

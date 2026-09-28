@@ -1379,12 +1379,20 @@ def broker_drop_group(
         False, "--force", help="Drop the group even though a current module derives it."
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask for confirmation."),
+    target: list[str] | None = typer.Option(
+        None,
+        "--target",
+        help="Remove only this target's subscription and backlog (repeatable).",
+    ),
 ) -> None:
     """Remove a retired module's group: its subscriptions and undelivered work.
 
     Applies to the shm and database brokers, which fan every publication out
     to each subscribed group and never prune undelivered rows. The group's
     queued messages are deleted, not delivered; prune then reclaims them.
+    With ``--target``, only those targets are removed, which is how a stale
+    target reported at worker start is cleaned up; a current module's group
+    then needs no ``--force``.
     """
     _runtime.configure(topology="processes")
     rt = _bootstrap_or_exit()
@@ -1398,21 +1406,25 @@ def broker_drop_group(
             err=True,
         )
         raise typer.Exit(code=1)
-    if group in _derived_consumer_groups(cfg.package, cfg.contracts_module) and not force:
+    targets = list(target) if target else None
+    if (
+        targets is None
+        and group in _derived_consumer_groups(cfg.package, cfg.contracts_module)
+        and not force
+    ):
         typer.echo(
             f"error: {group!r} belongs to a module of the current deployment; its workers "
             "would lose their queued messages. Pass --force to drop it anyway.",
             err=True,
         )
         raise typer.Exit(code=1)
-    if not yes and not typer.confirm(
-        f"Drop group {group!r} and delete its pending and claimed messages?"
-    ):
+    scope = f"group {group!r}" if targets is None else f"targets {targets!r} of group {group!r}"
+    if not yes and not typer.confirm(f"Drop {scope} and delete its pending and claimed messages?"):
         typer.echo("aborted — nothing was removed", err=True)
         raise typer.Exit(code=1)
-    subscriptions, deliveries = asyncio.run(broker.drop_group(group))
+    subscriptions, deliveries = asyncio.run(broker.drop_group(group, targets=targets))
     typer.echo(
-        f"dropped group {group!r}: {subscriptions} subscription(s), "
+        f"dropped {scope}: {subscriptions} subscription(s), "
         f"{deliveries} pending or claimed delivery(ies)"
     )
 

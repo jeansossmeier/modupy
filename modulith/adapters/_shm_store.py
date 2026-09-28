@@ -80,8 +80,11 @@ class SqliteQueueStore:
     def group_backlog(self) -> dict[str, int]:
         return _shm_publications.group_backlog(self._conn)
 
-    def drop_group(self, group: str) -> tuple[int, int]:
-        return _shm_publications.drop_group(self._conn, group)
+    def stale_targets(self, group: str, targets: list[str]) -> dict[str, int]:
+        return _shm_publications.stale_targets(self._conn, group, targets)
+
+    def drop_group(self, group: str, targets: list[str] | None = None) -> tuple[int, int]:
+        return _shm_publications.drop_group(self._conn, group, targets)
 
     def claim(
         self,
@@ -90,6 +93,7 @@ class SqliteQueueStore:
         consumer_name: str,
         reclaim_stale_seconds: float,
         max_attempts: int | None = None,
+        targets: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         return _shm_claims.claim(
             self._conn,
@@ -99,6 +103,7 @@ class SqliteQueueStore:
             reclaim_stale_seconds,
             self._max_payload_bytes,
             max_attempts,
+            targets,
         )
 
     def renew_claims(

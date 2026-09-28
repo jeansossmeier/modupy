@@ -101,8 +101,11 @@ class ShmColdStore(SerialStoreExecutor):
     async def group_backlog(self) -> dict[str, int]:
         return cast(dict[str, int], await self._call("group_backlog"))
 
-    async def drop_group(self, group: str) -> tuple[int, int]:
-        return cast(tuple[int, int], await self._call("drop_group", group))
+    async def stale_targets(self, group: str, targets: list[str]) -> dict[str, int]:
+        return cast(dict[str, int], await self._call("stale_targets", group, targets))
+
+    async def drop_group(self, group: str, targets: list[str] | None = None) -> tuple[int, int]:
+        return cast(tuple[int, int], await self._call("drop_group", group, targets))
 
     async def claim(
         self,
@@ -112,6 +115,7 @@ class ShmColdStore(SerialStoreExecutor):
         consumer_name: str = "",
         reclaim_stale_seconds: float = 60.0,
         max_attempts: int | None = None,
+        targets: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
         if type(limit) is not int or limit < 1:
             raise ValueError("limit must be an integer >= 1")
@@ -125,6 +129,7 @@ class ShmColdStore(SerialStoreExecutor):
                 consumer_name,
                 reclaim_stale_seconds,
                 max_attempts,
+                None if targets is None else list(targets),
             ),
         )
 
