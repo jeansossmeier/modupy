@@ -160,21 +160,21 @@ async def test_bind_unbind_session_round_trip_restores_previous_binding(engine) 
     docstring example."""
     from modulith.adapters.postgres_outbox import unbind_session
 
-    assert outbox._current_session.get() is None
+    assert outbox._bound_session() is None
 
     sessionmaker = async_sessionmaker(engine)
     async with sessionmaker() as outer, sessionmaker() as inner:
         outer_token = bind_session(outer)
-        assert outbox._current_session.get() is outer
+        assert outbox._bound_session() is outer
 
         inner_token = bind_session(inner)
-        assert outbox._current_session.get() is inner
+        assert outbox._bound_session() is inner
 
         unbind_session(inner_token)
-        assert outbox._current_session.get() is outer
+        assert outbox._bound_session() is outer
 
         unbind_session(outer_token)
-        assert outbox._current_session.get() is None
+        assert outbox._bound_session() is None
 
 
 # ---------------------------------------------------------------------------

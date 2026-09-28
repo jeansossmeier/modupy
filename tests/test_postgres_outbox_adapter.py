@@ -23,13 +23,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from modulith import EventPublication, event
+from modulith import EventPublication, event, publish
 from modulith.adapters import postgres_outbox
 from modulith.adapters.postgres_outbox import (
     Base,
     EventPublicationRow,
     PostgresPublicationStore,
     bind_session,
+    unbind_session,
 )
 from modulith.builtin import outbox
 from modulith.runtime import _runtime
@@ -647,3 +648,71 @@ async def test_store_cross_loop_warning_fires_once_per_instance(engine: Any, cap
         assert len(warnings) == 1, f"expected exactly one cross-loop warning, got: {caplog.records}"
     finally:
         await store.dispose()
+
+
+# ---------------------------------------------------------------------------
+# A task spawned inside a bound request must not publish into the dead binding
+# ---------------------------------------------------------------------------
+
+
+async def _completed_rows(engine: Any) -> int:
+    async with async_sessionmaker(engine)() as s:
+        rows = (await s.execute(select(EventPublicationRow))).scalars().all()
+        return sum(1 for r in rows if r.completed_at is not None)
+
+
+async def test_task_spawned_in_bound_request_publishes_after_unbind_is_delivered(
+    engine: Any,
+) -> None:
+    """``asyncio.create_task`` copies the request's context, binding included.
+    Once the request calls ``unbind_session`` that binding is over: a publish
+    from the task afterwards must take the unbound path and be delivered,
+    instead of being added to a session nobody will commit again."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+    go = asyncio.Event()
+
+    async def follow_up() -> None:
+        await go.wait()
+        await publish(G04Event(value=2))
+
+    async with async_sessionmaker(engine)() as session:
+        token = bind_session(session)
+        try:
+            await publish(G04Event(value=1))
+            task = asyncio.create_task(follow_up())
+            await session.commit()
+        finally:
+            unbind_session(token)
+    await store.wait_for_dispatch()
+
+    go.set()
+    await task
+    await store.wait_for_dispatch()
+
+    assert received == [1, 2]
+    assert await store.find_incomplete(timedelta(0)) == []
+
+
+async def test_bound_session_reused_across_commits_enlists_every_publish(engine: Any) -> None:
+    """A session stays bound across several commits (autobegin opens a new
+    transaction after each ``commit()``); every publish in that span is
+    persisted in the session and dispatched after its own commit."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+
+    async with async_sessionmaker(engine)() as session:
+        token = bind_session(session)
+        try:
+            await publish(G04Event(value=1))
+            await session.commit()
+            await publish(G04Event(value=2))
+            await session.commit()
+        finally:
+            unbind_session(token)
+    await store.wait_for_dispatch()
+
+    assert received == [1, 2]
+    assert await _completed_rows(engine) == 2
