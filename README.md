@@ -245,8 +245,10 @@ skipped silently — and `@listener` functions must be reachable from it
 
 **Re-export each module's router from its `__init__.py`.** Under
 `--topology=processes` there is no `main.py` in the worker: each worker
-imports only its own module package and mounts its `router` attribute under
-`/<module>`. A router wired only through `main.py` serves nothing there —
+imports its own module package and mounts its `router` attribute under
+`/<module>`. Sibling modules that package imports are loaded too, but their
+listeners run only in their owner's worker. A router wired only through
+`main.py` serves nothing there —
 every route answers 404 while the worker reports healthy, and the worker log
 carries a warning naming the missing `router`. Cookbook recipe
 [8](docs/COOKBOOK.md#8-go-process-per-module-and-externalize-an-event) shows

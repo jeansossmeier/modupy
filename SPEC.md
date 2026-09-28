@@ -640,7 +640,10 @@ uvicorn modulith._worker:create_app --factory \
 
 `create_app()`:
 - Reads `MODULITH_MODULE` from env
-- Imports only that module's package
+- Imports that module's package. Sibling module packages it imports are
+  loaded too, but a listener runs only in the worker of the module whose
+  import registered it; listeners registered outside any module import
+  (plugins, hooks) run in every worker
 - Routes this module's cross-module *publishes* out through the broker, and
   (via the lifespan) starts a `BrokerConsumer` that subscribes to the streams
   for the events this module's listeners consume, deserializes each via its
