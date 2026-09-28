@@ -346,15 +346,15 @@ class ShmBroker:
 
     async def active_groups(self, *, within_seconds: float) -> set[str]:
         """Groups a consumer refreshed, claimed or completed within ``within_seconds``."""
-        return cast(set[str], await self._cold._call("active_groups", within_seconds))
+        return await self._cold.active_groups(within_seconds)
 
     async def touch_subscriptions(self, targets: list[str], group: str) -> None:
         """Stamp ``group``'s subscriptions to ``targets`` as served right now."""
-        await self._cold._call("touch_subscriptions", list(targets), group)
+        await self._cold.touch_subscriptions(list(targets), group)
 
     async def sole_subscriber_targets(self, group: str) -> list[str]:
         """Targets ``group`` subscribes to that no other group subscribes to."""
-        return cast(list[str], await self._cold._call("sole_subscriber_targets", group))
+        return await self._cold.sole_subscriber_targets(group)
 
     async def stale_targets(
         self, group: str, targets: list[str] | tuple[str, ...]
