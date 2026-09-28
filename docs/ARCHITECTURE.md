@@ -586,18 +586,22 @@ every consume, since it is the sole chokepoint where broker/outbox bytes
 become a Python object; an oversized row is dead-lettered instead of parsed.
 The consumer resolves its cap lazily on first deserialize, from the same
 env/`broker_options` precedence the broker uses. `max_store_bytes` defaults to
-1 GiB (maximum 1 TiB) and sets SQLite `max_page_count`, a hard upper bound on
-the file. Publishes stop earlier: a publish that would leave
-`page_count - freelist_count` above `max_page_count` minus a consumer reserve
-rolls back with the store-full `ConfigurationError`, applying backpressure
-without corrupting existing rows. The reserve is 32 pages (128 KiB at 4 KiB
-pages), or one eighth of the pages for stores under 256 pages, and it keeps
-room for claims, acks, fails, dead-letters and prunes, so consumers can drain a
-backlog that filled the store and free space. One default-size consumer pass
-(claim 100, fail and dead-letter one each with a 4 KiB error, ack the rest,
-prune) measured 3–7 pages of growth at every store size from 192 KiB to
-256 MiB. Below 56 pages (224 KiB) the one-eighth reserve is smaller than that,
-so tiny stores no longer guarantee a full default pass. Both accept `MODULITH_BROKER_*` environment overrides. The legacy
+1 GiB (maximum 1 TiB) and sets SQLite `max_page_count` on the database file
+(`broker.db`; the `-wal` file is separate and unbounded, see the Cookbook).
+Publishes and subscribe replays stop earlier: one that would leave
+`page_count - freelist_count` above the configured page count minus a consumer
+reserve rolls back with a store-full `ConfigurationError`, applying
+backpressure without corrupting existing rows. The reserve is 32 pages
+(128 KiB at 4 KiB pages), or one eighth of the pages for stores under 256
+pages. Consumer writes (claims, renewals, acks, fails, dead-letters, prunes)
+only change rows the store already holds, but claims, error text, mark-mode
+completions and prune tombstones still grow them, and no fixed reserve covers
+a whole backlog. So `SqliteQueueStore._consumer_write` retries a consumer
+write that hits `max_page_count` with the limit lifted: consumers always finish
+the backlog they can see, and the file can grow past `max_store_bytes` by that
+growth while publishes stay refused. The same retry drains a store opened
+above its limit (filled before the reserve existed, or with `max_store_bytes`
+lowered). Both accept `MODULITH_BROKER_*` environment overrides. The legacy
 `shm_slot_size` option is deprecated and ignored because hint slots are
 fixed-size sequence records.
 
