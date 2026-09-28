@@ -2042,3 +2042,69 @@ def test_broker_drop_group_refuses_a_current_modules_group_without_force(
 
     assert forced.exit_code == 0, forced.output
     assert _shm_group_backlog(db_path) == {}
+
+
+def _claim_one(db_path: Path, group: str) -> None:
+    from modulith.adapters.shm_broker import ShmBroker
+
+    async def claim() -> None:
+        broker = ShmBroker(shm_name=str(db_path.with_suffix(".hints")), db_path=str(db_path))
+        try:
+            assert await broker.claim_batch(group, batch_size=1, consumer_name=f"{group}:w")
+        finally:
+            await broker.close()
+
+    asyncio.run(claim())
+
+
+def test_process_run_does_not_warn_about_a_group_another_service_consumes(
+    make_fake_app, monkeypatch, tmp_path, caplog
+):
+    make_fake_app(
+        {"orders": ""},
+        extra_files={"main.py": "from fastapi import FastAPI\napp = FastAPI()\n"},
+    )
+    db_path = _seed_shm_groups(
+        tmp_path, monkeypatch, {"modulith-orders": 2, "modulith-extracted": 3}
+    )
+    _claim_one(db_path, "modulith-extracted")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        return None
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    with caplog.at_level(logging.WARNING, logger="modulith"):
+        result = runner.invoke(app, ["run", "fakeapp.main:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert not [m for m in warnings if "modulith-extracted" in m], warnings
+
+
+def test_broker_drop_group_refuses_a_recently_active_group_without_force(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    db_path = _seed_shm_groups(tmp_path, monkeypatch, {"modulith-extracted": 3})
+    _claim_one(db_path, "modulith-extracted")
+
+    refused = runner.invoke(app, ["broker", "drop-group", "modulith-extracted", "--yes"])
+
+    assert refused.exit_code == 1, refused.output
+    assert "--force" in refused.output
+    assert _shm_group_backlog(db_path) == {"modulith-extracted": 3}
+
+
+def test_broker_drop_group_of_an_unknown_group_fails(make_fake_app, monkeypatch, tmp_path):
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    db_path = _seed_shm_groups(tmp_path, monkeypatch, {"modulith-retired": 3})
+
+    result = runner.invoke(app, ["broker", "drop-group", "modulith-retierd", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert "no subscription or undelivered work" in result.output
+    assert _shm_group_backlog(db_path) == {"modulith-retired": 3}

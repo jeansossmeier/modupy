@@ -1188,6 +1188,27 @@ async def test_drop_group_of_an_unknown_group_removes_nothing(broker: ShmBroker)
     assert await broker.group_backlog() == {"modulith-orders": 1}
 
 
+async def test_group_backlog_reports_undelivered_rows_of_an_unsubscribed_group(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "q.db"
+    broker = ShmBroker(shm_name=str(tmp_path / "hints"), db_path=str(db))
+    try:
+        await broker.subscribe(["t.A"], "modulith-live")
+        await broker.subscribe(["t.A"], "modulith-old")
+        await broker.publish("t.A", b"x", {"event_type": "t.A"})
+        await broker.publish("t.A", b"y", {"event_type": "t.A"})
+        await broker.claim_batch("modulith-old", batch_size=1, consumer_name="old:w")
+        conn = sqlite3.connect(db)
+        conn.execute("DELETE FROM shm_subscription WHERE consumer_group='modulith-old'")
+        conn.commit()
+        conn.close()
+
+        assert await broker.group_backlog() == {"modulith-live": 2, "modulith-old": 2}
+    finally:
+        await broker.close()
+
+
 async def test_claim_batch_claims_only_the_targets_the_consumer_names(broker: ShmBroker) -> None:
     await broker.subscribe(["t.Live", "t.Stale"], "modulith-orders")
     await broker.publish("t.Stale", b"stale", {"event_type": "t.Stale"})

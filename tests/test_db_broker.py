@@ -4595,6 +4595,51 @@ async def test_drop_group_removes_a_retired_groups_subscription_and_undelivered_
     assert await broker.drop_group("modulith-retired") == (0, 0)
 
 
+async def test_group_backlog_reports_undelivered_rows_of_an_unsubscribed_group(
+    engine: Any,
+) -> None:
+    from sqlalchemy import delete
+
+    broker = DatabaseBroker(engine=engine)
+    await broker.subscribe(["t.A"], "modulith-live")
+    await broker.subscribe(["t.A"], "modulith-old")
+    await broker.publish("t.A", b"x", {"event_type": "t.A"})
+    await broker.publish("t.A", b"y", {"event_type": "t.A"})
+    await broker.claim_batch("modulith-old", batch_size=1, consumer_name="old:w")
+    _, subscription, _ = broker_schema()
+    async with engine.begin() as conn:
+        await conn.execute(
+            delete(subscription).where(subscription.c.consumer_group == "modulith-old")
+        )
+
+    assert await broker.group_backlog() == {"modulith-live": 2, "modulith-old": 2}
+
+
+async def test_active_groups_counts_recent_subscribes_and_claims(engine: Any) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import update
+
+    broker = DatabaseBroker(engine=engine)
+    for group in ("modulith-subscribed", "modulith-claiming", "modulith-idle"):
+        await broker.subscribe(["t.A"], group)
+    await broker.publish("t.A", b"x", {"event_type": "t.A"})
+    await broker.claim_batch("modulith-claiming", batch_size=1, consumer_name="c:w")
+    _, subscription, _ = broker_schema()
+    long_ago = datetime.now(UTC) - timedelta(days=30)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(subscription)
+            .where(subscription.c.consumer_group != "modulith-subscribed")
+            .values(updated_at=long_ago)
+        )
+
+    assert await broker.active_groups(within_seconds=3600) == {
+        "modulith-subscribed",
+        "modulith-claiming",
+    }
+
+
 async def test_listener_that_never_returns_degrades_database_consumer_health(
     engine: Any, caplog: pytest.LogCaptureFixture
 ) -> None:

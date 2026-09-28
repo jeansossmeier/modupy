@@ -335,8 +335,12 @@ class ShmBroker:
         await self._cold.subscribe(targets, group)
 
     async def group_backlog(self) -> dict[str, int]:
-        """Map every subscribed group to its pending and claimed delivery count."""
+        """Map every subscribed group, or group with undelivered work, to its backlog."""
         return await self._cold.group_backlog()
+
+    async def active_groups(self, *, within_seconds: float) -> set[str]:
+        """Groups that claimed or completed a delivery within ``within_seconds``."""
+        return cast(set[str], await self._cold._call("active_groups", within_seconds))
 
     async def stale_targets(
         self, group: str, targets: list[str] | tuple[str, ...]

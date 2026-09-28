@@ -2175,7 +2175,11 @@ class DatabaseBroker:
 
     @_on_owning_loop
     async def group_backlog(self) -> dict[str, int]:
-        """Map every subscribed group to its pending and claimed row count."""
+        """Map every group to its pending and claimed row count.
+
+        A group counts when it is subscribed or still holds pending or
+        claimed rows, so rows left behind by an unsubscribed group show up.
+        """
         await self._ensure_schema()
         from sqlalchemy import func, select
 
@@ -2186,10 +2190,7 @@ class DatabaseBroker:
             backlog = {str(row[0]): 0 for row in groups}
             counts = await conn.execute(
                 select(message.c.consumer_group, func.count())
-                .where(
-                    message.c.consumer_group.in_(list(backlog)),
-                    message.c.status.in_(("pending", "claimed")),
-                )
+                .where(message.c.status.in_(("pending", "claimed")))
                 .group_by(message.c.consumer_group)
             )
             for group, count in counts:
@@ -2197,6 +2198,34 @@ class DatabaseBroker:
             return dict(sorted(backlog.items()))
 
         result: dict[str, int] = await self._write(op)
+        return result
+
+    @_on_owning_loop
+    async def active_groups(self, *, within_seconds: float) -> set[str]:
+        """Groups a consumer subscribed or claimed for within ``within_seconds``.
+
+        A consumer refreshes its subscription rows' ``updated_at`` at start,
+        and every claim stamps ``claimed_at``, so a group served by any
+        deployment shows up here even when this one's modules do not derive it.
+        """
+        await self._ensure_schema()
+        from sqlalchemy import select, union
+
+        _, subscription, message = broker_schema()
+
+        async def op(conn: Any) -> set[str]:
+            cutoff = await self._now(conn) - timedelta(seconds=within_seconds)
+            rows = await conn.execute(
+                union(
+                    select(subscription.c.consumer_group).where(
+                        subscription.c.updated_at >= cutoff
+                    ),
+                    select(message.c.consumer_group).where(message.c.claimed_at >= cutoff),
+                )
+            )
+            return {str(row[0]) for row in rows}
+
+        result: set[str] = await self._write(op)
         return result
 
     @_on_owning_loop

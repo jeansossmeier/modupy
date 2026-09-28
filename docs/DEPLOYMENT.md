@@ -857,17 +857,26 @@ Step 6 depends on the broker:
 
 - **SHM and database brokers:** every publication fans out one delivery per
   subscribed group, and prune never removes undelivered work, so a group
-  that never consumes again pins every later publication to its targets
-  until the store fills. `modulith run --topology processes` logs a warning
-  at startup for each subscribed group that no current module derives,
-  naming its backlog. Once the module is gone for good, run
-  `modulith broker drop-group modulith-<module>` from the project root. It
-  removes the group's subscriptions and deletes its pending and claimed
-  messages (they are not delivered); the next prune reclaims the
-  publications they held. It asks for confirmation unless `--yes` is given,
-  and refuses a group that a current module derives unless `--force` is
-  given. Nothing is dropped automatically: a module that is only disabled
-  for a deploy gets its backlog when it returns.
+  that never consumes again gets a queued row for every later publication
+  to its targets. On SHM those rows also keep prune from reclaiming the
+  publications; on the database broker they pile up in `broker_message`.
+  `modulith run --topology processes` logs a warning at startup for each
+  group that no current module derives and no consumer served in the last
+  24 hours (a subscribe or a claim), naming its backlog. A group that an
+  extracted service or another host still consumes is therefore not
+  reported. Once the module is gone for good, run
+  `modulith broker drop-group modulith-<module>` with the same broker
+  configuration and environment as the service. It removes the group's
+  subscriptions and deletes its pending and claimed messages (they are not
+  delivered); the next prune reclaims the publications they held. It asks
+  for confirmation unless `--yes` is given, exits non-zero when the store
+  holds nothing for the group, and refuses a group that a current module
+  derives or a consumer served in the last 24 hours unless `--force` is
+  given. On the database broker's default `error` policy, a producer that
+  still publishes to a target whose only subscriber was the dropped group
+  then gets `NoSubscribersError`; step 2 stops those publishes first.
+  Nothing is dropped automatically: a module that is only disabled for a
+  deploy gets its backlog when it returns.
 - **Redis Streams broker:** no storage cleanup is needed. Streams are
   trimmed by `MAXLEN` regardless of consumer groups, so a stale group holds
   no memory beyond its pending-entries list. To stop it from showing up
