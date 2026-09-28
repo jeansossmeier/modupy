@@ -29,7 +29,11 @@ def _namespace(package: str | None) -> str:
 
 
 def _canonical_package_origin(package: str | None) -> Path:
-    """Return a stable package location without importing application code."""
+    """Return the resolved package location without importing application code.
+
+    Symlinks are resolved, so a ``current -> releases/<ts>`` switch or a new
+    venv yields a different location and therefore a different default store.
+    """
     if package:
         root_package = package.partition(".")[0]
         try:
@@ -136,6 +140,15 @@ def _ensure_private_directory(path: Path, label: str) -> None:
     _reject_linked_components(path, label)
 
 
+def default_state_directory(package: str | None) -> Path:
+    """Return the default state directory for ``package`` without creating it.
+
+    The name digests the package's resolved install location, so the same
+    code installed at another path defaults to a different, empty directory.
+    """
+    return _absolute_unresolved(_default_state_home() / "modulith" / _namespace(package))
+
+
 def resolve_state_directory(
     package: str | None,
     *,
@@ -145,7 +158,7 @@ def resolve_state_directory(
     path = (
         _absolute_unresolved(state_dir)
         if state_dir is not None
-        else _absolute_unresolved(_default_state_home() / "modulith" / _namespace(package))
+        else default_state_directory(package)
     )
     _ensure_private_directory(path, "broker state")
     return path

@@ -603,6 +603,7 @@ def _run_process_topology(
     port: int,
     log_level: str,
     verify_warn: bool = False,
+    warn_default_state_dir: bool = False,
 ) -> None:
     """Spin up the process-per-module runtime: one worker per module + proxy.
 
@@ -669,8 +670,18 @@ def _run_process_topology(
         else:
             worker_env[env_key] = str(value)
     if cfg.broker == "shm":
-        from .adapters.shm_broker import _resolve_shm_paths
+        from .adapters.shm_broker import _broker_opt, _resolve_shm_paths
 
+        if warn_default_state_dir and (
+            _broker_opt(cfg.broker_options or {}, "state_dir", "STATE_DIR") is None
+        ):
+            logger.warning(
+                "SHM broker state_dir is not set: the default state directory is keyed "
+                "on the package's install path, so a redeploy to a different path "
+                "(a new release directory, venv or checkout) opens an empty store and "
+                "strands undelivered events in the old one. Production deploys must set "
+                "[tool.modulith.broker_options].state_dir or MODULITH_BROKER_STATE_DIR."
+            )
         state_dir, sqlite_path, hint_path = _resolve_shm_paths(
             cfg.package,
             cfg.broker_options or {},
@@ -861,6 +872,7 @@ def run(
             host=host,
             port=port,
             log_level=level,
+            warn_default_state_dir=True,
         )
         return
 

@@ -486,6 +486,64 @@ def test_process_topology_resolves_shm_paths_once_before_worker_cwd_changes(
     assert Path(worker_env["MODULITH_BROKER_HINT_PATH"]) == expected_hint
 
 
+def _state_dir_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "state_dir" in record.getMessage()
+    ]
+
+
+def test_run_processes_warns_once_when_shm_state_dir_is_defaulted(
+    make_fake_app, monkeypatch, tmp_path, caplog
+):
+    make_fake_app(
+        {"orders": ""},
+        extra_files={"main.py": "from fastapi import FastAPI\napp = FastAPI()\n"},
+    )
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    monkeypatch.delenv("MODULITH_BROKER_STATE_DIR", raising=False)
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        return None
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    with caplog.at_level(logging.WARNING):
+        result = runner.invoke(app, ["run", "fakeapp.main:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    (record,) = _state_dir_warnings(caplog)
+    message = record.getMessage()
+    assert "install path" in message
+    assert "[tool.modulith.broker_options].state_dir" in message
+    assert "MODULITH_BROKER_STATE_DIR" in message
+    assert "Production deploys must set" in message
+
+
+def test_run_processes_does_not_warn_when_shm_state_dir_is_explicit(
+    make_fake_app, monkeypatch, tmp_path, caplog
+):
+    make_fake_app(
+        {"orders": ""},
+        extra_files={"main.py": "from fastapi import FastAPI\napp = FastAPI()\n"},
+    )
+    monkeypatch.setenv("MODULITH_BROKER_STATE_DIR", str(tmp_path / "explicit-state"))
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        return None
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    with caplog.at_level(logging.WARNING):
+        result = runner.invoke(app, ["run", "fakeapp.main:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    assert _state_dir_warnings(caplog) == []
+
+
 def test_dev_processes_topology_env_url_beats_pyproject_url(make_fake_app, monkeypatch, tmp_path):
     """Parent MODULITH_BROKER_URL must reach workers, not the pyproject URL."""
     make_fake_app(

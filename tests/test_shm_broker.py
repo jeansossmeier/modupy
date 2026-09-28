@@ -20,6 +20,7 @@ from modulith.adapters._shm_coldstore import ShmColdStore
 from modulith.adapters._shm_ring import _HEADER_SIZE, _SLOT_SIZE, _SLOT_STRUCT
 from modulith.adapters._shm_schema import open_database
 from modulith.adapters._shm_store import SqliteQueueStore
+from modulith.adapters._state_path import default_state_directory
 from modulith.adapters.shm_broker import (
     ShmBroker,
     ShmConsumer,
@@ -1182,3 +1183,90 @@ async def test_drop_group_of_an_unknown_group_removes_nothing(broker: ShmBroker)
 
     assert await broker.drop_group("modulith-gone") == (0, 0)
     assert await broker.group_backlog() == {"modulith-orders": 1}
+
+
+def _state_dir_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        record
+        for record in caplog.records
+        if record.name == "modulith.adapters.shm"
+        and record.levelno == logging.INFO
+        and "state directory" in record.getMessage()
+    ]
+
+
+async def test_registration_logs_default_state_directory_at_info(
+    make_fake_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    make_fake_app({"orders": ""})
+    state_home = tmp_path / "state-home"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    monkeypatch.delenv("MODULITH_BROKER_STATE_DIR", raising=False)
+    with caplog.at_level(logging.INFO, logger="modulith.adapters.shm"):
+        configure(package="fakeapp", topology="processes", broker="shm")
+        _runtime.ensure_bootstrapped()
+    assert _runtime.broker_registry is not None
+    instance = cast(ShmBroker, _runtime.broker_registry.get("shm"))
+    try:
+        (record,) = _state_dir_records(caplog)
+        message = record.getMessage()
+        (store,) = (state_home / "modulith").iterdir()
+        assert str(store) in message
+        assert "default location" in message
+        assert "install path" in message
+    finally:
+        await instance.close()
+        instance._ring.unlink()
+
+
+async def test_worker_given_supervisors_default_state_directory_logs_it_as_default(
+    make_fake_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    forwarded = default_state_directory("fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER_STATE_DIR", str(forwarded))
+    with caplog.at_level(logging.INFO, logger="modulith.adapters.shm"):
+        configure(package="fakeapp", topology="processes", broker="shm")
+        _runtime.ensure_bootstrapped()
+    assert _runtime.broker_registry is not None
+    instance = cast(ShmBroker, _runtime.broker_registry.get("shm"))
+    try:
+        (record,) = _state_dir_records(caplog)
+        message = record.getMessage()
+        assert str(forwarded) in message
+        assert "default location" in message
+    finally:
+        await instance.close()
+        instance._ring.unlink()
+
+
+async def test_registration_logs_explicit_state_directory_at_info(
+    make_fake_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    make_fake_app({"orders": ""})
+    state_dir = tmp_path / "explicit-state"
+    monkeypatch.setenv("MODULITH_BROKER_STATE_DIR", str(state_dir))
+    with caplog.at_level(logging.INFO, logger="modulith.adapters.shm"):
+        configure(package="fakeapp", topology="processes", broker="shm")
+        _runtime.ensure_bootstrapped()
+    assert _runtime.broker_registry is not None
+    instance = cast(ShmBroker, _runtime.broker_registry.get("shm"))
+    try:
+        (record,) = _state_dir_records(caplog)
+        message = record.getMessage()
+        assert str(state_dir) in message
+        assert "explicit state_dir" in message
+        assert "default location" not in message
+    finally:
+        await instance.close()
+        instance._ring.unlink()
