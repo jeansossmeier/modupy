@@ -76,6 +76,18 @@ def _is_builtin_plugin_module(name: str) -> bool:
     return name == "modulith" or name.startswith(_BUILTIN_PLUGIN_PREFIXES)
 
 
+def _importing_module_names() -> tuple[str, ...]:
+    """Names of the modules whose import is on the caller's stack, innermost first."""
+    names: list[str] = []
+    frame: Any = sys._getframe(1)
+    while frame is not None:
+        name = frame.f_globals.get("__name__")
+        if frame.f_code.co_name == "<module>" and isinstance(name, str):
+            names.append(name)
+        frame = frame.f_back
+    return tuple(names)
+
+
 class Runtime:
     """The lazily-initialized modulith runtime.
 
@@ -118,12 +130,17 @@ class Runtime:
         self._pending_listeners: list[tuple[type, Callable[..., Any]]] = []
 
         # Module package whose import registered each listener (see
-        # _importing_module_package), and the one module package a
+        # _owning_module_package), and the one module package a
         # process-per-module worker hosts. With a hosted module set, only its
         # own and untagged listeners are consumed, dispatched or counted as
         # local; with none (single topology) every listener is local.
         self._listener_owners: dict[Callable[..., Any], str] = {}
         self._hosted_module: str | None = None
+        # Importing-module names of listeners registered before the
+        # configuration (and so the application package) is known, such as
+        # module packages an entry-point plugin imports while the plugin
+        # manager loads. Resolved into _listener_owners at the commit point.
+        self._unresolved_listener_modules: dict[Callable[..., Any], tuple[str, ...]] = {}
 
         # Plugins injected programmatically (not via entry points), registered
         # at bootstrap. Embedding contexts — most notably the pytest plugin's
@@ -254,23 +271,30 @@ class Runtime:
         # rejected at the registration call site instead of surfacing as a
         # confusing failure when the queued listener is flushed at bootstrap.
         _require_async_handler(event_type, handler)
-        owner = self._importing_module_package()
+        importing = _importing_module_names()
         with self._lock:
-            if owner is not None:
-                self._listener_owners[handler] = owner
+            if self._config is None:
+                if importing:
+                    self._unresolved_listener_modules[handler] = importing
+            else:
+                owner = self._owning_module_package(importing)
+                if owner is not None:
+                    self._listener_owners[handler] = owner
             if self._event_bus is not None:
                 self._event_bus.register(event_type, handler)
             else:
                 self._pending_listeners.append((event_type, handler))
 
-    def _importing_module_package(self) -> str | None:
-        """The application module package whose import is registering a listener.
+    def _owning_module_package(self, importing: tuple[str, ...]) -> str | None:
+        """The application module package among a listener's importing modules.
 
-        Walks the caller's frames outward to the innermost module-level frame
-        belonging to an application module package: a public direct
-        subpackage of the configured package, other than the contracts
+        ``importing`` lists the modules being imported when the listener
+        registered, innermost first (see _importing_module_names). The owner
+        is the first that belongs to an application module package: a public
+        direct subpackage of the configured package, other than the contracts
         module. A listener in a plain file such as ``app/shared.py`` is
-        credited to the module that imported it; one registered outside any
+        credited to the module that imported it in this process, so every
+        worker that imports that file runs it. One registered outside any
         module import (plugin code, a hook, a test) gets None and stays local
         to every process.
         """
@@ -278,23 +302,17 @@ class Runtime:
         if cfg is None or not cfg.package:
             return None
         prefix = f"{cfg.package}."
-        frame: Any = sys._getframe(1)
-        while frame is not None:
-            name = frame.f_globals.get("__name__")
+        for name in importing:
+            if not name.startswith(prefix):
+                continue
+            segment = name[len(prefix) :].partition(".")[0]
+            package = f"{prefix}{segment}"
             if (
-                frame.f_code.co_name == "<module>"
-                and isinstance(name, str)
-                and name.startswith(prefix)
+                not segment.startswith("_")
+                and segment != cfg.contracts_module
+                and hasattr(sys.modules.get(package), "__path__")
             ):
-                segment = name[len(prefix) :].partition(".")[0]
-                package = f"{prefix}{segment}"
-                if (
-                    not segment.startswith("_")
-                    and segment != cfg.contracts_module
-                    and hasattr(sys.modules.get(package), "__path__")
-                ):
-                    return package
-            frame = frame.f_back
+                return package
         return None
 
     def host_module(self, module_package: str) -> None:
@@ -974,6 +992,11 @@ class Runtime:
         # 7. Commit point — install all state on self. Nothing above mutated
         # the runtime, so an exception in steps 1-6.6 left it pristine.
         self._config = config
+        for handler, importing in self._unresolved_listener_modules.items():
+            owner = self._owning_module_package(importing)
+            if owner is not None:
+                self._listener_owners[handler] = owner
+        self._unresolved_listener_modules.clear()
         self._plugin_manager = plugin_manager
         self._event_bus = event_bus
         self._broker_registry = broker_registry
@@ -1166,6 +1189,7 @@ class Runtime:
         self._modules = []
         self._pending_listeners = []
         self._listener_owners = {}
+        self._unresolved_listener_modules = {}
         self._hosted_module = None
         self._extra_plugins = []
         self._disabled_plugins = []

@@ -339,6 +339,19 @@ class OrderPlaced:
     order_id: str
 ```
 
+A worker runs only the listeners owned by its own module package. Two
+listener shapes behave differently:
+
+- A listener registered outside any module import (a plugin or hook) is
+  local in every worker. A non-externalized event it handles is then never
+  routed to the broker, so a listener for that event in another worker
+  does not receive it.
+- A listener in a plain, non-package file such as `myapp/shared.py` runs in
+  every worker whose module imports that file.
+
+Keep listeners inside module packages, and mark an event `@externalized`
+when modules in other workers handle it.
+
 If you have direct cross-module function calls remaining, they will
 break here — that's the cliff that `modulith doctor` was warning about.
 Fix them by migrating to events first.
