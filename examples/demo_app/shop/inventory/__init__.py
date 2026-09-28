@@ -26,6 +26,7 @@ reserved: deque[StockReserved] = deque(maxlen=1000)
 # bounded too: past GUARD_MEMORY orders the oldest id is forgotten.
 GUARD_MEMORY = 10_000
 _reserved_order_ids: dict[str, None] = {}
+_in_flight: set[str] = set()
 
 router = APIRouter()
 
@@ -41,16 +42,22 @@ async def reserve_stock(event: OrderPlaced) -> None:
 
     The order is recorded only after ``publish`` returns. A failed publish
     raises, the event is redelivered, and the redelivery publishes again
-    instead of being swallowed as a duplicate.
+    instead of being swallowed as a duplicate. A delivery that arrives while
+    the same order is still publishing is dropped: if that publish fails, its
+    own redelivery publishes.
     """
-    if event.order_id in _reserved_order_ids:
+    if event.order_id in _reserved_order_ids or event.order_id in _in_flight:
         return
-    evt = StockReserved(order_id=event.order_id)
-    await publish(evt)
-    _reserved_order_ids[event.order_id] = None
-    if len(_reserved_order_ids) > GUARD_MEMORY:
-        del _reserved_order_ids[next(iter(_reserved_order_ids))]
-    reserved.append(evt)
+    _in_flight.add(event.order_id)
+    try:
+        evt = StockReserved(order_id=event.order_id)
+        await publish(evt)
+        _reserved_order_ids[event.order_id] = None
+        if len(_reserved_order_ids) > GUARD_MEMORY:
+            del _reserved_order_ids[next(iter(_reserved_order_ids))]
+        reserved.append(evt)
+    finally:
+        _in_flight.discard(event.order_id)
 
 
 @router.get("/reserved")

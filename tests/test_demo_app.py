@@ -15,6 +15,7 @@ modules + the runtime singleton afterwards (mirroring conftest's make_fake_app).
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -136,6 +137,32 @@ async def test_reserve_stock_suppresses_redelivery_after_successful_publish(
 
     assert published == [StockReserved(order_id="o-2")]
     assert [r.order_id for r in inventory.reserved] == ["o-2"]
+
+
+async def test_reserve_stock_publishes_once_for_concurrent_deliveries(
+    demo_app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from shop import inventory
+    from shop.contracts.events import OrderPlaced, StockReserved
+
+    release = asyncio.Event()
+    published: list[object] = []
+
+    async def publish(evt: object) -> None:
+        await release.wait()
+        published.append(evt)
+
+    monkeypatch.setattr(inventory, "publish", publish)
+    evt = OrderPlaced(order_id="o-3", customer_id="c-3", total=3.0)
+
+    first = asyncio.create_task(inventory.reserve_stock(evt))
+    second = asyncio.create_task(inventory.reserve_stock(evt))
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(first, second)
+
+    assert published == [StockReserved(order_id="o-3")]
+    assert [r.order_id for r in inventory.reserved] == ["o-3"]
 
 
 async def test_reserve_stock_guard_memory_is_bounded(

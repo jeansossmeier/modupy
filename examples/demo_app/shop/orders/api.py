@@ -32,10 +32,12 @@ async def get_session(request: Request) -> AsyncIterator[Any]:
     lifespan wired the durable outbox (``MODULITH_OUTBOX`` != "memory" or
     ``MODULITH_DB_URL`` set). When it's set, this dependency binds a session
     to the outbox's context var for the lifetime of the request and always
-    resets the binding. It does not commit: FastAPI runs a request-scoped
-    ``yield`` dependency's teardown after the response has been sent, so a
-    commit there would acknowledge the order before knowing it persisted. The
-    route commits instead (see ``post_order``).
+    resets the binding. FastAPI runs a request-scoped ``yield`` dependency's
+    teardown after the response has been sent, so a commit there would
+    acknowledge the order before knowing it persisted: the route commits the
+    order itself (see ``post_order``). The commit after ``yield`` only covers
+    publishes made after the route's commit, such as from ``BackgroundTasks``,
+    and is skipped when the route raises.
 
     Typed ``Any`` (rather than ``AsyncSession | None``) deliberately: FastAPI
     resolves this callable's annotations via forward-ref evaluation against its
@@ -54,6 +56,7 @@ async def get_session(request: Request) -> AsyncIterator[Any]:
         token = bind_session(session)
         try:
             yield session
+            await session.commit()
         finally:
             unbind_session(token)
 
