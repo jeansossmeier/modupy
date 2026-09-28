@@ -438,7 +438,9 @@ class FakePollingBroker:
         )
         return []
 
-    async def renew_claims(self, row_ids: list[str], *, consumer_name: str) -> int:
+    async def renew_claims(
+        self, row_ids: list[str], *, consumer_name: str, start_dispatch: bool = False
+    ) -> int:
         return 0
 
     async def ack(self, row_id: str, *, consumer_name: str) -> None:

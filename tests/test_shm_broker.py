@@ -945,6 +945,7 @@ def _seed_claimed_delivery(
     group: str,
     attempts: int,
     claimed_at: float,
+    dispatch_started: bool,
 ) -> None:
     now = time.time()
     conn.execute(
@@ -956,16 +957,22 @@ def _seed_claimed_delivery(
     conn.execute(
         "INSERT INTO shm_delivery "
         "(publication_id, consumer_group, status, attempts, available_at, "
-        "claimed_at, claimed_by, claim_generation, created_at) "
-        "VALUES (?, ?, 'claimed', ?, ?, ?, 'worker-1', 1, ?)",
-        ("pub-1", group, attempts, now - 10, claimed_at, now),
+        "claimed_at, claimed_by, claim_generation, dispatch_started, created_at) "
+        "VALUES (?, ?, 'claimed', ?, ?, ?, 'worker-1', 1, ?, ?)",
+        ("pub-1", group, attempts, now - 10, claimed_at, int(dispatch_started), now),
     )
 
 
 def test_reclaim_dead_letters_once_max_attempts_is_exhausted(tmp_path: Path) -> None:
     conn = _open_claims_db(tmp_path / "claims.db")
     try:
-        _seed_claimed_delivery(conn, group="workers", attempts=1, claimed_at=time.time() - 120)
+        _seed_claimed_delivery(
+            conn,
+            group="workers",
+            attempts=1,
+            claimed_at=time.time() - 120,
+            dispatch_started=True,
+        )
 
         claimed = _shm_claims.claim(
             conn,
@@ -984,10 +991,64 @@ def test_reclaim_dead_letters_once_max_attempts_is_exhausted(tmp_path: Path) -> 
         conn.close()
 
 
+def test_opening_a_store_from_before_dispatch_started_adds_the_column(tmp_path: Path) -> None:
+    """A current-version store created before ``dispatch_started`` existed
+    must gain the column on open, or every claim fails on it."""
+    path = tmp_path / "claims.db"
+    _open_claims_db(path).close()
+    legacy = sqlite3.connect(path)
+    legacy.execute("ALTER TABLE shm_delivery DROP COLUMN dispatch_started")
+    legacy.commit()
+    legacy.close()
+
+    conn = _open_claims_db(path)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(shm_delivery)")}
+        assert "dispatch_started" in columns
+    finally:
+        conn.close()
+
+
+def test_reclaim_of_a_never_started_delivery_keeps_its_retry_budget(tmp_path: Path) -> None:
+    """A delivery claimed in a batch whose listener never started did not fail
+    a delivery, so a stale reclaim must neither charge nor dead-letter it."""
+    conn = _open_claims_db(tmp_path / "claims.db")
+    try:
+        _seed_claimed_delivery(
+            conn,
+            group="workers",
+            attempts=1,
+            claimed_at=time.time() - 120,
+            dispatch_started=False,
+        )
+
+        claimed = _shm_claims.claim(
+            conn,
+            "workers",
+            10,
+            "worker-2",
+            reclaim_stale_seconds=60.0,
+            max_claim_bytes=1_000_000,
+            max_attempts=2,
+        )
+
+        assert [row["attempts"] for row in claimed] == [1]
+        row = conn.execute("SELECT status, attempts, claimed_by FROM shm_delivery").fetchone()
+        assert (row["status"], row["attempts"], row["claimed_by"]) == ("claimed", 1, "worker-2")
+    finally:
+        conn.close()
+
+
 def test_reclaim_below_cap_bumps_attempts_and_redelivers(tmp_path: Path) -> None:
     conn = _open_claims_db(tmp_path / "claims.db")
     try:
-        _seed_claimed_delivery(conn, group="workers", attempts=0, claimed_at=time.time() - 120)
+        _seed_claimed_delivery(
+            conn,
+            group="workers",
+            attempts=0,
+            claimed_at=time.time() - 120,
+            dispatch_started=True,
+        )
 
         claimed = _shm_claims.claim(
             conn,
@@ -1030,13 +1091,16 @@ async def test_public_claim_batch_dead_letters_after_max_attempts_stale_reclaims
     """The reclaim cap must reach the public ShmBroker.claim_batch surface,
     not just the lower-level _shm_claims.claim() it is built on -- a stale
     reclaim below the cap redelivers with attempts bumped, and the reclaim
-    that meets the cap dead-letters instead of redelivering forever."""
+    that meets the cap dead-letters instead of redelivering forever. Each
+    claimant starts dispatching before it is abandoned, as a consumer that
+    crashes inside its listener does."""
     await broker.subscribe(["events"], "workers")
     await broker.publish("events", b"payload")
 
     first = await broker.claim_batch("workers", batch_size=1, consumer_name="worker-1")
     assert len(first) == 1
     assert first[0]["attempts"] == 0
+    await broker.renew_claims([first[0]["id"]], consumer_name="worker-1", start_dispatch=True)
 
     below_cap = await broker.claim_batch(
         "workers",
@@ -1047,6 +1111,7 @@ async def test_public_claim_batch_dead_letters_after_max_attempts_stale_reclaims
     )
     assert len(below_cap) == 1
     assert below_cap[0]["attempts"] == 1
+    await broker.renew_claims([below_cap[0]["id"]], consumer_name="worker-2", start_dispatch=True)
 
     at_cap = await broker.claim_batch(
         "workers",

@@ -108,7 +108,7 @@ async def test_alembic_upgrade_head_after_broker_self_bootstrap(tmp_path: Path) 
         versions = {r[0] for r in conn.execute("SELECT version_num FROM alembic_version")}
     finally:
         conn.close()
-    assert versions == {"0005_outbox_scan_indexes"}
+    assert versions == {"0006_broker_dispatch_started"}
 
     tables = _objects(db, "table")
     assert "event_publications" in tables

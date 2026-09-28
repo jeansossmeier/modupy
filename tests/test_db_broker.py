@@ -183,6 +183,7 @@ async def _insert_ex(
     claimed_by: str | None = None,
     target: str = "A",
     group: str = "g",
+    dispatch_started: bool = False,
 ) -> str:
     """Insert one row with full control over status / attempts / claimed_by —
     the fixture the owner-guard regression tests need (they assert late writes
@@ -207,6 +208,7 @@ async def _insert_ex(
                 claimed_by=claimed_by,
                 created_at=now,
                 last_error=None,
+                dispatch_started=dispatch_started,
             )
         )
     return id
@@ -1246,22 +1248,77 @@ async def test_orphaned_claim_is_reclaimed_after_visibility_timeout(engine: Any)
     assert reclaimed[0]["id"] == first[0]["id"]
 
 
-async def test_reclaim_counts_as_a_delivery_attempt(engine: Any) -> None:
-    """A consumer that dies (or wedges) between claim and ack never reaches
-    ``fail()``, so the reclaim itself has to burn an attempt — otherwise the
-    row is handed out forever with ``attempts`` frozen at 0 and never reaches
-    the dead-letter cap."""
+async def test_reclaim_of_a_started_dispatch_counts_as_a_delivery_attempt(engine: Any) -> None:
+    """A consumer that dies (or wedges) after handing a row to its listener
+    and before ack never reaches ``fail()``, so the reclaim itself has to burn
+    an attempt — otherwise the row is handed out forever with ``attempts``
+    frozen at 0 and never reaches the dead-letter cap. The charge lands once
+    per started dispatch: reclaiming again without a new start is free."""
     broker = DatabaseBroker(engine=engine)
     await broker._ensure_schema()
-    await _insert_ex(engine, id="r1", status="claimed", claimed_by="c0")
+    await _insert_ex(engine, id="r1", status="pending")
+    await broker.claim_batch("g", batch_size=10, consumer_name="c0")
+    assert await broker.renew_claims(["r1"], consumer_name="c0", start_dispatch=True) == 1
 
     reclaimed = await broker.claim_batch(
         "g", batch_size=10, consumer_name="c1", reclaim_stale_seconds=0.0
     )
+    again = await broker.claim_batch(
+        "g", batch_size=10, consumer_name="c2", reclaim_stale_seconds=0.0
+    )
 
     assert [row["id"] for row in reclaimed] == ["r1"]
     assert reclaimed[0]["attempts"] == 1
-    assert await _fetch_row(engine, "r1") == ("claimed", 1, "c1")
+    assert [row["attempts"] for row in again] == [1]
+    assert await _fetch_row(engine, "r1") == ("claimed", 1, "c2")
+
+
+async def test_reclaim_of_a_never_started_row_keeps_its_retry_budget(engine: Any) -> None:
+    """A row claimed in a batch whose listener never started — only the
+    consumer's heartbeat renewed it — did not fail a delivery, so a reclaim
+    must not charge it an attempt."""
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="q1", status="pending")
+    await broker.claim_batch("g", batch_size=10, consumer_name="c0")
+    assert await broker.renew_claims(["q1"], consumer_name="c0") == 1
+
+    reclaimed = await broker.claim_batch(
+        "g", batch_size=10, consumer_name="c1", reclaim_stale_seconds=0.0, max_attempts=1
+    )
+
+    assert [(row["id"], row["attempts"]) for row in reclaimed] == [("q1", 0)]
+    assert await _fetch_row(engine, "q1") == ("claimed", 0, "c1")
+
+
+async def test_failure_after_a_started_dispatch_counts_once(engine: Any) -> None:
+    """``fail()`` owns the charge for a dispatch that reported its failure:
+    the started mark must not add a second attempt at the next claim."""
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="x1", status="pending")
+    await broker.claim_batch("g", batch_size=10, consumer_name="c0")
+    await broker.renew_claims(["x1"], consumer_name="c0", start_dispatch=True)
+    await broker.fail("x1", "boom", consumer_name="c0", max_attempts=5)
+    assert await _fetch_row(engine, "x1") == ("pending", 1, None)
+
+    from sqlalchemy import update
+
+    _, _, message = broker_schema()
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(message)
+            .where(message.c.id == "x1")
+            .values(available_at=datetime.now(UTC) - timedelta(seconds=1))
+        )
+    rows = await broker.claim_batch("g", batch_size=10, consumer_name="c1")
+    reclaimed = await broker.claim_batch(
+        "g", batch_size=10, consumer_name="c2", reclaim_stale_seconds=0.0
+    )
+
+    assert [row["attempts"] for row in rows] == [1]
+    assert [row["attempts"] for row in reclaimed] == [1]
+    assert await _fetch_row(engine, "x1") == ("claimed", 1, "c2")
 
 
 async def test_fresh_claim_does_not_count_as_a_delivery_attempt(engine: Any) -> None:
@@ -1285,7 +1342,9 @@ async def test_reclaim_dead_letters_the_row_that_burned_its_last_attempt(engine:
     ever calls ``fail()`` to apply the cap for it."""
     broker = DatabaseBroker(engine=engine)
     await broker._ensure_schema()
-    await _insert_ex(engine, id="p1", status="claimed", attempts=4, claimed_by="c0")
+    await _insert_ex(
+        engine, id="p1", status="claimed", attempts=4, claimed_by="c0", dispatch_started=True
+    )
     await _insert_ex(engine, id="ok", status="pending")
 
     rows = await broker.claim_batch(
@@ -1294,6 +1353,112 @@ async def test_reclaim_dead_letters_the_row_that_burned_its_last_attempt(engine:
 
     assert [row["id"] for row in rows] == ["ok"]
     assert await _fetch_row(engine, "p1") == ("dead", 5, None)
+
+
+async def test_wedging_row_does_not_dead_letter_the_rows_claimed_behind_it(
+    engine: Any,
+) -> None:
+    """A consumer restarted repeatedly while one listener wedges must spend
+    attempts only on that row. The rows queued behind it in the same batch
+    never reached their listener, so they must be delivered, not
+    dead-lettered alongside it."""
+    max_attempts = 3
+    wedged = asyncio.Event()
+    delivered: list[str] = []
+
+    async def handler(evt: WidgetCreated) -> None:
+        if evt.name == "poison":
+            wedged.set()
+            await asyncio.Event().wait()
+        delivered.append(evt.name)
+
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+    broker = DatabaseBroker(engine=engine)
+    target = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    await broker.subscribe([target], "modulith-inventory")
+    await broker.publish(
+        target, serializer.serialize(WidgetCreated(name="poison")), {"event_type": target}
+    )
+    (poison_id,) = await _all_ids(engine)
+    benign = [f"b{index}" for index in range(4)]
+    for name in benign:
+        await asyncio.sleep(0.01)
+        await broker.publish(
+            target, serializer.serialize(WidgetCreated(name=name)), {"event_type": target}
+        )
+
+    def incarnation() -> DatabaseConsumer:
+        return DatabaseConsumer(
+            broker=broker,
+            bus=bus,
+            serializer=serializer,
+            consumer_name="inventory:1",
+            group="modulith-inventory",
+            targets=[target],
+            poll_interval_s=0.01,
+            batch_size=10,
+            dispatch_concurrency=1,
+            max_attempts=max_attempts,
+            reclaim_stale_seconds=0.1,
+        )
+
+    for _ in range(max_attempts):
+        wedged.clear()
+        consumer = incarnation()
+        await consumer.start()
+        try:
+            await asyncio.wait_for(wedged.wait(), timeout=5.0)
+        finally:
+            await consumer.stop()
+        await asyncio.sleep(0.15)
+
+    consumer = incarnation()
+    await consumer.start()
+    try:
+        await _until_async(lambda: _only_dead_row_left(engine))
+    except AssertionError:
+        pass
+    finally:
+        await consumer.stop()
+
+    assert sorted(delivered) == benign
+    assert await _fetch_statuses(engine) == ["dead"]
+    assert await _fetch_row(engine, poison_id) == ("dead", max_attempts, None)
+
+
+async def test_bootstrap_adds_dispatch_started_to_an_older_message_table(engine: Any) -> None:
+    """A database the broker bootstrapped before ``dispatch_started`` existed
+    keeps its ``broker_message`` table, which ``create_all`` never alters;
+    the next bootstrap must add the column, or every claim fails."""
+    from sqlalchemy import text
+
+    await DatabaseBroker(engine=engine)._ensure_schema()
+    async with engine.begin() as conn:
+        await conn.execute(text("ALTER TABLE broker_message DROP COLUMN dispatch_started"))
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO broker_message (id, target, consumer_group, event_type, "
+                "payload, status, attempts, available_at, created_at) VALUES "
+                "('old', 'A', 'g', 'e', x'7b7d', 'pending', 0, :now, :now)"
+            ),
+            {"now": datetime.now(UTC) - timedelta(seconds=1)},
+        )
+
+    broker = DatabaseBroker(engine=engine)
+    rows = await broker.claim_batch("g", batch_size=10, consumer_name="c1")
+    assert [row["id"] for row in rows] == ["old"]
+    assert await broker.renew_claims(["old"], consumer_name="c1", start_dispatch=True) == 1
+    reclaimed = await broker.claim_batch(
+        "g", batch_size=10, consumer_name="c2", reclaim_stale_seconds=0.0
+    )
+    assert [row["attempts"] for row in reclaimed] == [1]
+
+
+async def _only_dead_row_left(engine: Any) -> bool:
+    return await _fetch_statuses(engine) == ["dead"]
 
 
 # ---------------------------------------------------------------------------
