@@ -978,9 +978,11 @@ def _cookie_setting_backend(token: str, seen: list[tuple[str, str | None]]) -> F
         return {"ok": True}
 
     @up.get("/health")
-    async def health(request: Request) -> dict[str, str]:
+    async def health(request: Request) -> Any:
         seen.append(("/health", request.headers.get("cookie")))
-        return {"status": "ok", "module": "orders", "deployment": token}
+        resp = JSONResponse({"status": "ok", "module": "orders", "deployment": token})
+        resp.set_cookie("probe", "PROBE_COOKIE", path="/")
+        return resp
 
     return up
 
