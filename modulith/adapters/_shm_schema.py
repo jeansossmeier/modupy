@@ -130,7 +130,7 @@ def _configure_max_page_count(conn: sqlite3.Connection, max_store_bytes: int) ->
     if page_size <= 0:
         raise ConfigurationError(f"SQLite reported invalid page_size={page_size}")
 
-    # Floor division keeps the configured byte count a hard upper bound. One
+    # Floor division keeps the page cap within the configured byte count. One
     # page is the smallest limit SQLite accepts; existing pages are retained.
     configured_pages = max(1, max_store_bytes // page_size)
     target_pages = max(current_pages, configured_pages)
