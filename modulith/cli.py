@@ -1105,7 +1105,11 @@ def extract(
 
 @app.command()
 def audit(
-    path: Path = typer.Argument(Path("."), help="Codebase root to analyze"),
+    path: Path | None = typer.Argument(
+        None,
+        help="Directory whose subdirectories are the module candidates "
+        "(default: the application package under the current directory)",
+    ),
     output: Path = typer.Option(Path("MIGRATION.md")),
 ) -> None:
     """Analyze an existing codebase for modulith readiness.
@@ -1117,8 +1121,11 @@ def audit(
     """
     from .audit import audit_codebase, find_audit_root, render_report, single_module_warning
 
-    if not path.exists():
+    if path is not None and not path.exists():
         typer.echo(f"path does not exist: {path}", err=True)
+        raise typer.Exit(code=1)
+    if path is not None and not path.is_dir():
+        typer.echo(f"not a directory: {path} (pass the directory to audit)", err=True)
         raise typer.Exit(code=1)
 
     try:
@@ -1127,7 +1134,8 @@ def audit(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from None
 
-    result = audit_codebase(find_audit_root(path), contracts_module=cfg.contracts_module)
+    root = find_audit_root(Path(".")) if path is None else path
+    result = audit_codebase(root, contracts_module=cfg.contracts_module)
     try:
         output.write_text(render_report(result), encoding="utf-8")
     except OSError as exc:
@@ -1148,7 +1156,7 @@ def audit(
     if result.score_applicable:
         typer.echo(f"readiness score: {result.readiness_score}/100")
     else:
-        typer.echo("readiness score: n/a (fewer than two module candidates)")
+        typer.echo("readiness score: n/a (no module boundaries to score; see the warning)")
     typer.echo(
         f"{len(result.cross_module_imports)} cross-module import pattern(s), "
         f"{len(result.shared_tables)} shared table(s)"

@@ -125,52 +125,103 @@ class AuditResult:
     # candidates.
     audited_root: Path | None = None
 
+    # Packages below the audited root that imports name but that are not
+    # module candidates (``shopkit`` when auditing above ``src/shopkit``).
+    # Those imports cannot be attributed to a candidate and are dropped.
+    unresolved_packages: list[str] = field(default_factory=list)
+
     @property
     def score_applicable(self) -> bool:
         """Whether ``readiness_score`` measures anything.
 
         With fewer than two module candidates every import stays inside one
         module, so the formula's 100 reflects the layout, not the coupling.
+        When no import crosses candidates but some name a package below the
+        root that is not a candidate, the audit ran above the application
+        and the 100 counts only the imports it could not see.
         """
-        return len(self.proposed_modules) > 1
+        if len(self._module_candidates) < 2:
+            return False
+        return bool(self.cross_module_imports) or not self.unresolved_packages
+
+    @property
+    def _module_candidates(self) -> list[str]:
+        """Proposed modules that can hold a boundary.
+
+        Leaves out a root package holding only its ``__init__.py`` and a
+        directory of loose scripts (no ``__init__.py``, no subdirectories
+        with Python), such as ``tools/`` beside the application package.
+        """
+        root = self.audited_root
+        if root is None:
+            return sorted(self.proposed_modules)
+        return sorted(
+            module
+            for module, files in self.proposed_modules.items()
+            if not (
+                module == root.name
+                and all(f.parent == root and f.name == "__init__.py" for f in files)
+            )
+            and not all(f.parent == root / module and f.name != "__init__.py" for f in files)
+        )
 
 
 def find_audit_root(path: Path) -> Path:
     """The directory whose subdirectories should be the module candidates.
 
-    ``path`` itself when it is a package or holds several application
-    directories. A project root whose only application directory is one
-    package, or ``src/`` holding one package, resolves to that package, so a
-    bare ``modulith audit`` at the project root does not propose the whole
-    application as a single module. Tests, docs, scripts, examples,
-    migrations, virtualenvs, hidden and build directories are ignored when
-    deciding; files directly under the project root (``manage.py``) are not
-    audited once it descends.
+    Used for a bare ``modulith audit`` at a project root. ``path`` itself
+    when it is a package. Otherwise ``src/`` holding one package resolves to
+    that package, then a single top-level package among the application
+    directories, then a lone application directory, so the whole application
+    is not proposed as one module and loose-script directories (``tools/``,
+    ``bin/``) beside the package do not keep the project root. Tests, docs,
+    scripts, examples, migrations, virtualenvs, hidden, build and unreadable
+    directories are ignored when deciding; files directly under the project
+    root (``manage.py``) are not audited once it descends.
     """
     root = path.resolve()
     if (root / "__init__.py").exists():
         return root
     candidates = _application_dirs(root)
-    if len(candidates) != 1:
-        return root
-    only = candidates[0]
-    if only.name == "src" and not (only / "__init__.py").exists():
-        inner = _application_dirs(only)
-        return inner[0] if len(inner) == 1 else only
-    return only
+    src = root / "src"
+    if src in candidates and not (src / "__init__.py").exists():
+        inner = _application_dirs(src)
+        if len(inner) == 1:
+            return inner[0]
+        if len(candidates) == 1:
+            return src
+    packages = [child for child in candidates if (child / "__init__.py").exists()]
+    if len(packages) == 1:
+        return packages[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    applications = [child for child in candidates if not _is_script_dir(child)]
+    return applications[0] if len(applications) == 1 else root
+
+
+def _is_script_dir(directory: Path) -> bool:
+    """No ``__init__.py`` and every ``.py`` file directly inside: loose scripts."""
+    return all(f.parent == directory and f.name != "__init__.py" for f in _iter_py_files(directory))
 
 
 def _application_dirs(root: Path) -> list[Path]:
-    return [
-        child
-        for child in sorted(root.iterdir())
-        if child.is_dir()
-        and not child.name.startswith(".")
-        and child.name not in _NON_APPLICATION_DIRS
-        and not child.name.endswith(".egg-info")
-        and not (child / "pyvenv.cfg").exists()
-        and _iter_py_files(child)
-    ]
+    return [child for child in sorted(root.iterdir()) if _is_application_dir(child)]
+
+
+def _is_application_dir(child: Path) -> bool:
+    try:
+        return (
+            child.is_dir()
+            and not child.name.startswith(".")
+            and child.name not in _NON_APPLICATION_DIRS
+            and not child.name.endswith(".egg-info")
+            and not (child / "pyvenv.cfg").exists()
+            and bool(_iter_py_files(child))
+        )
+    except OSError:
+        # A directory the user cannot search (a bind-mounted ``pgdata/``)
+        # holds nothing the audit could read anyway.
+        return False
 
 
 def audit_codebase(root: Path, contracts_module: str = CONTRACTS_MODULE) -> AuditResult:
@@ -204,7 +255,9 @@ def audit_codebase(root: Path, contracts_module: str = CONTRACTS_MODULE) -> Audi
     shared = _find_shared_tables(root, parsed, contracts_module)
     listeners = _find_listener_candidates(parsed)
     score = _compute_readiness_score(cross, listeners)
+    unresolved = _find_unresolved_packages(root, parsed, set(proposed))
     return AuditResult(
+        unresolved_packages=unresolved,
         readiness_score=score,
         proposed_modules=proposed,
         cross_module_imports=cross,
@@ -307,6 +360,28 @@ def _target_module(
             return None
         candidate = parts[0]
     return candidate if candidate in module_names else None
+
+
+def _find_unresolved_packages(root: Path, files: list[Path], module_names: set[str]) -> list[str]:
+    """Directories below a non-package ``root`` that absolute imports name
+    but that are not module candidates, so ``_target_module`` drops them."""
+    if (root / "__init__.py").exists():
+        return []
+    nested = {part for path in files for part in path.relative_to(root).parts[:-1]}
+    nested -= module_names
+    found: set[str] = set()
+    for path in files:
+        tree = _parse(path)
+        if tree is None:
+            continue
+        collector = _ImportCollector(path, _file_package(root, root.name, path))
+        collector.visit(tree)
+        found.update(
+            head
+            for record in collector.records
+            if (head := record.target_module.split(".")[0]) in nested
+        )
+    return sorted(found)
 
 
 def _find_cross_module_imports(
@@ -451,17 +526,25 @@ def _compute_readiness_score(
 def render_report(result: AuditResult) -> str:
     """Render an AuditResult as Markdown.
 
-    Pure function of its input (no timestamps) so output is reproducible and
-    easy to diff between runs — a team can commit the report and watch the
-    readiness score climb.
+    Pure function of its input (no timestamps, and file paths relative to the
+    audited root) so output is reproducible and easy to diff between runs and
+    machines — a team can commit the report and watch the readiness score
+    climb.
     """
+    root = result.audited_root
+
+    def shown(path: Path) -> str:
+        if root is not None and path.is_relative_to(root):
+            return path.relative_to(root).as_posix()
+        return str(path)
+
     lines: list[str] = ["# Modulith Audit Report", ""]
 
     # Summary
     score = f"{result.readiness_score}/100" if result.score_applicable else "not applicable"
     lines += ["## Summary", ""]
-    if result.audited_root is not None:
-        lines += [f"Audited root: `{result.audited_root}`", ""]
+    if root is not None:
+        lines += [f"Audited root: `{root.name}`", ""]
     lines += [f"**Readiness score: {score}**", ""]
     if result.files_scanned == 0:
         lines += [
@@ -500,7 +583,7 @@ def render_report(result: AuditResult) -> str:
             "for full coverage):",
             "",
         ]
-        lines += [f"  - `{path}`" for path in result.parse_failures]
+        lines += [f"  - `{shown(path)}`" for path in result.parse_failures]
         lines.append("")
 
     # Proposed module structure
@@ -518,7 +601,7 @@ def render_report(result: AuditResult) -> str:
     if result.cross_module_imports:
         lines += ["| From | To | Count | Sample |", "| --- | --- | --- | --- |"]
         for src, tgt, count, sample in result.cross_module_imports:
-            lines.append(f"| `{src}` | `{tgt}` | {count} | `{sample}` |")
+            lines.append(f"| `{src}` | `{tgt}` | {count} | `{shown(sample)}` |")
     else:
         lines.append("None — no cross-module imports detected.")
     lines.append("")
@@ -534,7 +617,7 @@ def render_report(result: AuditResult) -> str:
     # Listener candidates
     lines += ["## Listener-Shaped Code (events conversion candidates)", ""]
     if result.listener_candidates:
-        lines += [f"- `{path}`" for path in result.listener_candidates]
+        lines += [f"- `{shown(path)}`" for path in result.listener_candidates]
     else:
         lines.append("None detected.")
     lines.append("")
@@ -556,10 +639,20 @@ def render_report(result: AuditResult) -> str:
 
 
 def single_module_warning(result: AuditResult) -> str | None:
-    """Why the score is withheld when the audit found one module candidate."""
-    if len(result.proposed_modules) != 1:
+    """Why the score is withheld: one module candidate, or imports that name
+    packages below the audited root instead of its module candidates."""
+    candidates = result._module_candidates
+    if len(candidates) > 1 and not result.score_applicable:
+        names = ", ".join(f"`{name}`" for name in result.unresolved_packages)
+        return (
+            f"imports name {names}, which sit below the audited directory but are not "
+            "module candidates, so no import between modules could be scored. Run "
+            "`modulith audit <dir>` on the directory whose subdirectories are your "
+            "intended modules."
+        )
+    if len(candidates) != 1:
         return None
-    (module,) = result.proposed_modules
+    (module,) = candidates
     return (
         f"only one module candidate (`{module}`) was found, so every import stays "
         "inside it and there are no boundaries to score. Run `modulith audit <dir>` "
