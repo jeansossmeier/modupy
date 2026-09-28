@@ -516,17 +516,26 @@ def _is_pg_namespace_unique_race(exc: BaseException) -> bool:
 
 
 def _skip_locked_server_version(dialect: Any) -> tuple[int, ...] | None:
-    """The connected MySQL-family server's version, ``None`` before connect.
+    """The connected MySQL-family server's version, ``None`` when unknown.
 
-    MariaDB can report through MySQL's ``5.5.5-`` compatibility prefix, which
-    SQLAlchemy keeps in ``server_version_info``; its own version is the last
-    three numbers.
+    SQLAlchemy's ``server_version_info`` keeps every number in ``VERSION()``:
+    MariaDB's ``5.5.5-`` compatibility prefix and distro package suffixes such
+    as ``-1:10.11.2+maria~ubu2204`` included. The dialect records the number
+    before the ``MariaDB`` token in ``_mariadb_normalized_version_info`` (the
+    whole tuple for MySQL). That field is private, so a dialect without it falls
+    back to the leading numbers, skipping a MariaDB ``5.5.5`` prefix.
     """
-    version = getattr(dialect, "server_version_info", None)
-    if version is None:
-        return None
-    numbers = tuple(part for part in version if isinstance(part, int))
-    return numbers[-3:] if getattr(dialect, "is_mariadb", False) else numbers
+    if hasattr(dialect, "_mariadb_normalized_version_info"):
+        version = dialect._mariadb_normalized_version_info
+    else:
+        numbers = tuple(
+            part
+            for part in getattr(dialect, "server_version_info", None) or ()
+            if isinstance(part, int)
+        )
+        prefixed = getattr(dialect, "is_mariadb", False) and numbers[:3] == (5, 5, 5)
+        version = numbers[3:] if prefixed else numbers
+    return tuple(version[:3]) if version else None
 
 
 def _skip_locked_minimum(dialect: Any) -> tuple[int, ...]:

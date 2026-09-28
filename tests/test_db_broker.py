@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -64,6 +65,7 @@ from modulith.adapters.db_broker import (
     _make_db_consumer,
     _opt_float,
     _opt_int,
+    _require_skip_locked,
     _supports_skip_locked,
     broker_schema,
 )
@@ -2722,51 +2724,110 @@ def test_runtime_bootstrap_registers_db_consumer_factory(make_fake_app: Any) -> 
 # ---------------------------------------------------------------------------
 
 
-class _FakeDialect:
-    def __init__(
-        self,
-        name: str,
-        server_version_info: tuple[int, ...] | None = None,
-        is_mariadb: bool = False,
-    ) -> None:
-        self.name = name
-        self.server_version_info = server_version_info
-        self.is_mariadb = is_mariadb
+_MYSQL_URL = "mysql+aiomysql://user@localhost/db"
+_MARIADB_URL = "mariadb+aiomysql://user@localhost/db"
 
 
-class _FakeEngine:
-    def __init__(
-        self,
-        name: str,
-        server_version_info: tuple[int, ...] | None = None,
-        is_mariadb: bool = False,
-    ) -> None:
-        self.dialect = _FakeDialect(name, server_version_info, is_mariadb)
+def _engine_reporting(url: str, version: str) -> Any:
+    """An engine whose dialect has parsed ``version`` as it does on first connect."""
+    engine = create_async_engine(url)
+    dialect: Any = engine.dialect
+    dialect._parse_server_version(version)
+    return engine
+
+
+_SKIP_LOCKED_SERVERS = [
+    (_MYSQL_URL, "5.5.5-10.6.12-MariaDB"),
+    (_MYSQL_URL, "10.11.2-MariaDB-1:10.11.2+maria~ubu2204"),
+    (_MARIADB_URL, "10.11.2-MariaDB-1:10.11.2+maria~ubu2204"),
+    (_MYSQL_URL, "10.6.12-MariaDB-0ubuntu0.22.04.1"),
+    (_MARIADB_URL, "11.4.2-MariaDB-ubu2404"),
+    (_MYSQL_URL, "8.0.34-0ubuntu0.22.04.1"),
+    (_MYSQL_URL, "8.0.mysql_aurora.3.04.0"),
+]
+
+_MARIADB_TOO_OLD = "does not support; MariaDB 10.6 or newer"
+_MYSQL_TOO_OLD = "does not support; MySQL 8.0.1 or newer"
+_PRE_SKIP_LOCKED_SERVERS = [
+    (_MYSQL_URL, "10.5.23-MariaDB-1:10.5.23+maria~ubu2004", "MariaDB server 10.5.23"),
+    (_MARIADB_URL, "10.5.23-MariaDB-1:10.5.23+maria~ubu2004", "MariaDB server 10.5.23"),
+    (_MYSQL_URL, "10.3.39-MariaDB-0+deb10u1", "MariaDB server 10.3.39"),
+    (_MYSQL_URL, "5.7.44-log", "MySQL server 5.7.44"),
+    (_MYSQL_URL, "5.7.42-0ubuntu0.18.04.1", "MySQL server 5.7.42"),
+]
+
+
+def _expected_refusal(server: str) -> str:
+    too_old = _MARIADB_TOO_OLD if server.startswith("MariaDB") else _MYSQL_TOO_OLD
+    return f"{server} {too_old}"
+
+
+@pytest.mark.parametrize(("url", "version"), _SKIP_LOCKED_SERVERS)
+def test_skip_locked_gate_accepts_servers_that_support_the_clause(url: str, version: str) -> None:
+    engine = _engine_reporting(url, version)
+
+    assert _supports_skip_locked(engine) is True
+    _require_skip_locked(engine)
+
+
+@pytest.mark.parametrize(
+    ("url", "version", "server"),
+    [
+        *_PRE_SKIP_LOCKED_SERVERS,
+        # No version precedes the MariaDB token, so the server's version is unreadable.
+        (_MYSQL_URL, "MariaDB-10.6.12", "MariaDB server unknown"),
+    ],
+)
+def test_skip_locked_gate_refuses_servers_older_than_the_clause(
+    url: str, version: str, server: str
+) -> None:
+    from modulith import ConfigurationError
+
+    engine = _engine_reporting(url, version)
+
+    assert _supports_skip_locked(engine) is False
+    with pytest.raises(ConfigurationError, match=re.escape(_expected_refusal(server))):
+        _require_skip_locked(engine)
+
+
+@pytest.mark.parametrize(
+    ("url", "version", "server"),
+    [*((url, version, None) for url, version in _SKIP_LOCKED_SERVERS), *_PRE_SKIP_LOCKED_SERVERS],
+)
+def test_skip_locked_gate_reads_the_version_without_sqlalchemys_mariadb_field(
+    monkeypatch: pytest.MonkeyPatch, url: str, version: str, server: str | None
+) -> None:
+    from sqlalchemy.dialects.mysql.base import MySQLDialect
+
+    from modulith import ConfigurationError
+
+    engine = _engine_reporting(url, version)
+    monkeypatch.delattr(MySQLDialect, "_mariadb_normalized_version_info")
+    del engine.dialect._mariadb_normalized_version_info
+    assert not hasattr(engine.dialect, "_mariadb_normalized_version_info")
+
+    if server is None:
+        assert _supports_skip_locked(engine) is True
+        _require_skip_locked(engine)
+    else:
+        assert _supports_skip_locked(engine) is False
+        with pytest.raises(ConfigurationError, match=re.escape(_expected_refusal(server))):
+            _require_skip_locked(engine)
+
+
+def test_skip_locked_gate_refuses_a_mysql_server_whose_version_is_not_yet_known() -> None:
+    from modulith import ConfigurationError
+
+    engine = create_async_engine(_MYSQL_URL)
+
+    assert _supports_skip_locked(engine) is False
+    with pytest.raises(ConfigurationError, match="MySQL server unknown does not support"):
+        _require_skip_locked(engine)
 
 
 def test_skip_locked_gate_selects_lockable_dialects_only() -> None:
-    assert _supports_skip_locked(_FakeEngine("postgresql")) is True
-    assert _supports_skip_locked(_FakeEngine("mysql", (8, 0, 1))) is True
-    assert _supports_skip_locked(_FakeEngine("mysql", (8, 4, 3))) is True
-    assert _supports_skip_locked(_FakeEngine("mysql", (10, 6, 0), is_mariadb=True)) is True
-    assert _supports_skip_locked(_FakeEngine("mariadb", (11, 4, 2), is_mariadb=True)) is True
-    # A MariaDB server reporting through the MySQL "5.5.5-" compatibility prefix.
-    assert (
-        _supports_skip_locked(_FakeEngine("mysql", (5, 5, 5, 10, 11, 8), is_mariadb=True)) is True
-    )
-    assert _supports_skip_locked(_FakeEngine("sqlite")) is False
-
-
-def test_skip_locked_gate_rejects_servers_older_than_the_clause() -> None:
-    assert _supports_skip_locked(_FakeEngine("mysql", (8, 0, 0))) is False
-    assert _supports_skip_locked(_FakeEngine("mysql", (5, 7, 44))) is False
-    assert _supports_skip_locked(_FakeEngine("mysql", (10, 5, 29), is_mariadb=True)) is False
-    assert _supports_skip_locked(_FakeEngine("mariadb", (10, 3, 39), is_mariadb=True)) is False
-    assert (
-        _supports_skip_locked(_FakeEngine("mysql", (5, 5, 5, 10, 5, 29), is_mariadb=True)) is False
-    )
-    # An unknown version never assumes the clause parses.
-    assert _supports_skip_locked(_FakeEngine("mysql")) is False
+    assert _supports_skip_locked(create_async_engine("postgresql+asyncpg://u@localhost/db"))
+    assert not _supports_skip_locked(create_async_engine("sqlite+aiosqlite://"))
 
 
 # ---------------------------------------------------------------------------

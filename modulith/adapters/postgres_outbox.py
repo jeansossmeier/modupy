@@ -454,11 +454,14 @@ class PostgresPublicationStore:
     def _check_cross_loop_usage(self) -> None:
         """Warn once when this store's engine is used from a second loop.
 
-        Behaviour is unchanged either way: SQLAlchemy's ``AsyncAdaptedQueue``
-        binds to whichever loop first blocks on it, so under pool exhaustion a
-        later loop raises ``RuntimeError: <Queue ...> is bound to a different
-        event loop`` from deep inside SQLAlchemy. This surfaces the hazard
-        early instead of leaving it to that opaque failure.
+        Behaviour is unchanged either way. asyncpg and aiomysql connections
+        only work on the loop that opened them, so a pooled connection checked
+        out by another loop fails its first query with ``RuntimeError: ...
+        attached to a different loop``, idle pool or not. On SQLite the
+        ``AsyncAdaptedQueue`` binds to whichever loop first blocks on it, and a
+        later loop waiting for the connection raises ``RuntimeError: <Queue
+        ...> is bound to a different event loop``. This surfaces the hazard
+        early instead of leaving it to those opaque failures.
         """
         loop = asyncio.get_running_loop()
         if self._used_loop_ref is None:
@@ -472,9 +475,10 @@ class PostgresPublicationStore:
                 "PostgresPublicationStore engine first used on one event loop is "
                 "now used from another. Unlike the database broker, the store "
                 "does not hand calls to the loop that owns its engine: pooled "
-                "connections stay bound to the loop that opened them, and once "
-                "the pool is exhausted SQLAlchemy raises 'Queue is bound to a "
-                "different event loop'. Keep every publish and dispatch for one "
+                "connections only work on the loop that opened them, so the "
+                "next query on another loop's connection raises 'attached to a "
+                "different loop' (or, on SQLite, 'Queue is bound to a different "
+                "event loop'). Keep every publish and dispatch for one "
                 "store on one loop (await publish() rather than publish_sync())."
             )
             self._cross_loop_warned = True
