@@ -361,6 +361,101 @@ def test_isolated_child_that_runs_no_test_fails_the_parent(pytester) -> None:
     )
 
 
+def test_isolated_child_that_exits_0_before_finishing_the_test_fails_the_parent(
+    pytester,
+) -> None:
+    """A body that ends the child with exit 0 (``os._exit(0)`` in a worker
+    entrypoint, ``pytest.exit(returncode=0)``) leaves only the setup record
+    behind. The body never finished, so the parent must not report a pass;
+    a setup-phase skip or xfail still leaves no call record and keeps its
+    outcome."""
+    pytester.makepyfile(
+        test_early_exit="""
+        import os
+        import pytest
+
+        @pytest.mark.modulith_isolated
+        def test_os_exit():
+            os._exit(0)
+
+        @pytest.mark.modulith_isolated
+        def test_pytest_exit():
+            pytest.exit("stop here", returncode=0)
+
+        @pytest.mark.modulith_isolated
+        @pytest.mark.skip(reason="declared skip")
+        def test_setup_skip():
+            raise AssertionError("body must not run")
+
+        @pytest.mark.modulith_isolated
+        @pytest.mark.xfail(run=False, reason="never run")
+        def test_setup_xfail():
+            raise AssertionError("body must not run")
+        """
+    )
+
+    result = pytester.runpytest("-rsx")
+
+    result.assert_outcomes(failed=2, skipped=1, xfailed=1)
+    result.stdout.fnmatch_lines_random(
+        [
+            "*isolated subprocess for test_early_exit.py::test_os_exit exited 0 "
+            "before the test finished*",
+            "*isolated subprocess for test_early_exit.py::test_pytest_exit exited 0 "
+            "before the test finished*",
+            "SKIPPED*test_early_exit.py:*: declared skip",
+            "XFAIL*test_setup_xfail*never run",
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("ini_addopts", "cli_args", "autoload_env"),
+    [
+        pytest.param("-p modulith.testing", [], True, id="ini-module-path"),
+        pytest.param("-p modulith", [], True, id="ini-entry-point-name"),
+        pytest.param("", ["-p", "modulith.testing"], True, id="cli-module-path"),
+        pytest.param(
+            "--disable-plugin-autoload -p modulith.testing", [], False, id="ini-autoload-flag"
+        ),
+    ],
+)
+def test_isolated_tests_run_when_the_plugin_is_loaded_explicitly(
+    pytester, monkeypatch, ini_addopts: str, cli_args: list[str], autoload_env: bool
+) -> None:
+    """A project that disables plugin autoload loads this plugin with ``-p``.
+    The child clears ini ``addopts``, so it must still receive the plugin (and
+    not a second copy under another name); otherwise it never records an
+    outcome and every isolated test fails."""
+    from pathlib import Path
+
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1]))
+    if autoload_env:
+        monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    else:
+        monkeypatch.delenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", raising=False)
+    pytester.makeini(f"[pytest]\naddopts = {ini_addopts}\n")
+    pytester.makepyfile(
+        test_explicit="""
+        import os
+        import pytest
+
+        @pytest.mark.modulith_isolated
+        def test_runs_isolated():
+            assert os.environ.get("MODULITH_ISOLATED_SUBPROCESS") == "1"
+
+        @pytest.mark.modulith_isolated
+        def test_skips_isolated():
+            pytest.skip("child outcome")
+        """
+    )
+
+    result = pytester.runpytest(*cli_args, "-rs")
+
+    result.assert_outcomes(passed=1, skipped=1)
+    result.stdout.fnmatch_lines(["SKIPPED*test_explicit.py:*: child outcome"])
+
+
 def test_isolated_outcomes_survive_a_user_junitxml(pytester) -> None:
     """The parent's --junitxml is forwarded to the child, so the child's
     outcome must travel on a channel of its own; the user's report must still
