@@ -323,7 +323,9 @@ pyproject-only, though the SHM and database brokers lift their own
 
 Under `topology = "processes"` an omitted broker defaults to `shm`: despite
 the name, a same-host durable SQLite queue with at-least-once delivery, so
-listeners must be idempotent. Use `redis-streams` or `database` (Postgres /
+listeners must be idempotent. Its default store location is keyed on the
+package's install path, so production deploys must set `state_dir` (see
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)). Use `redis-streams` or `database` (Postgres /
 MySQL) for cross-host delivery. Every option — outbox claim strategies, SHM
 sizing and payload caps, database-broker polling, retention and
 dead-lettering, actuator protection — is documented in
