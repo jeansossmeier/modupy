@@ -17,18 +17,22 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import sys
+from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
 import modulith._worker as worker_module
-from modulith import ConfigurationError, Consumer, ConsumerSpec, configure
+from modulith import ConfigurationError, Consumer, ConsumerSpec, EventPublication, configure
 from modulith._worker import _build_consumer, create_app
 from modulith.adapters.shm_broker import ShmBroker, ShmConsumer
+from modulith.builtin import outbox
 from modulith.config import DEFAULT_MAX_PAYLOAD_BYTES
 from modulith.protocols import ConsumerHealth, ConsumerStatus
 from modulith.runtime import _runtime
+from modulith.serializers import JsonEventSerializer
 
 
 class _NoopBroker:
@@ -430,6 +434,50 @@ def test_listener_outside_module_packages_still_runs_in_importing_worker(
     asyncio.run(_runtime.dispatch_local(contracts.Audited("a1"), _runtime.event_bus))
 
     assert sorted(contracts.RUNS) == ["plugin", "shared.audit"]
+
+
+class _SessionScopedStore:
+    def __init__(self) -> None:
+        self.rows: dict[Any, EventPublication] = {}
+
+    async def save(self, publication: EventPublication) -> None:
+        self.rows[publication.id] = publication
+
+    async def mark_complete(self, publication_id: Any) -> None:
+        self.rows.pop(publication_id, None)
+
+
+def test_transactional_publish_in_worker_skips_sibling_listeners(
+    make_fake_app, monkeypatch
+) -> None:
+    contracts, _ = _sibling_importing_worker(make_fake_app, monkeypatch)
+    store = _SessionScopedStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)  # type: ignore[arg-type]
+    orders_on_note = sys.modules["fakeapp.orders"].on_note
+    persisted: list[str | None] = []
+
+    async def scenario() -> None:
+        token = outbox._current_session.set(object())
+        try:
+            await _runtime.publish(contracts.NoteSent("n1"))
+        finally:
+            outbox._current_session.reset(token)
+        persisted.extend(row.listener for row in store.rows.values())
+        sibling_row = EventPublication(
+            id=uuid4(),
+            payload=JsonEventSerializer().serialize(contracts.NoteSent("n2")),
+            event_type="fakeapp.contracts.NoteSent",
+            listener=outbox._listener_id(orders_on_note),
+            published_at=datetime.now(UTC),
+        )
+        await outbox._dispatch_publication(sibling_row)
+
+    asyncio.run(scenario())
+
+    assert (persisted, contracts.RUNS) == (
+        ["__modulith.broker_route__:test-noop-broker:fakeapp.contracts.NoteSent"],
+        [],
+    )
 
 
 # ---------------------------------------------------------------------------

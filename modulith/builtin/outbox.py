@@ -405,7 +405,7 @@ async def persist(event: Any) -> list[EventPublication]:
     bus = _rt._runtime.event_bus
     if bus is None:
         return []
-    handlers = bus.listeners_for(type(event))
+    handlers = _rt._runtime.local_listeners(bus.listeners_for(type(event)))
     if not handlers:
         return []
 
@@ -476,7 +476,7 @@ def _resolve_listener(publication: EventPublication, event: Any) -> Any:
 
     bus = _rt._runtime.event_bus
     assert bus is not None
-    for handler in bus.listeners_for(type(event)):
+    for handler in _rt._runtime.local_listeners(bus.listeners_for(type(event))):
         if _listener_id(handler) == publication.listener:
             return handler
     return None
@@ -598,7 +598,7 @@ async def _dispatch_publication(publication: EventPublication) -> None:
         # something left to the caller's serializer configuration.
         bus = _rt._runtime.event_bus
         registered_type_names = (
-            {_event_type_name(t) for t in bus.registered_event_types()}
+            {_event_type_name(t) for t in _rt._runtime.local_event_types(bus)}
             if bus is not None
             else set()
         )

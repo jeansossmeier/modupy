@@ -9,10 +9,15 @@ Invoked as:
 
 with MODULITH_MODULE / MODULITH_APP_PACKAGE in the worker's environment.
 
-Critical correctness: the worker imports ONLY the configured module
-(plus the contracts module). Other modules are NOT imported. This is
-what gives each worker its own GIL — it has its own process, its own
-import graph, its own event loop, its own memory.
+Critical correctness: the worker imports the configured module (plus the
+contracts module) and never walks the other modules. This is what gives each
+worker its own GIL — it has its own process, its own import graph, its own
+event loop, its own memory. A sibling module the configured module imports
+through its public API is imported too, but the listeners registered while
+importing it are ignored here (``Runtime.host_module``): the worker subscribes
+to, dispatches and persists outbox records only for its own module's
+listeners and for listeners registered outside any module import, such as
+plugins'. Each sibling listener runs in its owner's worker.
 
 Cross-module events flow through the broker, not in-memory dispatch. This
 factory wires BOTH halves: the runtime routes cross-module *publishes* to the
@@ -52,7 +57,9 @@ def create_app() -> FastAPI:
 
     Configures modulith with ``auto_discover=False`` so bootstrap imports no
     modules, then selectively imports the contracts module (shared event types,
-    if present) and this worker's module. Mounts the module's ``router`` under
+    if present) and this worker's module. Siblings that module imports may be
+    imported with it, but their listeners are ignored in this worker. Mounts
+    the module's ``router`` under
     ``/<module>`` and adds a ``/health`` endpoint; a module that exposes no
     ``router`` still starts (listener-only workers are legitimate) but says so
     at WARNING, because otherwise its 404s have no explanation anywhere.
