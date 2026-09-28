@@ -155,6 +155,27 @@ def _listener_id(handler: Any) -> str:
     return f"{module}.{qualname}" if module else qualname
 
 
+def _require_distinct_listener_ids(event_type: type, handlers: list[Any]) -> None:
+    """Refuse to persist rows under a listener id two handlers share.
+
+    ``_resolve_listener`` hands every row stamped with that id to the first
+    matching handler, so the other would silently never run — two instances
+    of one callable class, or bound methods of two instances, collide this way.
+    """
+    seen: dict[str, Any] = {}
+    for handler in handlers:
+        target = getattr(handler, "__modulith_sync_wrapped__", handler)
+        listener_id = _listener_id(handler)
+        other = seen.setdefault(listener_id, target)
+        if other is not target:
+            raise ConfigurationError(
+                f"listeners {other!r} and {target!r} for {event_type.__qualname__} share "
+                f"the outbox listener id {listener_id!r}, so durable delivery cannot "
+                "tell them apart. Register each as a distinct class or module-level "
+                "function: the stored id is the handler's module-qualified name."
+            )
+
+
 # ---------------------------------------------------------------------------
 # Plugin initialization
 # ---------------------------------------------------------------------------
@@ -408,6 +429,7 @@ async def persist(event: Any) -> list[EventPublication]:
     handlers = bus.listeners_for(type(event))
     if not handlers:
         return []
+    _require_distinct_listener_ids(type(event), handlers)
 
     fqcn = f"{type(event).__module__}.{type(event).__qualname__}"
     payload = _serializer.serialize(event)

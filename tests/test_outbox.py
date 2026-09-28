@@ -32,8 +32,18 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
-from modulith import EventPublication, event
+from modulith import EventPublication, event, listener, publish
+from modulith.adapters.postgres_outbox import (
+    Base,
+    EventPublicationRow,
+    PostgresPublicationStore,
+    bind_session,
+    unbind_session,
+)
 from modulith.adapters.shm_broker import ShmBroker
 from modulith.builtin import outbox
 from modulith.config import ConfigurationError
@@ -2100,3 +2110,129 @@ async def test_retry_all_dead_lettered_resubmits_with_reset_state() -> None:
     assert count == 1
     assert received == [1]
     assert store.rows[dead.id].completed_at is not None
+
+
+# ---------------------------------------------------------------------------
+# Listener identity on the durable path: every stored row must name exactly
+# one listener, stably across restarts.
+# ---------------------------------------------------------------------------
+
+callable_log: list[str] = []
+
+
+class EmailSender:
+    async def __call__(self, evt: OutboxEvent) -> None:
+        callable_log.append(f"email {evt.value}")
+
+
+class SmsSender:
+    async def __call__(self, evt: OutboxEvent) -> None:
+        callable_log.append(f"sms {evt.value}")
+
+
+class Notifier:
+    async def __call__(self, evt: OutboxEvent) -> None:
+        callable_log.append(f"notifier {evt.value}")
+
+    async def handle(self, evt: OutboxEvent) -> None:
+        callable_log.append(f"handle {evt.value}")
+
+
+async def _sqlite_outbox(tmp_path: Path) -> tuple[Any, PostgresPublicationStore]:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'outbox.db'}", poolclass=NullPool
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    return engine, store
+
+
+async def _publish_in_session(engine: Any, evt: OutboxEvent) -> None:
+    async with async_sessionmaker(engine)() as session:
+        token = bind_session(session)
+        try:
+            await publish(evt)
+            await session.commit()
+        finally:
+            unbind_session(token)
+
+
+async def _stored_rows(engine: Any) -> list[tuple[str, bool]]:
+    async with async_sessionmaker(engine)() as session:
+        rows = (
+            await session.execute(
+                select(EventPublicationRow.listener, EventPublicationRow.completed_at)
+            )
+        ).all()
+    return sorted((row.listener, row.completed_at is not None) for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_durable_publish_delivers_each_callable_instance_listener_once(
+    tmp_path: Path,
+) -> None:
+    _runtime.configure(package="outboxtest", auto_discover=False)
+    _runtime.ensure_bootstrapped()
+    callable_log.clear()
+    listener(EmailSender())
+    listener(SmsSender())
+    engine, store = await _sqlite_outbox(tmp_path)
+    try:
+        await _publish_in_session(engine, OutboxEvent(value=1))
+        await store.wait_for_dispatch()
+
+        assert sorted(callable_log) == ["email 1", "sms 1"]
+        assert await _stored_rows(engine) == [
+            (f"{__name__}.EmailSender", True),
+            (f"{__name__}.SmsSender", True),
+        ]
+    finally:
+        await store.dispose()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound_methods", [False, True], ids=["instances", "bound-methods"])
+async def test_durable_publish_rejects_two_listeners_sharing_a_stored_id(
+    tmp_path: Path, bound_methods: bool
+) -> None:
+    _runtime.configure(package="outboxtest", auto_discover=False)
+    _runtime.ensure_bootstrapped()
+    callable_log.clear()
+    first, second = Notifier(), Notifier()
+    if bound_methods:
+        assert _runtime.event_bus is not None
+        _runtime.event_bus.register(OutboxEvent, first.handle)
+        _runtime.event_bus.register(OutboxEvent, second.handle)
+    else:
+        listener(first)
+        listener(second)
+    engine, store = await _sqlite_outbox(tmp_path)
+    try:
+        with pytest.raises(ConfigurationError) as excinfo:
+            await _publish_in_session(engine, OutboxEvent(value=1))
+
+        message = str(excinfo.value)
+        assert repr(first) in message
+        assert repr(second) in message
+        assert f"{__name__}.Notifier" in message
+        assert "distinct class or module-level function" in message
+        assert await _stored_rows(engine) == []
+        assert callable_log == []
+    finally:
+        await store.dispose()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_persist_accepts_one_listener_registered_twice() -> None:
+    outbox.configure(StubStore(), JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+    assert _runtime.event_bus is not None
+    _runtime.event_bus.register(OutboxEvent, record)
+
+    saved = await outbox.persist(OutboxEvent(value=1))
+
+    assert [pub.listener for pub in saved] == [f"{__name__}.record"] * 2

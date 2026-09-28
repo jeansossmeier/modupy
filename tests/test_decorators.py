@@ -22,7 +22,8 @@ from pathlib import Path
 
 import pytest
 
-from modulith import event, listener
+from modulith import event, listener, publish
+from modulith.builtin import outbox
 from modulith.manifest import Manifest, verify_manifest
 from modulith.runtime import _runtime
 
@@ -234,6 +235,63 @@ async def test_listener_accepts_async_callable_class_instance() -> None:
     await registered(event_instance)
 
     assert received == [event_instance]
+
+
+class AsyncEmailSender:
+    async def __call__(self, evt: E) -> None:
+        pass
+
+
+class AsyncSmsSender:
+    async def __call__(self, evt: E) -> None:
+        pass
+
+
+async def async_on_e(evt: E) -> None:
+    pass
+
+
+def sync_on_e(evt: E) -> None:
+    pass
+
+
+def test_listener_ids_name_the_class_of_a_callable_instance() -> None:
+    listener(AsyncEmailSender())
+    listener(AsyncSmsSender())
+
+    ids = [outbox._listener_id(handler) for _, handler in _runtime._pending_listeners]
+
+    assert ids == [f"{__name__}.AsyncEmailSender", f"{__name__}.AsyncSmsSender"]
+
+
+def test_listener_ids_of_plain_functions_are_module_qualified_names() -> None:
+    listener(async_on_e)
+    listener(sync_on_e)
+
+    ids = [outbox._listener_id(handler) for _, handler in _runtime._pending_listeners]
+
+    assert ids == [f"{__name__}.async_on_e", f"{__name__}.sync_on_e"]
+
+
+@pytest.mark.asyncio
+async def test_in_memory_publish_reaches_two_instances_of_one_class() -> None:
+    received: list[str] = []
+
+    class Named:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def __call__(self, evt: E) -> None:
+            received.append(self.name)
+
+    _runtime.configure(package="decoratortest", auto_discover=False)
+    _runtime.ensure_bootstrapped()
+    listener(Named("first"))
+    listener(Named("second"))
+
+    await publish(E())
+
+    assert sorted(received) == ["first", "second"]
 
 
 @pytest.mark.parametrize(
