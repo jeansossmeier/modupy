@@ -300,6 +300,7 @@ async def get_db():
         token = bind_session(session)
         try:
             yield session
+            await session.commit()  # commits publishes made after the route's own commit
         finally:
             unbind_session(token)
 ```
@@ -309,9 +310,20 @@ data: a rollback discards the event (no ghosts), a commit guarantees delivery
 (no losses), and listeners are retried at-least-once after commit. Because
 delivery is at-least-once, **listeners must be idempotent**.
 
+A publish joins whatever transaction the bound session has open, and only a
+later `commit()` delivers it. After the route calls `session.commit()`, the
+session stays bound until the dependency's teardown, and FastAPI runs
+`BackgroundTasks` *before* that teardown. A publish from a background task, or
+from route code after its commit, therefore joins a fresh transaction. The
+`commit()` after `yield` above commits it. It is skipped when the route raises,
+so a failed request still discards its events. Without that commit, closing the
+session discards those publications, and the adapter logs a WARNING naming
+their event types.
+
 A task started with `asyncio.create_task` inside the request inherits the
 binding only until `unbind_session`. Its publishes before then join the
-request's transaction. Its publishes after then are not transactional: they
+session's open transaction, under the same rule: they are delivered only if a
+later commit covers them. Its publishes after then are not transactional: they
 dispatch directly, with no outbox row, exactly like a publish outside any
 request. For a durable publish from such a task, open and bind a session in
 the task itself. Inspect the queue

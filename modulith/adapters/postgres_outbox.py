@@ -19,8 +19,10 @@ Critical correctness pattern:
      before any listener runs.
   3. A rollback never fires after_commit, but ``session.info`` is *not* reset
      by SQLAlchemy — a reused session would carry the dead ids into its next
-     commit. An after_soft_rollback listener discards the queue explicitly so
-     queued-but-uncommitted publications are never dispatched.
+     commit. An after_transaction_end listener discards the queue explicitly
+     when a transaction ends uncommitted (rollback or close), so
+     queued-but-uncommitted publications are never dispatched, and logs each
+     such discard at WARNING with the event types.
 
 Two deliberate deviations from the literal SPEC §10.1 schema, both forced by
 the ``PublicationStore`` Protocol (the authoritative contract):
@@ -206,6 +208,7 @@ def _schedule_after_commit_dispatch(session: Session) -> None:
     fire-and-forget; the retry loop is the safety net if a task is lost.
     """
     pending = session.info.pop("_modulith_pending", [])
+    session.info.pop("_modulith_pending_types", None)
     if not pending:
         return
     store = _active_store
@@ -238,24 +241,44 @@ def _schedule_after_commit_dispatch(session: Session) -> None:
         task.add_done_callback(store._inflight.discard)
 
 
-def _discard_pending_on_rollback(session: Session, previous_transaction: Any) -> None:
-    """Drop the queued ids when the transaction that produced them rolls back.
+def _discard_uncommitted_pending(session: Session, transaction: Any) -> None:
+    """Drop, and report, queued ids whose transaction ended without committing.
+
+    Fires when a session transaction ends. After a commit, after_commit has
+    already popped the queue, so anything left belongs to a transaction that
+    rolled back or was closed uncommitted: those rows are gone, and so is
+    their dispatch. A bound session that outlives its last ``commit()`` —
+    FastAPI BackgroundTasks run before a ``get_db`` dependency's teardown —
+    loses its later publishes this way, so each loss is logged at WARNING
+    with the event types rather than passing silently.
 
     SQLAlchemy does not reset ``Session.info`` on rollback, and a Session is
-    routinely reused for a second transaction. Without this, the next commit's
-    after_commit pops ids whose rows were never committed and schedules a
-    dispatch for each — every one of them logging the "found no row … deleted
-    before delivery?" warning that is supposed to mean something has gone
-    wrong with a *committed* row.
+    routinely reused for a second transaction. Without the pop, the next
+    commit's after_commit would dispatch ids whose rows were never committed,
+    each logging the "found no row … deleted before delivery?" warning that
+    is supposed to mean something has gone wrong with a *committed* row.
 
-    A SAVEPOINT rollback is left alone: the queue is flat, so it cannot tell
-    which ids belong to the savepoint and which to the enclosing transaction,
-    and dropping the enclosing ones would silently downgrade them from
-    after-commit dispatch to retry-sweep latency.
+    Only the root transaction counts. A flush runs in its own inner
+    transaction, which ends before the root commits. A SAVEPOINT end is left
+    alone too: the queue is flat, so it cannot tell which ids belong to the
+    savepoint and which to the enclosing transaction, and dropping the
+    enclosing ones would silently downgrade them from after-commit dispatch
+    to retry-sweep latency.
     """
-    if previous_transaction is not None and previous_transaction.nested:
+    if transaction.parent is not None:
         return
-    session.info.pop("_modulith_pending", None)
+    pending = session.info.pop("_modulith_pending", None)
+    types = session.info.pop("_modulith_pending_types", {})
+    if not pending:
+        return
+    logger.warning(
+        "discarded %d outbox publication(s) of %s: the bound session's "
+        "transaction ended without committing (rolled back, or closed after "
+        "its last commit). Publish before the final commit, or commit after "
+        "the work that publishes (see the bind_session docs).",
+        len(pending),
+        ", ".join(sorted({types.get(pid, "<unknown>") for pid in pending})),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +448,7 @@ class PostgresPublicationStore:
         if _hook_installed:
             return
         sa_event.listen(Session, "after_commit", _schedule_after_commit_dispatch)
-        sa_event.listen(Session, "after_soft_rollback", _discard_pending_on_rollback)
+        sa_event.listen(Session, "after_transaction_end", _discard_uncommitted_pending)
         _hook_installed = True
 
     def _check_cross_loop_usage(self) -> None:
@@ -485,6 +508,9 @@ class PostgresPublicationStore:
             # session already. bind_session() accepts either.
             sync_session = getattr(session, "sync_session", session)
             sync_session.info.setdefault("_modulith_pending", []).append(publication.id)
+            sync_session.info.setdefault("_modulith_pending_types", {})[publication.id] = (
+                publication.event_type
+            )
             return
 
         async with self._open_session() as s:
@@ -1094,7 +1120,7 @@ class PostgresPublicationStore:
             _active_store = _store_stack[-1] if _store_stack else None
             if _active_store is None and _hook_installed:
                 sa_event.remove(Session, "after_commit", _schedule_after_commit_dispatch)
-                sa_event.remove(Session, "after_soft_rollback", _discard_pending_on_rollback)
+                sa_event.remove(Session, "after_transaction_end", _discard_uncommitted_pending)
                 _hook_installed = False
 
 
@@ -1115,13 +1141,22 @@ def bind_session(session: Any) -> Any:
                 token = bind_session(session)
                 try:
                     yield session
+                    await session.commit()
                 finally:
                     unbind_session(token)
 
+    A publish while bound joins the session's open transaction (autobegun if
+    needed) and is delivered only when a later ``commit()`` covers it. The
+    ``commit()`` after ``yield`` covers publishes made after the route's own
+    commit, such as FastAPI ``BackgroundTasks``, which run before the
+    dependency's teardown. A transaction that ends uncommitted (rollback, or
+    the session closing) discards its publications and logs a WARNING naming
+    their event types.
+
     A task created with ``asyncio.create_task`` inside the bound scope shares
     the binding until ``unbind_session``: its publishes before then enlist in
-    this session, and its publishes after then take the unbound path
-    (direct dispatch, no outbox row).
+    this session under the same rule, and its publishes after then take the
+    unbound path (direct dispatch, no outbox row).
     """
     return _current_session.set(_SessionBinding(session))
 
@@ -1135,6 +1170,10 @@ def unbind_session(token: Any) -> None:
     nested inside one) rather than unconditionally clearing it — the same
     guarantee ``contextvars.ContextVar.reset()`` gives, which this wraps.
     The binding also ends for every task that inherited it.
+
+    Unbinding neither commits nor discards: publications enlisted since the
+    last commit are still delivered if the session commits afterwards, and
+    are discarded, with a WARNING, if it closes or rolls back instead.
     """
     binding = _current_session.get()
     _current_session.reset(token)
@@ -1169,7 +1208,7 @@ def _reset_for_testing() -> None:
     _active_store = None
     if _hook_installed:
         sa_event.remove(Session, "after_commit", _schedule_after_commit_dispatch)
-        sa_event.remove(Session, "after_soft_rollback", _discard_pending_on_rollback)
+        sa_event.remove(Session, "after_transaction_end", _discard_uncommitted_pending)
         _hook_installed = False
 
 
