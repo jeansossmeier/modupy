@@ -24,7 +24,19 @@ class PollingBroker(Protocol):
         max_attempts: int | None = None,
     ) -> list[dict[str, Any]]: ...
 
-    async def renew_claims(self, row_ids: list[str], *, consumer_name: str) -> int: ...
+    async def renew_claims(
+        self,
+        row_ids: list[str],
+        *,
+        consumer_name: str,
+        start_dispatch: bool = False,
+    ) -> int:
+        """Extend owned claims; ``start_dispatch`` also marks dispatch started.
+
+        A stale reclaim charges an attempt only to rows marked started, so
+        rows claimed but never handed to a listener keep their retry budget.
+        """
+        ...
 
     async def ack(self, row_id: str, *, consumer_name: str) -> None: ...
 

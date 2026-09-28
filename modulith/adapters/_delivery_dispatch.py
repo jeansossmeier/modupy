@@ -87,6 +87,7 @@ class DeliveryDispatch:
                     renewed = await self._broker.renew_claims(
                         [row_id],
                         consumer_name=self._consumer_name,
+                        start_dispatch=True,
                     )
                 except asyncio.CancelledError:
                     raise

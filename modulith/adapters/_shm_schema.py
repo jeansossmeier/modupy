@@ -59,6 +59,7 @@ _SCHEMA = (
         claimed_at REAL,
         claimed_by TEXT,
         claim_generation INTEGER NOT NULL DEFAULT 0,
+        dispatch_started INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
         completed_at REAL,
         created_at REAL NOT NULL,
@@ -174,6 +175,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # store already at SCHEMA_VERSION from before this index existed gets
         # it backfilled without a schema-version migration path.
         conn.execute(_PUBLICATION_EXPIRY_INDEX_SCHEMA)
+        _add_dispatch_started_column(conn)
+
+
+def _add_dispatch_started_column(conn: sqlite3.Connection) -> None:
+    """Backfill the column onto a delivery table created before it existed.
+
+    Additive and defaulted, so a store opened by an older runtime at the same
+    schema version keeps working; that runtime simply never sets it.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(shm_delivery)")}
+    if "dispatch_started" not in columns:
+        conn.execute(
+            "ALTER TABLE shm_delivery ADD COLUMN dispatch_started INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def _migrate_v0(conn: sqlite3.Connection) -> None:

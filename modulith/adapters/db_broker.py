@@ -433,14 +433,44 @@ def _is_already_exists(exc: BaseException) -> bool:
     so two workers bootstrapping the same fresh DB can both pass the existence
     check and both issue CREATE; the loser gets Postgres 'already exists',
     MySQL 1050 'Table ... already exists', or SQLite 'table ... already
-    exists' — all of which carry the 'already exists' substring."""
+    exists' — all of which carry the 'already exists' substring. The
+    column backfill in ``_add_missing_message_columns`` races the same way;
+    its loser gets 'duplicate column name' on MySQL and SQLite."""
     from sqlalchemy.exc import OperationalError, ProgrammingError
 
     if not isinstance(exc, OperationalError | ProgrammingError):
         return False
     orig = getattr(exc, "orig", None)
     message = (str(orig) if orig is not None else str(exc)).lower()
-    return "already exists" in message
+    return "already exists" in message or "duplicate column name" in message
+
+
+def _add_missing_message_columns(connection: Any, schema: str | None) -> None:
+    """Add ``broker_message`` columns newer than a self-bootstrapped table.
+
+    ``metadata.create_all`` skips a table that already exists, so a database
+    the broker bootstrapped before ``dispatch_started`` existed would never
+    gain it. Migration 0006 adds the same column for alembic-managed
+    databases and skips it when this backfill already ran.
+    """
+    from sqlalchemy import inspect
+    from sqlalchemy.schema import CreateColumn
+
+    _, _, message = broker_schema()
+    column = message.c.dispatch_started
+    # Reflection and raw DDL bypass schema_translate_map, which is how both the
+    # ``schema`` engine option and an injected engine route the broker tables.
+    translate = connection.get_execution_options().get("schema_translate_map") or {}
+    schema = translate.get(None, schema)
+    existing = {col["name"] for col in inspect(connection).get_columns(message.name, schema=schema)}
+    if column.name in existing:
+        return
+    preparer = connection.dialect.identifier_preparer
+    table = preparer.quote(message.name)
+    if schema:
+        table = f"{preparer.quote_schema(schema)}.{table}"
+    column_ddl = CreateColumn(column).compile(dialect=connection.dialect)
+    connection.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column_ddl}")
 
 
 def _is_pg_namespace_unique_race(exc: BaseException) -> bool:
@@ -668,6 +698,7 @@ def broker_schema() -> tuple[Any, Any, Any]:
         return _metadata_cache, _subscription_table_cache, _message_table_cache
 
     from sqlalchemy import (
+        Boolean,
         Column,
         DateTime,
         ForeignKey,
@@ -679,6 +710,7 @@ def broker_schema() -> tuple[Any, Any, Any]:
         Table,
         Text,
         UniqueConstraint,
+        false,
     )
     from sqlalchemy.dialects.mysql import DATETIME as MySQLDateTime
     from sqlalchemy.dialects.mysql import LONGBLOB as MySQLLongBlob
@@ -745,6 +777,16 @@ def broker_schema() -> tuple[Any, Any, Any]:
         Column("claimed_by", String(_CLAIMED_BY_LEN), nullable=True),
         Column("created_at", ts, nullable=False),
         Column("last_error", Text, nullable=True),
+        # Set by the pre-dispatch renewal of the current claim, so a stale
+        # reclaim charges an attempt only to a row whose listener started.
+        # Keep in lockstep with migrations/versions/0006_broker_dispatch_started.py.
+        Column(
+            "dispatch_started",
+            Boolean,
+            nullable=False,
+            default=False,
+            server_default=false(),
+        ),
         Index("ix_broker_message_claim", "consumer_group", "status", "available_at"),
         Index("ix_broker_message_prune", "status", "created_at"),
         Index("ix_broker_message_target", "target"),
@@ -1038,6 +1080,11 @@ class DatabaseBroker:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + _SQLITE_SCHEMA_BUSY_BUDGET_S if self._is_sqlite else None
             attempt = 0
+            schema = self._schema
+
+            def create_tables(connection: Any) -> None:
+                metadata.create_all(connection)
+                _add_missing_message_columns(connection, schema)
 
             async def create_schema() -> None:
                 async def create() -> None:
@@ -1046,7 +1093,7 @@ class DatabaseBroker:
                             from sqlalchemy.schema import CreateSchema
 
                             await conn.execute(CreateSchema(self._schema, if_not_exists=True))
-                        await conn.run_sync(metadata.create_all)
+                        await conn.run_sync(create_tables)
 
                 if deadline is None:
                     await create()
@@ -1672,15 +1719,18 @@ class DatabaseBroker:
         a consumer crash (the DB analogue of the Redis adapter's XAUTOCLAIM
         reclaim).
 
-        A reclaim re-stamps ``claimed_at``/``claimed_by`` AND bumps
-        ``attempts`` — the same accounting Redis Streams applies, where
-        XAUTOCLAIM increments the entry's ``times_delivered``. It has to: a
-        consumer that crashes, is OOM-killed, or wedges past the lease cap
-        never reaches ``fail()``, so if the reclaim did not burn an attempt
-        that row would be handed out forever with ``attempts`` frozen at 0.
-        When ``max_attempts`` is given, a reclaim that exhausts it moves the
-        row straight to ``dead`` and withholds it from the batch, because
-        nothing on the crash path will run the cap in ``fail()`` for it.
+        A reclaim re-stamps ``claimed_at``/``claimed_by``, and bumps
+        ``attempts`` only when the abandoned claim had started dispatching
+        the row (``renew_claims(..., start_dispatch=True)`` sets
+        ``dispatch_started``). It has to charge that row: a consumer that
+        crashes, is OOM-killed, or wedges past the lease cap never reaches
+        ``fail()``, so without the charge the row would be handed out forever
+        with ``attempts`` frozen at 0. Rows claimed in the same batch whose
+        listener never started are reclaimed free, so a crash loop on one
+        row does not spend the retry budget of the rows queued behind it.
+        When ``max_attempts`` is given, a charged reclaim that exhausts it
+        moves the row straight to ``dead`` and withholds it from the batch,
+        because nothing on the crash path will run the cap in ``fail()``.
 
         Postgres/MySQL: ``FOR UPDATE SKIP LOCKED`` lets concurrent consumers
         partition the backlog instead of blocking or double-claiming. SQLite
@@ -1717,30 +1767,42 @@ class DatabaseBroker:
             result = await conn.execute(stmt)
             rows = [dict(row._mapping) for row in result]
 
-            fresh_ids = [row["id"] for row in rows if row["status"] != "claimed"]
-            reclaimed = [row for row in rows if row["status"] == "claimed"]
+            charged = [
+                row for row in rows if row["status"] == "claimed" and row["dispatch_started"]
+            ]
             exhausted_ids = (
                 set()
                 if cap is None
-                else {row["id"] for row in reclaimed if int(row["attempts"]) + 1 >= cap}
+                else {row["id"] for row in charged if int(row["attempts"]) + 1 >= cap}
             )
-            reclaimed_ids = [row["id"] for row in reclaimed if row["id"] not in exhausted_ids]
+            charged_ids = [row["id"] for row in charged if row["id"] not in exhausted_ids]
+            uncharged_ids = [
+                row["id"]
+                for row in rows
+                if row["status"] != "claimed" or not row["dispatch_started"]
+            ]
 
-            if fresh_ids:
+            if uncharged_ids:
                 await conn.execute(
                     update(message)
-                    .where(message.c.id.in_(fresh_ids))
-                    .values(status="claimed", claimed_at=now, claimed_by=consumer_name)
+                    .where(message.c.id.in_(uncharged_ids))
+                    .values(
+                        status="claimed",
+                        claimed_at=now,
+                        claimed_by=consumer_name,
+                        dispatch_started=False,
+                    )
                 )
-            if reclaimed_ids:
+            if charged_ids:
                 await conn.execute(
                     update(message)
-                    .where(message.c.id.in_(reclaimed_ids))
+                    .where(message.c.id.in_(charged_ids))
                     .values(
                         status="claimed",
                         claimed_at=now,
                         claimed_by=consumer_name,
                         attempts=message.c.attempts + 1,
+                        dispatch_started=False,
                     )
                 )
             if exhausted_ids:
@@ -1753,6 +1815,7 @@ class DatabaseBroker:
                         available_at=now,
                         claimed_at=None,
                         claimed_by=None,
+                        dispatch_started=False,
                         last_error=(
                             f"reclaimed {cap} times without completing "
                             "(consumer crashed or wedged mid-dispatch)"
@@ -1760,18 +1823,30 @@ class DatabaseBroker:
                     )
                 )
 
-            bumped = set(reclaimed_ids)
+            bumped = set(charged_ids)
             claimed_rows = [row for row in rows if row["id"] not in exhausted_ids]
             for row in claimed_rows:
                 if row["id"] in bumped:
                     row["attempts"] = int(row["attempts"]) + 1
+                row["dispatch_started"] = False
             return claimed_rows
 
         rows: list[dict[str, Any]] = await self._write(op)
         return rows
 
-    async def renew_claims(self, row_ids: list[str], *, consumer_name: str) -> int:
+    async def renew_claims(
+        self,
+        row_ids: list[str],
+        *,
+        consumer_name: str,
+        start_dispatch: bool = False,
+    ) -> int:
         """Re-stamp ``claimed_at`` = server-now for rows THIS consumer still owns.
+
+        ``start_dispatch=True`` also marks the rows' dispatch as started, in
+        the same statement: the consumer passes it once per row just before
+        handing the row to its listener, so a later stale reclaim charges
+        that row an attempt. Heartbeat renewals leave the mark alone.
 
         The consumer's in-flight heartbeat: called every
         ``reclaim_stale_seconds / 3`` while a claimed batch dispatches, so rows
@@ -1790,6 +1865,9 @@ class DatabaseBroker:
 
         async def op(conn: Any) -> int:
             now = await self._now(conn)
+            values: dict[str, Any] = {"claimed_at": now}
+            if start_dispatch:
+                values["dispatch_started"] = True
             result = await conn.execute(
                 update(message)
                 .where(
@@ -1797,7 +1875,7 @@ class DatabaseBroker:
                     message.c.status == "claimed",
                     message.c.claimed_by == consumer_name,
                 )
-                .values(claimed_at=now)
+                .values(**values)
             )
             return int(result.rowcount or 0)
 

@@ -99,11 +99,13 @@ class SqliteQueueStore:
         self,
         values: list[ClaimToken | str],
         consumer_name: str,
+        start_dispatch: bool = False,
     ) -> int:
         return _shm_claims.renew_claims(
             self._conn,
             values,
             consumer_name,
+            start_dispatch,
         )
 
     def ack(

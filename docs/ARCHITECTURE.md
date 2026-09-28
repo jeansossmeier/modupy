@@ -451,7 +451,12 @@ than `reclaim_stale_seconds` (default 60) — the DB analogue of the Redis
 that same claim-time reclaim now enforces `max_delivery_attempts` too — a row
 reclaimed past the cap is dead-lettered directly instead of redelivered
 forever, since a crashed/wedged consumer never reaches `fail()` to run the
-cap itself. Idle polling backoff never narrows below the configured
+cap itself. The reclaim charges an attempt only to a row whose dispatch had
+started: the consumer marks `dispatch_started` in the owner-guarded renewal it
+already makes just before handing a row to its listener. Rows claimed in the
+same batch but still queued behind the concurrency gate when the consumer died
+or stopped are reclaimed without losing an attempt, so one crash-looping row
+cannot dead-letter its batch-mates. Idle polling backoff never narrows below the configured
 `poll_interval_ms`: it grows exponentially while the queue is empty but is
 capped at `max(poll_interval, 0.5s)`.
 
@@ -519,7 +524,10 @@ is at-least-once: a process crash after listener completion but before the
 fenced ack commits can cause the listener to run again. A stale-claim reclaim
 enforces `max_delivery_attempts` too — a row reclaimed past the cap is
 dead-lettered directly instead of redelivered forever, since a crashed
-consumer never reaches `fail()` to run the cap itself.
+consumer never reaches `fail()` to run the cap itself. As with the database
+broker, only a row whose dispatch had started is charged; rows claimed
+alongside it that never reached a listener are reclaimed with their attempts
+intact.
 
 The broker is local-host only. Its canonical `state_dir`, `sqlite_path`, and
 `hint_path` resolve to absolute, package-namespaced paths under a private

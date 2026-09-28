@@ -90,10 +90,14 @@ def _delivery_state(broker: ShmBroker) -> list[tuple[str, int]]:
 class _RenewFlakyBroker(ShmBroker):
     fail_renewals = False
 
-    async def renew_claims(self, row_ids: list[str], *, consumer_name: str) -> int:
+    async def renew_claims(
+        self, row_ids: list[str], *, consumer_name: str, start_dispatch: bool = False
+    ) -> int:
         if self.fail_renewals:
             raise RuntimeError("renew unavailable")
-        return await super().renew_claims(row_ids, consumer_name=consumer_name)
+        return await super().renew_claims(
+            row_ids, consumer_name=consumer_name, start_dispatch=start_dispatch
+        )
 
 
 class _CompletionFlakyBroker(ShmBroker):
@@ -177,7 +181,9 @@ class _RenewLoopBroker(ShmBroker):
         self.renew_calls = 0
         self.renew_started = asyncio.Event()
 
-    async def renew_claims(self, row_ids: list[str], *, consumer_name: str) -> int:
+    async def renew_claims(
+        self, row_ids: list[str], *, consumer_name: str, start_dispatch: bool = False
+    ) -> int:
         self.renew_calls += 1
         self.renew_started.set()
         if self.block:
@@ -717,6 +723,67 @@ async def test_heartbeat_prevents_stale_reclaim_during_dispatch(broker: ShmBroke
     finally:
         release.set()
         await consumer.stop()
+
+
+async def test_wedging_row_does_not_dead_letter_the_rows_claimed_behind_it(
+    broker: ShmBroker,
+) -> None:
+    """A consumer restarted repeatedly while one listener wedges must spend
+    attempts only on that row. The rows queued behind it in the same batch
+    never reached their listener, so they must be delivered, not
+    dead-lettered alongside it."""
+    max_attempts = 3
+    wedged = asyncio.Event()
+    delivered: list[str] = []
+
+    async def handle(item: ConsumerEvent) -> None:
+        if item.name == "poison":
+            wedged.set()
+            await asyncio.Event().wait()
+        delivered.append(item.name)
+
+    bus = InMemoryEventBus()
+    bus.register(ConsumerEvent, handle)
+    serializer = JsonEventSerializer(allowed_event_types=[ConsumerEvent])
+    await broker.subscribe([TARGET], GROUP)
+    benign = [f"b{index}" for index in range(4)]
+    for name in ["poison", *benign]:
+        await broker.publish(
+            TARGET, serializer.serialize(ConsumerEvent(name)), {"event_type": EVENT_TYPE}
+        )
+
+    def incarnation() -> ShmConsumer:
+        return _consumer(
+            broker,
+            bus,
+            serializer,
+            batch_size=10,
+            dispatch_concurrency=1,
+            max_attempts=max_attempts,
+            reclaim_stale_seconds=0.1,
+        )
+
+    for _ in range(max_attempts):
+        wedged.clear()
+        consumer = incarnation()
+        await consumer.start()
+        try:
+            await asyncio.wait_for(wedged.wait(), timeout=5.0)
+        finally:
+            await consumer.stop()
+        await asyncio.sleep(0.15)
+
+    consumer = incarnation()
+    await consumer.start()
+    try:
+        await _until(lambda: _delivery_state(broker) == [("dead", max_attempts)])
+    except AssertionError:
+        pass
+    finally:
+        await consumer.stop()
+
+    assert sorted(delivered) == benign
+    assert _delivery_state(broker) == [("dead", max_attempts)]
 
 
 async def test_renew_failure_degrades_health_until_renewal_recovers(tmp_path: Path) -> None:

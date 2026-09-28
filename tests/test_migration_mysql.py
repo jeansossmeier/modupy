@@ -137,6 +137,37 @@ def test_alembic_upgrade_head_creates_broker_schema_on_real_mysql(clean_mysql) -
     assert "broker_retained_delivery" in tables
 
 
+def test_dispatch_started_matches_broker_bootstrap_and_defaults_false_on_real_mysql(
+    clean_mysql,
+) -> None:
+    """The migrated ``dispatch_started`` column has the type, nullability and
+    server default the broker's own bootstrap creates, and a row inserted
+    without it reads back as not started."""
+    from modulith.adapters.db_broker import broker_schema
+
+    url, engine = clean_mysql
+    command.upgrade(_cfg(url), "head")
+    migrated = _snapshot(engine, ["broker_message"])["broker_message"]
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO broker_message (id, target, consumer_group, payload, "
+                "available_at, created_at) VALUES ('m1', 't', 'g', x'00', NOW(6), NOW(6))"
+            )
+        )
+        started = conn.execute(
+            text("SELECT dispatch_started FROM broker_message WHERE id='m1'")
+        ).scalar_one()
+    _drop(engine)
+    metadata, _, _ = broker_schema()
+    metadata.create_all(engine)
+    bootstrapped = _snapshot(engine, ["broker_message"])["broker_message"]
+
+    assert migrated["dispatch_started"] == bootstrapped["dispatch_started"]
+    assert migrated["dispatch_started"][1] is False
+    assert not started
+
+
 def test_alembic_downgrade_base_on_real_mysql(clean_mysql) -> None:
     """``downgrade base`` removes every table (both revisions) on real MySQL."""
     url, engine = clean_mysql

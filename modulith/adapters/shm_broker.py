@@ -330,9 +330,12 @@ class ShmBroker:
     ) -> list[dict[str, Any]]:
         """Atomically claim durable work, including abandoned stale claims.
 
-        When ``max_attempts`` is given, a stale-claim reclaim bumps the
-        row's ``attempts`` and, once that meets or exceeds the cap,
-        dead-letters it instead of redelivering it -- the same accounting
+        A stale-claim reclaim bumps ``attempts`` only for a row whose
+        dispatch had started (``renew_claims(..., start_dispatch=True)``);
+        rows claimed alongside it that never reached a listener are
+        reclaimed free. When ``max_attempts`` is given, a charged reclaim
+        that meets or exceeds the cap dead-letters the row instead of
+        redelivering it -- the same accounting
         the database broker applies, needed because a consumer that crashes
         mid-dispatch never reaches ``fail()`` to run the cap itself.
         """
@@ -349,10 +352,20 @@ class ShmBroker:
             max_attempts=max_attempts,
         )
 
-    async def renew_claims(self, row_ids: list[str], *, consumer_name: str) -> int:
-        """Renew only claims whose owner and generation still match."""
+    async def renew_claims(
+        self,
+        row_ids: list[str],
+        *,
+        consumer_name: str,
+        start_dispatch: bool = False,
+    ) -> int:
+        """Renew only claims whose owner and generation still match.
+
+        ``start_dispatch`` also marks the claims' dispatch as started, so a
+        later stale reclaim charges them an attempt.
+        """
         claim_tokens: list[ClaimToken | str] = list(row_ids)
-        return await self._cold.renew_claims(claim_tokens, consumer_name)
+        return await self._cold.renew_claims(claim_tokens, consumer_name, start_dispatch)
 
     async def ack(self, row_id: str, *, consumer_name: str) -> None:
         """Complete one currently owned claim using its fencing token."""
