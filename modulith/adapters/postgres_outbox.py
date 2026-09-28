@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import weakref
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -70,7 +71,7 @@ try:
     )
     from sqlalchemy import event as sa_event
     from sqlalchemy.dialects.mysql import LONGBLOB as MySQLLongBlob
-    from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
     from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 except ImportError as exc:  # pragma: no cover — exercised in a subprocess test
     raise ImportError(
@@ -717,6 +718,8 @@ class PostgresPublicationStore:
             if self._supports_skip_locked:
                 stmt = stmt.with_for_update(skip_locked=True)
             rows = (await s.execute(stmt)).scalars().all()
+            if not self._supports_skip_locked:
+                return await self._claim_unlocked(s, rows, owner=owner, now=now, until=until)
             claimed: list[EventPublication] = []
             for row in rows:
                 token = uuid4().hex
@@ -728,6 +731,50 @@ class PostgresPublicationStore:
                 claimed.append(pub)
             await s.commit()
             return claimed
+
+    async def _claim_unlocked(
+        self,
+        s: AsyncSession,
+        rows: Sequence[EventPublicationRow],
+        *,
+        owner: str,
+        now: datetime,
+        until: datetime,
+    ) -> list[EventPublication]:
+        """Claim candidates read without row locks (MySQL, SQLite): each row
+        is taken by a conditional UPDATE that re-checks claimability, and only
+        a rowcount of 1 counts as claimed. A peer that claimed the row after
+        our SELECT leaves ``claim_until`` in the future, so our UPDATE matches
+        nothing and the row is dropped from the batch. Rows are updated in
+        primary-key order so concurrent claimers take row locks in the same
+        order and cannot deadlock each other."""
+        tokens: dict[UUID, str] = {}
+        for row in sorted(rows, key=lambda r: str(r.id)):
+            token = uuid4().hex
+            result = await s.execute(
+                update(EventPublicationRow)
+                .where(
+                    EventPublicationRow.id == row.id,
+                    EventPublicationRow.completed_at.is_(None),
+                    EventPublicationRow.is_dead_lettered.is_(False),
+                    or_(
+                        EventPublicationRow.claim_until.is_(None),
+                        EventPublicationRow.claim_until <= now,
+                    ),
+                )
+                .values(claim_owner=owner, claim_token=token, claim_until=until)
+                .execution_options(synchronize_session=False)
+            )
+            if cast(CursorResult[Any], result).rowcount == 1:
+                tokens[row.id] = token
+        await s.commit()
+        claimed: list[EventPublication] = []
+        for row in rows:
+            if row.id in tokens:
+                pub = _row_to_pub(row)
+                pub.claim_token = tokens[row.id]
+                claimed.append(pub)
+        return claimed
 
     async def renew_claim(self, publication_id: UUID, token: str, lease_seconds: float) -> bool:
         """Extend a still-held claim's lease. Returns False (no write applied)

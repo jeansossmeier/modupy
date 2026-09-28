@@ -340,7 +340,7 @@ outbox table are coordinated by `outbox.configure(claim_strategy=...)`
 
 | `claim_strategy` | How it coordinates | Cost |
 |---|---|---|
-| `"lease"` (default) | `claim_batch()` selects `FOR UPDATE SKIP LOCKED`, writes `claim_owner`/`claim_token`/`claim_until` and **commits before dispatch**; the lease renews at one third of `claim_lease_seconds` while dispatch is in flight, and completion/failure writes are fenced on `claim_token` so an expired claimant cannot clobber a newer one | one extra write per claimed batch |
+| `"lease"` (default) | `claim_batch()` selects `FOR UPDATE SKIP LOCKED` on Postgres, writes `claim_owner`/`claim_token`/`claim_until` and **commits before dispatch**. On MySQL and SQLite it claims each selected row with a conditional `UPDATE` that re-checks `completed_at IS NULL AND (claim_until IS NULL OR claim_until <= now)`, and drops a row a concurrent sweeper claimed first. The lease renews at one third of `claim_lease_seconds` while dispatch is in flight, and completion/failure writes are fenced on `claim_token` so an expired claimant cannot clobber a newer one | Postgres: one extra write per claimed batch. MySQL/SQLite: one `UPDATE` statement per candidate row |
 | `"advisory_lock"` | a per-publication `pg_try_advisory_lock` held for the duration of the dispatch. Postgres-only — a non-Postgres store rejects it at `configure()` | no extra write, but a held AUTOCOMMIT connection (no open transaction) per in-flight row, closed on any lock-query error |
 | `"none"` | no coordination; two sweepers CAN dispatch the same row. Logged as a warning at `configure()` so the tradeoff is visible | none |
 
@@ -351,8 +351,9 @@ the row) and `claim_batch_size` (default 100 rows per claim).
 Note what `FOR UPDATE SKIP LOCKED` does and does not buy on its own: under
 `"none"` and `"advisory_lock"` the row locks taken by the sweep query are
 released when that query's transaction ends, *before* dispatch begins, so they
-do not partition work across processes. Only `claim_batch()` — which locks and
-writes the claim in one transaction — does. Either way delivery stays
+do not partition work across processes. Only `claim_batch()` — which locks (or,
+off Postgres, conditionally updates) and writes the claim in one transaction —
+does. Either way delivery stays
 at-least-once and **listeners must be idempotent**.
 
 ### 7.5 Serialization

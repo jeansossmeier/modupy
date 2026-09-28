@@ -19,7 +19,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -647,3 +647,87 @@ async def test_store_cross_loop_warning_fires_once_per_instance(engine: Any, cap
         assert len(warnings) == 1, f"expected exactly one cross-loop warning, got: {caplog.records}"
     finally:
         await store.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Lease claims stay exclusive under concurrent sweepers on every dialect
+# ---------------------------------------------------------------------------
+
+
+async def _assert_concurrent_sweepers_claim_each_row_once(
+    engines: list[Any], *, rounds: int = 8, rows: int = 20
+) -> None:
+    """Every round, all stores call ``claim_batch`` at once over the same
+    all-claimable table. Each row must be claimed by exactly one sweeper, and
+    the token that sweeper returned must be the one stored on the row."""
+    stores = [PostgresPublicationStore(engine=eng) for eng in engines]
+    try:
+        seeded = datetime.now(UTC) - timedelta(seconds=5)
+        ids = set()
+        for i in range(rows):
+            pub = _pub(i, published_at=seeded)
+            await stores[0].save(pub)
+            ids.add(pub.id)
+        sessionmaker = async_sessionmaker(engines[0])
+        for _ in range(rounds):
+            async with sessionmaker() as s:
+                await s.execute(
+                    update(EventPublicationRow).values(claim_until=None, claim_token=None)
+                )
+                await s.commit()
+            batches = await asyncio.gather(
+                *(
+                    store.claim_batch(
+                        owner=f"sweeper-{n}",
+                        batch_size=100,
+                        lease_seconds=60,
+                        older_than=timedelta(0),
+                    )
+                    for n, store in enumerate(stores)
+                )
+            )
+            claimed = [p.id for batch in batches for p in batch]
+            assert len(claimed) == len(set(claimed)), "a row was claimed by two sweepers"
+            assert set(claimed) == ids
+            async with sessionmaker() as s:
+                result = await s.execute(
+                    select(EventPublicationRow.id, EventPublicationRow.claim_token)
+                )
+                stored = dict(result.tuples().all())
+            returned = {p.id: p.claim_token for batch in batches for p in batch}
+            assert returned == stored
+    finally:
+        for store in stores:
+            await store.dispose()
+
+
+async def test_concurrent_sweepers_claim_each_row_once_on_sqlite(tmp_path: Path) -> None:
+    url = f"sqlite+aiosqlite:///{tmp_path / 'claims.db'}"
+    engines = [create_async_engine(url, poolclass=NullPool) for _ in range(4)]
+    async with engines[0].begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    try:
+        await _assert_concurrent_sweepers_claim_each_row_once(engines)
+    finally:
+        for eng in engines:
+            await eng.dispose()
+
+
+@pytest.mark.integration
+async def test_concurrent_sweepers_claim_each_row_once_on_mysql(mysql_url: str) -> None:
+    engines = [create_async_engine(mysql_url) for _ in range(4)]
+    async with engines[0].begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+    try:
+        await _assert_concurrent_sweepers_claim_each_row_once(engines)
+    finally:
+        async with engines[0].begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+        for eng in engines:
+            await eng.dispose()
+
+
+@pytest.mark.integration
+async def test_concurrent_sweepers_claim_each_row_once_on_postgres(pg_engine: Any) -> None:
+    await _assert_concurrent_sweepers_claim_each_row_once([pg_engine] * 4)
