@@ -731,20 +731,35 @@ async def test_publish_from_the_sync_api_loop_uses_the_engine_owning_loop(
 
 @pytest.mark.parametrize("broker_engine", ["mysql"], indirect=True)
 @pytest.mark.parametrize(
-    ("version", "is_mariadb", "minimum"),
-    [((5, 7, 44), False, "8.0.1"), ((10, 5, 29), True, "10.6")],
+    ("reported", "version", "minimum"),
+    [
+        ("5.7.44-log", (5, 7, 44), "8.0.1"),
+        ("10.5.29-MariaDB-1:10.5.29+maria~ubu2004", (10, 5, 29), "10.6"),
+    ],
 )
 async def test_mysql_server_without_skip_locked_is_rejected_at_startup(
     broker_engine: Any,
     monkeypatch: pytest.MonkeyPatch,
+    reported: str,
     version: tuple[int, ...],
-    is_mariadb: bool,
     minimum: str,
 ) -> None:
     from modulith import ConfigurationError
 
-    monkeypatch.setattr(broker_engine.dialect, "server_version_info", version)
-    monkeypatch.setattr(broker_engine.dialect, "is_mariadb", is_mariadb)
+    dialect = broker_engine.dialect
+    # Everything _parse_server_version (and the MariaDB switch it makes) sets, so
+    # the fixture's teardown talks to the real MySQL server with its own state.
+    for name in (
+        "server_version_info",
+        "is_mariadb",
+        "_mariadb_normalized_version_info",
+        "preparer",
+        "identifier_preparer",
+        "delete_returning",
+        "insert_returning",
+    ):
+        monkeypatch.setattr(dialect, name, getattr(dialect, name))
+    dialect._parse_server_version(reported)
     broker = DatabaseBroker(engine=broker_engine)
 
     with pytest.raises(ConfigurationError) as excinfo:
