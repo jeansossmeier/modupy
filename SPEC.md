@@ -654,8 +654,18 @@ uvicorn modulith._worker:create_app --factory \
 - Reads `MODULITH_MODULE` from env
 - Imports that module's package. Sibling module packages it imports are
   loaded too, but a listener runs only in the worker of the module whose
-  import registered it; listeners registered outside any module import
-  (plugins, hooks) run in every worker
+  import registered it, including a module package an entry-point plugin
+  imports during bootstrap. Two shapes are not owned by a single module:
+  - Listeners registered outside any module import (plugins, hooks) are
+    untagged. They are local in every worker, so a non-externalized event
+    they handle is never routed to the broker, and a listener for that
+    event in another worker does not receive it.
+  - A listener in a plain, non-package file (`app/shared.py`) belongs to
+    whichever module imported it in that process. It runs in every worker
+    whose module imports it.
+
+  Keep listeners inside module packages, and mark an event `@externalized`
+  when modules in other workers handle it
 - Routes this module's cross-module *publishes* out through the broker, and
   (via the lifespan) starts a `BrokerConsumer` that subscribes to the streams
   for the events this module's listeners consume, deserializes each via its

@@ -436,6 +436,68 @@ def test_listener_outside_module_packages_still_runs_in_importing_worker(
     assert sorted(contracts.RUNS) == ["plugin", "shared.audit"]
 
 
+def test_module_imported_by_entry_point_plugin_at_bootstrap_keeps_its_listeners(
+    make_fake_app, monkeypatch, tmp_path
+) -> None:
+    dist_info = tmp_path / "fakeapp_routing-1.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: fakeapp-routing\nVersion: 1.0\n"
+    )
+    (dist_info / "entry_points.txt").write_text("[modulith]\nfakeapp_routing = fakeapp.routing\n")
+    make_fake_app(
+        {
+            "contracts": """
+                from dataclasses import dataclass
+                from modulith import event
+
+                RUNS: list[str] = []
+
+                @event
+                @dataclass(frozen=True)
+                class OrderPlaced:
+                    order_id: str
+            """,
+            "orders": """
+                from modulith import listener
+                from fakeapp.contracts import RUNS, OrderPlaced
+
+                @listener
+                async def on_placed(event: OrderPlaced) -> None:
+                    RUNS.append("orders.on_placed")
+            """,
+            "inventory": """
+                from modulith import listener
+                from fakeapp.contracts import RUNS, OrderPlaced
+                import fakeapp.orders
+
+                @listener
+                async def on_placed(event: OrderPlaced) -> None:
+                    RUNS.append("inventory.on_placed")
+            """,
+        },
+        extra_files={
+            "routing.py": """
+                from modulith import listener
+                from fakeapp.contracts import RUNS, OrderPlaced
+                import fakeapp.orders
+
+                @listener
+                async def audit(event: OrderPlaced) -> None:
+                    RUNS.append("routing.audit")
+            """
+        },
+    )
+    _set_worker_env(monkeypatch, "inventory")
+
+    create_app()
+
+    assert _runtime.plugin_manager.has_plugin("fakeapp_routing")
+    contracts = sys.modules["fakeapp.contracts"]
+    asyncio.run(_runtime.dispatch_local(contracts.OrderPlaced("o1"), _runtime.event_bus))
+    assert sorted(contracts.RUNS) == ["inventory.on_placed", "routing.audit"]
+
+
 class _SessionScopedStore:
     def __init__(self) -> None:
         self.rows: dict[Any, EventPublication] = {}
