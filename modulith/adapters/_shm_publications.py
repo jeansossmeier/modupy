@@ -103,9 +103,13 @@ def publish(
     except sqlite3.Error as error:
         if _is_store_full(error):
             raise ConfigurationError(
-                "SHM SQLite store is full while publishing. "
-                f"Increase max_store_bytes (currently {max_store_bytes}), "
-                "prune completed publications, or free disk space."
+                "SHM SQLite store is full while publishing. Every publication is "
+                f"kept for orphan_retention_seconds (currently {retention_seconds:g}) "
+                "even after every group has acked it, so the store sustains about "
+                "max_store_bytes / (bytes per publication x orphan_retention_seconds) "
+                "publications per second. Increase max_store_bytes (currently "
+                f"{max_store_bytes}) or shorten orphan_retention_seconds; if the disk "
+                "itself is full, free disk space."
             ) from error
         raise
     return publication

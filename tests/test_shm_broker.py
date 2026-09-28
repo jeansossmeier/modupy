@@ -164,6 +164,12 @@ async def test_cancelled_close_retry_waits_for_cold_store_cleanup(
         {"max_store_bytes": 1024**4 + 1},
         {"synchronous": "OFF"},
         {"completion_mode": []},
+        {"orphan_retention_seconds": 0},
+        {"orphan_retention_seconds": -1},
+        {"orphan_retention_seconds": float("inf")},
+        {"orphan_retention_seconds": float("nan")},
+        {"orphan_retention_seconds": "soon"},
+        {"orphan_retention_seconds": True},
     ],
 )
 def test_constructor_validates_options_before_creating_files(
@@ -314,6 +320,10 @@ async def test_payload_limit_accepts_exact_boundary_and_rejects_overage_without_
         ("MAX_PAYLOAD_BYTES", str(1024**3 + 1)),
         ("MAX_STORE_BYTES", "not-an-integer"),
         ("MAX_STORE_BYTES", str(1024**4 + 1)),
+        ("ORPHAN_RETENTION_SECONDS", "0"),
+        ("ORPHAN_RETENTION_SECONDS", "-5"),
+        ("ORPHAN_RETENTION_SECONDS", "nan"),
+        ("ORPHAN_RETENTION_SECONDS", "soon"),
     ],
 )
 def test_runtime_registration_rejects_invalid_storage_limit_environment(
@@ -690,6 +700,156 @@ async def test_prune_removes_at_most_one_bounded_batch(tmp_path: Path) -> None:
 
         assert await instance.prune(retention_age_seconds=1) == 1000
         assert len(_delivery_rows(db_path)) == 1
+    finally:
+        await instance.close()
+        instance._ring.unlink()
+
+
+def _retention_windows(path: Path) -> list[float]:
+    connection = sqlite3.connect(path)
+    try:
+        return [
+            float(row[0])
+            for row in connection.execute(
+                "SELECT retained_until - created_at FROM shm_publication ORDER BY sequence"
+            )
+        ]
+    finally:
+        connection.close()
+
+
+def _publication_count(path: Path) -> int:
+    connection = sqlite3.connect(path)
+    try:
+        return int(connection.execute("SELECT COUNT(*) FROM shm_publication").fetchone()[0])
+    finally:
+        connection.close()
+
+
+async def _publish_and_drain(instance: ShmBroker, count: int) -> int:
+    """Publish with an immediately acking consumer; return publishes before the store filled."""
+    for index in range(count):
+        try:
+            await instance.publish("events", b"x" * 1024)
+        except ConfigurationError as error:
+            assert "store is full" in str(error)
+            return index
+        for row in await instance.claim_batch("workers", batch_size=10, consumer_name="worker"):
+            await instance.ack(row["id"], consumer_name="worker")
+    return count
+
+
+async def test_orphan_retention_defaults_to_24_hours(tmp_path: Path) -> None:
+    db_path = tmp_path / "default-retention.db"
+    instance = ShmBroker(shm_name="default-retention-hints", db_path=str(db_path))
+    try:
+        await instance.publish("events", b"payload")
+
+        assert _retention_windows(db_path) == [pytest.approx(86400.0)]
+    finally:
+        await instance.close()
+        instance._ring.unlink()
+
+
+async def test_short_orphan_retention_frees_store_space_for_drained_publications(
+    tmp_path: Path,
+) -> None:
+    store_bytes = 256 * 1024
+    attempts = 1000
+    default_path = tmp_path / "default.db"
+    default = ShmBroker(
+        shm_name="default-hints",
+        db_path=str(default_path),
+        max_store_bytes=store_bytes,
+    )
+    try:
+        await default.subscribe(["events"], "workers")
+        # The drained store still fills: every acked publication is kept for 24 hours.
+        filled_after = await _publish_and_drain(default, attempts)
+        assert filled_after < attempts
+        assert _delivery_rows(default_path) == []
+    finally:
+        await default.close()
+        default._ring.unlink()
+
+    short_path = tmp_path / "short.db"
+    short = ShmBroker(
+        shm_name="short-hints",
+        db_path=str(short_path),
+        max_store_bytes=store_bytes,
+        orphan_retention_seconds=0.01,
+    )
+    try:
+        await short.subscribe(["events"], "workers")
+
+        assert await _publish_and_drain(short, attempts) == attempts
+        assert _publication_count(short_path) < filled_after
+    finally:
+        await short.close()
+        short._ring.unlink()
+
+
+async def test_late_subscriber_replay_honors_configured_orphan_retention(tmp_path: Path) -> None:
+    db_path = tmp_path / "replay-window.db"
+    instance = ShmBroker(
+        shm_name="replay-window-hints",
+        db_path=str(db_path),
+        orphan_retention_seconds=0.5,
+    )
+    try:
+        await instance.subscribe(["events"], "early")
+        await instance.publish("events", b"retained")
+        for row in await instance.claim_batch("early", batch_size=10, consumer_name="worker"):
+            await instance.ack(row["id"], consumer_name="worker")
+        assert _delivery_rows(db_path) == []
+        assert _retention_windows(db_path) == [pytest.approx(0.5)]
+
+        # Every original group is done, yet a group joining inside the window still replays.
+        await instance.subscribe(["events"], "late")
+        replayed = await instance.claim_batch("late", batch_size=10, consumer_name="worker")
+        assert [row["payload"] for row in replayed] == [b"retained"]
+        await instance.ack(replayed[0]["id"], consumer_name="worker")
+
+        await asyncio.sleep(0.6)
+        await instance.subscribe(["events"], "expired")
+        assert await instance.claim_batch("expired", batch_size=10, consumer_name="worker") == []
+        assert _publication_count(db_path) == 0
+    finally:
+        await instance.close()
+        instance._ring.unlink()
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [("config", 60.0), ("environment", 120.0)],
+)
+async def test_runtime_registration_applies_orphan_retention(
+    make_fake_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source: str,
+    expected: float,
+) -> None:
+    make_fake_app({"orders": ""})
+    if source == "environment":
+        monkeypatch.setenv("MODULITH_BROKER_ORPHAN_RETENTION_SECONDS", "120")
+    configure(
+        package="fakeapp",
+        topology="processes",
+        broker="shm",
+        broker_options={
+            "state_dir": str(tmp_path),
+            "sqlite_path": "retention.db",
+            "orphan_retention_seconds": 60,
+        },
+    )
+    _runtime.ensure_bootstrapped()
+    assert _runtime.broker_registry is not None
+    instance = cast(ShmBroker, _runtime.broker_registry.get("shm"))
+    try:
+        await instance.publish("events", b"payload")
+
+        assert _retention_windows(tmp_path / "retention.db") == [pytest.approx(expected)]
     finally:
         await instance.close()
         instance._ring.unlink()

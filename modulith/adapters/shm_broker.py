@@ -66,6 +66,7 @@ _DEFAULT_POLL_INTERVAL_S = 0.02
 _DEFAULT_RECLAIM_STALE_S = 60.0
 _MAX_DELIVERY_ATTEMPTS = 5
 _DEFAULT_RETENTION_AGE_S = 3 * 86400.0
+_DEFAULT_ORPHAN_RETENTION_S = 86400.0
 _DEFAULT_COMPLETION_MODE = "delete"
 _COMPLETION_MODES = frozenset({"delete", "mark"})
 _DEFAULT_SHM_CAPACITY = 8192
@@ -166,8 +167,13 @@ class ShmBroker:
         synchronous: str = _DEFAULT_SQLITE_SYNCHRONOUS,
         max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
         max_store_bytes: int = DEFAULT_SHM_MAX_STORE_BYTES,
+        orphan_retention_seconds: float = _DEFAULT_ORPHAN_RETENTION_S,
     ) -> None:
         capacity = _validated_hint_capacity(capacity)
+        orphan_retention_seconds = _positive_finite_float(
+            orphan_retention_seconds,
+            "orphan_retention_seconds",
+        )
         synchronous = _validated_synchronous(synchronous)
         max_payload_bytes = _bounded_positive_int(
             max_payload_bytes,
@@ -246,6 +252,7 @@ class ShmBroker:
             completion_mode=completion_mode,
             max_payload_bytes=max_payload_bytes,
             max_store_bytes=max_store_bytes,
+            orphan_retention_seconds=orphan_retention_seconds,
         )
         self._closed = False
 
@@ -507,6 +514,7 @@ _SHM_OPTION_ENV_SUFFIXES = {
     "sqlite_synchronous": "SQLITE_SYNCHRONOUS",
     "max_payload_bytes": "MAX_PAYLOAD_BYTES",
     "max_store_bytes": "MAX_STORE_BYTES",
+    "orphan_retention_seconds": "ORPHAN_RETENTION_SECONDS",
     "poll_interval_ms": "POLL_INTERVAL_MS",
     "batch_size": "BATCH_SIZE",
     "dispatch_concurrency": "DISPATCH_CONCURRENCY",
@@ -701,6 +709,10 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
         "max_store_bytes",
         _SHM_MAX_STORE_BYTES,
     )
+    orphan_retention_seconds = _option_or_default(
+        _opt_float(_broker_opt(opts, "orphan_retention_seconds", "ORPHAN_RETENTION_SECONDS")),
+        _DEFAULT_ORPHAN_RETENTION_S,
+    )
 
     broker = ShmBroker(
         shm_name=str(hint_path),
@@ -710,6 +722,7 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
         synchronous=str(synchronous),
         max_payload_bytes=max_payload_bytes,
         max_store_bytes=max_store_bytes,
+        orphan_retention_seconds=orphan_retention_seconds,
     )
     registry.register(_SHM_SCHEME, broker)
     logger.info(
