@@ -254,6 +254,7 @@ class ShmBroker:
             create=False,
             label="SHM hint file",
         )
+        self._db_path = resolved_db_path
         self._cold = ShmColdStore(
             str(resolved_db_path),
             synchronous=synchronous,
@@ -335,8 +336,25 @@ class ShmBroker:
         await self._cold.subscribe(targets, group)
 
     async def group_backlog(self) -> dict[str, int]:
-        """Map every subscribed group to its pending and claimed delivery count."""
+        """Map every subscribed group, or group with undelivered work, to its backlog."""
         return await self._cold.group_backlog()
+
+    @property
+    def store_location(self) -> str:
+        """The SQLite file holding this broker's subscriptions and deliveries."""
+        return str(self._db_path)
+
+    async def active_groups(self, *, within_seconds: float) -> set[str]:
+        """Groups a consumer refreshed, claimed or completed within ``within_seconds``."""
+        return await self._cold.active_groups(within_seconds)
+
+    async def touch_subscriptions(self, targets: list[str], group: str) -> None:
+        """Stamp ``group``'s subscriptions to ``targets`` as served right now."""
+        await self._cold.touch_subscriptions(list(targets), group)
+
+    async def sole_subscriber_targets(self, group: str) -> list[str]:
+        """Targets ``group`` subscribes to that no other group subscribes to."""
+        return await self._cold.sole_subscriber_targets(group)
 
     async def stale_targets(
         self, group: str, targets: list[str] | tuple[str, ...]
@@ -632,6 +650,28 @@ def _resolve_shm_paths(
         label="SHM hint file",
     )
     return state_dir, sqlite_path, hint_path
+
+
+def shm_store_path(package: str | None, broker_options: dict[str, Any]) -> Path:
+    """Where the SQLite store for these options lives, creating nothing.
+
+    Mirrors the path ``_resolve_shm_paths`` resolves (and creates) through
+    ``resolve_state_file`` in _state_path.py.
+    """
+    opts = _effective_shm_options(broker_options)
+    state_dir_value = _broker_opt(opts, "state_dir", "STATE_DIR")
+    state_dir = (
+        Path(os.path.abspath(os.path.expanduser(str(state_dir_value))))
+        if state_dir_value is not None
+        else default_state_directory(package)
+    )
+    sqlite_value = _broker_opt(opts, "sqlite_path", "SQLITE_PATH")
+    if sqlite_value is None:
+        sqlite_value = _broker_opt(opts, "url", "URL")
+    if sqlite_value is None:
+        return state_dir / DEFAULT_SHM_BROKER_DB_FILENAME
+    candidate = Path(os.path.expanduser(str(sqlite_value)))
+    return Path(os.path.abspath(candidate if candidate.is_absolute() else state_dir / candidate))
 
 
 def _shm_store_is_defaulted(package: str | None, sqlite_path: Path) -> bool:

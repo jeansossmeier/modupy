@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -4593,6 +4594,118 @@ async def test_drop_group_removes_a_retired_groups_subscription_and_undelivered_
     assert groups == {"modulith-orders"}
     assert message_groups == {"modulith-orders"}
     assert await broker.drop_group("modulith-retired") == (0, 0)
+
+
+async def test_group_backlog_reports_undelivered_rows_of_an_unsubscribed_group(
+    engine: Any,
+) -> None:
+    from sqlalchemy import delete
+
+    broker = DatabaseBroker(engine=engine)
+    await broker.subscribe(["t.A"], "modulith-live")
+    await broker.subscribe(["t.A"], "modulith-old")
+    await broker.publish("t.A", b"x", {"event_type": "t.A"})
+    await broker.publish("t.A", b"y", {"event_type": "t.A"})
+    await broker.claim_batch("modulith-old", batch_size=1, consumer_name="old:w")
+    _, subscription, _ = broker_schema()
+    async with engine.begin() as conn:
+        await conn.execute(
+            delete(subscription).where(subscription.c.consumer_group == "modulith-old")
+        )
+
+    assert await broker.group_backlog() == {"modulith-live": 2, "modulith-old": 2}
+
+
+async def test_active_groups_counts_recent_subscribes_and_claims(engine: Any) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import update
+
+    broker = DatabaseBroker(engine=engine)
+    for group in ("modulith-subscribed", "modulith-claiming", "modulith-idle"):
+        await broker.subscribe(["t.A"], group)
+    await broker.publish("t.A", b"x", {"event_type": "t.A"})
+    await broker.claim_batch("modulith-claiming", batch_size=1, consumer_name="c:w")
+    _, subscription, _ = broker_schema()
+    long_ago = datetime.now(UTC) - timedelta(days=30)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(subscription)
+            .where(subscription.c.consumer_group != "modulith-subscribed")
+            .values(updated_at=long_ago)
+        )
+
+    assert await broker.active_groups(within_seconds=3600) == {
+        "modulith-subscribed",
+        "modulith-claiming",
+    }
+
+
+async def test_running_consumer_keeps_an_idle_group_live(engine: Any) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import update
+
+    broker = DatabaseBroker(engine=engine)
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="idle:1",
+        group="modulith-idle",
+        targets=["t.A"],
+        poll_interval_s=0.01,
+    )
+    consumer._subscription_refresh_s = 0.05
+    _, subscription, _ = broker_schema()
+    await consumer.start()
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                update(subscription).values(updated_at=datetime.now(UTC) - timedelta(days=30))
+            )
+        await asyncio.sleep(0.3)
+
+        assert await broker.active_groups(within_seconds=3600) == {"modulith-idle"}
+    finally:
+        await consumer.stop()
+
+
+async def test_has_schema_is_false_without_creating_tables(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.db"
+    broker = DatabaseBroker(url=f"sqlite+aiosqlite:///{missing}")
+    try:
+        assert await broker.has_schema() is False
+        assert not missing.exists()
+    finally:
+        await broker.close()
+
+    empty = tmp_path / "empty.db"
+    sqlite3.connect(empty).close()
+    broker = DatabaseBroker(url=f"sqlite+aiosqlite:///{empty}")
+    try:
+        assert await broker.has_schema() is False
+        tables = sqlite3.connect(empty).execute("SELECT name FROM sqlite_master").fetchall()
+        assert tables == []
+        await broker.subscribe(["t.A"], "g")
+        assert await broker.has_schema() is True
+    finally:
+        await broker.close()
+
+
+def test_store_location_masks_the_password() -> None:
+    broker = DatabaseBroker(url="postgresql+asyncpg://app:s3cret@db.internal:5432/shop")
+
+    assert broker.store_location == "postgresql+asyncpg://app:***@db.internal:5432/shop"
+
+
+async def test_sole_subscriber_targets_lists_targets_no_other_group_holds(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker.subscribe(["t.Only", "t.Shared", "t.Also"], "modulith-retired")
+    await broker.subscribe(["t.Shared"], "modulith-orders")
+
+    assert await broker.sole_subscriber_targets("modulith-retired") == ["t.Also", "t.Only"]
+    assert await broker.sole_subscriber_targets("modulith-orders") == []
 
 
 async def test_listener_that_never_returns_degrades_database_consumer_health(

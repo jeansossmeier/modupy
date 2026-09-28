@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from ..config import DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_SHM_MAX_STORE_BYTES
 from . import _shm_claims, _shm_completion, _shm_publications
-from ._shm_schema import open_database
+from ._shm_schema import immediate_transaction, open_database
 from ._shm_types import ClaimToken, PublishResult
 
 __all__ = ["ClaimToken", "PublishResult", "SqliteQueueStore"]
@@ -79,6 +80,44 @@ class SqliteQueueStore:
 
     def group_backlog(self) -> dict[str, int]:
         return _shm_publications.group_backlog(self._conn)
+
+    def active_groups(self, within_seconds: float) -> set[str]:
+        """Groups a consumer refreshed, claimed or completed within ``within_seconds``."""
+        cutoff = time.time() - within_seconds
+        rows = self._conn.execute(
+            """
+            SELECT consumer_group FROM shm_subscription WHERE updated_at>=?
+            UNION
+            SELECT consumer_group FROM shm_delivery WHERE claimed_at>=? OR completed_at>=?
+            UNION
+            SELECT consumer_group FROM shm_completion_tombstone WHERE completed_at>=?
+            """,
+            (cutoff, cutoff, cutoff, cutoff),
+        )
+        return {str(row["consumer_group"]) for row in rows}
+
+    def touch_subscriptions(self, targets: list[str], group: str) -> None:
+        """Stamp this group's subscription rows as served by a running consumer."""
+        marks = ",".join("?" * len(targets))
+        with immediate_transaction(self._conn):
+            self._conn.execute(
+                f"UPDATE shm_subscription SET updated_at=? "
+                f"WHERE consumer_group=? AND target IN ({marks})",
+                (time.time(), group, *targets),
+            )
+
+    def sole_subscriber_targets(self, group: str) -> list[str]:
+        """Targets ``group`` subscribes to that no other group subscribes to."""
+        rows = self._conn.execute(
+            """
+            SELECT target FROM shm_subscription
+            WHERE target IN (SELECT target FROM shm_subscription WHERE consumer_group=?)
+            GROUP BY target HAVING COUNT(*)=1
+            ORDER BY target
+            """,
+            (group,),
+        )
+        return [str(row["target"]) for row in rows]
 
     def stale_targets(self, group: str, targets: list[str]) -> dict[str, int]:
         return _shm_publications.stale_targets(self._conn, group, targets)

@@ -230,7 +230,11 @@ def subscribe(
 
 
 def group_backlog(conn: sqlite3.Connection) -> dict[str, int]:
-    """Map every subscribed group to its pending and claimed delivery count."""
+    """Map every group to its pending and claimed delivery count.
+
+    A group counts when it is subscribed or still holds pending or claimed
+    deliveries, so deliveries left behind by an unsubscribed group show up.
+    """
     rows = conn.execute(
         """
         SELECT s.consumer_group, (
@@ -238,7 +242,11 @@ def group_backlog(conn: sqlite3.Connection) -> dict[str, int]:
             WHERE d.consumer_group=s.consumer_group
               AND d.status IN ('pending', 'claimed')
         ) AS backlog
-        FROM (SELECT DISTINCT consumer_group FROM shm_subscription) AS s
+        FROM (
+            SELECT consumer_group FROM shm_subscription
+            UNION
+            SELECT consumer_group FROM shm_delivery WHERE status IN ('pending', 'claimed')
+        ) AS s
         ORDER BY s.consumer_group
         """
     )

@@ -567,32 +567,56 @@ def _group_ledger_broker(rt: Runtime, scheme: str) -> Any | None:
     return registry.get(scheme)
 
 
-async def _warn_about_retired_groups(rt: Runtime, scheme: str, derived: set[str]) -> None:
-    """Log one warning per subscribed group that no current module derives.
+# A group whose consumer subscribed or claimed within this window counts as
+# live even when no local module derives it: an extracted service, or another
+# host of a rolling deploy, still serves it. A daily traffic cycle fits inside.
+_LIVE_GROUP_WINDOW_S = 24 * 60 * 60
 
-    Such a group never consumes again, so every publication to its targets
-    stays pinned by an undelivered row. Nothing is deleted here: a module
-    that is only disabled for this deploy gets its backlog when it returns.
+
+async def _live_groups(broker: Any, derived: set[str]) -> set[str]:
+    """Groups a module of this deployment derives or a consumer recently served."""
+    active: set[str] = await broker.active_groups(within_seconds=_LIVE_GROUP_WINDOW_S)
+    return derived | active
+
+
+async def _warn_about_retired_groups(rt: Runtime, scheme: str, derived: set[str]) -> None:
+    """Log one warning per group that no module derives and no consumer served lately.
+
+    Every later publication to its targets is queued for it. Nothing is
+    deleted here: a module that is only disabled for this deploy gets its
+    backlog when it returns.
     """
     broker = _group_ledger_broker(rt, scheme)
     if broker is None:
         return
     try:
         backlog = await broker.group_backlog()
+        live = await _live_groups(broker, derived)
     except Exception:
         logger.warning("could not read the %s broker's subscribed groups", scheme, exc_info=True)
         return
+    hours = _LIVE_GROUP_WINDOW_S // 3600
     for group, pending in backlog.items():
-        if group in derived:
+        if group in live:
             continue
+        if pending:
+            held = f"it holds {pending} pending or claimed delivery(ies) that no consumer claimed"
+        else:
+            held = "it holds no backlog yet"
+        cost = (
+            "and those rows keep the shm store from pruning its publications"
+            if scheme == "shm"
+            else "and those rows pile up in broker_message"
+        )
         logger.warning(
-            "broker group %r is subscribed but no module of this deployment derives it; "
-            "it holds %d pending or claimed delivery(ies) that nothing will consume, and "
-            "they keep the %s store from pruning. If the module is retired for good, run: "
+            "broker group %r is not derived by any module of this deployment and no "
+            "consumer served it in the last %d h; %s. Every later publication to its "
+            "targets is queued for it too, %s. If the module is retired for good, run: "
             "modulith broker drop-group %s",
             group,
-            pending,
-            scheme,
+            hours,
+            held,
+            cost,
             group,
         )
 
@@ -1388,6 +1412,48 @@ broker_app = typer.Typer(help="Broker operational commands.")
 app.add_typer(broker_app, name="broker")
 
 
+def _exit_unless_shm_store_exists() -> None:
+    """Exit 1 when the shm store drop-group would act on does not exist.
+
+    Bootstrapping the shm broker creates its state directory and SQLite
+    file, so the check has to run first, from configuration alone.
+    """
+    from .adapters.shm_broker import shm_store_path
+
+    try:
+        resolved = load_configuration(**_runtime._config_overrides)
+    except ConfigurationError:
+        return  # _bootstrap_or_exit reports it
+    if resolved.broker != "shm":
+        return
+    package = resolved.package or _detect_from_pyproject_name()
+    try:
+        path = shm_store_path(package, dict(resolved.broker_options or {}))
+    except ConfigurationError:
+        return
+    if not path.is_file():
+        typer.echo(
+            f"error: no shm broker store at {path}; nothing was removed. Run this with "
+            "the service's broker configuration (state_dir or MODULITH_BROKER_STATE_DIR).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
+def _sole_subscriber_warning(group: str, sole: list[str], broker: Any, scheme: str) -> str:
+    names = ", ".join(repr(t) for t in sole)
+    if scheme == "database" and broker.no_subscriber_policy in ("error", "wait"):
+        effect = (
+            f"under the database broker's {broker.no_subscriber_policy!r} no-subscriber "
+            "policy, every later publish to them raises NoSubscribersError"
+        )
+    elif scheme == "database":
+        effect = "later publishes to them are retained until a group subscribes"
+    else:
+        effect = "later publishes to them are stored but reach no consumer"
+    return f"warning: {group!r} is the only subscriber of {names}; after the drop, {effect}."
+
+
 @broker_app.command("drop-group")
 def broker_drop_group(
     group: str = typer.Argument(..., help="Consumer group, e.g. 'modulith-notifications'"),
@@ -1411,6 +1477,7 @@ def broker_drop_group(
     then needs no ``--force``.
     """
     _runtime.configure(topology="processes")
+    _exit_unless_shm_store_exists()
     rt = _bootstrap_or_exit()
     cfg = rt.config
     assert cfg is not None
@@ -1423,22 +1490,52 @@ def broker_drop_group(
         )
         raise typer.Exit(code=1)
     targets = list(target) if target else None
-    if (
-        targets is None
-        and group in _derived_consumer_groups(cfg.package, cfg.contracts_module)
-        and not force
-    ):
+    derived = _derived_consumer_groups(cfg.package, cfg.contracts_module)
+    scope = f"group {group!r}" if targets is None else f"targets {targets!r} of group {group!r}"
+
+    async def drop() -> tuple[int, int]:
+        # One event loop for every call: the database broker binds its engine
+        # to the loop that first used it.
+        typer.echo(f"{cfg.broker} broker store: {broker.store_location}")
+        if cfg.broker == "database" and not await broker.has_schema():
+            typer.echo(
+                f"error: no database broker tables at {broker.store_location}; "
+                "nothing was removed. Run this with the service's broker configuration.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if targets is None and not force and group in await _live_groups(broker, derived):
+            typer.echo(
+                f"error: {group!r} belongs to a module of the current deployment or a "
+                f"consumer served it in the last {_LIVE_GROUP_WINDOW_S // 3600} h. Dropping "
+                "it deletes its queued messages undelivered, and its running workers receive "
+                "no new publications until they restart and subscribe again. Pass --force "
+                "to drop it anyway.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        sole = [
+            t
+            for t in await broker.sole_subscriber_targets(group)
+            if targets is None or t in targets
+        ]
+        if sole:
+            typer.echo(_sole_subscriber_warning(group, sole, broker, cfg.broker))
+        prompt = f"Drop {scope} and delete its pending and claimed messages?"
+        if not yes and not typer.confirm(prompt):
+            typer.echo("aborted — nothing was removed", err=True)
+            raise typer.Exit(code=1)
+        removed: tuple[int, int] = await broker.drop_group(group, targets=targets)
+        return removed
+
+    subscriptions, deliveries = asyncio.run(drop())
+    if not subscriptions and not deliveries:
         typer.echo(
-            f"error: {group!r} belongs to a module of the current deployment; its workers "
-            "would lose their queued messages. Pass --force to drop it anyway.",
+            f"error: {scope} has no subscription or undelivered work in the "
+            f"{cfg.broker} broker's store; nothing was removed",
             err=True,
         )
         raise typer.Exit(code=1)
-    scope = f"group {group!r}" if targets is None else f"targets {targets!r} of group {group!r}"
-    if not yes and not typer.confirm(f"Drop {scope} and delete its pending and claimed messages?"):
-        typer.echo("aborted — nothing was removed", err=True)
-        raise typer.Exit(code=1)
-    subscriptions, deliveries = asyncio.run(broker.drop_group(group, targets=targets))
     typer.echo(
         f"dropped {scope}: {subscriptions} subscription(s), "
         f"{deliveries} pending or claimed delivery(ies)"

@@ -43,6 +43,7 @@ _SCHEMA = (
     CREATE TABLE IF NOT EXISTS shm_subscription (
         target TEXT NOT NULL,
         consumer_group TEXT NOT NULL,
+        updated_at REAL,
         PRIMARY KEY (target, consumer_group)
     )
     """,
@@ -176,6 +177,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # it backfilled without a schema-version migration path.
         conn.execute(_PUBLICATION_EXPIRY_INDEX_SCHEMA)
         _add_dispatch_started_column(conn)
+        _add_subscription_updated_at_column(conn)
+
+
+def _add_subscription_updated_at_column(conn: sqlite3.Connection) -> None:
+    """Backfill the consumer liveness stamp onto an older subscription table.
+
+    Nullable, so rows written by an older runtime simply read as never refreshed.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(shm_subscription)")}
+    if "updated_at" not in columns:
+        conn.execute("ALTER TABLE shm_subscription ADD COLUMN updated_at REAL")
 
 
 def _add_dispatch_started_column(conn: sqlite3.Connection) -> None:

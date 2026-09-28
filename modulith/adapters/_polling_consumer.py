@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from .._health_failures import HealthFailures
 from .._shutdown import DEFAULT_STOP_TIMEOUT_S, cancel_and_wait
@@ -19,13 +20,22 @@ _BACKOFF_CAP_S = 5.0
 _BACKOFF_MAX_EXPONENT = 7
 _IDLE_BACKOFF_CAP_S = 0.5
 _DEFAULT_PRUNE_INTERVAL_S = 300.0
+# Must stay well under cli._LIVE_GROUP_WINDOW_S, the age after which the
+# retired-group check stops counting a subscription as served.
+SUBSCRIPTION_REFRESH_S = 3600.0
 IdleWait = Callable[[float], Awaitable[None]]
+
+
+@runtime_checkable
+class _SubscriptionToucher(Protocol):
+    async def touch_subscriptions(self, targets: list[str], group: str) -> None: ...
 
 
 class PollingConsumer(DeliveryDispatch):
     """Store-neutral poll, health, backoff, pruning, and shutdown lifecycle."""
 
     _stop_timeout_s: float = DEFAULT_STOP_TIMEOUT_S
+    _subscription_refresh_s: float = SUBSCRIPTION_REFRESH_S
 
     def __init__(
         self,
@@ -212,9 +222,28 @@ class PollingConsumer(DeliveryDispatch):
             what=f"consumer {self._consumer_name!r} {label} task",
         )
 
+    async def _touch_subscriptions_if_due(self, now: float, last: float) -> float:
+        """Re-stamp this group's subscriptions so an idle consumer still reads as live."""
+        if now - last < self._subscription_refresh_s:
+            return last
+        if not isinstance(self._broker, _SubscriptionToucher):
+            return now
+        try:
+            await self._broker.touch_subscriptions(self._targets, self._group)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._logger.warning(
+                "could not refresh the subscriptions of group %s", self._group, exc_info=True
+            )
+        return now
+
     async def _run(self) -> None:
         idle_empty_streak = 0
+        loop = asyncio.get_running_loop()
+        touched_at = -math.inf
         while not self._stopping:
+            touched_at = await self._touch_subscriptions_if_due(loop.time(), touched_at)
             try:
                 rows = await self._broker.claim_batch(
                     self._group,

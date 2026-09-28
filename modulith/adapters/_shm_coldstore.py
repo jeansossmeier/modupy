@@ -101,6 +101,15 @@ class ShmColdStore(SerialStoreExecutor):
     async def group_backlog(self) -> dict[str, int]:
         return cast(dict[str, int], await self._call("group_backlog"))
 
+    async def active_groups(self, within_seconds: float) -> set[str]:
+        return cast(set[str], await self._call("active_groups", within_seconds))
+
+    async def touch_subscriptions(self, targets: list[str], group: str) -> None:
+        await self._call("touch_subscriptions", targets, group)
+
+    async def sole_subscriber_targets(self, group: str) -> list[str]:
+        return cast(list[str], await self._call("sole_subscriber_targets", group))
+
     async def stale_targets(self, group: str, targets: list[str]) -> dict[str, int]:
         return cast(dict[str, int], await self._call("stale_targets", group, targets))
 
