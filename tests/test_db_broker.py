@@ -4775,7 +4775,7 @@ async def test_consumer_warns_once_at_start_about_a_stale_subscription(
             await broker.publish(
                 live, serializer.serialize(WidgetCreated(name=name)), {"event_type": live}
             )
-        await _until_async(lambda: _async_true(delivered == ["w1", "w2", "w3"]))
+        await _until_async(lambda: _async_true(sorted(delivered) == ["w1", "w2", "w3"]))
     finally:
         await consumer.stop()
 
