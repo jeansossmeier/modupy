@@ -109,8 +109,58 @@ def _hint_tag(hint: Any) -> str:
     return repr(hint)
 
 
+def _unwrap_alias(hint: Any) -> Any:
+    """Resolve ``NewType`` and ``type X = ...`` aliases to the type they name.
+
+    Callers apply this to the hint itself, never to union members before
+    ``_hint_tag``: stored union tags name a ``NewType`` member by its repr.
+    """
+    while True:
+        if hasattr(hint, "__supertype__"):
+            hint = hint.__supertype__
+        elif type(hint).__name__ == "TypeAliasType":  # typing's or typing_extensions'
+            hint = hint.__value__
+        else:
+            return hint
+
+
+def _is_tagged(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {_UNION_TAG, "value"}
+        and isinstance(value[_UNION_TAG], str)
+    )
+
+
+class _UnknownSubclassTagError(ValueError):
+    """A nested type tag named no subclass of the declared field type."""
+
+
+def _subclass_for_tag(base: type, tag: str) -> type:
+    """Find the subclass of ``base`` whose ``_hint_tag`` is ``tag``.
+
+    The tag comes from an untrusted payload, and only the top-level event
+    type is checked against ``allowed_event_types``. So the tag is matched
+    against ``base``'s already-imported subclass tree and never imported.
+    """
+    pending = list(base.__subclasses__())
+    while pending:
+        candidate = pending.pop()
+        if _hint_tag(candidate) == tag:
+            return candidate
+        pending.extend(candidate.__subclasses__())
+    raise _UnknownSubclassTagError(
+        f"nested type tag {tag!r} names no imported subclass of {_hint_tag(base)}"
+    )
+
+
 def _to_jsonable_typed(obj: Any, hint: Any) -> Any:
-    """Encode values using their annotations where JSON loses union identity."""
+    """Encode values using their annotations where JSON loses type identity.
+
+    Union members and subclass instances in a field declared as their base
+    dataclass are wrapped as ``{_UNION_TAG: <tag>, "value": ...}``.
+    """
+    hint = _unwrap_alias(hint)
     origin = typing.get_origin(hint)
     if origin is Union or origin is types.UnionType:
         members = [member for member in typing.get_args(hint) if member is not type(None)]
@@ -120,6 +170,15 @@ def _to_jsonable_typed(obj: Any, hint: Any) -> Any:
                     candidate
                     for candidate in members
                     if isinstance(candidate, type) and type(obj) is candidate
+                ),
+                None,
+            ) or next(
+                (
+                    candidate
+                    for candidate in members
+                    if dataclasses.is_dataclass(candidate)
+                    and isinstance(candidate, type)
+                    and isinstance(obj, candidate)
                 ),
                 members[0],
             )
@@ -144,6 +203,13 @@ def _to_jsonable_typed(obj: Any, hint: Any) -> Any:
     if isinstance(hint, type) and isinstance(obj, dict):
         hints = _safe_type_hints(hint)
         return {key: _to_jsonable_typed(value, hints.get(key)) for key, value in obj.items()}
+    if (
+        dataclasses.is_dataclass(hint)
+        and isinstance(hint, type)
+        and type(obj) is not hint
+        and isinstance(obj, hint)
+    ):
+        return {_UNION_TAG: _hint_tag(type(obj)), "value": _to_jsonable_typed(obj, type(obj))}
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         hints = _safe_type_hints(type(obj))
         return {
@@ -277,14 +343,11 @@ def _coerce(value: Any, hint: Any) -> Any:
     if value is None or hint is None:
         return value
 
+    hint = _unwrap_alias(hint)
     origin = typing.get_origin(hint)
     if origin is Union or origin is types.UnionType:
         members = [a for a in typing.get_args(hint) if a is not type(None)]
-        if (
-            isinstance(value, dict)
-            and set(value) == {_UNION_TAG, "value"}
-            and isinstance(value[_UNION_TAG], str)
-        ):
+        if _is_tagged(value):
             tagged_member = next(
                 (member for member in members if _hint_tag(member) == value[_UNION_TAG]),
                 None,
@@ -294,6 +357,8 @@ def _coerce(value: Any, hint: Any) -> Any:
         for member in members:
             try:
                 return _coerce(value, member)
+            except _UnknownSubclassTagError:
+                raise
             except (ValueError, TypeError):
                 continue
         return value
@@ -356,6 +421,8 @@ def _coerce(value: Any, hint: Any) -> Any:
         return hint(value)
     # Nested dataclass field: reconstruct recursively from the decoded dict.
     if dataclasses.is_dataclass(hint) and isinstance(hint, type) and isinstance(value, dict):
+        if _is_tagged(value):
+            return _coerce(value["value"], _subclass_for_tag(hint, value[_UNION_TAG]))
         sub_hints = _safe_type_hints(hint)
         return hint(**{k: _coerce(v, sub_hints.get(k)) for k, v in value.items()})
     return value
