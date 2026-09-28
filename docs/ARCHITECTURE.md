@@ -250,9 +250,12 @@ listeners by `type(event)` and dispatches to **all** listeners for that type
   framework never swallows a genuine application failure as a budget overrun.
   That persistent daemon-thread loop is a second event loop.
   - **Outbox:** an outbox `AsyncEngine` also driven by `await publish()` on the
-    app loop is shared across both loops. Once its connection pool is
-    exhausted, SQLAlchemy raises `RuntimeError: <Queue> is bound to a different
-    event loop`.
+    app loop is shared across both loops. On Postgres and MySQL the first query
+    one loop runs on a connection the other loop opened raises `RuntimeError:
+    ... attached to a different loop`, even with idle connections in the pool;
+    an asyncpg connection is then unusable from its own loop too. On SQLite a
+    loop that waits for the single pooled connection raises `RuntimeError:
+    <Queue> is bound to a different event loop`.
   - **Database broker:** the broker never shares its pool across loops. It
     submits a call from another loop to the loop that first used it and runs
     the call there, so that loop must stay running and unblocked.
