@@ -428,6 +428,14 @@ def test_dev_isolate_help_states_it_excludes_other_modules():
     assert "only" in result.stdout.lower()
 
 
+def test_extract_force_help_states_the_import_check_is_never_overridden():
+    result = runner.invoke(app, ["extract", "--help"])
+
+    assert result.exit_code == 0, result.output
+    help_text = " ".join(result.stdout.replace("│", " ").split())
+    assert "never overrides the import check" in help_text
+
+
 def test_dev_processes_topology_uses_app_module_package_and_worker_env(make_fake_app, monkeypatch):
     """CLI-only process runs must hand package/broker config to workers.
 

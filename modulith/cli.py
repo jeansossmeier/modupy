@@ -1030,7 +1030,12 @@ def extract(
         help="Directory to write the extracted service (default: <module>-service)",
     ),
     force: bool = typer.Option(
-        False, "--force", help="Extract despite boundary violations or shared tables"
+        False,
+        "--force",
+        help=(
+            "Extract despite boundary violations, shared tables or imports of other "
+            "modules; never overrides the import check"
+        ),
     ),
 ) -> None:
     """Scaffold a standalone service (pyproject, Dockerfile, README) from one module.
@@ -1041,8 +1046,10 @@ def extract(
     the extracted module in a subprocess, so the service's third-party
     dependencies must be installed. Exit codes: 0 on success, 1 on an
     unknown module, boundary violations / shared tables / imports of other
-    modules not overridden by --force, an extracted module that fails to
-    import, or an existing/unsafe --output path (never overridable).
+    modules not overridden by --force, or (never overridable) an extracted
+    module that fails to import or loads code from the source tree outside
+    the extracted service, or an existing/unsafe --output path. A module-level
+    import of another module therefore fails even with --force.
     """
     from .extract import extraction_blockers, import_closure, write_extraction
 
