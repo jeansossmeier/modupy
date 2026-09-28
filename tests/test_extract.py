@@ -191,9 +191,10 @@ def test_extract_boundary_violation_blocks_and_force_overrides(
 ):
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     # orders reaches into inventory's private package — a hard boundary break.
+    # The import is deferred so the forced extraction still imports.
     make_fake_app(
         {
-            "orders": "from fakeapp.inventory._internal import secret\n",
+            "orders": "def use():\n    from fakeapp.inventory._internal import secret\n    return secret\n",
             "inventory": "",
         },
         extra_files={
@@ -596,3 +597,100 @@ def test_write_extraction_rejects_nonexistent_module(make_fake_app, monkeypatch,
         )
 
     assert not output.exists()
+
+
+def test_extract_copies_import_closure_of_module_contracts_and_helpers(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "from fakeapp.util import fmt\n", "inventory": ""},
+        extra_files={
+            "util.py": "from fakeapp.money import cents\n\ndef fmt():\n    return cents\n",
+            "money.py": "cents = 100\n",
+            "contracts/__init__.py": "",
+            "contracts/events.py": "from fakeapp.types import Currency\n",
+            "types.py": "Currency = str\n",
+        },
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    for rel in ("util.py", "money.py", "types.py", "contracts/events.py"):
+        assert (out_dir / "fakeapp" / rel).is_file(), rel
+    assert not (out_dir / "fakeapp" / "inventory").exists()
+    readme = (out_dir / "README.md").read_text()
+    assert "- `fakeapp.money`" in readme
+    assert "- `fakeapp.types`" in readme
+    assert "- `fakeapp.util`" in readme
+
+
+def test_extract_copies_helper_imported_from_bare_package(make_fake_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "from fakeapp import telemetry, serialization\n"},
+        extra_files={
+            "telemetry.py": "TRACE = True\n",
+            "serialization.py": "",
+            "unused.py": "",
+            "contracts/__init__.py": "",
+        },
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "fakeapp" / "telemetry.py").read_text() == "TRACE = True\n"
+    assert (out_dir / "fakeapp" / "serialization.py").is_file()
+    assert not (out_dir / "fakeapp" / "unused.py").exists()
+    readme = (out_dir / "README.md").read_text()
+    assert "- `fakeapp.telemetry`" in readme
+    assert "- `fakeapp.serialization`" in readme
+    assert "- `fakeapp`\n" not in readme
+
+
+def test_extract_blocks_import_of_another_declared_module_and_force_overrides(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {
+            "orders": "from fakeapp.util import fmt\n",
+            "inventory": "def reserve():\n    return 1\n",
+        },
+        extra_files={
+            "util.py": "def fmt():\n    from fakeapp.inventory import reserve\n    return reserve()\n",
+            "contracts/__init__.py": "",
+        },
+    )
+    out_dir = tmp_path / "orders-service"
+
+    blocked = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+    assert blocked.exit_code == 1, blocked.output
+    assert "imports declared module(s): inventory" in blocked.output
+    assert not out_dir.exists()
+
+    forced = runner.invoke(app, ["extract", "orders", "--output", str(out_dir), "--force"])
+    assert forced.exit_code == 0, forced.output
+    assert not (out_dir / "fakeapp" / "inventory").exists()
+    assert "imports declared module(s): inventory" in (out_dir / "README.md").read_text()
+
+
+def test_extract_fails_when_extracted_module_does_not_import(make_fake_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": 'import importlib\nimportlib.import_module("fakeapp." + "hidden")\n'},
+        extra_files={"hidden.py": "", "contracts/__init__.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 1, result.output
+    assert "fakeapp.orders" in result.output
+    assert "No module named 'fakeapp.hidden'" in result.output
+    assert not out_dir.exists()
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".orders-service.")] == []
