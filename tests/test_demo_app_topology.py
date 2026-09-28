@@ -250,11 +250,14 @@ async def test_demo_app_worker_routes_are_isolated_per_module(tmp_path: Path) ->
             await _wait_healthy(direct, inventory_port, "inventory")
             await _wait_healthy(direct, notifications_port, "notifications")
 
-            # Health readiness fields: orders has no listeners (no consumer),
-            # so it reports the no-consumer shape; inventory/notifications have
-            # listeners, so their consumer must report ready=True once healthy.
+            # Health readiness fields: orders has no listeners, but on the
+            # database broker (as on SHM) its worker still builds an empty
+            # consumer, with no poll task, so startup can warn about
+            # subscriptions its group still holds; that consumer reports ready.
+            # inventory/notifications have listeners, so their consumer must
+            # report ready=True once healthy.
             orders_health = await direct.get(f"http://127.0.0.1:{orders_port}/health")
-            assert orders_health.json() == {"status": "ok", "module": "orders"}
+            assert orders_health.json() == {"status": "ready", "module": "orders", "ready": True}
 
             for port, module in (
                 (inventory_port, "inventory"),
