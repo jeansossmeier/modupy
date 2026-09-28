@@ -175,6 +175,39 @@ def create_app() -> FastAPI:
         redoc_url=None,
     )
 
+    # Echoed on /health so the supervisor's proxy can tell its own workers from
+    # another deployment's listener on the same loopback port.
+    identity = {"module": module_name}
+    if deployment_token := os.environ.get("MODULITH_DEPLOYMENT_TOKEN"):
+        identity["deployment"] = deployment_token
+
+    # Registered BEFORE include_router: Starlette matches in registration
+    # order, and the proxy's identity check reads this route, so a module named
+    # "health" with a root route must not be able to answer it instead.
+    @app.get("/health")
+    async def health() -> Any:
+        consumer = getattr(app.state, "consumer", None)
+        if consumer is None:
+            return {"status": "ok", **identity}
+        if not isinstance(consumer, HealthAwareConsumer):
+            warning = "consumer does not expose health"
+            if not app.state.legacy_health_warning_emitted:
+                logger.warning("worker %r readiness is unknown: %s", module_name, warning)
+                app.state.legacy_health_warning_emitted = True
+            return {"status": "unknown", **identity, "warning": warning}
+
+        snapshot = consumer.health()
+        response: dict[str, Any] = {
+            "status": snapshot.status,
+            **identity,
+            "ready": snapshot.ready,
+        }
+        if snapshot.detail is not None:
+            response["detail"] = snapshot.detail
+        if snapshot.ready:
+            return response
+        return JSONResponse(status_code=503, content=response)
+
     router = getattr(module, "router", None)
     if router is not None:
         app.include_router(router, prefix=f"/{module_name}")
@@ -222,36 +255,6 @@ def create_app() -> FastAPI:
     app.redoc_url = f"/{module_name}/redoc"
     app.swagger_ui_oauth2_redirect_url = f"/{module_name}/docs/oauth2-redirect"
     app.setup()
-
-    # Echoed on /health so the supervisor's proxy can tell its own workers from
-    # another deployment's listener on the same loopback port.
-    identity = {"module": module_name}
-    if deployment_token := os.environ.get("MODULITH_DEPLOYMENT_TOKEN"):
-        identity["deployment"] = deployment_token
-
-    @app.get("/health")
-    async def health() -> Any:
-        consumer = getattr(app.state, "consumer", None)
-        if consumer is None:
-            return {"status": "ok", **identity}
-        if not isinstance(consumer, HealthAwareConsumer):
-            warning = "consumer does not expose health"
-            if not app.state.legacy_health_warning_emitted:
-                logger.warning("worker %r readiness is unknown: %s", module_name, warning)
-                app.state.legacy_health_warning_emitted = True
-            return {"status": "unknown", **identity, "warning": warning}
-
-        snapshot = consumer.health()
-        response: dict[str, Any] = {
-            "status": snapshot.status,
-            **identity,
-            "ready": snapshot.ready,
-        }
-        if snapshot.detail is not None:
-            response["detail"] = snapshot.detail
-        if snapshot.ready:
-            return response
-        return JSONResponse(status_code=503, content=response)
 
     logger.info("worker app built for module %r (package %r)", module_name, app_package)
     return app

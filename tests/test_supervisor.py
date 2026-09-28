@@ -21,6 +21,7 @@ import os
 import signal
 import sys
 import time
+from typing import Any
 
 import pytest
 
@@ -142,6 +143,86 @@ async def test_run_supervised_refuses_a_proxy_port_inside_the_worker_range(
     assert sup.events == []  # no worker was spawned
 
 
+async def test_supervisor_tells_spawn_listeners_about_every_spawn_and_restart() -> None:
+    spawned: list[int] = []
+
+    def crash_builder(spec: WorkerSpec, port: int) -> list[str]:
+        return _CRASH
+
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", 9001)],
+        command_builder=crash_builder,
+        restart_initial_delay=0.05,
+        restart_max_delay=0.05,
+    )
+    sup.add_spawn_listener(spawned.append)
+    try:
+        await sup.start()
+        await asyncio.sleep(0.4)
+    finally:
+        await sup.stop()
+
+    assert len(spawned) >= 2
+    assert set(spawned) == {9001}
+
+
+async def test_proxy_reverifies_a_worker_port_after_the_supervisor_respawns_it() -> None:
+    import httpx
+    from fastapi import FastAPI
+
+    from conftest import _serve
+
+    class _ListeningSupervisor(_FakeSupervisor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.listeners: list[Any] = []
+
+        def add_spawn_listener(self, listener: Any) -> None:
+            self.listeners.append(listener)
+
+    port = _free_port()
+    sup = _ListeningSupervisor()
+    captured: dict[str, Any] = {}
+
+    async def fake_serve(app: object, host: str, p: int) -> None:
+        captured["app"] = app
+
+    spec = WorkerSpec("orders", "app", port)
+    await run_supervised([spec], "127.0.0.1", 8000, supervisor=sup, serve=fake_serve)
+    answering = {"token": (spec.env or {})["MODULITH_DEPLOYMENT_TOKEN"]}
+    hits: list[str] = []
+    backend = FastAPI()
+
+    @backend.get("/orders/x")
+    async def x() -> dict[str, bool]:
+        hits.append("/orders/x")
+        return {"ok": True}
+
+    @backend.get("/health")
+    async def health() -> dict[str, str]:
+        hits.append("/health")
+        return {"status": "ok", "module": "orders", "deployment": answering["token"]}
+
+    proxy_app = captured["app"]
+    server, task = await _serve(backend, port, "h11")
+    try:
+        async with proxy_app.router.lifespan_context(proxy_app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+            ) as c:
+                first = await c.get("/orders/x")
+                answering["token"] = "another-deployment"
+                for listener in sup.listeners:
+                    listener(port)
+                second = await c.get("/orders/x")
+    finally:
+        server.should_exit = True
+        await task
+
+    assert (first.status_code, second.status_code) == (200, 503)
+    assert hits == ["/health", "/orders/x", "/health"]
+
+
 # ---------------------------------------------------------------------------
 # _rules_from_specs (pure) — derives the reverse-proxy routing table
 # ---------------------------------------------------------------------------
@@ -197,6 +278,9 @@ class _FakeSupervisor:
 
     def failed_instances(self) -> frozenset[str]:
         return frozenset()
+
+    def add_spawn_listener(self, listener: Any) -> None:
+        pass
 
 
 async def test_run_supervised_starts_serves_then_stops() -> None:

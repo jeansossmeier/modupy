@@ -299,6 +299,7 @@ class Supervisor:
         self._restart_max_delay = restart_max_delay
         self._shutdown_timeout = shutdown_timeout
         self._command_builder: CommandBuilder = command_builder or _default_command
+        self._spawn_listeners: list[Callable[[int], None]] = []
         # Circuit-breaker bound: more than `max_restarts` crashes IN A ROW,
         # with no healthy run in between, means the module is deterministically
         # broken → give up on that instance rather than respawn forever. A
@@ -334,6 +335,11 @@ class Supervisor:
                 name = spec.module_name if spec.worker_count == 1 else f"{spec.module_name}-{i}"
                 plan.append((name, spec, port))
         return plan
+
+    def add_spawn_listener(self, listener: Callable[[int], None]) -> None:
+        """Call ``listener(port)`` each time a worker is about to be spawned
+        on ``port``, the first start and every restart alike."""
+        self._spawn_listeners.append(listener)
 
     def failed_instances(self) -> frozenset[str]:
         """Instances the crash-loop breaker has permanently given up on.
@@ -377,6 +383,8 @@ class Supervisor:
         """
         cmd = self._command_builder(spec, port)
         env = _build_worker_env(spec)
+        for listener in self._spawn_listeners:
+            listener(port)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             env=env,
@@ -772,8 +780,8 @@ def _check_proxy_port(specs: list[WorkerSpec], proxy_port: int) -> None:
             raise ConfigurationError(
                 f"proxy port {proxy_port} is also assigned to worker {spec.module_name!r} "
                 f"(ports {spec.port}-{spec.port + max(1, spec.worker_count) - 1}); "
-                "choose another --port or move the workers with --worker-port-base / "
-                "[tool.modulith] worker_port_base"
+                "choose another --port or move the workers with "
+                "[tool.modulith] worker_port_base or MODULITH_WORKER_PORT_BASE"
             )
 
 
@@ -847,6 +855,15 @@ async def run_supervised(
 
     sup = supervisor if supervisor is not None else Supervisor(specs)
     rules = _rules_from_specs(specs)
+
+    # A port verified before a restart may be held by another process after it.
+    def forget_identity(port: int) -> None:
+        url = f"http://127.0.0.1:{port}"
+        for rule in rules:
+            if url in rule.backend_urls:
+                rule.forget_identity(url)
+
+    sup.add_spawn_listener(forget_identity)
     proxy_app = create_proxy_app(
         rules,
         actuator_token=actuator_token,
