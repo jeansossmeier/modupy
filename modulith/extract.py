@@ -13,6 +13,8 @@ import ast
 import json
 import keyword
 import shutil
+import subprocess
+import sys
 import tempfile
 import tomllib
 from pathlib import Path
@@ -58,6 +60,13 @@ def extraction_blockers(rt: Runtime, module: str, violations: list[Violation]) -
         if v.module == module
     ]
 
+    _helpers, siblings = import_closure(rt, module)
+    if siblings:
+        blockers.append(
+            f"imports declared module(s): {', '.join(siblings)}; the extracted service "
+            "does not contain them"
+        )
+
     target = next((m for m in rt.modules if m.name == module), None)
     cfg = rt.config
     if target is not None and cfg is not None and cfg.package is not None:
@@ -74,6 +83,101 @@ def extraction_blockers(rt: Runtime, module: str, violations: list[Violation]) -
                     "shared-table scan; results are incomplete"
                 )
     return blockers
+
+
+def _source_path(package_dir: Path, package: str, dotted: str) -> Path | None:
+    """The package directory or ``.py`` file *dotted* names under *package*, if any."""
+    if not dotted.startswith(f"{package}."):
+        return None
+    rel = Path(*dotted.removeprefix(f"{package}.").split("."))
+    if (package_dir / rel / "__init__.py").is_file():
+        return package_dir / rel
+    if (package_dir / f"{rel}.py").is_file():
+        return package_dir / f"{rel}.py"
+    return None
+
+
+def import_closure(rt: Runtime, module: str) -> tuple[list[str], list[str]]:
+    """Helper modules the extracted copy needs, and other declared modules it imports.
+
+    Scans the module, the contracts package and every helper found, until no
+    new helper appears. A helper is package-level code outside every declared
+    module and outside the contracts package. ``from pkg import name`` also
+    counts ``pkg.name`` when that is a module or package, since
+    ``target_module`` alone names only ``pkg``. Type-only imports of another
+    module are not reported: they never execute.
+    """
+    from .builtin.verifier import _file_package, _ImportCollector, _owning_module, _package_dir
+
+    cfg = rt.config
+    target = next((m for m in rt.modules if m.name == module), None)
+    if cfg is None or cfg.package is None or target is None:
+        return [], []
+    package = cfg.package
+    package_dir = _package_dir(package)
+    if package_dir is None:
+        return [], []
+    contracts = f"{package}.{cfg.contracts_module}"
+
+    helpers: set[str] = set()
+    siblings: set[str] = set()
+    pending = [target.package, contracts]
+    scanned: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in scanned:
+            continue
+        scanned.add(name)
+        source = _source_path(package_dir, package, name)
+        if source is None:
+            continue
+        for path in sorted(source.rglob("*.py")) if source.is_dir() else [source]:
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            collector = _ImportCollector(path, _file_package(package_dir, package, path))
+            collector.visit(tree)
+            for record in collector.records:
+                submodules = [
+                    f"{record.target_module}.{imported}" for imported in record.imported_names
+                ]
+                for candidate in [
+                    record.target_module,
+                    *(s for s in submodules if _source_path(package_dir, package, s)),
+                ]:
+                    if not candidate.startswith(f"{package}."):
+                        continue
+                    owner = _owning_module(candidate, rt.modules)
+                    if owner is not None:
+                        if owner.name != module and not record.type_only:
+                            siblings.add(owner.name)
+                    elif candidate != contracts and not candidate.startswith(f"{contracts}."):
+                        helpers.add(candidate)
+                        pending.append(candidate)
+    return sorted(helpers), sorted(siblings)
+
+
+def _check_imports(root: Path, dotted: str) -> None:
+    """Import *dotted* in a fresh interpreter rooted at *root*; raise if it fails.
+
+    Runs the extracted module's code, which is acceptable because extract is
+    a trusted-source tool that already imports the app to discover modules.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", f"import {dotted}"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError(f"importing {dotted} from the extracted tree timed out") from None
+    if result.returncode != 0:
+        lines = result.stderr.strip().splitlines()
+        reason = lines[-1] if lines else f"exit code {result.returncode}"
+        raise ValueError(f"the extracted service cannot import {dotted}: {reason}")
 
 
 def _validate_module_name(value: str, *, what: str) -> None:
@@ -420,16 +524,10 @@ def write_extraction(
         raise ValueError(f"module {module!r} does not exist as a valid Python package")
     for helper in helpers:
         _validate_module_name(helper, what="helper")
-        prefix = f"{cfg.package}."
-        if helper.startswith(prefix):
-            helper_rel = Path(*helper.removeprefix(prefix).split("."))
-            helper_pkg_path = package_dir / helper_rel
-            helper_file_path = package_dir / Path(str(helper_rel) + ".py")
-            if not (
-                (helper_pkg_path.is_dir() and (helper_pkg_path / "__init__.py").is_file())
-                or helper_file_path.is_file()
-            ):
-                raise ValueError(f"helper {helper!r} does not exist as a module or package")
+        if _source_path(package_dir, cfg.package, helper) is None:
+            raise ValueError(
+                f"helper {helper!r} does not exist as a module or package under {cfg.package!r}"
+            )
     if package_dir.is_symlink():
         raise ValueError(f"source package {package_dir} is a symlink")
     _validate_package_initializers(package_dir, cfg.package)
@@ -455,6 +553,7 @@ def write_extraction(
             helpers=helpers,
             notes=notes,
         )
+        _check_imports(staging, f"{cfg.package}.{module}")
         if output.is_symlink():
             raise FileExistsError(f"--output {output} appeared during extraction")
         if output.exists():
@@ -539,10 +638,7 @@ def _populate_extraction(
         copy_rel(Path(f"{contracts_rel}.py"))
 
     for helper in helpers:
-        prefix = f"{cfg.package}."
-        if not helper.startswith(prefix):
-            continue
-        rel = Path(*helper.removeprefix(prefix).split("."))
+        rel = Path(*helper.removeprefix(f"{cfg.package}.").split("."))
         if (package_dir / rel).is_dir():
             copy_rel(rel)
         elif (package_dir / f"{rel}.py").is_file():

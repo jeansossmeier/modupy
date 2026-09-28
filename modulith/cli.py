@@ -1013,13 +1013,16 @@ def extract(
 ) -> None:
     """Scaffold a standalone service (pyproject, Dockerfile, README) from one module.
 
-    Copies the module plus its contracts into --output and generates the
-    files needed to run it as its own process via
-    ``modulith._worker:create_app``. Exit codes: 0 on success, 1 on an
-    unknown module, boundary violations / shared tables not overridden by
-    --force, or an existing/unsafe --output path (never overridable).
+    Copies the module, its contracts and the package-level helpers they
+    import into --output and generates the files needed to run it as its own
+    process via ``modulith._worker:create_app``. Before publishing, imports
+    the extracted module in a subprocess, so the service's third-party
+    dependencies must be installed. Exit codes: 0 on success, 1 on an
+    unknown module, boundary violations / shared tables / imports of other
+    modules not overridden by --force, an extracted module that fails to
+    import, or an existing/unsafe --output path (never overridable).
     """
-    from .extract import extraction_blockers, write_extraction
+    from .extract import extraction_blockers, import_closure, write_extraction
 
     rt = _bootstrap_or_exit()
     known = {m.name for m in rt.modules}
@@ -1063,19 +1066,7 @@ def extract(
         typer.echo(f"error: could not resolve package directory for {cfg.package!r}", err=True)
         raise typer.Exit(code=1)
 
-    helpers = sorted(
-        {
-            record.target_module
-            for record in verifier._collect_imports(target)
-            if (
-                record.target_module == cfg.package
-                or record.target_module.startswith(cfg.package + ".")
-            )
-            and verifier._owning_module(record.target_module, rt.modules) is None
-            and record.target_module != f"{cfg.package}.{cfg.contracts_module}"
-            and not record.target_module.startswith(f"{cfg.package}.{cfg.contracts_module}.")
-        }
-    )
+    helpers, _siblings = import_closure(rt, module)
 
     notes = blockers if (blockers and force) else []
     try:

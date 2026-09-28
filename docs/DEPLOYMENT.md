@@ -812,8 +812,9 @@ hard-killed supervisor from leaving workers behind is Linux-only.
    - Code doesn't change; listeners stay `@listener` decorated
 
 4. **Extract microservice** — `modulith extract <module>` scaffolds a standalone service
-   - Copies the module plus its contracts into `--output` (default `<module>-service/`) and generates a `pyproject.toml`, `Dockerfile`, `README.md`, and `.env.example` to run it against `modulith._worker:create_app`
-   - Blocked (exit 1) by the module's own outbound boundary violations or tables it shares with another module — `--force` overrides either and records what it overrode in the generated README; a non-empty `--output` directory is never overridable
+   - Copies the module, its contracts and every package-level helper module they import, transitively, into `--output` (default `<module>-service/`) and generates a `pyproject.toml`, `Dockerfile`, `README.md`, and `.env.example` to run it against `modulith._worker:create_app`
+   - Blocked (exit 1) by the module's own outbound boundary violations, tables it shares with another module, or a runtime import of another declared module from any copied file — `--force` overrides each and records what it overrode in the generated README; a non-empty `--output` directory is never overridable
+   - Before publishing, imports the extracted module in a subprocess from the staged tree and exits 1 naming the failing import if that fails, so the service's third-party dependencies must be installed where you run `extract`
    - Other modules keep sending events via the broker; the extracted service subscribes and acts. The outbox is not auto-wired (the app's `main.py` is not copied), so code the worker imports must call `outbox.configure()` itself
 
 This path is why modulith exists: **every module is a potential microservice, but you pay that cost only when it's profitable.**
