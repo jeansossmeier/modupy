@@ -1777,6 +1777,45 @@ async def test_dispatch_failure_increments_attempts_then_dead_after_cap(engine: 
         await consumer.stop()
 
 
+async def test_dispatch_failure_stores_at_most_500_characters_of_the_error(engine: Any) -> None:
+    async def handler(evt: WidgetCreated) -> None:
+        raise RuntimeError("x" * 10_000)
+
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+    broker = DatabaseBroker(engine=engine)
+    target = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=[target],
+        poll_interval_s=0.01,
+        max_attempts=1,
+    )
+    await consumer.start()
+    try:
+        payload = serializer.serialize(WidgetCreated(name="w1"))
+        await broker.publish(target, payload, {"event_type": target})
+
+        async def _dead() -> bool:
+            return await _fetch_statuses(engine) == ["dead"]
+
+        await _until_async(_dead, timeout=8.0)
+
+        _, _, message = broker_schema()
+        from sqlalchemy import select
+
+        async with engine.connect() as conn:
+            row = (await conn.execute(select(message.c.last_error))).one()
+        assert row.last_error == "x" * 500
+    finally:
+        await consumer.stop()
+
+
 # ---------------------------------------------------------------------------
 # stop() safety
 # ---------------------------------------------------------------------------
@@ -2744,6 +2783,8 @@ _SKIP_LOCKED_SERVERS = [
     (_MARIADB_URL, "11.4.2-MariaDB-ubu2404"),
     (_MYSQL_URL, "8.0.34-0ubuntu0.22.04.1"),
     (_MYSQL_URL, "8.0.mysql_aurora.3.04.0"),
+    (_MYSQL_URL, "8.0.1-dmr"),
+    (_MARIADB_URL, "10.6.0-MariaDB"),
 ]
 
 _MARIADB_TOO_OLD = "does not support; MariaDB 10.6 or newer"
@@ -2754,6 +2795,8 @@ _PRE_SKIP_LOCKED_SERVERS = [
     (_MYSQL_URL, "10.3.39-MariaDB-0+deb10u1", "MariaDB server 10.3.39"),
     (_MYSQL_URL, "5.7.44-log", "MySQL server 5.7.44"),
     (_MYSQL_URL, "5.7.42-0ubuntu0.18.04.1", "MySQL server 5.7.42"),
+    (_MYSQL_URL, "8.0.0-dmr", "MySQL server 8.0.0"),
+    (_MARIADB_URL, "10.5.27-MariaDB", "MariaDB server 10.5.27"),
 ]
 
 

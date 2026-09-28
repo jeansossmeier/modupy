@@ -13,6 +13,8 @@ from ._consumer_protocol import PollingBroker
 _MAX_LEASE_EXTENSION_FACTOR = 10.0
 _MAX_MALFORMED_ROW_LOGS = 10
 _MAX_STUCK_ROWS_NAMED = 5
+# Same cap as the outbox's publication.last_error (modulith/builtin/outbox.py).
+_MAX_STORED_ERROR_CHARS = 500
 
 
 def _describe_rows(rows: dict[str, dict[str, Any]], in_flight: set[str]) -> str:
@@ -249,7 +251,7 @@ class DeliveryDispatch:
         try:
             await self._broker.fail(
                 row_id,
-                error,
+                error[:_MAX_STORED_ERROR_CHARS],
                 consumer_name=self._consumer_name,
                 max_attempts=self._max_attempts,
             )
@@ -264,7 +266,7 @@ class DeliveryDispatch:
         try:
             await self._broker.dead_letter(
                 row_id,
-                reason,
+                reason[:_MAX_STORED_ERROR_CHARS],
                 consumer_name=self._consumer_name,
             )
         except asyncio.CancelledError:
