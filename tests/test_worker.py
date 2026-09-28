@@ -19,7 +19,7 @@ import logging
 import sqlite3
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -1446,3 +1446,192 @@ def test_health_endpoint_echoes_the_deployment_token(make_fake_app, monkeypatch)
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok", "module": "orders", "deployment": "deployment-b"}
+
+
+# ---------------------------------------------------------------------------
+# durable outbox wiring
+# ---------------------------------------------------------------------------
+
+_MODULE_WIRING_OUTBOX = """
+    from datetime import timedelta
+
+    from modulith.builtin import outbox
+    from modulith.serializers import JsonEventSerializer
+
+    SWEEPS: list[timedelta] = []
+
+    class Store:
+        async def save(self, publication):
+            pass
+
+        async def find_incomplete(self, older_than):
+            SWEEPS.append(older_than)
+            return []
+
+    outbox.configure(Store(), JsonEventSerializer(), retry_interval_seconds=60)
+"""
+
+
+@pytest.fixture
+def _fresh_outbox() -> Any:
+    outbox._reset_for_testing()
+    yield
+    outbox._reset_for_testing()
+
+
+def test_worker_refuses_durable_outbox_without_a_bound_store(
+    make_fake_app, monkeypatch, _fresh_outbox
+) -> None:
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.setenv("MODULITH_OUTBOX", "postgres")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        create_app()
+
+    message = str(exc_info.value)
+    assert ("'postgres'" in message, "main.py" in message, "MODULITH_OUTBOX_URL" in message) == (
+        True,
+        True,
+        True,
+    )
+
+
+def test_worker_binds_store_from_outbox_url_for_its_module_events(
+    make_fake_app, monkeypatch, tmp_path, _fresh_outbox
+) -> None:
+    from modulith.adapters import postgres_outbox
+
+    make_fake_app(_SIBLING_IMPORT_APP)
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.setenv("MODULITH_OUTBOX", "postgres")
+    monkeypatch.setenv("MODULITH_OUTBOX_URL", f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
+
+    create_app()
+    serializer = outbox._serializer
+    store_type = type(outbox._store).__name__
+    asyncio.run(_runtime.shutdown())
+
+    assert (
+        store_type,
+        sorted(serializer._allowed_event_types),
+        postgres_outbox._active_store,
+    ) == (
+        "PostgresPublicationStore",
+        ["fakeapp.contracts.NoteSent", "fakeapp.contracts.PaymentReceived"],
+        None,
+    )
+
+
+def test_worker_starts_retry_loop_for_store_bound_at_module_import(
+    make_fake_app, monkeypatch, _fresh_outbox
+) -> None:
+    make_fake_app({"orders": _MODULE_WIRING_OUTBOX})
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.setenv("MODULITH_OUTBOX", "postgres")
+
+    app = create_app()
+    sweeps = sys.modules["fakeapp.orders"].SWEEPS
+    before_startup = list(sweeps)
+    with TestClient(app):
+        deadline = time.monotonic() + 2.0
+        while not sweeps and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    assert (before_startup, sweeps[:1]) == ([], [timedelta(0)])
+
+
+_SHARED_LISTENER_CLASS_APP = {
+    "contracts": """
+        from dataclasses import dataclass
+
+        from modulith import event
+
+        RUNS: list[tuple[str, str]] = []
+
+        @event
+        @dataclass(frozen=True)
+        class OrderPlaced:
+            order_id: str
+
+        class Notifier:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            async def __call__(self, evt: OrderPlaced) -> None:
+                RUNS.append((self.name, evt.order_id))
+    """,
+    "orders": """
+        from modulith import listener
+        from fakeapp.contracts import Notifier
+
+        listener(Notifier("orders"))
+    """,
+    "billing": """
+        from modulith import listener
+        from fakeapp.contracts import RUNS, Notifier, OrderPlaced
+
+        listener(Notifier("billing"))
+
+        @listener
+        async def on_placed(evt: OrderPlaced) -> None:
+            RUNS.append(("billing.on_placed", evt.order_id))
+    """,
+}
+
+
+@pytest.mark.parametrize("claim_strategy", ["lease", "none"])
+def test_worker_sweep_delivers_only_rows_its_module_owns(
+    make_fake_app, monkeypatch, tmp_path, _fresh_outbox, claim_strategy
+) -> None:
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from modulith.adapters import postgres_outbox
+
+    make_fake_app(_SHARED_LISTENER_CLASS_APP)
+    _set_worker_env(monkeypatch, "orders")
+    create_app()
+    contracts = sys.modules["fakeapp.contracts"]
+    payload = JsonEventSerializer().serialize(contracts.OrderPlaced("o1"))
+    listeners = [
+        "fakeapp.billing:fakeapp.contracts.Notifier",
+        "fakeapp.billing.on_placed",
+        "fakeapp.orders:fakeapp.contracts.Notifier",
+    ]
+
+    async def scenario() -> list[tuple[str, bool, int]]:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'shared.db'}")
+        async with engine.begin() as conn:
+            await conn.run_sync(postgres_outbox.Base.metadata.create_all)
+        store = postgres_outbox.PostgresPublicationStore(engine)
+        outbox.configure(
+            store,
+            JsonEventSerializer(allowed_event_types=[contracts.OrderPlaced]),
+            start_loop=False,
+            claim_strategy=claim_strategy,
+        )
+        for listener_id in listeners:
+            await store.save(
+                EventPublication(
+                    id=uuid4(),
+                    payload=payload,
+                    event_type="fakeapp.contracts.OrderPlaced",
+                    listener=listener_id,
+                    published_at=datetime.now(UTC),
+                )
+            )
+        await outbox._sweep(timedelta(0))
+        rows = await store.find_incomplete(timedelta(0))
+        await store.dispose()
+        await engine.dispose()
+        return sorted((p.listener or "", p.completed_at is None, p.attempt_count) for p in rows)
+
+    pending = asyncio.run(scenario())
+
+    assert (pending, contracts.RUNS) == (
+        [
+            ("fakeapp.billing.on_placed", True, 0),
+            ("fakeapp.billing:fakeapp.contracts.Notifier", True, 0),
+        ],
+        [("orders", "o1")],
+    )

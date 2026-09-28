@@ -28,10 +28,12 @@ talk through `@event`, `@listener` and `publish()`; you run
 AST analysis at load time, and `modulith verify` fails CI on boundary
 violations. Broker and outbox are in-memory, so there is nothing to provision.
 
-**Durable: one config line.** `outbox = "postgres"` (or MySQL / SQLite) makes
-the outbox transactional: events are stored durably and delivered
-at-least-once after commit, and process crashes and transaction rollbacks
-stay consistent. The Alembic migrations ship inside the package.
+**Durable: two config lines.** `outbox = "postgres"` plus `outbox_url`, the
+async SQLAlchemy URL of your business database (Postgres, MySQL or SQLite),
+makes the outbox transactional in every process: events are stored durably
+and delivered at-least-once after commit, and process crashes and
+transaction rollbacks stay consistent. The Alembic migrations ship inside the
+package.
 
 **Process-per-module: one flag, still one host.**
 `modulith run myapp.main:app --topology=processes` gives each module its own
@@ -175,7 +177,7 @@ app = FastAPI()
 app.include_router(orders_router, prefix="/orders")
 
 # That's it. Modules auto-discovered. Listeners auto-registered.
-# Transactional outbox available with one config line.
+# Transactional outbox available with two config lines (outbox, outbox_url).
 ```
 
 ```bash
@@ -304,12 +306,13 @@ it *in addition to* local listeners, or
 ## Configuration
 
 Everything is in `pyproject.toml`. Defaults are good enough that most
-users never set anything beyond `outbox`:
+users never set anything beyond `outbox` and `outbox_url`:
 
 ```toml
 [tool.modulith]
 package = "myapp"               # falls back to [project].name
 outbox = "postgres"             # default "memory" — switch for production
+outbox_url = "postgresql+asyncpg://app@db/app"  # the business database; binds the store everywhere
 broker = "redis-streams"        # default "memory" (single) / "shm" (processes)
 topology = "single"             # "single" | "processes"
 

@@ -263,6 +263,7 @@ def listener(
             # the adapter's own and every instance in a module would share one
             # outbox listener id. Its class name is distinct and restart-stable.
             registered.__qualname__ = type(handler).__qualname__
+            registered.__modulith_instance_listener__ = True  # type: ignore[union-attr]
 
         registered.__modulith_broker_targets__ = normalized_targets  # type: ignore[union-attr]
         _runtime.register_listener(event_type, registered)
@@ -287,7 +288,9 @@ def bootstrap() -> None:
     embedding app that configures a durable outbox and wants stranded
     publications from a previous crash retried immediately at startup,
     rather than waiting for the first publish(), should call
-    ``bootstrap()`` right after ``configure()``.
+    ``bootstrap()`` right after ``configure()`` and then
+    ``modulith.builtin.outbox.start()`` from its running event loop (an ASGI
+    lifespan's startup half): ``bootstrap()`` itself starts no retry loop.
 
     Safe to call any number of times — after the first call, subsequent
     calls are a no-op fast path (same guarantee as ``publish()``'s implicit

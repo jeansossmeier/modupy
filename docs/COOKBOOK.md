@@ -170,8 +170,9 @@ Three sharp edges (the first two from `wrap_sync_listener`'s contract):
   - **Outbox:** if the outbox is also driven with `await publish()` on the
     app's own loop, the same `AsyncEngine` is shared across two loops. Once its
     connection pool is exhausted, SQLAlchemy raises `RuntimeError: <Queue> is
-    bound to a different event loop`. Keep publishes for one outbox engine on
-    one loop.
+    bound to a different event loop`. The outbox store, unlike the database
+    broker, does not hand calls to its engine's loop, and a larger pool does
+    not help. Keep publishes for one outbox engine on one loop.
   - **Database broker:** the broker submits the call to the loop that first
     used it, which in a worker is the app loop, and runs it there. That loop
     must stay running and unblocked, or the `publish_sync()` call waits for it
@@ -316,6 +317,15 @@ request. For a durable publish from such a task, open and bind a session in
 the task itself. Inspect the queue
 with `modulith outbox status`; a persistently-failing publication is
 dead-lettered after 10 attempts.
+
+A module-scope `outbox.configure()` runs before the server's event loop exists,
+so it cannot start the retry loop: call `outbox.start()` in your ASGI
+lifespan's startup half, or undelivered rows from a crashed process wait for
+the first transactional publish. The outbox table must live in the database
+that holds your business data, or the row and your data cannot commit in one
+transaction. Under `--topology processes`, `main.py` (its lifespan, middleware
+and this wiring) does not run in workers; bind the store from the module's
+import or a `modulith_after_module_load` hook instead.
 
 On shutdown, drain the retry loop instead of letting the process die mid-flight
 — call `store.dispose()`, then `outbox.shutdown()`, then dispose the engine, in

@@ -2342,3 +2342,174 @@ async def test_persist_accepts_one_listener_registered_twice() -> None:
     saved = await outbox.persist(OutboxEvent(value=1))
 
     assert [pub.listener for pub in saved] == [f"{__name__}.record"] * 2
+
+
+def test_start_runs_crash_sweep_for_store_configured_without_a_loop() -> None:
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
+    before_start = outbox._retry_task
+
+    async def scenario() -> bool:
+        outbox.start()
+        first = outbox._retry_task
+        outbox.start()
+        await asyncio.sleep(0.05)
+        return first is not None and outbox._retry_task is first
+
+    reused = asyncio.run(scenario())
+
+    assert (before_start, reused, store.find_incomplete_calls) == (None, True, [timedelta(0)])
+
+
+_ORDERS_APP = {
+    "orders": """
+        from dataclasses import dataclass
+
+        from modulith import event, listener
+
+        RECEIVED: list[str] = []
+
+        @event
+        @dataclass(frozen=True)
+        class OrderPlaced:
+            order_id: str
+
+        @listener
+        async def on_placed(evt: OrderPlaced) -> None:
+            RECEIVED.append(evt.order_id)
+    """
+}
+
+
+def test_bootstrap_binds_store_from_outbox_url_and_delivers_after_commit(
+    make_fake_app: Any, tmp_path: Path
+) -> None:
+    from modulith.adapters import postgres_outbox
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'app.db'}"
+    make_fake_app(_ORDERS_APP)
+    _runtime.configure(
+        package="fakeapp",
+        outbox="postgres",
+        outbox_url=url,
+        outbox_options={"claim_lease_seconds": 7},
+    )
+    _runtime.ensure_bootstrapped()
+    orders = __import__("fakeapp.orders", fromlist=["OrderPlaced"])
+    bound = (
+        type(outbox._store).__name__,
+        outbox._claim_strategy,
+        outbox._claim_lease_seconds,
+        len(outbox._claim_owner),
+    )
+
+    async def scenario() -> list[tuple[str, bool]]:
+        engine = create_async_engine(url, poolclass=NullPool)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        await _publish_in_session(engine, orders.OrderPlaced("o1"))
+        assert outbox._store is not None
+        await outbox._store.wait_for_dispatch()  # type: ignore[attr-defined]
+        # The first transactional publish also starts the retry loop, whose
+        # crash sweep may be the one that claims and completes the row.
+        deadline = asyncio.get_running_loop().time() + 2.0
+        rows = await _stored_rows(engine)
+        while not all(done for _, done in rows) and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+            rows = await _stored_rows(engine)
+        await _runtime.shutdown()
+        await engine.dispose()
+        return rows
+
+    rows = asyncio.run(scenario())
+
+    assert (bound, orders.RECEIVED, rows) == (
+        ("PostgresPublicationStore", "lease", 7.0, 32),
+        ["o1"],
+        [("fakeapp.orders.on_placed", True)],
+    )
+    assert postgres_outbox._active_store is None
+
+
+def test_explicitly_configured_store_wins_over_outbox_url(
+    make_fake_app: Any, tmp_path: Path
+) -> None:
+    from modulith.adapters import postgres_outbox
+
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    make_fake_app(_ORDERS_APP)
+    _runtime.configure(
+        package="fakeapp",
+        outbox="postgres",
+        outbox_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
+    )
+    _runtime.ensure_bootstrapped()
+
+    assert (outbox._store is store, postgres_outbox._active_store) == (True, None)
+
+
+_SHARED_LISTENER_CLASS_APP = {
+    "contracts": """
+        from dataclasses import dataclass
+
+        from modulith import event
+
+        RUNS: list[tuple[str, str]] = []
+
+        @event
+        @dataclass(frozen=True)
+        class OrderPlaced:
+            order_id: str
+
+        class Notifier:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            async def __call__(self, evt: OrderPlaced) -> None:
+                RUNS.append((self.name, evt.order_id))
+    """,
+    "orders": """
+        from modulith import listener
+        from fakeapp.contracts import Notifier
+
+        listener(Notifier("orders"))
+    """,
+    "billing": """
+        from modulith import listener
+        from fakeapp.contracts import RUNS, Notifier, OrderPlaced
+
+        listener(Notifier("billing"))
+
+        @listener
+        async def on_placed(evt: OrderPlaced) -> None:
+            RUNS.append(("billing.on_placed", evt.order_id))
+    """,
+}
+
+
+@pytest.mark.asyncio
+async def test_rows_of_one_listener_class_are_attributed_to_each_registering_module(
+    make_fake_app: Any,
+) -> None:
+    make_fake_app(_SHARED_LISTENER_CLASS_APP)
+    _runtime.configure(package="fakeapp")
+    _runtime.ensure_bootstrapped()
+    outbox.configure(StubStore(), JsonEventSerializer(), start_loop=False)
+    contracts = __import__("fakeapp.contracts", fromlist=["OrderPlaced"])
+
+    saved = await outbox.persist(contracts.OrderPlaced("o1"))
+
+    assert sorted(pub.listener or "" for pub in saved) == [
+        "fakeapp.billing.on_placed",
+        "fakeapp.billing:fakeapp.contracts.Notifier",
+        "fakeapp.orders:fakeapp.contracts.Notifier",
+    ]
+
+
+def test_start_without_a_bound_store_starts_nothing() -> None:
+    async def scenario() -> Any:
+        outbox.start()
+        return outbox._retry_task
+
+    assert asyncio.run(scenario()) is None

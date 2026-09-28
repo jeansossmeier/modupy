@@ -476,8 +476,8 @@ def _require_outbox_store() -> None:
 
     Which is why the remedy depends on what the configuration already says.
     Pointing at ``[tool.modulith].outbox`` unconditionally is a dead end once
-    that key is set: its value selects an adapter, it never constructs or
-    binds a store, so re-setting it changes nothing about what the CLI sees.
+    that key is set: on its own it binds nothing, and bootstrap builds a store
+    only when ``outbox_url`` is set too.
     """
     if outbox._store is not None:
         return
@@ -492,7 +492,10 @@ def _require_outbox_store() -> None:
     else:
         cause = f"[tool.modulith].outbox is {configured!r} but no store is bound in this process"
     typer.echo(
-        f"no outbox store: {cause}. A store is bound only by calling "
+        f"no outbox store: {cause}. Set [tool.modulith].outbox_url (env "
+        "MODULITH_OUTBOX_URL) to the outbox database's async SQLAlchemy URL and "
+        "bootstrap binds a store in every process, this one included. "
+        "Otherwise a store is bound only by calling "
         "modulith.builtin.outbox.configure(store=..., serializer=...) — and the "
         "outbox commands run in their own process, seeing only what bootstrap "
         "imports, so that call has to run at module import time rather than "
@@ -660,6 +663,12 @@ def _run_process_topology(
     worker_env: dict[str, str] = {"UVICORN_LOG_LEVEL": log_level}
     if cfg.is_explicit("broker"):
         worker_env["MODULITH_BROKER"] = cfg.broker
+    # Workers bind their outbox store from these; a value already in the
+    # parent's environment reaches them by inheritance and wins.
+    if cfg.is_explicit("outbox") and not os.environ.get("MODULITH_OUTBOX"):
+        worker_env["MODULITH_OUTBOX"] = cfg.outbox
+    if cfg.outbox_url and not os.environ.get("MODULITH_OUTBOX_URL"):
+        worker_env["MODULITH_OUTBOX_URL"] = cfg.outbox_url
     for key, value in (cfg.broker_options or {}).items():
         if value is None:
             continue

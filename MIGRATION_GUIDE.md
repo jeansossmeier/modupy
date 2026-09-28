@@ -294,6 +294,22 @@ async def get_db():
             unbind_session(token)
 ```
 
+Call `outbox.start()` in your ASGI lifespan's startup half: module-scope code
+runs before the server's event loop exists, so `configure()` there cannot
+start the retry loop that redelivers rows a crashed process left behind. Keep
+the outbox table in the same database as your business data, or the row and
+your data cannot commit in one transaction. Under `--topology processes`,
+`main.py` does not run in workers. Set `[tool.modulith].outbox_url` (env
+`MODULITH_OUTBOX_URL`) to that database's async SQLAlchemy URL and modulith
+binds the store in every process, workers and the `modulith outbox` CLI
+included; a worker with a durable `outbox` and no store refuses to start.
+
+Upgrading with rows still in the outbox: a callable-instance or bound-method
+listener registered from a module is now stored as
+`<module package>:<class module>.<ClassName>`, so rows written under the old
+bare class id no longer match it. Let `modulith outbox status` report no
+incomplete rows before you deploy the upgrade.
+
 Now `publish()` calls inside a transaction are atomically persisted.
 Process crashes don't lose events. Rolled-back transactions don't leak
 ghost events. Listeners are called at-least-once after commit.

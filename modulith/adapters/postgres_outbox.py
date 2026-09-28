@@ -447,10 +447,12 @@ class PostgresPublicationStore:
         if bound_loop is not None and bound_loop is not loop:
             logger.warning(
                 "PostgresPublicationStore engine first used on one event loop is "
-                "now used from another; once the connection pool is exhausted "
-                "SQLAlchemy raises 'Queue is bound to a different event loop'. "
-                "Keep every save/dispatch on one loop or size "
-                "pool_size/max_overflow for the cross-loop concurrency."
+                "now used from another. Unlike the database broker, the store "
+                "does not hand calls to the loop that owns its engine: pooled "
+                "connections stay bound to the loop that opened them, and once "
+                "the pool is exhausted SQLAlchemy raises 'Queue is bound to a "
+                "different event loop'. Keep every publish and dispatch for one "
+                "store on one loop (await publish() rather than publish_sync())."
             )
             self._cross_loop_warned = True
 

@@ -51,6 +51,7 @@ loop skips such records; ``status`` counts them separately.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import threading
@@ -175,12 +176,49 @@ def _listener_id(handler: Any) -> str:
     module-level ``def on_order_created`` for the same event, and the bare
     qualname would collide — one listener delivered twice, the other never.
     Qualifying with ``__module__`` disambiguates them.
+
+    A callable instance or bound method is named after its class, so one class
+    registered from two application modules would give both the same id; its
+    id is prefixed with the registering module package (``orders:shared.X``)
+    so each module's rows reach only that module's instance, in whichever
+    worker sweeps them. A plain function's id stays module-qualified only.
     """
+    from .. import runtime as _rt
+
     qualname = getattr(handler, "__qualname__", None)
     if qualname is None:
         return repr(handler)
     module = getattr(handler, "__module__", None)
-    return f"{module}.{qualname}" if module else qualname
+    base = f"{module}.{qualname}" if module else qualname
+    owner = None
+    if inspect.ismethod(handler) or getattr(handler, "__modulith_instance_listener__", False):
+        owner = _rt._runtime._listener_owners.get(handler)
+    return f"{owner}:{base}" if owner else base
+
+
+def _foreign_to_this_worker(publication: EventPublication) -> bool:
+    """True for a listener row a sibling process-topology worker owns.
+
+    Workers share one outbox table, but each dispatches only its own module's
+    listeners. A sweep that claimed a sibling's row must hand it back
+    untouched: dispatching it here would find no handler and charge the row
+    an attempt, pushing it toward dead-letter before its owner delivers it.
+    Broker-route rows carry no listener and any worker may send them.
+    """
+    from .. import runtime as _rt
+
+    rt = _rt._runtime
+    listener_id = publication.listener or ""
+    if rt._hosted_module is None or listener_id.startswith(_BROKER_ROUTE_LISTENER_PREFIX):
+        return False
+    bus = rt.event_bus
+    assert bus is not None  # sweeps dispatch nothing until bootstrap installs the bus
+    local_ids = {
+        _listener_id(handler)
+        for event_type in bus.registered_event_types()
+        for handler in rt.local_listeners(bus.listeners_for(event_type))
+    }
+    return listener_id not in local_ids
 
 
 def _require_distinct_listener_ids(event_type: type, handlers: list[Any]) -> None:
@@ -350,6 +388,19 @@ def configure(
     _claim_owner = uuid4().hex
 
     if start_loop:
+        _ensure_retry_loop()
+
+
+def start() -> None:
+    """Start the retry loop and its one-shot crash sweep on the running loop.
+
+    Idempotent, and a no-op when no store is bound or no loop is running.
+    ``configure()`` at module import time runs before the server's event loop
+    exists, so a server calls this from its ASGI startup; without it, rows a
+    crashed process left undelivered wait for the first transactional
+    publish. CLI processes never call it, so they never sweep or dispatch.
+    """
+    if _store is not None:
         _ensure_retry_loop()
 
 
@@ -882,7 +933,7 @@ async def _sweep_unclaimed(older_than: timedelta, *, runtime_ready: bool) -> Non
     for pub in pending:
         if pub.attempt_count >= _dead_letter_after_attempts:
             continue  # dead-lettered — no further retries
-        if not _backoff_elapsed(pub):
+        if not _backoff_elapsed(pub) or _foreign_to_this_worker(pub):
             continue
         await _dispatch_publication(pub)
 
@@ -913,9 +964,13 @@ async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
             if pub.claim_token:
                 await _store.renew_claim(pub.id, pub.claim_token, 0.0)  # type: ignore[attr-defined]
             continue
-        if not _backoff_elapsed(pub):
-            # Release early: holding a full lease on a not-yet-due row would
-            # block every other sweeper from picking it up sooner.
+        if not _backoff_elapsed(pub) or _foreign_to_this_worker(pub):
+            # Release early: holding a full lease on a not-yet-due row, or on
+            # a row only a sibling worker can deliver, would block every other
+            # sweeper from picking it up sooner.
+            # ponytail: foreign rows still occupy claim_batch slots, so a large
+            # sibling backlog can delay this worker's own rows; filter the
+            # claim query by local listener ids if that shows up.
             if pub.claim_token:
                 await _store.renew_claim(pub.id, pub.claim_token, 0.0)  # type: ignore[attr-defined]
             continue
@@ -947,7 +1002,7 @@ async def _sweep_advisory(older_than: timedelta, *, runtime_ready: bool) -> None
     for pub in pending:
         if pub.attempt_count >= _dead_letter_after_attempts:
             continue
-        if not _backoff_elapsed(pub):
+        if not _backoff_elapsed(pub) or _foreign_to_this_worker(pub):
             continue
         await _dispatch_under_advisory_lock(pub)
 
@@ -1314,5 +1369,6 @@ __all__ = [
     "purge_completed",
     "retry_all_dead_lettered",
     "shutdown",
+    "start",
     "status",
 ]
