@@ -223,6 +223,16 @@ rejects any other `event_type` with `ValueError` before resolving the
 class. The cross-process worker applies this automatically, allowlisting
 exactly the event types its listeners consume.
 
+Fields decode by their annotations; `NewType` and `type` aliases decode as
+the type they name. Two field shapes carry a type tag,
+`{"__modulith_union_type__": "<module>.<qualname>", "value": ...}`: a
+multi-member union, and a nested dataclass holding an instance of a
+subclass of its declared class. A value of exactly the declared class stays
+untagged. A subclass tag is matched only against subclasses of the declared
+class already imported in the consuming process, never imported by name, so
+the consumer must import the module defining the subclass. A tag naming
+anything else raises `ValueError`.
+
 **`Broker`** — external message broker (producer side):
 ```
 async publish(target: str, payload: bytes, headers: dict[str, str] | None) -> None

@@ -9,14 +9,15 @@ from __future__ import annotations
 
 import logging
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, NewType, cast
 from uuid import UUID, uuid4
 
 import pytest
+from typing_extensions import TypeAliasType
 
 from modulith.config import (
     DEFAULT_MAX_PAYLOAD_BYTES,
@@ -633,3 +634,188 @@ def test_legacy_untagged_union_payload_still_decodes() -> None:
 
     # Legacy payloads retain the historic first-member coercion behavior.
     assert restored == StringOrIntEvent(value=7)
+
+
+@dataclass(frozen=True)
+class BasePayment:
+    amount: int
+
+
+@dataclass(frozen=True)
+class CardPayment(BasePayment):
+    card_last4: str
+
+
+@dataclass(frozen=True)
+class PremiumCardPayment(CardPayment):
+    tier: str
+
+
+@dataclass(frozen=True)
+class OrderPaid:
+    order_id: str
+    payment: BasePayment
+    history: list[BasePayment] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class OrderPaidUnion:
+    backup: BasePayment | None
+    alternative: str | BasePayment
+
+
+forged_instantiations: list[str] = []
+
+
+@dataclass(frozen=True)
+class ForgedTarget:
+    """Importable dataclass outside ``BasePayment``'s tree; records instantiation."""
+
+    amount: int
+
+    def __post_init__(self) -> None:
+        forged_instantiations.append("instantiated")
+
+
+def test_base_typed_nested_field_round_trips_subclass_instances() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[OrderPaid])
+    original = OrderPaid(
+        order_id="o-1",
+        payment=CardPayment(amount=500, card_last4="4242"),
+        history=[BasePayment(amount=1), PremiumCardPayment(amount=2, card_last4="1", tier="gold")],
+    )
+
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(OrderPaid))
+
+    assert restored == original
+    assert type(restored.payment) is CardPayment
+    assert [type(p) for p in restored.history] == [BasePayment, PremiumCardPayment]
+
+
+def test_base_typed_union_field_round_trips_subclass_instances() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[OrderPaidUnion])
+    original = OrderPaidUnion(
+        backup=PremiumCardPayment(amount=3, card_last4="9", tier="gold"),
+        alternative=CardPayment(amount=4, card_last4="7"),
+    )
+
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(OrderPaidUnion))
+
+    assert restored == original
+    assert type(restored.backup) is PremiumCardPayment
+    assert type(restored.alternative) is CardPayment
+
+
+def test_exact_type_nested_dataclass_keeps_untagged_wire_format() -> None:
+    """A value of exactly the declared class encodes as it always did, so rows
+    written before subclass envelopes existed still decode."""
+    serializer = JsonEventSerializer(allowed_event_types=[OrderPaid])
+    legacy = b'{"history":[],"order_id":"o-1","payment":{"amount":5}}'
+
+    assert serializer.serialize(OrderPaid(order_id="o-1", payment=BasePayment(amount=5))) == legacy
+    assert serializer.deserialize(legacy, _fqcn(OrderPaid)) == OrderPaid(
+        order_id="o-1", payment=BasePayment(amount=5)
+    )
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload"),
+    [
+        (
+            OrderPaid,
+            b'{"order_id":"o","payment":'
+            b'{"__modulith_union_type__":"' + __name__.encode() + b'.ForgedTarget",'
+            b'"value":{"amount":1}}}',
+        ),
+        (
+            OrderPaidUnion,
+            b'{"alternative":"x","backup":'
+            b'{"__modulith_union_type__":"' + __name__.encode() + b'.ForgedTarget",'
+            b'"value":{"amount":1}}}',
+        ),
+    ],
+)
+def test_subclass_tag_outside_declared_tree_is_rejected(event_type: type, payload: bytes) -> None:
+    """The nested type tag is resolved only among the declared class's
+    subclasses: naming any other importable class fails without importing
+    or instantiating it."""
+    serializer = JsonEventSerializer(allowed_event_types=[event_type])
+    forged_instantiations.clear()
+
+    with pytest.raises(ValueError, match="ForgedTarget"):
+        serializer.deserialize(payload, _fqcn(event_type))
+
+    assert forged_instantiations == []
+
+
+OrderId = NewType("OrderId", UUID)
+CustomerId = NewType("CustomerId", str)
+Money = NewType("Money", Decimal)
+When = NewType("When", datetime)
+Stamp = TypeAliasType("Stamp", datetime)
+
+
+@dataclass(frozen=True)
+class NewTypeEvent:
+    order_id: OrderId
+    amount: Money
+    at: When
+    maybe: OrderId | None = None
+    ids: list[OrderId] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class NewTypeUnionEvent:
+    ref: OrderId | CustomerId
+
+
+@dataclass(frozen=True)
+class AliasEvent:
+    at: Stamp
+
+
+def test_newtype_fields_deserialize_as_their_supertype() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[NewTypeEvent])
+    oid = OrderId(uuid4())
+    original = NewTypeEvent(
+        order_id=oid,
+        amount=Money(Decimal("9.99")),
+        at=When(datetime(2026, 9, 28, tzinfo=UTC)),
+        maybe=oid,
+        ids=[oid],
+    )
+
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(NewTypeEvent))
+
+    assert restored == original
+    assert type(restored.order_id) is UUID
+    assert type(restored.amount) is Decimal
+    assert type(restored.at) is datetime
+    assert type(restored.maybe) is UUID
+    assert [type(i) for i in restored.ids] == [UUID]
+
+
+def test_stored_tagged_union_of_newtypes_still_matches_its_member() -> None:
+    """Union tags name NewType members by repr; rows already stored with
+    those tags must keep matching, and new rows must keep writing them."""
+    serializer = JsonEventSerializer(allowed_event_types=[NewTypeUnionEvent])
+    oid = UUID("12345678-1234-5678-1234-567812345678")
+    stored = (
+        b'{"ref":{"__modulith_union_type__":"' + __name__.encode() + b'.OrderId",'
+        b'"value":"12345678-1234-5678-1234-567812345678"}}'
+    )
+
+    assert serializer.serialize(NewTypeUnionEvent(ref=OrderId(oid))) == stored
+    restored = serializer.deserialize(stored, _fqcn(NewTypeUnionEvent))
+    assert restored.ref == oid
+    assert type(restored.ref) is UUID
+
+
+def test_type_alias_field_deserializes_as_its_value() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[AliasEvent])
+    original = AliasEvent(at=datetime(2026, 9, 28, 12, tzinfo=UTC))
+
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(AliasEvent))
+
+    assert restored == original
+    assert type(restored.at) is datetime
