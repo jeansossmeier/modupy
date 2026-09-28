@@ -353,7 +353,7 @@ table. `claim_strategy` decides how those sweepers stay off each other's rows:
 | `claim_strategy` | Behaviour |
 |---|---|
 | `"lease"` (default) | claim a batch in one committed transaction, renew the lease while dispatching, fence the completion write on the claim token |
-| `"advisory_lock"` | hold a Postgres advisory lock per row for the dispatch. Rejected at `configure()` on a non-Postgres store |
+| `"advisory_lock"` | hold a Postgres advisory lock per row for the dispatch. Rejected at `configure()` on a non-Postgres store. Lock connections come from a second pool sized like the engine's, so during a burst a process can hold up to 2×(`pool_size` + `max_overflow`) Postgres connections; budget `max_connections` for that. A dispatch that waits past `pool_timeout` for a lock connection leaves its row to the next sweep |
 | `"none"` | no coordination — two sweepers may dispatch the same row. Warns at `configure()` |
 
 ```python

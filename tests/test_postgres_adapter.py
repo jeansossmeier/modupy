@@ -812,12 +812,15 @@ async def test_try_lock_publication_requires_postgres_engine(engine) -> None:
         await store.try_lock_publication(uuid4())
 
 
-async def test_try_lock_publication_closes_connection_on_execute_error() -> None:
+async def test_try_lock_publication_closes_connection_on_execute_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """try_lock_publication had no try/finally around the ``SELECT
     pg_try_advisory_lock`` execute(): a transient lock-query error (connection
     blip, failover, statement timeout) leaked the checked-out connection back
     to the pool on every retry. The connection must be released even when the
-    lock query itself raises."""
+    lock query itself raises, and invalidated: whether the lock was taken is
+    unknown."""
 
     class _StubDialect:
         name = "postgresql"
@@ -825,12 +828,16 @@ async def test_try_lock_publication_closes_connection_on_execute_error() -> None
     class _RaisingConn:
         def __init__(self) -> None:
             self.closed = False
+            self.invalidated = False
 
         async def execution_options(self, **opts: Any) -> _RaisingConn:
             return self
 
         async def execute(self, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError("boom")
+
+        async def invalidate(self) -> None:
+            self.invalidated = True
 
         async def close(self) -> None:
             self.closed = True
@@ -846,14 +853,18 @@ async def test_try_lock_publication_closes_connection_on_execute_error() -> None
 
     engine_stub = _StubEngine()
     store = PostgresPublicationStore(engine=engine_stub)
+    monkeypatch.setattr(store, "_lock_connection_engine", lambda: engine_stub)
 
     with pytest.raises(RuntimeError, match="boom"):
         await store.try_lock_publication(uuid4())
 
     assert engine_stub.conn.closed is True
+    assert engine_stub.conn.invalidated is True
 
 
-async def test_try_lock_publication_does_not_leave_an_open_transaction() -> None:
+async def test_try_lock_publication_does_not_leave_an_open_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """``conn.execute()`` autobegins a transaction that then stays open for
     the whole dispatch ``_sweep_advisory`` holds the lock connection across —
     idle-in-transaction on real Postgres, blocking VACUUM and risking
@@ -897,6 +908,7 @@ async def test_try_lock_publication_does_not_leave_an_open_transaction() -> None
 
     engine_stub = _StubEngine()
     store = PostgresPublicationStore(engine=engine_stub)
+    monkeypatch.setattr(store, "_lock_connection_engine", lambda: engine_stub)
 
     handle = await store.try_lock_publication(uuid4())
 

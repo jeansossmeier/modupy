@@ -990,6 +990,85 @@ async def test_advisory_after_commit_skips_a_row_a_peer_has_locked(pg_engine: An
     assert await _completed_rows(pg_engine) == 1
 
 
+async def _scalar_on(handle: object, sql: str) -> Any:
+    return (await cast(Any, handle).execute(text(sql))).scalar()
+
+
+@pytest.mark.integration
+async def test_advisory_lock_connection_returns_to_the_lock_pool_after_unlock(
+    pg_engine: Any,
+) -> None:
+    """A lock connection whose lock was released cleanly carries no session
+    state, so the next lock reuses it instead of opening a new backend."""
+    store = PostgresPublicationStore(engine=pg_engine)
+    pub_id = uuid4()
+    try:
+        first = await store.try_lock_publication(pub_id)
+        assert first is not None
+        first_pid = await _scalar_on(first, "SELECT pg_backend_pid()")
+        await store.unlock_publication(first, pub_id)
+        second = await store.try_lock_publication(pub_id)
+        assert second is not None
+        second_pid = await _scalar_on(second, "SELECT pg_backend_pid()")
+        await store.unlock_publication(second, pub_id)
+    finally:
+        await store.dispose()
+
+    assert second_pid == first_pid
+
+
+@pytest.mark.integration
+async def test_advisory_lock_connection_returns_to_the_lock_pool_when_contended(
+    pg_engine: Any,
+) -> None:
+    """A lock attempt that finds the row locked by a peer took no lock, so its
+    connection goes back to the lock pool for the next dispatch."""
+    store = PostgresPublicationStore(engine=pg_engine)
+    pub_id, other_id = uuid4(), uuid4()
+    try:
+        holder = await store.try_lock_publication(pub_id)
+        assert holder is not None
+        assert await store.try_lock_publication(pub_id) is None
+        mark = await _scalar_on(holder, "SELECT clock_timestamp()")
+        # The holder is still checked out, so the only pooled connection is
+        # the one the contended attempt returned.
+        other = await store.try_lock_publication(other_id)
+        assert other is not None
+        other_started = await _scalar_on(
+            other, "SELECT backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid()"
+        )
+        await store.unlock_publication(other, other_id)
+        await store.unlock_publication(holder, pub_id)
+    finally:
+        await store.dispose()
+
+    assert other_started < mark
+
+
+@pytest.mark.integration
+async def test_advisory_lock_connection_is_invalidated_when_unlock_fails(
+    pg_engine: Any,
+) -> None:
+    """``pg_advisory_unlock`` returning false means the session's lock state
+    is not what the handle claims, so the connection must not go back to the
+    pool, where a later dispatch would inherit whatever it still holds."""
+    store = PostgresPublicationStore(engine=pg_engine)
+    locked_id, never_locked_id = uuid4(), uuid4()
+    try:
+        handle = await store.try_lock_publication(locked_id)
+        assert handle is not None
+        first_pid = await _scalar_on(handle, "SELECT pg_backend_pid()")
+        await store.unlock_publication(handle, never_locked_id)
+        after = await store.try_lock_publication(never_locked_id)
+        assert after is not None
+        after_pid = await _scalar_on(after, "SELECT pg_backend_pid()")
+        await store.unlock_publication(after, never_locked_id)
+    finally:
+        await store.dispose()
+
+    assert after_pid != first_pid
+
+
 @pytest.mark.integration
 async def test_advisory_after_commit_delivers_a_burst_larger_than_the_pool(
     pg_engine: Any, caplog: pytest.LogCaptureFixture

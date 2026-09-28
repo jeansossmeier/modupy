@@ -967,8 +967,10 @@ class PostgresPublicationStore:
         The lock connection comes from a pool of its own, sized like the
         engine's. The listener and this store's reads and writes during the
         dispatch draw on the engine's pool, so a burst of held locks cannot
-        exhaust the pool they wait on. Lock connections are discarded after
-        use rather than pooled, so a lock can never outlive its handle.
+        exhaust the pool they wait on. A connection returns to the lock pool
+        only when it provably holds no lock: the lock attempt returned false,
+        or ``unlock_publication`` released the lock. Any other outcome
+        invalidates it, so a lock can never outlive its handle.
         """
         if not self.supports_advisory_lock:
             raise ConfigurationError(
@@ -990,7 +992,7 @@ class PostgresPublicationStore:
             await _discard_connection(conn)
             raise
         if not got:
-            await _discard_connection(conn)
+            await conn.close()
             return None
         return conn
 
@@ -1005,14 +1007,25 @@ class PostgresPublicationStore:
         return self._lock_engine
 
     async def unlock_publication(self, handle: object, publication_id: UUID) -> None:
-        """Release a lock handle returned by ``try_lock_publication`` and
-        discard its dedicated connection."""
+        """Release a lock handle returned by ``try_lock_publication``.
+
+        The connection returns to the lock pool when ``pg_advisory_unlock``
+        confirms the release; when the unlock raises, is cancelled or returns
+        false, the session may still hold a lock, so it is invalidated."""
         lock_key = publication_id.int & 0x7FFFFFFFFFFFFFFF
         conn = cast(Any, handle)
+        released = False
         try:
-            await conn.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": lock_key})
+            released = bool(
+                (
+                    await conn.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": lock_key})
+                ).scalar()
+            )
         finally:
-            await _discard_connection(conn)
+            if released:
+                await conn.close()
+            else:
+                await _discard_connection(conn)
 
     async def purge_completed(self, older_than: timedelta) -> int:
         """Delete completed publications older than ``older_than`` from BOTH
