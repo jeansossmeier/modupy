@@ -22,7 +22,10 @@ Configuration resolves env > [tool.modulith.broker] subtable > default:
   MODULITH_BROKER_MAX_PAYLOAD_BYTES /
   max_payload_bytes                        producer-side payload size cap, rejected with
                                             ConfigurationError (default 16 MiB)
-  poll_block_ms                            consumer XREADGROUP block timeout, ms (default 1000)
+  poll_block_ms                            consumer XREADGROUP block timeout, ms (default 1000);
+                                            also sets the client's socket_timeout to
+                                            poll_block_ms/1000 + 5 s (with socket_keepalive)
+                                            unless the URL's query string sets them
   reclaim_min_idle_ms                      consumer XAUTOCLAIM min-idle threshold, ms
                                             (default 60000)
   max_delivery_attempts                    consumer delivery attempts before dead-lettering

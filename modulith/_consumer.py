@@ -119,6 +119,7 @@ class BrokerConsumer:
         self._stopping = False
         self._health = ConsumerHealth(ready=False, status="stopped")
         self._read_started_at: float | None = None
+        self._read_stall_logged_for: float | None = None
         self._read_stall_s = _READ_STALL_POLL_INTERVALS * poll_block_ms / 1000 + 1.0
         # The redelivery window: past it, reclaim retries the message.
         self._health_failures = HealthFailures(completion_expiry_s=reclaim_min_idle_ms / 1000)
@@ -198,11 +199,17 @@ class BrokerConsumer:
             )
         started = self._read_started_at
         if started is not None and time.monotonic() - started >= self._read_stall_s:
-            return ConsumerHealth(
-                ready=False,
-                status="degraded",
-                detail=f"no broker read completed in {self._read_stall_s:g}s",
-            )
+            detail = f"no broker read completed in {self._read_stall_s:g}s"
+            if self._read_stall_logged_for != started:
+                self._read_stall_logged_for = started
+                logger.warning(
+                    "consumer %r: %s on %s -- the broker is not answering; "
+                    "health is degraded until a read completes",
+                    self._consumer_name,
+                    detail,
+                    self._targets,
+                )
+            return ConsumerHealth(ready=False, status="degraded", detail=detail)
         return self._health_failures.degraded() or self._health
 
     def _on_task_done(self, task: asyncio.Task[None]) -> None:

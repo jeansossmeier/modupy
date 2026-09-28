@@ -480,6 +480,21 @@ write from a healthy-but-slow consumer whose row a peer has already reclaimed
 clobbering the row the peer now owns. `fail` also reads the attempt count from
 the row inside the same transaction rather than trusting a caller snapshot.
 
+*A listener that never returns.* The consumer dispatches a claimed batch as one
+unit and claims nothing new until every row in it has finished, so one listener
+call that never returns (an HTTP call with no timeout, say) stops the whole
+consumer. While the batch runs, the consumer renews its claims every
+`reclaim_stale_seconds / 3`. It stops renewing after
+`reclaim_stale_seconds * 10`, so a peer consumer of the same group can reclaim
+the stuck rows. With one worker per module, the default, no peer exists.
+Past that deadline the consumer's health reports `degraded`, naming the stuck
+event type, target and row. It also logs one ERROR line that names the same
+rows. The listener is never cancelled, because modulith cannot know whether
+its side effects are safe to interrupt. The remedy is a restart: an orchestrator
+that restarts a worker on degraded health (see DEPLOYMENT "Health Checks and
+Monitoring") frees it, and the restarted consumer reclaims the stuck rows. The
+SHM consumer (§8.5) shares this dispatch code and behaves the same way.
+
 *Cross-host clock skew.* Every timing-sensitive value — a message's claim
 visibility (`available_at`), the reclaim cutoff (`claimed_at`), the retry
 backoff, and the prune age — is both stamped and compared against the **database
