@@ -91,10 +91,12 @@ delivers it is deliberately session-less (`postgres_outbox.py`'s
 (inventory → notifications) rides the in-memory bus, not the outbox — a crash
 between the two hops loses the second one. A production listener that wants a
 durable cascade must bind its own session and publish inside it (see
-`shop.orders.api.get_session` for the pattern). Because outbox delivery is
+`shop.orders.api.get_session`, which binds the session, and
+`post_order`, which commits it before responding). Because outbox delivery is
 at-least-once, `inventory.reserve_stock` and `notifications.notify_customer`
 each guard against a redelivered event with an `order_id` membership check
-before acting.
+before acting. `reserve_stock` records an order only after its `StockReserved`
+publish returns, so a redelivery that follows a failed publish retries it.
 
 ### C. Durable outbox on Postgres
 

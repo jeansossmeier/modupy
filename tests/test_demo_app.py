@@ -81,3 +81,76 @@ def test_demo_http_endpoint_triggers_chain(demo_app) -> None:
     # inventory (reserve) → notifications (notify).
     assert any(r.order_id == order_id for r in inventory.reserved)
     assert any(n.order_id == order_id for n in notifications.sent)
+
+
+def _flaky_publish(monkeypatch: pytest.MonkeyPatch, failures: int) -> list[object]:
+    """Replace inventory's ``publish`` with a broker send that fails ``failures`` times.
+
+    On the process topology a broker send failure propagates out of
+    ``publish`` into the listener (``modulith.runtime.Runtime.publish``), and
+    the consumer redelivers the event; this double stands in for that send.
+    """
+    from shop import inventory
+
+    published: list[object] = []
+    remaining = [failures]
+
+    async def publish(evt: object) -> None:
+        if remaining[0] > 0:
+            remaining[0] -= 1
+            raise ConnectionError("broker send failed")
+        published.append(evt)
+
+    monkeypatch.setattr(inventory, "publish", publish)
+    return published
+
+
+async def test_reserve_stock_republishes_after_failed_publish(
+    demo_app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from shop import inventory
+    from shop.contracts.events import OrderPlaced, StockReserved
+
+    published = _flaky_publish(monkeypatch, failures=1)
+    evt = OrderPlaced(order_id="o-1", customer_id="c-1", total=1.0)
+
+    with pytest.raises(ConnectionError):
+        await inventory.reserve_stock(evt)
+    await inventory.reserve_stock(evt)
+
+    assert published == [StockReserved(order_id="o-1")]
+    assert [r.order_id for r in inventory.reserved] == ["o-1"]
+
+
+async def test_reserve_stock_suppresses_redelivery_after_successful_publish(
+    demo_app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from shop import inventory
+    from shop.contracts.events import OrderPlaced, StockReserved
+
+    published = _flaky_publish(monkeypatch, failures=0)
+    evt = OrderPlaced(order_id="o-2", customer_id="c-2", total=2.0)
+
+    await inventory.reserve_stock(evt)
+    await inventory.reserve_stock(evt)
+
+    assert published == [StockReserved(order_id="o-2")]
+    assert [r.order_id for r in inventory.reserved] == ["o-2"]
+
+
+async def test_reserve_stock_guard_memory_is_bounded(
+    demo_app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard remembers the last ``GUARD_MEMORY`` orders and forgets older ones."""
+    from shop import inventory
+    from shop.contracts.events import OrderPlaced
+
+    published = _flaky_publish(monkeypatch, failures=0)
+    for i in range(inventory.GUARD_MEMORY + 1):
+        await inventory.reserve_stock(OrderPlaced(order_id=f"o-{i}", customer_id="c", total=1.0))
+
+    await inventory.reserve_stock(OrderPlaced(order_id="o-1", customer_id="c", total=1.0))
+    assert len(published) == inventory.GUARD_MEMORY + 1
+
+    await inventory.reserve_stock(OrderPlaced(order_id="o-0", customer_id="c", total=1.0))
+    assert len(published) == inventory.GUARD_MEMORY + 2

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -203,3 +204,40 @@ def test_durable_lifespan_with_otel_enabled(
         assert resp.status_code == 200
 
     assert shop.telemetry._initialized is True
+
+
+def test_durable_post_order_reports_failed_commit_as_error(
+    demo_shop, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A commit that fails must not be acknowledged with 200.
+
+    Another connection holds an EXCLUSIVE lock on the SQLite file across the
+    request, so the order + outbox INSERTs fail with ``database is locked``
+    once the 0.2 s busy timeout runs out. The client must see an error status
+    and no order row may exist; once the lock is gone the next request must
+    succeed, proving the session binding was released on the failure path.
+    """
+    db_path = tmp_path / "demo.db"
+    monkeypatch.setenv("MODULITH_OUTBOX", "postgres")
+    monkeypatch.setenv("MODULITH_DB_URL", f"sqlite+aiosqlite:///{db_path}?timeout=0.2")
+
+    import shop.main
+
+    with TestClient(shop.main.app, raise_server_exceptions=False) as client:
+        lock = sqlite3.connect(db_path, timeout=0, isolation_level=None)
+        try:
+            lock.execute("BEGIN EXCLUSIVE")
+            resp = client.post("/orders", json={"customer_id": "c-locked", "total": 1.0})
+            lock.execute("ROLLBACK")
+        finally:
+            lock.close()
+
+        assert resp.status_code == 500, resp.text
+        with sqlite3.connect(db_path) as con:
+            rows = con.execute(
+                "SELECT count(*) FROM shop_orders WHERE customer_id = 'c-locked'"
+            ).fetchone()
+        assert rows == (0,)
+
+        resp = client.post("/orders", json={"customer_id": "c-after", "total": 2.0})
+        assert resp.status_code == 200
