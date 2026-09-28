@@ -20,7 +20,12 @@ from modulith import listener, publish
 from shop.contracts.events import OrderPlaced, StockReserved
 
 reserved: deque[StockReserved] = deque(maxlen=1000)
-_reserved_order_ids: set[str] = set()
+
+# The idempotency guard's memory, oldest-first. It outlives the ``reserved``
+# inspection window so a late redelivery is still suppressed, but it is
+# bounded too: past GUARD_MEMORY orders the oldest id is forgotten.
+GUARD_MEMORY = 10_000
+_reserved_order_ids: dict[str, None] = {}
 
 router = APIRouter()
 
@@ -30,16 +35,22 @@ async def reserve_stock(event: OrderPlaced) -> None:
     """Reserve stock for a placed order, then announce the reservation.
 
     Guarded by order_id membership: outbox delivery is at-least-once
-    (modulith/builtin/outbox.py:14-16 — a listener may be called more than
-    once), so a redelivered OrderPlaced must not reserve stock (or publish
-    StockReserved) twice.
+    (``modulith/builtin/outbox.py`` module docstring — a listener may be
+    called more than once), so a redelivered OrderPlaced must not reserve
+    stock (or publish StockReserved) twice.
+
+    The order is recorded only after ``publish`` returns. A failed publish
+    raises, the event is redelivered, and the redelivery publishes again
+    instead of being swallowed as a duplicate.
     """
     if event.order_id in _reserved_order_ids:
         return
     evt = StockReserved(order_id=event.order_id)
-    reserved.append(evt)
-    _reserved_order_ids.add(event.order_id)
     await publish(evt)
+    _reserved_order_ids[event.order_id] = None
+    if len(_reserved_order_ids) > GUARD_MEMORY:
+        del _reserved_order_ids[next(iter(_reserved_order_ids))]
+    reserved.append(evt)
 
 
 @router.get("/reserved")

@@ -31,8 +31,11 @@ async def get_session(request: Request) -> AsyncIterator[Any]:
     ``request.app.state.sessionmaker`` is ``None`` unless ``shop.main``'s
     lifespan wired the durable outbox (``MODULITH_OUTBOX`` != "memory" or
     ``MODULITH_DB_URL`` set). When it's set, this dependency binds a session
-    to the outbox's context var for the lifetime of the request, commits after
-    the handler runs, and always resets the binding.
+    to the outbox's context var for the lifetime of the request and always
+    resets the binding. It does not commit: FastAPI runs a request-scoped
+    ``yield`` dependency's teardown after the response has been sent, so a
+    commit there would acknowledge the order before knowing it persisted. The
+    route commits instead (see ``post_order``).
 
     Typed ``Any`` (rather than ``AsyncSession | None``) deliberately: FastAPI
     resolves this callable's annotations via forward-ref evaluation against its
@@ -51,7 +54,6 @@ async def get_session(request: Request) -> AsyncIterator[Any]:
         token = bind_session(session)
         try:
             yield session
-            await session.commit()
         finally:
             unbind_session(token)
 
@@ -64,6 +66,13 @@ _session_dependency = Depends(get_session)
 
 @router.post("")
 async def post_order(req: PlaceOrderRequest, session: Any = _session_dependency) -> dict[str, str]:
-    """Place an order; the event chain fans out to the other modules."""
+    """Place an order; the event chain fans out to the other modules.
+
+    In durable mode the commit runs here, on the still-bound session, so a
+    failed commit becomes an error response instead of a 200 for an order
+    that was rolled back, and the outbox's after-commit dispatch still fires.
+    """
     order_id = await place_order(customer_id=req.customer_id, total=req.total, session=session)
+    if session is not None:
+        await session.commit()
     return {"order_id": order_id}
