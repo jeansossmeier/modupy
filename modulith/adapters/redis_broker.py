@@ -414,6 +414,7 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
     documents. No-op unless ``broker == "redis-streams"``.
     """
     from ..runtime import _runtime
+    from ..serializers import _resolve_max_payload_bytes
 
     cfg = _runtime.config
     if cfg is None or cfg.broker != _REDIS_SCHEME:
@@ -435,11 +436,7 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
             or _DEFAULT_MAXLEN
         ),
         dlq_max_stream_len=dlq_maxlen,
-        max_payload_bytes=int(
-            os.environ.get("MODULITH_BROKER_MAX_PAYLOAD_BYTES")
-            or opts.get("max_payload_bytes")
-            or DEFAULT_MAX_PAYLOAD_BYTES
-        ),
+        max_payload_bytes=_resolve_max_payload_bytes(opts),
     )
     registry.register(_REDIS_SCHEME, broker)
     logger.info("registered redis-streams broker (prefix=%s)", broker._stream_prefix)

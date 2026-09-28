@@ -1005,6 +1005,20 @@ def test_register_hook_rejects_invalid_stream_cap_env(
         _runtime.ensure_bootstrapped()
 
 
+def test_register_hook_rejects_non_numeric_max_payload_bytes_env(
+    make_fake_app, monkeypatch
+) -> None:
+    make_fake_app({"orders": ""})
+    from modulith import configure
+    from modulith.runtime import _runtime
+
+    monkeypatch.setenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", "abc")
+    configure(package="fakeapp", broker="redis-streams")
+
+    with pytest.raises(ConfigurationError, match="max_payload_bytes must be an integer"):
+        _runtime.ensure_bootstrapped()
+
+
 def test_register_hook_stream_caps_from_env_and_default(make_fake_app, monkeypatch) -> None:
     make_fake_app({"orders": ""})
     from modulith import configure
