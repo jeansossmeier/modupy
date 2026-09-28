@@ -468,8 +468,9 @@ cap itself. The reclaim charges an attempt only to a row whose dispatch had
 started: the consumer marks `dispatch_started` in the owner-guarded renewal it
 already makes just before handing a row to its listener. Rows claimed in the
 same batch but still queued behind the concurrency gate when the consumer died
-or stopped are reclaimed without losing an attempt, so one crash-looping row
-cannot dead-letter its batch-mates. Idle polling backoff never narrows below the configured
+or stopped are reclaimed without losing an attempt. Rows already dispatching
+beside a crash-looping row are charged with it, so with
+`dispatch_concurrency` above 1 a crash loop can still dead-letter those. Idle polling backoff never narrows below the configured
 `poll_interval_ms`: it grows exponentially while the queue is empty but is
 capped at `max(poll_interval, 0.5s)`.
 

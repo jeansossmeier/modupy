@@ -362,8 +362,10 @@ modulith doctor                   # nine operational + architectural health chec
 modulith outbox status            # outbox metrics (needs a durable outbox —
                                   # the default 'memory' store has nothing to
                                   # report and exits 1)
-modulith broker drop-group <group> # remove a retired module's consumer group
-                                  # (shm/database brokers; asks to confirm)
+modulith broker drop-group <group> [--target <target>]
+                                  # remove a retired module's consumer group, or
+                                  # only its stale targets (shm/database brokers;
+                                  # asks to confirm)
 modulith info                     # show detected config
 ```
 

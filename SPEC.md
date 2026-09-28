@@ -606,7 +606,7 @@ Same pattern as `mypy --strict` rolling out gradually. The baseline diff in git 
 - Proposed module structure based on folder layout: each top-level subdirectory of the audited root is a module candidate. At a project root whose only application directory is one package, or `src/` holding one package, the audited root is that package; tests, docs, scripts, examples, migrations, virtualenvs, hidden and build directories are ignored when deciding. The command prints the root it chose.
 - List of cross-module imports that would become violations
 - List of shared database tables that need ownership decisions
-- Modulith-readiness score (0-100): percentage of cross-module interactions that go through events vs direct calls. With fewer than two module candidates the score is reported as not applicable, with a warning.
+- Modulith-readiness score (0-100): percentage of cross-module interactions that go through events vs direct calls. With fewer than two module candidates the score is reported as not applicable, with a warning. It is also not applicable, with a warning naming the packages, when no import crosses candidates but some imports name packages below the audited folder that are not module candidates.
 
 Output is Markdown. Teams can run it on Friday afternoon, generate a baseline, have green CI on Monday, then tighten over weeks.
 
