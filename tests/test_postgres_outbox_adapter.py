@@ -784,7 +784,9 @@ async def test_task_spawned_in_bound_request_publishes_after_unbind_is_delivered
 async def test_bound_session_reused_across_commits_enlists_every_publish(engine: Any) -> None:
     """A session stays bound across several commits (autobegin opens a new
     transaction after each ``commit()``); every publish in that span is
-    persisted in the session and dispatched after its own commit."""
+    persisted in the session and dispatched after its own commit.
+    Each commit's dispatch is an independent task, so delivery order across
+    commits is not guaranteed."""
     store = PostgresPublicationStore(engine=engine)
     outbox.configure(store, JsonEventSerializer(), start_loop=False)
     _bootstrap_with_listener(record)
@@ -800,7 +802,7 @@ async def test_bound_session_reused_across_commits_enlists_every_publish(engine:
             unbind_session(token)
     await store.wait_for_dispatch()
 
-    assert received == [1, 2]
+    assert sorted(received) == [1, 2]
     assert await _completed_rows(engine) == 2
 
 
