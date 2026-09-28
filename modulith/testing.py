@@ -488,6 +488,24 @@ _ISOLATION_GUARD = "MODULITH_ISOLATED_SUBPROCESS"
 # Path of a private JSON-lines file the child appends its test reports to. A
 # file of its own, because a user's --junitxml is forwarded to the child.
 _RESULT_FILE_ENV = "MODULITH_ISOLATED_RESULT_FILE"
+# Must match the ``pytest11`` entry-point name in pyproject.toml.
+_ENTRY_POINT_NAME = "modulith"
+
+
+def _child_plugin_args(config: pytest.Config) -> list[str]:
+    """``-p`` options that load this plugin in the isolated child exactly once.
+
+    The child clears ini ``addopts``, so a plugin loaded there (typical with
+    plugin autoload disabled) would be missing. Loading it under the name the
+    parent used is a no-op when the child registers it anyway. Under any other
+    name than the entry point, the parent did not autoload the entry point, so
+    the child blocks it too: pluggy refuses one module under two names.
+    """
+    name = config.pluginmanager.get_name(sys.modules[__name__]) or _ENTRY_POINT_NAME
+    args = ["-p", name]
+    if name != _ENTRY_POINT_NAME:
+        args += ["-p", f"no:{_ENTRY_POINT_NAME}"]
+    return args
 
 
 class _IsolatedResultWriter:
@@ -594,12 +612,14 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
     process (guarded by an env var to prevent infinite recursion), then
     synthesize a report from the child's exit code and the outcome it
     records to a private result file, so a skip or xfail stays one and a
-    child that ran no test fails. Returning ``None`` for
+    child that ran no test, or exited before the test finished, fails.
+    Returning ``None`` for
     every other case hands control straight back to pytest's default
     protocol, so unmarked tests are completely unaffected.
 
     The child inherits the parent invocation's CLI arguments (see
-    ``_forwarded_parent_args``), runs from pytest's rootdir so the nodeid
+    ``_forwarded_parent_args``) and loads this plugin under the parent's name
+    (see ``_child_plugin_args``), runs from pytest's rootdir so the nodeid
     resolves regardless of the parent's cwd, and is killed after
     ``modulith_isolated_timeout`` seconds (ini option, default 300) so one
     hung test can't block the suite forever. The launch itself happens
@@ -624,6 +644,7 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
         "pytest",
         *_forwarded_parent_args(item.config),
         item.nodeid,
+        *_child_plugin_args(item.config),
         "-p",
         "no:cacheprovider",
         "-o",
@@ -687,6 +708,16 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
                 f"isolated subprocess for {item.nodeid} exited 0 without running "
                 "the test (a child-side plugin or option deselected or "
                 "suppressed it)\n"
+                f"--- stdout ---\n{completed.stdout}\n"
+                f"--- stderr ---\n{completed.stderr}"
+            )
+        # A setup skip or xfail writes a non-passed record and no call record;
+        # a passed setup with no call record means the body ended the child.
+        if not any(r["when"] == "call" or r["outcome"] != "passed" for r in records):
+            raise AssertionError(
+                f"isolated subprocess for {item.nodeid} exited 0 before the test "
+                "finished (the test body ended the process, e.g. os._exit(0) or "
+                "pytest.exit(returncode=0))\n"
                 f"--- stdout ---\n{completed.stdout}\n"
                 f"--- stderr ---\n{completed.stderr}"
             )
