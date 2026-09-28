@@ -59,8 +59,11 @@ and its contracts import, transitively. It refuses a module with outbound
 boundary violations, tables shared with another module, or imports of another
 declared module unless you pass `--force`, and the generated README records
 what you overrode. It then imports the extracted module in a subprocess and
-fails, naming the missing import, if that import fails, so the service's
-third-party dependencies must be installed.
+fails, naming the missing import, if that import fails or loads first-party
+code from outside the extracted tree, so the service's third-party
+dependencies must be installed. `--force` never overrides that import check:
+a module-level import of another declared module still fails it, so only a
+deferred one (inside a function) can be forced through.
 
 Adopting on an existing codebase? `modulith audit` writes a `MIGRATION.md`
 for it, and `modulith verify --mode=ratchet` baselines today's violations and

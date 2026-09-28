@@ -694,3 +694,129 @@ def test_extract_fails_when_extracted_module_does_not_import(make_fake_app, monk
     assert "No module named 'fakeapp.hidden'" in result.output
     assert not out_dir.exists()
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".orders-service.")] == []
+
+
+def test_extract_module_importing_contracts_needs_no_force(make_fake_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "from fakeapp.contracts.events import OrderPlaced\n"},
+        extra_files={
+            "contracts/__init__.py": "",
+            "contracts/events.py": "from fakeapp.contracts.base import Base\nOrderPlaced = Base\n",
+            "contracts/base.py": "Base = object\n",
+        },
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "fakeapp" / "contracts" / "events.py").is_file()
+    assert (out_dir / "fakeapp" / "contracts" / "base.py").is_file()
+    assert "Extraction notes" not in (out_dir / "README.md").read_text()
+
+
+def test_extract_copies_helper_file_beside_same_named_non_package_dir(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "from fakeapp.emails import send\n"},
+        extra_files={
+            "emails.py": "def send():\n    return 1\n",
+            "emails/welcome.html": "<p>hi</p>\n",
+            "contracts/__init__.py": "",
+        },
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "fakeapp" / "emails.py").read_text() == "def send():\n    return 1\n"
+    assert not (out_dir / "fakeapp" / "emails").exists()
+
+
+def test_extract_copies_helper_package_whose_initializer_does_work(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "from fakeapp._shared.fmt import fmt\n"},
+        extra_files={
+            "_shared/__init__.py": "from .fmt import fmt\n",
+            "_shared/fmt.py": "def fmt():\n    return 1\n",
+            "contracts/__init__.py": "",
+        },
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    shared = out_dir / "fakeapp" / "_shared"
+    assert (shared / "__init__.py").read_text() == "from .fmt import fmt\n"
+    assert (shared / "fmt.py").is_file()
+
+
+def test_extract_leaves_imports_naming_no_source_file_to_the_import_gate(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {
+            "orders": (
+                "from fakeapp._ns import mod\n"
+                "try:\n"
+                "    import fakeapp._generated\n"
+                "except ImportError:\n"
+                "    pass\n"
+            )
+        },
+        extra_files={"_ns/mod.py": "VALUE = 1\n", "contracts/__init__.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "fakeapp" / "_ns" / "mod.py").read_text() == "VALUE = 1\n"
+    assert not (out_dir / "fakeapp" / "_generated.py").exists()
+
+
+def test_extract_import_gate_refuses_first_party_code_from_the_source_tree(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "from common.money import cents\n"},
+        extra_files={"contracts/__init__.py": ""},
+    )
+    (tmp_path / "common").mkdir()
+    (tmp_path / "common" / "__init__.py").write_text("")
+    (tmp_path / "common" / "money.py").write_text("cents = 100\n")
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join(filter(None, [str(tmp_path), os.environ.get("PYTHONPATH")]))
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 1, result.output
+    assert "common.money" in result.output
+    assert "outside the extracted service" in result.output
+    assert not out_dir.exists()
+
+
+def test_extract_import_gate_sees_the_extracted_tree_under_pythonsafepath(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": "VALUE = 1\n"}, extra_files={"contracts/__init__.py": ""})
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "fakeapp" / "orders" / "__init__.py").read_text() == "VALUE = 1\n"

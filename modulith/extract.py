@@ -148,25 +148,67 @@ def import_closure(rt: Runtime, module: str) -> tuple[list[str], list[str]]:
                 ]:
                     if not candidate.startswith(f"{package}."):
                         continue
+                    if candidate == contracts or candidate.startswith(f"{contracts}."):
+                        continue
                     owner = _owning_module(candidate, rt.modules)
                     if owner is not None:
                         if owner.name != module and not record.type_only:
                             siblings.add(owner.name)
-                    elif candidate != contracts and not candidate.startswith(f"{contracts}."):
-                        helpers.add(candidate)
-                        pending.append(candidate)
+                        continue
+                    # Importing a.b.c runs a/__init__.py and a/b/__init__.py too, so
+                    # every resolvable ancestor package is part of the closure.
+                    parts = candidate.split(".")
+                    for depth in range(len(package.split(".")) + 1, len(parts) + 1):
+                        name = ".".join(parts[:depth])
+                        if _source_path(package_dir, package, name) is not None:
+                            helpers.add(name)
+                            pending.append(name)
     return sorted(helpers), sorted(siblings)
 
 
-def _check_imports(root: Path, dotted: str) -> None:
-    """Import *dotted* in a fresh interpreter rooted at *root*; raise if it fails.
+_IMPORT_CHECK = """
+import importlib, os, sys
+root, dotted, source = sys.argv[1:4]
+sys.path.insert(0, root)
+importlib.import_module(dotted)
+
+def under(path, parent):
+    return os.path.commonpath([path, parent]) == parent
+
+root, source = os.path.realpath(root), os.path.realpath(source)
+prefixes = {os.path.realpath(p) for p in (sys.prefix, sys.base_prefix, sys.exec_prefix)}
+leaked = sorted(
+    name
+    for name, mod in list(sys.modules.items())
+    if isinstance(getattr(mod, "__file__", None), str)
+    and under(os.path.realpath(mod.__file__), source)
+    and not under(os.path.realpath(mod.__file__), root)
+    and not any(under(os.path.realpath(mod.__file__), p) for p in prefixes)
+)
+if leaked:
+    sys.exit(
+        "ImportError: imported " + ", ".join(leaked) + " from the source tree " + source
+        + ", outside the extracted service; move that code into the module or a helper "
+        "under the package"
+    )
+"""
+
+
+def _check_imports(root: Path, dotted: str, source: Path) -> None:
+    """Import *dotted* in a fresh interpreter from the extracted tree at *root*; raise if it fails.
+
+    *root* goes first on the child's ``sys.path`` explicitly, so neither
+    ``PYTHONSAFEPATH`` nor an installed copy of the monolith can shadow it.
+    Any module the child then loads from *source* (the monolith's source
+    directory, reachable through ``PYTHONPATH`` or an editable install) is a
+    failure: the deployed service will not have it.
 
     Runs the extracted module's code, which is acceptable because extract is
     a trusted-source tool that already imports the app to discover modules.
     """
     try:
         result = subprocess.run(
-            [sys.executable, "-c", f"import {dotted}"],
+            [sys.executable, "-c", _IMPORT_CHECK, str(root), dotted, str(source)],
             cwd=root,
             capture_output=True,
             text=True,
@@ -396,7 +438,8 @@ def _render_readme(
             "",
             "## Copied helper modules — review these",
             "",
-            "Package-level code this module imports directly, outside any "
+            "Package-level code this module or its contracts import, directly or "
+            "transitively, outside any "
             "declared module and outside the contracts package. Copied so "
             "the extracted service still imports; review whether it belongs "
             "here or should become part of the contract:",
@@ -553,7 +596,11 @@ def write_extraction(
             helpers=helpers,
             notes=notes,
         )
-        _check_imports(staging, f"{cfg.package}.{module}")
+        _check_imports(
+            staging,
+            f"{cfg.package}.{module}",
+            source_root.parents[len(cfg.package.split(".")) - 1],
+        )
         if output.is_symlink():
             raise FileExistsError(f"--output {output} appeared during extraction")
         if output.exists():
@@ -637,12 +684,14 @@ def _populate_extraction(
     elif (package_dir / f"{contracts_rel}.py").is_file():
         copy_rel(Path(f"{contracts_rel}.py"))
 
+    helper_set = set(helpers)
     for helper in helpers:
-        rel = Path(*helper.removeprefix(f"{cfg.package}.").split("."))
-        if (package_dir / rel).is_dir():
-            copy_rel(rel)
-        elif (package_dir / f"{rel}.py").is_file():
-            copy_rel(Path(f"{rel}.py"))
+        parts = helper.split(".")
+        if any(".".join(parts[:depth]) in helper_set for depth in range(1, len(parts))):
+            continue  # already copied inside its ancestor package
+        source = _source_path(package_dir, cfg.package, helper)
+        if source is not None:
+            copy_rel(source.relative_to(package_dir))
 
     written.extend(
         _write_generated_files(
