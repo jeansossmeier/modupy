@@ -223,15 +223,27 @@ rejects any other `event_type` with `ValueError` before resolving the
 class. The cross-process worker applies this automatically, allowlisting
 exactly the event types its listeners consume.
 
-Fields decode by their annotations; `NewType` and `type` aliases decode as
-the type they name. Two field shapes carry a type tag,
-`{"__modulith_union_type__": "<module>.<qualname>", "value": ...}`: a
-multi-member union, and a nested dataclass holding an instance of a
-subclass of its declared class. A value of exactly the declared class stays
-untagged. A subclass tag is matched only against subclasses of the declared
-class already imported in the consuming process, never imported by name, so
-the consumer must import the module defining the subclass. A tag naming
-anything else raises `ValueError`.
+Fields decode by their annotations. A `NewType` and a non-generic `type`
+alias (a `TypeAliasType`, including chains of them) decode as the type they
+name. A parameterized generic alias such as `Pair[datetime]` is not
+unwrapped, and an alias whose value cannot be evaluated at runtime (a
+`TYPE_CHECKING`-only name) or that refers back to itself is left opaque:
+those fields pass through as their JSON values. Two field shapes carry a type
+tag, `{"__modulith_union_type__": "<module>.<qualname>", "value": ...}`: a
+multi-member union, and a nested dataclass holding an instance of a subclass
+of its declared class. A value of exactly the declared class stays untagged.
+A subclass tag is matched only against subclasses of the declared class
+already imported in the consuming process, never imported by name. A tag
+that matches no imported subclass decodes as the declared class when its
+fields fit that class, logging one WARNING per tag; import the module
+defining the subclass in the consumer (a process worker imports only the
+contracts package and its own module) to keep the subclass type. When the
+fields do not fit, decoding raises `TypeError`. In a union field, a tag that
+matches no member and no member's imported subclass decodes against the
+union's single dataclass member the same way; with no dataclass member, or
+more than one, it raises `ValueError`. A tagged value in a union never
+reaches the listener as the raw tagged dict: its reconstruction errors
+propagate.
 
 **`Broker`** — external message broker (producer side):
 ```

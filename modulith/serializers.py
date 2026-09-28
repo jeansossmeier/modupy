@@ -20,6 +20,7 @@ pass an instance to ``outbox.configure(serializer=...)``.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import importlib
 import json
 import logging
@@ -114,14 +115,23 @@ def _unwrap_alias(hint: Any) -> Any:
 
     Callers apply this to the hint itself, never to union members before
     ``_hint_tag``: stored union tags name a ``NewType`` member by its repr.
+    An alias whose lazy value cannot be evaluated (a ``TYPE_CHECKING``-only
+    name) or that cycles back to itself stays opaque, so its field is not
+    coerced.
     """
-    while True:
+    seen: set[int] = set()
+    while id(hint) not in seen:
+        seen.add(id(hint))
         if hasattr(hint, "__supertype__"):
             hint = hint.__supertype__
         elif type(hint).__name__ == "TypeAliasType":  # typing's or typing_extensions'
-            hint = hint.__value__
+            try:
+                hint = hint.__value__
+            except Exception:
+                return hint
         else:
             return hint
+    return hint
 
 
 def _is_tagged(value: Any) -> bool:
@@ -132,11 +142,7 @@ def _is_tagged(value: Any) -> bool:
     )
 
 
-class _UnknownSubclassTagError(ValueError):
-    """A nested type tag named no subclass of the declared field type."""
-
-
-def _subclass_for_tag(base: type, tag: str) -> type:
+def _subclass_for_tag(base: type, tag: str) -> type | None:
     """Find the subclass of ``base`` whose ``_hint_tag`` is ``tag``.
 
     The tag comes from an untrusted payload, and only the top-level event
@@ -149,8 +155,18 @@ def _subclass_for_tag(base: type, tag: str) -> type:
         if _hint_tag(candidate) == tag:
             return candidate
         pending.extend(candidate.__subclasses__())
-    raise _UnknownSubclassTagError(
-        f"nested type tag {tag!r} names no imported subclass of {_hint_tag(base)}"
+    return None
+
+
+@functools.lru_cache(maxsize=1024)
+def _warn_unknown_subclass_tag(tag: str, base_tag: str) -> None:
+    """Log once per tag (while cached) that a value decoded as its base class."""
+    logger.warning(
+        "nested type tag %r names no imported subclass of %s; decoded as %s. "
+        "Import the module defining the subclass in this process to keep its type.",
+        tag,
+        base_tag,
+        base_tag,
     )
 
 
@@ -348,17 +364,22 @@ def _coerce(value: Any, hint: Any) -> Any:
     if origin is Union or origin is types.UnionType:
         members = [a for a in typing.get_args(hint) if a is not type(None)]
         if _is_tagged(value):
-            tagged_member = next(
-                (member for member in members if _hint_tag(member) == value[_UNION_TAG]),
-                None,
-            )
+            tag = value[_UNION_TAG]
+            tagged_member = next((member for member in members if _hint_tag(member) == tag), None)
             if tagged_member is not None:
                 return _coerce(value["value"], tagged_member)
+            # A subclass of a dataclass member: that member's branch reconstructs
+            # it and any failure propagates, never a raw tagged dict.
+            bases = [m for m in members if dataclasses.is_dataclass(m) and isinstance(m, type)]
+            owner = next((b for b in bases if _subclass_for_tag(b, tag) is not None), None)
+            if owner is None and len(bases) == 1:
+                owner = bases[0]
+            if owner is None:
+                raise ValueError(f"union type tag {tag!r} names no member of {hint!r}")
+            return _coerce(value, owner)
         for member in members:
             try:
                 return _coerce(value, member)
-            except _UnknownSubclassTagError:
-                raise
             except (ValueError, TypeError):
                 continue
         return value
@@ -422,7 +443,13 @@ def _coerce(value: Any, hint: Any) -> Any:
     # Nested dataclass field: reconstruct recursively from the decoded dict.
     if dataclasses.is_dataclass(hint) and isinstance(hint, type) and isinstance(value, dict):
         if _is_tagged(value):
-            return _coerce(value["value"], _subclass_for_tag(hint, value[_UNION_TAG]))
+            tag = value[_UNION_TAG]
+            subclass = _subclass_for_tag(hint, tag)
+            if subclass is not None:
+                return _coerce(value["value"], subclass)
+            decoded = _coerce(value["value"], hint)
+            _warn_unknown_subclass_tag(tag, _hint_tag(hint))
+            return decoded
         sub_hints = _safe_type_hints(hint)
         return hint(**{k: _coerce(v, sub_hints.get(k)) for k, v in value.items()})
     return value
