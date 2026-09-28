@@ -1326,8 +1326,16 @@ def test_worker_port_base_is_read_from_pyproject(tmp_path: Path) -> None:
     assert load_configuration().worker_port_base == 19001
 
 
-@pytest.mark.parametrize("value", ["0", "65536", '"9001"', "true"])
-def test_worker_port_base_rejects_a_non_port(tmp_path: Path, value: str) -> None:
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        ("0", "a TCP port \\(1-65535\\), got 0"),
+        ("65536", "a TCP port \\(1-65535\\), got 65536"),
+        ('"9001"', "int, got str"),
+        ("true", "int, got bool"),
+    ],
+)
+def test_worker_port_base_rejects_a_non_port(tmp_path: Path, value: str, reason: str) -> None:
     (tmp_path / "pyproject.toml").write_text(f"[tool.modulith]\nworker_port_base = {value}\n")
-    with pytest.raises(ConfigurationError, match="worker_port_base"):
+    with pytest.raises(ConfigurationError, match=f"^worker_port_base must be {reason}"):
         load_configuration()

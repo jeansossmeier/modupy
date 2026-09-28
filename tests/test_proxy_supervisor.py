@@ -1192,3 +1192,81 @@ async def test_run_supervised_generates_a_distinct_token_per_deployment() -> Non
 
 async def _noop(app: Any, host: str, port: int) -> None:
     return None
+
+
+def _identified_upstream(name: str, token: str, hits: list[str]) -> FastAPI:
+    up = FastAPI()
+
+    @up.get("/orders/ping")
+    async def ping() -> dict[str, str]:
+        hits.append("/orders/ping")
+        return {"served_by": name}
+
+    @up.get("/health")
+    async def health() -> dict[str, str]:
+        hits.append("/health")
+        return {"status": "ok", "module": "orders", "deployment": token}
+
+    return up
+
+
+async def test_proxy_never_forwards_a_request_to_another_deployments_worker() -> None:
+    """Whether or not readiness has probed it yet, a backend answering for
+    another deployment never receives a request — the request carries the
+    client's cookies and auth headers."""
+    theirs_hits: list[str] = []
+    client = httpx.AsyncClient(
+        mounts={
+            "http://theirs": httpx.ASGITransport(
+                app=_identified_upstream("theirs", "deployment-a", theirs_hits)
+            )
+        }
+    )
+    rule = RoutingRule(prefix="/orders", backend_url="http://theirs")
+    proxy_app = create_proxy_app([rule], client=client, deployment_token="deployment-b")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+    ) as proxy_client:
+        before_probe = await proxy_client.get("/orders/ping", headers={"cookie": "s=1"})
+        await proxy_client.get("/_modulith/health")
+        after_probe = await proxy_client.get("/orders/ping", headers={"cookie": "s=1"})
+
+    assert (before_probe.status_code, after_probe.status_code) == (503, 503)
+    assert "/orders/ping" not in theirs_hits
+
+
+async def test_proxy_routes_only_to_its_own_replica_when_one_port_is_foreign() -> None:
+    """Round-robin lands on the foreign replica first; the request must be
+    served by this deployment's replica instead, before readiness has run."""
+    ours_hits: list[str] = []
+    theirs_hits: list[str] = []
+    client = httpx.AsyncClient(
+        mounts={
+            "http://theirs": httpx.ASGITransport(
+                app=_identified_upstream("theirs", "deployment-a", theirs_hits)
+            ),
+            "http://ours": httpx.ASGITransport(
+                app=_identified_upstream("ours", "deployment-b", ours_hits)
+            ),
+        }
+    )
+    rule = RoutingRule(
+        prefix="/orders",
+        backend_url="http://theirs",
+        backend_urls=("http://theirs", "http://ours"),
+    )
+    proxy_app = create_proxy_app([rule], client=client, deployment_token="deployment-b")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+    ) as proxy_client:
+        served = [(await proxy_client.get("/orders/ping")).json()["served_by"] for _ in range(3)]
+        identity_probes = ours_hits.count("/health")
+        health = await proxy_client.get("/_modulith/health")
+
+    assert served == ["ours", "ours", "ours"]
+    assert "/orders/ping" not in theirs_hits
+    assert health.json()["backends"] == {"/orders": "ok"}
+    # Identity is checked once per backend, not once per request.
+    assert identity_probes == 1

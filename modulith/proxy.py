@@ -66,36 +66,64 @@ class RoutingRule:
     backend_urls: tuple[str, ...] = ()
     _cycle: Iterator[str] = field(default_factory=_empty_backend_cycle, repr=False, compare=False)
     _down: dict[str, float] = field(default_factory=dict, repr=False, compare=False)
+    _foreign: dict[str, float] = field(default_factory=dict, repr=False, compare=False)
+    _verified: set[str] = field(default_factory=set, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         urls = self.backend_urls or (self.backend_url,)
         object.__setattr__(self, "backend_urls", urls)
         object.__setattr__(self, "_cycle", cycle(urls))
 
-    def next_backend(self) -> str:
-        """Round-robin over every replica not currently marked down.
+    def next_backend(self) -> str | None:
+        """Round-robin over every replica not currently marked down or foreign.
 
-        Falls back to the full replica set once every one of them is marked
-        down — proxying a doomed request (which still answers 502) beats a
-        proxy that permanently refuses a module the moment its whole fleet
-        blips.
+        Falls back to the replicas not marked foreign once every one is
+        marked down — proxying a doomed request (which still answers 502)
+        beats a proxy that permanently refuses a module the moment its whole
+        fleet blips. A foreign replica (its port answered for another
+        deployment) is never returned while its mark is fresh; ``None`` means
+        every replica is foreign. An expired foreign mark only makes the
+        replica eligible for the identity check that precedes any request.
         """
         now = time.monotonic()
         for _ in range(len(self.backend_urls)):
             candidate = next(self._cycle)
+            if self._is_foreign(candidate, now):
+                continue
             if candidate in self._down:
                 marked_at = self._down[candidate]
                 if now - marked_at < _DOWN_RETRY_SECONDS:
                     continue
                 del self._down[candidate]
             return candidate
-        return next(self._cycle)
+        for _ in range(len(self.backend_urls)):
+            candidate = next(self._cycle)
+            if not self._is_foreign(candidate, now):
+                return candidate
+        return None
+
+    def _is_foreign(self, url: str, now: float) -> bool:
+        marked_at = self._foreign.get(url)
+        return marked_at is not None and now - marked_at < _DOWN_RETRY_SECONDS
 
     def mark_down(self, url: str) -> None:
         self._down[url] = time.monotonic()
+        # Whatever answers on this port next may be a different process.
+        self._verified.discard(url)
 
     def mark_up(self, url: str) -> None:
         self._down.pop(url, None)
+
+    def mark_foreign(self, url: str) -> None:
+        self._foreign[url] = time.monotonic()
+        self._verified.discard(url)
+
+    def mark_verified(self, url: str) -> None:
+        self._verified.add(url)
+        self._foreign.pop(url, None)
+
+    def is_verified(self, url: str) -> bool:
+        return url in self._verified
 
 
 def _match_rule(path: str, rules: list[RoutingRule]) -> RoutingRule | None:
@@ -202,6 +230,32 @@ def create_proxy_app(
             return None
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
 
+    def record_identity(rule: RoutingRule, url: str, health: httpx.Response) -> bool:
+        """Mark ``url`` verified or foreign from its ``/health`` answer."""
+        if deployment_token is None:
+            return True
+        if _answers_for(health, deployment_token):
+            rule.mark_verified(url)
+            return True
+        rule.mark_foreign(url)
+        logger.warning(
+            "%s answers /health for another deployment (or is not a modulith "
+            "worker): another process holds this worker port; not routing to it",
+            url,
+        )
+        return False
+
+    async def confirm_identity(rule: RoutingRule, url: str) -> bool:
+        """Probe an unverified backend before it is sent any request.
+
+        Transport errors propagate so the caller's connect-retry and 502
+        handling apply to the probe exactly as to the request itself.
+        """
+        if deployment_token is None or rule.is_verified(url):
+            return True
+        health = await http_client.get(url + "/health", timeout=2.0)
+        return record_identity(rule, url, health)
+
     # Actuator routes are registered before the catch-all so they win for
     # /_modulith/* paths. Skipped entirely when disabled — see docstring.
     if actuator_enabled:
@@ -254,13 +308,7 @@ def create_proxy_app(
                     except Exception:
                         rule.mark_down(url)
                         return "unreachable"
-                    if deployment_token is not None and not _answers_for(resp, deployment_token):
-                        rule.mark_down(url)
-                        logger.warning(
-                            "%s answers /health for another deployment (or is not a "
-                            "modulith worker): another process holds this worker port",
-                            url,
-                        )
+                    if not record_identity(rule, url, resp):
                         return "foreign deployment"
                     if resp.status_code == 200:
                         rule.mark_up(url)
@@ -322,6 +370,23 @@ def create_proxy_app(
         # module (skipping any marked down by a failed health check or a
         # prior connect failure) — see RoutingRule.next_backend().
         backend = rule.next_backend()
+        # Skip past replicas whose port answers for another deployment before
+        # any request bytes (cookies, auth headers) reach them. An unreachable
+        # probe leaves the backend unverified; the send loop re-probes it.
+        for _ in range(len(rule.backend_urls)):
+            if backend is None:
+                break
+            try:
+                if await confirm_identity(rule, backend):
+                    break
+            except httpx.HTTPError:
+                break
+            backend = rule.next_backend()
+        if backend is None:
+            return JSONResponse(
+                {"detail": f"no worker of this deployment serves {rule.prefix}"},
+                status_code=503,
+            )
         query_string = request.scope.get("query_string", b"")
         # Log-only rendering; never parsed. The request itself is built from
         # components by _upstream_url.
@@ -395,6 +460,11 @@ def create_proxy_app(
         attempts = max(1, connect_retry_attempts)
         for attempt in range(attempts):
             try:
+                if not await confirm_identity(rule, backend):
+                    return JSONResponse(
+                        {"detail": f"no worker of this deployment serves {rule.prefix}"},
+                        status_code=503,
+                    )
                 upstream_resp = await http_client.send(upstream_req, stream=True)
             except httpx.ConnectError as exc:
                 # Worker port not bound yet (initial start or crash-respawn

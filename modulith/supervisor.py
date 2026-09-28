@@ -770,8 +770,8 @@ def _check_proxy_port(specs: list[WorkerSpec], proxy_port: int) -> None:
     for spec in specs:
         if proxy_port in _replica_ports(spec):
             raise ConfigurationError(
-                f"proxy port {proxy_port} is also worker {spec.module_name!r}'s port "
-                f"(worker ports {spec.port}-{spec.port + max(1, spec.worker_count) - 1}); "
+                f"proxy port {proxy_port} is also assigned to worker {spec.module_name!r} "
+                f"(ports {spec.port}-{spec.port + max(1, spec.worker_count) - 1}); "
                 "choose another --port or move the workers with --worker-port-base / "
                 "[tool.modulith] worker_port_base"
             )

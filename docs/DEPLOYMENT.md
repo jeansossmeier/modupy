@@ -611,7 +611,7 @@ open http://localhost:8000/orders/docs            # the orders worker's Swagger 
 open http://localhost:8000/inventory/docs         # a different worker, same public port
 ```
 
-The same URLs answer on each worker's **internal** port (9001+ by default; `modulith run --worker-port-base N` or `[tool.modulith] worker_port_base = N` moves the range, and each module takes one consecutive port per replica), which is where `kubectl port-forward` reaches them — note the module prefix is part of the path there too: `http://127.0.0.1:9001/orders/docs`, not `/docs`. Give each deployment sharing a host its own range: `modulith run` refuses a `--port` inside its worker range, and a proxy reports another deployment's worker as `foreign deployment` instead of serving it as healthy.
+The same URLs answer on each worker's **internal** port (9001+ by default; `modulith run --worker-port-base N` or `[tool.modulith] worker_port_base = N` moves the range, and each module takes one consecutive port per replica), which is where `kubectl port-forward` reaches them — note the module prefix is part of the path there too: `http://127.0.0.1:9001/orders/docs`, not `/docs`. Give each deployment sharing a host its own range: `modulith run` refuses a `--port` inside its worker range, and a proxy never forwards a request to another deployment's worker — it checks each worker's identity before its first request, answers 503 when no worker of its own serves the module, and reports the module as `foreign deployment`.
 
 Three consequences worth knowing:
 
