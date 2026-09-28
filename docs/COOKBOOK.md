@@ -170,8 +170,9 @@ Three sharp edges (the first two from `wrap_sync_listener`'s contract):
   - **Outbox:** if the outbox is also driven with `await publish()` on the
     app's own loop, the same `AsyncEngine` is shared across two loops. Once its
     connection pool is exhausted, SQLAlchemy raises `RuntimeError: <Queue> is
-    bound to a different event loop`. Keep publishes for one outbox engine on
-    one loop.
+    bound to a different event loop`. The outbox store, unlike the database
+    broker, does not hand calls to its engine's loop, and a larger pool does
+    not help. Keep publishes for one outbox engine on one loop.
   - **Database broker:** the broker submits the call to the loop that first
     used it, which in a worker is the app loop, and runs it there. That loop
     must stay running and unblocked, or the `publish_sync()` call waits for it

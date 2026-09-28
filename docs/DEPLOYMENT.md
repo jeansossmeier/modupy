@@ -40,10 +40,48 @@ gracefully. The outbox table must live in the same database as your business
 data: the row commits atomically with your data only inside one transaction.
 
 `main.py` does not run under `--topology processes`: its lifespan, middleware
-and this outbox wiring are absent from every worker. A worker whose
-`outbox` is not `"memory"` refuses to start unless the module's import or a
-`modulith_after_module_load` hook binds a store; each worker then starts the
-retry loop itself.
+and this outbox wiring are absent from every worker. Set `outbox_url` (below)
+so each worker binds the store itself. A worker whose `outbox` is not
+`"memory"` refuses to start with a `ConfigurationError` when neither
+`outbox_url`, the module's import nor a `modulith_after_module_load` hook
+bound a store. A deployment that exports `MODULITH_OUTBOX` without one of
+those therefore stops booting its workers instead of silently publishing
+without the outbox. Each worker starts the retry loop itself.
+
+**Binding the store from configuration.** Instead of the module-scope
+`outbox.configure()` below, set the outbox database's async SQLAlchemy URL:
+
+```toml
+[tool.modulith]
+outbox = "postgres"
+outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTBOX_URL
+```
+
+- modulith builds a `PostgresPublicationStore` on its own engine for that URL
+  and binds it in every process: the single-process server, each
+  process-topology worker, and the `modulith outbox ...` commands.
+- A store the application binds with `outbox.configure()` before bootstrap
+  wins, and no second store is built.
+- The claim settings in `[tool.modulith.outbox_options]` (`claim_strategy`,
+  `claim_lease_seconds`, `claim_batch_size`) apply to that store.
+- The deserialization allowlist is the event types of the process's own
+  listeners.
+- The binding needs module discovery (`auto_discover`, the default) outside a
+  worker, because the allowlist comes from the discovered listeners. With
+  `auto_discover = false`, call `outbox.configure()` yourself.
+- The outbox table must already exist (run the shipped Alembic migrations);
+  the URL must name the database holding your business tables.
+- The runtime's shutdown disposes the store and its engine. You still call
+  `outbox.start()` in a single-process app's lifespan.
+
+**Stored listener ids.** Each outbox row names its listener. A plain function
+is stored as `module.function`. A callable instance or bound method
+registered from an application module is stored as
+`<module package>:<class module>.<ClassName>`, for example
+`myapp.orders:myapp.shared.Notifier`, so one class used by two modules is
+delivered per module. Rows written by an earlier release under the bare
+`<class module>.<ClassName>` id no longer match a listener: drain them
+(`modulith outbox status` shows none incomplete) before upgrading.
 ```python
 from contextlib import asynccontextmanager
 
@@ -110,9 +148,11 @@ same engine across two loops; once the connection pool is exhausted,
 SQLAlchemy raises `RuntimeError: <Queue> is bound to a different event
 loop` (SQLite's forced `pool_size=1` hits this on the first concurrent
 publish; Postgres/MySQL only under load). modulith logs one warning the
-first time a second loop uses the engine. Keep publishes on one loop, or
-size `pool_size`/`max_overflow` for the cross-loop concurrency. The database
-broker does not share its pool across loops; see §A.
+first time a second loop uses the engine. Keep every publish for one outbox
+engine on one loop. A larger pool does not help: asyncpg and aiomysql
+connections only work on the loop that opened them. Unlike the outbox store,
+the database broker hands a call from another loop to the loop that owns its
+engine; see §A. This also applies to the store bound from `outbox_url`.
 
 **Listeners and durability:**
 - The outbox persists only the **first hop** of events (e.g., `orders` → `inventory`).
@@ -848,7 +888,10 @@ hard-killed supervisor from leaving workers behind is Linux-only.
 
 3. **Split processes** — `MODULITH_BROKER=database --topology processes`
    - Modules now run in separate workers
-   - Code doesn't change; listeners stay `@listener` decorated
+   - Module code doesn't change; listeners stay `@listener` decorated
+   - `main.py` does not run in workers: its lifespan, middleware, exception handlers and any `outbox.configure()` there are absent. Set `MODULITH_OUTBOX_URL` (or `[tool.modulith].outbox_url`) so every worker binds the outbox store itself, or bind it from each module's import or a `modulith_after_module_load` hook
+   - A worker with `MODULITH_OUTBOX` set and no store bound refuses to start with a `ConfigurationError`, so a deployment that exported `MODULITH_OUTBOX` for step 2 must add the URL before this step
+   - Each worker starts the outbox retry loop itself at startup
 
 4. **Extract microservice** — `modulith extract <module>` scaffolds a standalone service
    - Copies the module, its contracts and every package-level helper module they import, transitively, into `--output` (default `<module>-service/`) and generates a `pyproject.toml`, `Dockerfile`, `README.md`, and `.env.example` to run it against `modulith._worker:create_app`
