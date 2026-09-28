@@ -35,7 +35,7 @@ from modulith.supervisor import (
     run_supervised,
 )
 
-from conftest import _free_port
+from conftest import _free_port, _held_backend, _serve, _wait_for
 
 # ---------------------------------------------------------------------------
 # Replica round-robin: every replica gets HTTP traffic and a health check
@@ -468,6 +468,62 @@ async def test_run_supervised_wires_actuator_token_from_env(monkeypatch) -> None
         allowed = client.get("/_modulith/topology", headers={"authorization": "Bearer env-secret"})
     assert denied.status_code == 401
     assert allowed.status_code == 200
+
+
+@pytest.mark.real_process
+async def test_run_supervised_applies_proxy_max_connections_from_env(monkeypatch) -> None:
+    """MODULITH_PROXY_MAX_CONNECTIONS bounds the proxy's upstream pool: at 1,
+    a second concurrent request waits out the pool timeout and gets 503."""
+    monkeypatch.setenv("MODULITH_PROXY_MAX_CONNECTIONS", "1")
+    backend_port, proxy_port = _free_port(), _free_port()
+    captured: dict[str, Any] = {}
+
+    async def fake_serve(app: object, host: str, port: int) -> None:
+        captured["app"] = app
+
+    spec = WorkerSpec("orders", "app", backend_port)
+    await run_supervised(
+        [spec], "127.0.0.1", 8000, supervisor=_NoopSupervisor([]), serve=fake_serve
+    )
+    deployment = (spec.env or {})["MODULITH_DEPLOYMENT_TOKEN"]
+    release, in_flight = asyncio.Event(), [0]
+    servers = [
+        await _serve(_held_backend(release, in_flight, deployment), backend_port, "h11"),
+        await _serve(captured["app"], proxy_port, "h11"),
+    ]
+    try:
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{proxy_port}", timeout=30) as c:
+            held = asyncio.create_task(c.get("/orders/slow"))
+            await _wait_for(lambda: in_flight[0] >= 1, 10.0)
+            exhausted = await c.get("/orders/fast")
+            release.set()
+            await held
+    finally:
+        release.set()
+        for server, _ in servers:
+            server.should_exit = True
+        await asyncio.gather(*(task for _, task in servers))
+
+    assert (exhausted.status_code, exhausted.json()) == (
+        503,
+        {"detail": "proxy connection pool exhausted"},
+    )
+
+
+def test_run_supervised_rejects_non_positive_proxy_max_connections(monkeypatch) -> None:
+    from modulith.config import ConfigurationError
+
+    monkeypatch.setenv("MODULITH_PROXY_MAX_CONNECTIONS", "0")
+    with pytest.raises(ConfigurationError, match="MODULITH_PROXY_MAX_CONNECTIONS"):
+        asyncio.run(
+            run_supervised(
+                [WorkerSpec("orders", "app", 9001)],
+                "127.0.0.1",
+                8000,
+                supervisor=_NoopSupervisor([]),
+                serve=lambda app, host, port: asyncio.sleep(0),
+            )
+        )
 
 
 async def test_run_supervised_without_token_leaves_actuator_open(monkeypatch) -> None:

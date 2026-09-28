@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-import time
 import warnings
 from collections.abc import MutableMapping
 from typing import Any
@@ -26,7 +25,7 @@ from fastapi.testclient import TestClient
 
 from modulith.proxy import RoutingRule, _match_rule, create_proxy_app
 
-from conftest import _free_port
+from conftest import _free_port, _held_backend, _serve, _wait_for
 
 # ---------------------------------------------------------------------------
 # _match_rule (pure)
@@ -769,21 +768,6 @@ def _recording_app(seen: list[str]) -> Any:
     return app
 
 
-async def _serve(app: Any, port: int, http: Any) -> tuple[Any, asyncio.Task[None]]:
-    import uvicorn
-
-    server = uvicorn.Server(
-        uvicorn.Config(app, host="127.0.0.1", port=port, http=http, log_level="warning")
-    )
-    task = asyncio.create_task(server.serve())
-    deadline = time.monotonic() + 15.0
-    while not server.started:
-        assert not task.done(), f"server on port {port} died: {task.exception()!r}"
-        assert time.monotonic() < deadline, f"server on port {port} never came up"
-        await asyncio.sleep(0.02)
-    return server, task
-
-
 async def _raw_request_status(port: int, target: str) -> str:
     """Send ``target`` verbatim on the request line; return the status line."""
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -849,3 +833,125 @@ async def test_proxy_over_real_parser_sends_crafted_targets_nowhere(http: str) -
     assert crafted == ["HTTP/1.1 400 Bad Request"] * 4
     assert control == "HTTP/1.1 200 OK"
     assert worker_saw == ["/orders/x"]
+
+
+# ---------------------------------------------------------------------------
+# Connection pool: capacity, exhaustion, readiness isolation, env proxies
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.real_process
+async def test_proxy_serves_150_concurrent_slow_requests_with_default_pool() -> None:
+    backend_port, proxy_port = _free_port(), _free_port()
+    release, in_flight = asyncio.Event(), [0]
+    rule = RoutingRule("/orders", f"http://127.0.0.1:{backend_port}")
+    servers = [
+        await _serve(_held_backend(release, in_flight), backend_port, "h11"),
+        await _serve(create_proxy_app([rule]), proxy_port, "h11"),
+    ]
+    try:
+        async with httpx.AsyncClient(
+            base_url=f"http://127.0.0.1:{proxy_port}",
+            timeout=30,
+            limits=httpx.Limits(max_connections=None),
+        ) as client:
+            slow = [asyncio.create_task(client.get("/orders/slow")) for _ in range(150)]
+            await _wait_for(lambda: in_flight[0] >= 150, 10.0)
+            reached = in_flight[0]
+            fast = await client.get("/orders/fast")
+            health = await client.get("/_modulith/health")
+            down = dict(rule._down)
+            release.set()
+            slow_codes = [r.status_code for r in await asyncio.gather(*slow)]
+    finally:
+        release.set()
+        for server, _ in servers:
+            server.should_exit = True
+        await asyncio.gather(*(task for _, task in servers))
+
+    assert reached == 150
+    assert (fast.status_code, fast.json()) == (200, {"ok": "fast"})
+    assert (health.status_code, health.json()["backends"]) == (200, {"/orders": "ok"})
+    assert down == {}
+    assert slow_codes == [200] * 150
+
+
+@pytest.mark.real_process
+async def test_proxy_answers_503_on_pool_exhaustion_without_marking_backend_down() -> None:
+    backend_port, proxy_port = _free_port(), _free_port()
+    release, in_flight = asyncio.Event(), [0]
+    rule = RoutingRule("/orders", f"http://127.0.0.1:{backend_port}")
+    proxy = create_proxy_app(
+        [rule], max_connections=1, timeout=httpx.Timeout(5.0, read=None, pool=0.3)
+    )
+    servers = [
+        await _serve(_held_backend(release, in_flight), backend_port, "h11"),
+        await _serve(proxy, proxy_port, "h11"),
+    ]
+    try:
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{proxy_port}", timeout=30) as c:
+            held = asyncio.create_task(c.get("/orders/slow"))
+            await _wait_for(lambda: in_flight[0] >= 1, 10.0)
+            exhausted = await c.get("/orders/fast")
+            down = dict(rule._down)
+            health = await c.get("/_modulith/health")
+            release.set()
+            held_resp = await held
+            after = await c.get("/orders/fast")
+    finally:
+        release.set()
+        for server, _ in servers:
+            server.should_exit = True
+        await asyncio.gather(*(task for _, task in servers))
+
+    assert exhausted.status_code == 503
+    assert exhausted.json() == {"detail": "proxy connection pool exhausted"}
+    assert down == {}
+    assert (health.status_code, health.json()["backends"]) == (200, {"/orders": "ok"})
+    assert held_resp.status_code == 200
+    assert (after.status_code, after.json()) == (200, {"ok": "fast"})
+
+
+@pytest.mark.real_process
+async def test_proxy_ignores_environment_proxy_settings(monkeypatch) -> None:
+    """With HTTP_PROXY set and NO_PROXY=localhost (which does not cover
+    127.0.0.1), forwarded requests and readiness probes still go straight to
+    the loopback worker; the environment's proxy never sees a byte."""
+    recorded: list[bytes] = []
+
+    async def recording_proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        recorded.append(await reader.readuntil(b"\r\n\r\n"))
+        writer.write(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nfrom-proxy")
+        await writer.drain()
+        writer.close()
+
+    fake = await asyncio.start_server(recording_proxy, "127.0.0.1", 0)
+    for name in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.upper(), raising=False)
+    monkeypatch.setenv("HTTP_PROXY", f"http://127.0.0.1:{fake.sockets[0].getsockname()[1]}")
+    monkeypatch.setenv("NO_PROXY", "localhost")
+
+    backend_port, proxy_port = _free_port(), _free_port()
+    rule = RoutingRule("/orders", f"http://127.0.0.1:{backend_port}")
+    servers = [
+        await _serve(_held_backend(asyncio.Event(), [0]), backend_port, "h11"),
+        await _serve(create_proxy_app([rule], connect_retry_attempts=1), proxy_port, "h11"),
+    ]
+    try:
+        async with httpx.AsyncClient(
+            base_url=f"http://127.0.0.1:{proxy_port}", trust_env=False
+        ) as c:
+            resp = await c.get(
+                "/orders/fast", headers={"Authorization": "Bearer SECRET", "Cookie": "sid=abc"}
+            )
+            health = await c.get("/_modulith/health")
+    finally:
+        for server, _ in servers:
+            server.should_exit = True
+        await asyncio.gather(*(task for _, task in servers))
+        fake.close()
+
+    assert (resp.status_code, resp.json()) == (200, {"ok": "fast"})
+    assert (health.status_code, health.json()["backends"]) == (200, {"/orders": "ok"})
+    assert recorded == []

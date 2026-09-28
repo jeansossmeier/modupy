@@ -810,6 +810,10 @@ async def run_supervised(
     the cap exists, but an app with large uploads has no other way past it
     from ``modulith run``.
 
+    ``MODULITH_PROXY_MAX_CONNECTIONS`` bounds the proxy's concurrent upstream
+    connections (1000 by default). Each in-flight proxied request, including
+    a long-poll or streaming response, holds one until it finishes.
+
     Each call generates a random deployment token and adds it to every spec's
     ``env`` as ``MODULITH_DEPLOYMENT_TOKEN`` (mutating the specs, so an injected
     supervisor built from them passes it on too). Workers echo it on
@@ -822,7 +826,7 @@ async def run_supervised(
     ``supervisor`` and ``serve`` are injection seams for testing; production
     callers pass neither and get a real Supervisor plus a uvicorn server.
     """
-    from .proxy import DEFAULT_MAX_REQUEST_BODY_BYTES, create_proxy_app
+    from .proxy import DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_REQUEST_BODY_BYTES, create_proxy_app
 
     if actuator_token is None:
         actuator_token = os.environ.get("MODULITH_ACTUATOR_TOKEN") or None
@@ -852,6 +856,9 @@ async def run_supervised(
         ),
         failed_instances=sup.failed_instances,
         deployment_token=deployment_token,
+        max_connections=_env_positive_int(
+            "MODULITH_PROXY_MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS
+        ),
     )
     serve_fn = serve if serve is not None else _serve_uvicorn
 

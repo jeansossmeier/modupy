@@ -190,7 +190,11 @@ uvicorn's `FORWARDED_ALLOW_IPS` (env var, e.g. the ingress CIDR or `*` when
 the proxy is reachable only through the ingress) on the proxy process so
 `request.client`/scheme reflect the real client before this overwrite runs.
 
-**Request targets.** The proxy forwards the client's path bytes unchanged (an encoded `%2F` stays one segment) to the matched module's own worker only. It answers `400` for a request-target that does not start with `/` or that contains a `.` or `..` path segment, literal or percent-encoded, and contacts no worker for it.
+**Request targets.** The proxy forwards the path to the matched module's worker without decoding it, so an encoded `%2F` stays one segment. httpx percent-encodes a few characters on the way out (`"`, `<`, `>`, `` ` ``, `{`, `}`), which leaves the decoded path unchanged. The proxy answers `400` for a request-target, as the server's HTTP parser presented it, that does not start with `/` or that contains a `.` or `..` path segment, literal or percent-encoded, and contacts no worker for it. It connects to each worker's loopback port directly and ignores `HTTP_PROXY`, `ALL_PROXY` and related proxy variables in its environment.
+
+**Query strings in logs.** The `modulith.proxy` logger never logs query strings. uvicorn's access log does: on the proxy and on every worker it records each request's full target, query string included, at `INFO`. `modulith run --log-level warning` switches it off on both, together with every other `INFO` line.
+
+**Connection pool.** The proxy holds one upstream connection per in-flight request until the response has finished streaming, so long-polls, server-sent events and slow downloads each occupy one for their whole duration. `MODULITH_PROXY_MAX_CONNECTIONS` (default `1000`) bounds them. A request that finds every connection busy for 5 seconds gets `503` `{"detail": "proxy connection pool exhausted"}`; the worker is not marked down, and `/_modulith/health` probes use a separate pool, so readiness stays accurate. Raise the bound for many concurrent long-lived requests, keeping the proxy's open-file limit (`ulimit -n`) above it.
 
 **Set `state_dir` for the SHM broker in production.** Without it, the `shm`
 store lives in a per-user directory named after a digest of the package's
@@ -886,6 +890,7 @@ Broker and outbox settings are covered in the topology sections above
 | `MODULITH_ACTUATOR_TOKEN` | unset | Bearer token for `/_modulith/*`. Required to mount the actuator under `auto` on a non-loopback bind or in production. |
 | `MODULITH_PRODUCTION` | unset (false) | `1`/`true`/`yes`, case-insensitive. Treats the deployment as production: the actuator's `auto` mode requires a token even on loopback, and the boundary gate below is never disarmed. |
 | `MODULITH_PROXY_MAX_BODY_BYTES` | `10485760` (10 MiB) | Per-request body cap for the reverse proxy in `--topology processes`. The proxy buffers each request body in memory, which is why the cap exists; raise it for large uploads. Must be a positive integer — anything else fails startup with a `ConfigurationError`, rather than silently reverting to the default. |
+| `MODULITH_PROXY_MAX_CONNECTIONS` | `1000` | Most upstream connections the reverse proxy in `--topology processes` holds open at once. Each in-flight request, including a long-poll or streaming response, uses one until it finishes; a request that finds none free for 5 seconds gets `503`. Must be a positive integer — anything else fails startup with a `ConfigurationError`. See [Connection pool](#process-per-module-topology). |
 | `MODULITH_DEV_WARN_ONLY` | unset | Set to `1` by single-process `modulith dev` only. Under `strict_boundaries = true`, boundary violations then log a warning instead of aborting the boot, keeping interactive development usable. Process topology and `modulith run` ignore the marker. It is an environment variable rather than an in-process flag because it has to survive uvicorn's `--reload` fork. Do not set it in a deployment. |
 
 ---
