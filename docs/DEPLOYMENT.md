@@ -810,12 +810,12 @@ In single-process topology there is no proxy and no actuator: modulith adds no H
 
 **Per-worker-pod probes (generated manifests).** The manifests `modulith k8s-manifest` generates probe each worker pod directly rather than through the proxy: readiness is `httpGet /health` on the container port, and liveness is a `tcpSocket` check on the same port. `/health` returns 503 while that worker's broker consumer isn't ready, which readiness correctly treats as not-yet-serving; liveness intentionally does not use `httpGet`, since a worker whose broker connection is temporarily down would otherwise get killed and restarted for no reason.
 
-**When a broker error degrades `/health`.** A failed broker call puts the consumer in `degraded` (503) until the same operation next succeeds for the same stream or target. Completion writes (ack, fail, dead-letter, claim renewal) have two more ways to clear, identical for the Redis, database and SHM consumers:
+**When a broker error degrades `/health`.** A failed broker call puts the consumer in `degraded` (503) until the same operation next succeeds for the same stream or target. Completion writes (ack, fail, dead-letter, claim renewal) can also clear in these ways:
 
-- The failure expires after the redelivery window: `reclaim_min_idle_ms` for Redis, `reclaim_stale_seconds` for the database and SHM brokers. By then the affected message has been reclaimed and retried, here or on a peer replica. A write that still fails on the retry records a fresh failure, so a persistent failure stays visible.
-- On Redis, the failure clears as soon as its message is no longer pending in the consumer group, for example because a peer replica reclaimed and acknowledged it.
+- On every consumer, the failure expires after the redelivery window: `reclaim_min_idle_ms` for Redis, `reclaim_stale_seconds` for the database and SHM brokers. By then the affected message is eligible for reclaim, here or on a peer replica. A write that fails again on the retry records a fresh failure, so a persistent failure shows up again, but `/health` can report ready between the expiry and that retry.
+- On Redis only, the failure clears as soon as its message is no longer pending in the consumer group, for example because a peer replica reclaimed and acknowledged it.
 
-A failure on one target never clears because another target succeeded.
+A failure on one target never clears because another target succeeded. The exceptions are the database and SHM consumers' claim and claim-renewal heartbeat, which are tracked per consumer group.
 
 **When a stalled consumer degrades `/health`.** A consumer that stops making progress reports `degraded` (503) even when no broker call has failed:
 
