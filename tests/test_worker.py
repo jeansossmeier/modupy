@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import sys
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -282,6 +283,153 @@ def test_only_configured_module_is_imported(make_fake_app, monkeypatch) -> None:
 
     assert "fakeapp.orders" in sys.modules
     assert "fakeapp.inventory" not in sys.modules  # sibling NOT imported
+
+
+_SIBLING_IMPORT_APP = {
+    "contracts": """
+        from dataclasses import dataclass
+        from modulith import event
+
+        RUNS: list[str] = []
+
+        @event
+        @dataclass(frozen=True)
+        class PaymentReceived:
+            payment_id: str
+
+        @event
+        @dataclass(frozen=True)
+        class NoteSent:
+            note_id: str
+
+        @event
+        @dataclass(frozen=True)
+        class Audited:
+            audit_id: str
+    """,
+    "orders": """
+        from modulith import listener
+        from fakeapp.contracts import RUNS, NoteSent, PaymentReceived
+
+        def order_label(order_id: str) -> str:
+            return f"order-{order_id}"
+
+        @listener
+        async def on_payment(event: PaymentReceived) -> None:
+            RUNS.append("orders.on_payment")
+
+        @listener
+        async def on_note(event: NoteSent) -> None:
+            RUNS.append("orders.on_note")
+    """,
+    "notifications": """
+        from modulith import listener
+        from fakeapp.contracts import RUNS, PaymentReceived
+        from fakeapp.orders import order_label
+        import fakeapp.shared_listeners
+
+        @listener
+        async def notify_payment(event: PaymentReceived) -> None:
+            RUNS.append("notifications.notify_payment")
+    """,
+}
+
+_SHARED_LISTENERS = {
+    "shared_listeners.py": """
+        from modulith import listener
+        from fakeapp.contracts import RUNS, Audited
+
+        @listener
+        async def audit(event: Audited) -> None:
+            RUNS.append("shared.audit")
+    """
+}
+
+
+class _CapturingBroker(_NoopBroker):
+    def __init__(self) -> None:
+        self.targets: list[str] = []
+
+    async def publish(
+        self,
+        target: str,
+        payload: bytes,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.targets.append(target)
+
+
+def _sibling_importing_worker(make_fake_app, monkeypatch) -> tuple[Any, _CapturingBroker]:
+    make_fake_app(_SIBLING_IMPORT_APP, extra_files=_SHARED_LISTENERS)
+    _set_worker_env(monkeypatch, "notifications")
+    create_app()
+    broker = _CapturingBroker()
+    assert _runtime.broker_registry is not None
+    _runtime.broker_registry.register("test-noop-broker", broker)
+    return sys.modules["fakeapp.contracts"], broker
+
+
+def test_sibling_listener_imported_by_module_is_not_dispatched_by_worker(
+    make_fake_app, monkeypatch
+) -> None:
+    contracts, _ = _sibling_importing_worker(make_fake_app, monkeypatch)
+    assert "fakeapp.orders" in sys.modules  # the sibling really was imported
+
+    asyncio.run(_runtime.dispatch_local(contracts.PaymentReceived("p1"), _runtime.event_bus))
+
+    assert contracts.RUNS == ["notifications.notify_payment"]
+
+
+def test_sibling_owned_event_published_by_worker_routes_to_broker(
+    make_fake_app, monkeypatch
+) -> None:
+    contracts, broker = _sibling_importing_worker(make_fake_app, monkeypatch)
+
+    asyncio.run(_runtime.publish(contracts.NoteSent("n1")))
+
+    assert contracts.RUNS == []
+    assert broker.targets == ["fakeapp.contracts.NoteSent"]
+
+
+def test_worker_consumes_only_its_own_modules_event_types(make_fake_app, monkeypatch) -> None:
+    contracts, _ = _sibling_importing_worker(make_fake_app, monkeypatch)
+    specs: list[ConsumerSpec] = []
+
+    def _capture(spec: ConsumerSpec) -> _NoopConsumer:
+        specs.append(spec)
+        return _NoopConsumer()
+
+    assert _runtime.consumer_registry is not None
+    _runtime.consumer_registry.register("test-noop-broker", _capture)
+
+    assert _build_consumer("notifications") is not None
+
+    assert sorted(specs[0].targets) == [
+        "fakeapp.contracts.Audited",
+        "fakeapp.contracts.PaymentReceived",
+    ]
+    serializer = specs[0].serializer
+    note = serializer.serialize(contracts.NoteSent("n1"))
+    with pytest.raises(Exception, match="NoteSent"):
+        serializer.deserialize(note, "fakeapp.contracts.NoteSent")
+    payment = serializer.serialize(contracts.PaymentReceived("p1"))
+    assert serializer.deserialize(payment, "fakeapp.contracts.PaymentReceived") == (
+        contracts.PaymentReceived("p1")
+    )
+
+
+def test_listener_outside_module_packages_still_runs_in_importing_worker(
+    make_fake_app, monkeypatch
+) -> None:
+    contracts, _ = _sibling_importing_worker(make_fake_app, monkeypatch)
+
+    async def plugin_listener(event: Any) -> None:
+        contracts.RUNS.append("plugin")
+
+    _runtime.register_listener(contracts.Audited, plugin_listener)
+    asyncio.run(_runtime.dispatch_local(contracts.Audited("a1"), _runtime.event_bus))
+
+    assert sorted(contracts.RUNS) == ["plugin", "shared.audit"]
 
 
 # ---------------------------------------------------------------------------

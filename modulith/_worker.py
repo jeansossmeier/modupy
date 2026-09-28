@@ -84,6 +84,7 @@ def create_app() -> FastAPI:
     contracts_module = _runtime.config.contracts_module if _runtime.config else "contracts"
     _import_contracts(app_package, contracts_module)
     module_package = f"{app_package}.{module_name}"
+    _runtime.host_module(module_package)
     module = importlib.import_module(module_package)
     _import_manifest(module_package)
     # auto_discover=False means the bootstrap loop above never populates a
@@ -292,7 +293,7 @@ def _build_consumer(module_name: str, consumer_name: str | None = None) -> Any:
         targets=tuple(targets),
         bus=bus,
         serializer=JsonEventSerializer(
-            allowed_event_types=bus.registered_event_types(),
+            allowed_event_types=_runtime.local_event_types(bus),
             max_payload_bytes=_resolve_max_payload_bytes(cfg.broker_options),
         ),
         broker_registry=broker_registry,

@@ -14,6 +14,7 @@ import asyncio
 import logging
 import os
 import pkgutil
+import sys
 import threading
 from collections.abc import Callable
 from dataclasses import replace
@@ -114,6 +115,14 @@ class Runtime:
         # Listeners registered before bootstrap go here, then flush
         # into the real event bus once it exists.
         self._pending_listeners: list[tuple[type, Callable[..., Any]]] = []
+
+        # Module package whose import registered each listener (see
+        # _importing_module_package), and the one module package a
+        # process-per-module worker hosts. With a hosted module set, only its
+        # own and untagged listeners are consumed, dispatched or counted as
+        # local; with none (single topology) every listener is local.
+        self._listener_owners: dict[Callable[..., Any], str] = {}
+        self._hosted_module: str | None = None
 
         # Plugins injected programmatically (not via entry points), registered
         # at bootstrap. Embedding contexts — most notably the pytest plugin's
@@ -244,11 +253,72 @@ class Runtime:
         # rejected at the registration call site instead of surfacing as a
         # confusing failure when the queued listener is flushed at bootstrap.
         _require_async_handler(event_type, handler)
+        owner = self._importing_module_package()
         with self._lock:
+            if owner is not None:
+                self._listener_owners[handler] = owner
             if self._event_bus is not None:
                 self._event_bus.register(event_type, handler)
             else:
                 self._pending_listeners.append((event_type, handler))
+
+    def _importing_module_package(self) -> str | None:
+        """The application module package whose import is registering a listener.
+
+        Walks the caller's frames outward to the innermost module-level frame
+        belonging to an application module package: a public direct
+        subpackage of the configured package, other than the contracts
+        module. A listener in a plain file such as ``app/shared.py`` is
+        credited to the module that imported it; one registered outside any
+        module import (plugin code, a hook, a test) gets None and stays local
+        to every process.
+        """
+        cfg = self._config
+        if cfg is None or not cfg.package:
+            return None
+        prefix = f"{cfg.package}."
+        frame: Any = sys._getframe(1)
+        while frame is not None:
+            name = frame.f_globals.get("__name__")
+            if (
+                frame.f_code.co_name == "<module>"
+                and isinstance(name, str)
+                and name.startswith(prefix)
+            ):
+                segment = name[len(prefix) :].partition(".")[0]
+                package = f"{prefix}{segment}"
+                if (
+                    not segment.startswith("_")
+                    and segment != cfg.contracts_module
+                    and hasattr(sys.modules.get(package), "__path__")
+                ):
+                    return package
+            frame = frame.f_back
+        return None
+
+    def host_module(self, module_package: str) -> None:
+        """Restrict this process's listeners to one module package's own.
+
+        Called by the process-per-module worker. Listeners registered while
+        importing another module package (a sibling pulled in through its
+        public API) are then ignored by consumer subscriptions, broker
+        dispatch and local publish, so they run only in their owner's worker.
+        """
+        self._hosted_module = module_package
+
+    def local_listeners(self, handlers: list[Callable[..., Any]]) -> list[Callable[..., Any]]:
+        """The subset of ``handlers`` this process owns."""
+        hosted = self._hosted_module
+        if hosted is None:
+            return handlers
+        return [h for h in handlers if self._listener_owners.get(h, hosted) == hosted]
+
+    def local_event_types(self, bus: Any) -> list[type]:
+        """Registered event types with at least one listener this process owns."""
+        event_types: list[type] = bus.registered_event_types()
+        if self._hosted_module is None:
+            return event_types
+        return [t for t in event_types if self.local_listeners(bus.listeners_for(t))]
 
     async def publish(self, event: Any) -> None:
         """Publish an event. Triggers bootstrap if not yet done.
@@ -297,7 +367,7 @@ class Runtime:
             from .builtin import outbox
 
             assert self._event_bus is not None
-            handlers = self._event_bus.listeners_for(type(event))
+            handlers = self.local_listeners(self._event_bus.listeners_for(type(event)))
             try:
                 records = list(await outbox.persist(event))
                 target = self._broker_route_target(event, has_local_handler=bool(handlers))
@@ -447,7 +517,7 @@ class Runtime:
             id=uuid4(), payload=payload, event_type=event_type, published_at=datetime.now(UTC)
         )
 
-        handlers = bus.listeners_for(type(event))
+        handlers = self.local_listeners(bus.listeners_for(type(event)))
         if not handlers:
             # No local listener. In process-per-module topology this is a
             # cross-module event bound for a worker in another process —
@@ -506,7 +576,7 @@ class Runtime:
             # delivery already is the whole contract.
             await bus.publish(event)
             return
-        handlers = bus.listeners_for(type(event))
+        handlers = self.local_listeners(bus.listeners_for(type(event)))
         if not handlers:
             return
         first_error = await self._run_listeners(
@@ -1093,6 +1163,8 @@ class Runtime:
         self._consumer_registry = None
         self._modules = []
         self._pending_listeners = []
+        self._listener_owners = {}
+        self._hosted_module = None
         self._extra_plugins = []
         self._disabled_plugins = []
         # The manifest registry is a separate module-global, populated by
