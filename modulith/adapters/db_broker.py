@@ -73,9 +73,11 @@ fresh transactions until a group appears or its monotonic deadline expires;
 ``store`` retains one source until its replay policy has materialized the
 required per-group queue rows or its database-clock TTL expires.
 
-Claim path (competing consumers): ``FOR UPDATE SKIP LOCKED`` on Postgres/
-MySQL lets concurrent consumers partition the backlog instead of blocking or
-double-claiming (see ``_supports_skip_locked``). SQLite has no row locking at
+Claim path (competing consumers): ``FOR UPDATE SKIP LOCKED`` on Postgres,
+MySQL 8.0.1+ and MariaDB 10.6+ lets concurrent consumers partition the backlog
+instead of blocking or double-claiming (see ``_supports_skip_locked``). An
+older MySQL-family server is rejected with a ``ConfigurationError``
+(``_require_skip_locked``), never given an unlocked claim. SQLite has no row locking at
 all and rejects the clause, so it degrades to a plain claim inside one
 transaction — correct for sequential consumption in tests, but not a
 substitute for the Postgres/MySQL concurrency guarantee. SQLite is hardened
@@ -123,6 +125,7 @@ which restores the crash-reclaim guarantee above.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -130,10 +133,10 @@ import math
 import os
 import random
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any, Concatenate, ParamSpec, TypeVar, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from modulith import (
@@ -220,8 +223,13 @@ _BACKOFF_MAX_EXPONENT = 7
 # MariaDB reports its own dialect name ("mariadb", not "mysql") and has
 # supported SKIP LOCKED since 10.6 (2021) — without it here a ``mariadb://``
 # URL silently degraded to the SQLite-style plain claim, losing the
-# competing-consumer partitioning it is fully capable of.
+# competing-consumer partitioning it is fully capable of. A MariaDB server
+# reached through ``mysql+aiomysql://`` reports ``mysql`` with
+# ``dialect.is_mariadb`` set, so the MySQL-family gate reads the server version.
 _SKIP_LOCKED_DIALECTS = frozenset({"postgresql", "mysql", "mariadb"})
+_MYSQL_FAMILY_DIALECTS = frozenset({"mysql", "mariadb"})
+_MYSQL_SKIP_LOCKED_MINIMUM = (8, 0, 1)
+_MARIADB_SKIP_LOCKED_MINIMUM = (10, 6)
 
 # SQLite ``busy_timeout`` (ms) applied to every connection when none is
 # configured: how long a blocked writer waits for the lock before raising
@@ -499,16 +507,95 @@ def _is_pg_namespace_unique_race(exc: BaseException) -> bool:
     return sqlstate == "23505" and constraint == "pg_namespace_nspname_index"
 
 
-def _supports_skip_locked(engine: Any) -> bool:
-    """True when ``engine``'s dialect supports ``FOR UPDATE SKIP LOCKED``.
+def _skip_locked_server_version(dialect: Any) -> tuple[int, ...] | None:
+    """The connected MySQL-family server's version, ``None`` before connect.
 
-    Postgres and MySQL (8+) support it; SQLite has no row locking whatsoever
-    and raises a CompileError if the clause is issued, so the claim query
-    must gate on this before adding ``.with_for_update(skip_locked=True)``
-    (exactly the pattern ``postgres_outbox.py``'s ``_supports_skip_locked``
-    uses, generalized to the two lockable dialects instead of one).
+    MariaDB can report through MySQL's ``5.5.5-`` compatibility prefix, which
+    SQLAlchemy keeps in ``server_version_info``; its own version is the last
+    three numbers.
     """
-    return engine.dialect.name in _SKIP_LOCKED_DIALECTS
+    version = getattr(dialect, "server_version_info", None)
+    if version is None:
+        return None
+    numbers = tuple(part for part in version if isinstance(part, int))
+    return numbers[-3:] if getattr(dialect, "is_mariadb", False) else numbers
+
+
+def _skip_locked_minimum(dialect: Any) -> tuple[int, ...]:
+    if getattr(dialect, "is_mariadb", False):
+        return _MARIADB_SKIP_LOCKED_MINIMUM
+    return _MYSQL_SKIP_LOCKED_MINIMUM
+
+
+def _supports_skip_locked(engine: Any) -> bool:
+    """True when ``engine``'s connected server supports ``FOR UPDATE SKIP LOCKED``.
+
+    Postgres always does. MySQL does from 8.0.1 and MariaDB from 10.6; older
+    servers reject the clause as a syntax error, and an unknown version is
+    never assumed to parse it. SQLite has no row locking and raises a
+    CompileError if the clause is issued, so the claim query gates on this
+    before adding ``.with_for_update(skip_locked=True)``.
+    """
+    dialect = engine.dialect
+    if dialect.name not in _SKIP_LOCKED_DIALECTS:
+        return False
+    if dialect.name not in _MYSQL_FAMILY_DIALECTS:
+        return True
+    version = _skip_locked_server_version(dialect)
+    return version is not None and version >= _skip_locked_minimum(dialect)
+
+
+def _require_skip_locked(engine: Any) -> None:
+    """Reject a MySQL-family server that cannot run the locked claim.
+
+    The plain claim is not a fallback there: under InnoDB REPEATABLE READ two
+    consumers' consistent reads return the same pending rows and both claim them.
+    """
+    dialect = engine.dialect
+    if dialect.name not in _MYSQL_FAMILY_DIALECTS or _supports_skip_locked(engine):
+        return
+    version = _skip_locked_server_version(dialect)
+    server = "MariaDB" if getattr(dialect, "is_mariadb", False) else "MySQL"
+    shown = "unknown" if version is None else ".".join(map(str, version))
+    minimum = ".".join(map(str, _skip_locked_minimum(dialect)))
+    raise ConfigurationError(
+        f"The database broker claims messages with FOR UPDATE SKIP LOCKED, which the "
+        f"connected {server} server {shown} does not support; {server} {minimum} or "
+        "newer is required."
+    )
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _on_owning_loop(
+    method: Callable[Concatenate[DatabaseBroker, _P], Coroutine[Any, Any, _R]],
+) -> Callable[Concatenate[DatabaseBroker, _P], Coroutine[Any, Any, _R]]:
+    """Run a broker coroutine on the event loop that owns the engine's pool.
+
+    asyncpg and aiomysql connections are bound to the loop that opened them,
+    and one pool serves every loop, so a call from any other running loop (the
+    sync API's daemon-thread loop, for one) is submitted to the owning loop and
+    awaited from here. A call already on the owning loop runs directly.
+
+    The owning loop must stay running and unblocked: a submitted call waits on
+    it, and an owner blocked in synchronous code hangs the caller until it
+    unblocks.
+    """
+
+    @functools.wraps(method)
+    async def run(self: DatabaseBroker, /, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        owner = self._check_cross_loop_usage()
+        if owner is None:
+            return await method(self, *args, **kwargs)
+        # ponytail: an owner that stops between the is_running() check and
+        # running this task leaves the call waiting forever; bound the wait if
+        # an owner loop ever stops while other loops are still publishing.
+        future = asyncio.run_coroutine_threadsafe(method(self, *args, **kwargs), owner)
+        return await asyncio.wrap_future(future)
+
+    return run
 
 
 def _is_sqlite_url(url: Any) -> bool:
@@ -984,10 +1071,9 @@ class DatabaseBroker:
         self._schema_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
             weakref.WeakKeyDictionary()
         )
-        # Cross-loop usage detector for _write(), the chokepoint every
-        # publish/subscribe/claim/ack/fail/dead_letter/prune call routes
-        # through: a weakref.ref to the first loop seen, same eviction
-        # rationale as _schema_locks above.
+        # The loop that owns the engine's pool (see _on_owning_loop): a
+        # weakref.ref to the first loop seen, same eviction rationale as
+        # _schema_locks above.
         self._used_loop_ref: weakref.ReferenceType[asyncio.AbstractEventLoop] | None = None
         self._cross_loop_warned = False
 
@@ -1011,32 +1097,31 @@ class DatabaseBroker:
             self._schema_locks[loop] = lock
         return lock
 
-    def _check_cross_loop_usage(self) -> None:
-        """Warn once when this broker's engine is used from a second loop.
+    def _check_cross_loop_usage(self) -> asyncio.AbstractEventLoop | None:
+        """Return the loop a call from the running loop must run on, or ``None``
+        to run it here.
 
-        Behaviour is unchanged either way: SQLAlchemy's ``AsyncAdaptedQueue``
-        binds to whichever loop first blocks on it, so under pool exhaustion a
-        later loop raises ``RuntimeError: <Queue ...> is bound to a different
-        event loop`` from deep inside SQLAlchemy. This surfaces the hazard
-        early instead of leaving it to that opaque failure.
+        The first loop to use the broker owns the engine. A later call from
+        another loop goes to the owner while the owner is running, and warns
+        once. When the owner has stopped or closed, the running loop takes
+        ownership instead: nothing is left to run the call, and the pooled
+        connections opened on the old loop are only as usable as their driver
+        allows off it.
         """
         loop = asyncio.get_running_loop()
-        if self._used_loop_ref is None:
+        owner = None if self._used_loop_ref is None else self._used_loop_ref()
+        if owner is None or owner is loop or owner.is_closed() or not owner.is_running():
             self._used_loop_ref = weakref.ref(loop)
-            return
-        if self._cross_loop_warned:
-            return
-        bound_loop = self._used_loop_ref()
-        if bound_loop is not None and bound_loop is not loop:
+            return None
+        if not self._cross_loop_warned:
             logger.warning(
-                "DatabaseBroker engine first used on one event loop is now used "
-                "from another; once the connection pool is exhausted SQLAlchemy "
-                "raises 'Queue is bound to a different event loop'. Keep every "
-                "publish on one loop (do not mix `await publish()` with "
-                "`publish_sync()` on this broker) or size pool_size/max_overflow "
-                "for the cross-loop concurrency."
+                "DatabaseBroker engine is owned by the event loop that first used "
+                "it; calls from another loop (such as publish_sync()'s) are "
+                "submitted to the owning loop, and the broker runs them on that "
+                "loop, which must stay running and unblocked while they wait."
             )
             self._cross_loop_warned = True
+        return owner
 
     async def _broker_tables_present(self, *, deadline: float | None = None) -> bool:
         """True only when every table in broker metadata is queryable."""
@@ -1182,7 +1267,6 @@ class DatabaseBroker:
         and the caller should not see the outcome change with it. Exhausting
         ``_SQLITE_BUSY_MAX_RETRIES`` first keeps raising the driver's own error.
         """
-        self._check_cross_loop_usage()
         if not self._is_sqlite:
             async with self._engine.begin() as conn:
                 return await operation(conn)
@@ -1518,6 +1602,7 @@ class DatabaseBroker:
 
     # ----- producer side -----------------------------------------------
 
+    @_on_owning_loop
     async def publish(
         self,
         target: str,
@@ -1590,6 +1675,7 @@ class DatabaseBroker:
                 raise NoSubscribersError(target, self._no_subscriber_wait_timeout_s)
             await asyncio.sleep(min(self._no_subscriber_wait_poll_interval_s, remaining))
 
+    @_on_owning_loop
     async def close(self) -> None:
         """Dispose the engine (and its connection pool). Idempotent-friendly
         (close-after-close does not raise — ``AsyncEngine.dispose`` itself
@@ -1598,6 +1684,7 @@ class DatabaseBroker:
 
     # ----- consumer side -------------------------------------------------
 
+    @_on_owning_loop
     async def subscribe(self, targets: list[str] | tuple[str, ...], group: str) -> None:
         """Upsert ``(target, group)`` subscription rows — idempotent AND
         concurrency-safe.
@@ -1613,6 +1700,7 @@ class DatabaseBroker:
         if not targets:
             return
         await self._ensure_schema()
+        _require_skip_locked(self._engine)
         _, subscription, _ = broker_schema()
         retained, _ = _retained_tables()
         ordered_targets = sorted(set(targets))
@@ -1703,6 +1791,7 @@ class DatabaseBroker:
 
         return insert(subscription).values(rows)
 
+    @_on_owning_loop
     async def claim_batch(
         self,
         group: str,
@@ -1740,6 +1829,7 @@ class DatabaseBroker:
         see ``_supports_skip_locked`` and the module docstring.
         """
         await self._ensure_schema()
+        _require_skip_locked(self._engine)
         from sqlalchemy import and_, or_, select, update
 
         _, _, message = broker_schema()
@@ -1836,6 +1926,7 @@ class DatabaseBroker:
         rows: list[dict[str, Any]] = await self._write(op)
         return rows
 
+    @_on_owning_loop
     async def renew_claims(
         self,
         row_ids: list[str],
@@ -1884,6 +1975,7 @@ class DatabaseBroker:
         count: int = await self._write(op)
         return count
 
+    @_on_owning_loop
     async def ack(self, row_id: str, *, consumer_name: str) -> None:
         """Complete a row THIS consumer still owns: delete it (default) or mark
         it 'done' (mark mode, which keeps the row for the prune job — see
@@ -1910,6 +2002,7 @@ class DatabaseBroker:
 
         await self._write(op)
 
+    @_on_owning_loop
     async def fail(self, row_id: str, error: str, *, consumer_name: str, max_attempts: int) -> None:
         """Record a dispatch failure for a row THIS consumer still owns:
         attempts++ with backoff, staying 'pending' until ``max_attempts`` is
@@ -1957,6 +2050,7 @@ class DatabaseBroker:
 
         await self._write(op)
 
+    @_on_owning_loop
     async def dead_letter(self, row_id: str, error: str, *, consumer_name: str) -> None:
         """Mark a poison row THIS consumer still owns 'dead' immediately
         (undeserializable payload or missing ``event_type`` — retrying can never
@@ -1979,6 +2073,7 @@ class DatabaseBroker:
 
         await self._write(op)
 
+    @_on_owning_loop
     async def prune(
         self,
         *,
@@ -2056,6 +2151,7 @@ class DatabaseBroker:
             logger.debug("prune deleted %d terminal row(s)", deleted)
         return deleted
 
+    @_on_owning_loop
     async def group_backlog(self) -> dict[str, int]:
         """Map every subscribed group to its pending and claimed row count."""
         await self._ensure_schema()
@@ -2081,6 +2177,7 @@ class DatabaseBroker:
         result: dict[str, int] = await self._write(op)
         return result
 
+    @_on_owning_loop
     async def drop_group(self, group: str) -> tuple[int, int]:
         """Unsubscribe a retired group and delete its undelivered rows.
 

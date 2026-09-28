@@ -166,12 +166,16 @@ Three sharp edges (the first two from `wrap_sync_listener`'s contract):
 - Multiple sync listeners for one event run **concurrently on separate
   threads**, each with a copy of the caller's context. Share only thread-safe
   resources; give each listener its own session/lock.
-- `publish_sync()` runs on its own persistent daemon-thread loop. If the
-  outbox or database broker is also driven with `await publish()` on the
-  app's own loop, the same `AsyncEngine` is shared across two loops; once its
-  connection pool is exhausted, SQLAlchemy raises `RuntimeError: <Queue> is
-  bound to a different event loop`. Keep publishes for one engine on one
-  loop, or size `pool_size`/`max_overflow` for the cross-loop concurrency.
+- `publish_sync()` runs on its own persistent daemon-thread loop.
+  - **Outbox:** if the outbox is also driven with `await publish()` on the
+    app's own loop, the same `AsyncEngine` is shared across two loops. Once its
+    connection pool is exhausted, SQLAlchemy raises `RuntimeError: <Queue> is
+    bound to a different event loop`. Keep publishes for one outbox engine on
+    one loop.
+  - **Database broker:** the broker submits the call to the loop that first
+    used it, which in a worker is the app loop, and runs it there. That loop
+    must stay running and unblocked, or the `publish_sync()` call waits for it
+    (DEPLOYMENT.md §A).
 
 `publish_sync()` takes a `timeout` (default 30s) and raises `PublishSyncTimeout`
 if a listener deadlocks. Do **not** call it from inside async code on the loop's

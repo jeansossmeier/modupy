@@ -100,7 +100,8 @@ SQLAlchemy raises `RuntimeError: <Queue> is bound to a different event
 loop` (SQLite's forced `pool_size=1` hits this on the first concurrent
 publish; Postgres/MySQL only under load). modulith logs one warning the
 first time a second loop uses the engine. Keep publishes on one loop, or
-size `pool_size`/`max_overflow` for the cross-loop concurrency.
+size `pool_size`/`max_overflow` for the cross-loop concurrency. The database
+broker does not share its pool across loops; see §A.
 
 **Listeners and durability:**
 - The outbox persists only the **first hop** of events (e.g., `orders` → `inventory`).
@@ -252,11 +253,31 @@ exists rather than failing on a duplicate.
 - Each module is independently restartable
 - Ideal for: single-host deployments where process isolation improves fault tolerance and independent restartability without requiring external infrastructure
 
-Drive one `db_broker` `AsyncEngine` from a single event loop, for the same
-reason as the outbox's `PostgresPublicationStore` above: mixing an app-loop
-publish with `publish_sync()`'s daemon-thread loop shares the engine across
-loops and eventually raises `RuntimeError: <Queue> is bound to a different
-event loop` once the connection pool is exhausted.
+**The database broker runs every call on the loop that owns its engine.** An
+asyncpg or aiomysql connection only works on the event loop that opened it,
+and the broker keeps one connection pool. The first event loop to use the
+broker owns that pool. In a worker, that is the app loop, because the consumer
+subscribes there at startup. A call from any other loop, such as
+`publish_sync()`'s daemon-thread loop in a sync view, is submitted to the
+owning loop and waits for it there. Pool sizing plays no part in this.
+
+This has two consequences:
+
+- The owning loop must stay running and unblocked. A marshalled call waits on
+  it, so an owner blocked in synchronous code hangs every call from other
+  loops until it unblocks. `publish_sync()` already refuses to run on a thread
+  whose loop is running.
+- When the owning loop has stopped or closed, the next calling loop takes
+  ownership. A call that is submitted in the instant the owner stops can wait
+  indefinitely, because no loop is left to run it.
+
+modulith logs one warning the first time a call arrives from a second loop.
+
+The database broker needs `FOR UPDATE SKIP LOCKED` to claim messages: MySQL
+8.0.1 or newer, or MariaDB 10.6 or newer. A consumer connected to an older
+server fails at startup with a `ConfigurationError` that names the server
+version and the minimum. There is no unlocked fallback, because under InnoDB's
+REPEATABLE READ two consumers would claim the same rows.
 
 **Configuration:**
 

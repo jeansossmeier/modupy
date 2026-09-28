@@ -679,3 +679,55 @@ async def test_publish_and_claim_stamp_from_server_clock(broker_engine: Any) -> 
     assert abs((_aware(row.created_at) - ref).total_seconds()) < 10.0
     assert abs((_aware(row.available_at) - ref).total_seconds()) < 10.0
     assert abs((_aware(row.claimed_at) - ref).total_seconds()) < 10.0
+
+
+async def test_publish_from_the_sync_api_loop_uses_the_engine_owning_loop(
+    broker_engine: Any,
+) -> None:
+    """``publish_sync`` runs ``publish`` on the sync API's daemon-thread loop
+    while the worker's consumer has filled the pool from the app loop. asyncpg
+    and aiomysql connections are bound to the loop that opened them, so the
+    daemon-loop publish must never check one of them out on its own loop."""
+    from modulith.sync import _get_or_create_loop
+
+    broker = DatabaseBroker(engine=broker_engine)
+    await broker.subscribe([_TARGET], "g")
+    await broker.claim_batch("g", batch_size=10, consumer_name="app")
+    payload = JsonEventSerializer().serialize(WidgetCreated(name="w"))
+
+    def publish_from_sync_view() -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            broker.publish(_TARGET, payload, {"event_type": _EVENT_TYPE}), _get_or_create_loop()
+        )
+        future.result(timeout=10)
+
+    for _ in range(3):
+        await asyncio.to_thread(publish_from_sync_view)
+        rows = await broker.claim_batch("g", batch_size=10, consumer_name="app")
+        assert [row["payload"] for row in rows] == [payload]
+
+
+@pytest.mark.parametrize("broker_engine", ["mysql"], indirect=True)
+@pytest.mark.parametrize(
+    ("version", "is_mariadb", "minimum"),
+    [((5, 7, 44), False, "8.0.1"), ((10, 5, 29), True, "10.6")],
+)
+async def test_mysql_server_without_skip_locked_is_rejected_at_startup(
+    broker_engine: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    version: tuple[int, ...],
+    is_mariadb: bool,
+    minimum: str,
+) -> None:
+    from modulith import ConfigurationError
+
+    monkeypatch.setattr(broker_engine.dialect, "server_version_info", version)
+    monkeypatch.setattr(broker_engine.dialect, "is_mariadb", is_mariadb)
+    broker = DatabaseBroker(engine=broker_engine)
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        await broker.subscribe([_TARGET], "g")
+
+    message = str(excinfo.value)
+    assert ".".join(map(str, version)) in message
+    assert minimum in message

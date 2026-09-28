@@ -2720,20 +2720,50 @@ def test_runtime_bootstrap_registers_db_consumer_factory(make_fake_app: Any) -> 
 
 
 class _FakeDialect:
-    def __init__(self, name: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        server_version_info: tuple[int, ...] | None = None,
+        is_mariadb: bool = False,
+    ) -> None:
         self.name = name
+        self.server_version_info = server_version_info
+        self.is_mariadb = is_mariadb
 
 
 class _FakeEngine:
-    def __init__(self, name: str) -> None:
-        self.dialect = _FakeDialect(name)
+    def __init__(
+        self,
+        name: str,
+        server_version_info: tuple[int, ...] | None = None,
+        is_mariadb: bool = False,
+    ) -> None:
+        self.dialect = _FakeDialect(name, server_version_info, is_mariadb)
 
 
 def test_skip_locked_gate_selects_lockable_dialects_only() -> None:
     assert _supports_skip_locked(_FakeEngine("postgresql")) is True
-    assert _supports_skip_locked(_FakeEngine("mysql")) is True
-    assert _supports_skip_locked(_FakeEngine("mariadb")) is True  # 10.6+ supports it
+    assert _supports_skip_locked(_FakeEngine("mysql", (8, 0, 1))) is True
+    assert _supports_skip_locked(_FakeEngine("mysql", (8, 4, 3))) is True
+    assert _supports_skip_locked(_FakeEngine("mysql", (10, 6, 0), is_mariadb=True)) is True
+    assert _supports_skip_locked(_FakeEngine("mariadb", (11, 4, 2), is_mariadb=True)) is True
+    # A MariaDB server reporting through the MySQL "5.5.5-" compatibility prefix.
+    assert (
+        _supports_skip_locked(_FakeEngine("mysql", (5, 5, 5, 10, 11, 8), is_mariadb=True)) is True
+    )
     assert _supports_skip_locked(_FakeEngine("sqlite")) is False
+
+
+def test_skip_locked_gate_rejects_servers_older_than_the_clause() -> None:
+    assert _supports_skip_locked(_FakeEngine("mysql", (8, 0, 0))) is False
+    assert _supports_skip_locked(_FakeEngine("mysql", (5, 7, 44))) is False
+    assert _supports_skip_locked(_FakeEngine("mysql", (10, 5, 29), is_mariadb=True)) is False
+    assert _supports_skip_locked(_FakeEngine("mariadb", (10, 3, 39), is_mariadb=True)) is False
+    assert (
+        _supports_skip_locked(_FakeEngine("mysql", (5, 5, 5, 10, 5, 29), is_mariadb=True)) is False
+    )
+    # An unknown version never assumes the clause parses.
+    assert _supports_skip_locked(_FakeEngine("mysql")) is False
 
 
 # ---------------------------------------------------------------------------
@@ -4438,35 +4468,79 @@ async def test_prune_loop_survives_prune_failure(engine: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cross-event-loop engine usage: warn once, never raise
+# Cross-event-loop usage: calls run on the loop that owns the engine
 # ---------------------------------------------------------------------------
 
 
-def _run_on_new_loop(coro_factory: Any) -> None:
+def _run_on_new_loop(coro_factory: Any) -> Any:
     loop = asyncio.new_event_loop()
     try:
-        loop.run_until_complete(coro_factory())
+        return loop.run_until_complete(coro_factory())
     finally:
         loop.close()
 
 
-_CROSS_LOOP_MSG = "bound to a different event loop"
+_CROSS_LOOP_MSG = "runs them on that loop"
 
 
 async def test_broker_used_from_two_loops_warns_once(engine: Any, caplog: Any) -> None:
     broker = DatabaseBroker(engine=engine)
     with caplog.at_level(logging.WARNING, logger="modulith.adapters.db"):
         await broker.subscribe(["t1"], "g1")
-
-        thread = threading.Thread(
-            target=_run_on_new_loop, args=(lambda: broker.subscribe(["t2"], "g2"),)
-        )
-        thread.start()
-        thread.join(timeout=10)
-        assert not thread.is_alive()
+        await asyncio.to_thread(_run_on_new_loop, lambda: broker.subscribe(["t2"], "g2"))
 
     warnings = [r for r in caplog.records if _CROSS_LOOP_MSG in r.getMessage()]
     assert len(warnings) == 1, f"expected exactly one cross-loop warning, got: {caplog.records}"
+
+
+async def test_calls_from_another_loop_execute_on_the_loop_that_owns_the_engine(
+    engine: Any,
+) -> None:
+    from sqlalchemy import event as sa_event
+
+    statement_threads: list[int] = []
+
+    def record(*_args: Any) -> None:
+        statement_threads.append(threading.get_ident())
+
+    broker = DatabaseBroker(engine=engine)
+    await broker.subscribe(["t1"], "g1")
+    owner_thread = threading.get_ident()
+    sa_event.listen(engine.sync_engine, "before_cursor_execute", record)
+    try:
+        await asyncio.to_thread(
+            _run_on_new_loop, lambda: broker.publish("t1", b"p", {"event_type": "t1"})
+        )
+        rows = await asyncio.to_thread(
+            _run_on_new_loop,
+            lambda: broker.claim_batch("g1", batch_size=10, consumer_name="other-loop"),
+        )
+    finally:
+        sa_event.remove(engine.sync_engine, "before_cursor_execute", record)
+
+    assert [row["payload"] for row in rows] == [b"p"]
+    assert statement_threads, "expected the publish and claim to issue statements"
+    assert set(statement_threads) == {owner_thread}
+
+
+async def test_close_from_another_loop_disposes_on_the_owning_loop(
+    engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
+    broker = DatabaseBroker(engine=engine)
+    await broker.subscribe(["t1"], "g1")
+    disposed_on: list[int] = []
+    real_dispose = AsyncEngine.dispose
+
+    async def dispose(self: AsyncEngine, close: bool = True) -> None:
+        disposed_on.append(threading.get_ident())
+        await real_dispose(self, close)
+
+    monkeypatch.setattr(AsyncEngine, "dispose", dispose)
+    await asyncio.to_thread(_run_on_new_loop, broker.close)
+
+    assert disposed_on == [threading.get_ident()]
 
 
 async def test_broker_used_twice_same_loop_logs_nothing(engine: Any, caplog: Any) -> None:
@@ -4484,13 +4558,9 @@ async def test_broker_cross_loop_warning_fires_once_per_instance(engine: Any, ca
     with caplog.at_level(logging.WARNING, logger="modulith.adapters.db"):
         await broker.subscribe(["t0"], "g0")
         for i in range(2):
-            thread = threading.Thread(
-                target=_run_on_new_loop,
-                args=(lambda i=i: broker.subscribe([f"t{i + 1}"], f"g{i + 1}"),),
+            await asyncio.to_thread(
+                _run_on_new_loop, lambda i=i: broker.subscribe([f"t{i + 1}"], f"g{i + 1}")
             )
-            thread.start()
-            thread.join(timeout=10)
-            assert not thread.is_alive()
 
     warnings = [r for r in caplog.records if _CROSS_LOOP_MSG in r.getMessage()]
     assert len(warnings) == 1, f"expected exactly one cross-loop warning, got: {caplog.records}"
