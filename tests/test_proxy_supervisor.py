@@ -1085,3 +1085,110 @@ def test_build_worker_env_preserves_nonempty_inherited_state_paths(
     )
 
     assert _build_worker_env(spec)[key] == "/deployment/state"
+
+
+# ---------------------------------------------------------------------------
+# Deployment identity: a proxy never vouches for another deployment's worker
+# ---------------------------------------------------------------------------
+
+
+def _health_upstream(body: Any) -> FastAPI:
+    up = FastAPI()
+
+    @up.get("/health")
+    async def health() -> Any:
+        return body
+
+    return up
+
+
+@pytest.mark.parametrize(
+    "foreign_body",
+    [
+        {"status": "ok", "module": "orders", "deployment": "deployment-a"},
+        {"status": "ok", "module": "orders"},
+        "not a worker",
+    ],
+)
+async def test_health_rejects_a_backend_answering_for_another_deployment(foreign_body) -> None:
+    client = httpx.AsyncClient(
+        mounts={
+            "http://theirs": httpx.ASGITransport(app=_health_upstream(foreign_body)),
+            "http://ours": httpx.ASGITransport(
+                app=_health_upstream({"status": "ok", "deployment": "deployment-b"})
+            ),
+        }
+    )
+    rules = [
+        RoutingRule(prefix="/orders", backend_url="http://theirs", backend_urls=("http://theirs",)),
+        RoutingRule(prefix="/inventory", backend_url="http://ours", backend_urls=("http://ours",)),
+    ]
+    proxy_app = create_proxy_app(rules, client=client, deployment_token="deployment-b")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+    ) as proxy_client:
+        resp = await proxy_client.get("/_modulith/health")
+
+    assert resp.status_code == 503
+    assert resp.json()["backends"] == {"/orders": "foreign deployment", "/inventory": "ok"}
+
+
+@pytest.mark.real_process
+async def test_run_supervised_hands_one_deployment_token_to_its_workers_and_proxy(
+    make_fake_app, tmp_path
+) -> None:
+    """The token run_supervised generates has to reach both ends: a worker
+    that never received it is reported foreign, and a proxy that never
+    received it vouches for any listener."""
+    make_fake_app({"orders": ""})
+    port = _free_port()
+    specs = [
+        WorkerSpec(
+            "orders",
+            "fakeapp",
+            port,
+            env={
+                "MODULITH_BROKER": "test-noop-broker",
+                "PYTHONPATH": f"{tmp_path}{os.pathsep}{Path(__file__).resolve().parents[1]}",
+            },
+        )
+    ]
+    seen: dict[str, Any] = {}
+
+    async def probe(app: Any, host: str, proxy_port: int) -> None:
+        async with (
+            httpx.AsyncClient(timeout=5.0) as direct,
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+            ) as proxy_client,
+        ):
+            deadline = time.monotonic() + 20.0
+            while True:
+                try:
+                    seen["worker"] = (await direct.get(f"http://127.0.0.1:{port}/health")).json()
+                    break
+                except httpx.TransportError:
+                    assert time.monotonic() < deadline, "worker never came up"
+                    await asyncio.sleep(0.1)
+            seen["proxy"] = (await proxy_client.get("/_modulith/health")).json()
+
+    await run_supervised(specs, "127.0.0.1", _free_port(), serve=probe)
+
+    token = seen["worker"]["deployment"]
+    assert isinstance(token, str) and len(token) >= 32
+    assert seen["proxy"] == {"status": "ok", "backends": {"/orders": "ok"}}
+
+
+async def test_run_supervised_generates_a_distinct_token_per_deployment() -> None:
+    tokens = []
+    for _ in range(2):
+        specs = [WorkerSpec("orders", "app", 9001)]
+        await run_supervised(specs, "127.0.0.1", 8000, supervisor=_NoopSupervisor([]), serve=_noop)
+        assert specs[0].env is not None
+        tokens.append(specs[0].env["MODULITH_DEPLOYMENT_TOKEN"])
+    assert tokens[0] != tokens[1]
+
+
+async def _noop(app: Any, host: str, port: int) -> None:
+    return None

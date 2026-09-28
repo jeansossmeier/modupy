@@ -104,6 +104,44 @@ def test_derive_specs_requires_package() -> None:
         derive_specs_from_config({})
 
 
+def test_derive_specs_assigns_contiguous_ports_from_the_configured_base(make_fake_app) -> None:
+    make_fake_app({"orders": "", "inventory": ""})
+
+    specs = derive_specs_from_config(
+        {"package": "fakeapp", "worker_port_base": 19001, "workers": {"inventory": 2}}
+    )
+
+    assert [(s.module_name, s.port, s.worker_count) for s in specs] == [
+        ("inventory", 19001, 2),
+        ("orders", 19003, 1),
+    ]
+
+
+@pytest.mark.parametrize(("host", "port"), [("0.0.0.0", 9002), ("127.0.0.1", 9003)])
+async def test_run_supervised_refuses_a_proxy_port_inside_the_worker_range(
+    host: str, port: int
+) -> None:
+    """The proxy binds before a freshly spawned worker does, so a shared port
+    leaves that module permanently unbindable and its prefix proxying to the
+    proxy itself. Every replica port counts, not only each module's first."""
+    from modulith import ConfigurationError
+
+    sup = _FakeSupervisor()
+    specs = [
+        WorkerSpec("inventory", "app", 9001, worker_count=2),
+        WorkerSpec("orders", "app", 9003),
+    ]
+    owner = "inventory" if port == 9002 else "orders"
+
+    async def must_not_serve(app: object, h: str, p: int) -> None:
+        raise AssertionError("the proxy must not be served")
+
+    with pytest.raises(ConfigurationError, match=rf"port {port}.*{owner}"):
+        await run_supervised(specs, host, port, supervisor=sup, serve=must_not_serve)
+
+    assert sup.events == []  # no worker was spawned
+
+
 # ---------------------------------------------------------------------------
 # _rules_from_specs (pure) — derives the reverse-proxy routing table
 # ---------------------------------------------------------------------------

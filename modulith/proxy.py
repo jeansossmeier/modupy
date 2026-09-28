@@ -123,6 +123,7 @@ def create_proxy_app(
     connect_retry_attempts: int = 5,
     connect_retry_backoff: float = 0.2,
     failed_instances: Callable[[], frozenset[str]] | None = None,
+    deployment_token: str | None = None,
 ) -> FastAPI:
     """Build the reverse-proxy ASGI app.
 
@@ -156,6 +157,12 @@ def create_proxy_app(
     (e.g. ``Supervisor.failed_instances``) — ``/_modulith/health`` uses it to
     report such a module as ``"failed (given up)"`` instead of the generic
     ``"unreachable"`` a worker mid-restart-backoff also produces.
+
+    ``deployment_token`` (set by ``run_supervised``) is the value this
+    deployment's workers echo as ``"deployment"`` on their ``/health``. A
+    backend answering without it — another deployment's worker, or any other
+    process holding the port — is reported ``"foreign deployment"`` and marked
+    down instead of vouched for.
     """
     owns_client = client is None
     if timeout is None:
@@ -247,6 +254,14 @@ def create_proxy_app(
                     except Exception:
                         rule.mark_down(url)
                         return "unreachable"
+                    if deployment_token is not None and not _answers_for(resp, deployment_token):
+                        rule.mark_down(url)
+                        logger.warning(
+                            "%s answers /health for another deployment (or is not a "
+                            "modulith worker): another process holds this worker port",
+                            url,
+                        )
+                        return "foreign deployment"
                     if resp.status_code == 200:
                         rule.mark_up(url)
                         return "ok"
@@ -256,6 +271,8 @@ def create_proxy_app(
                 statuses = await asyncio.gather(*(check_backend(url) for url in rule.backend_urls))
                 if "ok" in statuses:
                     return rule.prefix, "ok"
+                if "foreign deployment" in statuses:
+                    return rule.prefix, "foreign deployment"
                 if "unhealthy" in statuses:
                     return rule.prefix, "unhealthy"
                 if failed_instances is not None and _module_has_given_up(
@@ -603,6 +620,17 @@ def _upstream_url(backend: str, raw_path: bytes, query: bytes) -> httpx.URL:
     if (url.scheme, url.host, url.port) != (base.scheme, base.host, base.port):
         raise httpx.InvalidURL(f"upstream URL left backend {backend}")
     return url
+
+
+def _answers_for(resp: httpx.Response, deployment_token: str) -> bool:
+    """Whether a worker ``/health`` response echoes this deployment's token."""
+    try:
+        echoed = resp.json().get("deployment")
+    except (ValueError, AttributeError):
+        return False
+    return isinstance(echoed, str) and hmac.compare_digest(
+        echoed.encode("utf-8"), deployment_token.encode("utf-8")
+    )
 
 
 def _module_has_given_up(prefix: str, failed: frozenset[str]) -> bool:

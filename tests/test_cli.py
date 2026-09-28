@@ -293,6 +293,60 @@ def test_processes_topology_forwards_the_project_root_to_workers(
     assert [s.env["PYTHONPATH"] for s in specs] == [str(tmp_path)]
 
 
+@pytest.mark.parametrize(
+    ("pyproject_base", "argv", "expected"),
+    [
+        (None, [], [9001, 9002]),
+        (19001, [], [19001, 19002]),
+        (19001, ["--worker-port-base", "29001"], [29001, 29002]),
+    ],
+)
+def test_processes_topology_assigns_worker_ports_from_the_configured_base(
+    make_fake_app, tmp_path, monkeypatch, pyproject_base, argv, expected
+):
+    make_fake_app({"orders": "", "inventory": ""})
+    if pyproject_base is not None:
+        (tmp_path / "pyproject.toml").write_text(
+            f'[tool.modulith]\npackage = "fakeapp"\nworker_port_base = {pyproject_base}\n'
+        )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["run", "fakeapp:app", "--topology", "processes", *argv])
+
+    assert result.exit_code == 0, result.output
+    assert [s.port for s in captured["specs"]] == expected
+
+
+def test_run_refuses_a_proxy_port_inside_the_worker_range(make_fake_app, monkeypatch):
+    """Exit 1 with the collision named, before any worker is spawned."""
+    make_fake_app({"orders": "", "inventory": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    monkeypatch.setattr(
+        "modulith.supervisor.Supervisor.start",
+        lambda self: pytest.fail("no worker may be spawned"),
+    )
+
+    result = runner.invoke(
+        app,
+        ["run", "fakeapp:app", "--topology", "processes", "--port", "9002"],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "port 9002" in result.output
+    assert "orders" in result.output
+
+
 # ---------------------------------------------------------------------------
 # python -m modulith
 # ---------------------------------------------------------------------------
