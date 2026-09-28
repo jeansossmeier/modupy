@@ -44,6 +44,7 @@ import asyncio
 import logging
 from typing import Any
 
+from ._health_failures import HealthFailures
 from ._shutdown import DEFAULT_STOP_TIMEOUT_S, cancel_and_wait
 from .config import ConfigurationError
 from .manifest import get_manifest
@@ -112,7 +113,8 @@ class BrokerConsumer:
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
         self._health = ConsumerHealth(ready=False, status="stopped")
-        self._health_failures: dict[tuple[str, str], str] = {}
+        # The redelivery window: past it, reclaim retries the message.
+        self._health_failures = HealthFailures(completion_expiry_s=reclaim_min_idle_ms / 1000)
         # Consecutive broker read()/reclaim() failures — drives the capped
         # exponential backoff. Reset on any broker success.
         self._consecutive_failures = 0
@@ -187,17 +189,7 @@ class BrokerConsumer:
                 status="failed",
                 detail="poll loop is not running",
             )
-        if self._health_failures:
-            details = list(self._health_failures.items())
-            detail = (
-                details[0][1]
-                if len(details) == 1
-                else "; ".join(
-                    f"{operation} ({target}): {error}" for (operation, target), error in details
-                )
-            )
-            return ConsumerHealth(ready=False, status="degraded", detail=detail)
-        return self._health
+        return self._health_failures.degraded() or self._health
 
     def _on_task_done(self, task: asyncio.Task[None]) -> None:
         """Record an unexpected poll-loop exit without changing shutdown."""
@@ -215,11 +207,28 @@ class BrokerConsumer:
                 exc_info=(type(error), error, error.__traceback__),
             )
 
-    def _mark_broker_failure(self, operation: str, target: str, exc: Exception) -> None:
-        self._health_failures[(operation, target)] = str(exc)
+    def _mark_broker_failure(
+        self, operation: str, target: str, exc: Exception, message_id: str | None = None
+    ) -> None:
+        self._health_failures.record(operation, target, exc, message_id)
 
     def _mark_broker_recovered(self, operation: str, target: str) -> None:
-        self._health_failures.pop((operation, target), None)
+        self._health_failures.recover(operation, target)
+
+    async def _drop_resolved_completion_failures(self) -> None:
+        """Clear completion failures whose message left the group's pending list."""
+        delivery_attempts = getattr(self._broker, "delivery_attempts", None)
+        if not callable(delivery_attempts):
+            return
+        for operation, target, message_id in self._health_failures.pending_messages():
+            try:
+                attempts = await delivery_attempts(target, message_id, self._group)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
+            if attempts is None:
+                self._health_failures.resolve_message(operation, target, message_id)
 
     async def _run(self) -> None:
         """Read → dispatch each subscribed stream until stopped.
@@ -236,6 +245,7 @@ class BrokerConsumer:
             # No per-target _stopping check: stop() also cancels this task, so
             # the in-flight reads below raise CancelledError and unwind
             # immediately — the top-of-loop check handles the rest.
+            await self._drop_resolved_completion_failures()
             for target in self._targets:
                 await self._reclaim(target)
             # Read every subscribed stream CONCURRENTLY. Each read blocks
@@ -455,7 +465,7 @@ class BrokerConsumer:
             # Broker-side blip must not kill the loop. The
             # un-ACK'd message stays pending → redelivered via reclaim; the
             # listener side must be idempotent anyway (at-least-once contract).
-            self._mark_broker_failure("ack", target, exc)
+            self._mark_broker_failure("ack", target, exc, mid)
             logger.exception(
                 "ack failed for %s on %s — message stays pending and will be redelivered",
                 mid,
@@ -507,7 +517,7 @@ class BrokerConsumer:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._mark_broker_failure("dead_letter", target, exc)
+            self._mark_broker_failure("dead_letter", target, exc, mid)
             logger.exception(
                 "dead-letter failed for %s on %s — message stays pending for retry",
                 mid,

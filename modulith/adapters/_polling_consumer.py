@@ -8,6 +8,7 @@ import random
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from .._health_failures import HealthFailures
 from .._shutdown import DEFAULT_STOP_TIMEOUT_S, cancel_and_wait
 from ..protocols import ConsumerHealth
 from ._consumer_protocol import PollingBroker
@@ -72,7 +73,7 @@ class PollingConsumer(DeliveryDispatch):
         self._prune_task: asyncio.Task[None] | None = None
         self._stopping = False
         self._health = ConsumerHealth(ready=False, status="stopped")
-        self._health_failures: dict[tuple[str, str], str] = {}
+        self._health_failures = HealthFailures(completion_expiry_s=reclaim_stale_seconds)
         self._consecutive_failures = 0
 
     async def start(self) -> None:
@@ -153,17 +154,7 @@ class PollingConsumer(DeliveryDispatch):
                 status="failed",
                 detail="poll loop is not running",
             )
-        if self._health_failures:
-            details = list(self._health_failures.items())
-            detail = (
-                details[0][1]
-                if len(details) == 1
-                else "; ".join(
-                    f"{operation} ({target}): {error}" for (operation, target), error in details
-                )
-            )
-            return ConsumerHealth(ready=False, status="degraded", detail=detail)
-        return self._health
+        return self._health_failures.degraded() or self._health
 
     def _on_task_done(self, task: asyncio.Task[None]) -> None:
         if self._stopping or task.cancelled():
@@ -181,10 +172,10 @@ class PollingConsumer(DeliveryDispatch):
             )
 
     def _mark_broker_failure(self, operation: str, target: str, exc: Exception) -> None:
-        self._health_failures[(operation, target)] = str(exc)
+        self._health_failures.record(operation, target, exc)
 
     def _mark_broker_recovered(self, operation: str, target: str) -> None:
-        self._health_failures.pop((operation, target), None)
+        self._health_failures.recover(operation, target)
 
     async def _cancel(self, task: asyncio.Task[None] | None, label: str) -> None:
         if task is None:

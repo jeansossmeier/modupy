@@ -179,7 +179,13 @@ async def _until(predicate, *, timeout: float = 1.0, interval: float = 0.01) -> 
         waited += interval
 
 
-def _make_consumer(broker: Any, bus: InMemoryEventBus, *, targets: list[str]) -> BrokerConsumer:
+def _make_consumer(
+    broker: Any,
+    bus: InMemoryEventBus,
+    *,
+    targets: list[str],
+    reclaim_min_idle_ms: int = 0,
+) -> BrokerConsumer:
     return BrokerConsumer(
         broker=broker,
         bus=bus,
@@ -188,7 +194,7 @@ def _make_consumer(broker: Any, bus: InMemoryEventBus, *, targets: list[str]) ->
         group="modulith-orders",
         targets=targets,
         poll_block_ms=10,
-        reclaim_min_idle_ms=0,
+        reclaim_min_idle_ms=reclaim_min_idle_ms,
     )
 
 
@@ -343,7 +349,7 @@ async def test_broker_consumer_completion_failures_recover_independently() -> No
     broker = CompletionFlakyBroker()
     bus = InMemoryEventBus()
     bus.register(CrossEvent, handler)
-    consumer = _make_consumer(broker, bus, targets=["t"])
+    consumer = _make_consumer(broker, bus, targets=["t"], reclaim_min_idle_ms=60_000)
     run_blocker = asyncio.Event()
 
     async def blocked_run() -> None:
@@ -401,7 +407,9 @@ async def test_broker_consumer_health_recovery_is_scoped_to_target() -> None:
     broker = TargetFlakyBroker()
     bus = InMemoryEventBus()
     bus.register(CrossEvent, handler)
-    consumer = _make_consumer(broker, bus, targets=["target-a", "target-b"])
+    consumer = _make_consumer(
+        broker, bus, targets=["target-a", "target-b"], reclaim_min_idle_ms=60_000
+    )
     run_blocker = asyncio.Event()
 
     async def blocked_run() -> None:
@@ -436,6 +444,86 @@ async def test_broker_consumer_health_recovery_is_scoped_to_target() -> None:
 
 
 @pytest.mark.asyncio
+class _AckDownBroker(FakeConsumerBroker):
+    """Every XACK fails; ``pending`` models the group's PEL when set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pending_ids: set[str] = set()
+
+    async def ack(self, target: str, message_id: str, group: str | None = None) -> None:
+        raise RuntimeError("simulated Redis blip during XACK")
+
+
+def _cross_fields() -> dict[bytes, bytes]:
+    event_type = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+    return {
+        b"data": JsonEventSerializer().serialize(CrossEvent(value=1)),
+        b"h:event_type": event_type.encode(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_broker_consumer_completion_failure_clears_once_message_is_not_pending() -> None:
+    class PelBroker(_AckDownBroker):
+        async def delivery_attempts(
+            self, target: str, message_id: str, group: str | None = None
+        ) -> int | None:
+            return 1 if message_id in self.pending_ids else None
+
+    async def handler(_event: CrossEvent) -> None:
+        pass
+
+    broker = PelBroker()
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    consumer = _make_consumer(broker, bus, targets=["t"], reclaim_min_idle_ms=60_000)
+    broker.pending_ids.add("1-0")
+    await consumer.start()
+    try:
+        await consumer._dispatch_one("t", b"1-0", _cross_fields())
+        await asyncio.sleep(0.1)
+        # Still pending in the group: the failure stays visible across polls.
+        assert consumer.health() == ConsumerHealth(
+            ready=False, status="degraded", detail="simulated Redis blip during XACK"
+        )
+
+        # A peer reclaimed and ACKed it; XACK here is still failing.
+        broker.pending_ids.discard("1-0")
+        await _until(lambda: consumer.health().ready)
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+    finally:
+        await consumer.stop()
+
+
+@pytest.mark.asyncio
+async def test_broker_consumer_completion_failure_expires_after_reclaim_window() -> None:
+    async def handler(_event: CrossEvent) -> None:
+        pass
+
+    broker = _AckDownBroker()
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    consumer = _make_consumer(broker, bus, targets=["t"], reclaim_min_idle_ms=300)
+
+    async def blocked_run() -> None:
+        await asyncio.Event().wait()
+
+    consumer._run = blocked_run  # type: ignore[method-assign]
+    await consumer.start()
+    try:
+        await consumer._dispatch_one("t", b"1-0", _cross_fields())
+        assert consumer.health().status == "degraded"
+
+        await asyncio.sleep(0.35)
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+
+        await consumer._dispatch_one("t", b"1-0", _cross_fields())
+        assert consumer.health().status == "degraded"
+    finally:
+        await consumer.stop()
+
+
 async def test_producer_to_consumer_roundtrip_without_redis(make_fake_app) -> None:
     """An event published in 'process A' reaches a listener in 'process B'.
 

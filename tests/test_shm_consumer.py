@@ -937,6 +937,53 @@ async def test_completion_failures_and_poison_rows_recover_health(
         instance._ring.unlink()
 
 
+async def test_completion_failure_clears_after_reclaim_window(tmp_path: Path) -> None:
+    """A failed fail() write stops degrading health once its row is reclaimable.
+
+    A write that still fails on the retry records a fresh failure.
+    """
+    instance = _CompletionFlakyBroker(
+        shm_name="completion-expiry-hints",
+        db_path=str(tmp_path / "consumer.db"),
+    )
+    instance.failures = {"fail"}
+
+    async def handle(_item: ConsumerEvent) -> None:
+        raise RuntimeError("listener unavailable")
+
+    async def block_poll_loop() -> None:
+        await asyncio.Event().wait()
+
+    bus = InMemoryEventBus()
+    bus.register(ConsumerEvent, handle)
+    serializer = JsonEventSerializer(allowed_event_types=[ConsumerEvent])
+    consumer = _consumer(instance, bus, serializer, reclaim_stale_seconds=0.3)
+    consumer._run = block_poll_loop  # type: ignore[method-assign]
+    try:
+        await consumer.start()
+        await instance.publish(
+            TARGET, serializer.serialize(ConsumerEvent("x")), {"event_type": EVENT_TYPE}
+        )
+        (row,) = await instance.claim_batch(GROUP, batch_size=1, consumer_name="worker-1")
+
+        with pytest.raises(RuntimeError, match="fail unavailable"):
+            await consumer._dispatch_one(row)
+        assert consumer.health() == ConsumerHealth(
+            ready=False, status="degraded", detail="fail unavailable"
+        )
+
+        await asyncio.sleep(0.35)
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+
+        with pytest.raises(RuntimeError, match="fail unavailable"):
+            await consumer._dispatch_one(row)
+        assert consumer.health().status == "degraded"
+    finally:
+        await consumer.stop()
+        await instance.close()
+        instance._ring.unlink()
+
+
 async def test_real_poll_loop_reclaims_after_one_shot_ack_failure(
     tmp_path: Path,
 ) -> None:

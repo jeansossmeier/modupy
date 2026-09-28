@@ -2166,6 +2166,74 @@ async def test_database_consumer_write_failures_recover_independently(engine: An
         await consumer.stop()
 
 
+async def test_database_consumer_completion_failure_clears_after_reclaim_window(
+    engine: Any,
+) -> None:
+    """A failed fail() write stops degrading health once its row is reclaimable.
+
+    By then the row is redelivered (here or on a peer replica); a write that
+    still fails on the retry records a fresh failure, so it stays visible.
+    """
+
+    class FailWriteDownBroker(DatabaseBroker):
+        async def fail(
+            self,
+            row_id: str,
+            error: str,
+            *,
+            consumer_name: str,
+            max_attempts: int,
+        ) -> None:
+            raise RuntimeError("server closed the connection unexpectedly")
+
+    async def handler(_event: WidgetCreated) -> None:
+        raise RuntimeError("listener unavailable")
+
+    broker = FailWriteDownBroker(engine=engine)
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+    event_type = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=[event_type],
+        reclaim_stale_seconds=0.3,
+    )
+
+    async def blocked_run() -> None:
+        await asyncio.Event().wait()
+
+    consumer._run = blocked_run  # type: ignore[method-assign]
+    row = {
+        "id": "fail-row",
+        "target": event_type,
+        "event_type": event_type,
+        "payload": serializer.serialize(WidgetCreated(name="w1")),
+        "attempts": 0,
+    }
+
+    await consumer.start()
+    try:
+        with pytest.raises(RuntimeError, match="server closed"):
+            await consumer._dispatch_one(row)
+        assert consumer.health() == ConsumerHealth(
+            ready=False, status="degraded", detail="server closed the connection unexpectedly"
+        )
+
+        await asyncio.sleep(0.35)
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+
+        with pytest.raises(RuntimeError, match="server closed"):
+            await consumer._dispatch_one(row)
+        assert consumer.health().status == "degraded"
+    finally:
+        await consumer.stop()
+
+
 async def test_database_consumer_dispatch_fires_the_per_listener_lifecycle_hooks(
     engine: Any,
 ) -> None:
