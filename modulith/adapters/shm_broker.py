@@ -326,6 +326,20 @@ class ShmBroker:
         """Persist exact subscriptions and replay retained publications."""
         await self._cold.subscribe(targets, group)
 
+    async def group_backlog(self) -> dict[str, int]:
+        """Map every subscribed group to its pending and claimed delivery count."""
+        return await self._cold.group_backlog()
+
+    async def drop_group(self, group: str) -> tuple[int, int]:
+        """Unsubscribe a retired group and delete its undelivered work.
+
+        Returns ``(subscriptions, deliveries)`` removed. Publish fans out to
+        every subscribed group and prune keeps any publication with an
+        undelivered row, so a group whose module is gone for good pins every
+        later publication until this runs (``modulith broker drop-group``).
+        """
+        return await self._cold.drop_group(group)
+
     async def claim_batch(
         self,
         group: str,

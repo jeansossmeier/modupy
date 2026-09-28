@@ -199,6 +199,44 @@ def subscribe(
     return inserted
 
 
+def group_backlog(conn: sqlite3.Connection) -> dict[str, int]:
+    """Map every subscribed group to its pending and claimed delivery count."""
+    rows = conn.execute(
+        """
+        SELECT s.consumer_group, (
+            SELECT COUNT(*) FROM shm_delivery AS d
+            WHERE d.consumer_group=s.consumer_group
+              AND d.status IN ('pending', 'claimed')
+        ) AS backlog
+        FROM (SELECT DISTINCT consumer_group FROM shm_subscription) AS s
+        ORDER BY s.consumer_group
+        """
+    )
+    return {str(row["consumer_group"]): int(row["backlog"]) for row in rows}
+
+
+def drop_group(conn: sqlite3.Connection, group: str) -> tuple[int, int]:
+    """Delete one group's subscriptions and undelivered work.
+
+    Returns ``(subscriptions, deliveries)`` removed. Terminal rows stay for
+    ``prune``; once the undelivered rows are gone, prune can reclaim the
+    publications they pinned.
+    """
+    with immediate_transaction(conn):
+        subscriptions = conn.execute(
+            "DELETE FROM shm_subscription WHERE consumer_group=?",
+            (group,),
+        ).rowcount
+        deliveries = conn.execute(
+            """
+            DELETE FROM shm_delivery
+            WHERE consumer_group=? AND status IN ('pending', 'claimed')
+            """,
+            (group,),
+        ).rowcount
+    return subscriptions, deliveries
+
+
 def get_subscriptions(
     conn: sqlite3.Connection,
 ) -> dict[str, list[str]]:

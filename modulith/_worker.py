@@ -239,6 +239,11 @@ def create_app() -> FastAPI:
     return app
 
 
+def consumer_group(module_name: str) -> str:
+    """The broker consumer group a module's workers share."""
+    return f"modulith-{module_name}"
+
+
 def _build_consumer(module_name: str, consumer_name: str | None = None) -> Any:
     """Build this worker's cross-process consumer, or None when there's nothing to do.
 
@@ -288,7 +293,7 @@ def _build_consumer(module_name: str, consumer_name: str | None = None) -> Any:
         scheme=cfg.broker,
         module_name=module_name,
         consumer_name=consumer_name,
-        group=f"modulith-{module_name}",
+        group=consumer_group(module_name),
         targets=tuple(targets),
         bus=bus,
         serializer=JsonEventSerializer(

@@ -714,6 +714,29 @@ Export spans to Prometheus, Jaeger, or your observability stack.
 3. Run outstanding events via `modulith outbox retry` if needed
 4. Delete the subpackage
 5. Restart
+6. Drop the retired module's broker consumer group (`modulith-<module>`; a
+   renamed module leaves its old name's group behind the same way)
+
+Step 6 depends on the broker:
+
+- **SHM and database brokers:** every publication fans out one delivery per
+  subscribed group, and prune never removes undelivered work, so a group
+  that never consumes again pins every later publication to its targets
+  until the store fills. `modulith run --topology processes` logs a warning
+  at startup for each subscribed group that no current module derives,
+  naming its backlog. Once the module is gone for good, run
+  `modulith broker drop-group modulith-<module>` from the project root. It
+  removes the group's subscriptions and deletes its pending and claimed
+  messages (they are not delivered); the next prune reclaims the
+  publications they held. It asks for confirmation unless `--yes` is given,
+  and refuses a group that a current module derives unless `--force` is
+  given. Nothing is dropped automatically: a module that is only disabled
+  for a deploy gets its backlog when it returns.
+- **Redis Streams broker:** no storage cleanup is needed. Streams are
+  trimmed by `MAXLEN` regardless of consumer groups, so a stale group holds
+  no memory beyond its pending-entries list. To stop it from showing up
+  with a growing lag in `XINFO GROUPS`, remove it from each stream it read
+  with `XGROUP DESTROY <stream> modulith-<module>`.
 
 ### Recovering from Broker Failure
 
