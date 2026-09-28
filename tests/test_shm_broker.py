@@ -171,6 +171,7 @@ async def test_cancelled_close_retry_waits_for_cold_store_cleanup(
         {"orphan_retention_seconds": float("nan")},
         {"orphan_retention_seconds": "soon"},
         {"orphan_retention_seconds": True},
+        {"orphan_retention_seconds": 100 * 365 * 86400.0 + 1},
     ],
 )
 def test_constructor_validates_options_before_creating_files(
@@ -1217,6 +1218,7 @@ async def test_registration_logs_default_state_directory_at_info(
         message = record.getMessage()
         (store,) = (state_home / "modulith").iterdir()
         assert str(store) in message
+        assert str(store / ".modulith-shm-broker.db") in message
         assert "default location" in message
         assert "install path" in message
     finally:
@@ -1268,6 +1270,32 @@ async def test_registration_logs_explicit_state_directory_at_info(
         message = record.getMessage()
         assert str(state_dir) in message
         assert "explicit state_dir" in message
+        assert "default location" not in message
+    finally:
+        await instance.close()
+        instance._ring.unlink()
+
+
+async def test_registration_logs_absolute_sqlite_path_as_the_explicit_store(
+    make_fake_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    monkeypatch.delenv("MODULITH_BROKER_STATE_DIR", raising=False)
+    pinned = tmp_path / "pinned" / "broker.db"
+    monkeypatch.setenv("MODULITH_BROKER_SQLITE_PATH", str(pinned))
+    with caplog.at_level(logging.INFO, logger="modulith.adapters.shm"):
+        configure(package="fakeapp", topology="processes", broker="shm")
+        _runtime.ensure_bootstrapped()
+    assert _runtime.broker_registry is not None
+    instance = cast(ShmBroker, _runtime.broker_registry.get("shm"))
+    try:
+        (record,) = _state_dir_records(caplog)
+        message = record.getMessage()
+        assert str(pinned) in message
         assert "default location" not in message
     finally:
         await instance.close()

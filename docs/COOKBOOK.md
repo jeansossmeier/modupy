@@ -517,8 +517,9 @@ per-user state directory, under a name that digests the package's resolved
 install path. Redeploying the same code to another path (a new release
 directory behind a `current` symlink, a new venv) therefore switches to a new,
 empty store and strands the old one's backlog, so production deploys must set
-`state_dir` (or `MODULITH_BROKER_STATE_DIR`). Startup logs the store path and
-whether it is the default. Configure paths canonically when needed:
+`state_dir` (or `MODULITH_BROKER_STATE_DIR`) or an absolute `sqlite_path`. The
+`modulith run` process logs the SQLite store path at INFO and whether it is the
+default; workers log it only when the application configures INFO logging. Configure paths canonically when needed:
 
 ```toml
 [tool.modulith.broker_options]
@@ -540,18 +541,24 @@ once to every group that subscribes before expiry.
 
 Payloads over `max_payload_bytes` are rejected before a transaction starts.
 `max_store_bytes` configures SQLite `max_page_count`, and the file never grows
-past it. A full store rejects new publishes until retained publications expire
-or the limit is raised. Publishes are refused a small reserve early, once
+past it. A full store rejects new publishes until retained publications expire,
+consumers drain their backlog, `modulith broker drop-group` removes a retired
+group, or every process restarts with a raised limit. Publishes are refused a small reserve early, once
 `page_count - freelist_count` would pass `max_page_count` minus 32 pages (one
 eighth of the pages below 256 pages), so consumers can still claim, ack, fail,
 dead-letter and prune their backlog while publishes are refused. A
 default-size consumer pass measured at most 7 pages of growth; stores under
-224 KiB reserve less than that. Because
-drained publications stay for the whole retention window, the store sustains
-about `max_store_bytes / (bytes per publication × orphan_retention_seconds)`
+224 KiB reserve less than that. A publication stays while any group has not
+consumed it, for `orphan_retention_seconds` after it is written, and, under
+`completion_mode = "mark"` or once dead-lettered, until `retention_age_seconds`
+(default 3 days) after completion. The store sustains about
+`max_store_bytes / (bytes per publication × the longest of those retentions)`
 publications per second: roughly 7/s for 1 KiB payloads and two groups with
-the defaults. Raise `max_store_bytes` or shorten `orphan_retention_seconds`
-(late subscribers then replay only within the shorter window). Override these
+the defaults in delete mode, and under 2.3/s in mark mode. Raise
+`max_store_bytes` or shorten `orphan_retention_seconds` (at most 100 years)
+before the store fills; publications already stored keep the retention they
+were written with, and late subscribers replay only within the shorter window.
+Override these
 with `MODULITH_BROKER_MAX_PAYLOAD_BYTES`, `MODULITH_BROKER_MAX_STORE_BYTES`, and
 `MODULITH_BROKER_ORPHAN_RETENTION_SECONDS`.
 `shm_slot_size` is deprecated and ignored because hint slots are fixed-size.

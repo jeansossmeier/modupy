@@ -254,6 +254,15 @@ def test_store_exhaustion_rolls_back_publish_with_actionable_error(tmp_path: Pat
                 assert "disk space" in message
                 # Pruning cannot help: drained publications stay until their retention ends.
                 assert "prune completed publications" not in message
+                assert "backlog" in message
+                assert "retired group" in message
+                assert "modulith broker drop-group" in message
+                assert "completion_mode" in message
+                assert "retention_age_seconds" in message
+                assert "restart every process" in message
+                # Rows already stored keep their stamped expiry, so a shorter
+                # retention frees nothing in a store that is already full.
+                assert "shorten" not in message
                 assert not store._conn.in_transaction
                 assert (
                     len(_rows(path, "SELECT id FROM shm_publication")),

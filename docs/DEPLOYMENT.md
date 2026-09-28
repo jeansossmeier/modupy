@@ -208,24 +208,43 @@ and retained events are never delivered. Pin the location:
 state_dir = "/var/lib/myapp/modulith"   # or MODULITH_BROKER_STATE_DIR
 ```
 
-Each process logs the store path at startup, marked as an explicit `state_dir`
-or the default location, and `modulith run --topology processes` logs a
-warning while `state_dir` is unset.
+An absolute `sqlite_path` (or a filesystem `url`) also pins the store. At
+startup, the `modulith run` process logs the SQLite store path and the state
+directory at INFO, marked as explicit or as the default location. Worker
+processes log the same line only when the application configures logging at
+INFO. `modulith run --topology processes` also logs a warning while the store
+sits in the default state directory.
 
-**Sizing the default SHM store.** The local `shm` broker keeps every
-publication for `orphan_retention_seconds` (default 86400) even after every
-group has acked it, so late subscribers can replay it. Its store (`max_store_bytes`,
-default 1 GiB) therefore caps the sustained publish rate, not only the backlog:
+**Sizing the default SHM store.** The local `shm` broker keeps a publication
+while any of these holds:
+
+- a subscribed group has not consumed it yet: an undelivered backlog, which
+  includes a retired group that never consumes again;
+- it is younger than `orphan_retention_seconds` (default 86400), even after
+  every group has acked it, so late subscribers can replay it;
+- a delivery of it is kept as a terminal row: every acked delivery under
+  `completion_mode = "mark"`, and every dead letter in either mode, holds it
+  until `retention_age_seconds` (default 259200, 3 days) after completion.
+
+Its store (`max_store_bytes`, default 1 GiB) therefore caps the sustained
+publish rate, not only the backlog:
 
 ```
-sustainable publications/s ≈ max_store_bytes / (bytes per publication × orphan_retention_seconds)
+sustainable publications/s ≈ max_store_bytes / (bytes per publication × longest retention above)
 ```
 
 A 1 KiB payload with two subscribed groups uses about 1.8 KB of store, so the
-defaults sustain roughly 7 publications/s; above that, every publish fails with
-"SHM SQLite store is full" after about a day. Raise `max_store_bytes` or
-shorten `orphan_retention_seconds` in `[tool.modulith.broker_options]` (or
-`MODULITH_BROKER_MAX_STORE_BYTES` / `MODULITH_BROKER_ORPHAN_RETENTION_SECONDS`).
+defaults (delete mode, no dead letters) sustain roughly 7 publications/s; under
+`completion_mode = "mark"` the 3-day terminal retention cuts that below
+2.3 publications/s. Above that rate, every publish fails with "SHM SQLite store
+is full". Size `max_store_bytes` (or `MODULITH_BROKER_MAX_STORE_BYTES`) for the
+longest retention, or shorten `orphan_retention_seconds` before the store
+fills: each publication keeps the orphan retention stamped when it was
+written, so shortening it frees nothing in a store that is already full. A
+backlog frees space only as consumers drain it, or when
+`modulith broker drop-group` removes a retired group. A new `max_store_bytes`
+or `retention_age_seconds` applies to a process only after it restarts.
+`orphan_retention_seconds` is capped at 100 years (3153600000).
 A group that subscribes after a publication replays it only within that window.
 Publishes stop a 32-page consumer reserve (128 KiB at 4 KiB pages) below
 `max_store_bytes`, so consumers can drain a backlog while publishes are

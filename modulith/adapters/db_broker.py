@@ -174,6 +174,9 @@ _NO_SUBSCRIBER_POLICIES = frozenset({"error", "store", "wait"})
 _DEFAULT_ORPHAN_REPLAY_POLICY = "ttl_all_groups"
 _ORPHAN_REPLAY_POLICIES = frozenset({"ttl_all_groups", "first_groups", "expected_groups"})
 _DEFAULT_ORPHAN_RETENTION_S = 86400.0
+# must match _MAX_ORPHAN_RETENTION_S in shm_broker.py; keeps the stored
+# publication's expires_at (now + timedelta) far from datetime's overflow.
+_MAX_ORPHAN_RETENTION_S = 100 * 365 * 86400.0
 
 # Default terminal-row retention applied by the consumer factory when
 # ``retention_age_seconds`` is not configured: dead-lettered rows (and 'done'
@@ -1020,6 +1023,11 @@ class DatabaseBroker:
         self._orphan_retention_seconds = _positive_finite_float(
             orphan_retention_seconds, "orphan_retention_seconds"
         )
+        if self._orphan_retention_seconds > _MAX_ORPHAN_RETENTION_S:
+            raise ConfigurationError(
+                f"orphan_retention_seconds must be <= {_MAX_ORPHAN_RETENTION_S:g} "
+                f"(100 years), got {orphan_retention_seconds!r}"
+            )
         self._expected_consumer_groups = _validate_expected_consumer_groups(
             {} if expected_consumer_groups is None else expected_consumer_groups
         )

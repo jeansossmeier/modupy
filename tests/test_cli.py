@@ -598,6 +598,39 @@ def test_run_processes_does_not_warn_when_shm_state_dir_is_explicit(
     assert _state_dir_warnings(caplog) == []
 
 
+@pytest.mark.parametrize(
+    ("env_key", "absolute", "warns"),
+    [
+        ("MODULITH_BROKER_SQLITE_PATH", True, False),
+        ("MODULITH_BROKER_URL", True, False),
+        ("MODULITH_BROKER_SQLITE_PATH", False, True),
+    ],
+)
+def test_run_processes_warns_only_when_the_shm_store_itself_is_defaulted(
+    make_fake_app, monkeypatch, tmp_path, caplog, env_key, absolute, warns
+):
+    make_fake_app(
+        {"orders": ""},
+        extra_files={"main.py": "from fastapi import FastAPI\napp = FastAPI()\n"},
+    )
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    monkeypatch.delenv("MODULITH_BROKER_STATE_DIR", raising=False)
+    store = str(tmp_path / "pinned" / "broker.db") if absolute else "broker.db"
+    monkeypatch.setenv(env_key, store)
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        return None
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    with caplog.at_level(logging.WARNING):
+        result = runner.invoke(app, ["run", "fakeapp.main:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    assert len(_state_dir_warnings(caplog)) == (1 if warns else 0)
+
+
 def test_dev_processes_topology_env_url_beats_pyproject_url(make_fake_app, monkeypatch, tmp_path):
     """Parent MODULITH_BROKER_URL must reach workers, not the pyproject URL."""
     make_fake_app(
