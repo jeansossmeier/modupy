@@ -50,7 +50,10 @@ so it can be committed and diffed. The report holds:
 - A "modulith-readiness score" (0-100) based on how much of your
   cross-module communication already goes through indirection. With only
   one module candidate there are no boundaries to measure, so the audit
-  warns and reports the score as not applicable.
+  warns and reports the score as not applicable. A loose-script directory
+  doesn't count as a candidate, and the score is also withheld when every
+  import names a package below the audited directory that isn't a
+  candidate, such as `modulith audit .` above `src/shopkit`.
 
 Read the report with the team. Argue about the proposed module
 boundaries. The audit is a starting point, not a verdict.

@@ -1156,7 +1156,7 @@ def audit(
     if result.score_applicable:
         typer.echo(f"readiness score: {result.readiness_score}/100")
     else:
-        typer.echo("readiness score: n/a (fewer than two module candidates)")
+        typer.echo("readiness score: n/a (no module boundaries to score; see the warning)")
     typer.echo(
         f"{len(result.cross_module_imports)} cross-module import pattern(s), "
         f"{len(result.shared_tables)} shared table(s)"

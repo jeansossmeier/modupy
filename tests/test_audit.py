@@ -693,6 +693,60 @@ def test_audit_from_flat_root_with_script_directories_audits_the_package(
     ]
 
 
+def test_audit_from_namespace_package_root_with_script_directory_audits_the_package(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """An application directory without ``__init__.py`` still outranks a
+    directory of loose scripts."""
+    project = tmp_path / "brownfield"
+    _write_coupled_app(project / "app", "app")
+    (project / "app" / "__init__.py").unlink()
+    _write(project, "tools/gen.py", "print(1)\n")
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["audit", "--output", str(tmp_path / "MIGRATION.md")])
+
+    assert result.exit_code == 0, result.output
+    assert f"audited {(project / 'app').resolve()}" in result.stdout
+    assert "readiness score: 0/100" in result.stdout
+
+
+def test_explicit_project_root_does_not_score_scripts_against_the_app(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """At an explicit project root the application package holds every
+    module; a loose-script directory beside it is not a second candidate."""
+    project = tmp_path / "brownfield"
+    _write_coupled_app(project / "app", "app")
+    _write(project, "tools/gen.py", "import app\n")
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["audit", ".", "--output", str(tmp_path / "MIGRATION.md")])
+
+    assert result.exit_code == 0, result.output
+    assert f"audited {project.resolve()}\n" in result.stdout
+    assert "readiness score: n/a" in result.stdout
+    assert "only one module candidate (`app`)" in result.stderr
+
+
+def test_score_withheld_when_every_import_misses_the_module_candidates(tmp_path: Path) -> None:
+    """Auditing above ``src/`` makes every ``shopkit.*`` import name a package
+    that is not a candidate; a score over the remaining zero imports would be
+    a fabricated 100."""
+    project = tmp_path / "brownfield"
+    _write_coupled_app(project / "src" / "shopkit", "shopkit")
+    _write(project, "lib/util/__init__.py", "")
+    _write(project, "lib/util/strings.py", "def slug(): ...\n")
+
+    result = audit_codebase(project)
+    report = render_report(result)
+
+    assert set(result.proposed_modules) == {"src", "lib"}
+    assert result.score_applicable is False
+    assert "100/100" not in report
+    assert "`shopkit`" in report
+
+
 def test_root_package_init_is_not_a_module_candidate(tmp_path: Path) -> None:
     """A package whose code all lives in one subpackage has one module
     candidate; its own ``__init__.py`` does not make a second one."""
