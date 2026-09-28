@@ -4681,3 +4681,88 @@ async def test_consumer_still_dead_letters_a_foreign_type_on_a_target_it_consume
         or (r.exc_info and "not in the allowed event types" in str(r.exc_info[1]))
         for r in caplog.records
     )
+
+
+def _stale_warnings(caplog: pytest.LogCaptureFixture, target: str) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "drop-group" in r.getMessage()
+        and target in r.getMessage()
+    ]
+
+
+async def test_consumer_warns_once_at_start_about_a_stale_subscription(
+    engine: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    delivered: list[str] = []
+
+    async def handler(evt: WidgetCreated) -> None:
+        delivered.append(evt.name)
+
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+    broker = DatabaseBroker(engine=engine)
+    live = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    stale = f"{SiblingNoteSent.__module__}.{SiblingNoteSent.__qualname__}"
+    await broker.subscribe([stale, live], "modulith-inventory")
+    sibling_payload = JsonEventSerializer().serialize(SiblingNoteSent(text="n"))
+    for _ in range(2):
+        await broker.publish(stale, sibling_payload, {"event_type": stale})
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=[live],
+        poll_interval_s=0.01,
+    )
+    caplog.set_level(logging.WARNING)
+    await consumer.start()
+    try:
+        for name in ("w1", "w2", "w3"):
+            await broker.publish(stale, sibling_payload, {"event_type": stale})
+            await broker.publish(
+                live, serializer.serialize(WidgetCreated(name=name)), {"event_type": live}
+            )
+        await _until_async(lambda: _async_true(delivered == ["w1", "w2", "w3"]))
+    finally:
+        await consumer.stop()
+
+    warnings = _stale_warnings(caplog, stale)
+    assert len(warnings) == 1
+    assert "2 undelivered" in warnings[0]
+    assert f"modulith broker drop-group modulith-inventory --target {stale}" in warnings[0]
+    assert _stale_warnings(caplog, live) == []
+
+
+async def test_consumer_without_targets_warns_about_its_groups_leftover_subscriptions(
+    engine: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    broker = DatabaseBroker(engine=engine)
+    stale = f"{SiblingNoteSent.__module__}.{SiblingNoteSent.__qualname__}"
+    await broker.subscribe([stale], "modulith-inventory")
+    await broker.publish(stale, b"{}", {"event_type": stale})
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=[],
+        poll_interval_s=0.01,
+    )
+    caplog.set_level(logging.WARNING)
+    await consumer.start()
+    await consumer.stop()
+
+    warnings = _stale_warnings(caplog, stale)
+    assert len(warnings) == 1
+    assert "1 undelivered" in warnings[0]
+
+
+async def _async_true(value: bool) -> bool:
+    return value

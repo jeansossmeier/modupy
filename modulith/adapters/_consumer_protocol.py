@@ -14,6 +14,10 @@ class PollingBroker(Protocol):
 
     async def subscribe(self, targets: list[str], group: str) -> None: ...
 
+    async def stale_targets(
+        self, group: str, targets: list[str] | tuple[str, ...]
+    ) -> dict[str, int]: ...
+
     async def claim_batch(
         self,
         group: str,

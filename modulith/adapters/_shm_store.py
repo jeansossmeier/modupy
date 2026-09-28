@@ -80,6 +80,9 @@ class SqliteQueueStore:
     def group_backlog(self) -> dict[str, int]:
         return _shm_publications.group_backlog(self._conn)
 
+    def stale_targets(self, group: str, targets: list[str]) -> dict[str, int]:
+        return _shm_publications.stale_targets(self._conn, group, targets)
+
     def drop_group(self, group: str) -> tuple[int, int]:
         return _shm_publications.drop_group(self._conn, group)
 

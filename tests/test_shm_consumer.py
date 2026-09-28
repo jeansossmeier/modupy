@@ -1203,3 +1203,69 @@ async def test_runtime_registry_builds_working_shm_consumer(
         await consumer.stop()
         await runtime_broker.close()
         runtime_broker._ring.unlink()
+
+
+def _stale_warnings(caplog: pytest.LogCaptureFixture, target: str) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "drop-group" in r.getMessage()
+        and target in r.getMessage()
+    ]
+
+
+async def test_shm_consumer_warns_once_about_deliveries_for_a_target_it_no_longer_consumes(
+    broker: ShmBroker, caplog: pytest.LogCaptureFixture
+) -> None:
+    await broker.subscribe([TARGET, "stale-stream"], GROUP)
+    for _ in range(2):
+        await broker.publish("stale-stream", b"{}", {"event_type": "t.Stale"})
+    delivered: list[ConsumerEvent] = []
+
+    async def handler(evt: ConsumerEvent) -> None:
+        delivered.append(evt)
+
+    bus = InMemoryEventBus()
+    bus.register(ConsumerEvent, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[ConsumerEvent])
+    consumer = _consumer(broker, bus, serializer)
+    caplog.set_level(logging.WARNING)
+    await consumer.start()
+    try:
+        for name in ("a", "b", "c"):
+            await broker.publish(
+                TARGET, serializer.serialize(ConsumerEvent(name)), {"event_type": EVENT_TYPE}
+            )
+        await _until(lambda: len(delivered) == 3)
+    finally:
+        await consumer.stop()
+
+    warnings = _stale_warnings(caplog, "stale-stream")
+    assert len(warnings) == 1
+    assert "2 undelivered" in warnings[0]
+    assert f"modulith broker drop-group {GROUP} --target stale-stream" in warnings[0]
+    assert _stale_warnings(caplog, TARGET) == []
+
+
+async def test_empty_shm_consumer_warns_about_deliveries_its_group_still_holds(
+    broker: ShmBroker, caplog: pytest.LogCaptureFixture
+) -> None:
+    await broker.subscribe(["stale-stream"], GROUP)
+    await broker.publish("stale-stream", b"{}", {"event_type": "t.Stale"})
+    consumer = ShmConsumer(
+        broker=broker,
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        consumer_name="worker-1",
+        group=GROUP,
+        targets=[],
+        poll_interval_s=0.01,
+    )
+    caplog.set_level(logging.WARNING)
+    await consumer.start()
+    await consumer.stop()
+
+    warnings = _stale_warnings(caplog, "stale-stream")
+    assert len(warnings) == 1
+    assert "1 undelivered" in warnings[0]

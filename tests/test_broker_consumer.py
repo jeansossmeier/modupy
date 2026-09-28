@@ -422,6 +422,11 @@ class FakePollingBroker:
     async def subscribe(self, targets: list[str], group: str) -> None:
         return None
 
+    async def stale_targets(
+        self, group: str, targets: list[str] | tuple[str, ...]
+    ) -> dict[str, int]:
+        return {}
+
     async def claim_batch(
         self,
         group: str,

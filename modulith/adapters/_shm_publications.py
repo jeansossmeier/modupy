@@ -238,6 +238,40 @@ def group_backlog(conn: sqlite3.Connection) -> dict[str, int]:
     return {str(row["consumer_group"]): int(row["backlog"]) for row in rows}
 
 
+def stale_targets(
+    conn: sqlite3.Connection,
+    group: str,
+    targets: list[str],
+) -> dict[str, int]:
+    """Map each target ``group`` holds but ``targets`` omits to its backlog.
+
+    A held target is one the group subscribes to or has pending or claimed
+    deliveries for; the count is those undelivered deliveries.
+    """
+    consumed = set(targets)
+    stale = {
+        str(row["target"]): 0
+        for row in conn.execute(
+            "SELECT target FROM shm_subscription WHERE consumer_group=?",
+            (group,),
+        )
+        if row["target"] not in consumed
+    }
+    rows = conn.execute(
+        """
+        SELECT p.target AS target, COUNT(*) AS backlog
+        FROM shm_delivery AS d JOIN shm_publication AS p ON p.id=d.publication_id
+        WHERE d.consumer_group=? AND d.status IN ('pending', 'claimed')
+        GROUP BY p.target
+        """,
+        (group,),
+    )
+    for row in rows:
+        if row["target"] not in consumed:
+            stale[str(row["target"])] = int(row["backlog"])
+    return dict(sorted(stale.items()))
+
+
 def drop_group(conn: sqlite3.Connection, group: str) -> tuple[int, int]:
     """Delete one group's subscriptions and undelivered work.
 

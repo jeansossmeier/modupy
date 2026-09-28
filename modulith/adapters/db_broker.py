@@ -2187,6 +2187,47 @@ class DatabaseBroker:
         return result
 
     @_on_owning_loop
+    async def stale_targets(
+        self, group: str, targets: list[str] | tuple[str, ...]
+    ) -> dict[str, int]:
+        """Map each target ``group`` holds but ``targets`` omits to its backlog.
+
+        A held target is one the group subscribes to or has pending or
+        claimed rows for. The count is those undelivered rows. Nothing is
+        removed: a rollback to a release that still consumes the target
+        finds its backlog intact.
+        """
+        await self._ensure_schema()
+        from sqlalchemy import func, select
+
+        _, subscription, message = broker_schema()
+        consumed = list(targets)
+
+        async def op(conn: Any) -> dict[str, int]:
+            subscribed = await conn.execute(
+                select(subscription.c.target).where(
+                    subscription.c.consumer_group == group,
+                    subscription.c.target.not_in(consumed),
+                )
+            )
+            stale = {str(row[0]): 0 for row in subscribed}
+            counts = await conn.execute(
+                select(message.c.target, func.count())
+                .where(
+                    message.c.consumer_group == group,
+                    message.c.status.in_(("pending", "claimed")),
+                    message.c.target.not_in(consumed),
+                )
+                .group_by(message.c.target)
+            )
+            for target, count in counts:
+                stale[str(target)] = int(count)
+            return dict(sorted(stale.items()))
+
+        result: dict[str, int] = await self._write(op)
+        return result
+
+    @_on_owning_loop
     async def drop_group(self, group: str) -> tuple[int, int]:
         """Unsubscribe a retired group and delete its undelivered rows.
 

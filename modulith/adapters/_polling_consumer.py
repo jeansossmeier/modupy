@@ -95,6 +95,7 @@ class PollingConsumer(DeliveryDispatch):
             if not stale_task.cancelled():
                 stale_task.exception()
             await self._cancel(stale_prune_task, "prune")
+        await self._warn_stale_targets()
         if not self._targets and not self._subscribe_when_empty:
             self._stopping = False
             self._health_failures.clear()
@@ -122,6 +123,27 @@ class PollingConsumer(DeliveryDispatch):
             self._group,
             len(self._targets),
         )
+
+    async def _warn_stale_targets(self) -> None:
+        """Report targets this group still holds but this module no longer consumes.
+
+        Subscriptions and their undelivered rows are never removed here, so a
+        rollback still finds them; the operator removes them explicitly.
+        """
+        stale = await self._broker.stale_targets(self._group, self._targets)
+        for target, backlog in stale.items():
+            self._logger.warning(
+                "consumer group %r still subscribes to or holds deliveries for target "
+                "%r, which this module no longer consumes; %d undelivered message(s) "
+                "stay queued and new publishes keep adding to them. If no release "
+                "that consumes it will run again, remove them with: "
+                "modulith broker drop-group %s --target %s",
+                self._group,
+                target,
+                backlog,
+                self._group,
+                target,
+            )
 
     def _prune_enabled(self) -> bool:
         if self._prune_interval_s is not None and self._prune_interval_s <= 0:

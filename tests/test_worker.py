@@ -1011,6 +1011,49 @@ def test_shm_worker_without_listeners_reconciles_previous_deployment(
         assert subscriptions == []
 
 
+def test_database_worker_without_listeners_warns_about_its_previous_subscriptions(
+    make_fake_app,
+    monkeypatch,
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from modulith.adapters.db_broker import DatabaseBroker, DatabaseConsumer
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'worker.db'}"
+
+    async def _previous_deployment() -> None:
+        engine = create_async_engine(url, poolclass=NullPool)
+        try:
+            previous = DatabaseBroker(engine=engine)
+            await previous.subscribe(["events.PreviousListener"], "modulith-orders")
+            await previous.publish("events.PreviousListener", b"{}", {"event_type": "x"})
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_previous_deployment())
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.setenv("MODULITH_BROKER", "database")
+    monkeypatch.setenv("MODULITH_BROKER_URL", url)
+    caplog.set_level("WARNING")
+
+    app = create_app()
+    with TestClient(app):
+        assert isinstance(app.state.consumer, DatabaseConsumer)
+
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if "modulith broker drop-group modulith-orders --target events.PreviousListener"
+        in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "1 undelivered" in warnings[0]
+
+
 # ---------------------------------------------------------------------------
 # Module lifecycle fires for the isolated worker's own module, and lifespan
 # teardown always reaches runtime/broker shutdown

@@ -330,6 +330,16 @@ class ShmBroker:
         """Map every subscribed group to its pending and claimed delivery count."""
         return await self._cold.group_backlog()
 
+    async def stale_targets(
+        self, group: str, targets: list[str] | tuple[str, ...]
+    ) -> dict[str, int]:
+        """Map each target ``group`` holds but ``targets`` omits to its backlog.
+
+        A held target is one the group subscribes to or has pending or
+        claimed deliveries for. Nothing is removed.
+        """
+        return await self._cold.stale_targets(group, list(targets))
+
     async def drop_group(self, group: str) -> tuple[int, int]:
         """Unsubscribe a retired group and delete its undelivered work.
 
