@@ -924,6 +924,15 @@ def _log_http_surface(package: str, names: list[str]) -> None:
     )
 
 
+def discover_module_names(package: str, contracts_module: str = "contracts") -> list[str]:
+    """Sorted names of the package's modules that run as workers."""
+    from .manager import create_plugin_manager
+
+    pm = create_plugin_manager()
+    module_infos = pm.hook.modulith_discover_modules(app_package=package) or []
+    return sorted(m.name for m in module_infos if m.name != contracts_module)
+
+
 def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
     """Read application config, discover modules, build one WorkerSpec each.
 
@@ -951,12 +960,7 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
             "(set [tool.modulith].package or pass it explicitly)"
         )
 
-    from .manager import create_plugin_manager
-
-    pm = create_plugin_manager()
-    module_infos = pm.hook.modulith_discover_modules(app_package=package) or []
-    contracts_module = config.get("contracts_module") or "contracts"
-    names = sorted(m.name for m in module_infos if m.name != contracts_module)
+    names = discover_module_names(package, config.get("contracts_module") or "contracts")
 
     isolate = config.get("isolate")
     if isolate:

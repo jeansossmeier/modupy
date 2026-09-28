@@ -4261,3 +4261,30 @@ async def test_broker_cross_loop_warning_fires_once_per_instance(engine: Any, ca
 
     warnings = [r for r in caplog.records if _CROSS_LOOP_MSG in r.getMessage()]
     assert len(warnings) == 1, f"expected exactly one cross-loop warning, got: {caplog.records}"
+
+
+async def test_drop_group_removes_a_retired_groups_subscription_and_undelivered_rows(
+    engine: Any,
+) -> None:
+    from sqlalchemy import select
+
+    broker = DatabaseBroker(engine=engine)
+    await broker.subscribe(["t.A", "t.B"], "modulith-retired")
+    await broker.subscribe(["t.A"], "modulith-orders")
+    for _ in range(3):
+        await broker.publish("t.A", b"x", {"event_type": "t.A"})
+    await broker.publish("t.B", b"y", {"event_type": "t.B"})
+    claimed = await broker.claim_batch("modulith-retired", batch_size=1, consumer_name="r1")
+    assert len(claimed) == 1
+
+    assert await broker.group_backlog() == {"modulith-orders": 3, "modulith-retired": 4}
+    assert await broker.drop_group("modulith-retired") == (2, 4)
+    assert await broker.group_backlog() == {"modulith-orders": 3}
+
+    _, subscription, message = broker_schema()
+    async with engine.connect() as conn:
+        groups = {row[0] for row in await conn.execute(select(subscription.c.consumer_group))}
+        message_groups = {row[0] for row in await conn.execute(select(message.c.consumer_group))}
+    assert groups == {"modulith-orders"}
+    assert message_groups == {"modulith-orders"}
+    assert await broker.drop_group("modulith-retired") == (0, 0)

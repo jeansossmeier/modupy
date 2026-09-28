@@ -77,6 +77,12 @@ class SqliteQueueStore:
     def get_subscriptions(self) -> dict[str, list[str]]:
         return _shm_publications.get_subscriptions(self._conn)
 
+    def group_backlog(self) -> dict[str, int]:
+        return _shm_publications.group_backlog(self._conn)
+
+    def drop_group(self, group: str) -> tuple[int, int]:
+        return _shm_publications.drop_group(self._conn, group)
+
     def claim(
         self,
         group: str,

@@ -1669,3 +1669,115 @@ def test_entry_point_imports_app_package_at_project_root(tmp_path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "package: shop" in proc.stdout
     assert "orders" in proc.stdout
+
+
+def _seed_shm_groups(tmp_path: Path, monkeypatch, groups: dict[str, int]) -> Path:
+    """Subscribe each group in the app's default SHM store and publish its backlog."""
+    from modulith.adapters.shm_broker import ShmBroker, _resolve_shm_paths
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    _, db_path, hint_path = _resolve_shm_paths("fakeapp", {})
+
+    async def seed() -> None:
+        broker = ShmBroker(shm_name=str(hint_path), db_path=str(db_path))
+        try:
+            for group, count in groups.items():
+                target = f"fakeapp.contracts.{group}"
+                await broker.subscribe([target], group)
+                for _ in range(count):
+                    await broker.publish(target, b"x", {"event_type": target})
+        finally:
+            await broker.close()
+
+    asyncio.run(seed())
+    return db_path
+
+
+def _shm_group_backlog(db_path: Path) -> dict[str, int]:
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        subscribed = {
+            row[0]: 0 for row in conn.execute("SELECT consumer_group FROM shm_subscription")
+        }
+        for group, count in conn.execute(
+            "SELECT consumer_group, COUNT(*) FROM shm_delivery GROUP BY consumer_group"
+        ):
+            subscribed[group] = count
+        return subscribed
+    finally:
+        conn.close()
+
+
+def test_process_run_warns_about_subscribed_groups_no_module_derives(
+    make_fake_app, monkeypatch, tmp_path, caplog
+):
+    make_fake_app(
+        {"orders": ""},
+        extra_files={"main.py": "from fastapi import FastAPI\napp = FastAPI()\n"},
+    )
+    _seed_shm_groups(tmp_path, monkeypatch, {"modulith-orders": 2, "modulith-retired": 3})
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        return None
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    with caplog.at_level(logging.WARNING, logger="modulith"):
+        result = runner.invoke(app, ["run", "fakeapp.main:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    retired = [m for m in warnings if "modulith-retired" in m]
+    assert len(retired) == 1, warnings
+    assert "3 pending" in retired[0]
+    assert "modulith broker drop-group modulith-retired" in retired[0]
+    assert not [m for m in warnings if "modulith-orders" in m]
+
+
+def test_broker_drop_group_removes_a_retired_groups_backlog(make_fake_app, monkeypatch, tmp_path):
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    db_path = _seed_shm_groups(tmp_path, monkeypatch, {"modulith-orders": 2, "modulith-retired": 3})
+
+    result = runner.invoke(app, ["broker", "drop-group", "modulith-retired", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "1 subscription(s)" in result.output
+    assert "3 pending or claimed delivery(ies)" in result.output
+    assert _shm_group_backlog(db_path) == {"modulith-orders": 2}
+
+
+def test_broker_drop_group_asks_before_removing(make_fake_app, monkeypatch, tmp_path):
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    db_path = _seed_shm_groups(tmp_path, monkeypatch, {"modulith-retired": 3})
+
+    result = runner.invoke(app, ["broker", "drop-group", "modulith-retired"], input="n\n")
+
+    assert result.exit_code == 1, result.output
+    assert _shm_group_backlog(db_path) == {"modulith-retired": 3}
+
+
+def test_broker_drop_group_refuses_a_current_modules_group_without_force(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    db_path = _seed_shm_groups(tmp_path, monkeypatch, {"modulith-orders": 2})
+
+    refused = runner.invoke(app, ["broker", "drop-group", "modulith-orders", "--yes"])
+
+    assert refused.exit_code == 1, refused.output
+    assert "--force" in refused.output
+    assert _shm_group_backlog(db_path) == {"modulith-orders": 2}
+
+    from modulith.runtime import _runtime
+
+    _runtime._reset_for_testing()  # each CLI invocation is a fresh process
+    forced = runner.invoke(app, ["broker", "drop-group", "modulith-orders", "--yes", "--force"])
+
+    assert forced.exit_code == 0, forced.output
+    assert _shm_group_backlog(db_path) == {}

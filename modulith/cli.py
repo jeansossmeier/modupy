@@ -66,6 +66,9 @@ app = typer.Typer(
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 def _version_callback(value: bool) -> None:
     """Eager ``--version`` handler: print the version and exit before any command."""
     if value:
@@ -534,6 +537,63 @@ def _parse_workers_json(workers_json: str) -> dict[str, Any]:
     return parsed
 
 
+_GROUP_LEDGER_BROKERS = ("shm", "database")
+
+
+def _derived_consumer_groups(package: str | None, contracts_module: str) -> set[str]:
+    """Consumer groups the current deployment's modules subscribe under.
+
+    Every discovered module counts, including ones ``--isolate`` leaves out
+    of this run, so isolating one module never flags its siblings.
+    """
+    from ._worker import consumer_group
+    from .supervisor import discover_module_names
+
+    if not package:
+        return set()
+    return {consumer_group(name) for name in discover_module_names(package, contracts_module)}
+
+
+def _group_ledger_broker(rt: Runtime, scheme: str) -> Any | None:
+    """The registered broker when it keeps a durable per-group subscription ledger."""
+    registry = rt.broker_registry
+    if scheme not in _GROUP_LEDGER_BROKERS or registry is None:
+        return None
+    if scheme not in registry.schemes():
+        return None
+    return registry.get(scheme)
+
+
+async def _warn_about_retired_groups(rt: Runtime, scheme: str, derived: set[str]) -> None:
+    """Log one warning per subscribed group that no current module derives.
+
+    Such a group never consumes again, so every publication to its targets
+    stays pinned by an undelivered row. Nothing is deleted here: a module
+    that is only disabled for this deploy gets its backlog when it returns.
+    """
+    broker = _group_ledger_broker(rt, scheme)
+    if broker is None:
+        return
+    try:
+        backlog = await broker.group_backlog()
+    except Exception:
+        logger.warning("could not read the %s broker's subscribed groups", scheme, exc_info=True)
+        return
+    for group, pending in backlog.items():
+        if group in derived:
+            continue
+        logger.warning(
+            "broker group %r is subscribed but no module of this deployment derives it; "
+            "it holds %d pending or claimed delivery(ies) that nothing will consume, and "
+            "they keep the %s store from pruning. If the module is retired for good, run: "
+            "modulith broker drop-group %s",
+            group,
+            pending,
+            scheme,
+            group,
+        )
+
+
 def _run_process_topology(
     *,
     app_module: str,
@@ -663,12 +723,16 @@ def _run_process_topology(
         f"modulith → process-per-module: {len(specs)} worker(s) [{layout}], "
         f"reverse proxy on http://{host}:{port}"
     )
-    try:
-        asyncio.run(
-            run_supervised(
-                specs, host, port, actuator_mode=cfg.actuator_mode, production=cfg.production
-            )
+    derived = _derived_consumer_groups(cfg.package, cfg.contracts_module)
+
+    async def supervise() -> None:
+        await _warn_about_retired_groups(rt, cfg.broker, derived)
+        await run_supervised(
+            specs, host, port, actuator_mode=cfg.actuator_mode, production=cfg.production
         )
+
+    try:
+        asyncio.run(supervise())
     except ConfigurationError as exc:
         # Configuration resolved inside run_supervised (actuator mode, proxy
         # tunables) is user error like any other: the documented contract is a
@@ -1274,6 +1338,59 @@ def openapi(
 
 outbox_app = typer.Typer(help="Outbox operational commands.")
 app.add_typer(outbox_app, name="outbox")
+
+
+# ---------------------------------------------------------------------------
+# modulith broker — operational commands for the cross-process broker
+# ---------------------------------------------------------------------------
+
+broker_app = typer.Typer(help="Broker operational commands.")
+app.add_typer(broker_app, name="broker")
+
+
+@broker_app.command("drop-group")
+def broker_drop_group(
+    group: str = typer.Argument(..., help="Consumer group, e.g. 'modulith-notifications'"),
+    force: bool = typer.Option(
+        False, "--force", help="Drop the group even though a current module derives it."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask for confirmation."),
+) -> None:
+    """Remove a retired module's group: its subscriptions and undelivered work.
+
+    Applies to the shm and database brokers, which fan every publication out
+    to each subscribed group and never prune undelivered rows. The group's
+    queued messages are deleted, not delivered; prune then reclaims them.
+    """
+    _runtime.configure(topology="processes")
+    rt = _bootstrap_or_exit()
+    cfg = rt.config
+    assert cfg is not None
+    broker = _group_ledger_broker(rt, cfg.broker)
+    if broker is None:
+        typer.echo(
+            f"error: broker {cfg.broker!r} keeps no per-group subscription ledger; "
+            f"drop-group applies to {' and '.join(_GROUP_LEDGER_BROKERS)}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    if group in _derived_consumer_groups(cfg.package, cfg.contracts_module) and not force:
+        typer.echo(
+            f"error: {group!r} belongs to a module of the current deployment; its workers "
+            "would lose their queued messages. Pass --force to drop it anyway.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    if not yes and not typer.confirm(
+        f"Drop group {group!r} and delete its pending and claimed messages?"
+    ):
+        typer.echo("aborted — nothing was removed", err=True)
+        raise typer.Exit(code=1)
+    subscriptions, deliveries = asyncio.run(broker.drop_group(group))
+    typer.echo(
+        f"dropped group {group!r}: {subscriptions} subscription(s), "
+        f"{deliveries} pending or claimed delivery(ies)"
+    )
 
 
 @outbox_app.command("status")

@@ -98,6 +98,12 @@ class ShmColdStore(SerialStoreExecutor):
             await self._call("get_subscriptions"),
         )
 
+    async def group_backlog(self) -> dict[str, int]:
+        return cast(dict[str, int], await self._call("group_backlog"))
+
+    async def drop_group(self, group: str) -> tuple[int, int]:
+        return cast(tuple[int, int], await self._call("drop_group", group))
+
     async def claim(
         self,
         consumer_group: str,

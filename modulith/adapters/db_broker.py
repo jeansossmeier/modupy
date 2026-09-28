@@ -96,8 +96,10 @@ ledgers; publish/subscribe also remove them lazily before replay-sensitive work.
 Corollary: a consumer group that stops consuming permanently (a module
 retired without dropping its ``broker_subscription`` rows) keeps accumulating
 'pending' rows that prune will never delete — undelivered work is never
-pruned by design. Delete that group's subscription rows (or the stale
-messages) out of band when decommissioning a module.
+pruned by design. ``modulith run --topology processes`` warns about such a
+group at startup; ``modulith broker drop-group <group>`` (``drop_group``)
+removes its subscription rows and undelivered messages when decommissioning
+a module.
 
 Resilience posture mirrors ``modulith._consumer.BrokerConsumer``: a
 background poll loop with capped exponential backoff on backend errors,
@@ -1975,6 +1977,57 @@ class DatabaseBroker:
         if deleted:
             logger.debug("prune deleted %d terminal row(s)", deleted)
         return deleted
+
+    async def group_backlog(self) -> dict[str, int]:
+        """Map every subscribed group to its pending and claimed row count."""
+        await self._ensure_schema()
+        from sqlalchemy import func, select
+
+        _, subscription, message = broker_schema()
+
+        async def op(conn: Any) -> dict[str, int]:
+            groups = await conn.execute(select(subscription.c.consumer_group).distinct())
+            backlog = {str(row[0]): 0 for row in groups}
+            counts = await conn.execute(
+                select(message.c.consumer_group, func.count())
+                .where(
+                    message.c.consumer_group.in_(list(backlog)),
+                    message.c.status.in_(("pending", "claimed")),
+                )
+                .group_by(message.c.consumer_group)
+            )
+            for group, count in counts:
+                backlog[str(group)] = int(count)
+            return dict(sorted(backlog.items()))
+
+        result: dict[str, int] = await self._write(op)
+        return result
+
+    async def drop_group(self, group: str) -> tuple[int, int]:
+        """Unsubscribe a retired group and delete its undelivered rows.
+
+        Returns ``(subscriptions, rows)`` removed. Terminal rows stay for
+        ``prune``. This is the cleanup behind ``modulith broker drop-group``.
+        """
+        await self._ensure_schema()
+        from sqlalchemy import delete
+
+        _, subscription, message = broker_schema()
+
+        async def op(conn: Any) -> tuple[int, int]:
+            subscriptions = await conn.execute(
+                delete(subscription).where(subscription.c.consumer_group == group)
+            )
+            rows = await conn.execute(
+                delete(message).where(
+                    message.c.consumer_group == group,
+                    message.c.status.in_(("pending", "claimed")),
+                )
+            )
+            return _rowcount(subscriptions), _rowcount(rows)
+
+        removed: tuple[int, int] = await self._write(op)
+        return removed
 
 
 # ---------------------------------------------------------------------------

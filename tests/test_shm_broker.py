@@ -1066,3 +1066,54 @@ async def test_public_claim_batch_dead_letters_after_max_attempts_stale_reclaims
         max_attempts=2,
     )
     assert never_again == []
+
+
+async def test_drop_group_lets_prune_reclaim_a_retired_groups_publications(tmp_path: Path) -> None:
+    db = tmp_path / "q.db"
+    target = "shop.contracts.events.OrderPlaced"
+    first = ShmBroker(shm_name=str(tmp_path / "hints"), db_path=str(db))
+    await first.subscribe([target], "modulith-inventory")
+    await first.subscribe([target], "modulith-notifications")
+    await first.close()
+
+    broker = ShmBroker(shm_name=str(tmp_path / "hints"), db_path=str(db))
+    try:
+        await broker.subscribe([target], "modulith-inventory")
+        for _ in range(20):
+            await broker.publish(target, b"x" * 64, {"event_type": target})
+        while rows := await broker.claim_batch(
+            "modulith-inventory", batch_size=100, consumer_name="modulith-inventory:w"
+        ):
+            for row in rows:
+                await broker.ack(row["id"], consumer_name="modulith-inventory:w")
+        claimed = await broker.claim_batch(
+            "modulith-notifications", batch_size=5, consumer_name="modulith-notifications:w"
+        )
+        assert len(claimed) == 5
+
+        assert await broker.group_backlog() == {
+            "modulith-inventory": 0,
+            "modulith-notifications": 20,
+        }
+        assert await broker.drop_group("modulith-notifications") == (1, 20)
+        assert await broker.group_backlog() == {"modulith-inventory": 0}
+
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE shm_publication SET retained_until = 0")
+        conn.commit()
+        conn.close()
+        assert await broker.prune(retention_age_seconds=0.0) == 20
+        conn = sqlite3.connect(db)
+        remaining = conn.execute("SELECT COUNT(*) FROM shm_publication").fetchone()[0]
+        conn.close()
+        assert remaining == 0
+    finally:
+        await broker.close()
+
+
+async def test_drop_group_of_an_unknown_group_removes_nothing(broker: ShmBroker) -> None:
+    await broker.subscribe(["t.A"], "modulith-orders")
+    await broker.publish("t.A", b"x", {"event_type": "t.A"})
+
+    assert await broker.drop_group("modulith-gone") == (0, 0)
+    assert await broker.group_backlog() == {"modulith-orders": 1}
