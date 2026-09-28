@@ -73,6 +73,7 @@ try:
     )
     from sqlalchemy import event as sa_event
     from sqlalchemy.dialects.mysql import LONGBLOB as MySQLLongBlob
+    from sqlalchemy.engine import Engine
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
     from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 except ImportError as exc:  # pragma: no cover — exercised in a subprocess test
@@ -286,6 +287,14 @@ def _discard_uncommitted_pending(session: Session, transaction: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _discard_connection(conn: Any) -> None:
+    """Close an advisory-lock connection without returning it to its pool."""
+    try:
+        await conn.invalidate()
+    finally:
+        await conn.close()
+
+
 def _aware(value: datetime | None) -> datetime | None:
     """Normalize a possibly-naive timestamp (SQLite loses tz) to UTC-aware."""
     if value is not None and value.tzinfo is None:
@@ -428,6 +437,7 @@ class PostgresPublicationStore:
         # this store's SQLAlchemy engine directly (keeps the storage-agnostic
         # plugin from depending on dialect internals).
         self.supports_advisory_lock = engine.dialect.name == "postgresql"
+        self._lock_engine: AsyncEngine | None = None
         # Push onto the live-store stack so dispose() can restore whichever
         # live store remains, rather than blanking dispatch routing — and warn
         # loudly instead of silently hijacking a still-live store's
@@ -957,6 +967,14 @@ class PostgresPublicationStore:
         Returns the open connection (the handle ``unlock_publication`` needs)
         on success, or None if another connection already holds it — the
         caller's contract is try-lock-and-skip, never block-and-wait.
+
+        The lock connection comes from a pool of its own, sized like the
+        engine's. The listener and this store's reads and writes during the
+        dispatch draw on the engine's pool, so a burst of held locks cannot
+        exhaust the pool they wait on. A connection returns to the lock pool
+        only when it provably holds no lock: the lock attempt returned false,
+        or ``unlock_publication`` released the lock. Any other outcome
+        invalidates it, so a lock can never outlive its handle.
         """
         if not self.supports_advisory_lock:
             raise ConfigurationError(
@@ -965,7 +983,7 @@ class PostgresPublicationStore:
                 f"{self._engine.dialect.name!r}"
             )
         lock_key = publication_id.int & 0x7FFFFFFFFFFFFFFF  # fit signed bigint
-        conn = await self._engine.connect()
+        conn = await self._lock_connection_engine().connect()
         try:
             # AUTOCOMMIT: the lock query would otherwise autobegin a
             # transaction that stays open for the whole dispatch this handle
@@ -975,22 +993,43 @@ class PostgresPublicationStore:
                 await conn.execute(text("SELECT pg_try_advisory_lock(:key)"), {"key": lock_key})
             ).scalar()
         except BaseException:
-            await conn.close()
+            await _discard_connection(conn)
             raise
         if not got:
             await conn.close()
             return None
         return conn
 
+    def _lock_connection_engine(self) -> AsyncEngine:
+        """The engine advisory-lock connections come from: the store engine's
+        URL, dialect and connection factory over a separate pool."""
+        if self._lock_engine is None:
+            sync_engine = self._engine.sync_engine
+            self._lock_engine = AsyncEngine(
+                Engine(sync_engine.pool.recreate(), sync_engine.dialect, sync_engine.url)
+            )
+        return self._lock_engine
+
     async def unlock_publication(self, handle: object, publication_id: UUID) -> None:
-        """Release a lock handle returned by ``try_lock_publication`` and
-        close its dedicated connection."""
+        """Release a lock handle returned by ``try_lock_publication``.
+
+        The connection returns to the lock pool when ``pg_advisory_unlock``
+        confirms the release; when the unlock raises, is cancelled or returns
+        false, the session may still hold a lock, so it is invalidated."""
         lock_key = publication_id.int & 0x7FFFFFFFFFFFFFFF
         conn = cast(Any, handle)
+        released = False
         try:
-            await conn.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": lock_key})
+            released = bool(
+                (
+                    await conn.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": lock_key})
+                ).scalar()
+            )
         finally:
-            await conn.close()
+            if released:
+                await conn.close()
+            else:
+                await _discard_connection(conn)
 
     async def purge_completed(self, older_than: timedelta) -> int:
         """Delete completed publications older than ``older_than`` from BOTH
@@ -1029,9 +1068,16 @@ class PostgresPublicationStore:
         sweep claims it, and delivered under that lease with renewal and
         fenced completion; a row a sweep holds is left to that sweep. Under
         ``"advisory_lock"`` it is delivered under the row's advisory lock,
-        through the same lock/re-read/unlock path the advisory sweep uses. The
-        claim is taken after commit, not in ``save()``, so a crashed
-        process's rows stay claimable by the next sweep right away.
+        through the same lock/re-read/unlock path the advisory sweep uses.
+
+        Crash recovery: the claim is taken after commit, not in ``save()``, so
+        a process that dies between commit and claim leaves its rows for the
+        restart sweep. A row it was already delivering under a lease stays
+        claimed until that lease expires, so the first sweep after expiry
+        recovers it: up to ``claim_lease_seconds`` plus
+        ``retry_interval_seconds`` after the crash. An advisory lock dies with
+        its connection, so under ``"advisory_lock"`` the restart sweep
+        recovers such rows at once.
         """
         token = _current_session.set(None)
         try:
@@ -1056,6 +1102,13 @@ class PostgresPublicationStore:
                 await outbox._dispatch_under_advisory_lock(pub)
             elif pub is not None:
                 await outbox._dispatch_publication(pub)
+            elif outbox._completion_mode in ("delete", "archive"):
+                # Completing the row removes it under these modes, so a sweep
+                # that delivered it first is the ordinary way to find it gone.
+                logger.debug(
+                    "after-commit dispatch: publication %s already completed and removed",
+                    publication_id,
+                )
             else:
                 # The row was committed (we were queued from after_commit) yet is
                 # gone now — deleted out from under us, or never actually
@@ -1118,6 +1171,9 @@ class PostgresPublicationStore:
         """
         global _active_store, _hook_installed
         await self.wait_for_dispatch()
+        if self._lock_engine is not None:
+            await self._lock_engine.dispose()
+            self._lock_engine = None
         if self in _store_stack:
             _store_stack.remove(self)
         if _active_store is self:

@@ -1115,18 +1115,22 @@ class PeerRacingLockStore(ClaimingStubStore):
             row.completed_at = datetime.now(UTC)
         elif self.peer_action == "dead_lettered":
             row.attempt_count = 3
+        elif self.peer_action == "failed":
+            row.attempt_count += 1
+            row.last_attempt_at = datetime.now(UTC)
         else:
             del self.rows[publication_id]
         return await super().try_lock_publication(publication_id)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("peer_action", ["completed", "dead_lettered", "gone"])
+@pytest.mark.parametrize("peer_action", ["completed", "dead_lettered", "failed", "gone"])
 async def test_advisory_sweep_rereads_row_after_locking(peer_action: str) -> None:
     """The advisory sweep dispatches from a snapshot read before locking. A
-    peer can finish a row in between and release its lock, so after locking
-    the sweep must re-read the row, skip it when it is completed,
-    dead-lettered or gone, and still release the lock."""
+    peer can finish or fail a row in between and release its lock, so after
+    locking the sweep must re-read the row, skip it when it is completed,
+    dead-lettered, gone, or failed so recently that its backoff has not
+    elapsed, and still release the lock."""
     store = PeerRacingLockStore(peer_action)
     outbox.configure(
         store,
@@ -1995,6 +1999,86 @@ async def test_lost_lease_stops_renewal_without_cancelling_dispatch() -> None:
     assert lease_lost.is_set()
     assert received == [14]
     assert store.rows[publication.id].completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_renewal_that_raises_is_retried_and_delivery_completes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A renewal that raises (a database blip) must not end renewals: the
+    next renewal still runs, the delivery completes, and the sweep does not
+    re-raise the renewal's error after a delivery that succeeded."""
+    renewed_after_error = asyncio.Event()
+
+    class BlippingRenewalStore(ClaimingStubStore):
+        async def renew_claim(self, publication_id: UUID, token: str, lease_seconds: float) -> bool:
+            call = len(self.renew_calls) + 1
+            if call == 2:
+                self.renew_calls.append((publication_id, token, lease_seconds))
+                raise OSError("db blip")
+            if call >= 3:
+                renewed_after_error.set()
+            return await super().renew_claim(publication_id, token, lease_seconds)
+
+    async def wait_for_renewal(event: OutboxEvent) -> None:
+        await renewed_after_error.wait()
+        received.append(event.value)
+
+    store = BlippingRenewalStore()
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        claim_lease_seconds=0.3,
+        start_loop=False,
+    )
+    _bootstrap_with_listener(wait_for_renewal)
+    publication = _make_pub(wait_for_renewal, value=15)
+    await store.save(publication)
+
+    with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
+        await asyncio.wait_for(outbox._sweep(timedelta(0)), timeout=2)
+
+    assert received == [15]
+    assert store.rows[publication.id].completed_at is not None
+    assert any(r.exc_info and "db blip" in str(r.exc_info[1]) for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_renewal_that_keeps_raising_stops_at_the_lease_deadline() -> None:
+    """Renewals that keep raising are retried only until the lease they
+    were protecting has expired; the delivery itself still completes and
+    is not reported as a failure."""
+
+    class DownRenewalStore(ClaimingStubStore):
+        async def renew_claim(self, publication_id: UUID, token: str, lease_seconds: float) -> bool:
+            self.renew_calls.append((publication_id, token, lease_seconds))
+            raise OSError("db down")
+
+    async def outlives_the_lease(event: OutboxEvent) -> None:
+        await asyncio.sleep(1.2)
+        received.append(event.value)
+
+    store = DownRenewalStore()
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        claim_lease_seconds=0.3,
+        start_loop=False,
+    )
+    _bootstrap_with_listener(outlives_the_lease)
+    publication = _make_pub(outlives_the_lease, value=16)
+    await store.save(publication)
+    [claimed] = await store.claim_batch(
+        owner="me", batch_size=1, lease_seconds=0.3, older_than=timedelta(0)
+    )
+
+    await outbox._dispatch_with_lease_renewal(claimed)
+
+    assert received == [16]
+    assert store.rows[publication.id].completed_at is not None
+    assert 2 <= len(store.renew_calls) <= 4
 
 
 @pytest.mark.asyncio

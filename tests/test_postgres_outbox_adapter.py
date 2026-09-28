@@ -21,7 +21,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi import BackgroundTasks, Depends, FastAPI
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -988,6 +988,162 @@ async def test_advisory_after_commit_skips_a_row_a_peer_has_locked(pg_engine: An
     assert delivered_under_peer_lock == []
     assert received == [1]
     assert await _completed_rows(pg_engine) == 1
+
+
+async def _scalar_on(handle: object, sql: str) -> Any:
+    return (await cast(Any, handle).execute(text(sql))).scalar()
+
+
+@pytest.mark.integration
+async def test_advisory_lock_connection_returns_to_the_lock_pool_after_unlock(
+    pg_engine: Any,
+) -> None:
+    """A lock connection whose lock was released cleanly carries no session
+    state, so the next lock reuses it instead of opening a new backend."""
+    store = PostgresPublicationStore(engine=pg_engine)
+    pub_id = uuid4()
+    try:
+        first = await store.try_lock_publication(pub_id)
+        assert first is not None
+        first_pid = await _scalar_on(first, "SELECT pg_backend_pid()")
+        await store.unlock_publication(first, pub_id)
+        second = await store.try_lock_publication(pub_id)
+        assert second is not None
+        second_pid = await _scalar_on(second, "SELECT pg_backend_pid()")
+        await store.unlock_publication(second, pub_id)
+    finally:
+        await store.dispose()
+
+    assert second_pid == first_pid
+
+
+@pytest.mark.integration
+async def test_advisory_lock_connection_returns_to_the_lock_pool_when_contended(
+    pg_engine: Any,
+) -> None:
+    """A lock attempt that finds the row locked by a peer took no lock, so its
+    connection goes back to the lock pool for the next dispatch."""
+    store = PostgresPublicationStore(engine=pg_engine)
+    pub_id, other_id = uuid4(), uuid4()
+    try:
+        holder = await store.try_lock_publication(pub_id)
+        assert holder is not None
+        assert await store.try_lock_publication(pub_id) is None
+        mark = await _scalar_on(holder, "SELECT clock_timestamp()")
+        # The holder is still checked out, so the only pooled connection is
+        # the one the contended attempt returned.
+        other = await store.try_lock_publication(other_id)
+        assert other is not None
+        other_started = await _scalar_on(
+            other, "SELECT backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid()"
+        )
+        await store.unlock_publication(other, other_id)
+        await store.unlock_publication(holder, pub_id)
+    finally:
+        await store.dispose()
+
+    assert other_started < mark
+
+
+@pytest.mark.integration
+async def test_advisory_lock_connection_is_invalidated_when_unlock_fails(
+    pg_engine: Any,
+) -> None:
+    """``pg_advisory_unlock`` returning false means the session's lock state
+    is not what the handle claims, so the connection must not go back to the
+    pool, where a later dispatch would inherit whatever it still holds."""
+    store = PostgresPublicationStore(engine=pg_engine)
+    locked_id, never_locked_id = uuid4(), uuid4()
+    try:
+        handle = await store.try_lock_publication(locked_id)
+        assert handle is not None
+        first_pid = await _scalar_on(handle, "SELECT pg_backend_pid()")
+        await store.unlock_publication(handle, never_locked_id)
+        after = await store.try_lock_publication(never_locked_id)
+        assert after is not None
+        after_pid = await _scalar_on(after, "SELECT pg_backend_pid()")
+        await store.unlock_publication(after, never_locked_id)
+    finally:
+        await store.dispose()
+
+    assert after_pid != first_pid
+
+
+@pytest.mark.integration
+async def test_advisory_after_commit_delivers_a_burst_larger_than_the_pool(
+    pg_engine: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Under ``advisory_lock`` every after-commit delivery holds its row's
+    lock for the whole listener call. A burst of committing requests larger
+    than the engine's pool, with listeners that use that same engine, must
+    still be delivered promptly: the held lock connections must not starve
+    the listeners and the store's own reads of the pool they wait on."""
+    pool_timeout = 2.0
+    small = create_async_engine(
+        pg_engine.url, pool_size=2, max_overflow=0, pool_timeout=pool_timeout
+    ).execution_options(**pg_engine.get_execution_options())
+    store = PostgresPublicationStore(engine=small)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+
+    async def uses_the_engine(event: G04Event) -> None:
+        async with small.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        received.append(event.value)
+
+    _bootstrap_with_listener(uses_the_engine)
+
+    async def committing_request(value: int) -> None:
+        async with async_sessionmaker(small)() as session:
+            token = bind_session(session)
+            try:
+                await publish(G04Event(value=value))
+                await session.commit()
+            finally:
+                unbind_session(token)
+
+    loop = asyncio.get_running_loop()
+    try:
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.postgres"):
+            started = loop.time()
+            await asyncio.gather(*(committing_request(v) for v in range(6)))
+            await asyncio.wait_for(store.wait_for_dispatch(), timeout=15)
+            elapsed = loop.time() - started
+    finally:
+        await store.dispose()
+        await small.dispose()
+
+    assert sorted(received) == [0, 1, 2, 3, 4, 5]
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "modulith.adapters.postgres" and r.levelno >= logging.WARNING
+    ] == []
+    assert elapsed < pool_timeout
+
+
+@pytest.mark.parametrize("mode", ["delete", "archive"])
+async def test_after_commit_is_quiet_when_a_sweep_already_removed_the_row(
+    engine: Any, mode: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Under delete or archive completion a sweep that delivers the row first
+    removes it from the table. The after-commit task then finds no row; that
+    is the expected race, so it must not log a WARNING suggesting data loss."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), completion_mode=mode, start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _pub(1)
+    await store.save(pub)
+    await outbox._sweep(timedelta(0))
+
+    with caplog.at_level(logging.DEBUG, logger="modulith.adapters.postgres"):
+        await store._dispatch_after_commit(pub.id)
+
+    assert received == [1]
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "modulith.adapters.postgres" and r.levelno >= logging.WARNING
+    ] == []
 
 
 async def test_after_commit_claim_expires_so_a_crashed_delivery_is_recovered(

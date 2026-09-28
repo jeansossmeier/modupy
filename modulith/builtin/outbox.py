@@ -10,7 +10,13 @@ Critical correctness properties:
      ``_store.save`` adds the row to the *bound* session, so a rollback of
      the business transaction also discards the publication.
   2. Crash-safe — process death before delivery leaves the record
-     incomplete; the retry loop picks it up on restart (crash sweep).
+     incomplete; the retry loop picks it up on restart (crash sweep). A row
+     the dead process was delivering under a lease (``claim_strategy=
+     "lease"``) stays claimed until that lease expires, so it is recovered by
+     the first sweep after expiry, up to ``claim_lease_seconds`` plus
+     ``retry_interval_seconds`` after the crash. An advisory lock is released
+     with the dead process's connection, so the crash sweep recovers those
+     rows at once.
   3. At-least-once — a listener may be called more than once if delivery
      completes but completion-marking fails. Listeners must be idempotent.
   4. Non-reentrant *within a process* — the after-commit dispatch task and the
@@ -1012,9 +1018,10 @@ async def _dispatch_under_advisory_lock(publication: EventPublication) -> None:
     another dispatcher (a peer's sweep or after-commit task) holds the lock.
 
     ``publication`` may have been read before locking, and a peer may have
-    delivered the row and released its lock since, so it is re-read under
-    the lock and delivered only if still pending. Both the advisory sweep
-    and the Postgres adapter's after-commit dispatch route through here.
+    delivered or failed the row and released its lock since, so it is re-read
+    under the lock and delivered only if still pending and past its backoff.
+    Both the advisory sweep and the Postgres adapter's after-commit dispatch
+    route through here.
     """
     assert _store is not None
     store_any: Any = _store  # AdvisoryLockingStore capability
@@ -1028,6 +1035,7 @@ async def _dispatch_under_advisory_lock(publication: EventPublication) -> None:
             current is not None
             and current.completed_at is None
             and current.attempt_count < _dead_letter_after_attempts
+            and _backoff_elapsed(current)
         ):
             await _dispatch_publication(current)
     finally:
@@ -1037,8 +1045,10 @@ async def _dispatch_under_advisory_lock(publication: EventPublication) -> None:
 async def _dispatch_with_lease_renewal(publication: EventPublication) -> None:
     """Dispatch under an active lease, renewing at one-third of the lease.
 
-    Renewal failures (stale token) stop the renew loop but do not cancel
-    dispatch — fencing happens in ``_complete`` / ``_record_failure``.
+    A lost lease (stale token) stops the renew loop but does not cancel
+    dispatch — fencing happens in ``_complete`` / ``_record_failure``. A
+    renewal that raises is logged and retried on the next interval until the
+    lease it protects has expired; it never fails the delivery.
     """
     token = publication.claim_token
     if not token or not hasattr(_store, "renew_claim"):
@@ -1050,21 +1060,39 @@ async def _dispatch_with_lease_renewal(publication: EventPublication) -> None:
 
     async def _renew_loop() -> None:
         assert _store is not None and token is not None
-        while not stop.is_set():
+        # ClaimingStore capability — not on the base PublicationStore Protocol.
+        store_any: Any = _store
+        loop = asyncio.get_running_loop()
+        lease_deadline = loop.time() + _claim_lease_seconds
+        while True:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=renew_interval)
                 return
             except TimeoutError:
-                # ClaimingStore capability — not on the base PublicationStore Protocol.
-                store_any: Any = _store
+                pass
+            try:
                 ok = await store_any.renew_claim(publication.id, token, _claim_lease_seconds)
-                if not ok:
-                    logger.warning(
-                        "lost lease on publication %s during dispatch — "
-                        "stopping renewals; completion will be fenced",
-                        publication.id,
-                    )
+            except Exception:
+                expired = loop.time() >= lease_deadline
+                logger.warning(
+                    "lease renewal for publication %s raised — %s",
+                    publication.id,
+                    "the lease has expired; stopping renewals, completion will be fenced"
+                    if expired
+                    else "retrying until the lease expires",
+                    exc_info=True,
+                )
+                if expired:
                     return
+                continue
+            if not ok:
+                logger.warning(
+                    "lost lease on publication %s during dispatch — "
+                    "stopping renewals; completion will be fenced",
+                    publication.id,
+                )
+                return
+            lease_deadline = loop.time() + _claim_lease_seconds
 
     renew_task = asyncio.create_task(_renew_loop())
     try:

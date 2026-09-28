@@ -356,7 +356,7 @@ table. `claim_strategy` decides how those sweepers stay off each other's rows:
 | `claim_strategy` | Behaviour |
 |---|---|
 | `"lease"` (default) | claim a batch in one committed transaction, renew the lease while dispatching, fence the completion write on the claim token |
-| `"advisory_lock"` | hold a Postgres advisory lock per row for the dispatch. Rejected at `configure()` on a non-Postgres store |
+| `"advisory_lock"` | hold a Postgres advisory lock per row for the dispatch. Rejected at `configure()` on a non-Postgres store. Lock connections come from a second pool sized like the engine's, so during a burst a process can hold up to 2×(`pool_size` + `max_overflow`) Postgres connections; budget `max_connections` for that. A dispatch that waits past `pool_timeout` for a lock connection leaves its row to the next sweep |
 | `"none"` | no coordination — two sweepers may dispatch the same row. Warns at `configure()` |
 
 ```python
@@ -371,7 +371,10 @@ outbox.configure(
 
 A lease shorter than a listener's runtime expires mid-dispatch and lets a peer
 legitimately reclaim the row — a duplicate delivery, not a bug. Raise
-`claim_lease_seconds` rather than lowering it to chase latency.
+`claim_lease_seconds` rather than lowering it to chase latency. The lease is
+also the crash-recovery bound: rows a crashed process was delivering are
+recovered once their lease expires, up to `claim_lease_seconds` plus
+`retry_interval_seconds` after the crash.
 
 The default strategy needs the lease columns, which arrive in migration
 `0003_outbox_claim_leases`: migrate to `head`, not to `0001_initial`. These are
