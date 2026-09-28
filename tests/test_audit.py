@@ -643,3 +643,128 @@ def test_demo_readme_quotes_what_the_audit_prints(monkeypatch, tmp_path: Path) -
     readme = (demo / "README.md").read_text(encoding="utf-8")
     for line in _summary_lines(result.stdout):
         assert f"`{line}`" in readme
+
+
+# ---------------------------------------------------------------------------
+# Script directories, unreadable directories and non-directory paths
+# ---------------------------------------------------------------------------
+
+
+def _write_script_dirs(project: Path, import_root: str) -> None:
+    """Top-level directories of loose scripts, which are never the application."""
+    _write(project, "tools/gen.py", "print(1)\n")
+    _write(project, "bin/run.py", f"from {import_root}.views.orders import charge\n")
+    _write(project, "scripts/seed.py", "x = 1\n")
+
+
+def test_audit_from_src_layout_root_with_script_directories_audits_the_package(
+    monkeypatch, tmp_path: Path
+) -> None:
+    project = tmp_path / "brownfield"
+    _write_coupled_app(project / "src" / "shopkit", "shopkit")
+    _write_script_dirs(project, "shopkit")
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["audit", "--output", str(tmp_path / "MIGRATION.md")])
+
+    assert result.exit_code == 0, result.output
+    assert f"audited {(project / 'src' / 'shopkit').resolve()}" in result.stdout
+    assert _summary_lines(result.stdout) == [
+        "readiness score: 0/100",
+        "3 cross-module import pattern(s), 0 shared table(s)",
+    ]
+
+
+def test_audit_from_flat_root_with_script_directories_audits_the_package(
+    monkeypatch, tmp_path: Path
+) -> None:
+    project = tmp_path / "brownfield"
+    _write_coupled_app(project / "app", "app")
+    _write_script_dirs(project, "app")
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["audit", "--output", str(tmp_path / "MIGRATION.md")])
+
+    assert result.exit_code == 0, result.output
+    assert f"audited {(project / 'app').resolve()}" in result.stdout
+    assert _summary_lines(result.stdout) == [
+        "readiness score: 0/100",
+        "3 cross-module import pattern(s), 0 shared table(s)",
+    ]
+
+
+def test_root_package_init_is_not_a_module_candidate(tmp_path: Path) -> None:
+    """A package whose code all lives in one subpackage has one module
+    candidate; its own ``__init__.py`` does not make a second one."""
+    root = tmp_path / "app"
+    _write(root, "__init__.py", "")
+    _write(root, "core/__init__.py", "")
+    _write(root, "core/orders.py", "from app.core.billing import charge\n")
+    _write(root, "core/billing.py", "def charge(): ...\n")
+
+    result = audit_codebase(root)
+    report = render_report(result)
+
+    assert result.score_applicable is False
+    assert "100/100" not in report
+    assert "only one module candidate (`core`)" in report
+
+
+def test_audit_skips_an_unreadable_top_level_directory(monkeypatch, tmp_path: Path) -> None:
+    project = tmp_path / "brownfield"
+    _write_coupled_app(project / "app", "app")
+    pgdata = project / "pgdata"
+    _write(pgdata, "base/stray.py", "x = 1\n")
+    pgdata.chmod(0)
+    monkeypatch.chdir(project)
+    try:
+        result = runner.invoke(app, ["audit", "--output", str(tmp_path / "MIGRATION.md")])
+    finally:
+        pgdata.chmod(0o700)
+
+    assert result.exit_code == 0, result.output
+    assert f"audited {(project / 'app').resolve()}" in result.stdout
+
+
+def test_audit_of_a_file_is_a_user_error(tmp_path: Path) -> None:
+    _write(tmp_path, "app.py", "x = 1\n")
+
+    result = runner.invoke(
+        app, ["audit", str(tmp_path / "app.py"), "--output", str(tmp_path / "M.md")]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "not a directory" in result.stderr
+    assert not (tmp_path / "M.md").exists()
+
+
+def test_explicit_path_is_audited_as_given(tmp_path: Path) -> None:
+    """``modulith audit <dir>`` audits that directory; only the bare command
+    looks for the application package."""
+    services = tmp_path / "services"
+    _write(services, "api.py", "from services.core.orders import place\n")
+    _write(services, "models.py", "x = 1\n")
+    _write(services, "core/orders.py", "def place(): ...\n")
+
+    result = runner.invoke(app, ["audit", str(services), "--output", str(tmp_path / "M.md")])
+
+    assert result.exit_code == 0, result.output
+    assert f"audited {services.resolve()}\n" in result.stdout
+    report = (tmp_path / "M.md").read_text(encoding="utf-8")
+    assert "- `services` (2 files)" in report
+    assert "- `core` (1 file)" in report
+
+
+def test_report_embeds_no_absolute_paths(tmp_path: Path) -> None:
+    """The report is meant to be committed and diffed between runs, so the
+    machine-specific location of the checkout must not appear in it."""
+    root = _make_codebase(tmp_path)
+    _write(root, "orders/broken.py", "def (:\n")
+
+    result = audit_codebase(root)
+    report = render_report(result)
+
+    assert result.cross_module_imports and result.listener_candidates and result.parse_failures
+    assert str(tmp_path) not in report
+    assert "`orders/broken.py`" in report
+    assert "`orders/service.py`" in report

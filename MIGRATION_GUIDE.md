@@ -32,12 +32,17 @@ echoes a short summary to stdout, so a redirect onto the same file
 corrupts the report it just wrote.)
 
 `modulith audit` reads your codebase non-destructively and produces a
-Markdown report. Run from the project root, it audits your application
-package: when the only application directory is one package (`app/`) or
-`src/` holding one package, that package's subpackages are the module
-candidates. Tests, docs, scripts, examples, migrations, virtualenvs, hidden
-and build directories are ignored when it decides. It prints the directory it
-chose; pass a path (`modulith audit app`) to pick another. The report holds:
+Markdown report. Run from the project root without a path, it audits your
+application package: `src/` holding one package, otherwise the one top-level
+package (`app/`), and that package's subpackages are the module candidates.
+Loose-script directories without an `__init__.py` (`tools/`, `bin/`) beside
+the package don't count, and tests, docs, scripts, examples, migrations,
+virtualenvs, hidden, build and unreadable directories are ignored when it
+decides. It prints the directory it chose. Pass a directory
+(`modulith audit app`) to audit exactly that directory instead: its
+subdirectories become the module candidates, and a file path is rejected
+with exit code 1. The report names files relative to the audited directory,
+so it can be committed and diffed. The report holds:
 - A proposed module structure based on your folder layout
 - A list of cross-module imports that would become violations
 - A list of database tables that multiple parts of the code touch (these
