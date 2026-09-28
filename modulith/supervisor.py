@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
 import signal
 import sys
 import time
@@ -755,6 +756,27 @@ def _resolve_actuator(
     return True, token
 
 
+def _check_proxy_port(specs: list[WorkerSpec], proxy_port: int) -> None:
+    """Refuse a proxy port that any worker replica is also assigned.
+
+    Compared by port alone, whatever the proxy host: workers bind 127.0.0.1,
+    which a wildcard or loopback proxy bind overlaps. A proxy bound to a
+    specific non-loopback address would not actually collide, but is refused
+    too; moving either port costs less than debugging one module that never
+    binds while its prefix proxies back into the proxy.
+    """
+    from .config import ConfigurationError
+
+    for spec in specs:
+        if proxy_port in _replica_ports(spec):
+            raise ConfigurationError(
+                f"proxy port {proxy_port} is also assigned to worker {spec.module_name!r} "
+                f"(ports {spec.port}-{spec.port + max(1, spec.worker_count) - 1}); "
+                "choose another --port or move the workers with --worker-port-base / "
+                "[tool.modulith] worker_port_base"
+            )
+
+
 async def run_supervised(
     specs: list[WorkerSpec],
     proxy_host: str,
@@ -788,6 +810,15 @@ async def run_supervised(
     the cap exists, but an app with large uploads has no other way past it
     from ``modulith run``.
 
+    Each call generates a random deployment token and adds it to every spec's
+    ``env`` as ``MODULITH_DEPLOYMENT_TOKEN`` (mutating the specs, so an injected
+    supervisor built from them passes it on too). Workers echo it on
+    ``/health``, and the proxy reports any backend that does not as a
+    ``"foreign deployment"`` rather than healthy.
+
+    Raises ``ConfigurationError`` before spawning anything when ``proxy_port``
+    equals any worker replica's port (see ``_check_proxy_port``).
+
     ``supervisor`` and ``serve`` are injection seams for testing; production
     callers pass neither and get a real Supervisor plus a uvicorn server.
     """
@@ -804,6 +835,12 @@ async def run_supervised(
         mode=actuator_mode, production=production, host=proxy_host, token=actuator_token
     )
 
+    _check_proxy_port(specs, proxy_port)
+
+    deployment_token = secrets.token_hex(16)
+    for spec in specs:
+        spec.env = {**(spec.env or {}), "MODULITH_DEPLOYMENT_TOKEN": deployment_token}
+
     sup = supervisor if supervisor is not None else Supervisor(specs)
     rules = _rules_from_specs(specs)
     proxy_app = create_proxy_app(
@@ -814,6 +851,7 @@ async def run_supervised(
             "MODULITH_PROXY_MAX_BODY_BYTES", DEFAULT_MAX_REQUEST_BODY_BYTES
         ),
         failed_instances=sup.failed_instances,
+        deployment_token=deployment_token,
     )
     serve_fn = serve if serve is not None else _serve_uvicorn
 
@@ -946,8 +984,8 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
         for it would host nothing while shifting every real module's port by
         one and publishing a dead ``/contracts`` prefix on the proxy.
 
-    Ports are assigned from 9001, incrementing by each module's worker_count
-    so replicas never collide.
+    Ports are assigned from ``worker_port_base`` (default 9001), incrementing
+    by each module's worker_count so replicas never collide.
 
     Also reports the resulting HTTP surface (see ``_log_http_surface``): this
     is the only process that sees every module, so it is where "nothing in
@@ -976,7 +1014,7 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
     worker_env = dict(config.get("env") or {})
 
     specs: list[WorkerSpec] = []
-    port = 9001
+    port = int(config.get("worker_port_base") or 9001)
     for name in names:
         count = int(workers.get(name, default_count))
         if count < 1:

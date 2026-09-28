@@ -1208,3 +1208,16 @@ async def test_lifespan_consumer_build_failure_still_runs_runtime_shutdown(
             pass
 
     assert shutdown_called, "runtime.shutdown() was skipped because _build_consumer() raised"
+
+
+def test_health_endpoint_echoes_the_deployment_token(make_fake_app, monkeypatch) -> None:
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.setenv("MODULITH_DEPLOYMENT_TOKEN", "deployment-b")
+
+    app = create_app()
+    with TestClient(app) as client:
+        resp = client.get("/health")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "module": "orders", "deployment": "deployment-b"}

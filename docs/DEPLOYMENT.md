@@ -648,7 +648,7 @@ open http://localhost:8000/orders/docs            # the orders worker's Swagger 
 open http://localhost:8000/inventory/docs         # a different worker, same public port
 ```
 
-The same URLs answer on each worker's **internal** port (9001+), which is where `kubectl port-forward` reaches them — note the module prefix is part of the path there too: `http://127.0.0.1:9001/orders/docs`, not `/docs`.
+The same URLs answer on each worker's **internal** port (9001+ by default; `modulith run --worker-port-base N` or `[tool.modulith] worker_port_base = N` moves the range, and each module takes one consecutive port per replica), which is where `kubectl port-forward` reaches them — note the module prefix is part of the path there too: `http://127.0.0.1:9001/orders/docs`, not `/docs`. Give each deployment sharing a host its own range: `modulith run` refuses a `--port` inside its worker range, and a proxy never forwards a request to another deployment's worker — it checks each worker's identity before its first request, answers 503 when no worker of its own serves the module, and reports the module as `foreign deployment`.
 
 Three consequences worth knowing:
 
@@ -681,7 +681,7 @@ Single-process topology is unaffected — modulith adds no HTTP routes there, so
 
 ## Health Checks and Monitoring
 
-Both probes are served by the reverse proxy on the port `modulith run` binds (8000 by default), and both need the actuator mounted — set `MODULITH_ACTUATOR_TOKEN` (see [Actuator Access](#actuator-access-_modulith)). Plain `/health` exists only on each worker's own internal port (9001+) and 404s on the proxy; there is no `/ready` route.
+Both probes are served by the reverse proxy on the port `modulith run` binds (8000 by default), and both need the actuator mounted — set `MODULITH_ACTUATOR_TOKEN` (see [Actuator Access](#actuator-access-_modulith)). Plain `/health` exists only on each worker's own internal port (9001+ by default, set by `--worker-port-base` / `worker_port_base`) and 404s on the proxy; there is no `/ready` route. Each `modulith run` hands its workers a random deployment token that their `/health` echoes as `"deployment"`.
 
 ### Liveness Probe (Is the Proxy Running?)
 
@@ -698,7 +698,10 @@ curl -H "Authorization: Bearer $MODULITH_ACTUATOR_TOKEN" http://localhost:8000/_
 # Fans out to every worker's /health. 200 when all are ok, 503 otherwise.
 ```
 
-Each module reports one of three states: `ok`, `unreachable` (a replica is
+Each module reports one of these states: `ok`, `unhealthy` (a replica
+answered `/health` with a non-200 status), `foreign deployment` (the port
+answered without this deployment's token: another deployment's worker, or an
+unrelated process, holds it), `unreachable` (a replica is
 mid-restart-backoff), or `failed (given up)` (the crash-loop breaker has
 given up on every replica). `failed (given up)` is only reported once every
 replica of that module is unreachable — a module with even one healthy

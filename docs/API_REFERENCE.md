@@ -330,6 +330,7 @@ Mutating it after the runtime starts would create inconsistent state.
 - `broker: str` = `'memory'`
 - `subscription_source: str` = `'manifest'`
 - `actuator_mode: str` = `'auto'`
+- `worker_port_base: int` = `9001`
 - `auto_discover: bool` = `True`
 - `production: bool` = `False`
 - `outbox_options: dict[str, Any]` (default factory)

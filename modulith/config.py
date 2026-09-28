@@ -116,6 +116,10 @@ class Configuration:
     # Access policy for the optional actuator endpoints.
     actuator_mode: str = "auto"
 
+    # First loopback port of the process topology's workers; each module takes
+    # as many consecutive ports as it has replicas.
+    worker_port_base: int = 9001
+
     # Whether to walk subpackages on bootstrap to discover modules.
     # Disable only if you want to register modules programmatically.
     auto_discover: bool = True
@@ -859,6 +863,7 @@ def _validate(data: dict[str, Any]) -> None:
         "broker": (str,),
         "subscription_source": (str,),
         "actuator_mode": (str,),
+        "worker_port_base": (int,),
         "auto_discover": (bool,),
         "production": (bool,),
         "observability": (bool, type(None)),
@@ -874,6 +879,10 @@ def _validate(data: dict[str, Any]) -> None:
             )
     if "contracts_module" in data:
         _validate_contracts_module(data["contracts_module"])
+    if "worker_port_base" in data and not 1 <= data["worker_port_base"] <= 65535:
+        raise ConfigurationError(
+            f"worker_port_base must be a TCP port (1-65535), got {data['worker_port_base']}"
+        )
 
     # Dict-typed fields must actually be tables. A scalar here is a natural
     # typo (forgetting the [tool.modulith.outbox_options] table header) that

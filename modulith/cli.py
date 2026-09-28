@@ -604,6 +604,7 @@ def _run_process_topology(
     log_level: str,
     verify_warn: bool = False,
     warn_default_state_dir: bool = False,
+    worker_port_base: int | None = None,
 ) -> None:
     """Spin up the process-per-module runtime: one worker per module + proxy.
 
@@ -715,6 +716,9 @@ def _run_process_topology(
         "workers": workers_map if workers_map is not None else dict(cfg.workers),
         "env": worker_env,
         "contracts_module": cfg.contracts_module,
+        "worker_port_base": (
+            worker_port_base if worker_port_base is not None else cfg.worker_port_base
+        ),
     }
     if isolate:
         config["isolate"] = [isolate]
@@ -843,6 +847,13 @@ def run(
     log_level: str = typer.Option(
         "info", help="debug | info | warning | error | critical (applies to workers too)"
     ),
+    worker_port_base: int | None = typer.Option(
+        None,
+        min=1,
+        max=65535,
+        help=r"First worker port under --topology processes (default: \[tool.modulith] "
+        "worker_port_base, else 9001); replicas take the following ports",
+    ),
 ) -> None:
     r"""Run the application in production mode.
 
@@ -873,11 +884,12 @@ def run(
             port=port,
             log_level=level,
             warn_default_state_dir=True,
+            worker_port_base=worker_port_base,
         )
         return
 
     argv = ["uvicorn", app_module, "--host", host, "--port", str(port), "--log-level", level]
-    typer.echo(f"modulith run → {app_module} on http://{host}:{port}")
+    typer.echo(f"modulith run →{app_module} on http://{host}:{port}")
     _exec_uvicorn(argv)
 
 

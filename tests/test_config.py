@@ -1315,3 +1315,27 @@ def test_strict_boundaries_explicit_override_wins(monkeypatch) -> None:
     monkeypatch.setenv("MODULITH_STRICT_BOUNDARIES", "false")
     cfg = load_configuration(strict_boundaries=True)
     assert cfg.strict_boundaries is True
+
+
+def test_worker_port_base_defaults_to_9001() -> None:
+    assert load_configuration().worker_port_base == 9001
+
+
+def test_worker_port_base_is_read_from_pyproject(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[tool.modulith]\nworker_port_base = 19001\n")
+    assert load_configuration().worker_port_base == 19001
+
+
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        ("0", "a TCP port \\(1-65535\\), got 0"),
+        ("65536", "a TCP port \\(1-65535\\), got 65536"),
+        ('"9001"', "int, got str"),
+        ("true", "int, got bool"),
+    ],
+)
+def test_worker_port_base_rejects_a_non_port(tmp_path: Path, value: str, reason: str) -> None:
+    (tmp_path / "pyproject.toml").write_text(f"[tool.modulith]\nworker_port_base = {value}\n")
+    with pytest.raises(ConfigurationError, match=f"^worker_port_base must be {reason}"):
+        load_configuration()
