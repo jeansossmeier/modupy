@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from ._health_failures import HealthFailures
@@ -69,6 +70,9 @@ _BACKOFF_CAP_S = 5.0
 # 0.05 * 2**7 = 6.4s already exceeds the cap — bound the exponent so the
 # power stays a small number no matter how long the outage lasts.
 _BACKOFF_MAX_EXPONENT = 7
+# Health turns degraded when a read round stays pending this many block
+# intervals (plus one second of slack for round-trip time).
+_READ_STALL_POLL_INTERVALS = 5
 
 
 def _as_str(value: Any) -> str:
@@ -114,6 +118,9 @@ class BrokerConsumer:
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
         self._health = ConsumerHealth(ready=False, status="stopped")
+        self._read_started_at: float | None = None
+        self._read_stall_logged_for: float | None = None
+        self._read_stall_s = _READ_STALL_POLL_INTERVALS * poll_block_ms / 1000 + 1.0
         # The redelivery window: past it, reclaim retries the message.
         self._health_failures = HealthFailures(completion_expiry_s=reclaim_min_idle_ms / 1000)
         # Consecutive broker read()/reclaim() failures — drives the capped
@@ -190,6 +197,19 @@ class BrokerConsumer:
                 status="failed",
                 detail="poll loop is not running",
             )
+        started = self._read_started_at
+        if started is not None and time.monotonic() - started >= self._read_stall_s:
+            detail = f"no broker read completed in {self._read_stall_s:g}s"
+            if self._read_stall_logged_for != started:
+                self._read_stall_logged_for = started
+                logger.warning(
+                    "consumer %r: %s on %s -- the broker is not answering; "
+                    "health is degraded until a read completes",
+                    self._consumer_name,
+                    detail,
+                    self._targets,
+                )
+            return ConsumerHealth(ready=False, status="degraded", detail=detail)
         return self._health_failures.degraded() or self._health
 
     def _on_task_done(self, task: asyncio.Task[None]) -> None:
@@ -258,7 +278,11 @@ class BrokerConsumer:
             # default). Concurrently, idle latency is one poll_block_ms no
             # matter how many streams there are, at the cost of holding one
             # broker connection per stream for the duration of the block.
-            batches = await asyncio.gather(*(self._read(target) for target in self._targets))
+            self._read_started_at = time.monotonic()
+            try:
+                batches = await asyncio.gather(*(self._read(target) for target in self._targets))
+            finally:
+                self._read_started_at = None
             # Dispatch stays sequential: only the *waiting* is parallel, so a
             # slow listener on one stream still cannot interleave with another.
             for target, messages in zip(self._targets, batches, strict=True):

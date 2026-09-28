@@ -4593,3 +4593,48 @@ async def test_drop_group_removes_a_retired_groups_subscription_and_undelivered_
     assert groups == {"modulith-orders"}
     assert message_groups == {"modulith-orders"}
     assert await broker.drop_group("modulith-retired") == (0, 0)
+
+
+async def test_listener_that_never_returns_degrades_database_consumer_health(
+    engine: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def hang(evt: WidgetCreated) -> None:
+        await asyncio.Event().wait()
+
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, hang)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+    broker = DatabaseBroker(engine=engine)
+    target = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=[target],
+        poll_interval_s=0.01,
+        reclaim_stale_seconds=0.05,
+    )
+    caplog.set_level(logging.ERROR, logger="modulith")
+    await consumer.start()
+    try:
+        await broker.publish(
+            target, serializer.serialize(WidgetCreated(name="w")), {"event_type": target}
+        )
+
+        async def _degraded() -> bool:
+            return consumer.health().status == "degraded"
+
+        await _until_async(_degraded, timeout=3.0)
+        assert target in (consumer.health().detail or "")
+
+        async def _logged() -> bool:
+            return any(
+                record.levelno == logging.ERROR and target in record.getMessage()
+                for record in caplog.records
+            )
+
+        await _until_async(_logged, timeout=3.0)
+    finally:
+        await consumer.stop()

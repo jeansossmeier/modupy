@@ -22,7 +22,10 @@ Configuration resolves env > [tool.modulith.broker] subtable > default:
   MODULITH_BROKER_MAX_PAYLOAD_BYTES /
   max_payload_bytes                        producer-side payload size cap, rejected with
                                             ConfigurationError (default 16 MiB)
-  poll_block_ms                            consumer XREADGROUP block timeout, ms (default 1000)
+  poll_block_ms                            consumer XREADGROUP block timeout, ms (default 1000);
+                                            also sets the client's socket_timeout to
+                                            poll_block_ms/1000 + 5 s (with socket_keepalive)
+                                            unless the URL's query string sets them
   reclaim_min_idle_ms                      consumer XAUTOCLAIM min-idle threshold, ms
                                             (default 60000)
   max_delivery_attempts                    consumer delivery attempts before dead-lettering
@@ -89,6 +92,7 @@ _DEFAULT_PREFIX = "modulith.events"
 _DEFAULT_GROUP = "modulith"
 _DEFAULT_MAXLEN = 10000
 _DLQ_DEDUP_TTL_SECONDS = 7 * 24 * 60 * 60
+_SOCKET_TIMEOUT_MARGIN_S = 5.0
 
 
 def _positive_int(value: object, name: str) -> int:
@@ -141,6 +145,7 @@ class RedisStreamsBroker:
         dlq_max_stream_len: int | str | None = None,
         max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
         client: Any | None = None,
+        poll_block_ms: int = 1000,
     ) -> None:
         if client is not None:
             self._client = client
@@ -157,7 +162,14 @@ class RedisStreamsBroker:
                     "Install the extra: pip install 'modupy[redis]'"
                 ) from exc
 
-            self._client = Redis.from_url(url or _DEFAULT_URL)
+            # XREADGROUP BLOCK is a server-side timeout: without a socket
+            # timeout, a hung server or half-open connection stalls a read
+            # forever. redis-py lets query options in the URL override these.
+            self._client = Redis.from_url(
+                url or _DEFAULT_URL,
+                socket_timeout=max(poll_block_ms, 1) / 1000 + _SOCKET_TIMEOUT_MARGIN_S,
+                socket_keepalive=True,
+            )
         self._stream_prefix = stream_prefix
         self._consumer_group = consumer_group or _DEFAULT_GROUP
         self._max_stream_len = _positive_int(
@@ -435,6 +447,7 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
         ),
         dlq_max_stream_len=dlq_maxlen,
         max_payload_bytes=_resolve_max_payload_bytes(opts),
+        poll_block_ms=opts.get("poll_block_ms", 1000),
     )
     registry.register(_REDIS_SCHEME, broker)
     logger.info("registered redis-streams broker (prefix=%s)", broker._stream_prefix)

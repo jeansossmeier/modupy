@@ -1201,3 +1201,35 @@ async def test_runtime_registry_builds_working_shm_consumer(
         await consumer.stop()
         await runtime_broker.close()
         runtime_broker._ring.unlink()
+
+
+async def test_listener_that_never_returns_degrades_health_and_logs_its_event(
+    broker: ShmBroker, caplog: pytest.LogCaptureFixture
+) -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[ConsumerEvent])
+    bus = InMemoryEventBus()
+
+    async def hang(evt: ConsumerEvent) -> None:
+        await asyncio.Event().wait()
+
+    bus.register(ConsumerEvent, hang)
+    consumer = _consumer(broker, bus, serializer, reclaim_stale_seconds=0.05)
+    await broker.publish(
+        TARGET, serializer.serialize(ConsumerEvent("stuck")), {"event_type": EVENT_TYPE}
+    )
+    caplog.set_level(logging.ERROR, logger="modulith")
+    await consumer.start()
+    try:
+        await _until(lambda: consumer.health().status == "degraded", timeout=3.0)
+        health = consumer.health()
+        assert health.ready is False
+        assert EVENT_TYPE in (health.detail or "")
+        await _until(
+            lambda: any(
+                record.levelno == logging.ERROR and EVENT_TYPE in record.getMessage()
+                for record in caplog.records
+            ),
+            timeout=3.0,
+        )
+    finally:
+        await consumer.stop()

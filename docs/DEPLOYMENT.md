@@ -382,6 +382,8 @@ reclaim_min_idle_ms = 60000   # idle threshold before a pending entry is claimed
 max_delivery_attempts = 5     # attempts before dead-lettering
 ```
 
+The Redis client gets `socket_timeout = poll_block_ms / 1000 + 5` seconds (6 s by default) and `socket_keepalive = true`. `XREADGROUP BLOCK` is only a server-side timeout, so without these a hung server or a half-open connection would stall reads forever. Query options in `REDIS_URL` win over these defaults, for example `redis://cache:6379?socket_timeout=30&socket_keepalive=false`. Keep any `socket_timeout` you set above the block time, or every idle poll times out. With the timeout, a slow direct `publish()` raises `TimeoutError` instead of hanging.
+
 Read batch size and listener concurrency are not tunable on the Redis path; scale out with more workers per module (`[tool.modulith.workers]`) instead.
 
 ### C. Postgres Broker (Advanced)
@@ -763,6 +765,13 @@ In single-process topology there is no proxy and no actuator: modulith adds no H
 - On Redis, the failure clears as soon as its message is no longer pending in the consumer group, for example because a peer replica reclaimed and acknowledged it.
 
 A failure on one target never clears because another target succeeded.
+
+**When a stalled consumer degrades `/health`.** A consumer that stops making progress reports `degraded` (503) even when no broker call has failed:
+
+- **A listener that never returns** (database and SHM brokers). The consumer claims nothing new until every row of its current batch has finished. Once a batch has run longer than `reclaim_stale_seconds * 10` (default 600 s), health reports `degraded` with the stuck event type, target and row. The consumer also logs an ERROR line starting `claim renewal for group ... exceeded` that names the same rows. The listener keeps running, because modulith never cancels user code. The consumer recovers only when the listener returns.
+- **A Redis server that stops answering.** Health reports `degraded` ("no broker read completed in N s") once a read has waited `5 * poll_block_ms + 1 s`. The consumer logs one WARNING per stall. The Redis client's socket timeout (see [Redis Streams Broker](#b-redis-streams-broker)) then fails the hung read. The consumer logs `broker read failed`, backs off and retries, and health stays `degraded` until a read succeeds.
+
+Restart a worker whose health stays `degraded` longer than you can tolerate; on a stuck listener a restart is the only remedy. The restarted consumer reclaims the stuck rows and charges each one a delivery attempt, so a listener that hangs on every delivery ends in the dead-letter state after `max_delivery_attempts`. The generated Kubernetes manifests do not do this for you: liveness is a `tcpSocket` check, so a degraded worker is only taken out of readiness. Add a liveness `httpGet /health` (with a generous `failureThreshold`) or an external watchdog if you want automatic restarts.
 
 ### Event Metrics
 

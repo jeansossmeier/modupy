@@ -16,6 +16,7 @@ These tests drive the consumer half end-to-end:
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import FrozenInstanceError, dataclass
 from typing import Any
 
@@ -1232,6 +1233,60 @@ async def test_consumer_dispatch_fires_the_per_listener_lifecycle_hooks() -> Non
     assert [name.split(".")[-1] for name in capture.completed] == ["handler"]
     assert capture.published == []
     assert broker.acked == [("t", "1-0")]
+
+
+async def test_read_that_never_completes_degrades_health() -> None:
+    class _HungReadBroker(FakeConsumerBroker):
+        async def read(self, *args: Any, **kwargs: Any) -> Any:
+            await asyncio.Event().wait()
+
+    consumer = _make_consumer(_HungReadBroker(), InMemoryEventBus(), targets=["orders"])
+    await consumer.start()
+    try:
+        assert consumer.health().status == "ready"
+        for _ in range(300):
+            if consumer.health().status == "degraded":
+                break
+            await asyncio.sleep(0.01)
+        health = consumer.health()
+        assert health.status == "degraded"
+        assert health.ready is False
+        assert "read" in (health.detail or "")
+    finally:
+        await consumer.stop()
+
+
+async def test_read_stall_logs_one_warning_per_stall(caplog: pytest.LogCaptureFixture) -> None:
+    class _HungReadBroker(FakeConsumerBroker):
+        async def read(self, *args: Any, **kwargs: Any) -> Any:
+            await asyncio.Event().wait()
+
+    caplog.set_level(logging.WARNING, logger="modulith.consumer")
+    consumer = _make_consumer(_HungReadBroker(), InMemoryEventBus(), targets=["orders"])
+    await consumer.start()
+    try:
+        for _ in range(300):
+            if consumer.health().status == "degraded":
+                break
+            await asyncio.sleep(0.01)
+        for _ in range(5):
+            assert consumer.health().status == "degraded"
+        stall_warnings = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+            and "no broker read completed" in record.getMessage()
+        ]
+        assert len(stall_warnings) == 1
+    finally:
+        await consumer.stop()
+
+
+async def test_consumer_with_no_targets_is_never_degraded_by_read_progress() -> None:
+    consumer = _make_consumer(FakeConsumerBroker(), InMemoryEventBus(), targets=[])
+    await consumer.start()
+    await asyncio.sleep(1.2)
+    assert consumer.health() == ConsumerHealth(ready=True, status="ready")
 
 
 # ---------------------------------------------------------------------------
