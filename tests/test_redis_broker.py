@@ -1124,3 +1124,26 @@ async def test_integration_whitespace_padded_target_reaches_the_consumer(
     finally:
         await consumer.stop()
         await broker.close()
+
+
+async def test_client_gets_socket_timeout_above_block_time_and_keepalive() -> None:
+    broker = RedisStreamsBroker(url="redis://localhost:6379", poll_block_ms=2000)
+    try:
+        kwargs = broker._client.connection_pool.connection_kwargs
+        assert kwargs["socket_timeout"] == 7.0
+        assert kwargs["socket_keepalive"] is True
+    finally:
+        await broker.close()
+
+
+async def test_socket_options_in_the_url_win_over_defaults() -> None:
+    broker = RedisStreamsBroker(
+        url="redis://localhost:6379?socket_timeout=30&socket_keepalive=false",
+        poll_block_ms=2000,
+    )
+    try:
+        kwargs = broker._client.connection_pool.connection_kwargs
+        assert kwargs["socket_timeout"] == 30.0
+        assert kwargs["socket_keepalive"] is False
+    finally:
+        await broker.close()

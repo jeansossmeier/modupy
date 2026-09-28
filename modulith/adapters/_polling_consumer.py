@@ -154,6 +154,9 @@ class PollingConsumer(DeliveryDispatch):
                 status="failed",
                 detail="poll loop is not running",
             )
+        stuck = self._stuck_dispatch_detail()
+        if stuck is not None:
+            return ConsumerHealth(ready=False, status="degraded", detail=stuck)
         return self._health_failures.degraded() or self._health
 
     def _on_task_done(self, task: asyncio.Task[None]) -> None:

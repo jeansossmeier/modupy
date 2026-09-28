@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, cast
 
 from ..runtime import _runtime
@@ -11,6 +12,18 @@ from ._consumer_protocol import PollingBroker
 
 _MAX_LEASE_EXTENSION_FACTOR = 10.0
 _MAX_MALFORMED_ROW_LOGS = 10
+_MAX_STUCK_ROWS_NAMED = 5
+
+
+def _describe_rows(rows: dict[str, dict[str, Any]], in_flight: set[str]) -> str:
+    stuck = [rows[row_id] for row_id in sorted(in_flight) if row_id in rows]
+    named = ", ".join(
+        f"{row.get('event_type') or '<unknown event>'} on {row.get('target') or '<unknown>'}"
+        f" (row {row['id']})"
+        for row in stuck[:_MAX_STUCK_ROWS_NAMED]
+    )
+    extra = len(stuck) - _MAX_STUCK_ROWS_NAMED
+    return f"{named} and {extra} more" if extra > 0 else named
 
 
 class DeliveryDispatch:
@@ -25,6 +38,23 @@ class DeliveryDispatch:
     _max_attempts: int
     _reclaim_stale_seconds: float
     _logger: logging.Logger
+    _batch_in_flight: tuple[float, dict[str, dict[str, Any]], set[str]] | None = None
+
+    def _renew_deadline_s(self) -> float:
+        return self._reclaim_stale_seconds * _MAX_LEASE_EXTENSION_FACTOR
+
+    def _stuck_dispatch_detail(self) -> str | None:
+        """Describe rows whose listener outlived the renew deadline, or None."""
+        batch = self._batch_in_flight
+        if batch is None:
+            return None
+        started_at, rows, in_flight = batch
+        if not in_flight or time.monotonic() - started_at < self._renew_deadline_s():
+            return None
+        return (
+            f"listener has not returned after {self._renew_deadline_s():g}s for "
+            f"{_describe_rows(rows, in_flight)}; the consumer cannot poll until it returns"
+        )
 
     def _should_stop(self) -> bool:
         raise NotImplementedError
@@ -61,6 +91,8 @@ class DeliveryDispatch:
         if not valid_rows:
             return
 
+        rows_by_id = {cast(str, row["id"]): row for row in valid_rows}
+        self._batch_in_flight = (time.monotonic(), rows_by_id, in_flight)
         renewer = asyncio.create_task(self._renew_loop(in_flight))
         semaphore = asyncio.Semaphore(self._dispatch_concurrency)
         try:
@@ -68,6 +100,7 @@ class DeliveryDispatch:
                 for row in valid_rows:
                     tasks.create_task(self._dispatch_guarded(row, semaphore, in_flight))
         finally:
+            self._batch_in_flight = None
             await self._cancel(renewer, "claim-renewal")
 
     async def _dispatch_guarded(
@@ -115,21 +148,23 @@ class DeliveryDispatch:
     async def _renew_loop(self, in_flight: set[str]) -> None:
         """Renew claims for a bounded period so wedged listeners can be reclaimed."""
         interval = self._reclaim_stale_seconds / 3.0
-        deadline = (
-            asyncio.get_running_loop().time()
-            + self._reclaim_stale_seconds * _MAX_LEASE_EXTENSION_FACTOR
-        )
+        deadline = asyncio.get_running_loop().time() + self._renew_deadline_s()
         while True:
             await asyncio.sleep(interval)
             row_ids = list(in_flight)
             if not row_ids:
                 return
             if asyncio.get_running_loop().time() >= deadline:
+                batch = self._batch_in_flight
+                stuck = _describe_rows(batch[1], in_flight) if batch is not None else "unknown"
                 self._logger.error(
-                    "claim renewal for group %s exceeded %.0fs with %d row(s) in flight",
+                    "claim renewal for group %s exceeded %gs with %d row(s) in flight; "
+                    "listener still running for %s -- health is degraded and this "
+                    "consumer polls no new messages until the listener returns",
                     self._group,
-                    self._reclaim_stale_seconds * _MAX_LEASE_EXTENSION_FACTOR,
+                    self._renew_deadline_s(),
                     len(row_ids),
+                    stuck,
                 )
                 return
             try:
