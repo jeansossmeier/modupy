@@ -392,6 +392,28 @@ async def test_skip_locked_partitions_backlog_across_competing_consumers(
     assert len(ids1) + len(ids2) == n  # every row claimed exactly once
 
 
+async def test_target_filtered_claim_skips_locked_rows_only_within_its_targets(
+    broker_engine: Any,
+) -> None:
+    broker = DatabaseBroker(engine=broker_engine)
+    await broker.subscribe([_TARGET, "t.Stale"], "g")
+    for i in range(4):
+        await broker.publish("t.Stale", b"stale", {"event_type": "t.Stale"})
+        await broker.publish(_TARGET, f"live{i}".encode(), {"event_type": _TARGET})
+
+    rows1, rows2 = await asyncio.gather(
+        broker.claim_batch("g", batch_size=10, consumer_name="c1", targets=[_TARGET]),
+        broker.claim_batch("g", batch_size=10, consumer_name="c2", targets=[_TARGET]),
+    )
+
+    claimed = rows1 + rows2
+    assert {row["target"] for row in claimed} == {_TARGET}
+    assert len({row["id"] for row in claimed}) == len(claimed) == 4
+    assert await broker.stale_targets("g", [_TARGET]) == {"t.Stale": 4}
+    assert await broker.drop_group("g", targets=["t.Stale"]) == (1, 4)
+    assert await broker.stale_targets("g", [_TARGET]) == {}
+
+
 # ---------------------------------------------------------------------------
 # Prune on the real dialect (window function + derived-table DELETE, age)
 # ---------------------------------------------------------------------------
