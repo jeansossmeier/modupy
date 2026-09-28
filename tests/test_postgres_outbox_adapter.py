@@ -800,3 +800,141 @@ async def test_bound_session_reused_across_commits_enlists_every_publish(engine:
 
     assert received == [1, 2]
     assert await _completed_rows(engine) == 2
+
+
+# ---------------------------------------------------------------------------
+# After-commit dispatch and the lease sweep must not both deliver one row
+# ---------------------------------------------------------------------------
+
+
+async def test_renew_claim_refuses_a_completed_row(engine: Any) -> None:
+    """The lease sweep re-arms each claimed row right before dispatching it.
+    A row completed under that claim meanwhile must fail the re-arm, so the
+    sweep does not deliver it a second time."""
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1)
+    await store.save(pub)
+    [claimed] = await store.claim_batch(
+        owner="sweeper", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+    assert claimed.claim_token is not None
+    await store.mark_complete(pub.id)
+
+    assert await store.renew_claim(pub.id, claimed.claim_token, 60) is False
+
+
+async def test_after_commit_dispatch_skips_a_row_the_sweep_has_claimed(
+    engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The crash sweep can claim a freshly committed row before its
+    after-commit dispatch runs. The after-commit path must then leave the row
+    to the sweep, so the listener runs exactly once."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _pub(1)
+    await store.save(pub)
+    real_claim_batch = store.claim_batch
+
+    async def claim_then_after_commit_runs(**kwargs: Any) -> list[EventPublication]:
+        claimed = await real_claim_batch(**kwargs)
+        await store._dispatch_after_commit(pub.id)
+        return claimed
+
+    monkeypatch.setattr(store, "claim_batch", claim_then_after_commit_runs)
+
+    await outbox._sweep(timedelta(0))
+
+    assert received == [1]
+    assert await _completed_rows(engine) == 1
+
+
+@pytest.mark.parametrize("strategy", ["lease", "none"])
+async def test_after_commit_dispatch_skips_a_row_already_completed(
+    engine: Any, strategy: str
+) -> None:
+    """When a sweep delivers and completes the row before the after-commit
+    task loads it, the after-commit task must not deliver it again."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy=strategy, start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _pub(1)
+    await store.save(pub)
+
+    await outbox._sweep(timedelta(0))
+    await store._dispatch_after_commit(pub.id)
+
+    assert received == [1]
+    assert await _completed_rows(engine) == 1
+
+
+async def test_sweep_cannot_claim_a_row_after_commit_is_delivering(engine: Any) -> None:
+    """The after-commit path claims its row before delivering it. A peer's
+    sweep must find the row held for the whole delivery, even when the
+    listener outlives one lease length, and the fenced completion must land."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), claim_lease_seconds=0.3, start_loop=False)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow(event: G04Event) -> None:
+        received.append(event.value)
+        entered.set()
+        await release.wait()
+
+    _bootstrap_with_listener(slow)
+    pub = _pub(1, slow)
+    await store.save(pub)
+
+    task = asyncio.create_task(store._dispatch_after_commit(pub.id))
+    await entered.wait()
+    peer_claims: list[EventPublication] = []
+    for _ in range(4):
+        peer_claims += await store.claim_batch(
+            owner="peer", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+        )
+        await asyncio.sleep(0.15)
+    release.set()
+    await task
+
+    assert peer_claims == []
+    assert received == [1]
+    assert await _completed_rows(engine) == 1
+
+
+async def test_after_commit_claim_expires_so_a_crashed_delivery_is_recovered(
+    engine: Any,
+) -> None:
+    """A process that dies mid-delivery leaves its after-commit claim behind.
+    Once that lease expires, a sweep must be able to claim the row again."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), claim_lease_seconds=0.3, start_loop=False)
+    entered = asyncio.Event()
+
+    async def hangs(event: G04Event) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    _bootstrap_with_listener(hangs)
+    pub = _pub(1, hangs)
+    await store.save(pub)
+
+    task = asyncio.create_task(store._dispatch_after_commit(pub.id))
+    await entered.wait()
+    held = await store.claim_batch(
+        owner="peer", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    reclaimed: list[EventPublication] = []
+    deadline = asyncio.get_running_loop().time() + 5.0
+    while not reclaimed and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.05)
+        reclaimed = await store.claim_batch(
+            owner="peer", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+        )
+
+    assert held == []
+    assert [p.id for p in reclaimed] == [pub.id]

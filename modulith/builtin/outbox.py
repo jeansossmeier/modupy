@@ -952,7 +952,16 @@ async def _sweep_advisory(older_than: timedelta, *, runtime_ready: bool) -> None
         if handle is None:
             continue  # another sweeper holds the lock — skip this cycle
         try:
-            await _dispatch_publication(pub)
+            # ``pending`` was read before locking: a peer may have delivered
+            # the row and released its lock since, so act on a fresh read.
+            finder = getattr(_store, "find_by_id", None)
+            current = await finder(pub.id) if finder is not None else pub
+            if (
+                current is not None
+                and current.completed_at is None
+                and current.attempt_count < _dead_letter_after_attempts
+            ):
+                await _dispatch_publication(current)
         finally:
             await _store.unlock_publication(handle, pub.id)  # type: ignore[attr-defined]
 
