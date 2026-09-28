@@ -591,10 +591,10 @@ Same pattern as `mypy --strict` rolling out gradually. The baseline diff in git 
 
 `modulith audit` analyzes an existing codebase non-destructively:
 
-- Proposed module structure based on folder layout
+- Proposed module structure based on folder layout: each top-level subdirectory of the audited root is a module candidate. At a project root whose only application directory is one package, or `src/` holding one package, the audited root is that package; tests, docs, scripts, examples, migrations, virtualenvs, hidden and build directories are ignored when deciding. The command prints the root it chose.
 - List of cross-module imports that would become violations
 - List of shared database tables that need ownership decisions
-- Modulith-readiness score (0-100): percentage of cross-module interactions that go through events vs direct calls
+- Modulith-readiness score (0-100): percentage of cross-module interactions that go through events vs direct calls. With fewer than two module candidates the score is reported as not applicable, with a warning.
 
 Output is Markdown. Teams can run it on Friday afternoon, generate a baseline, have green CI on Monday, then tighten over weeks.
 
@@ -982,7 +982,7 @@ modulith outbox dead-letter [--list|--retry-all]
 modulith info  # show detected config, modules, plugins
 ```
 
-`dev` and `run` take a required positional `APP_MODULE` (the ASGI app, e.g. `myapp.main:app`); `audit` takes an optional positional `PATH` (the codebase root, default `.`).
+`dev` and `run` take a required positional `APP_MODULE` (the ASGI app, e.g. `myapp.main:app`); `audit` takes an optional positional `PATH` (the codebase root, default `.`; a project root resolves to its single application package, see [§8.4](#84-the-audit-tool)).
 
 `extract`, `k8s-manifest`, and `openapi` bootstrap and import configured
 application modules to derive artifacts; they are build-time tools for trusted

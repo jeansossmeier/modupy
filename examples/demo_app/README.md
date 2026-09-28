@@ -199,11 +199,15 @@ modulith doctor    # health check on wired drivers and stores
 ```
 
 (`modulith audit` is deliberately absent: it is the migration-readiness scanner
-for codebases that have *not* adopted modulith yet. Pointed at this demo it
-reports `readiness score: 100/100` with 0 cross-module import patterns — the
-demo already talks across modules by events, so the scanner has nothing to
-propose — and writes a `MIGRATION.md` into the directory it runs from.
-`verify` is the boundary check for a modulith-native codebase.)
+for codebases that have *not* adopted modulith yet. Run here, it audits the
+`shop` package and reports `readiness score: 33/100` and
+`3 cross-module import pattern(s), 0 shared table(s)`. All three patterns are
+`shop/main.py` importing each module's router, plus the orders models' `Base`
+for table creation — composition-root wiring the scanner cannot tell from
+coupling. The modules themselves talk
+only through `contracts` and events. It also writes a `MIGRATION.md` into the
+directory it runs from. `verify` is the boundary check for a modulith-native
+codebase.)
 
 **Important caveat:** The `modulith outbox status|retry <id>|purge|dead-letter`
 subcommands operate on a **wired outbox store**. This demo wires the store

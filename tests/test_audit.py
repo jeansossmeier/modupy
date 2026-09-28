@@ -473,3 +473,173 @@ def test_relative_root_scores_the_same_as_absolute_root(monkeypatch, tmp_path: P
     }
     # A relative root also attributed root-level files to a module named "".
     assert "" not in relative.proposed_modules
+
+
+# ---------------------------------------------------------------------------
+# A bare `modulith audit` at a project root audits the application package
+# ---------------------------------------------------------------------------
+
+
+def _write_coupled_app(package_dir: Path, import_root: str) -> None:
+    """views/models/services importing each other directly: three patterns."""
+    _write(package_dir, "__init__.py", "")
+    _write(package_dir, "views/__init__.py", "")
+    _write(
+        package_dir,
+        "views/orders.py",
+        f"from {import_root}.models.inventory import Stock\n"
+        f"from {import_root}.services.billing import charge\n",
+    )
+    _write(package_dir, "views/inventory.py", f"from {import_root}.models.inventory import Stock\n")
+    _write(package_dir, "models/__init__.py", "")
+    _write(package_dir, "models/inventory.py", "class Stock:\n    pass\n")
+    _write(package_dir, "services/__init__.py", "")
+    _write(
+        package_dir,
+        "services/billing.py",
+        f"from {import_root}.views.orders import Stock\n\ndef charge():\n    pass\n",
+    )
+
+
+def _write_non_application_dirs(project: Path) -> None:
+    """Directories that hold Python but are never the application package."""
+    _write(project, "pyproject.toml", '[project]\nname = "brownfield"\nversion = "0"\n')
+    _write(project, "tests/test_views.py", "from app.views.orders import charge\n")
+    _write(project, "docs/conf.py", "project = 'brownfield'\n")
+    _write(project, "scripts/seed.py", "from app.models.inventory import Stock\n")
+    _write(project, "examples/demo.py", "from app.services.billing import charge\n")
+    _write(project, "migrations/env.py", "target_metadata = None\n")
+    _write(project, ".venv/lib/python3.11/site-packages/six.py", "X = 1\n")
+    _write(project, "build/lib/app/__init__.py", "")
+    _write(project, "manage.py", "from app.views.orders import charge\n")
+
+
+def _summary_lines(output: str) -> list[str]:
+    return [
+        line
+        for line in output.splitlines()
+        if line.startswith("readiness score") or "cross-module import pattern" in line
+    ]
+
+
+def test_audit_from_project_root_audits_the_application_package(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The migration guide runs a bare ``modulith audit`` at the project root.
+    With the application in one top-level package, that package's
+    subpackages are the module candidates — the same audit as pointing the
+    command at the package — and the output names the directory it chose."""
+    project = tmp_path / "brownfield"
+    _write_coupled_app(project / "app", "app")
+    _write_non_application_dirs(project)
+    monkeypatch.chdir(project)
+
+    from_root = runner.invoke(app, ["audit", "--output", str(tmp_path / "root.md")])
+    from_package = runner.invoke(app, ["audit", "app", "--output", str(tmp_path / "pkg.md")])
+
+    assert from_root.exit_code == 0, from_root.output
+    assert from_package.exit_code == 0, from_package.output
+    assert _summary_lines(from_root.stdout) == [
+        "readiness score: 0/100",
+        "3 cross-module import pattern(s), 0 shared table(s)",
+    ]
+    assert _summary_lines(from_root.stdout) == _summary_lines(from_package.stdout)
+    assert f"audited {(project / 'app').resolve()}" in from_root.stdout
+    report = (tmp_path / "root.md").read_text(encoding="utf-8")
+    assert "- `views` (3 files)" in report
+    assert "- `models` (2 files)" in report
+    assert "- `services` (2 files)" in report
+    assert "| `views` | `models` | 2 |" in report
+    assert "| `views` | `services` | 1 |" in report
+    assert "| `services` | `views` | 1 |" in report
+
+
+def test_audit_from_src_layout_root_audits_the_package(monkeypatch, tmp_path: Path) -> None:
+    project = tmp_path / "brownfield"
+    _write_coupled_app(project / "src" / "shopkit", "shopkit")
+    _write(project, "tests/test_views.py", "from shopkit.views.orders import charge\n")
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["audit", "--output", str(tmp_path / "MIGRATION.md")])
+
+    assert result.exit_code == 0, result.output
+    assert f"audited {(project / 'src' / 'shopkit').resolve()}" in result.stdout
+    assert _summary_lines(result.stdout) == [
+        "readiness score: 0/100",
+        "3 cross-module import pattern(s), 0 shared table(s)",
+    ]
+
+
+def test_audit_of_flat_root_with_several_packages_stays_at_root(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Several top-level application packages are themselves the module
+    candidates; the audit must not descend into any of them."""
+    project = tmp_path / "repo"
+    _write(project, "inventory/__init__.py", "")
+    _write(project, "inventory/stock.py", "def reserve(): ...\n")
+    _write(project, "billing/__init__.py", "")
+    _write(project, "billing/report.py", "from inventory.stock import reserve\n")
+    _write(project, "tests/test_billing.py", "from billing.report import reserve\n")
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["audit", "--output", str(tmp_path / "MIGRATION.md")])
+
+    assert result.exit_code == 0, result.output
+    assert f"audited {project.resolve()}" in result.stdout
+    assert "1 cross-module import pattern(s)" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# One module candidate has no boundaries to score
+# ---------------------------------------------------------------------------
+
+
+def test_single_module_candidate_report_withholds_the_score(tmp_path: Path) -> None:
+    """Every import inside a lone candidate is same-module, so the formula's
+    100 measures nothing; the report must say so instead of presenting it."""
+    project = tmp_path / "brownfield"
+    _write_coupled_app(project / "app", "app")
+
+    result = audit_codebase(project)
+    report = render_report(result)
+
+    assert set(result.proposed_modules) == {"app"}
+    assert result.score_applicable is False
+    assert "100/100" not in report
+    assert "100% ready" not in report
+    assert "only one module candidate" in report
+
+
+def test_audit_cli_warns_on_single_module_candidate(tmp_path: Path) -> None:
+    root = tmp_path / "solo"
+    _write(root, "__init__.py", "")
+    _write(root, "a.py", "from solo.b import thing\n")
+    _write(root, "b.py", "thing = 1\n")
+
+    result = runner.invoke(app, ["audit", str(root), "--output", str(tmp_path / "M.md")])
+
+    assert result.exit_code == 0, result.output
+    assert "100/100" not in result.output
+    assert "readiness score: n/a" in result.stdout
+    assert "only one module candidate" in result.stderr
+
+
+def test_multi_module_audit_keeps_its_score(tmp_path: Path) -> None:
+    root = _make_codebase(tmp_path)
+    result = audit_codebase(root)
+    assert result.score_applicable is True
+    assert f"**Readiness score: {result.readiness_score}/100**" in render_report(result)
+    assert "only one module candidate" not in render_report(result)
+
+
+def test_demo_readme_quotes_what_the_audit_prints(monkeypatch, tmp_path: Path) -> None:
+    demo = Path(__file__).resolve().parent.parent / "examples" / "demo_app"
+    monkeypatch.chdir(demo)
+
+    result = runner.invoke(app, ["audit", "--output", str(tmp_path / "MIGRATION.md")])
+
+    assert result.exit_code == 0, result.output
+    readme = (demo / "README.md").read_text(encoding="utf-8")
+    for line in _summary_lines(result.stdout):
+        assert f"`{line}`" in readme
