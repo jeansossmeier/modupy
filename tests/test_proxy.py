@@ -20,7 +20,7 @@ from urllib.parse import unquote
 import httpx
 import pytest
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.testclient import TestClient
 
 from modulith.proxy import RoutingRule, _match_rule, create_proxy_app
@@ -955,3 +955,148 @@ async def test_proxy_ignores_environment_proxy_settings(monkeypatch) -> None:
     assert (resp.status_code, resp.json()) == (200, {"ok": "fast"})
     assert (health.status_code, health.json()["backends"]) == (200, {"/orders": "ok"})
     assert recorded == []
+
+
+# ---------------------------------------------------------------------------
+# Upstream cookies and the identity probe (real sockets, proxy-owned clients)
+# ---------------------------------------------------------------------------
+
+
+def _cookie_setting_backend(token: str, seen: list[tuple[str, str | None]]) -> FastAPI:
+    up = FastAPI()
+
+    @up.get("/orders/login")
+    async def login(request: Request) -> Any:
+        seen.append(("/orders/login", request.headers.get("cookie")))
+        resp = JSONResponse({"ok": True})
+        resp.set_cookie("session", "USER_A_SECRET", path="/")
+        return resp
+
+    @up.get("/orders/profile")
+    async def profile(request: Request) -> dict[str, bool]:
+        seen.append(("/orders/profile", request.headers.get("cookie")))
+        return {"ok": True}
+
+    @up.get("/health")
+    async def health(request: Request) -> Any:
+        seen.append(("/health", request.headers.get("cookie")))
+        resp = JSONResponse({"status": "ok", "module": "orders", "deployment": token})
+        resp.set_cookie("probe", "PROBE_COOKIE", path="/")
+        return resp
+
+    return up
+
+
+async def test_proxy_never_replays_one_clients_upstream_cookie_to_another() -> None:
+    seen: list[tuple[str, str | None]] = []
+    port = _free_port()
+    server, task = await _serve(_cookie_setting_backend("tok", seen), port, "h11")
+    rule = RoutingRule(prefix="/orders", backend_url=f"http://127.0.0.1:{port}")
+    proxy_app = create_proxy_app([rule], deployment_token="tok")
+    try:
+        async with proxy_app.router.lifespan_context(proxy_app):
+            transport = httpx.ASGITransport(app=proxy_app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://proxy") as a:
+                login = await a.get("/orders/login")
+            async with httpx.AsyncClient(transport=transport, base_url="http://proxy") as b:
+                anonymous = await b.get("/orders/profile")
+                own = await b.get("/orders/profile", headers={"cookie": "mine=1"})
+                rule.mark_down(rule.backend_url)
+                await b.get("/_modulith/health")
+                after_down = await b.get("/orders/profile")
+    finally:
+        server.should_exit = True
+        await task
+
+    assert "session=USER_A_SECRET" in login.headers["set-cookie"]
+    assert [anonymous.status_code, own.status_code, after_down.status_code] == [200, 200, 200]
+    assert seen == [
+        ("/health", None),
+        ("/orders/login", None),
+        ("/orders/profile", None),
+        ("/orders/profile", "mine=1"),
+        ("/health", None),
+        ("/orders/profile", None),
+    ]
+
+
+def _slow_health_backend(token: str, delay: float, calls: list[str]) -> FastAPI:
+    up = FastAPI()
+
+    @up.get("/orders/x")
+    async def x() -> dict[str, bool]:
+        return {"ok": True}
+
+    @up.get("/health")
+    async def health() -> dict[str, str]:
+        calls.append("/health")
+        await asyncio.sleep(delay)
+        return {"status": "ok", "module": "orders", "deployment": token}
+
+    return up
+
+
+async def test_identity_probe_waits_for_a_slow_but_healthy_backend() -> None:
+    calls: list[str] = []
+    port = _free_port()
+    server, task = await _serve(_slow_health_backend("tok", 2.5, calls), port, "h11")
+    url = f"http://127.0.0.1:{port}"
+    rule = RoutingRule(prefix="/orders", backend_url=url)
+    proxy_app = create_proxy_app([rule], deployment_token="tok")
+    try:
+        async with proxy_app.router.lifespan_context(proxy_app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+            ) as c:
+                resp = await c.get("/orders/x")
+    finally:
+        server.should_exit = True
+        await task
+
+    assert (resp.status_code, resp.json()) == (200, {"ok": True})
+    assert (rule.is_verified(url), url in rule._down, calls) == (True, False, ["/health"])
+
+
+async def test_identity_probe_past_its_deadline_answers_504_without_marking_down() -> None:
+    calls: list[str] = []
+    port = _free_port()
+    server, task = await _serve(_slow_health_backend("tok", 1.5, calls), port, "h11")
+    url = f"http://127.0.0.1:{port}"
+    rule = RoutingRule(prefix="/orders", backend_url=url)
+    proxy_app = create_proxy_app([rule], deployment_token="tok", identity_probe_timeout=0.3)
+    try:
+        async with proxy_app.router.lifespan_context(proxy_app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+            ) as c:
+                started = asyncio.get_running_loop().time()
+                resp = await c.get("/orders/x")
+                elapsed = asyncio.get_running_loop().time() - started
+    finally:
+        server.should_exit = True
+        await task
+
+    assert (resp.status_code, resp.json()) == (504, {"detail": "worker identity check timed out"})
+    assert (url in rule._down, rule.is_verified(url)) == (False, False)
+    assert elapsed < 1.2
+
+
+async def test_identity_probe_refuses_an_oversized_health_body() -> None:
+    hits: list[str] = []
+
+    def backend(request: httpx.Request) -> httpx.Response:
+        hits.append(request.url.path)
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"deployment": "tok", "pad": "x" * (2 * 1024 * 1024)})
+        return httpx.Response(200, json={"ok": True})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(backend))
+    rule = RoutingRule(prefix="/orders", backend_url="http://w")
+    proxy_app = create_proxy_app([rule], client=client, deployment_token="tok")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+    ) as c:
+        resp = await c.get("/orders/x")
+
+    assert resp.status_code == 503
+    assert "/orders/x" not in hits

@@ -348,6 +348,35 @@ def test_run_refuses_a_proxy_port_inside_the_worker_range(make_fake_app, monkeyp
     assert "orders" in result.output
 
 
+def test_dev_port_collision_names_only_remedies_dev_accepts(make_fake_app, monkeypatch):
+    make_fake_app({"orders": "", "inventory": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    monkeypatch.setattr(
+        "modulith.supervisor.Supervisor.start",
+        lambda self: pytest.fail("no worker may be spawned"),
+    )
+
+    result = runner.invoke(
+        app,
+        ["dev", "fakeapp:app", "--topology", "processes", "--port", "9002"],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "--worker-port-base" not in result.output
+    assert "MODULITH_WORKER_PORT_BASE" in result.output
+
+
+def test_single_process_run_banner_has_a_space_after_the_arrow(monkeypatch):
+    monkeypatch.setattr(os, "execvp", lambda file, args: None)
+
+    result = runner.invoke(app, ["run", "myapp:app", "--port", "8123"])
+
+    assert result.exit_code == 0, result.output
+    assert "modulith run → myapp:app on http://0.0.0.0:8123" in result.output
+
+
 # ---------------------------------------------------------------------------
 # python -m modulith
 # ---------------------------------------------------------------------------

@@ -1448,6 +1448,38 @@ def test_health_endpoint_echoes_the_deployment_token(make_fake_app, monkeypatch)
     assert resp.json() == {"status": "ok", "module": "orders", "deployment": "deployment-b"}
 
 
+def test_a_module_named_health_cannot_shadow_the_workers_own_health(
+    make_fake_app, monkeypatch
+) -> None:
+    make_fake_app(
+        {
+            "health": """
+                from fastapi import APIRouter
+
+                router = APIRouter()
+
+                @router.get("")
+                async def root():
+                    return {"module_says": "hi"}
+
+                @router.get("/detail")
+                async def detail():
+                    return {"module_says": "detail"}
+            """
+        }
+    )
+    _set_worker_env(monkeypatch, "health")
+    monkeypatch.setenv("MODULITH_DEPLOYMENT_TOKEN", "deployment-b")
+
+    app = create_app()
+    with TestClient(app) as client:
+        own = client.get("/health")
+        module_route = client.get("/health/detail")
+
+    assert own.json() == {"status": "ok", "module": "health", "deployment": "deployment-b"}
+    assert module_route.json() == {"module_says": "detail"}
+
+
 # ---------------------------------------------------------------------------
 # durable outbox wiring
 # ---------------------------------------------------------------------------

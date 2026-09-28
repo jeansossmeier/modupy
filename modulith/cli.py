@@ -923,7 +923,7 @@ def run(
         return
 
     argv = ["uvicorn", app_module, "--host", host, "--port", str(port), "--log-level", level]
-    typer.echo(f"modulith run →{app_module} on http://{host}:{port}")
+    typer.echo(f"modulith run → {app_module} on http://{host}:{port}")
     _exec_uvicorn(argv)
 
 

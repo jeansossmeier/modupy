@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import http.cookiejar
 import logging
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -44,6 +45,17 @@ logger = logging.getLogger("modulith.proxy")
 DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_CONNECTIONS = 1000
 _DOWN_RETRY_SECONDS = 5.0
+DEFAULT_IDENTITY_PROBE_TIMEOUT = 30.0
+_MAX_HEALTH_BODY_BYTES = 64 * 1024
+
+
+def _cookieless_jar() -> http.cookiejar.CookieJar:
+    """A cookie jar that refuses every cookie, so none is stored or replayed.
+
+    Returned as a bare ``CookieJar``: httpx adopts one as-is, but copies an
+    ``httpx.Cookies`` into a new jar with the default, storing policy.
+    """
+    return http.cookiejar.CookieJar(policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
 
 
 def _empty_backend_cycle() -> Iterator[str]:
@@ -123,6 +135,9 @@ class RoutingRule:
         self._verified.add(url)
         self._foreign.pop(url, None)
 
+    def forget_identity(self, url: str) -> None:
+        self._verified.discard(url)
+
     def is_verified(self, url: str) -> bool:
         return url in self._verified
 
@@ -154,6 +169,7 @@ def create_proxy_app(
     failed_instances: Callable[[], frozenset[str]] | None = None,
     deployment_token: str | None = None,
     max_connections: int = DEFAULT_MAX_CONNECTIONS,
+    identity_probe_timeout: float = DEFAULT_IDENTITY_PROBE_TIMEOUT,
 ) -> FastAPI:
     """Build the reverse-proxy ASGI app.
 
@@ -200,7 +216,19 @@ def create_proxy_app(
     deployment's workers echo as ``"deployment"`` on their ``/health``. A
     backend answering without it — another deployment's worker, or any other
     process holding the port — is reported ``"foreign deployment"`` and marked
-    down instead of vouched for.
+    foreign: skipped by routing, including the all-down fallback, until
+    re-verified. Identity is checked before a backend's first request, again
+    after it was marked down or foreign, and after ``forget_identity`` (which
+    ``run_supervised`` calls whenever the supervisor respawns that worker).
+    The token tells this deployment's workers from another deployment's after
+    an accidental port collision; it is not a secret and does not defend
+    against a hostile local process. Each identity probe is bounded by
+    ``identity_probe_timeout`` seconds in total and 64 KiB of body; past the
+    deadline the request gets 504 and the backend is not marked down.
+
+    No client stores upstream cookies: both owned clients, and an injected
+    ``client`` (whose jar is replaced), refuse every ``Set-Cookie``, so one
+    user's cookie is never replayed for another or sent on a probe.
     """
     owns_client = client is None
     if timeout is None:
@@ -222,6 +250,27 @@ def create_proxy_app(
     probe_client: Any = (
         client if client is not None else httpx.AsyncClient(timeout=2.0, trust_env=False)
     )
+    # One jar serves every end user's requests and every probe; a stored
+    # upstream Set-Cookie would be replayed for other users. Replacing an
+    # injected client's jar is part of the ``client`` contract (docstring).
+    http_client.cookies = _cookieless_jar()
+    probe_client.cookies = _cookieless_jar()
+
+    async def read_health(url: str) -> httpx.Response:
+        """GET ``url``/health, keeping at most ``_MAX_HEALTH_BODY_BYTES`` of it.
+
+        An oversized body is replaced by an empty one, which answers for no
+        deployment. The read timeout is off: the caller bounds the total time.
+        """
+        async with probe_client.stream(
+            "GET", url + "/health", timeout=httpx.Timeout(5.0, read=None)
+        ) as resp:
+            body = bytearray()
+            async for chunk in resp.aiter_bytes():
+                body += chunk
+                if len(body) > _MAX_HEALTH_BODY_BYTES:
+                    return httpx.Response(resp.status_code)
+            return httpx.Response(resp.status_code, content=bytes(body))
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -276,12 +325,22 @@ def create_proxy_app(
         """Probe an unverified backend before it is sent any request.
 
         Transport errors propagate so the caller's connect-retry and 502
-        handling apply to the probe exactly as to the request itself.
+        handling apply to the probe exactly as to the request itself. A probe
+        still unanswered after ``identity_probe_timeout`` raises
+        ``TimeoutError`` and leaves the backend unverified but not down.
         """
         if deployment_token is None or rule.is_verified(url):
             return True
-        health = await probe_client.get(url + "/health", timeout=2.0)
+        health = await asyncio.wait_for(read_health(url), identity_probe_timeout)
         return record_identity(rule, url, health)
+
+    def identity_timed_out(url: str) -> JSONResponse:
+        logger.warning(
+            "%s did not answer /health within %ss; identity unverified",
+            url,
+            identity_probe_timeout,
+        )
+        return JSONResponse({"detail": "worker identity check timed out"}, status_code=504)
 
     # Actuator routes are registered before the catch-all so they win for
     # /_modulith/* paths. Skipped entirely when disabled — see docstring.
@@ -331,7 +390,7 @@ def create_proxy_app(
             async def check_one(rule: RoutingRule) -> tuple[str, str]:
                 async def check_backend(url: str) -> str:
                     try:
-                        resp = await probe_client.get(url + "/health", timeout=2.0)
+                        resp = await asyncio.wait_for(read_health(url), 2.0)
                     except Exception:
                         rule.mark_down(url)
                         return "unreachable"
@@ -406,6 +465,8 @@ def create_proxy_app(
             try:
                 if await confirm_identity(rule, backend):
                     break
+            except TimeoutError:
+                return identity_timed_out(backend)
             except httpx.HTTPError:
                 break
             backend = rule.next_backend()
@@ -493,6 +554,8 @@ def create_proxy_app(
                         status_code=503,
                     )
                 upstream_resp = await http_client.send(upstream_req, stream=True)
+            except TimeoutError:
+                return identity_timed_out(backend)
             except httpx.ConnectError as exc:
                 # Worker port not bound yet (initial start or crash-respawn
                 # window). The TCP connection never completed, so no request

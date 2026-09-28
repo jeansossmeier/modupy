@@ -159,6 +159,19 @@ def test_env_vars_override_pyproject(tmp_path: Path, monkeypatch) -> None:
     assert cfg.outbox == "mongodb"
 
 
+def test_worker_port_base_env_var_overrides_pyproject(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "pyproject.toml").write_text("[tool.modulith]\nworker_port_base = 11000\n")
+    monkeypatch.setenv("MODULITH_WORKER_PORT_BASE", "12000")
+    assert load_configuration().worker_port_base == 12000
+
+
+@pytest.mark.parametrize("value", ["abc", "0", "70000"])
+def test_worker_port_base_env_var_must_be_a_port(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("MODULITH_WORKER_PORT_BASE", value)
+    with pytest.raises(ConfigurationError, match="worker_port_base"):
+        load_configuration()
+
+
 def test_outbox_url_comes_from_pyproject_and_env_overrides_it(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "pyproject.toml").write_text(
         '[tool.modulith]\noutbox_url = "sqlite+aiosqlite:///from-pyproject.db"\n'

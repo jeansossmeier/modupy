@@ -707,6 +707,14 @@ def _read_env_vars() -> dict[str, Any]:
     for env_name, field_name in bool_vars:
         if (flag := _env_bool(env_name)) is not None:
             result[field_name] = flag
+    if (port_base := _env_str("MODULITH_WORKER_PORT_BASE")) is not None:
+        try:
+            result["worker_port_base"] = int(port_base)
+        except ValueError:
+            raise ConfigurationError(
+                f"MODULITH_WORKER_PORT_BASE must be an integer (worker_port_base), "
+                f"got {port_base!r}"
+            ) from None
     return result
 
 
