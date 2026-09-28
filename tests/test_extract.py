@@ -62,6 +62,23 @@ def test_extract_happy_path_produces_service_scaffold(make_fake_app, monkeypatch
     assert "0.0.0.0" in docker
 
 
+def test_extract_import_check_leaves_no_bytecode_in_the_output(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "", "inventory": ""},
+        extra_files={"__init__.py": "", "contracts/__init__.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert sorted(p.relative_to(out_dir) for p in out_dir.rglob("*.pyc")) == []
+
+
 def test_extract_generated_project_builds_a_wheel(make_fake_app, monkeypatch, tmp_path):
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app({"orders": ""}, extra_files={"contracts/__init__.py": ""})

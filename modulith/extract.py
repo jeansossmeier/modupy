@@ -205,10 +205,12 @@ def _check_imports(root: Path, dotted: str, source: Path) -> None:
 
     Runs the extracted module's code, which is acceptable because extract is
     a trusted-source tool that already imports the app to discover modules.
+    ``-B`` keeps the child from writing bytecode caches into *root*, which
+    becomes the published output.
     """
     try:
         result = subprocess.run(
-            [sys.executable, "-c", _IMPORT_CHECK, str(root), dotted, str(source)],
+            [sys.executable, "-B", "-c", _IMPORT_CHECK, str(root), dotted, str(source)],
             cwd=root,
             capture_output=True,
             text=True,
