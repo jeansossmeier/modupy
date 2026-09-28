@@ -577,9 +577,12 @@ def _create_engine(url: Any, opts: dict[str, Any]) -> Any:
       writer); WAL + ``busy_timeout`` are installed per connection. Pass a
       SQLAlchemy ``URL`` object (not ``str(URL)``) when the path may contain
       ``?`` / ``#`` — stringifying and reparsing truncates at ``?``.
+    - In-memory SQLite: ``StaticPool``, one shared connection, so the database
+      lives as long as the engine.
     """
     try:
         from sqlalchemy.ext.asyncio import create_async_engine
+        from sqlalchemy.pool import StaticPool
     except ImportError as exc:  # pragma: no cover — exercised via an import shim
         # The adapter is a BUILTIN plugin (lazy imports, module docstring), so a
         # missing extra only surfaces here — when an app actually selects
@@ -627,6 +630,11 @@ def _create_engine(url: Any, opts: dict[str, Any]) -> Any:
         max_overflow = _opt_int(_broker_opt(opts, "max_overflow", "MAX_OVERFLOW"))
         if max_overflow is not None:
             kwargs["max_overflow"] = max_overflow
+    else:
+        # SQLAlchemy 2.1 deprecates inferring StaticPool from a mode=memory URL;
+        # a later release would hand out separate connections, each seeing an
+        # empty database.
+        kwargs["poolclass"] = StaticPool
     engine = create_async_engine(url, **kwargs)
     if sqlite:
         assert busy_timeout_ms is not None

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Dependencies: the `postgres`, `database` and `test` extras require `sqlalchemy[asyncio]`, because SQLAlchemy 2.1 installs `greenlet` only through that extra and the async adapters cannot import without it; the `database` and `integration` extras cap PyMySQL below 1.2.1, whose releases break aiomysql 0.3.2 on every MySQL write
+- Database broker: in-memory SQLite URLs select `StaticPool` explicitly instead of relying on SQLAlchemy 2.1's deprecated inference from `mode=memory`
+
 ## [0.10.0] — 2026-09-02
 
 ### Added

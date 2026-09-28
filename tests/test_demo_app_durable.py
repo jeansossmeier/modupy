@@ -99,7 +99,7 @@ async def test_durable_outbox_persists_order_and_dispatches_across_modules(
         await store.wait_for_dispatch()
 
         async with sessionmaker() as s:
-            row = (await s.execute(select(Order).where(Order.id == order_id))).scalar_one()
+            row: Order = (await s.execute(select(Order).where(Order.id == order_id))).scalar_one()
             assert row.customer_id == "c-durable"
             assert row.total == 42.0
 
@@ -148,7 +148,7 @@ async def test_durable_outbox_persists_order_and_dispatches_across_modules_on_po
         await store.wait_for_dispatch()
 
         async with sessionmaker() as s:
-            row = (await s.execute(select(Order).where(Order.id == order_id))).scalar_one()
+            row: Order = (await s.execute(select(Order).where(Order.id == order_id))).scalar_one()
             assert row.customer_id == "c-pg"
 
         assert any(evt.order_id == order_id for evt in inventory.reserved)

@@ -77,8 +77,11 @@ dependencies = [
 # command API is synchronous, so it can't drive asyncpg directly — psycopg is
 # the sync driver Alembic actually connects with (postgresql+psycopg://) to
 # run `alembic upgrade head` against a real Postgres.
+# Every SQLAlchemy requirement here names the [asyncio] extra: SQLAlchemy 2.1
+# installs greenlet only through it, and sqlalchemy.ext.asyncio refuses to
+# import without greenlet.
 postgres = [
-    "sqlalchemy>=2.0,<3.0",
+    "sqlalchemy[asyncio]>=2.0,<3.0",
     "asyncpg>=0.29,<1.0",
     "alembic>=1.13,<2.0",
     "psycopg[binary]>=3.1,<4.0",
@@ -102,7 +105,7 @@ redis = [
 # PyMySQL — Alembic's command API is synchronous, so it can't drive aiomysql
 # directly) to run the broker schema migrations in adapters/migrations/.
 database = [
-    "sqlalchemy>=2.0,<3.0",
+    "sqlalchemy[asyncio]>=2.0,<3.0",
     "asyncpg>=0.29,<1.0",
     "aiomysql>=0.2,<1.0",
     # MySQL 8 defaults to caching_sha2_password auth, which aiomysql can only
@@ -112,7 +115,11 @@ database = [
     "cryptography>=41.0,<50.0",
     "aiosqlite>=0.19,<1.0",
     "alembic>=1.13,<2.0",
-    "pymysql>=1.1,<2.0",
+    # PyMySQL 1.2.1 removed converters.escape_bytes_prefixed, which aiomysql
+    # 0.3.2 (the latest release) imports and calls for every bytes parameter;
+    # 1.2.3 restores the name as a string, so every MySQL write raises
+    # TypeError. Lift the cap once aiomysql ships a compatible release.
+    "pymysql>=1.1,<1.2.1",
 ]
 
 # NOTE: a Kafka broker is on the roadmap (SPEC §10.3) but no adapter ships yet,
@@ -157,7 +164,7 @@ test = [
     "pytest-timeout>=2.1,<3.0",
     "build>=1.2,<2.0",
     "hatchling>=1.27",
-    "sqlalchemy>=2.0,<3.0",
+    "sqlalchemy[asyncio]>=2.0,<3.0",
     "alembic>=1.13,<2.0",
     "aiosqlite>=0.19,<1.0",
     # tests/test_ci_config.py parses .github/workflows/ci.yml structurally
@@ -190,7 +197,8 @@ integration = [
     # aiomysql needs cryptography to auth against MySQL 8 (caching_sha2_password).
     "cryptography>=41.0,<50.0",
     "psycopg[binary]>=3.1,<4.0",
-    "pymysql>=1.1,<2.0",
+    # Capped like the `database` extra: aiomysql breaks on PyMySQL >= 1.2.1.
+    "pymysql>=1.1,<1.2.1",
 ]
 
 # Everything. For "I want all the features" users.
