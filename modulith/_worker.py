@@ -105,6 +105,7 @@ def create_app() -> FastAPI:
         _runtime.plugin_manager.hook.modulith_after_module_load(
             module=ModuleInfo(name=module_name, package=module_package)
         )
+    _runtime.bind_configured_outbox()
     _require_outbox_store()
     consumer_name = f"{module_name}:{uuid4().hex}"
 
@@ -341,9 +342,10 @@ def _require_outbox_store() -> None:
     raise ConfigurationError(
         f"outbox is {cfg.outbox!r} but no outbox store is bound in this worker: "
         "the application's main.py (its lifespan, middleware and outbox wiring) "
-        "does not run under --topology processes. Call "
-        "modulith.builtin.outbox.configure() from the module's import or a "
-        "modulith_after_module_load hook, or set outbox = 'memory'."
+        "does not run under --topology processes. Set [tool.modulith].outbox_url "
+        "(env MODULITH_OUTBOX_URL) to the business database's async SQLAlchemy "
+        "URL, call modulith.builtin.outbox.configure() from the module's import "
+        "or a modulith_after_module_load hook, or set outbox = 'memory'."
     )
 
 

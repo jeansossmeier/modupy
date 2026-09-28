@@ -100,6 +100,12 @@ class Configuration:
     # Other values name a registered adapter (e.g. "postgres", "mongodb").
     outbox: str = "memory"
 
+    # Async SQLAlchemy URL of the database holding the outbox table (the
+    # business data's database, so a row commits atomically with it). With a
+    # durable outbox, bootstrap builds and binds a PostgresPublicationStore on
+    # it in every process unless the application already bound a store.
+    outbox_url: str | None = None
+
     # Process topology. "single" = one process, all modules in-memory bus.
     # "processes" = one subprocess per module, broker-based IPC.
     topology: str = "single"
@@ -682,6 +688,7 @@ def _read_env_vars() -> dict[str, Any]:
         ("MODULITH_PACKAGE", "package"),
         ("MODULITH_CONTRACTS_MODULE", "contracts_module"),
         ("MODULITH_OUTBOX", "outbox"),
+        ("MODULITH_OUTBOX_URL", "outbox_url"),
         ("MODULITH_TOPOLOGY", "topology"),
         ("MODULITH_BROKER", "broker"),
         ("MODULITH_SUBSCRIPTION_SOURCE", "subscription_source"),
@@ -859,6 +866,7 @@ def _validate(data: dict[str, Any]) -> None:
         "package": (str, type(None)),
         "contracts_module": (str,),
         "outbox": (str,),
+        "outbox_url": (str, type(None)),
         "topology": (str,),
         "broker": (str,),
         "subscription_source": (str,),

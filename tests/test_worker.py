@@ -1266,7 +1266,37 @@ def test_worker_refuses_durable_outbox_without_a_bound_store(
         create_app()
 
     message = str(exc_info.value)
-    assert ("'postgres'" in message, "main.py" in message) == (True, True)
+    assert ("'postgres'" in message, "main.py" in message, "MODULITH_OUTBOX_URL" in message) == (
+        True,
+        True,
+        True,
+    )
+
+
+def test_worker_binds_store_from_outbox_url_for_its_module_events(
+    make_fake_app, monkeypatch, tmp_path, _fresh_outbox
+) -> None:
+    from modulith.adapters import postgres_outbox
+
+    make_fake_app(_SIBLING_IMPORT_APP)
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.setenv("MODULITH_OUTBOX", "postgres")
+    monkeypatch.setenv("MODULITH_OUTBOX_URL", f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
+
+    create_app()
+    serializer = outbox._serializer
+    store_type = type(outbox._store).__name__
+    asyncio.run(_runtime.shutdown())
+
+    assert (
+        store_type,
+        sorted(serializer._allowed_event_types),
+        postgres_outbox._active_store,
+    ) == (
+        "PostgresPublicationStore",
+        ["fakeapp.contracts.NoteSent", "fakeapp.contracts.PaymentReceived"],
+        None,
+    )
 
 
 def test_worker_starts_retry_loop_for_store_bound_at_module_import(

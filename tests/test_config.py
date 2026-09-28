@@ -159,6 +159,26 @@ def test_env_vars_override_pyproject(tmp_path: Path, monkeypatch) -> None:
     assert cfg.outbox == "mongodb"
 
 
+def test_outbox_url_comes_from_pyproject_and_env_overrides_it(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith]\noutbox_url = "sqlite+aiosqlite:///from-pyproject.db"\n'
+    )
+    from_pyproject = load_configuration().outbox_url
+    monkeypatch.setenv("MODULITH_OUTBOX_URL", "postgresql+asyncpg://db/app")
+
+    assert (from_pyproject, load_configuration().outbox_url) == (
+        "sqlite+aiosqlite:///from-pyproject.db",
+        "postgresql+asyncpg://db/app",
+    )
+
+
+def test_outbox_url_must_be_a_string(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[tool.modulith]\noutbox_url = 5\n")
+
+    with pytest.raises(ConfigurationError, match="outbox_url must be str"):
+        load_configuration()
+
+
 def test_production_env_var_parses_truthy(monkeypatch) -> None:
     """MODULITH_PRODUCTION accepts 1, true, yes (case-insensitive)."""
     for value in ("1", "true", "TRUE", "yes", "Yes"):

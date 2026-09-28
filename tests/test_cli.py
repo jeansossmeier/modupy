@@ -1320,6 +1320,31 @@ def test_outbox_store_error_does_not_prescribe_already_set_config(
     assert "outbox = 'postgres'" not in result.stderr
     assert "no store is bound in this process" in result.stderr
     assert "outbox.configure(" in result.stderr
+    assert "MODULITH_OUTBOX_URL" in result.stderr
+
+
+def test_outbox_status_uses_store_built_from_outbox_url(make_fake_app, monkeypatch, tmp_path):
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from modulith.adapters.postgres_outbox import Base
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'app.db'}"
+
+    async def create_schema() -> None:
+        engine = create_async_engine(url)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        await engine.dispose()
+
+    asyncio.run(create_schema())
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_OUTBOX", "postgres")
+    monkeypatch.setenv("MODULITH_OUTBOX_URL", url)
+    make_fake_app({"orders": ""})
+
+    result = runner.invoke(app, ["outbox", "status"])
+
+    assert (result.exit_code, result.output.splitlines()[:1]) == (0, ["incomplete:    0"])
 
 
 def test_outbox_store_error_on_memory_outbox_names_the_config_key(

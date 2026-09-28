@@ -125,6 +125,10 @@ class Runtime:
         self._listener_owners: dict[Callable[..., Any], str] = {}
         self._hosted_module: str | None = None
 
+        # The (store, engine) pair bind_configured_outbox built from
+        # ``outbox_url``; shutdown() disposes both.
+        self._owned_outbox: tuple[Any, Any] | None = None
+
         # Plugins injected programmatically (not via entry points), registered
         # at bootstrap. Embedding contexts — most notably the pytest plugin's
         # event-capturing spy — append here before triggering bootstrap.
@@ -313,6 +317,39 @@ class Runtime:
         if hosted is None:
             return handlers
         return [h for h in handlers if self._listener_owners.get(h, hosted) == hosted]
+
+    def bind_configured_outbox(self) -> None:
+        """Bind a ``PostgresPublicationStore`` on ``outbox_url`` when none is bound.
+
+        No-op for the memory outbox, without a URL, or when the application
+        already called ``outbox.configure()``: an explicit store wins. The
+        serializer admits only the event types of this process's local
+        listeners, the only rows it may deserialize. The claim settings of
+        ``outbox_options`` are applied by the same ``configure()`` call that
+        binds the store, so no after-commit dispatch runs without them. The
+        retry loop starts on ``outbox.start()`` or the first transactional
+        publish; ``shutdown()`` disposes the store and its engine.
+        """
+        from .builtin import outbox
+
+        cfg = self._config
+        if cfg is None or cfg.outbox == "memory" or not cfg.outbox_url or outbox._store is not None:
+            return
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        from .adapters.postgres_outbox import PostgresPublicationStore
+        from .serializers import JsonEventSerializer
+
+        claims = {
+            key: cfg.outbox_options[key]
+            for key in ("claim_strategy", "claim_lease_seconds", "claim_batch_size")
+            if key in cfg.outbox_options
+        }
+        engine = create_async_engine(cfg.outbox_url)
+        store = PostgresPublicationStore(engine)
+        self._owned_outbox = (store, engine)
+        event_types = self.local_event_types(self._event_bus) if self._event_bus else []
+        outbox.configure(store, JsonEventSerializer(allowed_event_types=event_types), **claims)
 
     def local_event_types(self, bus: Any) -> list[type]:
         """Registered event types with at least one listener this process owns."""
@@ -991,6 +1028,12 @@ class Runtime:
             event_bus.register(event_type, handler)
         self._pending_listeners.clear()
 
+        # 7.4. Without discovery the bus lacks the modules' event types, so the
+        # store's deserialization allowlist would be empty; a worker binds
+        # after importing its module instead.
+        if config.auto_discover:
+            self.bind_configured_outbox()
+
         # 7.5. Friendly startup banner so users see what's active.
         self._log_banner()
 
@@ -1113,6 +1156,11 @@ class Runtime:
             waiter = getattr(store, "wait_for_dispatch", None) if store is not None else None
             if waiter is not None:
                 await waiter()
+            owned, self._owned_outbox = self._owned_outbox, None
+            if owned is not None:
+                owned_store, owned_engine = owned
+                await owned_store.dispose()
+                await owned_engine.dispose()
         except BaseException as exc:
             local_error = exc
 
@@ -1167,6 +1215,11 @@ class Runtime:
         self._pending_listeners = []
         self._listener_owners = {}
         self._hosted_module = None
+        if self._owned_outbox is not None:
+            from .adapters import postgres_outbox
+
+            postgres_outbox._reset_for_testing()
+            self._owned_outbox = None
         self._extra_plugins = []
         self._disabled_plugins = []
         # The manifest registry is a separate module-global, populated by
