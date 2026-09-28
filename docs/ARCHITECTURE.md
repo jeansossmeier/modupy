@@ -248,11 +248,16 @@ listeners by `type(event)` and dispatches to **all** listeners for that type
   deadlocks and raises `PublishSyncTimeout` — a subclass of `TimeoutError` that
   is deliberately distinct from a `TimeoutError` raised *by* a listener, so the
   framework never swallows a genuine application failure as a budget overrun.
-  That persistent daemon-thread loop is a second event loop: an outbox/database
-  broker `AsyncEngine` also driven by `await publish()` on the app loop is then
-  shared across both, and once its connection pool is exhausted SQLAlchemy
-  raises `RuntimeError: <Queue> is bound to a different event loop` (see
-  DEPLOYMENT.md's outbox and database-broker sections).
+  That persistent daemon-thread loop is a second event loop.
+  - **Outbox:** an outbox `AsyncEngine` also driven by `await publish()` on the
+    app loop is shared across both loops. Once its connection pool is
+    exhausted, SQLAlchemy raises `RuntimeError: <Queue> is bound to a different
+    event loop`.
+  - **Database broker:** the broker never shares its pool across loops. It
+    submits a call from another loop to the loop that first used it and runs
+    the call there, so that loop must stay running and unblocked.
+
+  See DEPLOYMENT.md's outbox section and §A.
 - **Sync listeners** run in the event loop's default executor
   (`wrap_sync_listener`). Two sharp edges: only *synchronous* SQLAlchemy
   sessions work in an executor thread (an `AsyncSession` needs the greenlet
@@ -438,9 +443,11 @@ configured, or stores a retained source for replay; it never silently reports
 success after writing zero delivery rows.
 
 *Competing consumers.* `DatabaseConsumer` polls, claiming a batch of due rows
-with `FOR UPDATE SKIP LOCKED` (Postgres / MySQL / MariaDB 10.6+) so concurrent
+with `FOR UPDATE SKIP LOCKED` (Postgres / MySQL 8.0.1+ / MariaDB 10.6+) so concurrent
 workers of a replicated module partition the backlog instead of blocking or
-double-claiming. It deserializes each row by its `event_type` header, dispatches
+double-claiming. An older MySQL or MariaDB server is rejected with a
+`ConfigurationError` when a consumer subscribes. It gets no unlocked claim,
+because InnoDB's REPEATABLE READ would let two consumers claim the same rows. It deserializes each row by its `event_type` header, dispatches
 to the local listeners, then removes the row (`completion_mode="delete"`, the
 default) or marks it `done` (`"mark"`, leaving it for the prune job). Poison rows
 (missing `event_type` / undeserializable payload) are dead-lettered immediately;
