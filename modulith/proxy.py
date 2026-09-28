@@ -42,6 +42,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger("modulith.proxy")
 DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
+DEFAULT_MAX_CONNECTIONS = 1000
 _DOWN_RETRY_SECONDS = 5.0
 
 
@@ -152,12 +153,21 @@ def create_proxy_app(
     connect_retry_backoff: float = 0.2,
     failed_instances: Callable[[], frozenset[str]] | None = None,
     deployment_token: str | None = None,
+    max_connections: int = DEFAULT_MAX_CONNECTIONS,
 ) -> FastAPI:
     """Build the reverse-proxy ASGI app.
 
     ``client`` (an ``httpx.AsyncClient``) may be injected — for tests, or to
-    share a connection pool. When omitted, one is created and closed with the
-    app's lifespan.
+    share a connection pool — and is then used for every upstream call,
+    worker ``/health`` probes included. When omitted, the app creates two
+    clients and closes them with its lifespan: one for proxied requests,
+    capped at ``max_connections`` concurrent upstream connections (each held
+    until its response finishes streaming), and a separate small one for
+    ``/health`` probes, so a saturated request pool cannot fail readiness.
+    A request that finds the pool full for the pool timeout gets 503
+    ``"proxy connection pool exhausted"``; the backend is not marked down.
+    Both clients ignore ``HTTP_PROXY``/``ALL_PROXY`` and related environment
+    variables and always connect to the worker directly.
 
     ``timeout`` configures the httpx client's request timeout. Defaults to
     ``httpx.Timeout(5.0, read=None)`` — finite connect/write/pool timeouts
@@ -195,13 +205,30 @@ def create_proxy_app(
     owns_client = client is None
     if timeout is None:
         timeout = httpx.Timeout(5.0, read=None)
-    http_client: Any = client if client is not None else httpx.AsyncClient(timeout=timeout)
+    # trust_env=False: httpx would otherwise route loopback traffic through an
+    # HTTP_PROXY/ALL_PROXY from the environment (NO_PROXY=localhost does not
+    # cover 127.0.0.1), handing the client's credentials to that proxy.
+    http_client: Any = (
+        client
+        if client is not None
+        else httpx.AsyncClient(
+            timeout=timeout,
+            limits=httpx.Limits(max_connections=max_connections),
+            trust_env=False,
+        )
+    )
+    # Worker /health probes get their own pool so request traffic that fills
+    # the main pool cannot fail readiness or identity checks.
+    probe_client: Any = (
+        client if client is not None else httpx.AsyncClient(timeout=2.0, trust_env=False)
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
         if owns_client:
             await http_client.aclose()
+            await probe_client.aclose()
 
     # ``openapi_url=None`` unregisters FastAPI's own /openapi.json, /docs,
     # /docs/oauth2-redirect and /redoc. A reverse proxy must not claim paths it
@@ -253,7 +280,7 @@ def create_proxy_app(
         """
         if deployment_token is None or rule.is_verified(url):
             return True
-        health = await http_client.get(url + "/health", timeout=2.0)
+        health = await probe_client.get(url + "/health", timeout=2.0)
         return record_identity(rule, url, health)
 
     # Actuator routes are registered before the catch-all so they win for
@@ -304,7 +331,7 @@ def create_proxy_app(
             async def check_one(rule: RoutingRule) -> tuple[str, str]:
                 async def check_backend(url: str) -> str:
                     try:
-                        resp = await http_client.get(url + "/health", timeout=2.0)
+                        resp = await probe_client.get(url + "/health", timeout=2.0)
                     except Exception:
                         rule.mark_down(url)
                         return "unreachable"
@@ -483,6 +510,15 @@ def create_proxy_app(
                     return JSONResponse({"detail": "backend unreachable"}, status_code=502)
                 await asyncio.sleep(connect_retry_backoff)
                 continue
+            except httpx.PoolTimeout:
+                # Every pooled connection is busy with another in-flight
+                # response. The backend is fine; this proxy is at capacity.
+                logger.warning(
+                    "proxy connection pool exhausted (%s connections in use) for %s",
+                    max_connections,
+                    upstream,
+                )
+                return JSONResponse({"detail": "proxy connection pool exhausted"}, status_code=503)
             except httpx.TransportError as exc:
                 # TransportError covers the whole connect/read failure tree —
                 # ConnectError (refused/DNS), ConnectTimeout (reachable but

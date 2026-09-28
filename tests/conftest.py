@@ -20,12 +20,15 @@ reset, so test order can never matter.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 import sys
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from textwrap import dedent
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -58,6 +61,51 @@ def _free_port() -> int:
         sock.bind(("127.0.0.1", 0))
         port: int = sock.getsockname()[1]
     return port
+
+
+async def _serve(app: Any, port: int, http: Any) -> tuple[Any, asyncio.Task[None]]:
+    """Serve ``app`` with uvicorn on ``port`` in this loop; return once it listens."""
+    import uvicorn
+
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, http=http, log_level="warning")
+    )
+    task = asyncio.create_task(server.serve())
+    deadline = time.monotonic() + 15.0
+    while not server.started:
+        assert not task.done(), f"server on port {port} died: {task.exception()!r}"
+        assert time.monotonic() < deadline, f"server on port {port} never came up"
+        await asyncio.sleep(0.02)
+    return server, task
+
+
+def _held_backend(release: asyncio.Event, in_flight: list[int], deployment: str = "") -> Any:
+    """Worker app whose ``/orders/slow`` holds its connection until ``release``."""
+    from fastapi import FastAPI
+
+    up = FastAPI()
+
+    @up.get("/orders/slow")
+    async def slow() -> dict[str, str]:
+        in_flight[0] += 1
+        await release.wait()
+        return {"ok": "slow"}
+
+    @up.get("/orders/fast")
+    async def fast() -> dict[str, str]:
+        return {"ok": "fast"}
+
+    @up.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok", "deployment": deployment}
+
+    return up
+
+
+async def _wait_for(predicate: Callable[[], bool], seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while not predicate() and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
 
 
 @pytest.fixture
