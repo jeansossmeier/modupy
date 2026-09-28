@@ -497,8 +497,17 @@ background prune when a retention knob is set: by age (`retention_age_seconds`,
 measured from `created_at`) and/or by count (`retention_count`, newest-N per
 `(target, consumer_group)`). Pending/claimed rows are never touched, so prune
 can't drop undelivered work. A permanently-defunct consumer group's pending
-rows are, by that same rule, never pruned — drop its `broker_subscription` rows
-out of band when retiring a module.
+rows are, by that same rule, never pruned — remove the group with
+`modulith broker drop-group` when retiring a module.
+
+*Stale targets.* Subscriptions are never removed automatically, so a group
+keeps a target its module no longer consumes (a listener moved to another
+module, or an upgrade narrowed the worker's event types) and keeps receiving
+rows for it. A consumer claims only the targets it currently consumes, so
+those rows stay pending instead of being dead-lettered, and a rollback finds
+them. At start the consumer logs one WARNING per such target with its
+backlog; `modulith broker drop-group <group> --target <t>` removes it. The
+SHM broker behaves the same way for queued deliveries.
 
 *Schema & config.* The tables are auto-created on first use, tolerant of the
 cross-process race where two workers `CREATE` the same fresh schema at once (the

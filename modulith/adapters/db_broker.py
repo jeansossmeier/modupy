@@ -65,7 +65,12 @@ Fan-out mechanism (how the producer learns the consumer groups): the
 producer process (module-isolated) never imports consumer modules, so
 consumers self-register their subscriptions in a persistent
 ``broker_subscription`` table at ``DatabaseConsumer.start()`` time (upsert,
-idempotent — never auto-deleted). ``DatabaseBroker.publish()`` looks up every
+idempotent — never auto-deleted, so a rollback still finds its backlog). A
+consumer claims only rows for the targets it currently consumes; at start it
+logs one WARNING per target its group still holds but no longer consumes
+(``stale_targets``), and ``drop_group(group, targets=...)`` — behind
+``modulith broker drop-group <group> --target <t>`` — is the only way such a
+subscription and its undelivered rows are removed. ``DatabaseBroker.publish()`` looks up every
 group subscribed to the target and inserts one ``broker_message`` row per
 group in a single transaction. With no registered group, the default ``error``
 policy raises ``NoSubscribersError`` without writing a row. ``wait`` polls in
