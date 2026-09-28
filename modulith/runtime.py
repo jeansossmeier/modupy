@@ -1,8 +1,9 @@
 """The modulith runtime singleton.
 
 Holds global state: configuration, plugin manager, event bus, modules.
-Lazily initializes on first use — importing modulith does no work, but
-the first @listener registration or publish() call triggers bootstrap.
+Lazily initializes on first use — importing modulith does no work,
+@listener registrations are queued, and the first publish() call triggers
+bootstrap.
 
 This pattern is what makes "just import and use" feel natural. The user
 doesn't construct anything; the framework constructs itself when needed.

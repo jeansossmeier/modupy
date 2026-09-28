@@ -212,8 +212,9 @@ def bootstrap() -> None:
 
 Eagerly run the runtime's one-time bootstrap. Idempotent.
 
-Normally bootstrap is *lazy* — the first ``@listener`` registration or
-``publish()`` call triggers it. Most applications never need to call
+Normally bootstrap is *lazy* — the first ``publish()`` call triggers it,
+and ``@listener`` registrations made before then are queued until it
+runs. Most applications never need to call
 this directly. Call it explicitly at startup when something depends on
 bootstrap having already happened before the first publish — most
 notably the outbox's crash-recovery sweep, which skips every pending

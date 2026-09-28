@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from modulith import configure, event, listener, publish, publish_sync
+from modulith import bootstrap, configure, event, listener, publish, publish_sync
 from modulith.sync import wrap_sync_listener
 
 
@@ -123,6 +123,10 @@ def test_publish_sync_timeout_raises() -> None:
         # cannot complete within the timeout window.
         gate.wait(timeout=5)
 
+    # publish() bootstraps on the daemon loop's thread. Left to it, a loaded
+    # machine can spend the whole budget there, and that bootstrap finishes
+    # after the reset fixture, leaving the next test's runtime bootstrapped.
+    bootstrap()
     try:
         with pytest.raises(TimeoutError):
             publish_sync(Slow(), timeout=0.05)
