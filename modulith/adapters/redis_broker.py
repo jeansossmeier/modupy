@@ -91,6 +91,23 @@ _DEFAULT_MAXLEN = 10000
 _DLQ_DEDUP_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
+def _positive_int(value: object, name: str) -> int:
+    """Accept a positive int, or a numeric string as env vars deliver it.
+
+    Zero is rejected, not read as "no cap": ``XADD MAXLEN ~ 0`` trims every
+    entry away in the same command that adds it.
+    """
+    number: object = value
+    if isinstance(value, str):
+        try:
+            number = int(value)
+        except ValueError:
+            pass
+    if type(number) is not int or number <= 0:
+        raise ConfigurationError(f"{name} must be a positive integer, got {value!r}")
+    return number
+
+
 def _cursor_str(raw: Any) -> str:
     """Normalize an XAUTOCLAIM cursor (bytes from redis-py, str from fakes)."""
     return raw.decode() if isinstance(raw, bytes) else str(raw)
@@ -120,8 +137,8 @@ class RedisStreamsBroker:
         *,
         stream_prefix: str = _DEFAULT_PREFIX,
         consumer_group: str | None = None,
-        max_stream_len: int = _DEFAULT_MAXLEN,
-        dlq_max_stream_len: int | None = None,
+        max_stream_len: int | str = _DEFAULT_MAXLEN,
+        dlq_max_stream_len: int | str | None = None,
         max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
         client: Any | None = None,
     ) -> None:
@@ -143,13 +160,19 @@ class RedisStreamsBroker:
             self._client = Redis.from_url(url or _DEFAULT_URL)
         self._stream_prefix = stream_prefix
         self._consumer_group = consumer_group or _DEFAULT_GROUP
-        self._max_stream_len = max_stream_len
+        self._max_stream_len = _positive_int(
+            max_stream_len, "max_stream_len (MODULITH_STREAM_MAXLEN)"
+        )
         # DLQ gets its own (by default larger) cap: poison messages are the
         # stream most likely to accumulate, but they're also the ones worth
         # retaining longest for inspection/replay. Still bounded so a poison
         # burst can't grow Redis memory without limit.
         self._dlq_max_stream_len = (
-            dlq_max_stream_len if dlq_max_stream_len is not None else max_stream_len * 10
+            _positive_int(
+                dlq_max_stream_len, "dlq_max_stream_len (MODULITH_BROKER_DLQ_MAX_STREAM_LEN)"
+            )
+            if dlq_max_stream_len is not None
+            else self._max_stream_len * 10
         )
         if type(max_payload_bytes) is not int or not 1 <= max_payload_bytes <= MAX_PAYLOAD_BYTES:
             raise ConfigurationError(
@@ -406,12 +429,12 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
             os.environ.get("MODULITH_STREAM_PREFIX") or opts.get("stream_prefix") or _DEFAULT_PREFIX
         ),
         consumer_group=os.environ.get("MODULITH_CONSUMER_GROUP") or opts.get("consumer_group"),
-        max_stream_len=int(
+        max_stream_len=(
             os.environ.get("MODULITH_STREAM_MAXLEN")
             or opts.get("max_stream_len")
             or _DEFAULT_MAXLEN
         ),
-        dlq_max_stream_len=int(dlq_maxlen) if dlq_maxlen is not None else None,
+        dlq_max_stream_len=dlq_maxlen,
         max_payload_bytes=int(
             os.environ.get("MODULITH_BROKER_MAX_PAYLOAD_BYTES")
             or opts.get("max_payload_bytes")
