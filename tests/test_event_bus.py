@@ -269,6 +269,16 @@ async def test_unregister_then_register_replaces_the_broker() -> None:
     assert original.published == []
 
 
+async def test_publish_strips_padding_and_splits_on_the_first_colon_only() -> None:
+    registry = BrokerRegistry()
+    broker = _RecordingBroker()
+    registry.register("amqp", broker)
+
+    await registry.publish(" amqp : orders:placed.eu ", b"payload")
+
+    assert broker.published == [("orders:placed.eu", b"payload")]
+
+
 def test_registered_event_types_lists_exactly_the_listened_types() -> None:
     """registered_event_types() feeds the worker's deserialization
     allowlist (modulith/_worker.py) and its broker-stream subscriptions

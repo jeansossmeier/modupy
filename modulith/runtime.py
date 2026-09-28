@@ -25,7 +25,7 @@ from uuid import uuid4
 
 import modulith
 
-from .brokers import BrokerRegistry, ConsumerRegistry
+from .brokers import BrokerRegistry, ConsumerRegistry, _split_broker_target
 from .config import Configuration, ConfigurationError, load_configuration
 from .discovery import detect_application_package
 from .event_bus import InMemoryEventBus, _require_async_handler
@@ -682,7 +682,8 @@ class Runtime:
         return None
 
     def _broker_route_target(self, event: Any, *, has_local_handler: bool) -> str | None:
-        """The validated broker target for this publish, or None (in-process).
+        """The validated, whitespace-normalized broker target for this publish,
+        or None (in-process).
 
         Only resolves in non-``single`` topology. An event routes to the
         broker when EITHER:
@@ -725,7 +726,7 @@ class Runtime:
             target = f"{cfg.broker}:{fqn}"
 
         event_type = f"{type(event).__module__}.{type(event).__qualname__}"
-        scheme = target.partition(":")[0]
+        scheme, destination = _split_broker_target(target)
         if scheme not in registry.schemes():
             raise ConfigurationError(
                 f"cannot route event {event_type} to broker target {target!r}: "
@@ -736,7 +737,7 @@ class Runtime:
                 f"consumer. Install or register the broker adapter, or fix "
                 f"the configured scheme."
             )
-        return target
+        return f"{scheme}:{destination}"
 
     async def _maybe_route_to_broker(self, event: Any, *, has_local_handler: bool) -> None:
         """Send an event to the broker when it crosses processes (direct path).

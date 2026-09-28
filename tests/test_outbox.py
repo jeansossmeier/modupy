@@ -1617,6 +1617,40 @@ async def test_broker_route_threads_publication_id_into_headers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_broker_route_persisted_with_padded_target_reaches_normalized_destination() -> None:
+    sent: list[tuple[str, bytes]] = []
+
+    class Broker:
+        async def publish(
+            self, target: str, payload: bytes, headers: dict[str, str] | None = None
+        ) -> None:
+            sent.append((target, payload))
+
+        async def close(self) -> None:
+            pass
+
+    _runtime.configure(package="outboxtest", auto_discover=False)
+    _runtime.ensure_bootstrapped()
+    assert _runtime.broker_registry is not None
+    _runtime.broker_registry.register("test", Broker())
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    publication = EventPublication(
+        id=uuid4(),
+        payload=b'{"value": 7}',
+        event_type=f"{OutboxEvent.__module__}.{OutboxEvent.__qualname__}",
+        listener=outbox._BROKER_ROUTE_LISTENER_PREFIX + " test : events ",
+        published_at=datetime.now(UTC),
+    )
+    await store.save(publication)
+
+    await outbox._dispatch_broker_route(publication)
+
+    assert sent == [("events", b'{"value": 7}')]
+    assert publication.last_error is None
+
+
+@pytest.mark.asyncio
 async def test_broker_route_redispatch_is_deduped_by_publication_id(tmp_path: Path) -> None:
     """A re-dispatch of the same publication (crash-recovery retry) must not
     deliver a second time — the SHM broker's consumer-side dedup keys on the

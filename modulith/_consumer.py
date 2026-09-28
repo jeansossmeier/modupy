@@ -46,6 +46,7 @@ from typing import Any
 
 from ._health_failures import HealthFailures
 from ._shutdown import DEFAULT_STOP_TIMEOUT_S, cancel_and_wait
+from .brokers import _split_broker_target
 from .config import ConfigurationError
 from .manifest import get_manifest
 from .protocols import ConsumerHealth
@@ -534,10 +535,8 @@ def _broker_destination(target: object, broker_scheme: str) -> str:
         raise ConfigurationError(
             f"invalid broker target {target!r}; expected non-empty 'scheme:destination'"
         )
-    scheme, separator, destination = target.partition(":")
-    scheme = scheme.strip()
-    destination = destination.strip()
-    if not separator or not scheme or not destination:
+    scheme, destination = _split_broker_target(target)
+    if not scheme or not destination:
         raise ConfigurationError(
             f"invalid broker target {target!r}; expected non-empty 'scheme:destination'"
         )

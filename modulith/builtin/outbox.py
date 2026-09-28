@@ -66,6 +66,7 @@ from modulith._claims import (
     DEFAULT_CLAIM_STRATEGY,
     VALID_CLAIM_STRATEGIES,
 )
+from modulith.brokers import _split_broker_target
 from modulith.config import ConfigurationError
 from modulith.serializers import JsonEventSerializer, _event_type_name
 
@@ -753,7 +754,7 @@ async def _dispatch_broker_route(publication: EventPublication) -> None:
     target = publication.listener[len(_BROKER_ROUTE_LISTENER_PREFIX) :]
     try:
         registry = _rt._runtime.broker_registry
-        scheme = target.partition(":")[0]
+        scheme = _split_broker_target(target)[0]
         if registry is None or scheme not in registry.schemes():
             registered = registry.schemes() if registry is not None else []
             raise LookupError(

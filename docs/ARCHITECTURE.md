@@ -387,14 +387,19 @@ priority order:
 2. the `@externalized(target="scheme:destination")` static override,
 3. the default scheme `{broker}:{fully-qualified-event-name}`.
 
+`@externalized` strips whitespace around the target's scheme and destination
+and raises `ConfigurationError` at decoration time when either is empty.
+
 ### 8.2 The broker registry
 
 **`modulith/brokers.py`.** `BrokerRegistry` routes outbound events by URI
 scheme (mirroring `urllib`/SQLAlchemy dialects). `register(scheme, broker)`
 raises `DuplicateBrokerError` on a collision (silent overwrites would mask
 plugin conflicts); `publish(target, ...)` splits the target on the **first**
-colon (destinations may contain more, e.g. AMQP `exchange:routing.key`) and
-raises `UnknownBrokerError` for an unregistered scheme; `close_all()` closes
+colon (destinations may contain more, e.g. AMQP `exchange:routing.key`),
+strips whitespace around both parts exactly as consumers do when they
+subscribe (so a hook-resolved or already-persisted padded target reaches the
+same stream), and raises `UnknownBrokerError` for an unregistered scheme; `close_all()` closes
 every broker on shutdown even if some raise (including `CancelledError`) —
 partial cleanup beats aborting on the first failure.
 

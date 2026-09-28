@@ -18,15 +18,21 @@ The fake matches redis-py's async surface for the methods the adapter uses.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import sys
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from modulith import ConfigurationError
+from modulith import ConfigurationError, event, externalized
+from modulith._consumer import BrokerConsumer, consumer_targets
 from modulith.adapters.redis_broker import RedisStreamsBroker, modulith_register_brokers
 from modulith.brokers import BrokerRegistry
+from modulith.event_bus import InMemoryEventBus
+from modulith.serializers import JsonEventSerializer
 
 
 class FakeRedis:
@@ -1067,4 +1073,54 @@ async def test_integration_publish_and_consume_roundtrip(
         assert fields[b"h:k"] == b"v"
         await broker.ack(stream, msg_id.decode() if isinstance(msg_id, bytes) else msg_id)
     finally:
+        await broker.close()
+
+
+@event
+@externalized(target="redis-streams: orders.placed")
+@dataclass(frozen=True)
+class PaddedTargetOrder:
+    order_id: str
+
+
+@pytest.mark.integration
+async def test_integration_whitespace_padded_target_reaches_the_consumer(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    broker = RedisStreamsBroker(url=redis_url, stream_prefix=redis_key_prefix)
+    registry = BrokerRegistry()
+    registry.register("redis-streams", broker)
+    delivered: list[PaddedTargetOrder] = []
+
+    async def on_order(item: PaddedTargetOrder) -> None:
+        delivered.append(item)
+
+    bus = InMemoryEventBus()
+    bus.register(PaddedTargetOrder, on_order)
+    cfg = SimpleNamespace(
+        broker="redis-streams", subscription_source="listener", package=None, subscriptions={}
+    )
+    serializer = JsonEventSerializer(allowed_event_types=[PaddedTargetOrder])
+    consumer = BrokerConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=consumer_targets(bus, cfg, "inventory"),
+        poll_block_ms=100,
+    )
+    await consumer.start()
+    try:
+        await registry.publish(
+            "redis-streams: orders.placed",
+            serializer.serialize(PaddedTargetOrder("o-1")),
+            {"event_type": f"{__name__}.PaddedTargetOrder"},
+        )
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while not delivered and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.02)
+        assert delivered == [PaddedTargetOrder("o-1")]
+    finally:
+        await consumer.stop()
         await broker.close()

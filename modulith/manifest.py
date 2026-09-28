@@ -62,6 +62,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from .brokers import _split_broker_target
+
 logger = logging.getLogger("modulith.manifest")
 
 
@@ -87,13 +89,13 @@ def _normalize_broker_targets(targets: object) -> tuple[str, ...]:
             raise ConfigurationError(
                 f"broker_targets must contain only 'scheme:destination' strings; got {target!r}"
             )
-        scheme, separator, destination = target.partition(":")
-        if not separator or not scheme.strip() or not destination.strip():
+        scheme, destination = _split_broker_target(target)
+        if not scheme or not destination:
             raise ConfigurationError(
                 "broker_targets must contain non-empty 'scheme:destination' "
                 f"strings; got {target!r}"
             )
-        normalized.append(f"{scheme.strip()}:{destination.strip()}")
+        normalized.append(f"{scheme}:{destination}")
     return tuple(normalized)
 
 

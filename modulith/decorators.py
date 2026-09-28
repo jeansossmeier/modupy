@@ -24,6 +24,8 @@ import inspect
 from collections.abc import Callable
 from typing import Any, TypeVar, overload
 
+from .brokers import _split_broker_target
+from .config import ConfigurationError
 from .runtime import _runtime
 
 T = TypeVar("T")
@@ -67,7 +69,18 @@ def externalized(cls: type[T] | None = None, *, target: str | None = None) -> An
       1. the ``modulith_resolve_event_target`` hook (dynamic / tenant-aware),
       2. this annotation's explicit ``target`` (static per-event override),
       3. the default scheme ``{broker}:{fully-qualified-event-name}``.
+
+    An explicit ``target`` is stored with the whitespace around its scheme and
+    destination stripped. One whose scheme or destination is empty raises
+    ``ConfigurationError`` here, at decoration time.
     """
+    if target is not None:
+        scheme, destination = _split_broker_target(target)
+        if not scheme or not destination:
+            raise ConfigurationError(
+                f"invalid @externalized target {target!r}; expected non-empty 'scheme:destination'"
+            )
+        target = f"{scheme}:{destination}"
 
     def wrap(klass: type[T]) -> type[T]:
         klass.__modulith_externalized__ = True  # type: ignore[attr-defined]
@@ -160,13 +173,13 @@ def _normalize_listener_targets(targets: object) -> tuple[str, ...]:
             raise TypeError(
                 f"broker_targets must contain only 'scheme:destination' strings; got {target!r}"
             )
-        scheme, separator, destination = target.partition(":")
-        if not separator or not scheme.strip() or not destination.strip():
+        scheme, destination = _split_broker_target(target)
+        if not scheme or not destination:
             raise TypeError(
                 "broker_targets must contain non-empty 'scheme:destination' "
                 f"strings; got {target!r}"
             )
-        normalized.append(f"{scheme.strip()}:{destination.strip()}")
+        normalized.append(f"{scheme}:{destination}")
     return tuple(normalized)
 
 

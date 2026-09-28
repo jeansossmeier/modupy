@@ -411,6 +411,44 @@ async def test_resolve_event_target_hook_overrides_routing(make_fake_app) -> Non
     assert destination == "dynamic.dest"
 
 
+async def test_whitespace_padded_hook_target_routes_to_normalized_destination(
+    make_fake_app,
+) -> None:
+    from modulith import hookimpl
+
+    class _Router:
+        @hookimpl
+        def modulith_resolve_event_target(self, event) -> str:
+            return " testbroker : dynamic.dest "
+
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event, publish
+
+                @event
+                @dataclass(frozen=True)
+                class OrderPlaced:
+                    order_id: str
+
+                async def place(order_id: str) -> None:
+                    await publish(OrderPlaced(order_id=order_id))
+            """
+        }
+    )
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+    _runtime.ensure_bootstrapped()
+    _runtime._plugin_manager.register(_Router(), name="padded-router")
+    fake = _register_fake_broker("testbroker")
+
+    import fakeapp.orders as orders
+
+    await orders.place("o-12")
+
+    assert [destination for destination, _, _ in fake.published] == ["dynamic.dest"]
+
+
 # ---------------------------------------------------------------------------
 # Broker publish failure — producer-side fake that CAN fail
 # ---------------------------------------------------------------------------

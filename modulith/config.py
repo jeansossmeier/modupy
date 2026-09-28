@@ -27,6 +27,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ._claims import VALID_CLAIM_STRATEGIES
+from .brokers import _split_broker_target
 
 logger = logging.getLogger(__name__)
 
@@ -612,8 +613,8 @@ def _is_broker_target(value: object) -> bool:
     """Return whether value is a non-empty ``scheme:destination`` string."""
     if type(value) is not str:
         return False
-    scheme, separator, destination = value.partition(":")
-    return bool(separator and scheme.strip() and destination.strip())
+    scheme, destination = _split_broker_target(value)
+    return bool(scheme and destination)
 
 
 def _env_str(name: str) -> str | None:

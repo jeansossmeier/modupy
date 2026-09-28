@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from modulith import event, listener, publish
+from modulith import ConfigurationError, event, externalized, listener, publish
 from modulith.builtin import outbox
 from modulith.manifest import Manifest, verify_manifest
 from modulith.runtime import _runtime
@@ -406,3 +406,37 @@ def test_listener_preserves_the_handler_signature_for_type_checkers(tmp_path: Pa
     # The parameterized form keeps the arity AND is itself typed.
     assert "[call-arg]" in result.stdout, result.stdout
     assert "untyped-decorator" not in result.stdout, result.stdout
+
+
+# ---------------------------------------------------------------------------
+# @externalized — target validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("target", "stored"),
+    [
+        (" redis-streams : orders.placed ", "redis-streams:orders.placed"),
+        ("redis-streams: orders.placed", "redis-streams:orders.placed"),
+        ("amqp: orders:placed.eu ", "amqp:orders:placed.eu"),
+    ],
+)
+def test_externalized_stores_whitespace_normalized_target(target: str, stored: str) -> None:
+    @externalized(target=target)
+    @dataclass(frozen=True)
+    class Placed:
+        order_id: str
+
+    assert Placed.__modulith_broker_target__ == stored  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "target", ["", "   ", "orders", "redis-streams:", "redis-streams:  ", " :orders"]
+)
+def test_externalized_rejects_target_without_scheme_or_destination(target: str) -> None:
+    with pytest.raises(ConfigurationError, match="scheme:destination"):
+
+        @externalized(target=target)
+        @dataclass(frozen=True)
+        class Placed:
+            order_id: str
