@@ -28,12 +28,22 @@ MODULITH_BROKER=memory uvicorn myapp.main:app --workers 1
 Add persistence without splitting processes: publish events atomically with your domain transaction.
 
 In `myapp/main.py`, keep `outbox.configure()` at module import time (the CLI
-outbox tooling below depends on that — see **Outbox operations**), but add a
-lifespan whose only job is teardown: a bare module-scope `outbox.configure()`
-with no matching `outbox.shutdown()` leaves the retry loop and the DB
-engine's connection pool running until the process is killed, relying
-entirely on the crash-recovery sweep on next start instead of a graceful
-drain:
+outbox tooling below depends on that — see **Outbox operations**), and add a
+lifespan that starts and stops the retry loop. Module-scope code runs before
+the server's event loop exists, so `outbox.configure()` there cannot start the
+retry loop: call `outbox.start()` in the lifespan's startup half, or rows a
+crashed process left undelivered wait until this process's first
+transactional publish. A bare module-scope `outbox.configure()` with no
+matching `outbox.shutdown()` leaves the retry loop and the DB engine's
+connection pool running until the process is killed instead of draining
+gracefully. The outbox table must live in the same database as your business
+data: the row commits atomically with your data only inside one transaction.
+
+`main.py` does not run under `--topology processes`: its lifespan, middleware
+and this outbox wiring are absent from every worker. A worker whose
+`outbox` is not `"memory"` refuses to start unless the module's import or a
+`modulith_after_module_load` hook binds a store; each worker then starts the
+retry loop itself.
 ```python
 from contextlib import asynccontextmanager
 
@@ -62,6 +72,7 @@ configure(outbox="postgres")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    outbox.start()  # crash-recovery sweep + retry loop on the server's loop
     yield
     # Teardown order matters: drain/unregister the store's after-commit hook
     # (store.dispose) BEFORE outbox.shutdown() stops the retry loop, and

@@ -353,6 +353,19 @@ def configure(
         _ensure_retry_loop()
 
 
+def start() -> None:
+    """Start the retry loop and its one-shot crash sweep on the running loop.
+
+    Idempotent, and a no-op when no store is bound or no loop is running.
+    ``configure()`` at module import time runs before the server's event loop
+    exists, so a server calls this from its ASGI startup; without it, rows a
+    crashed process left undelivered wait for the first transactional
+    publish. CLI processes never call it, so they never sweep or dispatch.
+    """
+    if _store is not None:
+        _ensure_retry_loop()
+
+
 def _ensure_retry_loop() -> None:
     """Start the retry loop + crash sweep if a loop is running and none runs.
 
@@ -1314,5 +1327,6 @@ __all__ = [
     "purge_completed",
     "retry_all_dead_lettered",
     "shutdown",
+    "start",
     "status",
 ]

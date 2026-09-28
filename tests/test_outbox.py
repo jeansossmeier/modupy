@@ -2342,3 +2342,28 @@ async def test_persist_accepts_one_listener_registered_twice() -> None:
     saved = await outbox.persist(OutboxEvent(value=1))
 
     assert [pub.listener for pub in saved] == [f"{__name__}.record"] * 2
+
+
+def test_start_runs_crash_sweep_for_store_configured_without_a_loop() -> None:
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
+    before_start = outbox._retry_task
+
+    async def scenario() -> bool:
+        outbox.start()
+        first = outbox._retry_task
+        outbox.start()
+        await asyncio.sleep(0.05)
+        return first is not None and outbox._retry_task is first
+
+    reused = asyncio.run(scenario())
+
+    assert (before_start, reused, store.find_incomplete_calls) == (None, True, [timedelta(0)])
+
+
+def test_start_without_a_bound_store_starts_nothing() -> None:
+    async def scenario() -> Any:
+        outbox.start()
+        return outbox._retry_task
+
+    assert asyncio.run(scenario()) is None

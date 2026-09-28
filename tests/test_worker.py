@@ -17,7 +17,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import sys
-from datetime import UTC, datetime
+import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -1221,3 +1222,66 @@ def test_health_endpoint_echoes_the_deployment_token(make_fake_app, monkeypatch)
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok", "module": "orders", "deployment": "deployment-b"}
+
+
+# ---------------------------------------------------------------------------
+# durable outbox wiring
+# ---------------------------------------------------------------------------
+
+_MODULE_WIRING_OUTBOX = """
+    from datetime import timedelta
+
+    from modulith.builtin import outbox
+    from modulith.serializers import JsonEventSerializer
+
+    SWEEPS: list[timedelta] = []
+
+    class Store:
+        async def save(self, publication):
+            pass
+
+        async def find_incomplete(self, older_than):
+            SWEEPS.append(older_than)
+            return []
+
+    outbox.configure(Store(), JsonEventSerializer(), retry_interval_seconds=60)
+"""
+
+
+@pytest.fixture
+def _fresh_outbox() -> Any:
+    outbox._reset_for_testing()
+    yield
+    outbox._reset_for_testing()
+
+
+def test_worker_refuses_durable_outbox_without_a_bound_store(
+    make_fake_app, monkeypatch, _fresh_outbox
+) -> None:
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.setenv("MODULITH_OUTBOX", "postgres")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        create_app()
+
+    message = str(exc_info.value)
+    assert ("'postgres'" in message, "main.py" in message) == (True, True)
+
+
+def test_worker_starts_retry_loop_for_store_bound_at_module_import(
+    make_fake_app, monkeypatch, _fresh_outbox
+) -> None:
+    make_fake_app({"orders": _MODULE_WIRING_OUTBOX})
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.setenv("MODULITH_OUTBOX", "postgres")
+
+    app = create_app()
+    sweeps = sys.modules["fakeapp.orders"].SWEEPS
+    before_startup = list(sweeps)
+    with TestClient(app):
+        deadline = time.monotonic() + 2.0
+        while not sweeps and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    assert (before_startup, sweeps[:1]) == ([], [timedelta(0)])

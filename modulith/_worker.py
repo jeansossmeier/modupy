@@ -80,6 +80,7 @@ def create_app() -> FastAPI:
     from fastapi.responses import JSONResponse
 
     from . import ModuleInfo, bootstrap, configure
+    from .builtin import outbox
     from .protocols import HealthAwareConsumer
     from .runtime import _runtime
 
@@ -104,6 +105,7 @@ def create_app() -> FastAPI:
         _runtime.plugin_manager.hook.modulith_after_module_load(
             module=ModuleInfo(name=module_name, package=module_package)
         )
+    _require_outbox_store()
     consumer_name = f"{module_name}:{uuid4().hex}"
 
     @asynccontextmanager
@@ -126,6 +128,7 @@ def create_app() -> FastAPI:
             _app.state.consumer = consumer
             if consumer is not None:
                 await consumer.start()
+            outbox.start()
             yield
         finally:
             # consumer.stop() and _runtime.shutdown() must both be attempted
@@ -317,6 +320,31 @@ def _build_consumer(module_name: str, consumer_name: str | None = None) -> Any:
         broker_registry=broker_registry,
     )
     return consumer_registry.build(cfg.broker, spec)
+
+
+def _require_outbox_store() -> None:
+    """Refuse to start a worker whose durable outbox has no store bound.
+
+    The application's ``main.py`` never runs in a worker, so an
+    ``outbox.configure()`` placed there leaves the worker publishing straight
+    to the broker, without the transactional guarantee the configuration
+    names. Runs after the module import and ``modulith_after_module_load``,
+    either of which may bind the store.
+    """
+    from .builtin import outbox
+    from .config import ConfigurationError
+    from .runtime import _runtime
+
+    cfg = _runtime.config
+    if cfg is None or cfg.outbox == "memory" or outbox._store is not None:
+        return
+    raise ConfigurationError(
+        f"outbox is {cfg.outbox!r} but no outbox store is bound in this worker: "
+        "the application's main.py (its lifespan, middleware and outbox wiring) "
+        "does not run under --topology processes. Call "
+        "modulith.builtin.outbox.configure() from the module's import or a "
+        "modulith_after_module_load hook, or set outbox = 'memory'."
+    )
 
 
 def _import_contracts(app_package: str, contracts_module: str = "contracts") -> None:

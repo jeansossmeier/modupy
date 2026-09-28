@@ -287,7 +287,9 @@ def bootstrap() -> None:
     embedding app that configures a durable outbox and wants stranded
     publications from a previous crash retried immediately at startup,
     rather than waiting for the first publish(), should call
-    ``bootstrap()`` right after ``configure()``.
+    ``bootstrap()`` right after ``configure()`` and then
+    ``modulith.builtin.outbox.start()`` from its running event loop (an ASGI
+    lifespan's startup half): ``bootstrap()`` itself starts no retry loop.
 
     Safe to call any number of times — after the first call, subsequent
     calls are a no-op fast path (same guarantee as ``publish()``'s implicit
