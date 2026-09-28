@@ -189,6 +189,8 @@ uvicorn's `FORWARDED_ALLOW_IPS` (env var, e.g. the ingress CIDR or `*` when
 the proxy is reachable only through the ingress) on the proxy process so
 `request.client`/scheme reflect the real client before this overwrite runs.
 
+**Request targets.** The proxy forwards the client's path bytes unchanged (an encoded `%2F` stays one segment) to the matched module's own worker only. It answers `400` for a request-target that does not start with `/` or that contains a `.` or `..` path segment, literal or percent-encoded, and contacts no worker for it.
+
 **Sizing the default SHM store.** The local `shm` broker keeps every
 publication for `orphan_retention_seconds` (default 86400) even after every
 group has acked it, so late subscribers can replay it. Its store (`max_store_bytes`,

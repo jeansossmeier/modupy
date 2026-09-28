@@ -29,6 +29,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from itertools import cycle
 from typing import Any
+from urllib.parse import quote, unquote
 
 # These are imported at module level (not lazily) so FastAPI's get_type_hints
 # can resolve the route handlers' string annotations against this module's
@@ -37,6 +38,7 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger("modulith.proxy")
 DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
@@ -179,6 +181,7 @@ def create_proxy_app(
     # remains callable, so a caller that wants the proxy's own schema can build
     # it in-process.
     app = FastAPI(title="modulith-proxy", lifespan=lifespan, openapi_url=None)
+    app.add_middleware(_RejectUnsafeTargets)
 
     def _actuator_auth_response(request: Request) -> JSONResponse | None:
         if actuator_token is None:
@@ -281,17 +284,6 @@ def create_proxy_app(
         include_in_schema=False,
     )
     async def proxy(request: Request, path: str) -> Response:
-        rule = _match_rule(request.url.path, rules)
-        if rule is None:
-            return JSONResponse(
-                {"detail": f"no worker route for {request.url.path!r}"}, status_code=404
-            )
-
-        # One backend per request, round-robin across every replica of this
-        # module (skipping any marked down by a failed health check or a
-        # prior connect failure) — see RoutingRule.next_backend().
-        backend = rule.next_backend()
-
         # scope["raw_path"]/["query_string"] carry the exact bytes the client
         # sent, still percent-encoded. request.url.path/.query are built from
         # scope["path"] — already percent-*decoded* per the ASGI spec — so an
@@ -299,11 +291,24 @@ def create_proxy_app(
         # slash within one segment, not a path boundary) would be silently
         # turned into a real "/" and change how many segments the upstream
         # sees. Forwarding the raw bytes preserves the client's exact request.
-        raw_path = request.scope.get("raw_path") or request.url.path.encode("utf-8")
-        upstream = backend + raw_path.decode("latin-1")
+        # Rule matching runs on the decoding of those same bytes, so the rule
+        # that matched and the path that is forwarded cannot disagree.
+        # _RejectUnsafeTargets has already answered 400 for any target that
+        # does not start with "/" or holds a dot segment.
+        raw_path = _raw_path(request.scope)
+        target = unquote(raw_path.decode("latin-1"))
+        rule = _match_rule(target, rules)
+        if rule is None:
+            return JSONResponse({"detail": f"no worker route for {target!r}"}, status_code=404)
+
+        # One backend per request, round-robin across every replica of this
+        # module (skipping any marked down by a failed health check or a
+        # prior connect failure) — see RoutingRule.next_backend().
+        backend = rule.next_backend()
         query_string = request.scope.get("query_string", b"")
-        if query_string:
-            upstream += "?" + query_string.decode("latin-1")
+        # Log-only rendering; never parsed. The request itself is built from
+        # components by _upstream_url.
+        upstream = backend + raw_path.decode("latin-1")
 
         too_large = _body_too_large(request, max_request_body_bytes)
         if too_large is not None:
@@ -352,7 +357,7 @@ def create_proxy_app(
         try:
             upstream_req = http_client.build_request(
                 method=request.method,
-                url=upstream,
+                url=_upstream_url(backend, raw_path, query_string),
                 headers=fwd_headers,
                 content=body,
             )
@@ -366,7 +371,7 @@ def create_proxy_app(
             # contract documented on the TransportError handler.
             logger.warning(
                 "cannot build upstream request for %s: %s",
-                _without_query(upstream),
+                upstream,
                 exc,
             )
             return JSONResponse({"detail": "invalid request"}, status_code=400)
@@ -385,7 +390,7 @@ def create_proxy_app(
                         "backend %s unreachable after %d connect attempts for %s: %s",
                         backend,
                         attempts,
-                        _without_query(upstream),
+                        upstream,
                         exc,
                     )
                     return JSONResponse({"detail": "backend unreachable"}, status_code=502)
@@ -401,7 +406,7 @@ def create_proxy_app(
                 logger.warning(
                     "backend %s unreachable for %s: %s",
                     backend,
-                    _without_query(upstream),
+                    upstream,
                     exc,
                 )
                 return JSONResponse({"detail": "backend unreachable"}, status_code=502)
@@ -415,14 +420,14 @@ def create_proxy_app(
                 logger.warning(
                     "backend %s returned no usable response for %s: %s",
                     rule.backend_url,
-                    _without_query(upstream),
+                    upstream,
                     exc,
                 )
                 return JSONResponse({"detail": "backend error"}, status_code=502)
             # success: this backend answered — clear any prior down-marking.
             rule.mark_up(backend)
             response = StreamingResponse(
-                _safe_stream(upstream_resp, _without_query(upstream)),
+                _safe_stream(upstream_resp, upstream),
                 status_code=upstream_resp.status_code,
             )
             # Passing headers= to StreamingResponse builds a plain dict internally
@@ -543,9 +548,61 @@ def _body_too_large(request: Request, limit: int | None) -> JSONResponse | None:
     return None
 
 
-def _without_query(url: str) -> str:
-    """Remove query strings before logging so credentials are not persisted."""
-    return url.partition("?")[0]
+def _raw_path(scope: Scope) -> bytes:
+    """The client's still-encoded path; rebuilt from ``path`` if the server omits it."""
+    raw: bytes | None = scope.get("raw_path")
+    return raw or quote(scope["path"]).encode("ascii")
+
+
+class _RejectUnsafeTargets:
+    """Answer 400 for a request-target the proxy must not route or forward.
+
+    Runs ahead of routing, so it covers the actuator routes as well as the
+    catch-all. A target that does not start with ``/`` (which uvicorn's h11
+    parser passes through) would otherwise either miss every route or name a
+    different authority once appended to a backend URL.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            raw_path = _raw_path(scope)
+            if not raw_path.startswith(b"/") or _has_dot_segment(
+                unquote(raw_path.decode("latin-1"))
+            ):
+                response = JSONResponse({"detail": "invalid request target"}, status_code=400)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+def _has_dot_segment(path: str) -> bool:
+    """Whether the decoded ``path`` has a ``.`` or ``..`` segment.
+
+    URL normalization (httpx's included) removes such segments, so a request
+    matched on ``/orders/..`` would reach the worker as something outside
+    ``/orders``. Checking the fully decoded path also covers ``%2e`` and
+    ``%2F``-joined forms.
+    """
+    return any(segment in (".", "..") for segment in path.split("/"))
+
+
+def _upstream_url(backend: str, raw_path: bytes, query: bytes) -> httpx.URL:
+    """The backend URL with the client's raw path and query as components.
+
+    Built from components rather than concatenated text, so no request-target
+    can change the scheme, host or port; the check below enforces that.
+    """
+    base = httpx.URL(backend)
+    raw = base.raw_path.rstrip(b"/") + raw_path
+    if query:
+        raw += b"?" + query
+    url = base.copy_with(raw_path=raw)
+    if (url.scheme, url.host, url.port) != (base.scheme, base.host, base.port):
+        raise httpx.InvalidURL(f"upstream URL left backend {backend}")
+    return url
 
 
 def _module_has_given_up(prefix: str, failed: frozenset[str]) -> bool:

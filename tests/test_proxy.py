@@ -10,7 +10,13 @@ the response, all in-process.
 
 from __future__ import annotations
 
+import asyncio
+import importlib.util
+import time
 import warnings
+from collections.abc import MutableMapping
+from typing import Any
+from urllib.parse import unquote
 
 import httpx
 import pytest
@@ -19,6 +25,8 @@ from fastapi.responses import RedirectResponse
 from fastapi.testclient import TestClient
 
 from modulith.proxy import RoutingRule, _match_rule, create_proxy_app
+
+from conftest import _free_port
 
 # ---------------------------------------------------------------------------
 # _match_rule (pure)
@@ -625,3 +633,219 @@ def test_proxy_aborts_stream_when_backend_dies_mid_response(caplog) -> None:
         client.get("/orders/ping")
 
     assert "backend stream interrupted" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Request-target validation: the upstream authority is always the backend's
+# ---------------------------------------------------------------------------
+
+_BACKEND = "http://127.0.0.1:9001"
+
+
+async def _proxy_raw_target(raw_path: bytes) -> tuple[int, list[httpx.URL]]:
+    """Feed ``raw_path`` to the proxy as an ASGI server would; return the
+    response status and every URL the proxy's real httpx client tried to send.
+
+    A hand-built scope reaches the app with exactly the bytes an HTTP parser
+    may hand it (h11 passes a target that does not start with ``/``), so the
+    result does not depend on which parser the deployment happens to run.
+    """
+    sent: list[httpx.URL] = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        sent.append(request.url)
+        return httpx.Response(200, stream=httpx.ByteStream(b"ok"))
+
+    app = create_proxy_app(
+        [RoutingRule("/orders", _BACKEND)],
+        client=httpx.AsyncClient(transport=httpx.MockTransport(record)),
+        actuator_enabled=False,
+        connect_retry_attempts=1,
+    )
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": unquote(raw_path.decode("ascii")),
+        "raw_path": raw_path,
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"public.example"), (b"authorization", b"Bearer client-token")],
+        "client": ("203.0.113.5", 51000),
+        "server": ("public.example", 80),
+    }
+    messages: list[MutableMapping[str, Any]] = []
+    request_sent = False
+
+    async def receive() -> MutableMapping[str, Any]:
+        # One request message, then block like a client that stays connected:
+        # a streaming response listens for disconnect until its body is done.
+        nonlocal request_sent
+        if request_sent:
+            await asyncio.Event().wait()
+        request_sent = True
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: MutableMapping[str, Any]) -> None:
+        messages.append(message)
+
+    await asyncio.wait_for(app(scope, receive, send), timeout=10.0)
+    status = next(m["status"] for m in messages if m["type"] == "http.response.start")
+    return status, sent
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    [
+        b"%2Forders%2F@127.0.0.1:1",
+        b"%2Forders%2F@127.0.0.1:1/admin",
+        b"%2forders%2f@other.example:443/x",
+        b"orders/x",
+        b"*",
+    ],
+)
+async def test_proxy_rejects_request_target_not_starting_with_slash(raw_path: bytes) -> None:
+    """A target that does not start with ``/`` is not an origin-form path. The
+    proxy answers 400 and contacts nothing: appended to the backend URL, such a
+    target can name a different host and port."""
+    status, sent = await _proxy_raw_target(raw_path)
+    assert status == 400
+    assert sent == []
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    [
+        b"/orders/../health",
+        b"/orders/./../health",
+        b"/orders/%2e%2e/health",
+        b"/orders/%2E%2E/health",
+        b"/orders/.%2e/health",
+        b"/orders%2F..%2Fhealth",
+        b"/orders/x/..",
+        b"/orders/.",
+    ],
+)
+async def test_proxy_rejects_dot_segments(raw_path: bytes) -> None:
+    """A ``.`` or ``..`` segment, literal or percent-encoded, gets 400 before
+    any backend is contacted, so ``/<module>/../health`` cannot reach a
+    worker's internal ``/health``: the rule matched ``/<module>``, but URL
+    normalization would have sent ``/health``."""
+    status, sent = await _proxy_raw_target(raw_path)
+    assert status == 400
+    assert sent == []
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    [
+        b"/orders/x",
+        b"/orders/a%2Fb",
+        b"/orders/@127.0.0.1:1/x",
+        b"/orders//127.0.0.1:1/x",
+        b"/orders/..x/.y",
+    ],
+)
+async def test_proxy_forwards_accepted_targets_only_to_the_backend(raw_path: bytes) -> None:
+    """Every forwarded request goes to the backend's own host and port with
+    the client's exact path bytes, whatever those bytes contain."""
+    status, sent = await _proxy_raw_target(raw_path)
+    assert status == 200
+    assert [(u.scheme, u.host, u.port, u.raw_path) for u in sent] == [
+        ("http", "127.0.0.1", 9001, raw_path)
+    ]
+
+
+def _recording_app(seen: list[str]) -> Any:
+    async def app(scope: MutableMapping[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            return
+        seen.append(scope["path"])
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"reached"})
+
+    return app
+
+
+async def _serve(app: Any, port: int, http: Any) -> tuple[Any, asyncio.Task[None]]:
+    import uvicorn
+
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, http=http, log_level="warning")
+    )
+    task = asyncio.create_task(server.serve())
+    deadline = time.monotonic() + 15.0
+    while not server.started:
+        assert not task.done(), f"server on port {port} died: {task.exception()!r}"
+        assert time.monotonic() < deadline, f"server on port {port} never came up"
+        await asyncio.sleep(0.02)
+    return server, task
+
+
+async def _raw_request_status(port: int, target: str) -> str:
+    """Send ``target`` verbatim on the request line; return the status line."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(
+        f"GET {target} HTTP/1.1\r\nHost: public.example\r\n"
+        "Authorization: Bearer client-token\r\nConnection: close\r\n\r\n".encode()
+    )
+    await writer.drain()
+    response = await asyncio.wait_for(reader.read(), timeout=10.0)
+    writer.close()
+    await writer.wait_closed()
+    return response.split(b"\r\n", 1)[0].decode("latin-1")
+
+
+@pytest.mark.real_process
+@pytest.mark.parametrize(
+    "http",
+    [
+        "h11",
+        pytest.param(
+            "httptools",
+            marks=pytest.mark.skipif(
+                importlib.util.find_spec("httptools") is None,
+                reason="httptools is not installed",
+            ),
+        ),
+    ],
+)
+async def test_proxy_over_real_parser_sends_crafted_targets_nowhere(http: str) -> None:
+    """End to end over real sockets, with the proxy on the named uvicorn HTTP
+    parser (h11 is what a default install uses): crafted targets reach neither
+    the module's worker nor any other listening server."""
+    worker_port, other_port, proxy_port = _free_port(), _free_port(), _free_port()
+    worker_saw: list[str] = []
+    other_saw: list[str] = []
+    proxy = create_proxy_app(
+        [RoutingRule("/orders", f"http://127.0.0.1:{worker_port}")],
+        actuator_enabled=False,
+        connect_retry_attempts=1,
+    )
+    servers = [
+        await _serve(_recording_app(worker_saw), worker_port, "h11"),
+        await _serve(_recording_app(other_saw), other_port, "h11"),
+        await _serve(proxy, proxy_port, http),
+    ]
+    try:
+        crafted = [
+            await _raw_request_status(proxy_port, target)
+            for target in (
+                f"%2Forders%2F@127.0.0.1:{other_port}",
+                f"%2Forders%2F@127.0.0.1:{other_port}/admin",
+                "/orders/../health",
+                "/orders/%2e%2e/health",
+            )
+        ]
+        control = await _raw_request_status(proxy_port, "/orders/x")
+    finally:
+        for server, _ in servers:
+            server.should_exit = True
+        await asyncio.gather(*(task for _, task in servers))
+
+    assert other_saw == []
+    assert crafted == ["HTTP/1.1 400 Bad Request"] * 4
+    assert control == "HTTP/1.1 200 OK"
+    assert worker_saw == ["/orders/x"]
