@@ -562,15 +562,27 @@ retained for `orphan_retention_seconds` (default 86400, 24 hours) and replayed
 once to every group that subscribes before expiry.
 
 Payloads over `max_payload_bytes` are rejected before a transaction starts.
-`max_store_bytes` configures SQLite `max_page_count`, and the file never grows
-past it. A full store rejects new publishes until retained publications expire,
-consumers drain their backlog, `modulith broker drop-group` removes a retired
-group, or every process restarts with a raised limit. Publishes are refused a small reserve early, once
-`page_count - freelist_count` would pass `max_page_count` minus 32 pages (one
-eighth of the pages below 256 pages), so consumers can still claim, ack, fail,
-dead-letter and prune their backlog while publishes are refused. A
-default-size consumer pass measured at most 7 pages of growth; stores under
-224 KiB reserve less than that. A publication stays while any group has not
+`max_store_bytes` bounds what publishes and subscribe replays may add to the
+database file (`broker.db`). A full store rejects new publishes until retained
+publications expire, consumers drain their backlog, `modulith broker
+drop-group` removes a retired group, or every process restarts with a raised
+limit. Publishes and replays are refused a small reserve early, once
+`page_count - freelist_count` would pass the configured page count minus 32
+pages (one eighth of the pages below 256 pages). A replay that would pass it
+fails the subscribe with a store-full `ConfigurationError`, so that consumer
+does not start until the backlog drains or the limit is raised. Consumers can
+always claim, ack, fail, dead-letter and prune the backlog they see: a consumer
+write the limit refuses is retried past it, so the database file can grow past
+`max_store_bytes` by the growth of rows it already holds (claims, error text,
+mark-mode completions, prune tombstones) while publishes stay refused. This
+also drains a store that filled before this release or whose `max_store_bytes`
+was lowered below its size; an existing larger file keeps its size. The
+`broker.db-wal` file is not counted: it grows to about 4 MiB (SQLite's
+1000-page autocheckpoint) before checkpoints reuse it, further while a long
+read blocks a checkpoint, and it keeps its largest size, so budget disk for
+it on top of `max_store_bytes`. The empty schema takes 13 pages, so a store
+under 56 KiB refuses every publish, and a 64 KiB store holds about 50 small
+publications. A publication stays while any group has not
 consumed it, for `orphan_retention_seconds` after it is written, and, under
 `completion_mode = "mark"` or once dead-lettered, until `retention_age_seconds`
 (default 3 days) after completion. The store sustains about

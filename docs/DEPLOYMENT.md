@@ -298,9 +298,15 @@ or `retention_age_seconds` applies to a process only after it restarts.
 `orphan_retention_seconds` is capped at 100 years (3153600000).
 A group that subscribes after a publication replays it only within that window.
 Publishes stop a 32-page consumer reserve (128 KiB at 4 KiB pages) below
-`max_store_bytes`, so consumers can drain a backlog while publishes are
-refused. Strictly, the numerator above is `max_store_bytes` minus that
+`max_store_bytes`. Strictly, the numerator above is `max_store_bytes` minus that
 reserve; at the 1 GiB default that is 0.01% and does not change the estimate.
+Consumers drain a backlog while publishes are refused: a consumer write that
+`max_store_bytes` refuses is retried past it, so `broker.db` can grow past the
+limit by the growth of rows it already holds. This also drains a store that
+filled before this release or that was opened with a lowered limit; publishes
+resume once the drained store is back under the limit. Budget disk for
+`broker.db-wal` on top: it is not counted, reaches about 4 MiB between
+checkpoints, and keeps its largest size.
 
 ### A. SQLite Database Broker (Zero Infrastructure)
 

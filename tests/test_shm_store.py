@@ -328,6 +328,145 @@ def test_consumers_drain_a_backlog_that_filled_the_store(
         store.close()
 
 
+def _bounded_store(path: Path, max_store_bytes: int, **options) -> SqliteQueueStore:
+    settings = {
+        "synchronous": "NORMAL",
+        "completion_mode": "delete",
+        "orphan_retention_seconds": 86400.0,
+        "retry_backoff_base_seconds": 1e-6,
+        "retry_backoff_cap_seconds": 1e-6,
+        **options,
+    }
+    return SqliteQueueStore(str(path), max_store_bytes=max_store_bytes, **settings)
+
+
+def _publish_until_refused(store: SqliteQueueStore, target: str = "events.Created") -> int:
+    published = 0
+    with pytest.raises(ConfigurationError, match="max_store_bytes"):
+        while True:
+            store.publish(target, b'{"order_id":"%08d"}' % published, None, None)
+            published += 1
+    assert published >= 100
+    return published
+
+
+_LONG_CONSUMER = "modulith-orders:worker-" + "0123456789abcdef" * 4
+
+
+@pytest.mark.parametrize("completion_mode", ["delete", "mark"])
+def test_consumers_drain_a_full_store_in_either_completion_mode(
+    tmp_path: Path, completion_mode: str
+) -> None:
+    store = _bounded_store(tmp_path / "full.db", 4 * 1024 * 1024, completion_mode=completion_mode)
+    try:
+        store.subscribe(["events.Created"], "orders")
+        published = _publish_until_refused(store)
+        acked = 0
+        while rows := store.claim("orders", 100, _LONG_CONSUMER, 30.0):
+            for row in rows:
+                assert store.ack(row["claim_token"], _LONG_CONSUMER, None)
+                acked += 1
+            store.prune(3 * 86400.0, 1000)
+        assert acked == published
+        assert store.group_backlog() == {"orders": 0}
+    finally:
+        store.close()
+
+
+def test_a_listener_failing_every_delivery_until_dead_letter_drains_a_full_store(
+    tmp_path: Path,
+) -> None:
+    store = _bounded_store(tmp_path / "failing.db", 1024 * 1024)
+    error = "ConnectionError: inventory database unavailable " + "x" * 250
+    try:
+        store.subscribe(["events.Created"], "orders")
+        published = _publish_until_refused(store)
+        dead = 0
+        while rows := store.claim("orders", 100, _LONG_CONSUMER, 30.0):
+            for row in rows:
+                assert store.fail(row["claim_token"], error, 2, _LONG_CONSUMER)
+                dead += row["attempts"] == 1
+        assert dead == published
+        assert store.group_backlog() == {"orders": 0}
+        assert store.prune(1e-9, 1000) == min(published, 1000)
+    finally:
+        store.close()
+
+
+def test_a_full_prune_batch_commits_in_a_full_store(tmp_path: Path) -> None:
+    group = "orders-consumer-group-long-name"
+    store = _bounded_store(tmp_path / "prune.db", 4 * 1024 * 1024, completion_mode="mark")
+    try:
+        store.subscribe(["events.Created"], group)
+        published = _publish_until_refused(store)
+        while rows := store.claim(group, 100, "c", 30.0):
+            for row in rows:
+                assert store.ack(row["claim_token"], "c", None)
+        pruned = 0
+        while batch := store.prune(1e-9, 1000):
+            pruned += batch
+        assert pruned == published
+    finally:
+        store.close()
+
+
+def test_a_replay_into_a_full_store_is_refused_and_the_backlog_stays_drainable(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "replay.db"
+    store = _bounded_store(path, 4 * 1024 * 1024)
+    try:
+        store.subscribe(["events.Busy"], "busy")
+        for index in range(800):
+            store.publish("events.Late", b'{"late":%d}' % index, None, None)
+        published = _publish_until_refused(store, "events.Busy")
+
+        with pytest.raises(ConfigurationError, match="replay"):
+            store.subscribe(["events.Late"], "late")
+        assert "events.Late" not in store.get_subscriptions()
+
+        acked = 0
+        while rows := store.claim("busy", 100, _LONG_CONSUMER, 30.0):
+            for row in rows:
+                assert store.ack(row["claim_token"], _LONG_CONSUMER, None)
+                acked += 1
+        assert acked == published
+    finally:
+        store.close()
+
+    # Drained publications stay for orphan_retention_seconds, so the recovery
+    # the error names is a larger limit.
+    store = _bounded_store(path, 8 * 1024 * 1024)
+    try:
+        assert store.subscribe(["events.Late"], "late") == 800
+    finally:
+        store.close()
+
+
+def test_a_store_opened_above_a_lowered_limit_still_drains(tmp_path: Path) -> None:
+    path = tmp_path / "lowered.db"
+    store = _bounded_store(path, 1024 * 1024, orphan_retention_seconds=1e-6)
+    try:
+        store.subscribe(["events.Created"], "orders")
+        published = _publish_until_refused(store)
+    finally:
+        store.close()
+
+    store = _bounded_store(path, 256 * 1024, orphan_retention_seconds=1e-6)
+    try:
+        with pytest.raises(ConfigurationError, match="max_store_bytes"):
+            store.publish("events.Created", b"{}", None, None)
+        acked = 0
+        while rows := store.claim("orders", 100, _LONG_CONSUMER, 30.0):
+            for row in rows:
+                assert store.ack(row["claim_token"], _LONG_CONSUMER, None)
+                acked += 1
+        assert acked == published
+        store.publish("events.Created", b"{}", None, "after-drain")
+    finally:
+        store.close()
+
+
 async def test_sqlite_allocates_one_global_sequence_across_store_instances(
     tmp_path: Path,
 ) -> None:

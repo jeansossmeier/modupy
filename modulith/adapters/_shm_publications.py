@@ -21,13 +21,12 @@ _PUBLISH_PRUNE_LIMIT = 100
 # caller (SqliteQueueStore) tracks the cadence and passes prune_due.
 PRUNE_EVERY_N_PUBLISHES = 100
 
-# Publishes stop this many pages below max_page_count so claims, acks, fails,
-# dead-letters and prunes always have room to commit and drain a backlog that
-# filled the store. A default-size consumer pass (claim 100, fail and
-# dead-letter with a 4 KiB error, ack the rest, prune) grows the file by at
-# most 7 pages at every measured store size; the reserve keeps ~4x that. Stores
-# under 256 pages give an eighth of their pages instead, so below 56 pages
-# (224 KiB at 4 KiB pages) the reserve no longer covers a full default pass.
+# Publishes and subscribe replays stop this many pages below the page count
+# max_store_bytes allows, so a consumer pass usually commits inside the limit.
+# A consumer write that still hits the limit is retried past it (see
+# SqliteQueueStore._consumer_write), so consumers always finish the backlog
+# they can see; the reserve keeps the database file within max_store_bytes in
+# the common case. Stores under 256 pages reserve an eighth of their pages.
 CONSUMER_RESERVE_PAGES = 32
 
 
@@ -113,7 +112,7 @@ def publish(
                     str(row["consumer_group"]),
                     now,
                 )
-            _ensure_consumer_reserve(conn)
+            _ensure_consumer_reserve(conn, max_store_bytes)
     except (sqlite3.Error, _PublishReserveReached) as error:
         if isinstance(error, _PublishReserveReached) or _is_store_full(error):
             raise ConfigurationError(
@@ -145,8 +144,11 @@ def _ensure_payload_size(payload: bytes, max_payload_bytes: int) -> None:
         )
 
 
-def _ensure_consumer_reserve(conn: sqlite3.Connection) -> None:
-    max_pages = int(conn.execute("PRAGMA max_page_count").fetchone()[0])
+def _ensure_consumer_reserve(conn: sqlite3.Connection, max_store_bytes: int) -> None:
+    # Consumer writes can raise the connection's max_page_count past the
+    # configured limit, so the publish budget comes from the setting itself.
+    page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+    max_pages = max(1, max_store_bytes // page_size)
     used_pages = int(conn.execute("PRAGMA page_count").fetchone()[0]) - int(
         conn.execute("PRAGMA freelist_count").fetchone()[0]
     )
@@ -166,8 +168,31 @@ def subscribe(
     conn: sqlite3.Connection,
     targets: list[str],
     group: str,
+    max_store_bytes: int,
 ) -> int:
     """Reconcile one group's subscriptions and replay newly added targets."""
+    try:
+        return _subscribe(conn, targets, group, max_store_bytes)
+    except (sqlite3.Error, _PublishReserveReached) as error:
+        if isinstance(error, _PublishReserveReached) or _is_store_full(error):
+            raise ConfigurationError(
+                "SHM SQLite store is too full to replay retained publications to "
+                f"group {group!r}; the subscription was not recorded and the consumer "
+                "does not start. A replay counts against the same budget as "
+                "publishes, so other groups can still drain their backlog. Let "
+                "consumers drain it, remove a retired group with modulith broker "
+                f"drop-group, or raise max_store_bytes (currently {max_store_bytes}) "
+                "and restart every process."
+            ) from error
+        raise
+
+
+def _subscribe(
+    conn: sqlite3.Connection,
+    targets: list[str],
+    group: str,
+    max_store_bytes: int,
+) -> int:
     inserted = 0
     now = time.time()
     requested_targets = set(targets)
@@ -226,6 +251,8 @@ def subscribe(
                 """,
                 (target, now),
             )
+        if inserted:
+            _ensure_consumer_reserve(conn, max_store_bytes)
     return inserted
 
 

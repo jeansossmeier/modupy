@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from ..config import DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_SHM_MAX_STORE_BYTES
 from . import _shm_claims, _shm_completion, _shm_publications
@@ -11,6 +13,11 @@ from ._shm_schema import immediate_transaction, open_database
 from ._shm_types import ClaimToken, PublishResult
 
 __all__ = ["ClaimToken", "PublishResult", "SqliteQueueStore"]
+
+_T = TypeVar("_T")
+
+# SQLite clamps a larger max_page_count to its compiled-in maximum.
+_UNCAPPED_PAGES = 4294967294
 
 
 class SqliteQueueStore:
@@ -36,6 +43,30 @@ class SqliteQueueStore:
         self._max_payload_bytes = max_payload_bytes
         self._max_store_bytes = max_store_bytes
         self._publishes_since_prune = 0
+
+    def _consumer_write(self, operation: Callable[[], _T]) -> _T:
+        """Run a consumer write, past max_store_bytes if the limit refuses it.
+
+        Claims, fails and mark-mode acks grow rows the store already holds, so a
+        backlog that filled the store may need more pages than any fixed reserve
+        leaves. Only publishes and replays add work, and they stay refused while
+        the store is over its limit, so the file grows past max_store_bytes only
+        while consumers finish the backlog it already holds.
+        """
+        try:
+            return operation()
+        except sqlite3.OperationalError as error:
+            if not _shm_publications._is_store_full(error):
+                raise
+        self._conn.execute(f"PRAGMA max_page_count={_UNCAPPED_PAGES}")
+        try:
+            return operation()
+        finally:
+            # SQLite keeps the cap at the current file size when that is larger.
+            page_size = int(self._conn.execute("PRAGMA page_size").fetchone()[0])
+            self._conn.execute(
+                f"PRAGMA max_page_count={max(1, self._max_store_bytes // page_size)}"
+            )
 
     def spill(self, messages: list[dict[str, Any]]) -> None:
         _shm_publications.spill(
@@ -73,6 +104,7 @@ class SqliteQueueStore:
             self._conn,
             targets,
             group,
+            self._max_store_bytes,
         )
 
     def get_subscriptions(self) -> dict[str, list[str]]:
@@ -134,15 +166,17 @@ class SqliteQueueStore:
         max_attempts: int | None = None,
         targets: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        return _shm_claims.claim(
-            self._conn,
-            group,
-            limit,
-            consumer_name,
-            reclaim_stale_seconds,
-            self._max_payload_bytes,
-            max_attempts,
-            targets,
+        return self._consumer_write(
+            lambda: _shm_claims.claim(
+                self._conn,
+                group,
+                limit,
+                consumer_name,
+                reclaim_stale_seconds,
+                self._max_payload_bytes,
+                max_attempts,
+                targets,
+            )
         )
 
     def renew_claims(
@@ -151,11 +185,13 @@ class SqliteQueueStore:
         consumer_name: str,
         start_dispatch: bool = False,
     ) -> int:
-        return _shm_claims.renew_claims(
-            self._conn,
-            values,
-            consumer_name,
-            start_dispatch,
+        return self._consumer_write(
+            lambda: _shm_claims.renew_claims(
+                self._conn,
+                values,
+                consumer_name,
+                start_dispatch,
+            )
         )
 
     def ack(
@@ -164,11 +200,13 @@ class SqliteQueueStore:
         consumer_name: str,
         completion_mode: str | None,
     ) -> bool:
-        return _shm_completion.ack(
-            self._conn,
-            value,
-            consumer_name,
-            completion_mode or self._completion_mode,
+        return self._consumer_write(
+            lambda: _shm_completion.ack(
+                self._conn,
+                value,
+                consumer_name,
+                completion_mode or self._completion_mode,
+            )
         )
 
     def fail(
@@ -178,14 +216,16 @@ class SqliteQueueStore:
         max_attempts: int,
         consumer_name: str,
     ) -> bool:
-        return _shm_completion.fail(
-            self._conn,
-            value,
-            error,
-            max_attempts,
-            consumer_name,
-            self._retry_backoff_base_seconds,
-            self._retry_backoff_cap_seconds,
+        return self._consumer_write(
+            lambda: _shm_completion.fail(
+                self._conn,
+                value,
+                error,
+                max_attempts,
+                consumer_name,
+                self._retry_backoff_base_seconds,
+                self._retry_backoff_cap_seconds,
+            )
         )
 
     def dead_letter(
@@ -194,18 +234,22 @@ class SqliteQueueStore:
         error: str,
         consumer_name: str,
     ) -> bool:
-        return _shm_completion.dead_letter(
-            self._conn,
-            value,
-            error,
-            consumer_name,
+        return self._consumer_write(
+            lambda: _shm_completion.dead_letter(
+                self._conn,
+                value,
+                error,
+                consumer_name,
+            )
         )
 
     def prune(self, retention_age_seconds: float, limit: int) -> int:
-        return _shm_completion.prune(
-            self._conn,
-            retention_age_seconds,
-            limit,
+        return self._consumer_write(
+            lambda: _shm_completion.prune(
+                self._conn,
+                retention_age_seconds,
+                limit,
+            )
         )
 
     def read_pragma(self, name: str) -> int:
