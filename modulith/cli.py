@@ -663,6 +663,12 @@ def _run_process_topology(
     worker_env: dict[str, str] = {"UVICORN_LOG_LEVEL": log_level}
     if cfg.is_explicit("broker"):
         worker_env["MODULITH_BROKER"] = cfg.broker
+    # Workers bind their outbox store from these; a value already in the
+    # parent's environment reaches them by inheritance and wins.
+    if cfg.is_explicit("outbox") and not os.environ.get("MODULITH_OUTBOX"):
+        worker_env["MODULITH_OUTBOX"] = cfg.outbox
+    if cfg.outbox_url and not os.environ.get("MODULITH_OUTBOX_URL"):
+        worker_env["MODULITH_OUTBOX_URL"] = cfg.outbox_url
     for key, value in (cfg.broker_options or {}).items():
         if value is None:
             continue

@@ -632,6 +632,56 @@ def test_dev_processes_topology_env_url_beats_pyproject_url(make_fake_app, monke
     assert _build_worker_env(spec)["MODULITH_BROKER_URL"] == "postgresql+asyncpg://db/prod"
 
 
+def _dev_processes_worker_env(make_fake_app, monkeypatch, tmp_path) -> dict[str, str]:
+    make_fake_app(
+        {"orders": ""},
+        extra_files={"main.py": "from fastapi import FastAPI\napp = FastAPI()\n"},
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.modulith]\n"
+        'broker = "database"\n'
+        'outbox = "postgres"\n'
+        'outbox_url = "sqlite+aiosqlite:///outbox.db"\n'
+        "[tool.modulith.broker_options]\n"
+        'url = "sqlite+aiosqlite:///wf.db"\n'
+    )
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["dev", "fakeapp.main:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    (spec,) = captured["specs"]
+    return dict(spec.env or {})
+
+
+def test_dev_processes_topology_forwards_outbox_settings_to_workers(
+    make_fake_app, monkeypatch, tmp_path
+):
+    env = _dev_processes_worker_env(make_fake_app, monkeypatch, tmp_path)
+
+    assert (env.get("MODULITH_OUTBOX"), env.get("MODULITH_OUTBOX_URL")) == (
+        "postgres",
+        "sqlite+aiosqlite:///outbox.db",
+    )
+
+
+def test_dev_processes_topology_leaves_env_outbox_settings_to_the_workers_env(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_OUTBOX", "postgres")
+    monkeypatch.setenv("MODULITH_OUTBOX_URL", "postgresql+asyncpg://db/prod")
+
+    env = _dev_processes_worker_env(make_fake_app, monkeypatch, tmp_path)
+
+    assert ("MODULITH_OUTBOX" in env, "MODULITH_OUTBOX_URL" in env) == (False, False)
+
+
 def test_run_processes_topology_runs_supervisor(make_fake_app, monkeypatch):
     make_fake_app({"orders": "", "inventory": ""})
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
