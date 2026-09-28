@@ -368,7 +368,10 @@ outbox.configure(
 
 A lease shorter than a listener's runtime expires mid-dispatch and lets a peer
 legitimately reclaim the row — a duplicate delivery, not a bug. Raise
-`claim_lease_seconds` rather than lowering it to chase latency.
+`claim_lease_seconds` rather than lowering it to chase latency. The lease is
+also the crash-recovery bound: rows a crashed process was delivering are
+recovered once their lease expires, up to `claim_lease_seconds` plus
+`retry_interval_seconds` after the crash.
 
 The default strategy needs the lease columns, which arrive in migration
 `0003_outbox_claim_leases`: migrate to `head`, not to `0001_initial`. These are

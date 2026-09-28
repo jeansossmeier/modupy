@@ -295,6 +295,13 @@ only if** that transaction commits.
   threshold. On startup the sweep uses `older_than=0` (recover everything a
   crash left behind); steady-state it polls on a ~30s cadence so it doesn't
   thrash on freshly-published events.
+- A row the crashed process was delivering under a lease (`claim_strategy=
+  "lease"`, the default, which after-commit dispatch also takes) stays claimed
+  until that lease expires: the startup sweep skips it, and the first sweep
+  after expiry recovers it, up to `claim_lease_seconds` plus
+  `retry_interval_seconds` after the crash. Rows committed but not yet
+  claimed, and rows under `"advisory_lock"` (the lock dies with the crashed
+  process's connection) or `"none"`, are recovered by the startup sweep.
 - Backoff is exponential, measured from `last_attempt_at` (not `published_at`),
   and **capped at 5 minutes** — a persistently-failing listener actually backs
   off instead of being retried every sweep.
@@ -346,12 +353,15 @@ outbox table are coordinated by `outbox.configure(claim_strategy=...)`
 | `claim_strategy` | How it coordinates | Cost |
 |---|---|---|
 | `"lease"` (default) | `claim_batch()` selects `FOR UPDATE SKIP LOCKED` on Postgres, writes `claim_owner`/`claim_token`/`claim_until` and **commits before dispatch**. On MySQL and SQLite it claims each selected row with a conditional `UPDATE` that re-checks `completed_at IS NULL AND (claim_until IS NULL OR claim_until <= now)`, and drops a row a concurrent sweeper claimed first. The lease renews at one third of `claim_lease_seconds` while dispatch is in flight, and completion/failure writes are fenced on `claim_token` so an expired claimant cannot clobber a newer one | Postgres: one extra write per claimed batch. MySQL/SQLite: one `UPDATE` statement per candidate row |
-| `"advisory_lock"` | a per-publication `pg_try_advisory_lock` held for the duration of the dispatch. Postgres-only — a non-Postgres store rejects it at `configure()` | no extra write, but a held AUTOCOMMIT connection (no open transaction) per in-flight row, closed on any lock-query error |
+| `"advisory_lock"` | a per-publication `pg_try_advisory_lock` held for the duration of the dispatch. Postgres-only — a non-Postgres store rejects it at `configure()` | no extra write, but a held AUTOCOMMIT connection (no open transaction) per in-flight row. Lock connections come from a separate pool sized like the engine's, so held locks never starve the listener or the store's own reads of the engine pool; a burst larger than that pool waits up to `pool_timeout` for a lock connection. Lock connections are discarded after use, never returned to a pool |
 | `"none"` | no coordination; two sweepers CAN dispatch the same row. Logged as a warning at `configure()` so the tradeoff is visible | none |
 
 Tuning knobs: `claim_lease_seconds` (default 60 — must exceed your slowest
 listener, or the lease expires mid-dispatch and a peer legitimately reclaims
-the row) and `claim_batch_size` (default 100 rows per claim).
+the row; it also bounds how long a crashed process's in-flight rows wait for
+recovery, see §7.2) and `claim_batch_size` (default 100 rows per claim). A
+renewal that raises (a database blip) is logged and retried until the lease
+expires; it never fails the delivery.
 
 Note what `FOR UPDATE SKIP LOCKED` does and does not buy on its own: under
 `"none"` and `"advisory_lock"` the row locks taken by the sweep query are
