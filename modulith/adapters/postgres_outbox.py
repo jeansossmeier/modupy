@@ -995,7 +995,9 @@ class PostgresPublicationStore:
         A row a sweep already completed is skipped. Under
         ``claim_strategy="lease"`` the row is claimed first, exactly as a
         sweep claims it, and delivered under that lease with renewal and
-        fenced completion; a row a sweep holds is left to that sweep. The
+        fenced completion; a row a sweep holds is left to that sweep. Under
+        ``"advisory_lock"`` it is delivered under the row's advisory lock,
+        through the same lock/re-read/unlock path the advisory sweep uses. The
         claim is taken after commit, not in ``save()``, so a crashed
         process's rows stay claimable by the next sweep right away.
         """
@@ -1018,6 +1020,8 @@ class PostgresPublicationStore:
                     )
                 else:
                     await outbox._dispatch_with_lease_renewal(claimed)
+            elif pub is not None and outbox._claim_strategy == "advisory_lock":
+                await outbox._dispatch_under_advisory_lock(pub)
             elif pub is not None:
                 await outbox._dispatch_publication(pub)
             else:

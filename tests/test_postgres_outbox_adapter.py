@@ -826,6 +826,19 @@ async def test_renew_claim_refuses_a_completed_row(engine: Any) -> None:
 async def test_after_commit_dispatch_skips_a_row_the_sweep_has_claimed(
     engine: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    await _assert_after_commit_leaves_a_sweep_claimed_row(engine, monkeypatch)
+
+
+@pytest.mark.integration
+async def test_after_commit_dispatch_skips_a_row_the_sweep_has_claimed_on_postgres(
+    pg_engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _assert_after_commit_leaves_a_sweep_claimed_row(pg_engine, monkeypatch)
+
+
+async def _assert_after_commit_leaves_a_sweep_claimed_row(
+    engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The crash sweep can claim a freshly committed row before its
     after-commit dispatch runs. The after-commit path must then leave the row
     to the sweep, so the listener runs exactly once."""
@@ -869,6 +882,17 @@ async def test_after_commit_dispatch_skips_a_row_already_completed(
 
 
 async def test_sweep_cannot_claim_a_row_after_commit_is_delivering(engine: Any) -> None:
+    await _assert_sweep_cannot_claim_a_row_after_commit_is_delivering(engine)
+
+
+@pytest.mark.integration
+async def test_sweep_cannot_claim_a_row_after_commit_is_delivering_on_postgres(
+    pg_engine: Any,
+) -> None:
+    await _assert_sweep_cannot_claim_a_row_after_commit_is_delivering(pg_engine)
+
+
+async def _assert_sweep_cannot_claim_a_row_after_commit_is_delivering(engine: Any) -> None:
     """The after-commit path claims its row before delivering it. A peer's
     sweep must find the row held for the whole delivery, even when the
     listener outlives one lease length, and the fenced completion must land."""
@@ -900,6 +924,66 @@ async def test_sweep_cannot_claim_a_row_after_commit_is_delivering(engine: Any) 
     assert peer_claims == []
     assert received == [1]
     assert await _completed_rows(engine) == 1
+
+
+@pytest.mark.integration
+async def test_advisory_after_commit_holds_the_lock_for_its_delivery(pg_engine: Any) -> None:
+    """Under ``advisory_lock`` the after-commit path delivers under the row's
+    advisory lock, so a peer's advisory sweep cannot lock and re-deliver the
+    row while that delivery runs."""
+    store = PostgresPublicationStore(engine=pg_engine)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow(event: G04Event) -> None:
+        received.append(event.value)
+        entered.set()
+        await release.wait()
+
+    _bootstrap_with_listener(slow)
+    pub = _pub(1, slow)
+    await store.save(pub)
+
+    task = asyncio.create_task(store._dispatch_after_commit(pub.id))
+    await entered.wait()
+    peer_handle = await store.try_lock_publication(pub.id)
+    if peer_handle is not None:
+        await store.unlock_publication(peer_handle, pub.id)
+    release.set()
+    await task
+
+    assert peer_handle is None
+    assert received == [1]
+    assert await _completed_rows(pg_engine) == 1
+    after_handle = await store.try_lock_publication(pub.id)
+    assert after_handle is not None
+    await store.unlock_publication(after_handle, pub.id)
+
+
+@pytest.mark.integration
+async def test_advisory_after_commit_skips_a_row_a_peer_has_locked(pg_engine: Any) -> None:
+    """When a peer's advisory sweep holds the row's lock, the after-commit
+    path must leave the row to it; delivering under the peer's lock would be
+    a concurrent second delivery."""
+    store = PostgresPublicationStore(engine=pg_engine)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _pub(1)
+    await store.save(pub)
+
+    peer_handle = await store.try_lock_publication(pub.id)
+    assert peer_handle is not None
+    try:
+        await store._dispatch_after_commit(pub.id)
+        delivered_under_peer_lock = list(received)
+    finally:
+        await store.unlock_publication(peer_handle, pub.id)
+    await outbox._sweep(timedelta(0))
+
+    assert delivered_under_peer_lock == []
+    assert received == [1]
+    assert await _completed_rows(pg_engine) == 1
 
 
 async def test_after_commit_claim_expires_so_a_crashed_delivery_is_recovered(
