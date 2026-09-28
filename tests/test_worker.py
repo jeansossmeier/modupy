@@ -743,6 +743,35 @@ def test_listener_free_worker_does_not_require_broker_adapters(
     assert _build_consumer("orders") is None
 
 
+def test_shm_worker_broker_applies_forwarded_orphan_retention(
+    make_fake_app,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+    database_path = tmp_path / "worker.db"
+    monkeypatch.setenv("MODULITH_BROKER", "shm")
+    monkeypatch.setenv("MODULITH_BROKER_SQLITE_PATH", str(database_path))
+    monkeypatch.setenv("MODULITH_BROKER_HINT_PATH", str(tmp_path / "worker.hints"))
+    monkeypatch.setenv("MODULITH_BROKER_ORPHAN_RETENTION_SECONDS", "900")
+
+    create_app()
+    assert _runtime.broker_registry is not None
+    broker = _runtime.broker_registry.get("shm")
+    assert isinstance(broker, ShmBroker)
+    asyncio.run(broker.publish("events.Created", b"{}"))
+
+    connection = sqlite3.connect(database_path)
+    try:
+        windows = connection.execute(
+            "SELECT retained_until - created_at FROM shm_publication"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert windows == [(pytest.approx(900.0),)]
+
+
 def test_shm_worker_without_listeners_reconciles_previous_deployment(
     make_fake_app,
     monkeypatch,

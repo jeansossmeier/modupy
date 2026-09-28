@@ -533,6 +533,12 @@ def test_broker_url_redaction_fails_closed_for_unparseable_input(url: str) -> No
         ({"reclaim_stale_seconds": float("nan")}, "reclaim_stale_seconds"),
         ({"retention_age_seconds": 0}, "retention_age_seconds"),
         ({"prune_interval_seconds": -1}, "prune_interval_seconds"),
+        ({"orphan_retention_seconds": 0}, "orphan_retention_seconds"),
+        ({"orphan_retention_seconds": -1}, "orphan_retention_seconds"),
+        ({"orphan_retention_seconds": float("inf")}, "orphan_retention_seconds"),
+        ({"orphan_retention_seconds": float("nan")}, "orphan_retention_seconds"),
+        ({"orphan_retention_seconds": "a day"}, "orphan_retention_seconds"),
+        ({"orphan_retention_seconds": True}, "orphan_retention_seconds"),
     ],
 )
 def test_shm_options_are_validated_before_adapter_construction(

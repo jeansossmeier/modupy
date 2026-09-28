@@ -247,8 +247,13 @@ def test_store_exhaustion_rolls_back_publish_with_actionable_error(tmp_path: Pat
                     f"publication-{index}",
                 )
             except ConfigurationError as error:
-                assert "max_store_bytes" in str(error)
-                assert "disk space" in str(error)
+                message = str(error)
+                assert "max_store_bytes" in message
+                assert "orphan_retention_seconds" in message
+                assert "bytes per publication" in message
+                assert "disk space" in message
+                # Pruning cannot help: drained publications stay until their retention ends.
+                assert "prune completed publications" not in message
                 assert not store._conn.in_transaction
                 assert (
                     len(_rows(path, "SELECT id FROM shm_publication")),

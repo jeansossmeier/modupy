@@ -189,6 +189,22 @@ uvicorn's `FORWARDED_ALLOW_IPS` (env var, e.g. the ingress CIDR or `*` when
 the proxy is reachable only through the ingress) on the proxy process so
 `request.client`/scheme reflect the real client before this overwrite runs.
 
+**Sizing the default SHM store.** The local `shm` broker keeps every
+publication for `orphan_retention_seconds` (default 86400) even after every
+group has acked it, so late subscribers can replay it. Its store (`max_store_bytes`,
+default 1 GiB) therefore caps the sustained publish rate, not only the backlog:
+
+```
+sustainable publications/s ≈ max_store_bytes / (bytes per publication × orphan_retention_seconds)
+```
+
+A 1 KiB payload with two subscribed groups uses about 1.8 KB of store, so the
+defaults sustain roughly 7 publications/s; above that, every publish fails with
+"SHM SQLite store is full" after about a day. Raise `max_store_bytes` or
+shorten `orphan_retention_seconds` in `[tool.modulith.broker_options]` (or
+`MODULITH_BROKER_MAX_STORE_BYTES` / `MODULITH_BROKER_ORPHAN_RETENTION_SECONDS`).
+A group that subscribes after a publication replays it only within that window.
+
 ### A. SQLite Database Broker (Zero Infrastructure)
 
 ```bash

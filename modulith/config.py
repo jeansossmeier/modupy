@@ -347,7 +347,12 @@ def _validate_shm_broker_options(options: dict[str, Any]) -> None:
         "max_delivery_attempts",
         maximum=_SHM_MAX_DELIVERY_ATTEMPTS,
     )
-    for name in ("poll_interval_ms", "reclaim_stale_seconds", "retention_age_seconds"):
+    for name in (
+        "poll_interval_ms",
+        "reclaim_stale_seconds",
+        "retention_age_seconds",
+        "orphan_retention_seconds",
+    ):
         _validate_shm_float_option(options, name, allow_zero=False)
     _validate_shm_float_option(options, "prune_interval_seconds", allow_zero=True)
 

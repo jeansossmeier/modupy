@@ -518,13 +518,20 @@ max_store_bytes = 1073741824    # default 1 GiB; maximum 1 TiB
 process restarts on the same disk. Only `FULL` promises the last commits across
 OS failure or power loss. Delivery is at-least-once: a crash after a listener
 returns but before its ack commits can cause a duplicate, so listeners must be
-idempotent. Publications without a registered group are retained for 24 hours
-and replayed once to every group that subscribes before expiry.
+idempotent. Every publication, including one every group has already acked, is
+retained for `orphan_retention_seconds` (default 86400, 24 hours) and replayed
+once to every group that subscribes before expiry.
 
 Payloads over `max_payload_bytes` are rejected before a transaction starts.
 `max_store_bytes` configures SQLite `max_page_count`; a full store rejects new
-publishes until space is pruned or the limit is raised. Override either with
-`MODULITH_BROKER_MAX_PAYLOAD_BYTES` / `MODULITH_BROKER_MAX_STORE_BYTES`.
+publishes until retained publications expire or the limit is raised. Because
+drained publications stay for the whole retention window, the store sustains
+about `max_store_bytes / (bytes per publication × orphan_retention_seconds)`
+publications per second: roughly 7/s for 1 KiB payloads and two groups with
+the defaults. Raise `max_store_bytes` or shorten `orphan_retention_seconds`
+(late subscribers then replay only within the shorter window). Override these
+with `MODULITH_BROKER_MAX_PAYLOAD_BYTES`, `MODULITH_BROKER_MAX_STORE_BYTES`, and
+`MODULITH_BROKER_ORPHAN_RETENTION_SECONDS`.
 `shm_slot_size` is deprecated and ignored because hint slots are fixed-size.
 
 Explicit `broker = "shm"` rejects DSNs and SQLAlchemy/network URLs. If the
