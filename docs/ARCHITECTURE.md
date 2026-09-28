@@ -534,7 +534,9 @@ intact.
 The broker is local-host only. Its canonical `state_dir`, `sqlite_path`, and
 `hint_path` resolve to absolute, package-namespaced paths under a private
 per-user state directory (`0700` directories and `0600` files on POSIX).
-Explicit SHM rejects DSNs and SQLAlchemy/network URLs. SQLite uses WAL with
+The default directory name digests the package's resolved install path, so a
+redeploy to another path opens a new, empty store; production deploys set
+`state_dir` (see DEPLOYMENT.md). Explicit SHM rejects DSNs and SQLAlchemy/network URLs. SQLite uses WAL with
 `synchronous=NORMAL` by default, which survives application/process restart on
 the same disk; set `sqlite_synchronous="FULL"` for the last commits to survive
 OS failure or power loss.

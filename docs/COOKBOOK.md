@@ -509,7 +509,12 @@ missing, corrupt, stale, or wrapped. A successful `publish()` has already
 committed to SQLite.
 
 By default its absolute, package-namespaced files live in the platform's private
-per-user state directory. Configure paths canonically when needed:
+per-user state directory, under a name that digests the package's resolved
+install path. Redeploying the same code to another path (a new release
+directory behind a `current` symlink, a new venv) therefore switches to a new,
+empty store and strands the old one's backlog, so production deploys must set
+`state_dir` (or `MODULITH_BROKER_STATE_DIR`). Startup logs the store path and
+whether it is the default. Configure paths canonically when needed:
 
 ```toml
 [tool.modulith.broker_options]

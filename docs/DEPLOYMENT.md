@@ -191,6 +191,22 @@ the proxy is reachable only through the ingress) on the proxy process so
 
 **Request targets.** The proxy forwards the client's path bytes unchanged (an encoded `%2F` stays one segment) to the matched module's own worker only. It answers `400` for a request-target that does not start with `/` or that contains a `.` or `..` path segment, literal or percent-encoded, and contacts no worker for it.
 
+**Set `state_dir` for the SHM broker in production.** Without it, the `shm`
+store lives in a per-user directory named after a digest of the package's
+resolved install path (symlinks followed). The same code deployed to another
+path — a new `releases/<ts>` behind a `current` symlink, a new venv, another
+checkout — therefore opens a new, empty store, and the old store's undelivered
+and retained events are never delivered. Pin the location:
+
+```toml
+[tool.modulith.broker_options]
+state_dir = "/var/lib/myapp/modulith"   # or MODULITH_BROKER_STATE_DIR
+```
+
+Each process logs the store path at startup, marked as an explicit `state_dir`
+or the default location, and `modulith run --topology processes` logs a
+warning while `state_dir` is unset.
+
 **Sizing the default SHM store.** The local `shm` broker keeps every
 publication for `orphan_retention_seconds` (default 86400) even after every
 group has acked it, so late subscribers can replay it. Its store (`max_store_bytes`,

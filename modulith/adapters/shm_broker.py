@@ -53,7 +53,7 @@ from ._polling_consumer import PollingConsumer
 from ._shm_coldstore import ShmColdStore
 from ._shm_ring import _HEADER_SIZE, _SLOT_SIZE, ShmRing
 from ._shm_types import ClaimToken
-from ._state_path import resolve_state_directory, resolve_state_file
+from ._state_path import default_state_directory, resolve_state_directory, resolve_state_file
 
 logger = logging.getLogger("modulith.adapters.shm")
 
@@ -757,7 +757,16 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
         hint_path,
         capacity,
     )
-    logger.debug("shm broker private state directory: %s", state_dir)
+    # A worker receives the supervisor's resolution as MODULITH_BROKER_STATE_DIR,
+    # so "was state_dir set" cannot tell a defaulted store apart; compare paths.
+    if state_dir == default_state_directory(cfg.package):
+        logger.info(
+            "shm broker state directory: %s (default location, keyed on the "
+            "package's install path; set state_dir in production)",
+            state_dir,
+        )
+    else:
+        logger.info("shm broker state directory: %s (explicit state_dir)", state_dir)
 
 
 @hookimpl
