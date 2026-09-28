@@ -671,22 +671,23 @@ def _run_process_topology(
         else:
             worker_env[env_key] = str(value)
     if cfg.broker == "shm":
-        from .adapters.shm_broker import _broker_opt, _resolve_shm_paths
+        from .adapters.shm_broker import _resolve_shm_paths, _shm_store_is_defaulted
 
-        if warn_default_state_dir and (
-            _broker_opt(cfg.broker_options or {}, "state_dir", "STATE_DIR") is None
-        ):
-            logger.warning(
-                "SHM broker state_dir is not set: the default state directory is keyed "
-                "on the package's install path, so a redeploy to a different path "
-                "(a new release directory, venv or checkout) opens an empty store and "
-                "strands undelivered events in the old one. Production deploys must set "
-                "[tool.modulith.broker_options].state_dir or MODULITH_BROKER_STATE_DIR."
-            )
         state_dir, sqlite_path, hint_path = _resolve_shm_paths(
             cfg.package,
             cfg.broker_options or {},
         )
+        if warn_default_state_dir and _shm_store_is_defaulted(cfg.package, sqlite_path):
+            logger.warning(
+                "SHM broker state_dir is not set: the SQLite store %s lives in the "
+                "default state directory, which is keyed on the package's install "
+                "path, so a redeploy to a different path (a new release directory, "
+                "venv or checkout) opens an empty store and strands undelivered events "
+                "in the old one. Production deploys must set "
+                "[tool.modulith.broker_options].state_dir or MODULITH_BROKER_STATE_DIR, "
+                "or an absolute sqlite_path.",
+                sqlite_path,
+            )
         for env_key, path in (
             ("MODULITH_BROKER_STATE_DIR", state_dir),
             ("MODULITH_BROKER_SQLITE_PATH", sqlite_path),

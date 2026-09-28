@@ -117,13 +117,20 @@ def publish(
     except (sqlite3.Error, _PublishReserveReached) as error:
         if isinstance(error, _PublishReserveReached) or _is_store_full(error):
             raise ConfigurationError(
-                "SHM SQLite store is full while publishing. Every publication is "
-                f"kept for orphan_retention_seconds (currently {retention_seconds:g}) "
-                "even after every group has acked it, so the store sustains about "
-                "max_store_bytes / (bytes per publication x orphan_retention_seconds) "
-                "publications per second. Increase max_store_bytes (currently "
-                f"{max_store_bytes}) or shorten orphan_retention_seconds; if the disk "
-                "itself is full, free disk space."
+                "SHM SQLite store is full while publishing. A publication stays in "
+                "the store while any subscribed group has not consumed it (an "
+                "undelivered backlog, including a retired group that never consumes "
+                "again), for orphan_retention_seconds (currently "
+                f"{retention_seconds:g}) after it is written even once every group "
+                'has acked it, and, under completion_mode="mark" or once '
+                "dead-lettered, until retention_age_seconds after completion. The "
+                "store sustains about max_store_bytes / (bytes per publication x the "
+                "longest of those retentions) publications per second. Let stopped "
+                "consumers drain the backlog, remove a retired group (named in the "
+                "modulith run startup warning) with modulith broker drop-group, or "
+                f"raise max_store_bytes (currently {max_store_bytes}) and restart every "
+                "process, since each opened store keeps the limit it opened with; if "
+                "the disk itself is full, free disk space."
             ) from error
         raise
     return publication

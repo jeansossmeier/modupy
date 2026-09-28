@@ -755,6 +755,8 @@ def test_payload_columns_compile_to_longblob_for_mysql_and_mariadb() -> None:
         ({"no_subscriber_wait_poll_interval_ms": -1}, "no_subscriber_wait_poll_interval_ms"),
         ({"orphan_retention_seconds": True}, "orphan_retention_seconds"),
         ({"orphan_retention_seconds": 0}, "orphan_retention_seconds"),
+        ({"orphan_retention_seconds": 100 * 365 * 86400.0 + 1}, "orphan_retention_seconds"),
+        ({"orphan_retention_seconds": 1e12}, "orphan_retention_seconds"),
     ],
 )
 def test_broker_rejects_invalid_policy_options(kwargs: dict[str, Any], option_name: str) -> None:

@@ -67,6 +67,9 @@ _DEFAULT_RECLAIM_STALE_S = 60.0
 _MAX_DELIVERY_ATTEMPTS = 5
 _DEFAULT_RETENTION_AGE_S = 3 * 86400.0
 _DEFAULT_ORPHAN_RETENTION_S = 86400.0
+# must match _MAX_ORPHAN_RETENTION_S in db_broker.py; far below the
+# timedelta/datetime overflow that the database broker's expiry stamp hits.
+_MAX_ORPHAN_RETENTION_S = 100 * 365 * 86400.0
 _DEFAULT_COMPLETION_MODE = "delete"
 _COMPLETION_MODES = frozenset({"delete", "mark"})
 _DEFAULT_SHM_CAPACITY = 8192
@@ -174,6 +177,11 @@ class ShmBroker:
             orphan_retention_seconds,
             "orphan_retention_seconds",
         )
+        if orphan_retention_seconds > _MAX_ORPHAN_RETENTION_S:
+            raise ConfigurationError(
+                f"orphan_retention_seconds must be <= {_MAX_ORPHAN_RETENTION_S:g} "
+                f"(100 years), got {orphan_retention_seconds!r}"
+            )
         synchronous = _validated_synchronous(synchronous)
         max_payload_bytes = _bounded_positive_int(
             max_payload_bytes,
@@ -607,6 +615,11 @@ def _resolve_shm_paths(
     return state_dir, sqlite_path, hint_path
 
 
+def _shm_store_is_defaulted(package: str | None, sqlite_path: Path) -> bool:
+    """Whether the SQLite store sits in the install-path-keyed default directory."""
+    return sqlite_path.is_relative_to(default_state_directory(package))
+
+
 def _opt_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -759,14 +772,19 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
     )
     # A worker receives the supervisor's resolution as MODULITH_BROKER_STATE_DIR,
     # so "was state_dir set" cannot tell a defaulted store apart; compare paths.
-    if state_dir == default_state_directory(cfg.package):
+    if _shm_store_is_defaulted(cfg.package, db_path):
         logger.info(
-            "shm broker state directory: %s (default location, keyed on the "
-            "package's install path; set state_dir in production)",
+            "shm broker SQLite store: %s, state directory: %s (default location, "
+            "keyed on the package's install path; set state_dir in production)",
+            db_path,
             state_dir,
         )
     else:
-        logger.info("shm broker state directory: %s (explicit state_dir)", state_dir)
+        logger.info(
+            "shm broker SQLite store: %s, state directory: %s (explicit state_dir or sqlite_path)",
+            db_path,
+            state_dir,
+        )
 
 
 @hookimpl
