@@ -11,11 +11,15 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-from modulith import event
-from modulith._consumer import BrokerConsumer
+from modulith import event, externalized
+from modulith._consumer import BrokerConsumer, consumer_targets
 from modulith.adapters._polling_consumer import PollingConsumer
+from modulith.adapters.shm_broker import ShmBroker, ShmConsumer
+from modulith.brokers import BrokerRegistry
 from modulith.event_bus import InMemoryEventBus
 from modulith.serializers import JsonEventSerializer
 
@@ -636,3 +640,56 @@ async def test_broker_consumer_stop_abandons_a_task_that_never_stops(caplog) -> 
         task.cancel()
         await asyncio.wait({task}, timeout=2.0)
     assert task.done()
+
+
+@event
+@externalized(target="shm: orders.placed")
+@dataclass(frozen=True)
+class PaddedTargetEvent:
+    order_id: str
+
+
+async def test_whitespace_padded_target_reaches_the_shm_consumer(tmp_path: Path) -> None:
+    """Producer and consumer resolve a padded target to the same destination.
+
+    The producer publishes the raw padded string, as a hook-resolved target or
+    an outbox row persisted with that target would hand it to the registry.
+    """
+    broker = ShmBroker(shm_name="padded-target-hints", db_path=str(tmp_path / "padded.db"))
+    registry = BrokerRegistry()
+    registry.register("shm", broker)
+    delivered: list[PaddedTargetEvent] = []
+
+    async def on_order(item: PaddedTargetEvent) -> None:
+        delivered.append(item)
+
+    bus = InMemoryEventBus()
+    bus.register(PaddedTargetEvent, on_order)
+    cfg = SimpleNamespace(
+        broker="shm", subscription_source="listener", package=None, subscriptions={}
+    )
+    serializer = JsonEventSerializer(allowed_event_types=[PaddedTargetEvent])
+    consumer = ShmConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=consumer_targets(bus, cfg, "inventory"),
+        poll_interval_s=0.01,
+    )
+    await consumer.start()
+    try:
+        await registry.publish(
+            "shm: orders.placed",
+            serializer.serialize(PaddedTargetEvent("o-1")),
+            {"event_type": f"{__name__}.PaddedTargetEvent"},
+        )
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while not delivered and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        assert delivered == [PaddedTargetEvent("o-1")]
+    finally:
+        await consumer.stop()
+        await broker.close()
+        broker._ring.unlink()

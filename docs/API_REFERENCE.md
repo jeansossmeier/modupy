@@ -261,6 +261,10 @@ The runtime resolves an event's broker target in priority order:
   2. this annotation's explicit ``target`` (static per-event override),
   3. the default scheme ``{broker}:{fully-qualified-event-name}``.
 
+An explicit ``target`` is stored with the whitespace around its scheme and
+destination stripped. One whose scheme or destination is empty raises
+``ConfigurationError`` here, at decoration time.
+
 ## Manifests
 
 Declare and read a module's contract (what it publishes, consumes, owns).

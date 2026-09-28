@@ -24,6 +24,17 @@ from .protocols import Broker, Consumer
 logger = logging.getLogger(__name__)
 
 
+def _split_broker_target(target: str) -> tuple[str, str]:
+    """Split a ``scheme:destination`` target into its whitespace-stripped parts.
+
+    Splits on the first colon only, so destinations may themselves contain
+    colons (AMQP ``exchange:routing.key``). A part is empty when the target is
+    malformed; callers raise their own error type for that.
+    """
+    scheme, _, destination = target.partition(":")
+    return scheme.strip(), destination.strip()
+
+
 class UnknownBrokerError(KeyError):
     """Raised when an event targets a scheme with no registered broker.
 
@@ -100,9 +111,10 @@ class BrokerRegistry:
 
         ``target`` must be in ``scheme:destination`` form. Splits on the
         first colon, so destinations may themselves contain colons
-        (e.g. AMQP ``exchange:routing.key``).
+        (e.g. AMQP ``exchange:routing.key``). Whitespace around the scheme
+        and the destination is stripped, matching how consumers subscribe.
         """
-        scheme, _, destination = target.partition(":")
+        scheme, destination = _split_broker_target(target)
         if not destination:
             raise ValueError(f"invalid broker target {target!r}; expected 'scheme:destination'")
         broker = self.get(scheme)
