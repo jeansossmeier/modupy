@@ -19,6 +19,8 @@ import pytest
 from modulith import event, listener, publish, publish_sync
 from modulith.decorators import configure
 
+pytest_plugins = "pytester"
+
 
 # Module-level event types so @listener annotations resolve to real classes.
 @event
@@ -261,6 +263,144 @@ def test_isolated_marker_survives_a_parent_run_under_coverage(tmp_path) -> None:
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "2 passed" in completed.stdout
+
+
+_ISOLATED_OUTCOMES = """
+import pytest
+
+@pytest.mark.modulith_isolated
+def test_passes():
+    pass
+
+@pytest.mark.modulith_isolated
+@pytest.mark.skip(reason="declared skip")
+def test_marked_skip():
+    raise AssertionError("body must not run")
+
+@pytest.mark.modulith_isolated
+@pytest.mark.skipif(True, reason="platform gate")
+def test_skipif():
+    raise AssertionError("body must not run")
+
+@pytest.mark.modulith_isolated
+def test_imperative_skip():
+    pytest.skip("optional dependency missing")
+
+@pytest.mark.modulith_isolated
+@pytest.mark.xfail(reason="known bug")
+def test_xfail():
+    raise AssertionError("known failure")
+
+@pytest.mark.modulith_isolated
+@pytest.mark.xfail(reason="fixed upstream")
+def test_xpass():
+    pass
+
+@pytest.mark.modulith_isolated
+@pytest.mark.xfail(reason="must stay broken", strict=True)
+def test_strict_xpass():
+    pass
+"""
+
+
+def test_isolated_test_reports_the_childs_skip_and_xfail_outcomes(pytester) -> None:
+    """The isolated body runs in the child, so the parent never evaluates
+    skip/xfail marks. A child that skipped or xfailed exits 0; reading only
+    the exit code reported those tests as PASSED although their bodies never
+    ran (or failed as expected)."""
+    pytester.makepyfile(test_outcomes=_ISOLATED_OUTCOMES)
+
+    result = pytester.runpytest("-rsxX")
+
+    result.assert_outcomes(passed=1, skipped=3, xfailed=1, xpassed=1, failed=1)
+    result.stdout.fnmatch_lines_random(
+        [
+            "SKIPPED*test_outcomes.py:*: declared skip",
+            "SKIPPED*test_outcomes.py:*: platform gate",
+            "SKIPPED*test_outcomes.py:*: optional dependency missing",
+            "XFAIL*test_xfail*known bug",
+            "XPASS*test_xpass*fixed upstream",
+            "*XPASS(strict)*must stay broken*",
+        ]
+    )
+
+
+def test_isolated_child_that_runs_no_test_fails_the_parent(pytester) -> None:
+    """A plugin can end the child with exit 0 without running the test (for
+    example one that suppresses pytest's no-tests-ran exit code). The parent
+    must fail the test rather than read the clean exit as a pass."""
+    pytester.makeconftest(
+        """
+        import os
+
+        def pytest_collection_modifyitems(config, items):
+            if os.environ.get("MODULITH_ISOLATED_SUBPROCESS") == "1":
+                config.hook.pytest_deselected(items=list(items))
+                items[:] = []
+
+        def pytest_sessionfinish(session):
+            if os.environ.get("MODULITH_ISOLATED_SUBPROCESS") == "1":
+                session.exitstatus = 0
+        """
+    )
+    pytester.makepyfile(
+        test_no_run="""
+        import pytest
+
+        @pytest.mark.modulith_isolated
+        def test_isolated():
+            pass
+        """
+    )
+
+    result = pytester.runpytest()
+
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(
+        ["*isolated subprocess for test_no_run.py::test_isolated exited 0 without running*"]
+    )
+
+
+def test_isolated_outcomes_survive_a_user_junitxml(pytester) -> None:
+    """The parent's --junitxml is forwarded to the child, so the child's
+    outcome must travel on a channel of its own; the user's report must still
+    record the isolated skip and xfail."""
+    import xml.etree.ElementTree as ET
+
+    pytester.makepyfile(
+        test_junit="""
+        import pytest
+
+        @pytest.mark.modulith_isolated
+        def test_passes():
+            pass
+
+        @pytest.mark.modulith_isolated
+        def test_imperative_skip():
+            pytest.skip("optional dependency missing")
+
+        @pytest.mark.modulith_isolated
+        @pytest.mark.xfail(reason="known bug")
+        def test_xfail():
+            raise AssertionError("known failure")
+        """
+    )
+    xml_path = pytester.path / "report.xml"
+
+    result = pytester.runpytest(f"--junitxml={xml_path}")
+
+    result.assert_outcomes(passed=1, skipped=1, xfailed=1)
+    cases = {case.get("name"): case for case in ET.parse(xml_path).getroot().iter("testcase")}
+    skips = {
+        name: skipped.get("message")
+        for name, case in cases.items()
+        if (skipped := case.find("skipped")) is not None
+    }
+    assert skips == {
+        "test_imperative_skip": "optional dependency missing",
+        "test_xfail": "known bug",
+    }
+    assert set(cases) == {"test_passes", "test_imperative_skip", "test_xfail"}
 
 
 @pytest.mark.modulith_no_outbox
