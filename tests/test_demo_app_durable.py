@@ -4,9 +4,8 @@ Drives the REAL ``shop`` package (not a synthetic fixture app) with the
 transactional outbox wired to a real SQLAlchemy engine, proving the durable
 path documented in ``shop.main``'s lifespan actually works: ``place_order``
 persists an ``Order`` row atomically with the ``OrderPlaced`` outbox row, and
-after commit the after-commit hook dispatches the event to ``inventory``'s
-listener — exactly the chain ``tests/test_demo_app.py`` proves for the
-default in-memory path.
+after commit the event reaches ``inventory``'s listener — exactly the chain
+``tests/test_demo_app.py`` proves for the default in-memory path.
 
 The default-lane test uses a temp-file SQLite engine (no Docker); an
 ``@pytest.mark.integration`` variant repeats the same assertions against real
@@ -15,8 +14,10 @@ Postgres via the shared ``postgres_url`` fixture (see tests/conftest.py).
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sqlalchemy import select
@@ -31,6 +32,21 @@ from modulith.runtime import _runtime
 from modulith.serializers import JsonEventSerializer
 
 DEMO_ROOT = Path(__file__).resolve().parent.parent / "examples" / "demo_app"
+
+
+async def _until_reserved(inventory: Any, order_id: str, timeout: float = 5.0) -> None:
+    """Wait for ``inventory``'s listener to record ``order_id``.
+
+    ``wait_for_dispatch()`` awaits only after-commit dispatch tasks. The retry
+    loop's startup sweep (``older_than=0``) can claim the just-committed row
+    first, and after-commit dispatch then leaves the row to that sweep.
+    """
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+    while not any(evt.order_id == order_id for evt in inventory.reserved):
+        if loop.time() >= end:
+            raise AssertionError(f"order {order_id} was never reserved")
+        await asyncio.sleep(0.02)
 
 
 @pytest.fixture
@@ -103,8 +119,7 @@ async def test_durable_outbox_persists_order_and_dispatches_across_modules(
             assert row.customer_id == "c-durable"
             assert row.total == 42.0
 
-        # after-commit dispatch delivered OrderPlaced to inventory's listener.
-        assert any(evt.order_id == order_id for evt in inventory.reserved)
+        await _until_reserved(inventory, order_id)
 
         await store.dispose()
         await outbox.shutdown()
@@ -151,7 +166,7 @@ async def test_durable_outbox_persists_order_and_dispatches_across_modules_on_po
             row: Order = (await s.execute(select(Order).where(Order.id == order_id))).scalar_one()
             assert row.customer_id == "c-pg"
 
-        assert any(evt.order_id == order_id for evt in inventory.reserved)
+        await _until_reserved(inventory, order_id)
 
         await store.dispose()
         await outbox.shutdown()
