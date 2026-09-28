@@ -220,6 +220,7 @@ class _PublishAfterEmptyClaimBroker(ShmBroker):
         consumer_name: str,
         reclaim_stale_seconds: float = 60.0,
         max_attempts: int | None = None,
+        targets: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
         rows = await super().claim_batch(
             group,
@@ -227,6 +228,7 @@ class _PublishAfterEmptyClaimBroker(ShmBroker):
             consumer_name=consumer_name,
             reclaim_stale_seconds=reclaim_stale_seconds,
             max_attempts=max_attempts,
+            targets=targets,
         )
         if rows or not self._publications:
             return rows

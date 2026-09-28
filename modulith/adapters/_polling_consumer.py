@@ -197,6 +197,7 @@ class PollingConsumer(DeliveryDispatch):
                     consumer_name=self._consumer_name,
                     reclaim_stale_seconds=self._reclaim_stale_seconds,
                     max_attempts=self._max_attempts,
+                    targets=self._targets,
                 )
             except asyncio.CancelledError:
                 raise

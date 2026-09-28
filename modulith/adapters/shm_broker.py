@@ -348,8 +348,12 @@ class ShmBroker:
         consumer_name: str,
         reclaim_stale_seconds: float = _DEFAULT_RECLAIM_STALE_S,
         max_attempts: int | None = None,
+        targets: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
         """Atomically claim durable work, including abandoned stale claims.
+
+        ``targets``, when given, restricts the claim to those targets, so
+        deliveries for a target the consumer no longer consumes stay pending.
 
         A stale-claim reclaim bumps ``attempts`` only for a row whose
         dispatch had started (``renew_claims(..., start_dispatch=True)``);
@@ -371,6 +375,7 @@ class ShmBroker:
             consumer_name=consumer_name,
             reclaim_stale_seconds=reclaim_stale_seconds,
             max_attempts=max_attempts,
+            targets=targets,
         )
 
     async def renew_claims(

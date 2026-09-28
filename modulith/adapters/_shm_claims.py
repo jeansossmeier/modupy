@@ -44,10 +44,28 @@ _ROW_FIELDS = (
     "d.id AS delivery_id, d.claim_generation, d.attempts, d.dispatch_started, d.last_error, p.*"
 )
 
-_PENDING_SIZES_SQL = f"SELECT {_SIZE_FIELDS} {_JOIN} WHERE {_PENDING_PREDICATE} {_ORDER_LIMIT}"
-_STALE_SIZES_SQL = f"SELECT {_SIZE_FIELDS} {_JOIN} WHERE {_STALE_CLAIMED_PREDICATE} {_ORDER_LIMIT}"
-_PENDING_ROWS_SQL = f"SELECT {_ROW_FIELDS} {_JOIN} WHERE {_PENDING_PREDICATE} {_ORDER_LIMIT}"
-_STALE_ROWS_SQL = f"SELECT {_ROW_FIELDS} {_JOIN} WHERE {_STALE_CLAIMED_PREDICATE} {_ORDER_LIMIT}"
+_T = "{targets}"
+_PENDING_SIZES_SQL = f"SELECT {_SIZE_FIELDS} {_JOIN} WHERE {_PENDING_PREDICATE}{_T} {_ORDER_LIMIT}"
+_STALE_SIZES_SQL = (
+    f"SELECT {_SIZE_FIELDS} {_JOIN} WHERE {_STALE_CLAIMED_PREDICATE}{_T} {_ORDER_LIMIT}"
+)
+_PENDING_ROWS_SQL = f"SELECT {_ROW_FIELDS} {_JOIN} WHERE {_PENDING_PREDICATE}{_T} {_ORDER_LIMIT}"
+_STALE_ROWS_SQL = (
+    f"SELECT {_ROW_FIELDS} {_JOIN} WHERE {_STALE_CLAIMED_PREDICATE}{_T} {_ORDER_LIMIT}"
+)
+
+
+def _target_filter(
+    targets: list[str] | tuple[str, ...] | None,
+) -> tuple[str, tuple[str, ...]]:
+    """SQL fragment and parameters restricting a claim to ``targets``."""
+    # ponytail: rows for excluded targets are skipped inside the range scan,
+    # so a large backlog on a no-longer-consumed target costs each poll a scan
+    # of it; ``modulith broker drop-group --target`` removes that backlog.
+    if targets is None:
+        return "", ()
+    names = tuple(targets)
+    return f" AND p.target IN ({','.join('?' * len(names))})", names
 
 
 def claim(
@@ -58,8 +76,12 @@ def claim(
     reclaim_stale_seconds: float,
     max_claim_bytes: int,
     max_attempts: int | None = None,
+    targets: list[str] | tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """Atomically claim due pending work and abandoned stale claims.
+
+    ``targets``, when given, restricts the claim to deliveries of
+    publications for those targets; the rest stay undelivered.
 
     A stale-claim reclaim bumps ``attempts`` only when the abandoned claim
     had started dispatching the row (``renew_claims(..., start_dispatch=True)``
@@ -75,11 +97,11 @@ def claim(
     cutoff = now - reclaim_stale_seconds
     claimed: list[dict[str, Any]] = []
     with immediate_transaction(conn):
-        candidates = _merged_size_candidates(conn, group, now, cutoff, limit)
+        candidates = _merged_size_candidates(conn, group, now, cutoff, limit, targets)
         affordable = _affordable_candidates(candidates, max_claim_bytes)
         if not affordable:
             return claimed
-        rows_by_id = _fetch_needed_rows(conn, group, now, cutoff, affordable)
+        rows_by_id = _fetch_needed_rows(conn, group, now, cutoff, affordable, targets)
         for branch, delivery_id, _row_bytes in affordable:
             row = rows_by_id[delivery_id]
             charge = 1 if branch == "stale" and row["dispatch_started"] else 0
@@ -120,6 +142,7 @@ def _merged_size_candidates(
     now: float,
     cutoff: float,
     limit: int,
+    targets: list[str] | tuple[str, ...] | None = None,
 ) -> list[tuple[str, int, int]]:
     """Merge each branch's own bounded, pre-sorted candidates into one list.
 
@@ -133,9 +156,13 @@ def _merged_size_candidates(
             row_bytes = int(row["payload_bytes"]) + int(row["headers_bytes"] or 0)
             yield (row["available_at"], int(row["delivery_id"]), branch, row_bytes)
 
-    pending = _entries(conn.execute(_PENDING_SIZES_SQL, (group, now, limit)), "pending")
+    clause, names = _target_filter(targets)
+    pending = _entries(
+        conn.execute(_PENDING_SIZES_SQL.format(targets=clause), (group, now, *names, limit)),
+        "pending",
+    )
     stale = _entries(
-        conn.execute(_STALE_SIZES_SQL, (group, now, cutoff, limit)),
+        conn.execute(_STALE_SIZES_SQL.format(targets=clause), (group, now, cutoff, *names, limit)),
         "stale",
     )
     merged = heapq.merge(pending, stale, key=lambda entry: (entry[0], entry[1]))
@@ -169,16 +196,20 @@ def _fetch_needed_rows(
     now: float,
     cutoff: float,
     affordable: list[tuple[str, int, int]],
+    targets: list[str] | tuple[str, ...] | None = None,
 ) -> dict[int, sqlite3.Row]:
     """Read full payload rows only for the exact ids the budget affords."""
     needed_pending = sum(1 for candidate in affordable if candidate[0] == "pending")
     needed_stale = len(affordable) - needed_pending
+    clause, names = _target_filter(targets)
     rows_by_id: dict[int, sqlite3.Row] = {}
     if needed_pending:
-        for row in conn.execute(_PENDING_ROWS_SQL, (group, now, needed_pending)):
+        pending_sql = _PENDING_ROWS_SQL.format(targets=clause)
+        for row in conn.execute(pending_sql, (group, now, *names, needed_pending)):
             rows_by_id[int(row["delivery_id"])] = row
     if needed_stale:
-        for row in conn.execute(_STALE_ROWS_SQL, (group, now, cutoff, needed_stale)):
+        stale_sql = _STALE_ROWS_SQL.format(targets=clause)
+        for row in conn.execute(stale_sql, (group, now, cutoff, *names, needed_stale)):
             rows_by_id[int(row["delivery_id"])] = row
     return rows_by_id
 

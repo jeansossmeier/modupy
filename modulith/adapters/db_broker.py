@@ -1800,8 +1800,15 @@ class DatabaseBroker:
         consumer_name: str,
         reclaim_stale_seconds: float = _DEFAULT_RECLAIM_STALE_S,
         max_attempts: int | None = None,
+        targets: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
         """Claim up to ``batch_size`` due rows for ``group``.
+
+        ``targets``, when given, restricts the claim to rows for those
+        targets. A consumer passes the targets it currently consumes, so rows
+        fanned out through a subscription its module no longer consumes stay
+        ``pending`` for a rollback or an explicit ``drop_group(...,
+        targets=...)`` instead of being dead-lettered as undeserializable.
 
         Picks up both freshly ``pending`` rows AND rows stuck in ``claimed``
         whose ``claimed_at`` is older than ``reclaim_stale_seconds`` — the
@@ -1854,6 +1861,8 @@ class DatabaseBroker:
                 .order_by(message.c.available_at)
                 .limit(batch_size)
             )
+            if targets is not None:
+                stmt = stmt.where(message.c.target.in_(list(targets)))
             if _supports_skip_locked(self._engine):
                 stmt = stmt.with_for_update(skip_locked=True)
             result = await conn.execute(stmt)

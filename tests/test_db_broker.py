@@ -4591,3 +4591,93 @@ async def test_drop_group_removes_a_retired_groups_subscription_and_undelivered_
     assert groups == {"modulith-orders"}
     assert message_groups == {"modulith-orders"}
     assert await broker.drop_group("modulith-retired") == (0, 0)
+
+
+@event
+@dataclass(frozen=True)
+class SiblingNoteSent:
+    text: str
+
+
+async def _statuses_by_target(engine: Any) -> dict[str, list[str]]:
+    from sqlalchemy import select
+
+    _, _, message = broker_schema()
+    async with engine.connect() as conn:
+        result = await conn.execute(select(message.c.target, message.c.status))
+        out: dict[str, list[str]] = {}
+        for target, status in result:
+            out.setdefault(target, []).append(status)
+        return out
+
+
+async def _statuses_equal(engine: Any, expected: dict[str, list[str]]) -> bool:
+    return await _statuses_by_target(engine) == expected
+
+
+async def test_consumer_leaves_rows_for_a_target_it_no_longer_consumes_pending(
+    engine: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    delivered: list[str] = []
+
+    async def handler(evt: WidgetCreated) -> None:
+        delivered.append(evt.name)
+
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+    broker = DatabaseBroker(engine=engine, completion_mode="mark")
+    live = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    stale = f"{SiblingNoteSent.__module__}.{SiblingNoteSent.__qualname__}"
+    await broker.subscribe([stale], "modulith-inventory")
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=[live],
+        poll_interval_s=0.01,
+    )
+    await consumer.start()
+    try:
+        sibling_payload = JsonEventSerializer().serialize(SiblingNoteSent(text="n"))
+        await broker.publish(stale, sibling_payload, {"event_type": stale})
+        await broker.publish(
+            live, serializer.serialize(WidgetCreated(name="w1")), {"event_type": live}
+        )
+        await _until_async(lambda: _delivered(delivered))
+        await _until_async(lambda: _statuses_equal(engine, {stale: ["pending"], live: ["done"]}))
+    finally:
+        await consumer.stop()
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+async def test_consumer_still_dead_letters_a_foreign_type_on_a_target_it_consumes(
+    engine: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+    broker = DatabaseBroker(engine=engine, completion_mode="mark")
+    live = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=InMemoryEventBus(),
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=[live],
+        poll_interval_s=0.01,
+    )
+    await consumer.start()
+    try:
+        foreign = JsonEventSerializer().serialize(SiblingNoteSent(text="n"))
+        foreign_type = f"{SiblingNoteSent.__module__}.{SiblingNoteSent.__qualname__}"
+        await broker.publish(live, foreign, {"event_type": foreign_type})
+        await _until_async(lambda: _statuses_equal(engine, {live: ["dead"]}))
+    finally:
+        await consumer.stop()
+    assert any(
+        "not in the allowed event types" in r.getMessage()
+        or (r.exc_info and "not in the allowed event types" in str(r.exc_info[1]))
+        for r in caplog.records
+    )

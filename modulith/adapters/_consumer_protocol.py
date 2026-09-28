@@ -22,6 +22,7 @@ class PollingBroker(Protocol):
         consumer_name: str,
         reclaim_stale_seconds: float,
         max_attempts: int | None = None,
+        targets: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]: ...
 
     async def renew_claims(

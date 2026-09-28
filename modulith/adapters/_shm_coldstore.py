@@ -112,6 +112,7 @@ class ShmColdStore(SerialStoreExecutor):
         consumer_name: str = "",
         reclaim_stale_seconds: float = 60.0,
         max_attempts: int | None = None,
+        targets: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
         if type(limit) is not int or limit < 1:
             raise ValueError("limit must be an integer >= 1")
@@ -125,6 +126,7 @@ class ShmColdStore(SerialStoreExecutor):
                 consumer_name,
                 reclaim_stale_seconds,
                 max_attempts,
+                None if targets is None else list(targets),
             ),
         )
 

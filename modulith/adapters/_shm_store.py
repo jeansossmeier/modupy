@@ -90,6 +90,7 @@ class SqliteQueueStore:
         consumer_name: str,
         reclaim_stale_seconds: float,
         max_attempts: int | None = None,
+        targets: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         return _shm_claims.claim(
             self._conn,
@@ -99,6 +100,7 @@ class SqliteQueueStore:
             reclaim_stale_seconds,
             self._max_payload_bytes,
             max_attempts,
+            targets,
         )
 
     def renew_claims(
