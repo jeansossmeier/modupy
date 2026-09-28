@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
+import httpx
 import pytest
+from fastapi import BackgroundTasks, Depends, FastAPI
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -1022,3 +1024,122 @@ async def test_after_commit_claim_expires_so_a_crashed_delivery_is_recovered(
 
     assert held == []
     assert [p.id for p in reclaimed] == [pub.id]
+
+
+# ---------------------------------------------------------------------------
+# A FastAPI request's post-commit publishes (BackgroundTasks) under get_db
+# ---------------------------------------------------------------------------
+
+
+async def _post_order_with_background_publish(engine: Any, *, commit_after_yield: bool) -> int:
+    """Drive a real FastAPI app: the route publishes, commits, then schedules a
+    BackgroundTasks job that publishes again. FastAPI runs that job before it
+    tears down the ``get_db`` dependency, so the job's publish lands in the
+    still-bound session after the route's commit."""
+
+    sessionmaker = async_sessionmaker(engine)
+
+    async def get_db() -> Any:
+        async with sessionmaker() as session:
+            token = bind_session(session)
+            try:
+                yield session
+                if commit_after_yield:
+                    await session.commit()
+            finally:
+                unbind_session(token)
+
+    async def notify() -> None:
+        await publish(G04Event(value=2))
+
+    app = FastAPI()
+
+    session_dependency = Depends(get_db)
+
+    @app.post("/order")
+    async def order(
+        background: BackgroundTasks, session: Any = session_dependency
+    ) -> dict[str, bool]:
+        await publish(G04Event(value=1))
+        await session.commit()
+        background.add_task(notify)
+        return {"ok": True}
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/order")
+    return response.status_code
+
+
+def _discard_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "discarded" in r.getMessage()
+    ]
+
+
+async def test_background_task_publish_discarded_by_get_db_teardown_is_logged(
+    engine: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Under a ``get_db`` that never commits after the route, a BackgroundTasks
+    publish joins a transaction nobody commits. Closing the session discards
+    it, and that loss is reported at WARNING naming the event type."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+
+    with caplog.at_level(logging.WARNING):
+        status = await _post_order_with_background_publish(engine, commit_after_yield=False)
+    await store.wait_for_dispatch()
+
+    assert status == 200
+    assert received == [1]
+    assert await _completed_rows(engine) == 1
+    [message] = _discard_warnings(caplog)
+    assert "1 outbox publication" in message
+    assert "G04Event" in message
+
+
+async def test_background_task_publish_delivered_when_get_db_commits_after_yield(
+    engine: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A ``get_db`` that commits after ``yield`` commits the BackgroundTasks
+    publish too, so it is delivered and nothing is reported as discarded."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+
+    with caplog.at_level(logging.WARNING):
+        status = await _post_order_with_background_publish(engine, commit_after_yield=True)
+    await store.wait_for_dispatch()
+
+    assert status == 200
+    assert received == [1, 2]
+    assert await _completed_rows(engine) == 2
+    assert _discard_warnings(caplog) == []
+
+
+async def test_rollback_discarding_bound_publish_is_logged(
+    engine: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A rollback still discards a bound publish, and the WARNING names it."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+
+    async with async_sessionmaker(engine)() as session:
+        token = bind_session(session)
+        try:
+            await publish(G04Event(value=1))
+            with caplog.at_level(logging.WARNING):
+                await session.rollback()
+            await session.commit()
+        finally:
+            unbind_session(token)
+    await store.wait_for_dispatch()
+
+    assert received == []
+    assert await _completed_rows(engine) == 0
+    [message] = _discard_warnings(caplog)
+    assert "G04Event" in message
