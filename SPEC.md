@@ -949,7 +949,7 @@ For non-isolated tests, the plugin handles state reset via session fixtures: cle
 
 ### 11.4 Subprocess-Per-Test Mode
 
-Activated via `@pytest.mark.modulith_isolated`. The plugin re-invokes pytest on that single test in a child process (an env-var guard prevents recursion) and synthesizes the test report from the child's exit code. State leaks are impossible. Cost: a full interpreter + pytest startup per test — fine for integration tests, not for unit tests on save.
+Activated via `@pytest.mark.modulith_isolated`. The plugin re-invokes pytest on that single test in a child process (an env-var guard prevents recursion) and synthesizes the test report from the child's exit code and the outcome the child records: a skipped or xfailed child stays skipped or xfailed, and a child that runs no test fails. State leaks are impossible. Cost: a full interpreter + pytest startup per test — fine for integration tests, not for unit tests on save.
 
 Each isolated subprocess is bounded by the `modulith_isolated_timeout` ini option (seconds, default `300`): a hung child is killed and reported as a failure of that one test — with its captured stdout/stderr — instead of blocking the suite forever. Tune it in pytest configuration, e.g.:
 

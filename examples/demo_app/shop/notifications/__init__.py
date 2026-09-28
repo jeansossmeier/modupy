@@ -31,8 +31,9 @@ async def notify_customer(event: StockReserved) -> None:
     """Notify the customer that their order's stock is reserved.
 
     Guarded by order_id membership: outbox delivery is at-least-once
-    (modulith/builtin/outbox.py:14-16 — a listener may be called more than
-    once), so a redelivered StockReserved must not notify twice.
+    (``modulith/builtin/outbox.py`` module docstring — a listener may be
+    called more than once), so a redelivered StockReserved must not notify
+    twice.
     """
     if any(evt.order_id == event.order_id for evt in sent):
         return
