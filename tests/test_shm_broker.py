@@ -755,7 +755,9 @@ async def test_orphan_retention_defaults_to_24_hours(tmp_path: Path) -> None:
 async def test_short_orphan_retention_frees_store_space_for_drained_publications(
     tmp_path: Path,
 ) -> None:
-    store_bytes = 256 * 1024
+    # Publishing between prune passes (every PRUNE_EVERY_N_PUBLISHES) peaks
+    # near 58 pages here; the store must hold that below its consumer reserve.
+    store_bytes = 320 * 1024
     attempts = 1000
     default_path = tmp_path / "default.db"
     default = ShmBroker(
