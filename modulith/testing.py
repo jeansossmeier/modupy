@@ -38,10 +38,12 @@ import contextlib
 import dataclasses
 import importlib
 import inspect
+import json
 import math
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import typing
@@ -433,6 +435,11 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 def pytest_configure(config: pytest.Config) -> None:
     """Register modulith markers so pytest doesn't warn about them."""
+    # Popped so a pytest the isolated test itself launches cannot append to
+    # the parent's result file.
+    result_path = os.environ.pop(_RESULT_FILE_ENV, None)
+    if result_path and os.environ.get(_ISOLATION_GUARD) == "1":
+        config.pluginmanager.register(_IsolatedResultWriter(result_path))
     config.addinivalue_line(
         "markers",
         "modulith_isolated: run this test in a subprocess for true isolation",
@@ -478,6 +485,32 @@ def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> 
 # Set in the child process so the re-run there executes the test inline
 # instead of recursing into another subprocess.
 _ISOLATION_GUARD = "MODULITH_ISOLATED_SUBPROCESS"
+# Path of a private JSON-lines file the child appends its test reports to. A
+# file of its own, because a user's --junitxml is forwarded to the child.
+_RESULT_FILE_ENV = "MODULITH_ISOLATED_RESULT_FILE"
+
+
+class _IsolatedResultWriter:
+    """Child-side plugin: record each report's outcome for the parent."""
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        longrepr = report.longrepr
+        record = {
+            "when": report.when,
+            "outcome": report.outcome,
+            # A skip's longrepr is a (path, lineno, reason) tuple that the
+            # terminal and junitxml reporters unpack; anything else is text.
+            "longrepr": list(longrepr)
+            if isinstance(longrepr, tuple)
+            else (None if longrepr is None else str(longrepr)),
+            "wasxfail": getattr(report, "wasxfail", None),
+        }
+        with open(self._path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+
 
 # Options never forwarded to the isolated child. The child runs with the
 # cacheprovider plugin disabled (``-p no:cacheprovider``), so cache-backed
@@ -559,7 +592,9 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
     True isolation: import-time side effects and global state from other
     tests can't leak in. We re-invoke pytest on this single test in a child
     process (guarded by an env var to prevent infinite recursion), then
-    synthesize a report from the child's exit code. Returning ``None`` for
+    synthesize a report from the child's exit code and the outcome it
+    records to a private result file, so a skip or xfail stays one and a
+    child that ran no test fails. Returning ``None`` for
     every other case hands control straight back to pytest's default
     protocol, so unmarked tests are completely unaffected.
 
@@ -602,7 +637,8 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
     if item.config.pluginmanager.hasplugin("_cov"):
         argv.append("--no-cov")
 
-    def _outcome() -> None:
+    def _outcome() -> dict[str, Any] | None:
+        """Run the child; return its skip/xfail/xpass record, or None for a pass."""
         raw_timeout = item.config.getini("modulith_isolated_timeout")
         try:
             timeout = float(raw_timeout)
@@ -611,36 +647,65 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
                 f"invalid modulith_isolated_timeout ini value {raw_timeout!r}: "
                 "expected a number of seconds"
             ) from None
+        fd, result_path = tempfile.mkstemp(prefix="modulith-isolated-", suffix=".jsonl")
+        os.close(fd)
+        env[_RESULT_FILE_ENV] = result_path
         try:
-            completed = subprocess.run(
-                argv,
-                env=env,
-                # Nodeids are rootdir-relative; the parent's incidental cwd
-                # need not be (and often isn't) the rootdir.
-                cwd=str(item.config.rootpath),
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired as exc:
+            try:
+                completed = subprocess.run(
+                    argv,
+                    env=env,
+                    # Nodeids are rootdir-relative; the parent's incidental cwd
+                    # need not be (and often isn't) the rootdir.
+                    cwd=str(item.config.rootpath),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise AssertionError(
+                    f"isolated subprocess for {item.nodeid} timed out after "
+                    f"{timeout}s (tune via the modulith_isolated_timeout ini "
+                    f"option)\n"
+                    f"--- stdout ---\n{_stream_text(exc.stdout)}\n"
+                    f"--- stderr ---\n{_stream_text(exc.stderr)}"
+                ) from exc
+            if completed.returncode != 0:
+                raise AssertionError(
+                    f"isolated subprocess for {item.nodeid} exited "
+                    f"{completed.returncode}\n"
+                    f"--- stdout ---\n{completed.stdout}\n"
+                    f"--- stderr ---\n{completed.stderr}"
+                )
+            with open(result_path, encoding="utf-8") as fh:
+                records = [json.loads(line) for line in fh if line.strip()]
+        finally:
+            os.unlink(result_path)
+        if not records:
             raise AssertionError(
-                f"isolated subprocess for {item.nodeid} timed out after "
-                f"{timeout}s (tune via the modulith_isolated_timeout ini "
-                f"option)\n"
-                f"--- stdout ---\n{_stream_text(exc.stdout)}\n"
-                f"--- stderr ---\n{_stream_text(exc.stderr)}"
-            ) from exc
-        if completed.returncode != 0:
-            raise AssertionError(
-                f"isolated subprocess for {item.nodeid} exited "
-                f"{completed.returncode}\n"
+                f"isolated subprocess for {item.nodeid} exited 0 without running "
+                "the test (a child-side plugin or option deselected or "
+                "suppressed it)\n"
                 f"--- stdout ---\n{completed.stdout}\n"
                 f"--- stderr ---\n{completed.stderr}"
             )
+        return next(
+            (r for r in records if r["outcome"] != "passed" or r["wasxfail"] is not None),
+            None,
+        )
 
     call = CallInfo.from_call(_outcome, when="call")
     report = ihook.pytest_runtest_makereport(item=item, call=call)
+    # skip/xfail marks are evaluated in the child only, so its record decides
+    # the outcome; the parent-side report alone would read every one as passed.
+    child = call.result if call.excinfo is None else None
+    if child is not None:
+        report.outcome = child["outcome"]
+        longrepr = child["longrepr"]
+        report.longrepr = tuple(longrepr) if isinstance(longrepr, list) else longrepr
+        if child["wasxfail"] is not None:
+            report.wasxfail = child["wasxfail"]
     ihook.pytest_runtest_logreport(report=report)
     # The test body ran entirely in the child, so this item's per-test
     # plugin hooks (setup/teardown) never ran here. We must still reconcile
