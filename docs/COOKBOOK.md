@@ -621,11 +621,17 @@ ack, fail, dead-letter and prune the backlog they see, and a group can always
 subscribe: a consumer write or subscription record the limit refuses is
 retried past it, so the database file can grow past `max_store_bytes` by the
 growth of rows it already holds (claims, error text, mark-mode completions,
-prune tombstones) while publishes stay refused. A subscribe replay never grows
-the store past its publish budget: it replays the retained publications the
-group lacks, oldest first, and stops 8 pages below the budget (halfway there
-under `completion_mode="mark"`, leaving room to claim and ack what it added),
-logging one WARNING with the group, the target and the replayed and skipped
+prune tombstones) while publishes stay refused. A subscribe replay itself never
+grows the store past its publish budget: it replays the retained publications
+the group lacks, oldest first, and stops 8 pages below the budget, so a small
+publish that fit before the replay still fits right after it. Under
+`completion_mode="mark"` it uses at most half the room left, which covers
+claiming and acking its own rows when one group drains them and its listeners
+succeed. Draining can still take the store past the budget, as any consumer
+write can: failed and dead-lettered rows keep their error text, and under
+`completion_mode="mark"` claiming and acking grows every row, including rows
+other groups replayed. Publishes are then refused until prune frees pages or
+`max_store_bytes` is raised. A replay cut short logs one WARNING with the group, the target and the replayed and skipped
 counts. The skipped publications reach that group only through another replay.
 To replay them without losing work, first let the group's workers drain its
 backlog on that target: `modulith broker drop-group <group> --target <target>`

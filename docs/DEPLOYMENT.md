@@ -310,9 +310,15 @@ reserve; at the 1 GiB default that is 0.01% and does not change the estimate.
 Consumers drain a backlog while publishes are refused: a consumer write or
 subscription record that `max_store_bytes` refuses is retried past it, so
 `broker.db` can grow past the limit by the growth of rows it already holds. A
-subscribe replay stops 8 pages below the publish budget instead (halfway there
-under `completion_mode="mark"`), so a publish that fit before it still fits,
-also after the group drains the replayed rows; one cut short logs a WARNING
+subscribe replay stops 8 pages below the publish budget instead, so a small
+publish that fit before the replay still fits right after it. Under
+`completion_mode="mark"` it uses at most half the room left, which covers
+claiming and acking its own rows when one group drains them and its listeners
+succeed. Draining can still take the store past the budget, as any consumer
+write can: failed and dead-lettered rows keep their error text, and under
+`completion_mode="mark"` claiming and acking grows every row, including rows
+other groups replayed. Publishes are then refused until prune frees pages or
+`max_store_bytes` is raised. A replay cut short logs a WARNING
 with the replayed and skipped counts and a recovery that drains the group's
 backlog before `drop-group --target`, and the skipped publications reach that
 group only through another replay. Size

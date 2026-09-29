@@ -421,7 +421,10 @@ refused a small consumer reserve below it. Consumer writes can grow the file
 past it while they drain work the store already holds, and the `-wal` file is
 not counted. A subscribe replay stops short of the publish budget and logs a
 WARNING with the group, the target, and the counts of publications it replayed
-and skipped. Environment overrides are
+and skipped. Draining the replayed rows can still take the store past the
+budget, as any consumer write can (error text, dead letters, and mark-mode
+completions grow rows); publishes are then refused until prune frees pages or
+`max_store_bytes` is raised. Environment overrides are
 `MODULITH_BROKER_MAX_PAYLOAD_BYTES` and `MODULITH_BROKER_MAX_STORE_BYTES`.
 Remove legacy `shm_slot_size`; it is deprecated and ignored.
 

@@ -202,9 +202,14 @@ def subscribe(
     store too full even for that grows past max_store_bytes rather than keeping
     the group's consumer from starting. The replay adds only the retained
     publications the group lacks and stops before it would take the store past
-    its publish budget, so a publish that fit before it still fits. Under
-    completion_mode="mark" it also leaves room for claiming and acking the rows
-    it adds, which grows them in place.
+    its publish budget, so a small publish that fit before the replay still
+    fits right after it. Under completion_mode="mark" it uses at most half the
+    room left, which covers the in-place growth of its own rows when one group
+    claims and acks them and its listeners succeed. Draining can still take the
+    store past the budget, as any consumer write can: failed and dead-lettered
+    rows keep their error text, and under completion_mode="mark" every claimed
+    and acked row grows, including rows other groups replayed. Publishes are
+    then refused until prune frees pages or max_store_bytes is raised.
     """
     try:
         inserted, cut_short = consumer_write(
@@ -222,7 +227,9 @@ def subscribe(
         raise
     for target, replayed, skipped in cut_short:
         logger.warning(
-            "SHM store reached its publish budget while replaying target %r to group "
+            "SHM store reached the replay's page limit (8 pages below its publish "
+            "budget, or halfway from the used pages to there under "
+            'completion_mode="mark") while replaying target %r to group '
             "%r: replayed %d and skipped %d of the retained publications the group "
             "lacked (the oldest were replayed first). The target now counts as "
             "subscribed, so the skipped publications reach this group only through "
@@ -289,7 +296,9 @@ def _subscribe(
             # Claiming and mark-acking a replayed row rewrites it wider in place,
             # splitting the pages the replay packed full: draining a cut replay
             # grew the store by about half the pages the replay added. Charging
-            # the replay as much again as it adds keeps that drain in budget.
+            # the replay as much again as it adds covers that growth for one
+            # group whose listeners succeed; error text, dead letters and other
+            # groups' undrained replays are not reserved for.
             used = _used_pages(conn)
             if used < page_limit:
                 page_limit = used + (page_limit - used) // 2
