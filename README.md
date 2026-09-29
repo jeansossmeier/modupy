@@ -30,7 +30,8 @@ violations. Broker and outbox are in-memory, so there is nothing to provision.
 
 **Durable: two config lines.** `outbox = "postgres"` plus `outbox_url`, the
 async SQLAlchemy URL of your business database (Postgres, MySQL or SQLite),
-makes the outbox transactional in every process: events are stored durably
+makes the outbox transactional in every process while module discovery
+(`auto_discover`) stays on, its default: events are stored durably
 and delivered at-least-once after commit, and process crashes and
 transaction rollbacks stay consistent. The Alembic migrations ship inside the
 package. A single-process app calls `modulith.bootstrap()` and then
@@ -284,8 +285,10 @@ uvicorn myapp.main:app --reload
 ```
 
 Package detection, module discovery and listener registration are automatic
-and run at the first `publish()`. Only a durable outbox needs
-`modulith.bootstrap()` at startup, as described under **Durable** above.
+and run at the first `publish()`. A durable outbox needs
+`modulith.bootstrap()` at startup, as described under **Durable** above. Call
+it at startup too when a manifest or boundary violation should stop the server
+from starting rather than fail its first `publish()`.
 
 ### Run the same code process-per-module
 
@@ -319,7 +322,7 @@ users never set anything beyond `outbox` and `outbox_url`:
 [tool.modulith]
 package = "myapp"               # falls back to [project].name
 outbox = "postgres"             # default "memory" — switch for production
-outbox_url = "postgresql+asyncpg://app@db/app"  # the business database; binds the store everywhere
+outbox_url = "postgresql+asyncpg://app@db/app"  # the business database; binds the store everywhere while auto_discover is on
 broker = "redis-streams"        # default "memory" (single) / "shm" (processes)
 topology = "single"             # "single" | "processes"
 

@@ -238,10 +238,17 @@ calls are a no-op fast path (same guarantee as ``publish()``'s implicit
 bootstrap).
 
 Example:
-    from modulith import bootstrap, configure
+    from contextlib import asynccontextmanager
 
-    configure(package="myapp", outbox="postgres")
-    bootstrap()  # crash-recovery sweep can dispatch immediately
+    from modulith import bootstrap
+    from modulith.builtin import outbox
+
+    @asynccontextmanager
+    async def lifespan(app):
+        bootstrap()  # the sweep dispatches nothing until the runtime is bootstrapped
+        outbox.start()  # crash-recovery sweep + retry loop on the server's loop
+        yield
+        await outbox.shutdown()
 
 ### `externalized`
 

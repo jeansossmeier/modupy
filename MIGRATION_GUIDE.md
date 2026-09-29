@@ -306,8 +306,10 @@ the outbox table in the same database as your business data, or the row and
 your data cannot commit in one transaction. Under `--topology processes`,
 `main.py` does not run in workers. Set `[tool.modulith].outbox_url` (env
 `MODULITH_OUTBOX_URL`) to that database's async SQLAlchemy URL and modulith
-binds the store in every process, workers and the `modulith outbox` CLI
-included; a worker with a durable `outbox` and no store refuses to start.
+binds the store in every process-topology worker and, while `auto_discover` is
+on (the default), in the single-process server and the `modulith outbox` CLI;
+without discovery, call `outbox.configure()` yourself. A worker with a durable
+`outbox` and no store refuses to start.
 
 Upgrading with rows still in the outbox: a callable-instance or bound-method
 listener registered from a module is now stored as
