@@ -858,3 +858,54 @@ def test_extract_copies_contracts_file_beside_same_named_non_package_dir(
     assert (out_dir / "fakeapp" / "contracts.py").read_text() == "OrderPlaced = object\n"
     assert not (out_dir / "fakeapp" / "contracts").exists()
 
+
+def _dotted_contracts_app(make_fake_app, tmp_path, orders_source):
+    make_fake_app(
+        {"orders": orders_source},
+        extra_files={
+            "_shared/__init__.py": "from .fmt import fmt\n",
+            "_shared/fmt.py": "def fmt():\n    return 1\n",
+            "_shared/contracts/__init__.py": "",
+            "_shared/contracts/events.py": "OrderPlaced = object\n",
+        },
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith]\ncontracts_module = "_shared.contracts"\n'
+    )
+
+
+def test_extract_dotted_contracts_under_helper_package_whose_initializer_does_work(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    _dotted_contracts_app(
+        make_fake_app,
+        tmp_path,
+        "from fakeapp._shared.fmt import fmt\n"
+        "from fakeapp._shared.contracts.events import OrderPlaced\n",
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    shared = out_dir / "fakeapp" / "_shared"
+    assert (shared / "__init__.py").read_text() == "from .fmt import fmt\n"
+    assert (shared / "contracts" / "events.py").read_text() == "OrderPlaced = object\n"
+
+
+def test_extract_dotted_contracts_refuses_working_parent_initializer_not_copied_as_helper(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    _dotted_contracts_app(
+        make_fake_app, tmp_path, "from fakeapp._shared.contracts.events import OrderPlaced\n"
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 1, result.output
+    assert "_shared/__init__.py" in result.output
+    assert not out_dir.exists()
+

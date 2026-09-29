@@ -680,22 +680,27 @@ def _populate_extraction(
 
     copy_rel(Path(*module.split(".")))
 
-    # Python's own order: a regular package, then a module file, then a namespace directory.
-    contracts_rel = Path(*cfg.contracts_module.split("."))
-    contracts_src = _source_path(package_dir, cfg.package, f"{cfg.package}.{cfg.contracts_module}")
-    if contracts_src is None and (package_dir / contracts_rel).is_dir():
-        contracts_src = package_dir / contracts_rel
-    if contracts_src is not None:
-        copy_rel(contracts_src.relative_to(package_dir))
-
     helper_set = set(helpers)
+
+    def inside_helper(dotted: str) -> bool:
+        parts = dotted.split(".")
+        return any(".".join(parts[:depth]) in helper_set for depth in range(1, len(parts)))
+
     for helper in helpers:
-        parts = helper.split(".")
-        if any(".".join(parts[:depth]) in helper_set for depth in range(1, len(parts))):
+        if inside_helper(helper):
             continue  # already copied inside its ancestor package
         source = _source_path(package_dir, cfg.package, helper)
         if source is not None:
             copy_rel(source.relative_to(package_dir))
+
+    # Python's own order: a regular package, then a module file, then a namespace directory.
+    contracts = f"{cfg.package}.{cfg.contracts_module}"
+    contracts_rel = Path(*cfg.contracts_module.split("."))
+    contracts_src = _source_path(package_dir, cfg.package, contracts)
+    if contracts_src is None and (package_dir / contracts_rel).is_dir():
+        contracts_src = package_dir / contracts_rel
+    if contracts_src is not None and not inside_helper(contracts):
+        copy_rel(contracts_src.relative_to(package_dir))
 
     written.extend(
         _write_generated_files(
