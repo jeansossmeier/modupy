@@ -97,6 +97,15 @@ def _source_path(package_dir: Path, package: str, dotted: str) -> Path | None:
     return None
 
 
+def _contracts_source(package_dir: Path, package: str, contracts_module: str) -> Path | None:
+    """The contracts source in Python's own order: a regular package, a module, a namespace dir."""
+    source = _source_path(package_dir, package, f"{package}.{contracts_module}")
+    namespace_dir = package_dir.joinpath(*contracts_module.split("."))
+    if source is None and namespace_dir.is_dir():
+        return namespace_dir
+    return source
+
+
 def import_closure(rt: Runtime, module: str) -> tuple[list[str], list[str]]:
     """Helper modules the extracted copy needs, and other declared modules it imports.
 
@@ -128,7 +137,10 @@ def import_closure(rt: Runtime, module: str) -> tuple[list[str], list[str]]:
         if name in scanned:
             continue
         scanned.add(name)
-        source = _source_path(package_dir, package, name)
+        if name == contracts:
+            source = _contracts_source(package_dir, package, cfg.contracts_module)
+        else:
+            source = _source_path(package_dir, package, name)
         if source is None:
             continue
         for path in sorted(source.rglob("*.py")) if source.is_dir() else [source]:
@@ -670,12 +682,15 @@ def _populate_extraction(
                 )
 
     def ensure_parent_packages(rel: Path) -> None:
+        # A namespace folder stays one: an initializer would make module discovery
+        # see it as an extra module in the extracted service.
         parent = dest_pkg
-        for part in rel.parent.parts:
+        for depth, part in enumerate(rel.parent.parts, start=1):
             parent /= part
             parent.mkdir(exist_ok=True)
             init = parent / "__init__.py"
-            if not init.exists():
+            source_init = package_dir.joinpath(*rel.parent.parts[:depth], "__init__.py")
+            if source_init.exists() and not init.exists():
                 init.write_text("", encoding="utf-8")
                 written.append(str(init.relative_to(output)))
 
@@ -715,12 +730,8 @@ def _populate_extraction(
         if source is not None:
             copy_rel(source.relative_to(package_dir))
 
-    # Python's own order: a regular package, then a module file, then a namespace directory.
     contracts = f"{cfg.package}.{cfg.contracts_module}"
-    contracts_rel = Path(*cfg.contracts_module.split("."))
-    contracts_src = _source_path(package_dir, cfg.package, contracts)
-    if contracts_src is None and (package_dir / contracts_rel).is_dir():
-        contracts_src = package_dir / contracts_rel
+    contracts_src = _contracts_source(package_dir, cfg.package, cfg.contracts_module)
     if contracts_src is not None and not inside_helper(contracts):
         copy_rel(contracts_src.relative_to(package_dir))
 
