@@ -26,6 +26,7 @@ modulith follows rather than fighting the framework.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import importlib
 import json
@@ -1780,6 +1781,84 @@ def info() -> None:
 
     schemes = registry.schemes() if registry is not None else []
     typer.echo(f"  brokers: {', '.join(schemes) if schemes else '(none registered)'}")
+
+
+# ---------------------------------------------------------------------------
+# modulith migrate — the packaged outbox and broker schema migrations
+# ---------------------------------------------------------------------------
+
+
+_SYNC_DRIVER_SUFFIXES = (("+asyncpg", "+psycopg"), ("+aiosqlite", ""), ("+aiomysql", "+pymysql"))
+
+
+def _migration_url(url: str) -> str:
+    """Swap the async driver of an ``outbox_url`` for the sync one Alembic connects with."""
+    scheme, separator, rest = url.partition("://")
+    for async_suffix, sync_suffix in _SYNC_DRIVER_SUFFIXES:
+        if scheme.endswith(async_suffix):
+            scheme = scheme.removesuffix(async_suffix) + sync_suffix
+    return f"{scheme}{separator}{rest}"
+
+
+def _masked_url(url: str) -> str:
+    from sqlalchemy.engine import make_url
+
+    return make_url(url).render_as_string(hide_password=True)
+
+
+@app.command()
+def migrate(
+    revision: str = typer.Argument("head", help="Target revision (default: head)"),
+    url: str | None = typer.Option(
+        None,
+        "--url",
+        help=r"SQLAlchemy URL to migrate (default: \[tool.modulith] outbox_url)",
+    ),
+    schema: str | None = typer.Option(None, "--schema", help="Target schema (PostgreSQL only)"),
+) -> None:
+    """Apply the packaged outbox and broker migrations.
+
+    Reads configuration only and never bootstraps the application, so it runs
+    before any table exists and under ``strict_boundaries``. Without ``--url``
+    it migrates ``[tool.modulith] outbox_url`` (env ``MODULITH_OUTBOX_URL``),
+    swapping its async driver for the sync one the migrations use. The chain
+    creates the outbox tables and the ``broker_*`` tables of the database broker.
+    """
+    try:
+        from alembic import command
+        from alembic.config import Config
+        from alembic.util import CommandError
+        from sqlalchemy.exc import SQLAlchemyError
+    except ImportError:
+        typer.echo(
+            "error: modulith migrate needs Alembic and SQLAlchemy. Install "
+            "'modupy[postgres]' or 'modupy[database]'.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
+
+    try:
+        target = _migration_url(url or load_configuration().outbox_url or "")
+    except ConfigurationError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    if not target:
+        typer.echo(
+            "error: no database URL to migrate. Pass --url <sqlalchemy url>, or set "
+            "[tool.modulith] outbox_url (env MODULITH_OUTBOX_URL).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    x_args = [f"url={target}"] + ([f"schema={schema}"] if schema else [])
+    ini = Path(__file__).parent / "adapters" / "alembic.ini"
+    config = Config(str(ini), cmd_opts=argparse.Namespace(x=x_args))
+    try:
+        command.upgrade(config, revision)
+    except (CommandError, SQLAlchemyError, ConfigurationError) as exc:
+        typer.echo(f"error: migration failed: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(f"migrated {_masked_url(target)} to {revision}")
 
 
 # ---------------------------------------------------------------------------

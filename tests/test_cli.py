@@ -2424,3 +2424,249 @@ def test_broker_drop_group_does_not_create_a_missing_database_store(
     assert result.exit_code == 1, result.output
     assert "no database broker tables" in result.output
     assert not db_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# modulith migrate
+# ---------------------------------------------------------------------------
+
+
+def _packaged_head() -> str:
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    import modulith
+
+    ini = Path(modulith.__file__).parent / "adapters" / "alembic.ini"
+    head = ScriptDirectory.from_config(Config(str(ini))).get_current_head()
+    assert head is not None
+    return head
+
+
+def _sqlite_tables(db_file: Path) -> set[str]:
+    with sqlite3.connect(db_file) as conn:
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    return {name for (name,) in rows}
+
+
+def _sqlite_revision(db_file: Path) -> str:
+    with sqlite3.connect(db_file) as conn:
+        (revision,) = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+    return str(revision)
+
+
+def _migrate_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, tool_modulith: str = ""
+) -> Path:
+    """A project whose pyproject holds ``tool_modulith``, with no MODULITH_* env."""
+    for name in list(os.environ):
+        if name.startswith("MODULITH_"):
+            monkeypatch.delenv(name)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        f'[project]\nname = "migrateapp"\n\n[tool.modulith]\n{tool_modulith}', encoding="utf-8"
+    )
+    monkeypatch.chdir(project)
+    return project
+
+
+def test_migrate_applies_the_packaged_chain_to_the_configured_outbox_url(
+    tmp_path, monkeypatch
+) -> None:
+    db_file = tmp_path / "durable.db"
+    _migrate_project(
+        tmp_path, monkeypatch, tool_modulith=f'outbox_url = "sqlite+aiosqlite:///{db_file}"\n'
+    )
+
+    result = runner.invoke(app, ["migrate"])
+
+    assert result.exit_code == 0, result.output
+    assert f"migrated sqlite:///{db_file} to head" in result.output
+    assert {
+        "event_publications",
+        "event_publications_archive",
+        "broker_subscription",
+        "broker_message",
+    } <= _sqlite_tables(db_file)
+    assert _sqlite_revision(db_file) == _packaged_head()
+
+
+def test_migrate_never_bootstraps_the_application_under_strict_boundaries(
+    tmp_path, monkeypatch
+) -> None:
+    db_file = tmp_path / "strict.db"
+    project = _migrate_project(
+        tmp_path,
+        monkeypatch,
+        tool_modulith=(
+            'package = "migrateapp"\n'
+            "strict_boundaries = true\n"
+            f'outbox_url = "sqlite+aiosqlite:///{db_file}"\n'
+        ),
+    )
+    package = project / "migrateapp"
+    (package / "orders").mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "orders" / "__init__.py").write_text(
+        'raise RuntimeError("bootstrap imported the application")\n', encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(project))
+
+    result = runner.invoke(app, ["migrate"])
+
+    assert result.exit_code == 0, result.output
+    assert "migrateapp.orders" not in sys.modules
+    assert _sqlite_revision(db_file) == _packaged_head()
+
+
+def test_migrate_url_option_wins_over_the_configured_outbox_url(tmp_path, monkeypatch) -> None:
+    unreachable = tmp_path / "missing-dir" / "configured.db"
+    target = tmp_path / "target.db"
+    _migrate_project(
+        tmp_path, monkeypatch, tool_modulith=f'outbox_url = "sqlite+aiosqlite:///{unreachable}"\n'
+    )
+
+    result = runner.invoke(app, ["migrate", "--url", f"sqlite:///{target}"])
+
+    assert result.exit_code == 0, result.output
+    assert f"migrated sqlite:///{target} to head" in result.output
+    assert _sqlite_revision(target) == _packaged_head()
+    assert not unreachable.parent.exists()
+
+
+def test_migrate_url_option_accepts_an_async_driver_url(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "async.db"
+    _migrate_project(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["migrate", "--url", f"sqlite+aiosqlite:///{target}"])
+
+    assert result.exit_code == 0, result.output
+    assert f"migrated sqlite:///{target} to head" in result.output
+
+
+def test_migrate_reports_the_missing_extra_when_alembic_is_not_installed(
+    tmp_path, monkeypatch
+) -> None:
+    _migrate_project(tmp_path, monkeypatch)
+    monkeypatch.setitem(sys.modules, "alembic", None)
+
+    result = runner.invoke(app, ["migrate", "--url", f"sqlite:///{tmp_path / 'x.db'}"])
+
+    assert result.exit_code == 1, result.output
+    assert "modupy[postgres]" in result.output
+    assert "modupy[database]" in result.output
+
+
+def test_migrate_url_option_needs_no_readable_configuration(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "target.db"
+    _migrate_project(tmp_path, monkeypatch, tool_modulith='topology = "nonsense"\n')
+
+    result = runner.invoke(app, ["migrate", "--url", f"sqlite:///{target}"])
+
+    assert result.exit_code == 0, result.output
+    assert _sqlite_revision(target) == _packaged_head()
+
+
+def test_migrate_revision_argument_stops_at_that_revision(tmp_path, monkeypatch) -> None:
+    db_file = tmp_path / "stepwise.db"
+    _migrate_project(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["migrate", "0001_initial", "--url", f"sqlite:///{db_file}"])
+
+    assert result.exit_code == 0, result.output
+    assert f"migrated sqlite:///{db_file} to 0001_initial" in result.output
+    assert _sqlite_revision(db_file) == "0001_initial"
+    assert "broker_message" not in _sqlite_tables(db_file)
+
+
+def test_migrate_without_a_url_names_both_accepted_forms(tmp_path, monkeypatch) -> None:
+    _migrate_project(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["migrate"])
+
+    assert result.exit_code == 1, result.output
+    assert "--url <sqlalchemy url>" in result.output
+    assert "[tool.modulith] outbox_url" in result.output
+    assert "MODULITH_OUTBOX_URL" in result.output
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        ("postgresql+asyncpg://u:p@h:5432/db", "postgresql+psycopg://u:p@h:5432/db"),
+        ("sqlite+aiosqlite:///rel.db", "sqlite:///rel.db"),
+        ("sqlite+aiosqlite:////abs/x.db", "sqlite:////abs/x.db"),
+        ("mysql+aiomysql://u:p@h/db?charset=utf8mb4", "mysql+pymysql://u:p@h/db?charset=utf8mb4"),
+        ("postgresql+psycopg://u:p@h/db", "postgresql+psycopg://u:p@h/db"),
+        ("sqlite:///plain.db", "sqlite:///plain.db"),
+    ],
+)
+def test_migration_url_swaps_the_async_driver_for_the_sync_one(configured, expected) -> None:
+    from modulith.cli import _migration_url
+
+    assert _migration_url(configured) == expected
+
+
+def test_migrate_reads_the_outbox_url_environment_variable(tmp_path, monkeypatch) -> None:
+    db_file = tmp_path / "env.db"
+    _migrate_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("MODULITH_OUTBOX_URL", f"sqlite+aiosqlite:///{db_file}")
+
+    result = runner.invoke(app, ["migrate"])
+
+    assert result.exit_code == 0, result.output
+    assert _sqlite_revision(db_file) == _packaged_head()
+
+
+def test_masked_url_hides_only_the_password() -> None:
+    from modulith.cli import _masked_url
+
+    masked = _masked_url("postgresql+psycopg://user:s3cret@db.example/app?sslmode=require")
+
+    assert masked == "postgresql+psycopg://user:***@db.example/app?sslmode=require"
+
+
+def test_migrate_failure_reports_an_error_without_leaking_the_password(
+    tmp_path, monkeypatch
+) -> None:
+    _migrate_project(
+        tmp_path,
+        monkeypatch,
+        tool_modulith='outbox_url = "postgresql+asyncpg://user:s3cret@127.0.0.1:1/app"\n',
+    )
+
+    result = runner.invoke(app, ["migrate"])
+
+    assert result.exit_code == 1, result.output
+    assert result.output.startswith("error: migration failed")
+    assert "s3cret" not in result.output
+
+
+def test_migrate_schema_option_reaches_the_migration_environment(tmp_path, monkeypatch) -> None:
+    db_file = tmp_path / "schema.db"
+    _migrate_project(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app, ["migrate", "--url", f"sqlite:///{db_file}", "--schema", "not a schema"]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "schema must be a valid unquoted SQL identifier" in result.output
+    assert not db_file.exists()
+
+
+def test_migrate_schema_option_is_ignored_on_sqlite_as_the_migrations_do(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    db_file = tmp_path / "ignored-schema.db"
+    _migrate_project(tmp_path, monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="modulith.adapters.migrations.env"):
+        result = runner.invoke(
+            app, ["migrate", "--url", f"sqlite:///{db_file}", "--schema", "orders_outbox"]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "only supported on PostgreSQL" in caplog.text
+    assert _sqlite_revision(db_file) == _packaged_head()
