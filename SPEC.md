@@ -882,8 +882,9 @@ periodic SQLite safety poll.
 
 Publications are retained for `orphan_retention_seconds` (default 24 hours),
 even after every group has acknowledged them. A consumer group that subscribes
-after publication receives one replay before expiry, preventing silent loss during
-worker startup. Delivery is at-least-once: a crash after listener completion
+after publication receives one replay before expiry while the store has room
+below its publish budget (see `max_store_bytes` below), preventing silent loss
+during worker startup. Delivery is at-least-once: a crash after listener completion
 but before the fenced acknowledgement commits can cause a duplicate.
 
 Canonical `state_dir`, `sqlite_path`, and `hint_path` resolve to absolute,
@@ -906,11 +907,16 @@ way: one that hits `max_page_count` is retried with the limit lifted, so
 consumers drain a backlog that filled the store, including a store opened above
 its limit, a group always subscribes, and the file can grow past
 `max_store_bytes` while they do. A subscribe replay is bounded instead: it
-replays retained publications oldest first and stops 8 pages below the publish
-budget, so it never refuses other publishes. A replay cut short logs one
-WARNING naming the group, the target and the replayed and skipped counts; the
-target then counts as subscribed, so the skipped publications never reach that
-group. If
+replays the retained publications the group lacks (no delivery or completion
+tombstone) oldest first and stops 8 pages below the publish budget, so a
+publish that fit before it still fits. Under `completion_mode="mark"` it stops
+halfway to that limit, leaving room for claiming and acking the rows it added.
+A replay cut short logs one WARNING naming the group, the target and the
+replayed and skipped counts; the target then counts as subscribed, so the
+skipped publications reach that group only through another replay. The
+WARNING's recovery drains the group's backlog on the target before
+`modulith broker drop-group --target`, which deletes the group's pending and
+claimed deliveries there, replayed ones included. If
 SQLite does not raise the limit, the write fails with the store-full error and
 a note naming the SQLite version. Both have
 `MODULITH_BROKER_MAX_PAYLOAD_BYTES` / `MODULITH_BROKER_MAX_STORE_BYTES`

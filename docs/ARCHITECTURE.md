@@ -617,8 +617,8 @@ delay consumers until their periodic SQLite safety poll.
 
 Subscriptions are persisted. Every publication is retained for
 `orphan_retention_seconds` (default 24 hours), so
-groups that register after publication receive one replay before expiry instead
-of losing the startup race. Claims use owner and generation fencing. Delivery
+groups that register after publication receive one replay before expiry, while
+the store has room below its publish budget, instead of losing the startup race. Claims use owner and generation fencing. Delivery
 is at-least-once: a process crash after listener completion but before the
 fenced ack commits can cause the listener to run again. A stale-claim reclaim
 enforces `max_delivery_attempts` too — a row reclaimed past the cap is
@@ -665,12 +665,19 @@ note naming the SQLite version if it did not rise). Consumers always finish
 the backlog they can see, a group's subscribe never fails on the store limit,
 and the file can grow past `max_store_bytes` by that growth while publishes
 stay refused. A subscribe replay is bounded by the publish budget instead:
-`_shm_publications._replay` inserts deliveries oldest first, each under a
-savepoint, and rolls back the one that would leave used pages above 8 pages
-below the publish budget (`REPLAY_PUBLISH_HEADROOM_PAGES`), so a replay never
-refuses other publishes. A replay cut short logs one WARNING naming the group,
+`_shm_publications._replay` selects the retained publications the group holds
+no delivery or completion tombstone for, inserts their deliveries oldest first,
+each under a savepoint, and rolls back the one that would leave used pages
+above 8 pages below the publish budget (`REPLAY_PUBLISH_HEADROOM_PAGES`), so a
+publish that fit before the replay still fits. Under `completion_mode="mark"`,
+`_subscribe` halves the room the replay may use, because claiming and
+mark-acking the replayed rows grows them in place (measured at about half the
+pages the replay added). A replay cut short logs one WARNING naming the group,
 the target and the replayed and skipped counts; the target then counts as
-subscribed, so the skipped publications never reach that group. The same retry drains a store opened
+subscribed, so the skipped publications reach that group only through another
+replay. Its recovery drains the group's backlog on the target first, since
+`drop-group --target` deletes pending and claimed deliveries whose
+publications may have expired, and a replay restores only retained ones. The same retry drains a store opened
 above its limit (filled before the reserve existed, or with `max_store_bytes`
 lowered). Both accept `MODULITH_BROKER_*` environment overrides. The legacy
 `shm_slot_size` option is deprecated and ignored because hint slots are

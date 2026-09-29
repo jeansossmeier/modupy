@@ -194,17 +194,21 @@ def subscribe(
     group: str,
     max_store_bytes: int,
     consumer_write: Callable[[Callable[[], _Subscribed]], _Subscribed],
+    completion_mode: str = "delete",
 ) -> int:
     """Reconcile one group's subscriptions and replay newly added targets.
 
     The subscription is always recorded: it runs as a consumer write, so a
     store too full even for that grows past max_store_bytes rather than keeping
-    the group's consumer from starting. The replay stops before it would take
-    the store past its publish budget, so it never refuses other publishes.
+    the group's consumer from starting. The replay adds only the retained
+    publications the group lacks and stops before it would take the store past
+    its publish budget, so a publish that fit before it still fits. Under
+    completion_mode="mark" it also leaves room for claiming and acking the rows
+    it adds, which grows them in place.
     """
     try:
         inserted, cut_short = consumer_write(
-            lambda: _subscribe(conn, targets, group, max_store_bytes)
+            lambda: _subscribe(conn, targets, group, max_store_bytes, completion_mode)
         )
     except sqlite3.Error as error:
         if _is_store_full(error):
@@ -219,14 +223,19 @@ def subscribe(
     for target, replayed, skipped in cut_short:
         logger.warning(
             "SHM store reached its publish budget while replaying target %r to group "
-            "%r: replayed %d and skipped %d of its retained publications (the oldest "
-            "were replayed first). The target now counts as subscribed, so the skipped "
-            "publications never reach this group; its consumer receives every "
-            "publication written from now on. To replay them, stop the group's "
-            "workers, run modulith broker drop-group %s --target %s (this also deletes "
-            "the group's undelivered replayed work on that target), raise "
-            "max_store_bytes (currently %d) and restart every process before they "
-            "expire, orphan_retention_seconds after they were written.",
+            "%r: replayed %d and skipped %d of the retained publications the group "
+            "lacked (the oldest were replayed first). The target now counts as "
+            "subscribed, so the skipped publications reach this group only through "
+            "another replay; its consumer receives every publication written from now "
+            "on. To replay them without losing work, first let the group's workers "
+            "drain its backlog on that target: modulith broker drop-group deletes every "
+            "pending and claimed delivery the group holds on the target, the replayed "
+            "ones included, and a replay restores only publications still within "
+            "orphan_retention_seconds of being written. Once that backlog is empty, "
+            "stop the group's workers, run modulith broker drop-group %s --target %s, "
+            "raise max_store_bytes (currently %d), and restart every process before the "
+            "skipped publications expire, orphan_retention_seconds after they were "
+            "written.",
             target,
             group,
             replayed,
@@ -239,7 +248,11 @@ def subscribe(
 
 
 def _subscribe(
-    conn: sqlite3.Connection, targets: list[str], group: str, max_store_bytes: int
+    conn: sqlite3.Connection,
+    targets: list[str],
+    group: str,
+    max_store_bytes: int,
+    completion_mode: str,
 ) -> _Subscribed:
     inserted = 0
     cut_short: list[tuple[str, int, int]] = []
@@ -272,6 +285,14 @@ def _subscribe(
                 """,
                 (target, group),
             )
+        if completion_mode == "mark":
+            # Claiming and mark-acking a replayed row rewrites it wider in place,
+            # splitting the pages the replay packed full: draining a cut replay
+            # grew the store by about half the pages the replay added. Charging
+            # the replay as much again as it adds keeps that drain in budget.
+            used = _used_pages(conn)
+            if used < page_limit:
+                page_limit = used + (page_limit - used) // 2
         for target in sorted(requested_targets - current_targets):
             replayed, skipped = _replay(conn, target, group, now, page_limit)
             inserted += replayed
@@ -296,33 +317,41 @@ def _subscribe(
 def _replay(
     conn: sqlite3.Connection, target: str, group: str, now: float, page_limit: int
 ) -> tuple[int, int]:
-    """Replay retained publications oldest first while used pages stay within page_limit.
+    """Replay the retained publications the group lacks, oldest first, within page_limit.
 
-    Oldest first keeps each group's deliveries in publication-sequence order,
-    which the claim queries in _shm_claims rely on. Returns (replayed, skipped).
+    A publication the group holds a delivery or completion tombstone for is not
+    missing, so it neither counts as skipped nor takes pages. Oldest first keeps
+    each group's deliveries in publication-sequence order, which the claim
+    queries in _shm_claims rely on. Returns (replayed, skipped).
     """
-    retained = [
+    missing = [
         str(row["id"])
         for row in conn.execute(
             """
-            SELECT id FROM shm_publication
-            WHERE target=? AND retained_until>?
-            ORDER BY sequence
+            SELECT p.id FROM shm_publication AS p
+            WHERE p.target=? AND p.retained_until>?
+              AND NOT EXISTS (
+                SELECT 1 FROM shm_delivery AS d
+                WHERE d.publication_id=p.id AND d.consumer_group=?
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM shm_completion_tombstone AS t
+                WHERE t.publication_id=p.id AND t.consumer_group=?
+              )
+            ORDER BY p.sequence
             """,
-            (target, now),
+            (target, now, group, group),
         )
     ]
-    replayed = 0
-    for index, publication_id in enumerate(retained):
+    for index, publication_id in enumerate(missing):
         conn.execute("SAVEPOINT shm_replay")
-        added = _insert_delivery(conn, publication_id, group, now)
+        _insert_delivery(conn, publication_id, group, now)
         if _used_pages(conn) > page_limit:
             conn.execute("ROLLBACK TO shm_replay")
             conn.execute("RELEASE shm_replay")
-            return replayed, len(retained) - index
+            return index, len(missing) - index
         conn.execute("RELEASE shm_replay")
-        replayed += added
-    return replayed, 0
+    return len(missing), 0
 
 
 def group_backlog(conn: sqlite3.Connection) -> dict[str, int]:

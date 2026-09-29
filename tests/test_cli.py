@@ -2321,6 +2321,7 @@ def test_broker_drop_group_on_the_shm_broker_states_the_orphan_retention(
         "kept for 7200 s (orphan_retention_seconds) and replayed to a group that "
         "subscribes within that time" in result.output
     )
+    assert "while the store has room below its publish budget" in result.output
     assert "reach no consumer" not in result.output
 
 

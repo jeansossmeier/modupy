@@ -310,9 +310,12 @@ reserve; at the 1 GiB default that is 0.01% and does not change the estimate.
 Consumers drain a backlog while publishes are refused: a consumer write or
 subscription record that `max_store_bytes` refuses is retried past it, so
 `broker.db` can grow past the limit by the growth of rows it already holds. A
-subscribe replay stops 8 pages below the publish budget instead, so it never
-refuses other publishes; one cut short logs a WARNING with the replayed and
-skipped counts, and the skipped publications never reach that group. Size
+subscribe replay stops 8 pages below the publish budget instead (halfway there
+under `completion_mode="mark"`), so a publish that fit before it still fits,
+also after the group drains the replayed rows; one cut short logs a WARNING
+with the replayed and skipped counts and a recovery that drains the group's
+backlog before `drop-group --target`, and the skipped publications reach that
+group only through another replay. Size
 `max_store_bytes` for the retained backlog before adding a listener to a busy
 store. This also drains a store that
 filled before this release or that was opened with a lowered limit; publishes
@@ -916,7 +919,8 @@ Step 6 depends on the broker:
     at once to `expected_consumer_groups` and nothing is kept for a later
     subscriber;
   - SHM broker: each is kept for `orphan_retention_seconds` and replayed to
-    a group that subscribes within it.
+    a group that subscribes within it while the store has room below its
+    publish budget.
 
   On the database broker with `no_subscriber_policy = "store"` and
   `orphan_replay_policy = "expected_groups"`, a group named in

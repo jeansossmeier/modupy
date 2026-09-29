@@ -548,6 +548,131 @@ def test_a_replay_within_the_publish_budget_logs_no_warning(
         store.close()
 
 
+def _drain(store: SqliteQueueStore, group: str) -> list[bytes]:
+    payloads: list[bytes] = []
+    while rows := store.claim(group, 100, _LONG_CONSUMER, 30.0):
+        for row in rows:
+            payloads.append(bytes(row["payload"]))
+            assert store.ack(row["claim_token"], _LONG_CONSUMER, None)
+    return payloads
+
+
+def _hold_then_drop_target(store: SqliteQueueStore, held: int, acked: int) -> None:
+    store.subscribe(["events.T"], "g")
+    for index in range(held):
+        store.publish("events.T", b'{"t":%d}' % index, None, None)
+    for row in store.claim("g", acked, _LONG_CONSUMER, 30.0):
+        assert store.ack(row["claim_token"], _LONG_CONSUMER, None)
+    store.subscribe([], "g")
+
+
+def test_re_adding_a_target_the_group_still_holds_in_a_full_store_logs_no_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = _bounded_store(tmp_path / "held.db", 2 * 1024 * 1024)
+    try:
+        _hold_then_drop_target(store, held=10, acked=3)
+        _publish_until_refused(store, "events.U")
+
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
+            assert store.subscribe(["events.T"], "g") == 0
+
+        assert _warnings(caplog) == []
+        assert store.group_backlog() == {"g": 7}
+    finally:
+        store.close()
+
+
+def test_a_cut_replay_counts_only_the_publications_the_group_lacks_as_skipped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = _bounded_store(tmp_path / "lacks.db", 2 * 1024 * 1024)
+    try:
+        _hold_then_drop_target(store, held=10, acked=3)
+        for index in range(5):
+            store.publish("events.T", b'{"missed":%d}' % index, None, None)
+        _publish_until_refused(store, "events.U")
+
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
+            assert store.subscribe(["events.T"], "g") == 0
+
+        [warning] = _warnings(caplog)
+        assert "replayed 0 and skipped 5 " in warning
+    finally:
+        store.close()
+
+
+def test_the_cut_replay_recovery_delivers_every_publication_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "recover.db"
+    max_store_bytes = 2 * 1024 * 1024
+    store = _bounded_store(path, max_store_bytes)
+    try:
+        for index in range(3000):
+            store.publish("events.T", b'{"t":%d}' % index, None, None)
+        used, budget = _used_and_budget_pages(store, max_store_bytes)
+        index = 0
+        while used < budget - 40:
+            store.publish("events.U", b'{"u":%d}' % index, None, None)
+            index += 1
+            used, _ = _used_and_budget_pages(store, max_store_bytes)
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
+            replayed = store.subscribe(["events.T"], "late")
+        [warning] = _warnings(caplog)
+        assert 0 < replayed < 3000
+        # The recovery the warning gives: drain first, then drop-group and restart.
+        assert warning.index("drain") < warning.index("drop-group")
+        # The replayed publications are the oldest, so they expire first.
+        store._conn.execute(
+            "UPDATE shm_publication SET retained_until=0 WHERE target='events.T' "
+            "AND sequence IN (SELECT sequence FROM shm_publication "
+            "WHERE target='events.T' ORDER BY sequence LIMIT ?)",
+            (replayed,),
+        )
+        store._conn.commit()
+        delivered = _drain(store, "late")
+        assert store.drop_group("late", ["events.T"]) == (1, 0)
+    finally:
+        store.close()
+
+    store = _bounded_store(path, 16 * 1024 * 1024)
+    try:
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
+            assert store.subscribe(["events.T"], "late") == 3000 - replayed
+        delivered += _drain(store, "late")
+    finally:
+        store.close()
+    assert delivered == [b'{"t":%d}' % index for index in range(3000)]
+
+
+def test_draining_a_cut_replay_in_mark_mode_keeps_room_for_a_publish_that_fit_before_it(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    max_store_bytes = 2 * 1024 * 1024
+    store = _bounded_store(tmp_path / "mark.db", max_store_bytes, completion_mode="mark")
+    try:
+        for index in range(3000):
+            store.publish("events.T", b'{"t":%d}' % index, None, None)
+        used, budget = _used_and_budget_pages(store, max_store_bytes)
+        index = 0
+        while used < budget - 40:
+            store.publish("events.U", b'{"u":%d}' % index, None, None)
+            index += 1
+            used, _ = _used_and_budget_pages(store, max_store_bytes)
+        store.publish("events.V", b"{}", None, None)
+
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
+            replayed = store.subscribe(["events.T"], "late")
+        assert 0 < replayed < 3000
+        assert len(_warnings(caplog)) == 1
+        assert len(_drain(store, "late")) == replayed
+
+        store.publish("events.V", b"{}", None, None)
+    finally:
+        store.close()
+
+
 def test_the_uncapped_page_count_fits_the_32_bit_pragma_parser(tmp_path: Path) -> None:
     # SQLite 3.31.1 and older parse PRAGMA max_page_count as a signed 32-bit
     # int and treat a larger value as a query that leaves the cap unchanged.
