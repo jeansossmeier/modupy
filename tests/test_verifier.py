@@ -856,6 +856,54 @@ def test_package_dir_does_not_execute_ancestor_init(make_fake_app) -> None:
     assert "fakeapp" not in sys.modules
 
 
+def test_verify_reports_violation_when_other_namespace_portion_precedes_project(
+    monkeypatch, request, tmp_path
+) -> None:
+    """An editable install's .pth puts the project root after site-packages,
+    so another installed portion of a PEP 420 root comes first in the root's
+    namespace path. The app's package directory must still resolve to the
+    project's portion, or verify collects no imports and passes a violation."""
+    import sys
+
+    from typer.testing import CliRunner
+
+    from modulith.cli import app
+    from modulith.runtime import _runtime
+
+    site = tmp_path / "site"
+    (site / "company" / "common").mkdir(parents=True)
+    (site / "company" / "common" / "__init__.py").write_text("x = 1\n")
+    src = tmp_path / "src"
+    package_dir = src / "company" / "shop"
+    for name in ("orders", "billing"):
+        (package_dir / name).mkdir(parents=True)
+    (package_dir / "__init__.py").write_text("")
+    (package_dir / "orders" / "__init__.py").write_text(
+        "from company.shop.billing._internal import secret\n"
+    )
+    (package_dir / "billing" / "__init__.py").write_text("")
+    (package_dir / "billing" / "_internal.py").write_text("secret = 1\n")
+    monkeypatch.chdir(src)
+    monkeypatch.syspath_prepend(str(src))
+    monkeypatch.syspath_prepend(str(site))
+    monkeypatch.setenv("MODULITH_PACKAGE", "company.shop")
+
+    def reset_namespace_app() -> None:
+        for name in list(sys.modules):
+            if name == "company" or name.startswith("company."):
+                del sys.modules[name]
+        _runtime._reset_for_testing()
+
+    request.addfinalizer(reset_namespace_app)
+
+    result = CliRunner().invoke(app, ["verify"])
+
+    assert result.exit_code == 1, result.output
+    assert "no-internal-imports" in result.output
+    assert "company.shop.billing._internal" in result.output
+    assert verifier._package_dir("company.shop") == package_dir
+
+
 # ---------------------------------------------------------------------------
 # Rule 5 message wording: "defines" vs "references"
 # ---------------------------------------------------------------------------
