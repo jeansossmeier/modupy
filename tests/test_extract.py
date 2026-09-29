@@ -1047,6 +1047,69 @@ def test_import_gate_exempts_a_virtualenv_inside_the_project_when_site_packages_
     extract._check_imports(service, "shop.orders", project)
 
 
+def _installed_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, files: dict[str, str]) -> Path:
+    """Install *files* as plain copies into a fresh virtualenv's purelib; return that purelib."""
+    python = _venv_python(tmp_path / "venv")
+    purelib = _purelib(python)
+    for name, content in files.items():
+        (purelib / name).parent.mkdir(parents=True, exist_ok=True)
+        (purelib / name).write_text(content)
+    monkeypatch.setattr(sys, "executable", str(python))
+    monkeypatch.chdir(tmp_path)
+    return purelib
+
+
+def test_import_gate_exempts_other_distributions_beside_an_installed_copy(monkeypatch, tmp_path):
+    orders = "import json\nimport thirdparty\n"
+    purelib = _installed_copy(
+        tmp_path,
+        monkeypatch,
+        {"thirdparty.py": "VALUE = 1\n", "shop/__init__.py": "", "shop/orders/__init__.py": orders},
+    )
+    output = tmp_path / "orders-service"
+
+    write_extraction(
+        cfg=Configuration(package="shop"),
+        module="orders",
+        package_dir=purelib / "shop",
+        output=output,
+        helpers=[],
+        notes=[],
+    )
+
+    assert (output / "shop" / "orders" / "__init__.py").read_text() == orders
+
+
+def test_import_gate_reports_first_party_code_from_an_installed_copy(monkeypatch, tmp_path):
+    purelib = _installed_copy(
+        tmp_path,
+        monkeypatch,
+        {
+            "thirdparty.py": "VALUE = 1\n",
+            "company/common.py": "cents = 100\n",
+            "company/shop/__init__.py": "",
+            "company/shop/orders/__init__.py": "import thirdparty\nfrom company.common import cents\n",
+        },
+    )
+    output = tmp_path / "orders-service"
+
+    with pytest.raises(ValueError) as excinfo:
+        write_extraction(
+            cfg=Configuration(package="company.shop"),
+            module="orders",
+            package_dir=purelib / "company" / "shop",
+            output=output,
+            helpers=[],
+            notes=[],
+        )
+
+    assert (
+        f"cannot import company.shop.orders: ImportError: imported company.common from the "
+        f"source tree {os.path.realpath(purelib / 'company')}, outside the extracted service"
+    ) in str(excinfo.value)
+    assert not output.exists()
+
+
 def test_extract_import_gate_sees_the_extracted_tree_under_pythonsafepath(
     make_fake_app, monkeypatch, tmp_path
 ):
