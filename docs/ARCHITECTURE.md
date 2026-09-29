@@ -644,16 +644,21 @@ backpressure without corrupting existing rows. The reserve is 32 pages
 pages. Consumer writes (claims, renewals, acks, fails, dead-letters, prunes)
 only change rows the store already holds, but claims, error text, mark-mode
 completions and prune tombstones still grow them, and no fixed reserve covers
-a whole backlog. A subscribe replay only adds deliveries for publications the
-store already holds. So `SqliteQueueStore._consumer_write` retries a consumer
-write or replay that hits `max_page_count` with the limit lifted (to
+a whole backlog. So `SqliteQueueStore._consumer_write` retries a consumer
+write, or a subscribe too big for even its subscription row, that hits
+`max_page_count` with the limit lifted (to
 2147483647 pages, which SQLite builds that parse the pragma as a 32-bit int
 also accept; it reads the limit back and fails with the store-full error and a
 note naming the SQLite version if it did not rise). Consumers always finish
 the backlog they can see, a group's subscribe never fails on the store limit,
 and the file can grow past `max_store_bytes` by that growth while publishes
-stay refused. A replay that leaves the store over its publish budget logs one
-WARNING naming the group and the replayed count. The same retry drains a store opened
+stay refused. A subscribe replay is bounded by the publish budget instead:
+`_shm_publications._replay` inserts deliveries oldest first, each under a
+savepoint, and rolls back the one that would leave used pages above 8 pages
+below the publish budget (`REPLAY_PUBLISH_HEADROOM_PAGES`), so a replay never
+refuses other publishes. A replay cut short logs one WARNING naming the group,
+the target and the replayed and skipped counts; the target then counts as
+subscribed, so the skipped publications never reach that group. The same retry drains a store opened
 above its limit (filled before the reserve existed, or with `max_store_bytes`
 lowered). Both accept `MODULITH_BROKER_*` environment overrides. The legacy
 `shm_slot_size` option is deprecated and ignored because hint slots are

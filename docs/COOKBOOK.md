@@ -606,12 +606,16 @@ with a raised limit. Publishes are refused a small reserve early, once
 `page_count - freelist_count` would pass the configured page count minus 32
 pages (one eighth of the pages below 256 pages). Consumers can always claim,
 ack, fail, dead-letter and prune the backlog they see, and a group can always
-subscribe: a consumer write or subscribe replay the limit refuses is retried
-past it, so the database file can grow past `max_store_bytes` by the growth of
-rows it already holds (claims, replayed deliveries, error text, mark-mode
-completions, prune tombstones) while publishes stay refused. A replay that
-leaves the store over its publish budget logs one WARNING naming the group and
-the replayed count. This
+subscribe: a consumer write or subscription record the limit refuses is
+retried past it, so the database file can grow past `max_store_bytes` by the
+growth of rows it already holds (claims, error text, mark-mode completions,
+prune tombstones) while publishes stay refused. A subscribe replay never grows
+the store past its publish budget: it replays retained publications oldest
+first and stops 8 pages below the budget, logging one WARNING with the group,
+the target and the replayed and skipped counts. The skipped publications never
+reach that group; to replay them, stop its workers, run
+`modulith broker drop-group <group> --target <target>`, raise
+`max_store_bytes` and restart every process before they expire. This
 also drains a store that filled before this release or whose `max_store_bytes`
 was lowered below its size; an existing larger file keeps its size. The
 `broker.db-wal` file is not counted: it grows to about 4 MiB (SQLite's

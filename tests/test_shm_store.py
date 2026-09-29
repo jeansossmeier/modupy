@@ -437,22 +437,99 @@ def test_a_group_whose_backlog_filled_the_store_replays_a_new_target_and_drains(
         published = _publish_until_refused(store, "events.Busy")
 
         with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
-            assert store.subscribe(["events.Busy", "events.Late"], "busy") == 800
+            assert store.subscribe(["events.Busy", "events.Late"], "busy") == 0
         [warning] = _warnings(caplog)
         assert "'busy'" in warning
-        assert "800" in warning
-        assert "over its publish budget" in warning
+        assert "'events.Late'" in warning
+        assert "replayed 0 and skipped 800" in warning
         assert store.get_subscriptions()["events.Late"] == ["busy"]
-        assert store.group_backlog() == {"busy": published + 800}
-        with pytest.raises(ConfigurationError, match="max_store_bytes"):
-            store.publish("events.Busy", b"{}", None, None)
+        assert store.group_backlog() == {"busy": published}
 
         acked = 0
         while rows := store.claim("busy", 100, _LONG_CONSUMER, 30.0):
             for row in rows:
                 assert store.ack(row["claim_token"], _LONG_CONSUMER, None)
                 acked += 1
-        assert acked == published + 800
+        assert acked == published
+        store.publish("events.Busy", b"{}", None, None)
+    finally:
+        store.close()
+
+
+def _used_and_budget_pages(store: SqliteQueueStore, max_store_bytes: int) -> tuple[int, int]:
+    conn = store._conn
+    page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+    used = int(conn.execute("PRAGMA page_count").fetchone()[0]) - int(
+        conn.execute("PRAGMA freelist_count").fetchone()[0]
+    )
+    max_pages = max_store_bytes // page_size
+    return used, max_pages - min(_shm_publications.CONSUMER_RESERVE_PAGES, max_pages // 8)
+
+
+def test_a_replay_into_a_nearly_full_store_stops_at_the_publish_budget(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    max_store_bytes = 2 * 1024 * 1024
+    store = _bounded_store(tmp_path / "bounded.db", max_store_bytes)
+    try:
+        for index in range(3000):
+            store.publish("events.T", b'{"t":%d}' % index, None, None)
+        used, budget = _used_and_budget_pages(store, max_store_bytes)
+        index = 0
+        while used < budget - 40:
+            store.publish("events.U", b'{"u":%d}' % index, None, None)
+            index += 1
+            used, _ = _used_and_budget_pages(store, max_store_bytes)
+
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
+            replayed = store.subscribe(["events.T"], "late")
+
+        assert 0 < replayed < 3000
+        assert _used_and_budget_pages(store, max_store_bytes)[0] <= budget
+        assert store.get_subscriptions()["events.T"] == ["late"]
+        [warning] = _warnings(caplog)
+        assert "'late'" in warning
+        assert "'events.T'" in warning
+        assert f"replayed {replayed} and skipped {3000 - replayed}" in warning
+        store.publish("events.V", b"{}", None, None)
+
+        claimed: list[bytes] = []
+        while rows := store.claim("late", 100, _LONG_CONSUMER, 30.0):
+            for row in rows:
+                claimed.append(bytes(row["payload"]))
+                assert store.ack(row["claim_token"], _LONG_CONSUMER, None)
+        assert claimed == [b'{"t":%d}' % index for index in range(replayed)]
+        assert store.subscribe(["events.T"], "late") == 0
+    finally:
+        store.close()
+
+
+def test_a_replay_leaves_room_for_a_publish_that_fit_before_it(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    max_store_bytes = 2 * 1024 * 1024
+    store = _bounded_store(tmp_path / "probe.db", max_store_bytes)
+    try:
+        store.subscribe(["events.T"], "early")
+        for index in range(3000):
+            store.publish("events.T", b'{"t":%d}' % index, None, None)
+        while rows := store.claim("early", 100, _LONG_CONSUMER, 30.0):
+            for row in rows:
+                assert store.ack(row["claim_token"], _LONG_CONSUMER, None)
+        used, budget = _used_and_budget_pages(store, max_store_bytes)
+        index = 0
+        while used < budget - 3:
+            store.publish("events.U", b'{"u":%d}' % index, None, None)
+            index += 1
+            used, _ = _used_and_budget_pages(store, max_store_bytes)
+
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
+            store.subscribe(["events.T"], "late")
+
+        assert _used_and_budget_pages(store, max_store_bytes)[0] <= budget
+        assert store.get_subscriptions()["events.T"] == ["early", "late"]
+        assert len(_warnings(caplog)) == 1
+        store.publish("events.V", b"{}", None, None)
     finally:
         store.close()
 
