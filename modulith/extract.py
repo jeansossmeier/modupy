@@ -199,11 +199,15 @@ root, source = os.path.realpath(root), os.path.realpath(source)
 # A directory holding the project would exempt its first-party code too. That
 # covers a prefix and, on Windows, site.getsitepackages(), which lists each
 # prefix itself; the library directories inside such a prefix stay exempt.
-prefixes = [sys.prefix, sys.base_prefix, sys.exec_prefix]
+prefixes = {os.path.realpath(p) for p in (sys.prefix, sys.base_prefix, sys.exec_prefix)}
 libraries = [sysconfig.get_path(n) for n in ("stdlib", "platstdlib", "purelib", "platlib")]
 libraries += site.getsitepackages() + [site.getusersitepackages()]
-exempt = {os.path.realpath(p) for p in prefixes + libraries}
-exempt = {p for p in exempt if not under(source, p)}
+libraries = {os.path.realpath(p) for p in libraries} - prefixes
+# An installed copy of the app shares its library directory with every other
+# distribution, so only the app's own top-level package counts as first-party.
+if any(under(source, p) for p in libraries):
+    source = os.path.join(source, dotted.split(".")[0])
+exempt = {p for p in prefixes | libraries if not under(source, p)}
 leaked = sorted(
     name
     for name, mod in list(sys.modules.items())
@@ -229,7 +233,9 @@ def _check_imports(root: Path, dotted: str, source: Path) -> None:
     ``PYTHONSAFEPATH`` nor an installed copy of the monolith can shadow it.
     Any module the child then loads from *source* (the monolith's source
     directory, reachable through ``PYTHONPATH`` or an editable install) is a
-    failure: the deployed service will not have it.
+    failure: the deployed service will not have it. When *source* lies in a
+    library directory (the app is an installed copy), only the app's top-level
+    package counts, so other installed distributions stay exempt.
 
     Runs the extracted module's code, which is acceptable because extract is
     a trusted-source tool that already imports the app to discover modules.
