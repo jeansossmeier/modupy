@@ -301,10 +301,32 @@ only if** that transaction commits.
 - A row the crashed process was delivering under a lease (`claim_strategy=
   "lease"`, the default, which after-commit dispatch also takes) stays claimed
   until that lease expires: the startup sweep skips it, and the first sweep
-  after expiry recovers it, up to `claim_lease_seconds` plus
-  `retry_interval_seconds` after the crash. Rows committed but not yet
-  claimed, and rows under `"advisory_lock"` (the lock dies with the crashed
-  process's connection) or `"none"`, are recovered by the startup sweep.
+  after expiry recovers it. In the normal case that is within
+  `claim_lease_seconds` plus `retry_interval_seconds` of the crash. It takes
+  longer when `retry_stale_seconds` exceeds the lease, because a periodic
+  sweep only takes rows at least that old. It also takes longer while the
+  previous sweep is still dispatching a slow batch, because the interval
+  counts from the end of that sweep. And no sweep recovers anything while
+  the runtime is not bootstrapped. A graceful stop that cancels a sweep
+  leaves every row of its claimed batch leased, not only the row being
+  delivered, and those rows wait out the lease the same way.
+- Rows committed but not yet claimed, and rows under `"none"`, are recovered
+  by the startup sweep.
+- Under `"advisory_lock"` the row's lock lives as long as the dead process's
+  Postgres session. When the process dies on a live host, its kernel closes
+  the socket, the session ends, and the startup sweep recovers the row at
+  once. After a host loss or a network partition nothing closes the socket,
+  so the row stays locked and every sweep skips it until Postgres drops the
+  dead session through TCP keepalive. With stock Linux defaults that takes
+  about 2 h 11 min: 7200 s idle, then 9 probes 75 s apart. To shorten it,
+  lower the server's `tcp_keepalives_idle`, `tcp_keepalives_interval` and
+  `tcp_keepalives_count`, either in `postgresql.conf` or per connection:
+  `connect_args={"server_settings": {"tcp_keepalives_idle": "60",
+  "tcp_keepalives_interval": "10", "tcp_keepalives_count": "3"}}` for
+  asyncpg, or `connect_args={"options": "-c tcp_keepalives_idle=60 -c
+  tcp_keepalives_interval=10 -c tcp_keepalives_count=3"}` for psycopg (about
+  90 s). Lock connections are opened with the engine's connect arguments.
+  Postgres ignores these settings on Unix-domain socket connections.
 - Backoff is exponential, measured from `last_attempt_at` (not `published_at`),
   and **capped at 5 minutes** — a persistently-failing listener actually backs
   off instead of being retried every sweep.
@@ -356,7 +378,7 @@ outbox table are coordinated by `outbox.configure(claim_strategy=...)`
 | `claim_strategy` | How it coordinates | Cost |
 |---|---|---|
 | `"lease"` (default) | `claim_batch()` selects `FOR UPDATE SKIP LOCKED` on Postgres, writes `claim_owner`/`claim_token`/`claim_until` and **commits before dispatch**. On MySQL and SQLite it claims each selected row with a conditional `UPDATE` that re-checks `completed_at IS NULL AND (claim_until IS NULL OR claim_until <= now)`, and drops a row a concurrent sweeper claimed first. The lease renews at one third of `claim_lease_seconds` while dispatch is in flight, and completion/failure writes are fenced on `claim_token` so an expired claimant cannot clobber a newer one | Postgres: one extra write per claimed batch. MySQL/SQLite: one `UPDATE` statement per candidate row |
-| `"advisory_lock"` | a per-publication `pg_try_advisory_lock` held for the duration of the dispatch. Postgres-only — a non-Postgres store rejects it at `configure()` | no extra write, but a held AUTOCOMMIT connection (no open transaction) per in-flight row. Lock connections come from a separate pool sized like the engine's, so held locks never starve the listener or the store's own reads of the engine pool. During a burst a process can therefore hold up to 2×(`pool_size` + `max_overflow`) Postgres connections. A dispatch that waits past `pool_timeout` for a lock connection leaves its row to the next sweep. A lock connection returns to its pool when the lock attempt found the row taken or the unlock confirmed the release; after a failed lock query or unlock it is invalidated, so a lock never outlives its dispatch |
+| `"advisory_lock"` | a per-publication `pg_try_advisory_lock` held for the duration of the dispatch. Postgres-only — a non-Postgres store rejects it at `configure()` | no extra write, but a held AUTOCOMMIT connection (no open transaction) per in-flight row. Lock connections come from a separate pool sized like the engine's, so held locks never starve the listener or the store's own reads of the engine pool. With a `QueuePool` (the async engine default) a process can therefore hold up to 2×(`pool_size` + `max_overflow`) Postgres connections during a burst, and keeps up to `pool_size` idle lock connections open after it. `NullPool` and `max_overflow=-1` bound neither pool, so a burst opens one lock connection per in-flight row. The lock pool also caps how many rows the after-commit path delivers at once: an after-commit dispatch that waits past `pool_timeout` for a lock connection logs a WARNING and leaves its row, untouched and uncharged, to the sweep, which delivers one row at a time. A sweep that itself waits past `pool_timeout` logs a WARNING and leaves the rest of its batch to the next sweep. A lock connection returns to its pool when the lock attempt found the row taken or the unlock confirmed the release; after a failed lock query or unlock it is invalidated, so a lock never outlives its dispatch |
 | `"none"` | no coordination; two sweepers CAN dispatch the same row. Logged as a warning at `configure()` so the tradeoff is visible | none |
 
 Tuning knobs: `claim_lease_seconds` (default 60 — must exceed your slowest

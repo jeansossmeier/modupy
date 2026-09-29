@@ -21,9 +21,10 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi import BackgroundTasks, Depends, FastAPI
+from sqlalchemy import event as sa_event
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool
 
 from modulith import EventPublication, event, publish
 from modulith.adapters import postgres_outbox
@@ -1119,6 +1120,118 @@ async def test_advisory_after_commit_delivers_a_burst_larger_than_the_pool(
         if r.name == "modulith.adapters.postgres" and r.levelno >= logging.WARNING
     ] == []
     assert elapsed < pool_timeout
+
+
+async def _advisory_store_with_one_lock_connection(
+    tmp_path: Path,
+) -> tuple[Any, PostgresPublicationStore]:
+    """A real store whose lock pool holds one connection and waits 0.2 s for it.
+
+    SQLite has no advisory locks, so the two functions the store calls are
+    registered as always-succeeding stand-ins; the lock pool's wait and
+    timeout do not depend on the dialect."""
+    eng = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'lock-pool.db'}",
+        poolclass=AsyncAdaptedQueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.2,
+    )
+
+    @sa_event.listens_for(eng.sync_engine, "connect")
+    def _advisory_stand_ins(dbapi_conn: Any, _record: Any) -> None:
+        dbapi_conn.create_function("pg_try_advisory_lock", 1, lambda _key: 1)
+        dbapi_conn.create_function("pg_advisory_unlock", 1, lambda _key: 1)
+
+    async with eng.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    store = PostgresPublicationStore(engine=eng)
+    store.supports_advisory_lock = True
+    return eng, store
+
+
+def _logged_at_warning_or_above(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str, bool]]:
+    return [
+        (r.levelname, r.getMessage(), r.exc_info is not None)
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and r.name in ("modulith.adapters.postgres", "modulith.outbox")
+    ]
+
+
+async def test_advisory_after_commit_without_a_lock_connection_leaves_the_row_to_the_sweep(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A burst larger than the lock pool leaves some after-commit tasks
+    waiting past ``pool_timeout``. Such a row is untouched and the sweep
+    delivers it, so the task logs one WARNING naming the row, with no
+    traceback, and charges the row no attempt."""
+    eng, store = await _advisory_store_with_one_lock_connection(tmp_path)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _pub(1)
+    await store.save(pub)
+    holder_id = uuid4()
+    holder = await store.try_lock_publication(holder_id)
+    assert holder is not None
+    try:
+        with caplog.at_level(logging.WARNING):
+            await store._dispatch_after_commit(pub.id)
+        delivered_during_wait = list(received)
+        left = await store.find_incomplete(timedelta(0))
+        await store.unlock_publication(holder, holder_id)
+        await outbox._sweep(timedelta(0))
+        completed = await _completed_rows(eng)
+    finally:
+        await store.dispose()
+        await eng.dispose()
+
+    logged = _logged_at_warning_or_above(caplog)
+    assert [(level, has_traceback) for level, _, has_traceback in logged] == [("WARNING", False)]
+    assert str(pub.id) in logged[0][1]
+    assert "sweep will deliver it" in logged[0][1]
+    assert delivered_during_wait == []
+    assert [(p.id, p.attempt_count) for p in left] == [(pub.id, 0)]
+    assert received == [1]
+    assert completed == 1
+
+
+async def test_advisory_sweep_without_a_lock_connection_leaves_its_batch_to_the_next_sweep(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A sweep that cannot get a lock connection within ``pool_timeout``
+    stops at that row with one WARNING and leaves the whole batch, untouched
+    and uncharged, to the next sweep, which delivers it once the pool frees."""
+    eng, store = await _advisory_store_with_one_lock_connection(tmp_path)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+    _bootstrap_with_listener(record)
+    pubs = [_pub(1), _pub(2)]
+    for pub in pubs:
+        await store.save(pub)
+    holder_id = uuid4()
+    holder = await store.try_lock_publication(holder_id)
+    assert holder is not None
+    try:
+        with caplog.at_level(logging.WARNING):
+            await outbox._guarded_sweep(timedelta(0))
+        delivered_during_wait = list(received)
+        left = await store.find_incomplete(timedelta(0))
+        await store.unlock_publication(holder, holder_id)
+        await outbox._guarded_sweep(timedelta(0))
+        completed = await _completed_rows(eng)
+    finally:
+        await store.dispose()
+        await eng.dispose()
+
+    logged = _logged_at_warning_or_above(caplog)
+    assert [(level, has_traceback) for level, _, has_traceback in logged] == [("WARNING", False)]
+    assert "next sweep" in logged[0][1]
+    assert delivered_during_wait == []
+    assert sorted((str(p.id), p.attempt_count) for p in left) == sorted(
+        (str(p.id), 0) for p in pubs
+    )
+    assert sorted(received) == [1, 2]
+    assert completed == 2
 
 
 @pytest.mark.parametrize("mode", ["delete", "archive"])
