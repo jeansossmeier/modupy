@@ -309,14 +309,23 @@ only if** that transaction commits.
   previous sweep is still dispatching a slow batch, because the interval
   counts from the end of that sweep. And no sweep recovers anything while
   the runtime is not bootstrapped. A crash, or a graceful stop that cancels
-  a sweep, leaves every row of its claimed batch leased, not only the row
-  being delivered, and those rows wait out the lease the same way.
+  a sweep, leaves leased the row being delivered and every row of its
+  claimed batch the sweep had not reached yet, and those rows wait out the
+  lease the same way. Rows the sweep had already delivered, failed or
+  released are not leased.
 - Rows committed but not yet claimed, and rows under `"none"`, are recovered
   by the startup sweep.
 - Under `"advisory_lock"` the row's lock lives as long as the dead process's
   Postgres session. When the process dies on a live host, its kernel closes
   the socket, the session ends, and the startup sweep recovers the row at
-  once. After a host loss or a network partition nothing closes the socket,
+  once. The exception is a descendant forked from the process, such as a
+  fork-started `multiprocessing` or `ProcessPoolExecutor` child: it keeps a
+  copy of the lock connection's socket, so the session and its locks outlive
+  the process until that descendant exits, and every sweep skips the row
+  meanwhile. Start such children with the `spawn` or `forkserver` method
+  (`multiprocessing.get_context("spawn")`, passed as `ProcessPoolExecutor`'s
+  `mp_context`), which does not inherit the connection. After a host loss or
+  a network partition nothing closes the socket,
   so the row stays locked and every sweep skips it until Postgres drops the
   dead session through TCP keepalive. With stock Linux defaults that takes
   about 2 h 11 min: 7200 s idle, then 9 probes 75 s apart. To shorten it,
@@ -328,9 +337,12 @@ only if** that transaction commits.
   tcp_keepalives_interval=10 -c tcp_keepalives_count=3"}` for psycopg (about
   90 s). Lock connections are opened with the engine's connect arguments.
   Postgres ignores these settings on Unix-domain socket connections. An
-  engine built from `outbox_url` takes no `connect_args`, so set them in
-  `postgresql.conf` or with `ALTER ROLE ... SET` there; psycopg's `options`
-  argument also replaces any `options` in the URL, such as a `search_path`.
+  engine built from `outbox_url` takes no `connect_args`. With psycopg, put
+  them in the URL's `options` query parameter:
+  `?options=-c%20tcp_keepalives_idle%3D60%20-c%20tcp_keepalives_interval%3D10%20-c%20tcp_keepalives_count%3D3`.
+  With asyncpg, set them in `postgresql.conf` or with `ALTER ROLE ... SET`.
+  psycopg's `options` connect argument replaces any `options` in the URL,
+  such as a `search_path`.
   A process that hangs without exiting keeps its session, and so its locks,
   until it resumes or is killed. Leave `idle_session_timeout` unset for the
   outbox's role: a lock connection sits idle while its listener runs, so
