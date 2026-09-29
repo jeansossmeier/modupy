@@ -145,7 +145,7 @@ fastapi = [
 # the CLI (just `import modulith`) don't pay typer's startup cost.
 cli = [
     "typer>=0.12,<1.0",
-    "rich>=13.0,<15.0",
+    "rich>=13.0,<16.0",
 ]
 
 # Test plugin (separate package conceptually, but shipped inside modupy as
