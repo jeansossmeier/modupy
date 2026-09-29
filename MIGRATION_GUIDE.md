@@ -298,9 +298,10 @@ async def get_db():
             unbind_session(token)
 ```
 
-Call `outbox.start()` in your ASGI lifespan's startup half: module-scope code
-runs before the server's event loop exists, so `configure()` there cannot
-start the retry loop that redelivers rows a crashed process left behind. Keep
+Call `modulith.bootstrap()` and then `outbox.start()` in your ASGI lifespan's
+startup half: module-scope code runs before the server's event loop exists, so
+`configure()` there cannot start the retry loop that redelivers rows a crashed
+process left behind, and that loop skips every row until bootstrap has run. Keep
 the outbox table in the same database as your business data, or the row and
 your data cannot commit in one transaction. Under `--topology processes`,
 `main.py` does not run in workers. Set `[tool.modulith].outbox_url` (env
@@ -377,11 +378,15 @@ listener shapes behave differently:
 - A listener in a plain, non-package file such as `myapp/shared.py`, or in
   a namespace folder without `__init__.py` such as `myapp/common/`, belongs
   to the module package whose import first loads that file in each process:
-  the innermost module package on the import stack at that moment. Only
-  that module's worker runs it. If your module imports a sibling (`from
-  myapp import orders`) whose import loads the file first, your module's
-  own later import of the file does not make your worker run it. To run
-  such a listener in a module's worker, define it inside that module
+  the innermost module package on the import stack at that moment. Each
+  worker decides this on its own, so if two modules each import the file
+  directly, both workers run the listener, once each per broker delivery.
+  If your module imports a sibling (`from myapp import orders`) whose import
+  loads the file first, your module's own later import of the file does not
+  make your worker run it. If your application package's `__init__.py` or
+  the contracts package loads the file first, no module owns it and it
+  behaves like a plugin listener: every worker runs it. To run such a
+  listener in exactly one module's worker, define it inside that module
   package.
 
 Keep listeners inside module packages, and mark an event `@externalized`
@@ -401,10 +406,10 @@ and process restart on the same disk; set `sqlite_synchronous = "FULL"` when
 the last commits must survive OS failure or power loss.
 
 Delivery is at-least-once. A crash after a listener returns but before its ack
-commits can deliver the event again, so make listeners idempotent. A publication
-without a registered group is retained for `orphan_retention_seconds` (default
-one hour) and replayed to groups that subscribe before expiry, while the store
-has room below its publish budget.
+commits can deliver the event again, so make listeners idempotent. Every
+publication, including one every group has acked, is retained for
+`orphan_retention_seconds` (default one hour) and replayed to groups that
+subscribe before expiry, while the store has room below its publish budget.
 
 Use canonical private paths rather than the legacy names:
 

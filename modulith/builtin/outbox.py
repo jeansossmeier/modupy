@@ -413,9 +413,11 @@ def start() -> None:
 
     Idempotent, and a no-op when no store is bound or no loop is running.
     ``configure()`` at module import time runs before the server's event loop
-    exists, so a server calls this from its ASGI startup; without it, rows a
-    crashed process left undelivered wait for the first transactional
-    publish. CLI processes never call it, so they never sweep or dispatch.
+    exists, so a server calls this from its ASGI startup, after
+    ``modulith.bootstrap()``: every sweep skips its rows until the runtime is
+    bootstrapped, so with ``start()`` alone, rows a crashed process left
+    undelivered still wait for the first publish. CLI processes never call
+    it, so they never sweep or dispatch.
     """
     if _store is not None:
         _ensure_retry_loop()

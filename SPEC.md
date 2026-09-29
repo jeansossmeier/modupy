@@ -664,10 +664,16 @@ uvicorn modulith._worker:create_app --factory \
     namespace folder without `__init__.py` (`app/common/audit.py`) belongs
     to the module package whose import first loads that file in each
     process: the innermost module package on the import stack at that
-    moment. Only that module's worker runs it. A worker whose own module
-    imports the file after a sibling's import loaded it (`from app import
-    orders` first) does not. To run such a listener in a module's worker,
-    define it inside that module package.
+    moment. Each worker decides this on its own. If two modules each import
+    the file directly, both workers own it, so an event delivered through
+    the broker runs it once in each. A worker whose own module imports the
+    file after a sibling's import loaded it (`from app import orders` first)
+    does not run it. If the application package's own `__init__.py` or the
+    contracts package loads the file first, no module owns it: it is
+    untagged like a plugin listener, runs in every worker, and the
+    non-externalized events it handles are never routed. To run such a
+    listener in exactly one module's worker, define it inside that module
+    package.
 
   Keep listeners inside module packages, and mark an event `@externalized`
   when modules in other workers handle it

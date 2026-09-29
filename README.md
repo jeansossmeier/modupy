@@ -33,7 +33,10 @@ async SQLAlchemy URL of your business database (Postgres, MySQL or SQLite),
 makes the outbox transactional in every process: events are stored durably
 and delivered at-least-once after commit, and process crashes and
 transaction rollbacks stay consistent. The Alembic migrations ship inside the
-package.
+package. A single-process app calls `modulith.bootstrap()` and then
+`outbox.start()` in its lifespan, so rows a crashed process left undelivered
+are retried at startup rather than after the first publish
+([DEPLOYMENT.md](docs/DEPLOYMENT.md#durable-single-process-outbox-pattern)).
 
 **Process-per-module: one flag, still one host.**
 `modulith run myapp.main:app --topology=processes` gives each module its own
@@ -280,8 +283,9 @@ version = "0.1.0"
 uvicorn myapp.main:app --reload
 ```
 
-Package detection, module discovery and listener registration are automatic;
-there is no `modulith.bootstrap()` call to make.
+Package detection, module discovery and listener registration are automatic
+and run at the first `publish()`. Only a durable outbox needs
+`modulith.bootstrap()` at startup, as described under **Durable** above.
 
 ### Run the same code process-per-module
 

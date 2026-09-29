@@ -229,7 +229,9 @@ publications from a previous crash retried immediately at startup,
 rather than waiting for the first publish(), should call
 ``bootstrap()`` right after ``configure()`` and then
 ``modulith.builtin.outbox.start()`` from its running event loop (an ASGI
-lifespan's startup half): ``bootstrap()`` itself starts no retry loop.
+lifespan's startup half). ``bootstrap()`` starts the retry loop itself
+only when it binds the store from ``outbox_url`` inside a running event
+loop; ``start()`` is idempotent, so calling both is safe.
 
 Safe to call any number of times — after the first call, subsequent
 calls are a no-op fast path (same guarantee as ``publish()``'s implicit

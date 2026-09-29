@@ -300,13 +300,16 @@ class Runtime:
         ``app/shared.py``, or in a namespace folder without ``__init__.py``
         such as ``app/common/``, runs its registration once per process, so
         it belongs to the module package whose import first loaded that file
-        in this process: the innermost one on the import stack then. Only
-        that module's worker runs it. A worker whose own module imports the
-        file after a sibling's import loaded it does not, because the cached
-        import registers nothing. Module discovery never reports such a
-        folder, so no worker hosts it.
+        in this process: the innermost one on the import stack then. Each
+        process decides this on its own, so when two modules each import the
+        file directly, both of their workers run it. A worker whose own
+        module imports the file after a sibling's import loaded it does not,
+        because the cached import registers nothing. Module discovery never
+        reports such a folder, so no worker hosts it.
         One registered outside any module import (plugin code, a hook, a
-        test) gets None and stays local to every process.
+        test, or a file first loaded by the application package's own
+        ``__init__.py`` or by the contracts package) gets None and stays local
+        to every process.
         """
         cfg = self._config
         if cfg is None or not cfg.package:
@@ -352,9 +355,11 @@ class Runtime:
         serializer admits only the event types of this process's local
         listeners, the only rows it may deserialize. The claim settings of
         ``outbox_options`` are applied by the same ``configure()`` call that
-        binds the store, so no after-commit dispatch runs without them. The
-        retry loop starts on ``outbox.start()`` or the first transactional
-        publish. ``shutdown()`` disposes the store and its engine, but only
+        binds the store, so no after-commit dispatch runs without them. That
+        call also starts the retry loop when an event loop is running
+        (``modulith.bootstrap()`` from a lifespan); otherwise the loop starts on
+        ``outbox.start()`` or the first transactional publish.
+        ``shutdown()`` disposes the store and its engine, but only
         process-topology workers call it; a single-process app stops the retry
         loop with ``outbox.shutdown()``.
         """

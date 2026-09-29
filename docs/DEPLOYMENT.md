@@ -31,9 +31,11 @@ In `myapp/main.py`, keep `outbox.configure()` at module import time (the CLI
 outbox tooling below depends on that — see **Outbox operations**), and add a
 lifespan that starts and stops the retry loop. Module-scope code runs before
 the server's event loop exists, so `outbox.configure()` there cannot start the
-retry loop: call `outbox.start()` in the lifespan's startup half, or rows a
-crashed process left undelivered wait until this process's first
-transactional publish. A bare module-scope `outbox.configure()` with no
+retry loop: call `modulith.bootstrap()` and then `outbox.start()` in the
+lifespan's startup half. Every sweep skips its rows until the runtime is
+bootstrapped, and bootstrap otherwise first runs at the first `publish()`, so
+without both calls rows a crashed process left undelivered wait for this
+process's first publish. A bare module-scope `outbox.configure()` with no
 matching `outbox.shutdown()` leaves the retry loop and the DB engine's
 connection pool running until the process is killed instead of draining
 gracefully. The outbox table must live in the same database as your business
@@ -68,7 +70,10 @@ outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTB
   listeners.
 - The binding needs module discovery (`auto_discover`, the default) outside a
   worker, because the allowlist comes from the discovered listeners. With
-  `auto_discover = false`, call `outbox.configure()` yourself.
+  `auto_discover = false`, call `outbox.configure()` yourself. The
+  `modulith outbox` commands then bind no store, because they import none of
+  your modules; run them with `MODULITH_AUTO_DISCOVER=true` when discovery can
+  import the package.
 - The outbox table must already exist (run the shipped Alembic migrations);
   the URL must name the database holding your business tables.
 - In a single-process app, call `modulith.bootstrap()` and then
@@ -102,7 +107,7 @@ delivered per module. Rows written by an earlier release under the bare
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from modulith import configure
+from modulith import bootstrap, configure
 from modulith.builtin import outbox
 from modulith.adapters.postgres_outbox import PostgresPublicationStore
 from modulith.serializers import JsonEventSerializer
@@ -126,6 +131,7 @@ configure(outbox="postgres")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    bootstrap()  # the sweep dispatches nothing until the runtime is bootstrapped
     outbox.start()  # crash-recovery sweep + retry loop on the server's loop
     yield
     # Teardown order matters: drain/unregister the store's after-commit hook
@@ -316,7 +322,11 @@ longest retention, or shorten `orphan_retention_seconds` before the store
 fills: each publication keeps the orphan retention stamped when it was
 written, so shortening it frees nothing in a store that is already full. A
 backlog frees space only as consumers drain it, or when
-`modulith broker drop-group` removes a retired group. A new `max_store_bytes`
+`modulith broker drop-group` removes a retired group. Until then a retired or
+stopped group pins every publication to its targets, and the `modulith run`
+startup warning names a retired group only 24 hours after its last consumer
+activity, so size for that backlog or drop the group with `--force` as soon
+as no host runs it. A new `max_store_bytes`
 or `retention_age_seconds` applies to a process only after it restarts.
 `orphan_retention_seconds` is capped at 100 years (3153600000).
 A group that subscribes after a publication replays it only within that window.
@@ -899,7 +909,10 @@ Export spans to Prometheus, Jaeger, or your observability stack.
    consumer served the group until step 5, so for 24 hours after that the
    group still counts as live: `drop-group` refuses it unless you pass
    `--force`. Pass `--force` once you have checked that no service or host
-   still runs the group, or wait 24 hours. The startup warning for a
+   still runs the group, or wait 24 hours. On the SHM broker, do not wait:
+   the group pins every publication to its targets until it is dropped, and
+   a store sized for the one-hour default retention can fill within those 24
+   hours. The startup warning for a
    forgotten group likewise appears only when `modulith run` restarts at
    least 24 hours after the group's last consumer activity; the restart in
    step 5 does not report it.
@@ -966,14 +979,16 @@ types a worker consumes. Since the release in which a worker consumes only
 its own module's listeners, a worker no longer subscribes to event types
 that only a sibling module it imports listens to.
 
-On the SHM and database brokers, subscriptions are never removed
-automatically, and neither are the pending or claimed messages queued for
-them, so a rollback to a release that still consumes the target finds its
-backlog intact. (SHM drops the group's subscription rows for targets it no
-longer consumes when the worker starts, but keeps their queued deliveries.)
-Until you clean up:
+On the SHM and database brokers, the pending or claimed messages queued for
+the target are never removed automatically, so a rollback to a release that
+still consumes the target finds them intact. The database broker also keeps
+the group's subscription, so every publish to the target still adds a
+message for the group. The SHM broker drops the group's subscription rows for
+targets it no longer consumes when the worker starts: later publishes add
+nothing for the group, and a rollback that subscribes again replays only the
+publications still inside `orphan_retention_seconds` (one hour by default),
+so older ones written in between never reach the group. Until you clean up:
 
-- every publish to the target still adds a message for the group;
 - the group's consumer claims only the targets it currently consumes, so
   those messages stay pending, are never dead-lettered, and log no error;
 - each time the worker's consumer starts, it logs one WARNING per stale

@@ -335,9 +335,10 @@ with `modulith outbox status`; a persistently-failing publication is
 dead-lettered after 10 attempts.
 
 A module-scope `outbox.configure()` runs before the server's event loop exists,
-so it cannot start the retry loop: call `outbox.start()` in your ASGI
-lifespan's startup half, or undelivered rows from a crashed process wait for
-the first transactional publish. The outbox table must live in the database
+so it cannot start the retry loop: call `modulith.bootstrap()` and then
+`outbox.start()` in your ASGI lifespan's startup half. Every sweep skips its
+rows until the runtime is bootstrapped, so without both calls undelivered rows
+from a crashed process wait for the first publish. The outbox table must live in the database
 that holds your business data, or the row and your data cannot commit in one
 transaction. Under `--topology processes`, `main.py` (its lifespan, middleware
 and this wiring) does not run in workers; bind the store from the module's
