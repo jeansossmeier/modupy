@@ -87,8 +87,9 @@ The core, the transactional outbox, the tooling and the process-per-module
 runtime are code-complete and green under `pytest`, `mypy --strict` and
 `ruff`; what remains before 1.0 is adapter breadth. [ROADMAP.md](ROADMAP.md)
 has the plan, [SPEC.md](SPEC.md) every design decision, and
-[`examples/demo_app`](examples/demo_app) is a runnable three-module shop wired
-purely through events.
+[`examples/quickstart`](examples/quickstart) is the project below, ready to
+run, and [`examples/demo_app`](examples/demo_app) is a runnable three-module
+shop wired purely through events.
 
 ---
 
@@ -136,6 +137,10 @@ async def create_order(customer_id: str) -> str:
     return order_id
 
 
+def is_fulfilled(order_id: str) -> bool:
+    return order_id in _fulfilled
+
+
 @listener
 async def on_payment(event: PaymentReceived) -> None:
     """Cross-module communication via events, not direct calls."""
@@ -149,10 +154,10 @@ from myapp.orders.api import router as router  # noqa: E402
 
 ```python
 # myapp/orders/api.py
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from myapp.orders import create_order
+from myapp.orders import create_order, is_fulfilled
 
 router = APIRouter()
 
@@ -164,11 +169,61 @@ class NewOrder(BaseModel):
 @router.post("")
 async def post_order(body: NewOrder) -> dict[str, str]:
     return {"order_id": await create_order(body.customer_id)}
+
+
+@router.get("/{order_id}/fulfilment")
+async def get_fulfilment(order_id: str) -> dict[str, str | bool]:
+    if not is_fulfilled(order_id):
+        raise HTTPException(status_code=404, detail="order not fulfilled")
+    return {"order_id": order_id, "fulfilled": True}
 ```
 
-The route sits at the router root (`""`) and `main.py` mounts the router under
+The routes sit at the router root and `main.py` mounts the router under
 `/orders` — the same prefix a process-per-module worker uses, so both
-topologies serve the identical URL, `POST /orders`.
+topologies serve the identical URLs, `POST /orders` and
+`GET /orders/{order_id}/fulfilment`.
+
+Two more modules react to `OrderCreated`. Neither is called by `orders`, and
+`orders` imports neither:
+
+```python
+# myapp/payments/__init__.py
+from modulith import listener, publish
+
+from myapp.contracts.events import OrderCreated, PaymentReceived
+
+
+@listener
+async def charge(event: OrderCreated) -> None:
+    await publish(PaymentReceived(order_id=event.order_id))  # your real charge goes here
+```
+
+```python
+# myapp/inventory/__init__.py
+from fastapi import APIRouter, HTTPException
+from modulith import listener
+
+from myapp.contracts.events import OrderCreated
+
+_reserved: set[str] = set()
+
+router = APIRouter()
+
+
+@listener
+async def reserve(event: OrderCreated) -> None:
+    _reserved.add(event.order_id)  # your real stock reservation goes here
+
+
+@router.get("/{order_id}")
+async def get_reservation(order_id: str) -> dict[str, str | bool]:
+    if order_id not in _reserved:
+        raise HTTPException(status_code=404, detail="order not reserved")
+    return {"order_id": order_id, "reserved": True}
+```
+
+`payments` has no HTTP surface, so it has no `router`. `inventory` defines
+its router in its own `__init__.py`.
 
 ```python
 # myapp/main.py
@@ -176,12 +231,14 @@ import logging
 
 from fastapi import FastAPI
 
+from myapp.inventory import router as inventory_router
 from myapp.orders import router as orders_router
 
 logging.basicConfig(level=logging.INFO)  # so the banner below is visible
 
 app = FastAPI()
 app.include_router(orders_router, prefix="/orders")
+app.include_router(inventory_router, prefix="/inventory")
 
 # That's it. Modules auto-discovered. Listeners auto-registered.
 # Transactional outbox available with two config lines (outbox, outbox_url).
@@ -201,6 +258,17 @@ INFO:modulith:ready
 $ curl -sX POST localhost:8000/orders \
       -H 'content-type: application/json' -d '{"customer_id": "alice"}'
 {"order_id":"ord-1"}
+```
+
+The order fans out through events, not calls: `payments` charged it and
+published `PaymentReceived`, which `orders` handled, while `inventory`
+reserved the stock.
+
+```bash
+$ curl -s localhost:8000/orders/ord-1/fulfilment
+{"order_id":"ord-1","fulfilled":true}
+$ curl -s localhost:8000/inventory/ord-1
+{"order_id":"ord-1","reserved":true}
 ```
 
 The banner goes through the standard `modulith` logger at INFO level, which
@@ -301,6 +369,17 @@ modulith → process-per-module: 3 worker(s) [inventory:9001, orders:9002, payme
 $ curl -sX POST localhost:8000/orders \
       -H 'content-type: application/json' -d '{"customer_id": "alice"}'
 {"order_id":"ord-1"}
+```
+
+Each event now crosses a process boundary, so give the order a moment before
+reading it back; until `payments` has charged it, the fulfilment route
+answers 404.
+
+```bash
+$ curl -s localhost:8000/orders/ord-1/fulfilment
+{"order_id":"ord-1","fulfilled":true}
+$ curl -s localhost:8000/inventory/ord-1
+{"order_id":"ord-1","reserved":true}
 ```
 
 The reverse proxy is the only public port and routes `/<module>/...` to that
@@ -405,6 +484,7 @@ build their artifacts — run them only against trusted source.
 - **[ROADMAP.md](ROADMAP.md)** — phase plan with checkboxes and kill criteria
 - **[MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)** — adopting on existing codebases
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — development setup, both test suites, lint and type checks
+- **[examples/quickstart](examples/quickstart)** — the pitch above as a runnable project, with its own tests
 - **[examples/demo_app](examples/demo_app)** — a runnable three-module shop; the fastest way to see modulith end-to-end
 
 Single-file plugin examples (a Redis Streams broker, a naming-convention

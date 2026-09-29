@@ -21,12 +21,17 @@ renaming the package cannot quietly disable the guard.
 from __future__ import annotations
 
 import ast
+import difflib
 import re
 from pathlib import Path
 
 from conftest import Block, fenced_blocks
 
-README = Path(__file__).resolve().parent.parent / "README.md"
+REPO = Path(__file__).resolve().parent.parent
+README = REPO / "README.md"
+QUICKSTART = REPO / "examples" / "quickstart"
+QUICKSTART_README = QUICKSTART / "README.md"
+QUICKSTART_SECTIONS = ("The 30-second pitch", "Quickstart")
 PATH_COMMENT = re.compile(r"^#\s*([\w./-]+\.py)\s*$")
 TREE_BRANCHES = ("├──", "└──")
 
@@ -198,3 +203,93 @@ def test_readme_project_tree_lists_pyproject_toml() -> None:
         "README.md draws a project tree that omits 'pyproject.toml', which every CLI command "
         f"except 'audit' needs to resolve the application package: {'; '.join(missing)}"
     )
+
+
+def _section_blocks(path: Path, title: str) -> list[Block]:
+    """Fenced blocks under the ``## <title>`` heading, sub-headings included."""
+    blocks = fenced_blocks(path)
+    fenced_lines = {
+        number
+        for block in blocks
+        for number in range(block.line - 1, block.line + len(block.body.splitlines()) + 1)
+    }
+    headings = [
+        (number, text[3:].strip())
+        for number, text in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1)
+        if text.startswith("## ") and number not in fenced_lines
+    ]
+    starts = [number for number, name in headings if name == title]
+    assert starts, f"{path.name} has no '## {title}' section"
+    following = [number for number, _name in headings if number > starts[0]]
+    end = following[0] if following else float("inf")
+    return [block for block in blocks if starts[0] < block.line < end]
+
+
+def _diff(expected: str, actual: str, expected_name: str, actual_name: str) -> str:
+    return "".join(
+        difflib.unified_diff(
+            expected.splitlines(keepends=True),
+            actual.splitlines(keepends=True),
+            fromfile=expected_name,
+            tofile=actual_name,
+        )
+    )
+
+
+def test_root_readme_quickstart_blocks_run_in_the_quickstart_example() -> None:
+    """The root README's example is the quickstart project, not a lookalike.
+
+    What a reader copies from the root README is what CI executes in
+    ``examples/quickstart``: each ``# myapp/...`` python block equals that file
+    without its path comment, no non-empty module of the example goes unshown,
+    and every bash block under the pitch and the Quickstart reappears verbatim
+    in the example's README, whose commands the runbook test runs.
+    """
+    problems: list[str] = []
+    blocks = _python_blocks()
+    package = _example_package(blocks)
+
+    shown: set[str] = set()
+    for block, path in blocks:
+        if path is None:
+            continue
+        shown.add(path)
+        source = QUICKSTART / path
+        if not source.is_file():
+            problems.append(f"README.md:{block.line} shows {path}, which the example lacks")
+            continue
+        code = block.body.partition("\n")[2] + "\n"
+        if code != source.read_text(encoding="utf-8"):
+            problems.append(
+                f"README.md:{block.line} differs from examples/quickstart/{path}:\n"
+                + _diff(source.read_text(encoding="utf-8"), code, path, f"README.md:{block.line}")
+            )
+
+    on_disk = {
+        module.relative_to(QUICKSTART).as_posix()
+        for module in (QUICKSTART / package).rglob("*.py")
+        if module.read_text(encoding="utf-8").strip()
+    }
+    problems.extend(
+        f"examples/quickstart/{path} is not shown by any README python block"
+        for path in sorted(on_disk - shown)
+    )
+
+    if QUICKSTART_README.is_file():
+        runnable = [
+            block.body for block in fenced_blocks(QUICKSTART_README) if block.lang == "bash"
+        ]
+    else:
+        problems.append("examples/quickstart/README.md does not exist")
+        runnable = []
+    for title in QUICKSTART_SECTIONS:
+        commands = [block for block in _section_blocks(README, title) if block.lang == "bash"]
+        assert commands, f"README.md '{title}' shows no bash block, so nothing is checked there"
+        problems.extend(
+            f"README.md:{block.line} bash block is not in examples/quickstart/README.md:\n"
+            + block.body
+            for block in commands
+            if not any(block.body in body for body in runnable)
+        )
+
+    assert not problems, "\n\n".join(problems)
