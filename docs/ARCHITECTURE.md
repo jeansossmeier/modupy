@@ -669,10 +669,16 @@ stay refused. A subscribe replay is bounded by the publish budget instead:
 no delivery or completion tombstone for, inserts their deliveries oldest first,
 each under a savepoint, and rolls back the one that would leave used pages
 above 8 pages below the publish budget (`REPLAY_PUBLISH_HEADROOM_PAGES`), so a
-publish that fit before the replay still fits. Under `completion_mode="mark"`,
-`_subscribe` halves the room the replay may use, because claiming and
-mark-acking the replayed rows grows them in place (measured at about half the
-pages the replay added). A replay cut short logs one WARNING naming the group,
+small publish that fit before the replay still fits right after it. Under
+`completion_mode="mark"`, `_subscribe` halves the room the replay may use,
+because claiming and mark-acking the replayed rows grows them in place
+(measured at about half the pages the replay added); that covers one group
+draining its own replay with succeeding listeners. Draining can still take the
+store past the budget, as any consumer write can: failed and dead-lettered rows
+keep their error text, and under mark mode claiming and acking grows every row,
+including rows other groups replayed, which the halving does not reserve for.
+Publishes are then refused until prune frees pages or `max_store_bytes` is
+raised. A replay cut short logs one WARNING naming the group,
 the target and the replayed and skipped counts; the target then counts as
 subscribed, so the skipped publications reach that group only through another
 replay. Its recovery drains the group's backlog on the target first, since

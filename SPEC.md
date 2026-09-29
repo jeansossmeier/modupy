@@ -908,9 +908,15 @@ consumers drain a backlog that filled the store, including a store opened above
 its limit, a group always subscribes, and the file can grow past
 `max_store_bytes` while they do. A subscribe replay is bounded instead: it
 replays the retained publications the group lacks (no delivery or completion
-tombstone) oldest first and stops 8 pages below the publish budget, so a
-publish that fit before it still fits. Under `completion_mode="mark"` it stops
-halfway to that limit, leaving room for claiming and acking the rows it added.
+tombstone) oldest first and stops 8 pages below the publish budget, so a small
+publish that fit before the replay still fits right after it. Under
+`completion_mode="mark"` it uses at most half the room left, which covers
+claiming and acking its own rows when one group drains them and its listeners
+succeed. Draining can still take the store past the budget, as any consumer
+write can: failed and dead-lettered rows keep their error text, and under
+`completion_mode="mark"` claiming and acking grows every row, including rows
+other groups replayed. Publishes are then refused until prune frees pages or
+`max_store_bytes` is raised.
 A replay cut short logs one WARNING naming the group, the target and the
 replayed and skipped counts; the target then counts as subscribed, so the
 skipped publications reach that group only through another replay. The
