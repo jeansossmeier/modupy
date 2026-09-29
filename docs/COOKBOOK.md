@@ -569,19 +569,20 @@ retained for `orphan_retention_seconds` (default 86400, 24 hours) and replayed
 once to every group that subscribes before expiry.
 
 Payloads over `max_payload_bytes` are rejected before a transaction starts.
-`max_store_bytes` bounds what publishes and subscribe replays may add to the
-database file (`broker.db`). A full store rejects new publishes until retained
-publications expire, consumers drain their backlog, `modulith broker
-drop-group` removes a retired group, or every process restarts with a raised
-limit. Publishes and replays are refused a small reserve early, once
+`max_store_bytes` bounds what publishes may add to the database file
+(`broker.db`), not the size of the file itself. A full store rejects new
+publishes until retained publications expire, consumers drain their backlog,
+`modulith broker drop-group` removes a retired group, or every process restarts
+with a raised limit. Publishes are refused a small reserve early, once
 `page_count - freelist_count` would pass the configured page count minus 32
-pages (one eighth of the pages below 256 pages). A replay that would pass it
-fails the subscribe with a store-full `ConfigurationError`, so that consumer
-does not start until the backlog drains or the limit is raised. Consumers can
-always claim, ack, fail, dead-letter and prune the backlog they see: a consumer
-write the limit refuses is retried past it, so the database file can grow past
-`max_store_bytes` by the growth of rows it already holds (claims, error text,
-mark-mode completions, prune tombstones) while publishes stay refused. This
+pages (one eighth of the pages below 256 pages). Consumers can always claim,
+ack, fail, dead-letter and prune the backlog they see, and a group can always
+subscribe: a consumer write or subscribe replay the limit refuses is retried
+past it, so the database file can grow past `max_store_bytes` by the growth of
+rows it already holds (claims, replayed deliveries, error text, mark-mode
+completions, prune tombstones) while publishes stay refused. A replay that
+leaves the store over its publish budget logs one WARNING naming the group and
+the replayed count. This
 also drains a store that filled before this release or whose `max_store_bytes`
 was lowered below its size; an existing larger file keeps its size. The
 `broker.db-wal` file is not counted: it grows to about 4 MiB (SQLite's

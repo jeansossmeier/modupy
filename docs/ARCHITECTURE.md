@@ -602,7 +602,7 @@ The consumer resolves its cap lazily on first deserialize, from the same
 env/`broker_options` precedence the broker uses. `max_store_bytes` defaults to
 1 GiB (maximum 1 TiB) and sets SQLite `max_page_count` on the database file
 (`broker.db`; the `-wal` file is separate and unbounded, see the Cookbook).
-Publishes and subscribe replays stop earlier: one that would leave
+Publishes stop earlier: one that would leave
 `page_count - freelist_count` above the configured page count minus a consumer
 reserve rolls back with a store-full `ConfigurationError`, applying
 backpressure without corrupting existing rows. The reserve is 32 pages
@@ -610,10 +610,16 @@ backpressure without corrupting existing rows. The reserve is 32 pages
 pages. Consumer writes (claims, renewals, acks, fails, dead-letters, prunes)
 only change rows the store already holds, but claims, error text, mark-mode
 completions and prune tombstones still grow them, and no fixed reserve covers
-a whole backlog. So `SqliteQueueStore._consumer_write` retries a consumer
-write that hits `max_page_count` with the limit lifted: consumers always finish
-the backlog they can see, and the file can grow past `max_store_bytes` by that
-growth while publishes stay refused. The same retry drains a store opened
+a whole backlog. A subscribe replay only adds deliveries for publications the
+store already holds. So `SqliteQueueStore._consumer_write` retries a consumer
+write or replay that hits `max_page_count` with the limit lifted (to
+2147483647 pages, which SQLite builds that parse the pragma as a 32-bit int
+also accept; it reads the limit back and fails with the store-full error and a
+note naming the SQLite version if it did not rise). Consumers always finish
+the backlog they can see, a group's subscribe never fails on the store limit,
+and the file can grow past `max_store_bytes` by that growth while publishes
+stay refused. A replay that leaves the store over its publish budget logs one
+WARNING naming the group and the replayed count. The same retry drains a store opened
 above its limit (filled before the reserve existed, or with `max_store_bytes`
 lowered). Both accept `MODULITH_BROKER_*` environment overrides. The legacy
 `shm_slot_size` option is deprecated and ignored because hint slots are

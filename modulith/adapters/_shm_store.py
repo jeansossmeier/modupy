@@ -16,8 +16,9 @@ __all__ = ["ClaimToken", "PublishResult", "SqliteQueueStore"]
 
 _T = TypeVar("_T")
 
-# SQLite clamps a larger max_page_count to its compiled-in maximum.
-_UNCAPPED_PAGES = 4294967294
+# SQLite 3.31.1 and older parse PRAGMA max_page_count as a signed 32-bit int
+# and read a larger value as a query that leaves the cap unchanged.
+_UNCAPPED_PAGES = 2**31 - 1
 
 
 class SqliteQueueStore:
@@ -49,16 +50,24 @@ class SqliteQueueStore:
 
         Claims, fails and mark-mode acks grow rows the store already holds, so a
         backlog that filled the store may need more pages than any fixed reserve
-        leaves. Only publishes and replays add work, and they stay refused while
-        the store is over its limit, so the file grows past max_store_bytes only
-        while consumers finish the backlog it already holds.
+        leaves. A subscribe replay only copies publications the store already
+        holds. Publishes stay refused while the store is over its publish budget,
+        so the file grows past max_store_bytes only by work it already holds.
         """
         try:
             return operation()
         except sqlite3.OperationalError as error:
             if not _shm_publications._is_store_full(error):
                 raise
-        self._conn.execute(f"PRAGMA max_page_count={_UNCAPPED_PAGES}")
+            capped_pages = self.read_pragma("max_page_count")
+            self._conn.execute(f"PRAGMA max_page_count={_UNCAPPED_PAGES}")
+            if self.read_pragma("max_page_count") <= capped_pages:
+                error.add_note(
+                    f"SQLite {sqlite3.sqlite_version} kept PRAGMA max_page_count at "
+                    f"{capped_pages} pages, so this consumer write cannot grow the "
+                    "store past max_store_bytes."
+                )
+                raise
         try:
             return operation()
         finally:
@@ -105,6 +114,7 @@ class SqliteQueueStore:
             targets,
             group,
             self._max_store_bytes,
+            self._consumer_write,
         )
 
     def get_subscriptions(self) -> dict[str, list[str]]:

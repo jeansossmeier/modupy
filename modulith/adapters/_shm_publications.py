@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
+from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
 from ..config import ConfigurationError
 from ._shm_schema import immediate_transaction
 from ._shm_types import PublishResult
+
+logger = logging.getLogger("modulith.adapters.shm")
 
 _PUBLISH_PRUNE_LIMIT = 100
 
@@ -21,9 +25,9 @@ _PUBLISH_PRUNE_LIMIT = 100
 # caller (SqliteQueueStore) tracks the cadence and passes prune_due.
 PRUNE_EVERY_N_PUBLISHES = 100
 
-# Publishes and subscribe replays stop this many pages below the page count
-# max_store_bytes allows, so a consumer pass usually commits inside the limit.
-# A consumer write that still hits the limit is retried past it (see
+# Publishes stop this many pages below the page count max_store_bytes allows,
+# so a consumer pass usually commits inside the limit. A consumer write or
+# subscribe replay that still hits the limit is retried past it (see
 # SqliteQueueStore._consumer_write), so consumers always finish the backlog
 # they can see; the reserve keeps the database file within max_store_bytes in
 # the common case. Stores under 256 pages reserve an eighth of their pages.
@@ -145,6 +149,11 @@ def _ensure_payload_size(payload: bytes, max_payload_bytes: int) -> None:
 
 
 def _ensure_consumer_reserve(conn: sqlite3.Connection, max_store_bytes: int) -> None:
+    if _over_publish_budget(conn, max_store_bytes):
+        raise _PublishReserveReached
+
+
+def _over_publish_budget(conn: sqlite3.Connection, max_store_bytes: int) -> bool:
     # Consumer writes can raise the connection's max_page_count past the
     # configured limit, so the publish budget comes from the setting itself.
     page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
@@ -152,8 +161,7 @@ def _ensure_consumer_reserve(conn: sqlite3.Connection, max_store_bytes: int) -> 
     used_pages = int(conn.execute("PRAGMA page_count").fetchone()[0]) - int(
         conn.execute("PRAGMA freelist_count").fetchone()[0]
     )
-    if used_pages > max_pages - min(CONSUMER_RESERVE_PAGES, max_pages // 8):
-        raise _PublishReserveReached
+    return used_pages > max_pages - min(CONSUMER_RESERVE_PAGES, max_pages // 8)
 
 
 def _is_store_full(error: sqlite3.Error) -> bool:
@@ -169,30 +177,40 @@ def subscribe(
     targets: list[str],
     group: str,
     max_store_bytes: int,
+    consumer_write: Callable[[Callable[[], int]], int],
 ) -> int:
-    """Reconcile one group's subscriptions and replay newly added targets."""
+    """Reconcile one group's subscriptions and replay newly added targets.
+
+    A replay only copies publications the store already holds, so it runs as a
+    consumer write that may grow the store past max_store_bytes rather than
+    failing the subscribe and keeping the group's consumer from starting.
+    """
     try:
-        return _subscribe(conn, targets, group, max_store_bytes)
-    except (sqlite3.Error, _PublishReserveReached) as error:
-        if isinstance(error, _PublishReserveReached) or _is_store_full(error):
+        inserted = consumer_write(lambda: _subscribe(conn, targets, group))
+    except sqlite3.Error as error:
+        if _is_store_full(error):
             raise ConfigurationError(
-                "SHM SQLite store is too full to replay retained publications to "
-                f"group {group!r}; the subscription was not recorded and the consumer "
-                "does not start. A replay counts against the same budget as "
-                "publishes, so other groups can still drain their backlog. Let "
-                "consumers drain it, remove a retired group with modulith broker "
-                f"drop-group, or raise max_store_bytes (currently {max_store_bytes}) "
-                "and restart every process."
+                f"SHM SQLite store could not record the subscription of group {group!r} "
+                "or replay retained publications to it, so the consumer does not "
+                "start: the disk is full, or SQLite would not raise max_page_count "
+                "past max_store_bytes (see the error's note). Free disk space and "
+                "restart the process."
             ) from error
         raise
+    if inserted and _over_publish_budget(conn, max_store_bytes):
+        logger.warning(
+            "SHM store replayed %d retained publications to group %r and is over its "
+            "publish budget: publishes are refused until consumers drain the backlog. "
+            "Replays and consumer writes can grow the store past max_store_bytes "
+            "(currently %d).",
+            inserted,
+            group,
+            max_store_bytes,
+        )
+    return inserted
 
 
-def _subscribe(
-    conn: sqlite3.Connection,
-    targets: list[str],
-    group: str,
-    max_store_bytes: int,
-) -> int:
+def _subscribe(conn: sqlite3.Connection, targets: list[str], group: str) -> int:
     inserted = 0
     now = time.time()
     requested_targets = set(targets)
@@ -251,8 +269,6 @@ def _subscribe(
                 """,
                 (target, now),
             )
-        if inserted:
-            _ensure_consumer_reserve(conn, max_store_bytes)
     return inserted
 
 

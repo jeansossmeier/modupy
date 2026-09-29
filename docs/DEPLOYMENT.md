@@ -307,9 +307,11 @@ A group that subscribes after a publication replays it only within that window.
 Publishes stop a 32-page consumer reserve (128 KiB at 4 KiB pages) below
 `max_store_bytes`. Strictly, the numerator above is `max_store_bytes` minus that
 reserve; at the 1 GiB default that is 0.01% and does not change the estimate.
-Consumers drain a backlog while publishes are refused: a consumer write that
-`max_store_bytes` refuses is retried past it, so `broker.db` can grow past the
-limit by the growth of rows it already holds. This also drains a store that
+Consumers drain a backlog while publishes are refused: a consumer write or
+subscribe replay that `max_store_bytes` refuses is retried past it, so
+`broker.db` can grow past the limit by the growth of rows it already holds, and
+a replay into a store at its publish budget logs one WARNING instead of keeping
+the consumer from starting. This also drains a store that
 filled before this release or that was opened with a lowered limit; publishes
 resume once the drained store is back under the limit. Budget disk for
 `broker.db-wal` on top: it is not counted, reaches about 4 MiB between
