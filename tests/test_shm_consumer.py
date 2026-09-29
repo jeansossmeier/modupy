@@ -304,12 +304,10 @@ async def test_consumer_starts_with_a_replay_into_a_store_its_own_backlog_filled
         with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
             await consumer.start()
         try:
-            await _until(lambda: len(delivered) == backlog + 30, timeout=30.0)
+            await _until(lambda: len(delivered) == backlog, timeout=30.0)
         finally:
             await consumer.stop()
-        assert sorted(delivered) == sorted(
-            [f"busy-{index}" for index in range(backlog)] + [f"late-{index}" for index in range(30)]
-        )
+        assert sorted(delivered) == sorted(f"busy-{index}" for index in range(backlog))
         replay_warnings = [
             record.getMessage()
             for record in caplog.records
@@ -317,7 +315,8 @@ async def test_consumer_starts_with_a_replay_into_a_store_its_own_backlog_filled
         ]
         assert len(replay_warnings) == 1
         assert repr(GROUP) in replay_warnings[0]
-        assert "30" in replay_warnings[0]
+        assert repr(late_target) in replay_warnings[0]
+        assert "replayed 0 and skipped 30" in replay_warnings[0]
     finally:
         await _close_test_broker(instance)
 

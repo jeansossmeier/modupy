@@ -900,12 +900,16 @@ counted). It bounds what publishes add: a publish that would leave
 `page_count - freelist_count` above the configured page count minus a consumer
 reserve (32 pages, or one eighth of the pages below 256 pages) rolls back and
 is rejected as backpressure. Consumer writes (claims, renewals, acks, fails,
-dead-letters and prunes) and subscribe replays are never refused this way:
-one that hits `max_page_count` is retried with the limit lifted, so consumers
-drain a backlog that filled the store, including a store opened above its
-limit, a group always subscribes, and the file can grow past
-`max_store_bytes` while they do. A replay that leaves the store over its
-publish budget logs one WARNING naming the group and the replayed count. If
+dead-letters and prunes) and recording a subscription are never refused this
+way: one that hits `max_page_count` is retried with the limit lifted, so
+consumers drain a backlog that filled the store, including a store opened above
+its limit, a group always subscribes, and the file can grow past
+`max_store_bytes` while they do. A subscribe replay is bounded instead: it
+replays retained publications oldest first and stops 8 pages below the publish
+budget, so it never refuses other publishes. A replay cut short logs one
+WARNING naming the group, the target and the replayed and skipped counts; the
+target then counts as subscribed, so the skipped publications never reach that
+group. If
 SQLite does not raise the limit, the write fails with the store-full error and
 a note naming the SQLite version. Both have
 `MODULITH_BROKER_MAX_PAYLOAD_BYTES` / `MODULITH_BROKER_MAX_STORE_BYTES`

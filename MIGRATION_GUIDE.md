@@ -410,9 +410,10 @@ state directory (`0700` directories and `0600` files on POSIX).
 `max_payload_bytes` defaults to 16 MiB (maximum 1 GiB) and rejects oversized
 messages before a publish transaction. `max_store_bytes` defaults to 1 GiB
 (maximum 1 TiB) and bounds what publishes add to `broker.db`: publishes are
-refused a small consumer reserve below it. Consumer writes and subscribe
-replays can grow the file past it while they drain or replay work the store
-already holds, and the `-wal` file is not counted. Environment overrides are
+refused a small consumer reserve below it. Consumer writes can grow the file
+past it while they drain work the store already holds, and the `-wal` file is
+not counted. A subscribe replay stops short of the publish budget and logs a
+WARNING with the publications it skipped. Environment overrides are
 `MODULITH_BROKER_MAX_PAYLOAD_BYTES` and `MODULITH_BROKER_MAX_STORE_BYTES`.
 Remove legacy `shm_slot_size`; it is deprecated and ignored.
 

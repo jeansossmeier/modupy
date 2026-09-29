@@ -50,9 +50,10 @@ class SqliteQueueStore:
 
         Claims, fails and mark-mode acks grow rows the store already holds, so a
         backlog that filled the store may need more pages than any fixed reserve
-        leaves. A subscribe replay only copies publications the store already
-        holds. Publishes stay refused while the store is over its publish budget,
-        so the file grows past max_store_bytes only by work it already holds.
+        leaves. A subscribe runs here so its subscription row is always
+        recorded; its replay stops below the publish budget on its own. Publishes
+        stay refused while the store is over its publish budget, so the file
+        grows past max_store_bytes only by work it already holds.
         """
         try:
             return operation()

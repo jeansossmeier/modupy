@@ -26,12 +26,21 @@ _PUBLISH_PRUNE_LIMIT = 100
 PRUNE_EVERY_N_PUBLISHES = 100
 
 # Publishes stop this many pages below the page count max_store_bytes allows,
-# so a consumer pass usually commits inside the limit. A consumer write or
-# subscribe replay that still hits the limit is retried past it (see
-# SqliteQueueStore._consumer_write), so consumers always finish the backlog
-# they can see; the reserve keeps the database file within max_store_bytes in
-# the common case. Stores under 256 pages reserve an eighth of their pages.
+# so a consumer pass usually commits inside the limit. A consumer write that
+# still hits the limit is retried past it (see SqliteQueueStore._consumer_write),
+# so consumers always finish the backlog they can see; the reserve keeps the
+# database file within max_store_bytes in the common case. Stores under 256
+# pages reserve an eighth of their pages.
 CONSUMER_RESERVE_PAGES = 32
+
+# A subscribe replay stops this many pages below the publish budget, so a
+# publish that fit before the replay (a small publication touches the
+# shm_publication table and its three indexes) still fits after it.
+REPLAY_PUBLISH_HEADROOM_PAGES = 8
+
+
+# (deliveries replayed, [(target, replayed, skipped) for each replay cut short])
+_Subscribed = tuple[int, list[tuple[str, int, int]]]
 
 
 class _PublishReserveReached(Exception):
@@ -154,14 +163,21 @@ def _ensure_consumer_reserve(conn: sqlite3.Connection, max_store_bytes: int) -> 
 
 
 def _over_publish_budget(conn: sqlite3.Connection, max_store_bytes: int) -> bool:
+    return _used_pages(conn) > _publish_budget_pages(conn, max_store_bytes)
+
+
+def _publish_budget_pages(conn: sqlite3.Connection, max_store_bytes: int) -> int:
     # Consumer writes can raise the connection's max_page_count past the
     # configured limit, so the publish budget comes from the setting itself.
     page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
     max_pages = max(1, max_store_bytes // page_size)
-    used_pages = int(conn.execute("PRAGMA page_count").fetchone()[0]) - int(
+    return max_pages - min(CONSUMER_RESERVE_PAGES, max_pages // 8)
+
+
+def _used_pages(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("PRAGMA page_count").fetchone()[0]) - int(
         conn.execute("PRAGMA freelist_count").fetchone()[0]
     )
-    return used_pages > max_pages - min(CONSUMER_RESERVE_PAGES, max_pages // 8)
 
 
 def _is_store_full(error: sqlite3.Error) -> bool:
@@ -177,16 +193,19 @@ def subscribe(
     targets: list[str],
     group: str,
     max_store_bytes: int,
-    consumer_write: Callable[[Callable[[], int]], int],
+    consumer_write: Callable[[Callable[[], _Subscribed]], _Subscribed],
 ) -> int:
     """Reconcile one group's subscriptions and replay newly added targets.
 
-    A replay only copies publications the store already holds, so it runs as a
-    consumer write that may grow the store past max_store_bytes rather than
-    failing the subscribe and keeping the group's consumer from starting.
+    The subscription is always recorded: it runs as a consumer write, so a
+    store too full even for that grows past max_store_bytes rather than keeping
+    the group's consumer from starting. The replay stops before it would take
+    the store past its publish budget, so it never refuses other publishes.
     """
     try:
-        inserted = consumer_write(lambda: _subscribe(conn, targets, group))
+        inserted, cut_short = consumer_write(
+            lambda: _subscribe(conn, targets, group, max_store_bytes)
+        )
     except sqlite3.Error as error:
         if _is_store_full(error):
             raise ConfigurationError(
@@ -197,22 +216,35 @@ def subscribe(
                 "restart the process."
             ) from error
         raise
-    if inserted and _over_publish_budget(conn, max_store_bytes):
+    for target, replayed, skipped in cut_short:
         logger.warning(
-            "SHM store replayed %d retained publications to group %r and is over its "
-            "publish budget: publishes are refused until consumers drain the backlog. "
-            "Replays and consumer writes can grow the store past max_store_bytes "
-            "(currently %d).",
-            inserted,
+            "SHM store reached its publish budget while replaying target %r to group "
+            "%r: replayed %d and skipped %d of its retained publications (the oldest "
+            "were replayed first). The target now counts as subscribed, so the skipped "
+            "publications never reach this group; its consumer receives every "
+            "publication written from now on. To replay them, stop the group's "
+            "workers, run modulith broker drop-group %s --target %s (this also deletes "
+            "the group's undelivered replayed work on that target), raise "
+            "max_store_bytes (currently %d) and restart every process before they "
+            "expire, orphan_retention_seconds after they were written.",
+            target,
             group,
+            replayed,
+            skipped,
+            group,
+            target,
             max_store_bytes,
         )
     return inserted
 
 
-def _subscribe(conn: sqlite3.Connection, targets: list[str], group: str) -> int:
+def _subscribe(
+    conn: sqlite3.Connection, targets: list[str], group: str, max_store_bytes: int
+) -> _Subscribed:
     inserted = 0
+    cut_short: list[tuple[str, int, int]] = []
     now = time.time()
+    page_limit = _publish_budget_pages(conn, max_store_bytes) - REPLAY_PUBLISH_HEADROOM_PAGES
     requested_targets = set(targets)
     with immediate_transaction(conn):
         current_targets = {
@@ -241,21 +273,10 @@ def _subscribe(conn: sqlite3.Connection, targets: list[str], group: str) -> int:
                 (target, group),
             )
         for target in sorted(requested_targets - current_targets):
-            retained = conn.execute(
-                """
-                SELECT id FROM shm_publication
-                WHERE target=? AND retained_until>?
-                ORDER BY sequence
-                """,
-                (target, now),
-            )
-            for row in retained:
-                inserted += _insert_delivery(
-                    conn,
-                    str(row["id"]),
-                    group,
-                    now,
-                )
+            replayed, skipped = _replay(conn, target, group, now, page_limit)
+            inserted += replayed
+            if skipped:
+                cut_short.append((target, replayed, skipped))
             # Expiry never removes pending or claimed work because only
             # publications without delivery rows qualify.
             conn.execute(
@@ -269,7 +290,39 @@ def _subscribe(conn: sqlite3.Connection, targets: list[str], group: str) -> int:
                 """,
                 (target, now),
             )
-    return inserted
+    return inserted, cut_short
+
+
+def _replay(
+    conn: sqlite3.Connection, target: str, group: str, now: float, page_limit: int
+) -> tuple[int, int]:
+    """Replay retained publications oldest first while used pages stay within page_limit.
+
+    Oldest first keeps each group's deliveries in publication-sequence order,
+    which the claim queries in _shm_claims rely on. Returns (replayed, skipped).
+    """
+    retained = [
+        str(row["id"])
+        for row in conn.execute(
+            """
+            SELECT id FROM shm_publication
+            WHERE target=? AND retained_until>?
+            ORDER BY sequence
+            """,
+            (target, now),
+        )
+    ]
+    replayed = 0
+    for index, publication_id in enumerate(retained):
+        conn.execute("SAVEPOINT shm_replay")
+        added = _insert_delivery(conn, publication_id, group, now)
+        if _used_pages(conn) > page_limit:
+            conn.execute("ROLLBACK TO shm_replay")
+            conn.execute("RELEASE shm_replay")
+            return replayed, len(retained) - index
+        conn.execute("RELEASE shm_replay")
+        replayed += added
+    return replayed, 0
 
 
 def group_backlog(conn: sqlite3.Connection) -> dict[str, int]:
