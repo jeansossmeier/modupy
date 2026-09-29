@@ -371,8 +371,14 @@ listener shapes behave differently:
   routed to the broker, so a listener for that event in another worker
   does not receive it.
 - A listener in a plain, non-package file such as `myapp/shared.py`, or in
-  a namespace folder without `__init__.py` such as `myapp/common/`, runs in
-  every worker whose module imports that file.
+  a namespace folder without `__init__.py` such as `myapp/common/`, belongs
+  to the module package whose import first loads that file in each process:
+  the innermost module package on the import stack at that moment. Only
+  that module's worker runs it. If your module imports a sibling (`from
+  myapp import orders`) whose import loads the file first, your module's
+  own later import of the file does not make your worker run it. To run
+  such a listener in a module's worker, define it inside that module
+  package.
 
 Keep listeners inside module packages, and mark an event `@externalized`
 when modules in other workers handle it.

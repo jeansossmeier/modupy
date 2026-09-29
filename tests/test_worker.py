@@ -500,7 +500,14 @@ def test_module_imported_by_entry_point_plugin_at_bootstrap_keeps_its_listeners(
     assert sorted(contracts.RUNS) == ["inventory.on_placed", "routing.audit"]
 
 
-def _namespace_helper_worker(make_fake_app, monkeypatch) -> Any:
+def _namespace_helper_worker(
+    make_fake_app, monkeypatch, *, sibling_imports_helpers: bool = False
+) -> Any:
+    sibling_imports = (
+        "import fakeapp.shared\n                import fakeapp.common.audit"
+        if sibling_imports_helpers
+        else ""
+    )
     make_fake_app(
         {
             "contracts": """
@@ -519,9 +526,10 @@ def _namespace_helper_worker(make_fake_app, monkeypatch) -> Any:
                 class Audited:
                     audit_id: str
             """,
-            "orders": """
+            "orders": f"""
                 from modulith import listener
                 from fakeapp.contracts import RUNS, OrderPlaced
+                {sibling_imports}
 
                 @listener
                 async def on_placed(event: OrderPlaced) -> None:
@@ -581,6 +589,28 @@ def test_namespace_folder_listener_runs_in_importing_worker(make_fake_app, monke
         "notifications.on_placed",
         "shared.share_placed",
     ]
+
+
+def test_helper_listener_belongs_to_sibling_whose_import_loaded_it_first(
+    make_fake_app, monkeypatch
+) -> None:
+    contracts = _namespace_helper_worker(make_fake_app, monkeypatch, sibling_imports_helpers=True)
+    audit = sys.modules["fakeapp.common.audit"]
+    shared = sys.modules["fakeapp.shared"]
+    notifications = sys.modules["fakeapp.notifications"]
+    bus = _runtime.event_bus
+    assert bus is not None
+
+    assert _runtime._listener_owners[audit.audit_placed] == "fakeapp.orders"
+    assert _runtime._listener_owners[shared.share_placed] == "fakeapp.orders"
+    assert _runtime.local_listeners(bus.listeners_for(contracts.OrderPlaced)) == [
+        notifications.on_placed
+    ]
+    assert _runtime.local_listeners(bus.listeners_for(contracts.Audited)) == []
+
+    asyncio.run(_runtime.dispatch_local(contracts.OrderPlaced("o1"), bus))
+
+    assert contracts.RUNS == ["notifications.on_placed"]
 
 
 def test_worker_consumes_event_types_of_namespace_folder_listeners(

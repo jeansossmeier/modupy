@@ -298,9 +298,13 @@ class Runtime:
         direct subpackage of the configured package with an ``__init__.py``,
         other than the contracts module. A listener in a plain file such as
         ``app/shared.py``, or in a namespace folder without ``__init__.py``
-        such as ``app/common/``, is credited to the module that imported it
-        in this process, so every worker that imports that file runs it;
-        module discovery never reports such a folder, so no worker hosts it.
+        such as ``app/common/``, runs its registration once per process, so
+        it belongs to the module package whose import first loaded that file
+        in this process: the innermost one on the import stack then. Only
+        that module's worker runs it. A worker whose own module imports the
+        file after a sibling's import loaded it does not, because the cached
+        import registers nothing. Module discovery never reports such a
+        folder, so no worker hosts it.
         One registered outside any module import (plugin code, a hook, a
         test) gets None and stays local to every process.
         """
