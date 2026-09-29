@@ -217,9 +217,13 @@ outbox = "postgres"
 
 The completion mode (`"update"` keeps history visible; `"delete"` and
 `"archive"` are the alternatives) is passed to `outbox.configure()` in
-the wiring code below — the `[tool.modulith.outbox_options]` subtable
-is parsed and validated but currently reserved: the runtime does not
-read its keys yet.
+the wiring code below. The runtime reads only the claim keys of
+`[tool.modulith.outbox_options]` (`claim_strategy`, `claim_lease_seconds`,
+`claim_batch_size`), and only when it binds the store from `outbox_url`.
+Those three keys are validated; any other key in the table is accepted
+and ignored. An application that binds its own store, as the wiring code
+below does, passes the claim settings to `outbox.configure()` as keyword
+arguments.
 
 Run the packaged schema migration. modulith ships its alembic config
 *inside* the installed package (your project needs no alembic.ini), so

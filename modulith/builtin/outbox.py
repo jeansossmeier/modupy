@@ -18,10 +18,16 @@ Critical correctness properties:
      above the lease, a slow sweep still running, or a runtime not yet
      bootstrapped make it longer. An advisory lock ends with the dead
      process's Postgres session. On a live host that is at once, so the
-     crash sweep recovers those rows immediately; after a host loss or a
-     network partition it is only when Postgres drops the dead session
-     through TCP keepalive (``tcp_keepalives_*``, about 2 h with stock
-     Linux defaults).
+     crash sweep recovers those rows immediately. The exception is a
+     descendant forked from the process, such as a fork-started
+     ``multiprocessing`` or ``ProcessPoolExecutor`` child: it keeps a copy
+     of the lock connection's socket, so the session and its locks outlive
+     the process until that descendant exits, and every sweep skips the
+     row meanwhile. Start such children with the ``spawn`` or
+     ``forkserver`` method, which does not inherit the connection. After a
+     host loss or a network partition the lock ends only when Postgres
+     drops the dead session through TCP keepalive (``tcp_keepalives_*``,
+     about 2 h with stock Linux defaults).
   3. At-least-once — a listener may be called more than once if delivery
      completes but completion-marking fails. Listeners must be idempotent.
   4. Non-reentrant *within a process* — the after-commit dispatch task and the
