@@ -2785,6 +2785,11 @@ _SKIP_LOCKED_SERVERS = [
     (_MYSQL_URL, "8.0.mysql_aurora.3.04.0"),
     (_MYSQL_URL, "8.0.1-dmr"),
     (_MARIADB_URL, "10.6.0-MariaDB"),
+    # MariaDB Enterprise Server puts a build number between the release and "MariaDB".
+    (_MARIADB_URL, "10.6.12-8-MariaDB-enterprise"),
+    (_MYSQL_URL, "10.6.16-11-MariaDB-enterprise-log"),
+    (_MYSQL_URL, "5.5.5-10.6.12-8-MariaDB-enterprise-log"),
+    (_MARIADB_URL, "11.4.2-1-MariaDB-enterprise"),
 ]
 
 _MARIADB_TOO_OLD = "does not support; MariaDB 10.6 or newer"
@@ -2797,6 +2802,8 @@ _PRE_SKIP_LOCKED_SERVERS = [
     (_MYSQL_URL, "5.7.42-0ubuntu0.18.04.1", "MySQL server 5.7.42"),
     (_MYSQL_URL, "8.0.0-dmr", "MySQL server 8.0.0"),
     (_MARIADB_URL, "10.5.27-MariaDB", "MariaDB server 10.5.27"),
+    (_MARIADB_URL, "10.5.23-17-MariaDB-enterprise", "MariaDB server 10.5.23"),
+    (_MYSQL_URL, "5.5.5-10.5.23-17-MariaDB-enterprise-log", "MariaDB server 10.5.23"),
 ]
 
 
