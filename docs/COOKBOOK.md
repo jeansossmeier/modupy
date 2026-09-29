@@ -378,11 +378,15 @@ recovered once their lease expires, normally within `claim_lease_seconds`
 plus `retry_interval_seconds` of the crash. Recovery takes longer when
 `retry_stale_seconds` exceeds the lease, while a slow sweep is still running,
 or while the runtime is not bootstrapped. A crash or a graceful stop in the
-middle of a sweep leaves its whole claimed batch leased until the lease
-expires.
+middle of a sweep leaves the row being delivered, and every row of its
+claimed batch not yet reached, leased until the lease expires. Rows it had
+already delivered, failed or released are not leased.
 
 Under `"advisory_lock"` a crashed process's rows are recovered at once when
-the process dies on a live host. After a host loss or a network partition
+the process dies on a live host, unless a descendant forked from it is still
+running. A fork-started `multiprocessing` or `ProcessPoolExecutor` child keeps
+a copy of the lock connection's socket, so the locks stay held until that
+child exits. Start such children with the `spawn` or `forkserver` method. After a host loss or a network partition
 they stay locked until Postgres drops the dead session through TCP
 keepalive, about 2 h 11 min with stock Linux defaults. Lower the server's
 keepalive settings to shorten that; lock connections use the engine's
@@ -399,17 +403,22 @@ engine = create_async_engine(
 )
 ```
 
-An engine built from `outbox_url` takes no `connect_args`: set the
-keepalives in `postgresql.conf` or with `ALTER ROLE ... SET` instead. Leave
+An engine built from `outbox_url` takes no `connect_args`. With
+`postgresql+psycopg`, put the keepalives in the URL's `options` query
+parameter:
+`?options=-c%20tcp_keepalives_idle%3D60%20-c%20tcp_keepalives_interval%3D10%20-c%20tcp_keepalives_count%3D3`.
+With asyncpg, set them in `postgresql.conf` or with `ALTER ROLE ... SET`. Leave
 `idle_session_timeout` unset for the outbox's role, because a lock
 connection sits idle while its listener runs and ending that session frees
 the row for a second delivery. Behind PgBouncer, advisory locks need session
 pooling; transaction pooling breaks them.
 
 The default strategy needs the lease columns, which arrive in migration
-`0003_outbox_claim_leases`: migrate to `head`, not to `0001_initial`. These are
-`outbox.configure()` keyword arguments, not pyproject keys — see the note under
-recipe 7 about `[tool.modulith.outbox_options]`.
+`0003_outbox_claim_leases`: migrate to `head`, not to `0001_initial`. In your
+own `outbox.configure()` call, `claim_strategy`, `claim_lease_seconds` and
+`claim_batch_size` are keyword arguments. When the runtime binds the store from
+`outbox_url`, it applies those three keys from `[tool.modulith.outbox_options]`
+— see the note under recipe 7.
 
 ### Putting the outbox in a per-module schema
 
@@ -471,9 +480,11 @@ outbox.configure(store=store, serializer=serializer, completion_mode="archive")
 ```
 
 With `"archive"`, trim old archive rows past their retention with
-`modulith outbox purge`. The `[tool.modulith.outbox_options]` subtable is
-reserved for future use — the runtime does not read its keys yet, so set the
-mode here in the wiring code, not in pyproject.
+`modulith outbox purge`. The runtime reads only the claim keys of
+`[tool.modulith.outbox_options]` (`claim_strategy`, `claim_lease_seconds`,
+`claim_batch_size`), and only when it binds the store from `outbox_url`. It
+does not read `completion_mode` there, so set the mode here in the wiring
+code, as an `outbox.configure()` keyword argument, not in pyproject.
 
 ---
 

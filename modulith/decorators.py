@@ -338,8 +338,12 @@ def configure(**overrides: Any) -> None:
         )
 
     Dict-valued fields like ``outbox_options`` are accepted and
-    validated but currently reserved — the runtime does not read them
-    yet. Outbox tuning (e.g. ``completion_mode``) is passed to
-    ``modulith.builtin.outbox.configure()`` instead.
+    validated. When the runtime binds the outbox store from
+    ``outbox_url``, it applies the ``claim_strategy``,
+    ``claim_lease_seconds`` and ``claim_batch_size`` keys of
+    ``outbox_options`` and reads no other key. An application's own
+    ``modulith.builtin.outbox.configure()`` call takes those settings,
+    and other outbox tuning such as ``completion_mode``, as keyword
+    arguments.
     """
     _runtime.configure(**overrides)
