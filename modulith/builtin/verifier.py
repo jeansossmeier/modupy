@@ -439,10 +439,15 @@ def _project_root(module: ModuleInfo) -> Path | None:
     a teammate's checkout or a CI runner's (``/home/runner/...``), silently
     reopening every grandfathered violation the moment the baseline is
     regenerated on a different machine.
+
+    The module's own package is resolved and walked up, rather than the
+    top-level name: for a PEP 420 namespace root the first portion on
+    ``sys.path`` may be another installed distribution, not the project.
     """
-    top_level = module.package.split(".", 1)[0]
-    root = _package_dir(top_level)
-    return root.parent if root is not None else None
+    root = _package_dir(module.package)
+    if root is None:
+        return None
+    return root.parents[module.package.count(".")]
 
 
 def _portable_path(path: Path, module: ModuleInfo) -> str:
