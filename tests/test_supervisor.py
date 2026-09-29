@@ -24,6 +24,7 @@ import time
 from typing import Any
 
 import pytest
+from fastapi import Request
 
 from modulith.supervisor import (
     Supervisor,
@@ -221,6 +222,78 @@ async def test_proxy_reverifies_a_worker_port_after_the_supervisor_respawns_it()
 
     assert (first.status_code, second.status_code) == (200, 503)
     assert hits == ["/health", "/orders/x", "/health"]
+
+
+@pytest.mark.parametrize(("max_restarts", "exited_log"), [(0, "giving up"), (5, "restarting in")])
+async def test_proxy_reverifies_a_worker_port_as_soon_as_its_worker_exits(
+    caplog: pytest.LogCaptureFixture, max_restarts: int, exited_log: str
+) -> None:
+    """Between a worker's exit and its respawn (or forever, once the breaker
+    gives up) another process can bind its port; a request must not reach it
+    on the dead worker's verification."""
+    import httpx
+    from fastapi import FastAPI
+
+    from conftest import _serve
+
+    port = _free_port()
+    spec = WorkerSpec("orders", "app", port)
+    sup = Supervisor(
+        [spec],
+        command_builder=lambda s, p: [
+            sys.executable,
+            "-c",
+            "import sys, time; time.sleep(1.0); sys.exit(3)",
+        ],
+        max_restarts=max_restarts,
+        restart_initial_delay=30.0,
+        restart_max_delay=30.0,
+    )
+    answering: dict[str, str] = {}
+    hits: list[tuple[str, str | None, str | None]] = []
+    backend = FastAPI()
+
+    @backend.get("/orders/x")
+    async def x(request: Request) -> dict[str, bool]:
+        hits.append(
+            ("/orders/x", request.headers.get("cookie"), request.headers.get("authorization"))
+        )
+        return {"ok": True}
+
+    @backend.get("/health")
+    async def health() -> dict[str, str]:
+        hits.append(("/health", None, None))
+        return {"status": "ok", "module": "orders", "deployment": answering["token"]}
+
+    statuses: list[int] = []
+
+    async def serve(proxy_app: Any, host: str, p: int) -> None:
+        answering["token"] = (spec.env or {})["MODULITH_DEPLOYMENT_TOKEN"]
+        server, task = await _serve(backend, port, "h11")
+        try:
+            async with proxy_app.router.lifespan_context(proxy_app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+                ) as c:
+                    statuses.append((await c.get("/orders/x")).status_code)
+                    answering["token"] = "another-deployment"
+                    deadline = time.monotonic() + 10.0
+                    while not any(exited_log in r.getMessage() for r in caplog.records):
+                        assert time.monotonic() < deadline, "worker never exited"
+                        await asyncio.sleep(0.02)
+                    secret = {"cookie": "sid=SECRET", "authorization": "Bearer T"}
+                    statuses.append((await c.get("/orders/x", headers=secret)).status_code)
+        finally:
+            server.should_exit = True
+            await task
+
+    with caplog.at_level(logging.WARNING, logger="modulith.supervisor"):
+        await run_supervised([spec], "127.0.0.1", 8000, supervisor=sup, serve=serve)
+
+    assert statuses == [200, 503]
+    assert hits == [("/health", None, None), ("/orders/x", None, None), ("/health", None, None)]
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert [m for m in errors if "giving up" not in m] == []
 
 
 # ---------------------------------------------------------------------------
