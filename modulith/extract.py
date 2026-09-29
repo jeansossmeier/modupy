@@ -184,12 +184,14 @@ importlib.import_module(dotted)
     + _IMPORT_CHECK_UNDER
     + """
 root, source = os.path.realpath(root), os.path.realpath(source)
-# A prefix holding the project would exempt its first-party code too, so such
-# a prefix is replaced by the interpreter's library directories inside it.
-prefixes = {os.path.realpath(p) for p in (sys.prefix, sys.base_prefix, sys.exec_prefix)}
+# A directory holding the project would exempt its first-party code too. That
+# covers a prefix and, on Windows, site.getsitepackages(), which lists each
+# prefix itself; the library directories inside such a prefix stay exempt.
+prefixes = [sys.prefix, sys.base_prefix, sys.exec_prefix]
 libraries = [sysconfig.get_path(n) for n in ("stdlib", "platstdlib", "purelib", "platlib")]
 libraries += site.getsitepackages() + [site.getusersitepackages()]
-exempt = {p for p in prefixes if not under(source, p)} | {os.path.realpath(p) for p in libraries}
+exempt = {os.path.realpath(p) for p in prefixes + libraries}
+exempt = {p for p in exempt if not under(source, p)}
 leaked = sorted(
     name
     for name, mod in list(sys.modules.items())

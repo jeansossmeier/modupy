@@ -845,15 +845,32 @@ def _venv_python(venv: Path) -> Path:
     return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
+def _run_python(python: Path, code: str) -> str:
+    return subprocess.run(
+        [str(python), "-c", code], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _purelib(python: Path) -> Path:
+    return Path(_run_python(python, "import sysconfig; print(sysconfig.get_path('purelib'))"))
+
+
+def _emulate_windows_site_packages(python: Path) -> None:
+    """Make the venv's ``site.getsitepackages()`` list each prefix itself, as CPython does on nt."""
+    (_purelib(python) / "sitecustomize.py").write_text(
+        "import os, site\n"
+        "def getsitepackages(prefixes=None):\n"
+        "    return [p for prefix in (prefixes or site.PREFIXES)\n"
+        "            for p in (prefix, os.path.join(prefix, 'Lib', 'site-packages'))]\n"
+        "site.getsitepackages = getsitepackages\n"
+    )
+    listed = _run_python(python, "import site, sys; print(sys.prefix in site.getsitepackages())")
+    assert listed == "True"
+
+
 def _leaking_service(project: Path, tmp_path: Path, python: Path) -> Path:
     """Lay out a monolith whose shop.orders imports stdlib, third-party and first-party code."""
-    purelib = subprocess.run(
-        [str(python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    Path(purelib, "thirdparty.py").write_text("VALUE = 1\n")
+    (_purelib(python) / "thirdparty.py").write_text("VALUE = 1\n")
     source_orders = "import json\nimport thirdparty\nfrom common.money import cents\n"
     for tree in (project, tmp_path / "service"):
         (tree / "shop").mkdir(parents=True)
@@ -888,6 +905,45 @@ def test_import_gate_exempts_a_virtualenv_inside_the_project(monkeypatch, tmp_pa
     project = tmp_path / "proj"
     project.mkdir()
     python = _venv_python(project / ".venv")
+    service = _leaking_service(project, tmp_path, python)
+    (service / "shop" / "orders.py").write_text("import json\nimport thirdparty\n")
+    monkeypatch.setattr(sys, "executable", str(python))
+
+    extract._check_imports(service, "shop.orders", project)
+
+
+@pytest.mark.parametrize("project_in_venv", ["", "proj"], ids=["venv-root", "inside-venv"])
+def test_import_gate_reports_a_leak_when_site_packages_lists_a_prefix_holding_the_project(
+    monkeypatch, tmp_path, project_in_venv
+):
+    venv = tmp_path / "venv"
+    python = _venv_python(venv)
+    _emulate_windows_site_packages(python)
+    project = venv / project_in_venv
+    project.mkdir(exist_ok=True)
+    service = _leaking_service(project, tmp_path, python)
+    monkeypatch.setattr(sys, "executable", str(python))
+    monkeypatch.setenv("PYTHONPATH", str(project))
+
+    with pytest.raises(ValueError) as excinfo:
+        extract._check_imports(service, "shop.orders", project)
+
+    message = str(excinfo.value)
+    assert (
+        f"cannot import shop.orders: ImportError: imported common, common.money from the "
+        f"source tree {os.path.realpath(project)}, outside the extracted service"
+    ) in message
+    assert "thirdparty" not in message
+    assert "json" not in message
+
+
+def test_import_gate_exempts_a_virtualenv_inside_the_project_when_site_packages_lists_it(
+    monkeypatch, tmp_path
+):
+    project = tmp_path / "proj"
+    project.mkdir()
+    python = _venv_python(project / ".venv")
+    _emulate_windows_site_packages(python)
     service = _leaking_service(project, tmp_path, python)
     (service / "shop" / "orders.py").write_text("import json\nimport thirdparty\n")
     monkeypatch.setattr(sys, "executable", str(python))
