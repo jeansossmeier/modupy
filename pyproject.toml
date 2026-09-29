@@ -455,7 +455,7 @@ ignore_missing_imports = true
 # py.typed (pyyaml's stubs live in the separate types-PyYAML package, which
 # the suite doesn't need — test code consumes safe_load output behind
 # isinstance narrowing).
-module = ["fakeapp", "fakeapp.*", "shop", "shop.*", "testcontainers.*", "docker", "docker.*", "yaml", "yaml.*"]
+module = ["fakeapp", "fakeapp.*", "myapp", "myapp.*", "shop", "shop.*", "testcontainers.*", "docker", "docker.*", "yaml", "yaml.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
