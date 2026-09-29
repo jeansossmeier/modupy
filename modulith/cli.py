@@ -1442,23 +1442,61 @@ def _exit_unless_shm_store_exists() -> None:
 
 def _sole_subscriber_warning(group: str, sole: list[str], broker: Any, scheme: str) -> str:
     names = ", ".join(repr(t) for t in sole)
-    if scheme == "database" and broker.no_subscriber_policy in ("error", "wait"):
+    if scheme != "database":
         effect = (
-            f"under the database broker's {broker.no_subscriber_policy!r} no-subscriber "
-            "policy, every later publish to them raises NoSubscribersError"
+            f"later publishes to them are kept for {broker.orphan_retention_seconds:g} s "
+            "(orphan_retention_seconds) and replayed to a group that subscribes within "
+            "that time; after it they are discarded undelivered"
         )
-    elif scheme == "database":
-        effect = "later publishes to them are retained until a group subscribes"
+    elif broker.no_subscriber_policy == "error":
+        effect = (
+            "under the database broker's 'error' no-subscriber policy, every later "
+            "publish to them raises NoSubscribersError"
+        )
+    elif broker.no_subscriber_policy == "wait":
+        effect = (
+            "under the database broker's 'wait' no-subscriber policy, each later publish "
+            f"to them waits up to {broker.no_subscriber_wait_timeout_seconds:g} s "
+            "(no_subscriber_wait_timeout_seconds), succeeds if a group subscribes "
+            "meanwhile, and raises NoSubscribersError otherwise"
+        )
+    elif broker.orphan_replay_policy == "expected_groups":
+        effect = (
+            "later publishes to them are fanned out at once to the groups "
+            "expected_consumer_groups names for them and not retained, so a group that "
+            "subscribes later receives none of them"
+        )
     else:
-        effect = "later publishes to them are stored but reach no consumer"
+        which = "every" if broker.orphan_replay_policy == "ttl_all_groups" else "the first"
+        effect = (
+            f"later publishes to them are kept for {broker.orphan_retention_seconds:g} s "
+            f"(orphan_retention_seconds) and replayed to {which} group that subscribes "
+            "before then; after it they are pruned undelivered"
+        )
     return f"warning: {group!r} is the only subscriber of {names}; after the drop, {effect}."
+
+
+def _expected_targets_warning(group: str, expected: list[str]) -> str:
+    names = ", ".join(repr(t) for t in expected)
+    return (
+        f"warning: the database broker's expected_consumer_groups still lists {group!r} "
+        f"for {names}, so every later publish to them queues a pending message for it "
+        "again, and the `modulith run` startup check reports it again. The drop has no lasting "
+        f"effect there: remove {group!r} from expected_consumer_groups too "
+        "(broker_options or MODULITH_BROKER_EXPECTED_CONSUMER_GROUPS)."
+    )
 
 
 @broker_app.command("drop-group")
 def broker_drop_group(
     group: str = typer.Argument(..., help="Consumer group, e.g. 'modulith-notifications'"),
     force: bool = typer.Option(
-        False, "--force", help="Drop the group even though a current module derives it."
+        False,
+        "--force",
+        help=(
+            "Drop the group even though a current module derives it or a consumer served "
+            f"it in the last {_LIVE_GROUP_WINDOW_S // 3600} h."
+        ),
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask for confirmation."),
     target: list[str] | None = typer.Option(
@@ -1504,12 +1542,27 @@ def broker_drop_group(
                 err=True,
             )
             raise typer.Exit(code=1)
+        expected = [
+            t
+            for t in (broker.expected_targets(group) if cfg.broker == "database" else [])
+            if targets is None or t in targets
+        ]
         if targets is None and not force and group in await _live_groups(broker, derived):
+            if expected:
+                workers = (
+                    "its running workers receive no new publications to its other targets "
+                    "until they restart and subscribe again, while expected_consumer_groups "
+                    f"keeps queueing publishes to {', '.join(repr(t) for t in expected)} for it"
+                )
+            else:
+                workers = (
+                    "its running workers receive no new publications until they restart "
+                    "and subscribe again"
+                )
             typer.echo(
                 f"error: {group!r} belongs to a module of the current deployment or a "
                 f"consumer served it in the last {_LIVE_GROUP_WINDOW_S // 3600} h. Dropping "
-                "it deletes its queued messages undelivered, and its running workers receive "
-                "no new publications until they restart and subscribe again. Pass --force "
+                f"it deletes its queued messages undelivered, and {workers}. Pass --force "
                 "to drop it anyway.",
                 err=True,
             )
@@ -1521,6 +1574,8 @@ def broker_drop_group(
         ]
         if sole:
             typer.echo(_sole_subscriber_warning(group, sole, broker, cfg.broker))
+        if expected:
+            typer.echo(_expected_targets_warning(group, expected))
         prompt = f"Drop {scope} and delete its pending and claimed messages?"
         if not yes and not typer.confirm(prompt):
             typer.echo("aborted — nothing was removed", err=True)

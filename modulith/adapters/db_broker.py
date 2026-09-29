@@ -2288,6 +2288,32 @@ class DatabaseBroker:
         """What a publish does when its target has no subscribed group."""
         return str(self._no_subscriber_policy)
 
+    @property
+    def no_subscriber_wait_timeout_seconds(self) -> float:
+        """How long a publish waits for a subscriber under the ``wait`` policy."""
+        return float(self._no_subscriber_wait_timeout_s)
+
+    @property
+    def orphan_replay_policy(self) -> str:
+        """Which groups a stored publish reaches under the ``store`` policy."""
+        return str(self._orphan_replay_policy)
+
+    @property
+    def orphan_retention_seconds(self) -> float:
+        """How long a stored publish is kept for a group that subscribes later."""
+        return float(self._orphan_retention_seconds)
+
+    def expected_targets(self, group: str) -> list[str]:
+        """Targets whose every publish is queued for ``group`` by configuration alone.
+
+        Under the ``store`` policy with ``orphan_replay_policy="expected_groups"``
+        a publish fans out to its ``expected_consumer_groups`` whether or not
+        they subscribe, so dropping such a group's subscription does not stop it.
+        """
+        if self._no_subscriber_policy != "store" or self._orphan_replay_policy != "expected_groups":
+            return []
+        return sorted(t for t, groups in self._expected_consumer_groups.items() if group in groups)
+
     @_on_owning_loop
     async def has_schema(self) -> bool:
         """Whether the broker tables exist, checked without creating anything.
