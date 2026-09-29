@@ -377,8 +377,9 @@ also the crash-recovery bound: rows a crashed process was delivering are
 recovered once their lease expires, normally within `claim_lease_seconds`
 plus `retry_interval_seconds` of the crash. Recovery takes longer when
 `retry_stale_seconds` exceeds the lease, while a slow sweep is still running,
-or while the runtime is not bootstrapped. A graceful stop that cancels a
-sweep leaves its whole claimed batch leased until the lease expires.
+or while the runtime is not bootstrapped. A crash or a graceful stop in the
+middle of a sweep leaves its whole claimed batch leased until the lease
+expires.
 
 Under `"advisory_lock"` a crashed process's rows are recovered at once when
 the process dies on a live host. After a host loss or a network partition
@@ -397,6 +398,13 @@ engine = create_async_engine(
     }},  # psycopg: {"options": "-c tcp_keepalives_idle=60 -c ..."}
 )
 ```
+
+An engine built from `outbox_url` takes no `connect_args`: set the
+keepalives in `postgresql.conf` or with `ALTER ROLE ... SET` instead. Leave
+`idle_session_timeout` unset for the outbox's role, because a lock
+connection sits idle while its listener runs and ending that session frees
+the row for a second delivery. Behind PgBouncer, advisory locks need session
+pooling; transaction pooling breaks them.
 
 The default strategy needs the lease columns, which arrive in migration
 `0003_outbox_claim_leases`: migrate to `head`, not to `0001_initial`. These are

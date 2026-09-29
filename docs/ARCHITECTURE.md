@@ -308,9 +308,9 @@ only if** that transaction commits.
   sweep only takes rows at least that old. It also takes longer while the
   previous sweep is still dispatching a slow batch, because the interval
   counts from the end of that sweep. And no sweep recovers anything while
-  the runtime is not bootstrapped. A graceful stop that cancels a sweep
-  leaves every row of its claimed batch leased, not only the row being
-  delivered, and those rows wait out the lease the same way.
+  the runtime is not bootstrapped. A crash, or a graceful stop that cancels
+  a sweep, leaves every row of its claimed batch leased, not only the row
+  being delivered, and those rows wait out the lease the same way.
 - Rows committed but not yet claimed, and rows under `"none"`, are recovered
   by the startup sweep.
 - Under `"advisory_lock"` the row's lock lives as long as the dead process's
@@ -327,7 +327,19 @@ only if** that transaction commits.
   asyncpg, or `connect_args={"options": "-c tcp_keepalives_idle=60 -c
   tcp_keepalives_interval=10 -c tcp_keepalives_count=3"}` for psycopg (about
   90 s). Lock connections are opened with the engine's connect arguments.
-  Postgres ignores these settings on Unix-domain socket connections.
+  Postgres ignores these settings on Unix-domain socket connections. An
+  engine built from `outbox_url` takes no `connect_args`, so set them in
+  `postgresql.conf` or with `ALTER ROLE ... SET` there; psycopg's `options`
+  argument also replaces any `options` in the URL, such as a `search_path`.
+  A process that hangs without exiting keeps its session, and so its locks,
+  until it resumes or is killed. Leave `idle_session_timeout` unset for the
+  outbox's role: a lock connection sits idle while its listener runs, so
+  ending that session releases the lock mid-delivery and a peer's sweep can
+  deliver the row again. Advisory locks need a server session that stays
+  with one client connection: behind PgBouncer use session pooling, never
+  transaction or statement pooling, and set PgBouncer's own `tcp_keepalive`
+  options, because the server's keepalive then watches PgBouncer, not your
+  process.
 - Backoff is exponential, measured from `last_attempt_at` (not `published_at`),
   and **capped at 5 minutes** — a persistently-failing listener actually backs
   off instead of being retried every sweep.
