@@ -837,3 +837,24 @@ def test_extract_import_gate_sees_the_extracted_tree_under_pythonsafepath(
 
     assert result.exit_code == 0, result.output
     assert (out_dir / "fakeapp" / "orders" / "__init__.py").read_text() == "VALUE = 1\n"
+
+
+def test_extract_copies_contracts_file_beside_same_named_non_package_dir(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "from fakeapp.contracts import OrderPlaced\n"},
+        extra_files={
+            "contracts.py": "OrderPlaced = object\n",
+            "contracts/order_placed.avsc": "{}\n",
+        },
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "fakeapp" / "contracts.py").read_text() == "OrderPlaced = object\n"
+    assert not (out_dir / "fakeapp" / "contracts").exists()
+

@@ -680,11 +680,13 @@ def _populate_extraction(
 
     copy_rel(Path(*module.split(".")))
 
+    # Python's own order: a regular package, then a module file, then a namespace directory.
     contracts_rel = Path(*cfg.contracts_module.split("."))
-    if (package_dir / contracts_rel).is_dir():
-        copy_rel(contracts_rel)
-    elif (package_dir / f"{contracts_rel}.py").is_file():
-        copy_rel(Path(f"{contracts_rel}.py"))
+    contracts_src = _source_path(package_dir, cfg.package, f"{cfg.package}.{cfg.contracts_module}")
+    if contracts_src is None and (package_dir / contracts_rel).is_dir():
+        contracts_src = package_dir / contracts_rel
+    if contracts_src is not None:
+        copy_rel(contracts_src.relative_to(package_dir))
 
     helper_set = set(helpers)
     for helper in helpers:
