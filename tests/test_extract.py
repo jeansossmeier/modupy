@@ -1039,3 +1039,46 @@ def test_extract_keeps_namespace_root_without_initializer(monkeypatch, request, 
         names = set(archive.namelist())
     assert "company/shop/orders/__init__.py" in names
     assert "company/__init__.py" not in names
+
+
+def test_extract_resolves_namespace_root_when_other_portion_precedes_project(
+    monkeypatch, request, tmp_path
+):
+    """An editable install's .pth puts the project root after site-packages,
+    so another installed portion of the PEP 420 root is first in its
+    namespace path; extract must still find the project's package directory."""
+    site = tmp_path / "site"
+    (site / "company" / "common").mkdir(parents=True)
+    (site / "company" / "common" / "__init__.py").write_text("x = 1\n")
+    src = tmp_path / "src"
+    package_dir = src / "company" / "shop"
+    (package_dir / "orders").mkdir(parents=True)
+    (package_dir / "contracts").mkdir()
+    (package_dir / "__init__.py").write_text("")
+    (package_dir / "orders" / "__init__.py").write_text("from company.common import x\n")
+    (package_dir / "contracts" / "__init__.py").write_text("")
+    monkeypatch.chdir(src)
+    monkeypatch.syspath_prepend(str(src))
+    monkeypatch.syspath_prepend(str(site))
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join(filter(None, [str(site), os.environ.get("PYTHONPATH")]))
+    )
+    monkeypatch.setenv("MODULITH_PACKAGE", "company.shop")
+
+    def reset_namespace_app() -> None:
+        for name in list(sys.modules):
+            if name == "company" or name.startswith("company."):
+                del sys.modules[name]
+        _runtime._reset_for_testing()
+
+    request.addfinalizer(reset_namespace_app)
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "company" / "shop" / "orders" / "__init__.py").read_text() == (
+        "from company.common import x\n"
+    )
+    assert (out_dir / "company" / "shop" / "__init__.py").read_text() == ""
+    assert not (out_dir / "company" / "__init__.py").exists()

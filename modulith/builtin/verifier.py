@@ -201,6 +201,12 @@ def _package_dir(package: str) -> Path | None:
     segment via ``find_spec`` is side-effect free; every remaining dotted
     segment is then just a directory name checked on disk, no import
     machinery involved.
+
+    A PEP 420 namespace root lists one location per portion, in ``sys.path``
+    order, and the portion holding the package need not be the first: an
+    editable install's ``.pth`` entry lands after site-packages, where other
+    installed portions of the same root live. So every portion is searched,
+    in the import system's own order, for the full dotted path.
     """
     parts = package.split(".")
     try:
@@ -209,12 +215,11 @@ def _package_dir(package: str) -> Path | None:
         return None
     if spec is None or not spec.submodule_search_locations:
         return None
-    directory = Path(next(iter(spec.submodule_search_locations)))
-    for part in parts[1:]:
-        directory = directory / part
-        if not directory.is_dir():
-            return None
-    return directory
+    for location in spec.submodule_search_locations:
+        directory = Path(location).joinpath(*parts[1:])
+        if directory.is_dir():
+            return directory
+    return None
 
 
 def _is_type_checking(test: ast.expr, aliases: Collection[str] = ("TYPE_CHECKING",)) -> bool:
