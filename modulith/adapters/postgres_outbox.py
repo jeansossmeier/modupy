@@ -1085,8 +1085,9 @@ class PostgresPublicationStore:
         recovers it, normally within ``claim_lease_seconds`` plus
         ``retry_interval_seconds`` of the crash. An advisory lock ends with
         its Postgres session: at once when the process dies on a live host,
-        but after a host loss or a network partition only when Postgres
-        drops the dead session through TCP keepalive.
+        unless a descendant forked from it still holds the connection's
+        socket, but after a host loss or a network partition only when
+        Postgres drops the dead session through TCP keepalive.
 
         Under ``"advisory_lock"`` each delivery holds a lock-pool connection
         while its listener runs. A task that finds no free lock connection
