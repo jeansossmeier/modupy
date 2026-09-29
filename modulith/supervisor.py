@@ -40,6 +40,7 @@ production runtime for users who don't want a separate orchestrator.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import secrets
@@ -73,6 +74,36 @@ _MAX_LEVEL_TOKEN_LEN = max(len(name) for name in _LEVEL_TOKENS)
 # Draining is expected to be near-instant — this is a safety backstop, not a
 # tunable, so it isn't threaded through Supervisor.__init__.
 _LOG_DRAIN_TIMEOUT = 5.0
+# A forwarder that has received no line for this long after its process died
+# is waiting on a pipe a surviving descendant holds open, not on unread output:
+# stop() cancels it then rather than waiting out _LOG_DRAIN_TIMEOUT.
+_LOG_QUIET_PERIOD = 0.5
+# How often a waiter re-checks a worker's returncode (see _exited).
+_EXIT_POLL_INTERVAL = 0.05
+
+
+async def _exited(proc: asyncio.subprocess.Process) -> int:
+    """Return ``proc``'s exit code as soon as the process has exited.
+
+    ``Process.wait()`` resolves only after the process has exited AND every
+    pipe to it has closed (``asyncio.base_subprocess``'s ``_try_finish``). A
+    descendant that inherited the worker's stdout or stderr would hold it off
+    until that descendant exits, possibly never. ``returncode`` is set by the
+    child watcher at exit, whatever holds the pipes, so it is polled alongside
+    ``wait()``; ``wait()`` still answers first when nothing else holds them.
+    """
+    wait = asyncio.ensure_future(proc.wait())
+    try:
+        while proc.returncode is None and not wait.done():
+            await asyncio.wait({wait}, timeout=_EXIT_POLL_INTERVAL)
+    finally:
+        if not wait.done():
+            wait.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await wait
+    code = proc.returncode
+    return code if code is not None else wait.result()
+
 
 # Parent-death signal support (Linux only). libc is resolved in the *parent*
 # at import time so the child-side preexec_fn — which runs between fork() and
@@ -319,6 +350,8 @@ class Supervisor:
         # forwarders, so pruning only in stop() would grow this without bound
         # under a crash-looping worker (each restart leaks two done tasks).
         self._log_tasks: set[asyncio.Task[None]] = set()
+        # Monotonic time any forwarder last received a line; read by stop().
+        self._last_log_line = 0.0
         # Instances the breaker has given up on — surfaced for health reporting.
         self._failed_instances: set[str] = set()
         self._stopping = False
@@ -385,8 +418,7 @@ class Supervisor:
         """
         cmd = self._command_builder(spec, port)
         env = _build_worker_env(spec)
-        for listener in self._spawn_listeners:
-            listener(port)
+        self._notify_listeners(port)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             env=env,
@@ -412,6 +444,18 @@ class Supervisor:
             )
         return proc
 
+    def _notify_listeners(self, port: int) -> None:
+        """Call every spawn listener; one that raises is logged, never fatal.
+
+        A raising listener must not stop a spawn or kill a monitor task: the
+        module would silently stop being supervised.
+        """
+        for listener in self._spawn_listeners:
+            try:
+                listener(port)
+            except Exception:
+                logger.exception("spawn listener %r failed for port %d", listener, port)
+
     def _track_log_task(self, task: asyncio.Task[None]) -> None:
         """Hold a strong reference to a log forwarder only while it runs.
 
@@ -429,7 +473,7 @@ class Supervisor:
 
         Loops as ``while True`` (rather than ``while not self._stopping``)
         because ``self._stopping`` is flipped by ``stop()`` *across* the
-        ``await proc.wait()`` below — the post-await re-checks are the real
+        ``await _exited(proc)`` below — the post-await re-checks are the real
         termination guards, and ``stop()`` also cancels this task.
 
         Backoff and the give-up decision are delegated to ``_RestartPolicy``:
@@ -446,9 +490,8 @@ class Supervisor:
         )
         while True:
             started = time.monotonic()
-            return_code = await proc.wait()
-            for listener in self._spawn_listeners:
-                listener(port)
+            return_code = await _exited(proc)
+            self._notify_listeners(port)
             if self._stopping:
                 return
             uptime = time.monotonic() - started
@@ -506,7 +549,7 @@ class Supervisor:
             # this process was registered. Cascade the SIGTERM here —
             # otherwise the worker blocks stop() for the full
             # shutdown_timeout and only ever gets the final SIGKILL reap.
-            # The loop's proc.wait() + _stopping check handle the rest.
+            # The loop's _exited(proc) + _stopping check handle the rest.
             if self._stopping and proc.returncode is None:  # type: ignore[unreachable]
                 proc.terminate()  # type: ignore[unreachable]
 
@@ -551,6 +594,7 @@ class Supervisor:
                     continue
                 if not line:
                     return  # EOF
+                self._last_log_line = time.monotonic()
                 text = line.decode(errors="replace").rstrip()
                 logger.log(_line_level(text, default_level), "[%s] %s", prefix, text)
         except asyncio.CancelledError:
@@ -575,9 +619,10 @@ class Supervisor:
 
         Monitors are allowed to observe the termination and return on their own
         (so a monitor mid-respawn finishes registering its process); they're
-        cancelled only as a timeout backstop. A final reap sweep then waits on
-        every tracked process — including any spawned during shutdown — so no
-        subprocess transport is left to be garbage-collected after the loop.
+        cancelled only as a timeout backstop. A final reap sweep then waits
+        for every tracked process to exit, including any spawned during
+        shutdown. A process whose pipes a surviving descendant still holds
+        counts as exited: stop() neither waits for nor kills that descendant.
         """
         self._stopping = True
         self._stop_event.set()  # wakes any monitor mid-restart-backoff
@@ -602,37 +647,35 @@ class Supervisor:
                 await asyncio.gather(*self._monitor_tasks, return_exceptions=True)
 
         # Final reap: escalate anything still alive (POSIX only — see the
-        # docstring above), then wait on every tracked process (covers late
-        # respawns) so no subprocess transport is left to be
-        # garbage-collected after the loop.
+        # docstring above), then wait for every tracked process (covers late
+        # respawns) to exit.
         if sys.platform != "win32":
             for proc in self._processes.values():
                 if proc.returncode is None:
                     proc.kill()
         await asyncio.gather(
-            *(proc.wait() for proc in self._processes.values()), return_exceptions=True
+            *(_exited(proc) for proc in self._processes.values()), return_exceptions=True
         )
 
         # Snapshot: done-callbacks discard from the set as tasks finish, so
-        # iterate and await over a stable copy. Every process is dead by now
-        # (killed + waited above), so its pipes are at EOF and the
-        # forwarders should drain and finish on their own almost
-        # immediately — give them a bounded grace period to do that first.
-        # Cancelling unconditionally (the old behavior) could cut off log
-        # lines the worker wrote just before dying but that were still
-        # sitting unread in the OS pipe buffer, silently dropping a
-        # crashing worker's last, most diagnostically useful output.
-        log_tasks = list(self._log_tasks)
-        if log_tasks:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*log_tasks, return_exceptions=True),
-                    timeout=_LOG_DRAIN_TIMEOUT,
-                )
-            except TimeoutError:
+        # iterate and await over a copy. Every process is dead by now, so
+        # its last output already sits in the OS pipe buffer and the
+        # forwarders should reach EOF almost immediately. Cancelling them
+        # unconditionally could drop a crashing worker's last, most
+        # diagnostically useful lines, so they get a bounded grace period.
+        # A forwarder that stays quiet for _LOG_QUIET_PERIOD is waiting on a
+        # pipe a surviving descendant holds open, and is cancelled then.
+        log_tasks = set(self._log_tasks)
+        drain_deadline = time.monotonic() + _LOG_DRAIN_TIMEOUT
+        while log_tasks:
+            _, log_tasks = await asyncio.wait(log_tasks, timeout=_LOG_QUIET_PERIOD)
+            now = time.monotonic()
+            quiet = now - self._last_log_line >= _LOG_QUIET_PERIOD
+            if log_tasks and (quiet or now >= drain_deadline):
                 for task in log_tasks:
                     task.cancel()
                 await asyncio.gather(*log_tasks, return_exceptions=True)
+                break
         self._monitor_tasks.clear()
         self._log_tasks.clear()
         logger.info("supervisor stopped")

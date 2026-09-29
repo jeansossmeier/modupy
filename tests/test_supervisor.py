@@ -952,6 +952,170 @@ async def test_stop_sigkills_only_the_worker_still_alive_at_timeout() -> None:
     assert procs["stubborn"].returncode == -signal.SIGKILL  # still alive -> escalated
 
 
+# A worker that starts a helper subprocess inheriting its stdout and stderr,
+# records the helper's pid, then either exits at once or keeps running.
+# argv: pid file, helper sleep seconds, "exit" | "stay".
+_DESCENDANT_WORKER = """
+import os, subprocess, sys, time
+helper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(%s)" % sys.argv[2]])
+with open(sys.argv[1], "a") as f:
+    f.write("%d\\n" % helper.pid)
+if sys.argv[3] == "exit":
+    os._exit(3)
+time.sleep(30)
+"""
+
+
+def _descendant_builder(pid_file: Any, helper_sleep: int, then: str) -> Any:
+    return lambda spec, port: [
+        sys.executable,
+        "-c",
+        _DESCENDANT_WORKER,
+        str(pid_file),
+        str(helper_sleep),
+        then,
+    ]
+
+
+def _kill_descendants(pid_file: Any) -> None:
+    if pid_file.exists():
+        for pid in pid_file.read_text().split():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(pid), signal.SIGKILL)
+
+
+@pytest.mark.real_process
+async def test_a_worker_exit_is_seen_while_a_descendant_still_holds_its_pipes(tmp_path) -> None:
+    """The worker's helper outlives it and keeps its stdout and stderr open.
+    The exit must still reach the exit listeners, the restart and the
+    crash-loop breaker straight away, not when the helper finally exits."""
+    pid_file = tmp_path / "descendants"
+    notified: list[int] = []
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", 9001)],
+        command_builder=_descendant_builder(pid_file, 30, "exit"),
+        restart_initial_delay=0.01,
+        restart_max_delay=0.01,
+        max_restarts=1,
+        restart_healthy_uptime=30.0,
+    )
+    sup.add_spawn_listener(notified.append)
+    try:
+        await sup.start()
+        deadline = time.monotonic() + 3.0
+        while not sup.failed_instances() and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+
+        # spawn, exit, respawn, exit: the breaker then gives up
+        assert notified == [9001, 9001, 9001, 9001]
+        assert sup.failed_instances() == frozenset({"orders"})
+    finally:
+        _kill_descendants(pid_file)
+        await sup.stop()
+
+
+@pytest.mark.real_process
+async def test_stop_returns_within_its_timeout_while_a_descendant_holds_a_workers_pipes(
+    tmp_path,
+) -> None:
+    pid_file = tmp_path / "descendants"
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", 9001)],
+        command_builder=_descendant_builder(pid_file, 10, "stay"),
+        shutdown_timeout=1.0,
+    )
+    await sup.start()
+    procs = list(sup._processes.values())
+    try:
+        deadline = time.monotonic() + 5.0
+        while not pid_file.exists() and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert pid_file.exists(), "the worker never started its helper"
+
+        started = time.monotonic()
+        await sup.stop()
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0
+        assert [t for t in asyncio.all_tasks() if t is not asyncio.current_task()] == []
+    finally:
+        _kill_descendants(pid_file)
+        for proc in procs:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+
+
+@pytest.mark.real_process
+async def test_stop_still_forwards_a_workers_final_lines(caplog) -> None:
+    """A worker writing its last lines as it shuts down, with no descendant
+    holding its pipes: stop() must forward every one of them."""
+    worker = (
+        "import signal, sys, time\n"
+        "def bye(*_):\n"
+        "    for i in range(500):\n"
+        "        print('final-line-%d' % i, file=sys.stderr)\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, bye)\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(30)\n"
+    )
+    caplog.set_level(logging.INFO, logger="modulith.supervisor")
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", 9001)],
+        command_builder=lambda s, p: [sys.executable, "-c", worker],
+        shutdown_timeout=5.0,
+    )
+    await sup.start()
+    deadline = time.monotonic() + 5.0
+    while not any("[orders] ready" in r.getMessage() for r in caplog.records):
+        assert time.monotonic() < deadline, "worker never became ready"
+        await asyncio.sleep(0.02)
+
+    await sup.stop()
+
+    forwarded = [r.getMessage() for r in caplog.records if "final-line-" in r.getMessage()]
+    assert forwarded == [f"[orders] final-line-{i}" for i in range(500)]
+
+
+@pytest.mark.real_process
+async def test_a_raising_listener_is_logged_and_the_worker_is_still_restarted(caplog) -> None:
+    calls: list[int] = []
+
+    def flaky_listener(port: int) -> None:
+        calls.append(port)
+        if len(calls) > 1:  # every call after the first spawn, the exit included
+            raise RuntimeError("metrics backend down")
+
+    caplog.set_level(logging.INFO, logger="modulith.supervisor")
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", 9001)],
+        command_builder=lambda s, p: _CRASH,
+        restart_initial_delay=0.01,
+        restart_max_delay=0.01,
+        max_restarts=5,
+        restart_healthy_uptime=30.0,
+    )
+    sup.add_spawn_listener(flaky_listener)
+
+    def spawns() -> int:
+        return sum("spawned worker" in r.getMessage() for r in caplog.records)
+
+    try:
+        await sup.start()
+        deadline = time.monotonic() + 3.0
+        while spawns() < 3 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+
+        assert spawns() >= 3
+        listener_errors = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.ERROR and "listener" in r.getMessage() and r.exc_info
+        ]
+        assert listener_errors
+    finally:
+        await sup.stop()
+
+
 @pytest.mark.real_process
 async def test_failed_respawn_retries_under_backoff_and_trips_the_breaker(caplog) -> None:
     """A respawn that raises (fork EAGAIN under pid/thread pressure, ENOMEM,
