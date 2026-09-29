@@ -2218,6 +2218,172 @@ def test_broker_drop_group_on_the_database_broker_names_its_store_and_sole_targe
     assert "NoSubscribersError" in result.output
 
 
+def _seed_database_subscriptions(
+    url: str, db_file: Path, subscriptions: dict[str, list[str]], *, served_recently: bool
+) -> None:
+    from modulith.adapters.db_broker import DatabaseBroker
+
+    async def seed() -> None:
+        broker = DatabaseBroker(url=url)
+        try:
+            for group, targets in subscriptions.items():
+                await broker.subscribe(targets, group)
+        finally:
+            await broker.close()
+
+    asyncio.run(seed())
+    if not served_recently:
+        conn = sqlite3.connect(db_file)
+        conn.execute("UPDATE broker_subscription SET updated_at='2000-01-01 00:00:00.000000'")
+        conn.commit()
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("options", "expected", "absent"),
+    [
+        (
+            {"NO_SUBSCRIBER_POLICY": "store", "ORPHAN_RETENTION_SECONDS": "3600"},
+            [
+                "kept for 3600 s (orphan_retention_seconds)",
+                "replayed to every group that subscribes before then",
+                "pruned undelivered",
+            ],
+            ["retained until a group subscribes", "NoSubscribersError"],
+        ),
+        (
+            {"NO_SUBSCRIBER_POLICY": "store", "ORPHAN_REPLAY_POLICY": "first_groups"},
+            [
+                "kept for 86400 s (orphan_retention_seconds)",
+                "replayed to the first group that subscribes before then",
+            ],
+            ["retained until a group subscribes"],
+        ),
+        (
+            {
+                "NO_SUBSCRIBER_POLICY": "store",
+                "ORPHAN_REPLAY_POLICY": "expected_groups",
+                "EXPECTED_CONSUMER_GROUPS": '{"t.Only": ["modulith-orders"]}',
+            },
+            [
+                "fanned out at once to the groups expected_consumer_groups names for them",
+                "a group that subscribes later receives none of them",
+            ],
+            ["retained until a group subscribes", "kept for"],
+        ),
+        (
+            {"NO_SUBSCRIBER_POLICY": "wait", "NO_SUBSCRIBER_WAIT_TIMEOUT_SECONDS": "5"},
+            [
+                "each later publish to them waits up to 5 s (no_subscriber_wait_timeout_seconds)",
+                "succeeds if a group subscribes meanwhile",
+                "raises NoSubscribersError otherwise",
+            ],
+            [],
+        ),
+    ],
+    ids=["store-ttl_all_groups", "store-first_groups", "store-expected_groups", "wait"],
+)
+def test_broker_drop_group_on_the_database_broker_states_what_happens_to_later_publishes(
+    make_fake_app, monkeypatch, tmp_path, options, expected, absent
+):
+    make_fake_app({"orders": ""})
+    db_file = tmp_path / "broker.db"
+    url = _database_project(tmp_path, monkeypatch, db_file)
+    for key, value in options.items():
+        monkeypatch.setenv(f"MODULITH_BROKER_{key}", value)
+    _seed_database_subscriptions(
+        url, db_file, {"modulith-retired": ["t.Only"]}, served_recently=False
+    )
+
+    result = runner.invoke(app, ["broker", "drop-group", "modulith-retired"], input="n\n")
+
+    assert result.exit_code == 1, result.output
+    assert "only subscriber of 't.Only'" in result.output
+    for fragment in expected:
+        assert fragment in result.output
+    for fragment in absent:
+        assert fragment not in result.output
+
+
+def test_broker_drop_group_on_the_shm_broker_states_the_orphan_retention(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER_ORPHAN_RETENTION_SECONDS", "7200")
+    _seed_shm_groups(tmp_path, monkeypatch, {"modulith-retired": 1})
+
+    result = runner.invoke(app, ["broker", "drop-group", "modulith-retired"], input="n\n")
+
+    assert result.exit_code == 1, result.output
+    assert "only subscriber of 'fakeapp.contracts.modulith-retired'" in result.output
+    assert (
+        "kept for 7200 s (orphan_retention_seconds) and replayed to a group that "
+        "subscribes within that time" in result.output
+    )
+    assert "reach no consumer" not in result.output
+
+
+def _expected_groups_options(monkeypatch, groups: dict[str, list[str]]) -> None:
+    monkeypatch.setenv("MODULITH_BROKER_NO_SUBSCRIBER_POLICY", "store")
+    monkeypatch.setenv("MODULITH_BROKER_ORPHAN_REPLAY_POLICY", "expected_groups")
+    monkeypatch.setenv("MODULITH_BROKER_EXPECTED_CONSUMER_GROUPS", json.dumps(groups))
+
+
+def test_broker_drop_group_says_expected_consumer_groups_still_routes_to_the_group(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    db_file = tmp_path / "broker.db"
+    url = _database_project(tmp_path, monkeypatch, db_file)
+    _expected_groups_options(
+        monkeypatch, {"t.Only": ["modulith-retired"], "t.Other": ["modulith-orders"]}
+    )
+    _seed_database_subscriptions(
+        url, db_file, {"modulith-retired": ["t.Only"]}, served_recently=False
+    )
+
+    result = runner.invoke(app, ["broker", "drop-group", "modulith-retired", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "expected_consumer_groups still lists 'modulith-retired' for 't.Only'" in result.output
+    assert "every later publish to them queues a pending message for it again" in result.output
+    assert "remove 'modulith-retired' from expected_consumer_groups too" in result.output
+    assert "t.Other" not in result.output
+    assert "dropped group 'modulith-retired'" in result.output
+
+
+def test_broker_drop_group_refusal_names_expected_consumer_groups_routing(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    db_file = tmp_path / "broker.db"
+    url = _database_project(tmp_path, monkeypatch, db_file)
+    _expected_groups_options(monkeypatch, {"t.Only": ["modulith-retired"]})
+    _seed_database_subscriptions(
+        url, db_file, {"modulith-retired": ["t.Only"]}, served_recently=True
+    )
+
+    refused = runner.invoke(app, ["broker", "drop-group", "modulith-retired", "--yes"])
+
+    assert refused.exit_code == 1, refused.output
+    assert "receive no new publications until" not in refused.output
+    assert "expected_consumer_groups keeps queueing publishes to 't.Only' for it" in (
+        refused.output
+    )
+    assert "--force" in refused.output
+
+
+def test_broker_drop_group_force_help_describes_the_live_group_guard() -> None:
+    result = runner.invoke(app, ["broker", "drop-group", "--help"], env={"COLUMNS": "400"})
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "Drop the group even though a current module derives it or a consumer served "
+        "it in the last 24 h." in result.output
+    )
+
+
 def test_broker_drop_group_does_not_create_a_missing_database_store(
     make_fake_app, monkeypatch, tmp_path
 ):

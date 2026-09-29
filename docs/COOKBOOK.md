@@ -676,7 +676,10 @@ group yet, `no_subscriber_policy` decides what happens:
 `orphan_replay_policy` (store mode only): `ttl_all_groups` (default — every
 group that registers before expiry gets a copy), `first_groups` (fan out to
 the first registration set then delete), or `expected_groups` (pre-create
-delivery rows for configured groups).
+delivery rows for configured groups). A group listed in
+`expected_consumer_groups` keeps receiving rows even after `modulith broker
+drop-group` removes its subscription; remove it from that setting when you
+retire its module.
 
 ### Declaring broker destinations
 

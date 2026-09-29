@@ -255,6 +255,7 @@ class ShmBroker:
             label="SHM hint file",
         )
         self._db_path = resolved_db_path
+        self._orphan_retention_seconds = orphan_retention_seconds
         self._cold = ShmColdStore(
             str(resolved_db_path),
             synchronous=synchronous,
@@ -343,6 +344,11 @@ class ShmBroker:
     def store_location(self) -> str:
         """The SQLite file holding this broker's subscriptions and deliveries."""
         return str(self._db_path)
+
+    @property
+    def orphan_retention_seconds(self) -> float:
+        """How long a publish is kept for a group that subscribes to its target later."""
+        return float(self._orphan_retention_seconds)
 
     async def active_groups(self, *, within_seconds: float) -> set[str]:
         """Groups a consumer refreshed, claimed or completed within ``within_seconds``."""

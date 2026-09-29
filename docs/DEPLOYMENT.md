@@ -866,7 +866,14 @@ Export spans to Prometheus, Jaeger, or your observability stack.
 4. Delete the subpackage
 5. Restart
 6. Drop the retired module's broker consumer group (`modulith-<module>`; a
-   renamed module leaves its old name's group behind the same way)
+   renamed module leaves its old name's group behind the same way). Its
+   consumer served the group until step 5, so for 24 hours after that the
+   group still counts as live: `drop-group` refuses it unless you pass
+   `--force`. Pass `--force` once you have checked that no service or host
+   still runs the group, or wait 24 hours. The startup warning for a
+   forgotten group likewise appears only when `modulith run` restarts at
+   least 24 hours after the group's last consumer activity; the restart in
+   step 5 does not report it.
 
 Step 6 depends on the broker:
 
@@ -891,10 +898,28 @@ Step 6 depends on the broker:
   unless `--yes` is given, exits non-zero when the store holds nothing for
   the group, and refuses a group that a current module derives or a
   consumer served in the last 24 hours unless `--force` is given. Before
-  asking, it lists the targets the group is the only subscriber of: on the
-  database broker's default `error` (or `wait`) policy, a producer that
-  still publishes to one of them then gets `NoSubscribersError`; step 2
-  stops those publishes first.
+  asking, it lists the targets the group is the only subscriber of and says
+  what happens to later publishes to them, which step 2 stops first:
+  - database broker, `error` policy (the default): each raises
+    `NoSubscribersError`;
+  - database broker, `wait` policy: each waits up to
+    `no_subscriber_wait_timeout_seconds` (30 s by default), succeeds if a
+    group subscribes meanwhile, and raises `NoSubscribersError` otherwise;
+  - database broker, `store` policy: each is kept for
+    `orphan_retention_seconds` (86400 s by default) and replayed to a group
+    that subscribes before then (`ttl_all_groups`; only the first such group
+    under `first_groups`), then pruned; under `expected_groups` it fans out
+    at once to `expected_consumer_groups` and nothing is kept for a later
+    subscriber;
+  - SHM broker: each is kept for `orphan_retention_seconds` and replayed to
+    a group that subscribes within it.
+
+  On the database broker with `no_subscriber_policy = "store"` and
+  `orphan_replay_policy = "expected_groups"`, a group named in
+  `expected_consumer_groups` gets a pending message for every later publish
+  to those targets whether or not it subscribes, so dropping it has no
+  lasting effect and the startup warning returns. `drop-group` says so;
+  remove the group from `expected_consumer_groups` as well.
   Nothing is dropped automatically: a module that is only disabled for a
   deploy gets its backlog when it returns.
 - **Redis Streams broker:** no storage cleanup is needed. Streams are
