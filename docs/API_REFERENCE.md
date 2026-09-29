@@ -199,14 +199,14 @@ Example:
         production=os.environ.get("ENV") == "prod",
     )
 
-Dict-valued fields like ``outbox_options`` are accepted and
-validated. When the runtime binds the outbox store from
-``outbox_url``, it applies the ``claim_strategy``,
-``claim_lease_seconds`` and ``claim_batch_size`` keys of
-``outbox_options`` and reads no other key. An application's own
-``modulith.builtin.outbox.configure()`` call takes those settings,
-and other outbox tuning such as ``completion_mode``, as keyword
-arguments.
+Dict-valued fields like ``outbox_options`` are accepted. Only the
+``claim_strategy``, ``claim_lease_seconds`` and ``claim_batch_size``
+keys of ``outbox_options`` are validated, and the runtime applies
+them only when it binds the outbox store from ``outbox_url``. Any
+other key in ``outbox_options`` is accepted and ignored. An
+application's own ``modulith.builtin.outbox.configure()`` call takes
+those settings, and other outbox tuning such as ``completion_mode``,
+as keyword arguments.
 
 ### `bootstrap`
 

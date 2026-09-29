@@ -71,8 +71,24 @@ outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTB
   `auto_discover = false`, call `outbox.configure()` yourself.
 - The outbox table must already exist (run the shipped Alembic migrations);
   the URL must name the database holding your business tables.
-- The runtime's shutdown disposes the store and its engine. You still call
-  `outbox.start()` in a single-process app's lifespan.
+- In a single-process app, call `modulith.bootstrap()` and then
+  `outbox.start()` in the lifespan's startup half. Bootstrap binds the store,
+  and it is lazy: without the explicit call it first runs at the first
+  `publish()`. `outbox.start()` is a no-op while no store is bound, so a
+  lifespan that calls only `start()` runs no crash sweep and no retry loop
+  until something publishes.
+- The runtime's own shutdown drains in-flight after-commit deliveries and
+  disposes the store and its engine, but it runs only in process-topology
+  workers. In a single-process app nothing public drains or disposes the
+  store bound from `outbox_url`; call `outbox.shutdown()` in the lifespan's
+  teardown to stop the retry loop. An after-commit delivery still running when
+  the process exits is cancelled and delivered again later: under `"lease"`
+  once its lease expires, under `"advisory_lock"` by a later sweep once its
+  lock is released, at the latest when the dead process's lock connection
+  closes, and under `"none"` by the next sweep. The connection pools close
+  with the process. An app that needs a graceful drain binds its own store
+  with `outbox.configure()` and follows the teardown order of the lifespan
+  below.
 
 **Stored listener ids.** Each outbox row names its listener. A plain function
 is stored as `module.function`. A callable instance or bound method
