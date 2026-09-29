@@ -23,44 +23,12 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
-from typing import NamedTuple
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-README = REPO_ROOT / "README.md"
+from conftest import Block, fenced_blocks
 
-FENCE = re.compile(r"^```(\S*)\s*$")
-# ``# myapp/orders/api.py`` — the path comment that opens a file block.
+README = Path(__file__).resolve().parent.parent / "README.md"
 PATH_COMMENT = re.compile(r"^#\s*([\w./-]+\.py)\s*$")
-# Characters that mark a fenced block as a directory tree rather than prose.
 TREE_BRANCHES = ("├──", "└──")
-
-
-class Block(NamedTuple):
-    """One fenced code block: its info string, first content line, and body."""
-
-    lang: str
-    line: int
-    body: str
-
-
-def _blocks() -> list[Block]:
-    """Every fenced block in the README, with 1-based README line numbers."""
-    lines = README.read_text(encoding="utf-8").splitlines()
-    blocks: list[Block] = []
-    opened: tuple[str, int] | None = None
-    for number, text in enumerate(lines, start=1):
-        fence = FENCE.match(text)
-        if fence is None:
-            continue
-        if opened is None:
-            opened = (fence.group(1), number + 1)
-        else:
-            lang, start = opened
-            blocks.append(Block(lang, start, "\n".join(lines[start - 1 : number - 1])))
-            opened = None
-    if opened is not None:
-        raise AssertionError(f"README.md:{opened[1] - 1} opens a code fence that is never closed")
-    return blocks
 
 
 def _python_blocks() -> list[tuple[Block, str | None]]:
@@ -71,7 +39,7 @@ def _python_blocks() -> list[tuple[Block, str | None]]:
     checked.
     """
     paired: list[tuple[Block, str | None]] = []
-    for block in _blocks():
+    for block in fenced_blocks(README):
         if block.lang != "python":
             continue
         body = block.body.strip()
@@ -217,7 +185,7 @@ def test_readme_project_tree_lists_pyproject_toml() -> None:
     package = _example_package(_python_blocks())
     trees = [
         block
-        for block in _blocks()
+        for block in fenced_blocks(README)
         if any(branch in block.body for branch in TREE_BRANCHES) and f"{package}/" in block.body
     ]
 

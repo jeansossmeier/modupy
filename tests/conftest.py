@@ -22,18 +22,49 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import socket
 import sys
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from textwrap import dedent
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import uuid4
 
 import pytest
 
 from modulith.config import _announced_broker_defaults
+
+FENCE = re.compile(r"^```(\S*)\s*$")
+
+
+class Block(NamedTuple):
+    """One fenced code block: its info string, first content line, and body."""
+
+    lang: str
+    line: int
+    body: str
+
+
+def fenced_blocks(path: Path) -> list[Block]:
+    """Every fenced block in a Markdown file, with 1-based line numbers."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    blocks: list[Block] = []
+    opened: tuple[str, int] | None = None
+    for number, text in enumerate(lines, start=1):
+        fence = FENCE.match(text)
+        if fence is None:
+            continue
+        if opened is None:
+            opened = (fence.group(1), number + 1)
+        else:
+            lang, start = opened
+            blocks.append(Block(lang, start, "\n".join(lines[start - 1 : number - 1])))
+            opened = None
+    if opened is not None:
+        raise AssertionError(f"{path}:{opened[1] - 1} opens a code fence that is never closed")
+    return blocks
 
 
 @pytest.fixture(autouse=True)
