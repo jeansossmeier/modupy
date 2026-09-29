@@ -47,6 +47,7 @@ DEFAULT_MAX_CONNECTIONS = 1000
 _DOWN_RETRY_SECONDS = 5.0
 DEFAULT_IDENTITY_PROBE_TIMEOUT = 30.0
 _MAX_HEALTH_BODY_BYTES = 64 * 1024
+_PROBE_MAX_CONNECTIONS = 100
 
 
 def _cookieless_jar() -> http.cookiejar.CookieJar:
@@ -178,10 +179,11 @@ def create_proxy_app(
     worker ``/health`` probes included. When omitted, the app creates two
     clients and closes them with its lifespan: one for proxied requests,
     capped at ``max_connections`` concurrent upstream connections (each held
-    until its response finishes streaming), and a separate small one for
-    ``/health`` probes, so a saturated request pool cannot fail readiness.
-    A request that finds the pool full for the pool timeout gets 503
-    ``"proxy connection pool exhausted"``; the backend is not marked down.
+    until its response finishes streaming), and a separate 100-connection one
+    for ``/health`` probes, so a saturated request pool cannot fail readiness.
+    A request that finds either pool full for the pool timeout gets 503
+    ``"proxy connection pool exhausted"``, logged with the pool's name; the
+    backend is not marked down.
     Both clients ignore ``HTTP_PROXY``/``ALL_PROXY`` and related environment
     variables and always connect to the worker directly.
 
@@ -225,6 +227,10 @@ def create_proxy_app(
     against a hostile local process. Each identity probe is bounded by
     ``identity_probe_timeout`` seconds in total and 64 KiB of body; past the
     deadline the request gets 504 and the backend is not marked down.
+    Concurrent requests to one unverified backend wait on a single shared
+    probe, so a stalled backend holds one probe connection however many
+    requests are waiting for it; a waiting request that is cancelled leaves
+    that probe running for the others.
 
     No client stores upstream cookies: both owned clients, and an injected
     ``client`` (whose jar is replaced), refuse every ``Set-Cookie``, so one
@@ -247,8 +253,15 @@ def create_proxy_app(
     )
     # Worker /health probes get their own pool so request traffic that fills
     # the main pool cannot fail readiness or identity checks.
+    probe_max_connections = _PROBE_MAX_CONNECTIONS
     probe_client: Any = (
-        client if client is not None else httpx.AsyncClient(timeout=2.0, trust_env=False)
+        client
+        if client is not None
+        else httpx.AsyncClient(
+            timeout=2.0,
+            limits=httpx.Limits(max_connections=probe_max_connections),
+            trust_env=False,
+        )
     )
     # One jar serves every end user's requests and every probe; a stored
     # upstream Set-Cookie would be replayed for other users. Replacing an
@@ -321,18 +334,50 @@ def create_proxy_app(
         )
         return False
 
+    async def probe_identity(rule: RoutingRule, url: str) -> bool:
+        health = await asyncio.wait_for(read_health(url), identity_probe_timeout)
+        return record_identity(rule, url, health)
+
+    identity_probes: dict[tuple[str, str], asyncio.Task[bool]] = {}
+
+    def forget_probe(key: tuple[str, str], probe: asyncio.Task[bool]) -> None:
+        if identity_probes.get(key) is probe:
+            del identity_probes[key]
+        if not probe.cancelled():
+            # Retrieved here so a probe whose every waiter was cancelled does
+            # not log "exception was never retrieved".
+            probe.exception()
+
     async def confirm_identity(rule: RoutingRule, url: str) -> bool:
         """Probe an unverified backend before it is sent any request.
 
-        Transport errors propagate so the caller's connect-retry and 502
-        handling apply to the probe exactly as to the request itself. A probe
-        still unanswered after ``identity_probe_timeout`` raises
-        ``TimeoutError`` and leaves the backend unverified but not down.
+        Concurrent callers for one backend share a single probe and its
+        verdict; the probe is shielded, so a cancelled caller does not cancel
+        it for the rest. Transport errors propagate so the caller's
+        connect-retry and 502 handling apply to the probe exactly as to the
+        request itself. A probe still unanswered ``identity_probe_timeout``
+        after it started raises ``TimeoutError`` in every caller and leaves the
+        backend unverified but not down.
         """
         if deployment_token is None or rule.is_verified(url):
             return True
-        health = await asyncio.wait_for(read_health(url), identity_probe_timeout)
-        return record_identity(rule, url, health)
+        key = (rule.prefix, url)
+        probe = identity_probes.get(key)
+        if probe is None or probe.done():
+            probe = asyncio.create_task(probe_identity(rule, url))
+            identity_probes[key] = probe
+            probe.add_done_callback(lambda done: forget_probe(key, done))
+        return await asyncio.shield(probe)
+
+    def pool_exhausted(pool: str, limit: int, upstream: str) -> JSONResponse:
+        # The backend is fine; this proxy is at capacity.
+        logger.warning(
+            "proxy %s pool exhausted (%s) for %s",
+            pool,
+            f"all {limit} connections in use" if owns_client else "injected client's limit",
+            upstream,
+        )
+        return JSONResponse({"detail": "proxy connection pool exhausted"}, status_code=503)
 
     def identity_timed_out(url: str) -> JSONResponse:
         logger.warning(
@@ -467,6 +512,10 @@ def create_proxy_app(
                     break
             except TimeoutError:
                 return identity_timed_out(backend)
+            except httpx.PoolTimeout:
+                return pool_exhausted(
+                    "health-probe", probe_max_connections, backend + raw_path.decode("latin-1")
+                )
             except httpx.HTTPError:
                 break
             backend = rule.next_backend()
@@ -547,12 +596,14 @@ def create_proxy_app(
             return JSONResponse({"detail": "invalid request"}, status_code=400)
         attempts = max(1, connect_retry_attempts)
         for attempt in range(attempts):
+            probing = True
             try:
                 if not await confirm_identity(rule, backend):
                     return JSONResponse(
                         {"detail": f"no worker of this deployment serves {rule.prefix}"},
                         status_code=503,
                     )
+                probing = False
                 upstream_resp = await http_client.send(upstream_req, stream=True)
             except TimeoutError:
                 return identity_timed_out(backend)
@@ -574,14 +625,9 @@ def create_proxy_app(
                 await asyncio.sleep(connect_retry_backoff)
                 continue
             except httpx.PoolTimeout:
-                # Every pooled connection is busy with another in-flight
-                # response. The backend is fine; this proxy is at capacity.
-                logger.warning(
-                    "proxy connection pool exhausted (%s connections in use) for %s",
-                    max_connections,
-                    upstream,
-                )
-                return JSONResponse({"detail": "proxy connection pool exhausted"}, status_code=503)
+                if probing:
+                    return pool_exhausted("health-probe", probe_max_connections, upstream)
+                return pool_exhausted("request", max_connections, upstream)
             except httpx.TransportError as exc:
                 # TransportError covers the whole connect/read failure tree —
                 # ConnectError (refused/DNS), ConnectTimeout (reachable but
