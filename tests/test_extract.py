@@ -17,7 +17,12 @@ from typer.testing import CliRunner
 from modulith import __version__, extract
 from modulith.cli import app
 from modulith.config import Configuration
-from modulith.extract import _render_pyproject, _render_readme, write_extraction
+from modulith.extract import (
+    _render_env_example,
+    _render_pyproject,
+    _render_readme,
+    write_extraction,
+)
 from modulith.runtime import _runtime
 
 runner = CliRunner()
@@ -161,6 +166,57 @@ def test_generated_toml_quotes_dynamic_keys_and_omits_none():
     assert parsed["tool"]["modulith"]["broker_options"] == {"routing.key": "orders"}
     assert parsed["tool"]["modulith"]["subscriptions"] == {"orders.v2": ["inventory"]}
     assert "observability" not in parsed["tool"]["modulith"]
+
+
+def _readme_section(readme: str, heading: str) -> str:
+    _, _, tail = readme.partition(f"## {heading}\n")
+    return tail.split("\n## ", 1)[0]
+
+
+def _extracted_readme() -> str:
+    return _render_readme(
+        cfg=Configuration(package="fakeapp"),
+        module="orders",
+        pkg_name="fakeapp",
+        helpers=[],
+        notes=[],
+    )
+
+
+def test_extract_env_example_configures_the_runtime_outbox_and_scopes_the_db_url():
+    text = _render_env_example(
+        cfg=Configuration(package="fakeapp"), module="orders", package="fakeapp"
+    )
+    lines = text.splitlines()
+
+    assert "MODULITH_OUTBOX=" in lines
+    assert "MODULITH_OUTBOX_URL=" in lines
+    assert lines[lines.index("MODULITH_DB_URL=") - 1].startswith("# Alembic migrations only")
+
+
+def test_extract_readme_lists_the_outbox_variables_and_scopes_the_db_url():
+    table = _readme_section(_extracted_readme(), "Environment variables")
+
+    assert "| `MODULITH_OUTBOX` |" in table
+    assert "| `MODULITH_OUTBOX_URL` |" in table
+    db_row = next(line for line in table.splitlines() if line.startswith("| `MODULITH_DB_URL`"))
+    assert "Alembic" in db_row
+    assert "outbox" not in db_row.lower()
+
+
+def test_extract_readme_says_the_worker_binds_its_store_from_the_url_and_refuses_without_one():
+    outbox = _readme_section(_extracted_readme(), "Outbox")
+
+    assert "`MODULITH_OUTBOX_URL`" in outbox
+    assert "refuses to start" in outbox
+    assert "outbox.configure" not in outbox
+    assert "not auto-wired" not in outbox
+
+
+def test_extract_readme_shows_a_local_run_through_the_supported_command():
+    run_locally = _readme_section(_extracted_readme(), "Run locally")
+
+    assert "modulith run fakeapp:app --topology processes" in run_locally
 
 
 def test_database_broker_postgres_migration_has_sync_driver_and_packaged_config(monkeypatch):

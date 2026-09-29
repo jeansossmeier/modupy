@@ -395,6 +395,9 @@ def _render_env_example(*, cfg: Configuration, module: str, package: str) -> str
         lines.append("REDIS_URL=")
     lines += [
         "MODULITH_BROKER_SCHEMA=",
+        "MODULITH_OUTBOX=",
+        "MODULITH_OUTBOX_URL=",
+        "# Alembic migrations only; the runtime outbox reads MODULITH_OUTBOX_URL.",
         "MODULITH_DB_URL=",
         "MODULITH_DB_SCHEMA=",
         "UVICORN_LOG_LEVEL=info",
@@ -418,6 +421,12 @@ def _render_readme(
         "uvicorn modulith._worker:create_app --factory",
         "```",
         "",
+        "Or run it the way the whole application runs, one process per module:",
+        "",
+        "```",
+        f"modulith run {pkg_name}:app --topology processes",
+        "```",
+        "",
         "## Run with Docker",
         "",
         "```",
@@ -434,7 +443,9 @@ def _render_readme(
         "| `MODULITH_BROKER` | Broker adapter scheme |",
         "| `MODULITH_BROKER_URL` | Broker connection string |",
         "| `MODULITH_BROKER_SCHEMA` | Broker-side schema/prefix |",
-        "| `MODULITH_DB_URL` | Database connection string |",
+        "| `MODULITH_OUTBOX` | Outbox adapter (`memory`, or a durable adapter such as `postgres`) |",
+        "| `MODULITH_OUTBOX_URL` | Async SQLAlchemy URL of the database the outbox store binds to |",
+        "| `MODULITH_DB_URL` | Connection string the Alembic migrations read |",
         "| `MODULITH_DB_SCHEMA` | Database schema for this module |",
         "| `UVICORN_LOG_LEVEL` | uvicorn log level |",
         "",
@@ -446,10 +457,12 @@ def _render_readme(
         "",
         "## Outbox",
         "",
-        "The outbox is not auto-wired here: `main.py` is not copied into an "
-        "extracted service, so code the worker imports must call "
-        "`outbox.configure(store, serializer)` itself before the app starts "
-        "handling requests.",
+        "The service binds its outbox store from `MODULITH_OUTBOX_URL` "
+        "(`[tool.modulith] outbox_url`) at startup. When `MODULITH_OUTBOX` "
+        "is not `memory`, the service refuses to start without one "
+        "(unless module code it imports binds a store itself): `main.py` is "
+        "not copied into an extracted service, so its lifespan wiring never "
+        "runs.",
         "",
         "## Database migrations",
         "",

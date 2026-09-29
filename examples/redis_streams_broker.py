@@ -15,13 +15,19 @@ without any registration boilerplate:
 
     @event
     @externalized(target="redis-streams-example:my-stream")
-    @dataclass
+    @dataclass(frozen=True)
     class OrderShipped:
         order_id: str
 
-The total surface for a broker adapter is one class implementing the
-Broker protocol plus one hookimpl function. No base class to inherit,
-no manifest file, no framework knowledge beyond the protocol contract.
+This adapter is producer-only: it publishes events to a stream and
+nothing reads them back. Cross-process delivery also needs a consumer
+adapter registered for the same scheme, which reads the stream and
+hands each entry to the receiving process. The built-in ``redis-streams``
+adapter (``modulith.adapters.redis_broker``) ships both halves.
+
+The producer side is one class implementing the Broker protocol plus
+one hookimpl function. No base class to inherit, no manifest file, no
+framework knowledge beyond the protocol contract.
 
 Scheme naming: each broker scheme may be registered exactly once per
 BrokerRegistry — registering a scheme that is already taken raises

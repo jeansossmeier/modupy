@@ -15,12 +15,16 @@ created once per cluster/namespace outside of this generator::
     kubectl create secret generic <package>-broker \\
         --from-literal=url=<broker connection URL>
 
-Every container also references an optional ``<package>-env`` Secret
-(``envFrom``, ``optional: true``) for any additional environment variables
-an operator wants injected without editing the generated manifest::
+Every container also references a ``<package>-env`` Secret (``envFrom``,
+``optional: true``, so applying never requires it) for any additional
+environment variables an operator wants injected without editing the
+generated manifest. Whenever ``outbox`` is not ``"memory"`` that Secret must
+carry ``MODULITH_OUTBOX_URL`` — the business database's async SQLAlchemy URL —
+unless the image's ``[tool.modulith]`` already sets ``outbox_url``; a worker
+with a durable outbox and no store refuses to start::
 
     kubectl create secret generic <package>-env \\
-        --from-literal=SOME_KEY=some-value
+        --from-literal=MODULITH_OUTBOX_URL=<async SQLAlchemy URL>
 """
 
 from __future__ import annotations
@@ -194,10 +198,13 @@ def render_manifests(
         f"#   kubectl create secret generic {broker_secret_name} "
         f"--from-literal={_BROKER_SECRET_KEY}=<broker connection URL>{namespace_arg}\n"
         "#\n"
-        "# Optionally, create an env Secret for any extra variables a module needs\n"
-        "# (referenced with `optional: true`, so it is never required):\n"
+        "# Create an env Secret for any extra variables a module needs. It is\n"
+        "# referenced with `optional: true`, so applying never requires it, but when\n"
+        '# outbox is not "memory" it must carry MODULITH_OUTBOX_URL (the business\n'
+        "# database's async SQLAlchemy URL): a pod refuses to start with no outbox\n"
+        "# store, unless the image's [tool.modulith] already sets outbox_url:\n"
         f"#   kubectl create secret generic {env_secret_name} "
-        f"--from-literal=SOME_KEY=value{namespace_arg}\n"
+        f"--from-literal=MODULITH_OUTBOX_URL=<async SQLAlchemy URL>{namespace_arg}\n"
     )
 
     documents = [header.rstrip("\n")]

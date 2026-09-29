@@ -484,23 +484,24 @@ ignore_missing_imports = true
 # actuator_mode = "auto"     # "auto" | "token" | "open" | "disabled"
 
 [tool.modulith.verify]
-# mode = "strict"            # "strict" for new projects, "ratchet" for migration
-# baseline = ".modulith-baseline.json"
 # disabled_rules = []        # rule names to skip, e.g. ["use-contracts"]
 
 # NOTE: the options subtable is `outbox_options` (NOT `outbox` — that
 # spelling is the top-level string key selecting the adapter, and a legacy
 # `[tool.modulith.outbox]` subtable is rejected with a ConfigurationError).
-# The runtime reads only the three claim keys, and only when it binds the
-# store from `outbox_url`; they are validated. Any other key here is
-# accepted and ignored: pass those settings, and the claim keys for a store
-# the application binds itself, to outbox.configure() as keyword arguments.
+# The runtime forwards these keys, validated, only when it binds the store
+# from `outbox_url`: claim_strategy, claim_lease_seconds, claim_batch_size,
+# dead_letter_after_attempts, retry_interval_seconds, retry_stale_seconds,
+# max_retry_backoff_seconds and completion_mode. Any other key here is
+# accepted and ignored; a store the application binds itself takes its
+# settings as outbox.configure() keyword arguments instead.
 [tool.modulith.outbox_options]
-# completion_mode = "update" # "update" | "delete" | "archive" — ignored here; pass to outbox.configure()
-# claim_strategy = "lease"   # "lease" | "advisory_lock" | "none" — applied to the outbox_url store; otherwise pass to outbox.configure()
-# claim_lease_seconds = 60.0 # applied to the outbox_url store; otherwise pass to outbox.configure()
-# claim_batch_size = 100     # applied to the outbox_url store; otherwise pass to outbox.configure()
-# retry_interval_seconds = 30  # ignored here, like the keys below; pass to outbox.configure()
+# completion_mode = "update" # "update" | "delete" | "archive"
+# claim_strategy = "lease"   # "lease" | "advisory_lock" | "none"
+# claim_lease_seconds = 60.0
+# claim_batch_size = 100
+# retry_interval_seconds = 30
+# retry_stale_seconds = 30
 # dead_letter_after_attempts = 10  # NOT `max_attempts` — that is the broker
 #                                  # consumer's redelivery cap, a different knob
 # max_retry_backoff_seconds = 300

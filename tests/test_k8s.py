@@ -475,3 +475,21 @@ def test_k8s_manifest_cli_stdout_output_starts_with_comment_and_has_ingress(
     assert result.exit_code == 0, result.output
     assert result.output.startswith("# ")
     assert "kind: Ingress" in result.output
+
+
+def test_generated_header_names_the_outbox_url_as_a_required_env_secret_key() -> None:
+    text = render_manifests(_cfg(outbox="postgres"), _two_module_specs(), image="shop:dev")
+
+    header = text.split("\n---\n", 1)[0]
+    assert "MODULITH_OUTBOX_URL" in header
+    assert "fakeapp-env" in header
+    assert 'outbox is not "memory"' in header
+    assert "never required" not in header
+
+
+def test_module_docstring_names_the_outbox_url_as_a_required_env_secret_key() -> None:
+    from modulith import k8s
+
+    assert k8s.__doc__ is not None
+    assert "MODULITH_OUTBOX_URL" in k8s.__doc__
+    assert '``outbox`` is not ``"memory"``' in k8s.__doc__

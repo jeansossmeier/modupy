@@ -131,3 +131,18 @@ def test_example_docstring_snippet_routes_to_the_example_scheme() -> None:
         f"docstring snippet routes to {target!r}, which is not the "
         f"{EXAMPLE_SCHEME!r} scheme this example registers"
     )
+
+
+def test_example_declares_a_producer_only_adapter_with_a_frozen_event() -> None:
+    """The example registers no consumer, so its docstring must say delivery
+    across processes needs one, and its sample event must be immutable."""
+    example = _load_example_adapter()
+    assert example.__doc__ is not None
+    assert not hasattr(example, "modulith_register_consumers")
+    assert "producer-only" in example.__doc__
+    assert "also needs a consumer" in example.__doc__
+
+    namespace: dict[str, Any] = {}
+    exec(compile(_indented_block(example.__doc__, "@externalized"), "<doc>", "exec"), namespace)
+    event_type = namespace["OrderShipped"]
+    assert event_type.__dataclass_params__.frozen
