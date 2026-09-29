@@ -13,7 +13,7 @@ from typing import Any, cast
 
 import pytest
 
-from modulith import ConsumerSpec, configure, event
+from modulith import ConfigurationError, ConsumerSpec, configure, event
 from modulith.adapters._shm_ring import _HEADER_SIZE, _SLOT_SIZE
 from modulith.adapters.shm_broker import ShmBroker, ShmConsumer
 from modulith.event_bus import InMemoryEventBus
@@ -258,6 +258,68 @@ def _publication(serializer: JsonEventSerializer, name: str) -> tuple[str, bytes
         serializer.serialize(ConsumerEvent(name)),
         {"event_type": EVENT_TYPE},
     )
+
+
+async def test_consumer_starts_with_a_replay_into_a_store_its_own_backlog_filled(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[ConsumerEvent])
+    instance = ShmBroker(
+        shm_name="full-store-replay",
+        db_path=str(tmp_path / "full.db"),
+        max_store_bytes=512 * 1024,
+    )
+    late_target = "late-stream"
+    try:
+        await instance.subscribe([TARGET], GROUP)
+        for index in range(30):
+            await instance.publish(
+                late_target,
+                serializer.serialize(ConsumerEvent(f"late-{index}")),
+                {"event_type": EVENT_TYPE},
+            )
+        backlog = 0
+        with pytest.raises(ConfigurationError, match="max_store_bytes"):
+            while True:
+                await instance.publish(*_publication(serializer, f"busy-{backlog}"))
+                backlog += 1
+        assert backlog >= 100
+
+        delivered: list[str] = []
+
+        async def handle(item: ConsumerEvent) -> None:
+            delivered.append(item.name)
+
+        bus = InMemoryEventBus()
+        bus.register(ConsumerEvent, handle)
+        consumer = ShmConsumer(
+            broker=instance,
+            bus=bus,
+            serializer=serializer,
+            consumer_name="worker-1",
+            group=GROUP,
+            targets=[TARGET, late_target],
+            poll_interval_s=0.01,
+        )
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
+            await consumer.start()
+        try:
+            await _until(lambda: len(delivered) == backlog + 30, timeout=30.0)
+        finally:
+            await consumer.stop()
+        assert sorted(delivered) == sorted(
+            [f"busy-{index}" for index in range(backlog)] + [f"late-{index}" for index in range(30)]
+        )
+        replay_warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING and "publish budget" in record.getMessage()
+        ]
+        assert len(replay_warnings) == 1
+        assert repr(GROUP) in replay_warnings[0]
+        assert "30" in replay_warnings[0]
+    finally:
+        await _close_test_broker(instance)
 
 
 async def test_hint_wakes_consumer_before_safety_poll_timeout(tmp_path: Path) -> None:

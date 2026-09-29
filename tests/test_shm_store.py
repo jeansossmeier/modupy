@@ -4,16 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
 from modulith import ConfigurationError
 from modulith.adapters import _shm_publications
 from modulith.adapters._shm_coldstore import ShmColdStore
-from modulith.adapters._shm_store import ClaimToken, PublishResult, SqliteQueueStore
+from modulith.adapters._shm_store import (
+    _UNCAPPED_PAGES,
+    ClaimToken,
+    PublishResult,
+    SqliteQueueStore,
+)
 
 
 async def _published_store(
@@ -410,35 +418,120 @@ def test_a_full_prune_batch_commits_in_a_full_store(tmp_path: Path) -> None:
         store.close()
 
 
-def test_a_replay_into_a_full_store_is_refused_and_the_backlog_stays_drainable(
-    tmp_path: Path,
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "modulith.adapters.shm" and record.levelno == logging.WARNING
+    ]
+
+
+def test_a_group_whose_backlog_filled_the_store_replays_a_new_target_and_drains(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    path = tmp_path / "replay.db"
-    store = _bounded_store(path, 4 * 1024 * 1024)
+    store = _bounded_store(tmp_path / "replay.db", 4 * 1024 * 1024)
     try:
         store.subscribe(["events.Busy"], "busy")
         for index in range(800):
             store.publish("events.Late", b'{"late":%d}' % index, None, None)
         published = _publish_until_refused(store, "events.Busy")
 
-        with pytest.raises(ConfigurationError, match="replay"):
-            store.subscribe(["events.Late"], "late")
-        assert "events.Late" not in store.get_subscriptions()
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
+            assert store.subscribe(["events.Busy", "events.Late"], "busy") == 800
+        [warning] = _warnings(caplog)
+        assert "'busy'" in warning
+        assert "800" in warning
+        assert "over its publish budget" in warning
+        assert store.get_subscriptions()["events.Late"] == ["busy"]
+        assert store.group_backlog() == {"busy": published + 800}
+        with pytest.raises(ConfigurationError, match="max_store_bytes"):
+            store.publish("events.Busy", b"{}", None, None)
 
         acked = 0
         while rows := store.claim("busy", 100, _LONG_CONSUMER, 30.0):
             for row in rows:
                 assert store.ack(row["claim_token"], _LONG_CONSUMER, None)
                 acked += 1
-        assert acked == published
+        assert acked == published + 800
     finally:
         store.close()
 
-    # Drained publications stay for orphan_retention_seconds, so the recovery
-    # the error names is a larger limit.
-    store = _bounded_store(path, 8 * 1024 * 1024)
+
+def test_a_replay_within_the_publish_budget_logs_no_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = _bounded_store(tmp_path / "roomy.db", 4 * 1024 * 1024)
     try:
-        assert store.subscribe(["events.Late"], "late") == 800
+        for index in range(20):
+            store.publish("events.Late", b'{"late":%d}' % index, None, None)
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
+            assert store.subscribe(["events.Late"], "late") == 20
+        assert _warnings(caplog) == []
+    finally:
+        store.close()
+
+
+def test_the_uncapped_page_count_fits_the_32_bit_pragma_parser(tmp_path: Path) -> None:
+    # SQLite 3.31.1 and older parse PRAGMA max_page_count as a signed 32-bit
+    # int and treat a larger value as a query that leaves the cap unchanged.
+    assert _UNCAPPED_PAGES <= 2**31 - 1
+    store = _bounded_store(tmp_path / "uncap.db", 256 * 1024)
+    try:
+        store._conn.execute(f"PRAGMA max_page_count={_UNCAPPED_PAGES}")
+        assert store.read_pragma("max_page_count") == _UNCAPPED_PAGES
+    finally:
+        store.close()
+
+
+class _CapLiftIgnoringConnection:
+    """A real connection whose SQLite reads an over-range cap as a query."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def execute(self, sql: str, *parameters: Any) -> sqlite3.Cursor:
+        if sql == f"PRAGMA max_page_count={_UNCAPPED_PAGES}":
+            sql = "PRAGMA max_page_count"
+        return self._conn.execute(sql, *parameters)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
+def _grow_past_the_limit(store: SqliteQueueStore) -> Callable[[], None]:
+    conn = store._conn
+    conn.execute("CREATE TABLE filler(data BLOB)")
+
+    def operation() -> None:
+        with conn:
+            conn.execute("INSERT INTO filler VALUES (randomblob(512 * 1024))")
+
+    return operation
+
+
+def test_a_consumer_write_grows_the_store_past_its_limit(tmp_path: Path) -> None:
+    store = _bounded_store(tmp_path / "grow.db", 256 * 1024)
+    try:
+        store._consumer_write(_grow_past_the_limit(store))
+        assert store.read_pragma("page_count") * store.read_pragma("page_size") > 256 * 1024
+    finally:
+        store.close()
+
+
+def test_a_consumer_write_names_the_sqlite_version_when_the_cap_cannot_be_lifted(
+    tmp_path: Path,
+) -> None:
+    store = _bounded_store(tmp_path / "stuck.db", 256 * 1024)
+    try:
+        operation = _grow_past_the_limit(store)
+        real_conn = store._conn
+        store._conn = cast(sqlite3.Connection, _CapLiftIgnoringConnection(real_conn))
+        with pytest.raises(sqlite3.OperationalError, match="full") as raised:
+            store._consumer_write(operation)
+        notes = getattr(raised.value, "__notes__", [])
+        assert any(f"SQLite {sqlite3.sqlite_version}" in note for note in notes)
+        store._conn = real_conn
+        assert store.read_pragma("page_count") * store.read_pragma("page_size") <= 256 * 1024
     finally:
         store.close()
 
