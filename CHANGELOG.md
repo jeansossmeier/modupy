@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [0.10.0] — 2026-09-29
+
+The `v0.10.0` tag first marked an unpublished build of 2026-09-02 and now marks this release. Where an entry below describes earlier behavior, that behavior may exist only in that unpublished build.
 
 ### Upgrade notes
 
@@ -22,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `modulith extract <module>` — scaffold a wheel-buildable standalone service (`pyproject.toml`, `Dockerfile`, `README.md`, `.env.example`) from one module; boundary/shared-table blockers require `--force`, while unsafe output paths and escaping source symlinks are always rejected
+- `modulith k8s-manifest` — generate RFC-1123-safe Deployment, Service, and Ingress names; validate ports; pass the contracts module and supported broker settings; reference connection secrets without embedding credentials
+- `modulith openapi` — merge module OpenAPI documents into one build-time spec, prefix schema names, and reject incompatible collisions or duplicate operation IDs
+- `modulith doctor` — three new checks: **actuator token** (including an error when token mode lacks a token), **single-host broker**, and **redis retention**; process-split readiness also reports table-only cross-module coupling
+- Per-module Postgres schema — `broker_options.schema` / `MODULITH_BROKER_SCHEMA` for the database broker, and alembic `-x schema=` / `MODULITH_DB_SCHEMA` for migrations, applied via `schema_translate_map` so `Table`/`MetaData` definitions stay unchanged
 - `modulith broker drop-group <group>` removes a consumer group's subscriptions and pending deliveries on the SHM and database brokers after confirmation, and `--target <target>` removes only that target's subscription and deliveries. It names the store it acts on (the SHM file, or the database URL with its password masked), never creates a missing store or schema, warns when the group is the only subscriber of a target, stating what later publishes to it will do under the broker's policy in effect, warns when the database broker's `expected_consumer_groups` still lists the group and will keep queuing messages for it, and exits 1 when nothing matched. Without `--force` it refuses a group the current deployment still derives or that a consumer served in the last 24 hours. Running consumers re-stamp their subscriptions hourly, but consumers from earlier releases do not, so upgrade them first. `modulith run` warns about consumer groups that no current module derives and no consumer has served in 24 hours, because a retired module's group keeps every publication pinned. Nothing is removed automatically
 - Durable outbox: `outbox = "postgres"` plus the new `outbox_url` (`MODULITH_OUTBOX_URL`) builds and binds the store in every process, including process-topology workers and, with `auto_discover` on, the `modulith outbox` CLI, and applies the claim keys of `[tool.modulith.outbox_options]` (`claim_strategy`, `claim_lease_seconds`, `claim_batch_size`) to it; an explicit `outbox.configure()` still wins. The new `outbox.start()` starts the retry loop from an ASGI lifespan, and workers call it at startup. A single-process app calls `modulith.bootstrap()` before it, because bootstrap binds the store, and only with `auto_discover` on; without discovery, bind the store with `outbox.configure()`
 
@@ -32,9 +39,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - SHM broker: startup logs the resolved store path at INFO, naming the SQLite file and whether its location is the default or explicit. `modulith run --topology processes` warns when `state_dir` is not set and no absolute `sqlite_path`/`url` pins the store. README, DEPLOYMENT and COOKBOOK say to set `state_dir` in production
 - Database broker, process topology: a worker whose module has no listeners now builds an empty consumer, without a poll task, so startup can warn about subscriptions its group still holds, as SHM workers already did. Its `/health` therefore reports that consumer's readiness (`{"status": "ready", "ready": true}`) instead of `{"status": "ok"}`
 - Database and SHM consumers store at most the first 500 characters of a failing listener's error, as the outbox does; the full text is still logged
+- `modulith doctor`'s process-split readiness check now also counts cross-module table references (a coupling direct imports can't see) and reports, per module, tables not prefixed with the module's own name; the "microservice-ready" tier now additionally requires zero cross-module table references, otherwise the headline reads "process-split ready (shared tables block extraction)" instead
+- The verifier's `data-ownership` rule now detects `ForeignKey("table.col")` string literals referencing another module's table, not just `Table()`/`__tablename__` declarations, and warns when a module with a non-empty `owns_tables` defines a table it doesn't declare there
+- `modulith audit`'s shared-table detection now also follows `ForeignKey` string literals, mirroring the verifier
+- SQL schema identifiers are validated consistently through configuration, environment variables, Alembic `-x`, and direct database-broker construction
+- Enabling a named migration schema now refuses to abandon existing Modulith tables or Alembic history in `public`; data movement remains an explicit operator migration
+- Artifact generators import application modules and therefore require trusted source; `openapi` reports an actionable `modupy[fastapi]` installation error when FastAPI is unavailable
+- `MODULITH_DEV_WARN_ONLY` is limited to single-process `modulith dev`; process topology and `modulith run` continue enforcing strict boundaries
+- `JsonEventSerializer.deserialize` now enforces a payload cap — `MODULITH_BROKER_MAX_PAYLOAD_BYTES`, else `broker_options["max_payload_bytes"]`, else 16 MiB — and raises `ConfigurationError` for an oversized payload where it previously decoded unconditionally; the cap resolves lazily from the loaded broker config at first deserialize (or from the new `max_payload_bytes` constructor argument) instead of freezing a default before configuration is available
 
 ### Fixed
 
+- Database broker: schema-aware alembic revisions skip tables/indexes the broker already bootstrapped instead of erroring; a stale claim past `max_attempts` is now reclaimed, retried, and dead-lettered instead of stuck forever; the broker schema falls back to `MODULITH_DB_SCHEMA` when unset; a database broker or store used from a second event loop now warns once instead of deadlocking on schema/session setup
+- Outbox: the retry loop recreates itself if its event loop closes instead of dying silently; `shutdown()` no longer raises on an already-closed loop; lease renewal re-raises a real shutdown cancellation instead of swallowing it and hanging shutdown forever; `claim_lease_seconds` must be finite and positive; `status()` and the doctor outbox check now include archived-row counts (`count_archived`)
+- SHM broker: the ring file's temporary descriptor is closed before it is linked into place, so a racing peer on Windows no longer sees `st_nlink == 2` and rejects the hint file; completion pruning under retention 0 also removes rows completed in the same clock tick as the prune call; per-event-loop store locks evict closed loops instead of leaking; `claim_batch` respects `max_attempts` end-to-end so a reclaimed row is retried and eventually dead-lettered instead of looping forever; pruning runs every 100 publishes instead of every publish; added a backfilled expiry index and a deterministic claim-cost test
+- Redis broker/consumer: `MODULITH_BROKER_MAX_PAYLOAD_BYTES` and the dead-letter max-stream-len env var are read ahead of `broker_options`; the dead-letter script checks for an existing dedup entry before appending, so a replayed acknowledgment can no longer duplicate a dead-letter record
+- Polling consumer: idle backoff never drops below the configured poll interval, so raising `poll_interval_ms` above the previous 0.5s floor actually reduces poll frequency
+- Reverse proxy: requests round-robin across a module's healthy replica instances instead of always hitting the first one, and a replica marked down is retried after a cooldown instead of staying excluded forever
+- Supervisor: failed worker instances are now reported through `/_modulith/health`; `stop()` no longer sends a second, functionally-identical kill signal on Windows, where `terminate()` and `kill()` are the same hard stop
+- Config: a whitespace-only `MODULITH_*` env var is treated as unset, matching the empty-string contract; `[tool.modulith.verify].disabled_rules` is honored by the verifier itself (previously ignored), and an unknown rule name in it now warns
+- `sync.publish_sync`'s nested-loop dispatch bounds its `loop_ready` wait so a failure before the nested loop starts raises the documented timeout instead of hanging forever
+- `@listener` recognizes an async-callable class instance (not just a plain async function) as an async handler
+- Observability hooks now match module boundaries the same way the verifier does
+- Generated docs and canvases are written as UTF-8 explicitly
+- k8s manifest generation: the Ingress path is the raw module name (YAML-quoted) instead of a hyphenated one that could mismatch the worker's actual route prefix, and a non-identifier module name is now rejected instead of producing a broken manifest
+- `modulith extract`: a parse failure during extraction is now a blocker (`--force`-overridable) instead of silently skipped; the contracts module is exempt from the shared-table scan; a module/helper name that doesn't resolve to a real importable package is now an error instead of writing an empty extraction tree
+- Verifier: `importlib.import_module()`/`__import__()` string-literal imports now count as cross-module imports like a normal `import` statement
+- Testing plugin: the manifest registry is snapshotted and restored alongside `sys.modules` between tests, and `modulith.testing` no longer leaks helper imports (`Any`, `MagicMock`, `dataclass`, …) into its public namespace — a guard test now enforces that, like the top-level package's
+- `modulith dev --isolate` now states, in `--help` and on stderr, that every other discovered module is not started and its routes 404
+- Packaging: dropped a `py.typed` include that pointed at a directory the wheel doesn't ship; `.opencode/` is excluded from the sdist; CI and release inspection now require `alembic.ini` and `py.typed` to be present in the built distribution
+- Raised the `redis` extra's floor to `redis>=5.0.1` (the actual tested minimum)
+- The issue template's "Question or usage help" contact link now points at a working `issues/new?labels=question` URL instead of the disabled Discussions tab
+- Consumer `stop()` (database, SHM and Redis Streams consumers) can no longer hang forever on a poll task whose cancellation is absorbed — SQLAlchemy shields a cancelled connection's graceful close, and a driver that never finishes it swallowed the only cancel. `stop()` now re-cancels after 10 s and, if the task still ignores that, logs an error and abandons it after another 10 s; cancelling the stopping task itself still reaches the poll task first
 - Durable outbox: one publication is no longer delivered twice when after-commit dispatch races a sweep. Under `claim_strategy="lease"`, after-commit dispatch claims its row with the sweep's lease, and a sweep's lease renewal fails on a completed row; a row a crashed process was delivering is recovered once its lease expires, normally within `claim_lease_seconds` plus `retry_interval_seconds`. Under `claim_strategy="advisory_lock"`, the sweep re-reads each row after locking and skips one a peer already completed, dead-lettered or deleted, or that is still backing off, and after-commit dispatch holds the row's advisory lock and skips a row a peer's sweep holds. Advisory locks use a second connection pool (see Upgrade notes); an after-commit dispatch or a sweep that waits past `pool_timeout` for a lock connection logs one WARNING and leaves the row, uncharged, to a later sweep
 - Durable outbox (`"lease"` claim strategy): a lease renewal that raises, for example on a dropped database connection, no longer stops renewals or surfaces as an error after a successful delivery; it is logged and retried until the lease runs out
 - Durable outbox (SQLAlchemy store, `"lease"` claim strategy): on MySQL and SQLite, concurrent sweepers could claim and deliver the same publications. Off Postgres, `claim_batch` now takes each row with a conditional `UPDATE` that re-checks the lease and keeps only the rows it won. Postgres keeps `FOR UPDATE SKIP LOCKED`
@@ -71,51 +107,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The process-per-module reverse proxy now builds each upstream URL from the matched backend's scheme, host and port, and matches routing rules on the same bytes it forwards. A request-target that does not start with `/`, or that contains a `.`/`..` path segment (literal or percent-encoded), now gets 400 and reaches no worker. Before, such a target could send the request, client headers included, to another host, or reach a worker's internal `/health`
 - The process-per-module proxy no longer stores upstream cookies. Before, its shared HTTP client kept every `Set-Cookie` a worker sent and replayed it on later requests from other clients and on health probes, so one user's session cookie could reach requests made for another user. A client's own `Cookie` header and upstream `Set-Cookie` responses still pass through unchanged
 - The proxy's upstream clients ignore `HTTP_PROXY`/`ALL_PROXY` from the environment. Before, with the common `NO_PROXY=localhost` (which does not match `127.0.0.1`), every proxied request and its credential headers went to the environment's proxy
-
-## [0.10.0] — 2026-09-02
-
-### Added
-
-- `modulith extract <module>` — scaffold a wheel-buildable standalone service (`pyproject.toml`, `Dockerfile`, `README.md`, `.env.example`) from one module; boundary/shared-table blockers require `--force`, while unsafe output paths and escaping source symlinks are always rejected
-- `modulith k8s-manifest` — generate RFC-1123-safe Deployment, Service, and Ingress names; validate ports; pass the contracts module and supported broker settings; reference connection secrets without embedding credentials
-- `modulith openapi` — merge module OpenAPI documents into one build-time spec, prefix schema names, and reject incompatible collisions or duplicate operation IDs
-- `modulith doctor` — three new checks: **actuator token** (including an error when token mode lacks a token), **single-host broker**, and **redis retention**; process-split readiness also reports table-only cross-module coupling
-- Per-module Postgres schema — `broker_options.schema` / `MODULITH_BROKER_SCHEMA` for the database broker, and alembic `-x schema=` / `MODULITH_DB_SCHEMA` for migrations, applied via `schema_translate_map` so `Table`/`MetaData` definitions stay unchanged
-
-### Changed
-
-- `modulith doctor`'s process-split readiness check now also counts cross-module table references (a coupling direct imports can't see) and reports, per module, tables not prefixed with the module's own name; the "microservice-ready" tier now additionally requires zero cross-module table references, otherwise the headline reads "process-split ready (shared tables block extraction)" instead
-- The verifier's `data-ownership` rule now detects `ForeignKey("table.col")` string literals referencing another module's table, not just `Table()`/`__tablename__` declarations, and warns when a module with a non-empty `owns_tables` defines a table it doesn't declare there
-- `modulith audit`'s shared-table detection now also follows `ForeignKey` string literals, mirroring the verifier
-- SQL schema identifiers are validated consistently through configuration, environment variables, Alembic `-x`, and direct database-broker construction
-- Enabling a named migration schema now refuses to abandon existing Modulith tables or Alembic history in `public`; data movement remains an explicit operator migration
-- Artifact generators import application modules and therefore require trusted source; `openapi` reports an actionable `modupy[fastapi]` installation error when FastAPI is unavailable
-- `MODULITH_DEV_WARN_ONLY` is limited to single-process `modulith dev`; process topology and `modulith run` continue enforcing strict boundaries
-- `JsonEventSerializer.deserialize` now enforces a payload cap — `MODULITH_BROKER_MAX_PAYLOAD_BYTES`, else `broker_options["max_payload_bytes"]`, else 16 MiB — and raises `ConfigurationError` for an oversized payload where it previously decoded unconditionally; the cap resolves lazily from the loaded broker config at first deserialize (or from the new `max_payload_bytes` constructor argument) instead of freezing a default before configuration is available
-
-### Fixed
-
-- Database broker: schema-aware alembic revisions skip tables/indexes the broker already bootstrapped instead of erroring; a stale claim past `max_attempts` is now reclaimed, retried, and dead-lettered instead of stuck forever; the broker schema falls back to `MODULITH_DB_SCHEMA` when unset; a database broker or store used from a second event loop now warns once instead of deadlocking on schema/session setup
-- Outbox: the retry loop recreates itself if its event loop closes instead of dying silently; `shutdown()` no longer raises on an already-closed loop; lease renewal re-raises a real shutdown cancellation instead of swallowing it and hanging shutdown forever; `claim_lease_seconds` must be finite and positive; `status()` and the doctor outbox check now include archived-row counts (`count_archived`)
-- SHM broker: the ring file's temporary descriptor is closed before it is linked into place, so a racing peer on Windows no longer sees `st_nlink == 2` and rejects the hint file; completion pruning under retention 0 also removes rows completed in the same clock tick as the prune call; per-event-loop store locks evict closed loops instead of leaking; `claim_batch` respects `max_attempts` end-to-end so a reclaimed row is retried and eventually dead-lettered instead of looping forever; pruning runs every 100 publishes instead of every publish; added a backfilled expiry index and a deterministic claim-cost test
-- Redis broker/consumer: `MODULITH_BROKER_MAX_PAYLOAD_BYTES` and the dead-letter max-stream-len env var are read ahead of `broker_options`; the dead-letter script checks for an existing dedup entry before appending, so a replayed acknowledgment can no longer duplicate a dead-letter record
-- Polling consumer: idle backoff never drops below the configured poll interval, so raising `poll_interval_ms` above the previous 0.5s floor actually reduces poll frequency
-- Reverse proxy: requests round-robin across a module's healthy replica instances instead of always hitting the first one, and a replica marked down is retried after a cooldown instead of staying excluded forever
-- Supervisor: failed worker instances are now reported through `/_modulith/health`; `stop()` no longer sends a second, functionally-identical kill signal on Windows, where `terminate()` and `kill()` are the same hard stop
-- Config: a whitespace-only `MODULITH_*` env var is treated as unset, matching the empty-string contract; `[tool.modulith.verify].disabled_rules` is honored by the verifier itself (previously ignored), and an unknown rule name in it now warns
-- `sync.publish_sync`'s nested-loop dispatch bounds its `loop_ready` wait so a failure before the nested loop starts raises the documented timeout instead of hanging forever
-- `@listener` recognizes an async-callable class instance (not just a plain async function) as an async handler
-- Observability hooks now match module boundaries the same way the verifier does
-- Generated docs and canvases are written as UTF-8 explicitly
-- k8s manifest generation: the Ingress path is the raw module name (YAML-quoted) instead of a hyphenated one that could mismatch the worker's actual route prefix, and a non-identifier module name is now rejected instead of producing a broken manifest
-- `modulith extract`: a parse failure during extraction is now a blocker (`--force`-overridable) instead of silently skipped; the contracts module is exempt from the shared-table scan; a module/helper name that doesn't resolve to a real importable package is now an error instead of writing an empty extraction tree
-- Verifier: `importlib.import_module()`/`__import__()` string-literal imports now count as cross-module imports like a normal `import` statement
-- Testing plugin: the manifest registry is snapshotted and restored alongside `sys.modules` between tests, and `modulith.testing` no longer leaks helper imports (`Any`, `MagicMock`, `dataclass`, …) into its public namespace — a guard test now enforces that, like the top-level package's
-- `modulith dev --isolate` now states, in `--help` and on stderr, that every other discovered module is not started and its routes 404
-- Packaging: dropped a `py.typed` include that pointed at a directory the wheel doesn't ship; `.opencode/` is excluded from the sdist; CI and release inspection now require `alembic.ini` and `py.typed` to be present in the built distribution
-- Raised the `redis` extra's floor to `redis>=5.0.1` (the actual tested minimum)
-- The issue template's "Question or usage help" contact link now points at a working `issues/new?labels=question` URL instead of the disabled Discussions tab
-- Consumer `stop()` (database, SHM and Redis Streams consumers) can no longer hang forever on a poll task whose cancellation is absorbed — SQLAlchemy shields a cancelled connection's graceful close, and a driver that never finishes it swallowed the only cancel. `stop()` now re-cancels after 10 s and, if the task still ignores that, logs an error and abandons it after another 10 s; cancelling the stopping task itself still reaches the poll task first
 
 ## [0.9.0] — 2026-07-22
 
