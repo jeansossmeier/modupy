@@ -353,8 +353,9 @@ class Runtime:
         No-op for the memory outbox, without a URL, or when the application
         already called ``outbox.configure()``: an explicit store wins. The
         serializer admits only the event types of this process's local
-        listeners, the only rows it may deserialize. The claim settings of
-        ``outbox_options`` are applied by the same ``configure()`` call that
+        listeners, the only rows it may deserialize. The claim, retry,
+        dead-letter and completion settings of ``outbox_options`` are applied
+        by the same ``configure()`` call that
         binds the store, so no after-commit dispatch runs without them. That
         call also starts the retry loop when an event loop is running
         (``modulith.bootstrap()`` from a lifespan); otherwise the loop starts on
@@ -373,16 +374,25 @@ class Runtime:
         from .adapters.postgres_outbox import PostgresPublicationStore
         from .serializers import JsonEventSerializer
 
-        claims = {
+        tuning = {
             key: cfg.outbox_options[key]
-            for key in ("claim_strategy", "claim_lease_seconds", "claim_batch_size")
+            for key in (
+                "claim_strategy",
+                "claim_lease_seconds",
+                "claim_batch_size",
+                "dead_letter_after_attempts",
+                "retry_interval_seconds",
+                "retry_stale_seconds",
+                "max_retry_backoff_seconds",
+                "completion_mode",
+            )
             if key in cfg.outbox_options
         }
         engine = create_async_engine(cfg.outbox_url)
         store = PostgresPublicationStore(engine)
         self._owned_outbox = (store, engine)
         event_types = self.local_event_types(self._event_bus) if self._event_bus else []
-        outbox.configure(store, JsonEventSerializer(allowed_event_types=event_types), **claims)
+        outbox.configure(store, JsonEventSerializer(allowed_event_types=event_types), **tuning)
 
     def local_event_types(self, bus: Any) -> list[type]:
         """Registered event types with at least one listener this process owns."""

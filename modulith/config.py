@@ -721,35 +721,51 @@ def _read_env_vars() -> dict[str, Any]:
     return result
 
 
+_COMPLETION_MODES = ("update", "delete", "archive")
+_POSITIVE_SECONDS_KEYS = (
+    "claim_lease_seconds",
+    "retry_interval_seconds",
+    "retry_stale_seconds",
+    "max_retry_backoff_seconds",
+)
+_POSITIVE_INTEGER_KEYS = ("claim_batch_size", "dead_letter_after_attempts")
+
+
 def _validate_outbox_options(options: dict[str, Any]) -> None:
-    """Validate the claim-strategy keys of [tool.modulith.outbox_options]
-    when present. Other keys in that table are intentionally NOT validated
-    here — outbox_options is a forward-compatible passthrough (see
-    _read_pyproject); only these three have runtime behavior gated on them
-    (the outbox claim abstraction in modulith/_claims.py).
+    """Validate the keys of [tool.modulith.outbox_options] that
+    ``Runtime.bind_configured_outbox`` forwards to ``outbox.configure()``
+    (claim, retry, dead-letter and completion settings) when present. Other
+    keys in that table are intentionally NOT validated here — outbox_options
+    is a forward-compatible passthrough (see _read_pyproject).
     """
     if "claim_strategy" in options and options["claim_strategy"] not in VALID_CLAIM_STRATEGIES:
         raise ConfigurationError(
             "outbox_options.claim_strategy must be one of "
             f"{VALID_CLAIM_STRATEGIES}, got {options['claim_strategy']!r}"
         )
-    if "claim_lease_seconds" in options:
-        value = options["claim_lease_seconds"]
-        # bool is an int subclass; isinstance(True, (int, float)) is True, so
-        # it must be excluded explicitly or `claim_lease_seconds = true` would
-        # silently pass as 1.0.
-        valid = isinstance(value, (int, float)) and not isinstance(value, bool)
-        if not valid or not (0 < value < float("inf")):
-            raise ConfigurationError(
-                "outbox_options.claim_lease_seconds must be a finite number "
-                f"greater than 0, got {value!r}"
-            )
-    if "claim_batch_size" in options:
-        value = options["claim_batch_size"]
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ConfigurationError(
-                f"outbox_options.claim_batch_size must be a positive integer, got {value!r}"
-            )
+    if "completion_mode" in options and options["completion_mode"] not in _COMPLETION_MODES:
+        raise ConfigurationError(
+            "outbox_options.completion_mode must be one of "
+            f"{_COMPLETION_MODES}, got {options['completion_mode']!r}"
+        )
+    for key in _POSITIVE_SECONDS_KEYS:
+        if key in options:
+            value = options[key]
+            # bool is an int subclass; isinstance(True, (int, float)) is True, so
+            # it must be excluded explicitly or `claim_lease_seconds = true` would
+            # silently pass as 1.0.
+            valid = isinstance(value, (int, float)) and not isinstance(value, bool)
+            if not valid or not (0 < value < float("inf")):
+                raise ConfigurationError(
+                    f"outbox_options.{key} must be a finite number greater than 0, got {value!r}"
+                )
+    for key in _POSITIVE_INTEGER_KEYS:
+        if key in options:
+            value = options[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ConfigurationError(
+                    f"outbox_options.{key} must be a positive integer, got {value!r}"
+                )
 
 
 def _validate_redis_broker_options(options: dict[str, Any]) -> None:

@@ -1301,6 +1301,65 @@ def test_pyproject_outbox_options_accepts_valid_claim_batch_size() -> None:
     assert cfg.outbox_options == {"claim_batch_size": 250}
 
 
+# ----- outbox_options retry, dead-letter and completion validation ------------
+
+_RETRY_SECONDS_KEYS = ["retry_interval_seconds", "retry_stale_seconds", "max_retry_backoff_seconds"]
+
+
+@pytest.mark.parametrize("key", _RETRY_SECONDS_KEYS)
+@pytest.mark.parametrize(
+    "value", [0, -1.0, float("inf"), float("-inf"), float("nan"), "30", True, None, [5]]
+)
+def test_outbox_options_reject_invalid_retry_seconds(key: str, value: object) -> None:
+    with pytest.raises(
+        ConfigurationError,
+        match=rf"outbox_options\.{key} must be a finite number greater than 0",
+    ):
+        load_configuration(outbox_options={key: value})
+
+
+@pytest.mark.parametrize("key", _RETRY_SECONDS_KEYS)
+@pytest.mark.parametrize("value", [1, 0.05, 300.5])
+def test_outbox_options_accept_valid_retry_seconds(key: str, value: float) -> None:
+    cfg = load_configuration(outbox_options={key: value})
+    assert cfg.outbox_options == {key: value}
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, float("inf"), float("nan"), "3", True, None])
+def test_outbox_options_reject_invalid_dead_letter_after_attempts(value: object) -> None:
+    with pytest.raises(
+        ConfigurationError,
+        match=r"outbox_options\.dead_letter_after_attempts must be a positive integer",
+    ):
+        load_configuration(outbox_options={"dead_letter_after_attempts": value})
+
+
+def test_outbox_options_accept_valid_dead_letter_after_attempts() -> None:
+    cfg = load_configuration(outbox_options={"dead_letter_after_attempts": 1})
+    assert cfg.outbox_options == {"dead_letter_after_attempts": 1}
+
+
+@pytest.mark.parametrize("value", ["remove", "", "UPDATE", 1, True, None, ["delete"]])
+def test_outbox_options_reject_invalid_completion_mode(value: object) -> None:
+    with pytest.raises(
+        ConfigurationError,
+        match=r"outbox_options\.completion_mode must be one of "
+        r"\('update', 'delete', 'archive'\)",
+    ):
+        load_configuration(outbox_options={"completion_mode": value})
+
+
+@pytest.mark.parametrize("mode", ["update", "delete", "archive"])
+def test_outbox_options_accept_valid_completion_mode(mode: str) -> None:
+    cfg = load_configuration(outbox_options={"completion_mode": mode})
+    assert cfg.outbox_options == {"completion_mode": mode}
+
+
+def test_outbox_options_keep_unknown_keys_next_to_validated_ones() -> None:
+    options = {"dead_letter_after_attempts": 3, "completion_mode": "delete", "future_key": [1]}
+    assert load_configuration(outbox_options=options).outbox_options == options
+
+
 # ----- strict_boundaries (boundary enforcement mode) --------------------------
 
 

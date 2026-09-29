@@ -2515,6 +2515,152 @@ def test_bootstrap_binds_store_from_outbox_url_and_delivers_after_commit(
     assert postgres_outbox._active_store is None
 
 
+_FAILING_LISTENER_APP = {
+    "orders": """
+        from dataclasses import dataclass
+
+        from modulith import event, listener
+
+        ATTEMPTS: list[str] = []
+
+        @event
+        @dataclass(frozen=True)
+        class OrderPlaced:
+            order_id: str
+
+        @listener
+        async def on_placed(evt: OrderPlaced) -> None:
+            ATTEMPTS.append(evt.order_id)
+            raise RuntimeError("boom")
+    """
+}
+
+_FAILS_ONCE_APP = {
+    "orders": """
+        from dataclasses import dataclass
+
+        from modulith import event, listener
+
+        ATTEMPTS: list[str] = []
+
+        @event
+        @dataclass(frozen=True)
+        class OrderPlaced:
+            order_id: str
+
+        @listener
+        async def on_placed(evt: OrderPlaced) -> None:
+            ATTEMPTS.append(evt.order_id)
+            if len(ATTEMPTS) == 1:
+                raise RuntimeError("first attempt fails")
+    """
+}
+
+
+def _publish_after_bootstrap_from_outbox_url(
+    make_fake_app: Any,
+    tmp_path: Path,
+    app: dict[str, str],
+    options: dict[str, Any],
+    *,
+    settled: Any,
+    timeout: float,
+) -> tuple[Any, list[tuple[bool, int, bool]], dict[str, int]]:
+    """Bootstrap ``fakeapp`` from ``outbox_url``, publish one OrderPlaced and
+    wait until ``settled(rows)`` or ``timeout`` seconds pass. Returns the
+    orders module and the rows as ``(completed, attempt_count, dead_lettered)``."""
+    url = f"sqlite+aiosqlite:///{tmp_path / 'app.db'}"
+    make_fake_app(app)
+    _runtime.configure(package="fakeapp", outbox="postgres", outbox_url=url, outbox_options=options)
+    _runtime.ensure_bootstrapped()
+    orders = __import__("fakeapp.orders", fromlist=["OrderPlaced"])
+
+    async def rows_of(engine: Any) -> list[tuple[bool, int, bool]]:
+        async with async_sessionmaker(engine)() as session:
+            result = await session.execute(
+                select(
+                    EventPublicationRow.completed_at,
+                    EventPublicationRow.attempt_count,
+                    EventPublicationRow.is_dead_lettered,
+                )
+            )
+        return [(done is not None, attempts, dead) for done, attempts, dead in result.all()]
+
+    async def scenario() -> tuple[list[tuple[bool, int, bool]], dict[str, int]]:
+        engine = create_async_engine(url, poolclass=NullPool)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        await _publish_in_session(engine, orders.OrderPlaced("o1"))
+        assert outbox._store is not None
+        await outbox._store.wait_for_dispatch()  # type: ignore[attr-defined]
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        rows = await rows_of(engine)
+        while not settled(rows) and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+            rows = await rows_of(engine)
+        counts = await outbox.status()
+        await _runtime.shutdown()
+        await engine.dispose()
+        return rows, counts
+
+    rows, counts = asyncio.run(scenario())
+    return orders, rows, counts
+
+
+def test_outbox_url_dead_letter_after_attempts_dead_letters_after_one_failure(
+    make_fake_app: Any, tmp_path: Path
+) -> None:
+    orders, rows, counts = _publish_after_bootstrap_from_outbox_url(
+        make_fake_app,
+        tmp_path,
+        _FAILING_LISTENER_APP,
+        {"dead_letter_after_attempts": 1},
+        settled=lambda rows: any(attempts >= 1 for _, attempts, _ in rows),
+        timeout=2.0,
+    )
+
+    assert (orders.ATTEMPTS, rows, counts) == (
+        ["o1"],
+        [(False, 1, True)],
+        {"incomplete": 0, "completed": 0, "dead_lettered": 1},
+    )
+
+
+def test_outbox_url_completion_mode_delete_leaves_no_row_for_a_delivered_publication(
+    make_fake_app: Any, tmp_path: Path
+) -> None:
+    orders, rows, _ = _publish_after_bootstrap_from_outbox_url(
+        make_fake_app,
+        tmp_path,
+        _ORDERS_APP,
+        {"completion_mode": "delete"},
+        settled=lambda rows: not rows,
+        timeout=2.0,
+    )
+
+    assert (orders.RECEIVED, rows) == (["o1"], [])
+
+
+def test_outbox_url_retry_keys_retry_a_failed_delivery_within_a_second(
+    make_fake_app: Any, tmp_path: Path
+) -> None:
+    orders, rows, _ = _publish_after_bootstrap_from_outbox_url(
+        make_fake_app,
+        tmp_path,
+        _FAILS_ONCE_APP,
+        {
+            "retry_interval_seconds": 0.05,
+            "retry_stale_seconds": 0.05,
+            "max_retry_backoff_seconds": 0.05,
+        },
+        settled=lambda rows: any(done for done, _, _ in rows),
+        timeout=0.8,
+    )
+
+    assert (orders.ATTEMPTS, [done for done, _, _ in rows]) == (["o1", "o1"], [True])
+
+
 def test_explicitly_configured_store_wins_over_outbox_url(
     make_fake_app: Any, tmp_path: Path
 ) -> None:
