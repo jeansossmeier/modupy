@@ -338,7 +338,9 @@ class Supervisor:
 
     def add_spawn_listener(self, listener: Callable[[int], None]) -> None:
         """Call ``listener(port)`` each time a worker is about to be spawned
-        on ``port``, the first start and every restart alike."""
+        on ``port``, the first start and every restart alike, and again as
+        soon as a worker on ``port`` exits: before any restart backoff, and
+        also when the crash-loop breaker gives up and nothing is respawned."""
         self._spawn_listeners.append(listener)
 
     def failed_instances(self) -> frozenset[str]:
@@ -445,6 +447,8 @@ class Supervisor:
         while True:
             started = time.monotonic()
             return_code = await proc.wait()
+            for listener in self._spawn_listeners:
+                listener(port)
             if self._stopping:
                 return
             uptime = time.monotonic() - started
@@ -856,7 +860,8 @@ async def run_supervised(
     sup = supervisor if supervisor is not None else Supervisor(specs)
     rules = _rules_from_specs(specs)
 
-    # A port verified before a restart may be held by another process after it.
+    # Once a worker exits, its port may be bound by another process, so the
+    # proxy re-probes /health before forwarding to it again.
     def forget_identity(port: int) -> None:
         url = f"http://127.0.0.1:{port}"
         for rule in rules:
