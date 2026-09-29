@@ -662,8 +662,12 @@ uvicorn modulith._worker:create_app --factory \
     event in another worker does not receive it.
   - A listener in a plain, non-package file (`app/shared.py`) or in a
     namespace folder without `__init__.py` (`app/common/audit.py`) belongs
-    to whichever module imported it in that process. It runs in every
-    worker whose module imports it.
+    to the module package whose import first loads that file in each
+    process: the innermost module package on the import stack at that
+    moment. Only that module's worker runs it. A worker whose own module
+    imports the file after a sibling's import loaded it (`from app import
+    orders` first) does not. To run such a listener in a module's worker,
+    define it inside that module package.
 
   Keep listeners inside module packages, and mark an event `@externalized`
   when modules in other workers handle it
