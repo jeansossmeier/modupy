@@ -253,9 +253,10 @@ listeners by `type(event)` and dispatches to **all** listeners for that type
     app loop is shared across both loops. On Postgres and MySQL the first query
     one loop runs on a connection the other loop opened raises `RuntimeError:
     ... attached to a different loop`, even with idle connections in the pool;
-    an asyncpg connection is then unusable from its own loop too. On SQLite a
-    loop that waits for the single pooled connection raises `RuntimeError:
-    <Queue> is bound to a different event loop`.
+    an asyncpg connection is then unusable from its own loop too. On SQLite,
+    connections work from any loop, but once every pooled connection is
+    checked out, a loop that waits for one after another loop already has
+    raises `RuntimeError: <Queue> is bound to a different event loop`.
   - **Database broker:** the broker never shares its pool across loops. It
     submits a call from another loop to the loop that first used it and runs
     the call there, so that loop must stay running and unblocked.

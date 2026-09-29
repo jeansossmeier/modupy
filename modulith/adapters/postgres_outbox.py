@@ -468,9 +468,9 @@ class PostgresPublicationStore:
         only work on the loop that opened them, so a pooled connection checked
         out by another loop fails its first query with ``RuntimeError: ...
         attached to a different loop``, idle pool or not. On SQLite the
-        ``AsyncAdaptedQueue`` binds to whichever loop first blocks on it, and a
-        later loop waiting for the connection raises ``RuntimeError: <Queue
-        ...> is bound to a different event loop``. This surfaces the hazard
+        ``AsyncAdaptedQueue`` binds to whichever loop first blocks on it, and
+        another loop that later waits for a free connection raises
+        ``RuntimeError: <Queue ...> is bound to a different event loop``. This surfaces the hazard
         early instead of leaving it to those opaque failures.
         """
         loop = asyncio.get_running_loop()
@@ -484,12 +484,13 @@ class PostgresPublicationStore:
             logger.warning(
                 "PostgresPublicationStore engine first used on one event loop is "
                 "now used from another. Unlike the database broker, the store "
-                "does not hand calls to the loop that owns its engine: pooled "
-                "connections only work on the loop that opened them, so the "
-                "next query on another loop's connection raises 'attached to a "
-                "different loop' (or, on SQLite, 'Queue is bound to a different "
-                "event loop'). Keep every publish and dispatch for one "
-                "store on one loop (await publish() rather than publish_sync())."
+                "does not hand calls to the loop that owns its engine. On "
+                "Postgres and MySQL, the next query on a connection another "
+                "loop opened raises 'attached to a different loop'; on SQLite, "
+                "a loop that has to wait for a free connection after another "
+                "loop did raises 'Queue is bound to a different event loop'. "
+                "Keep every publish and dispatch for one store on one loop "
+                "(await publish() rather than publish_sync())."
             )
             self._cross_loop_warned = True
 

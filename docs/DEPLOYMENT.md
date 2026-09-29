@@ -150,10 +150,14 @@ runs on a pooled connection the other loop opened raises `RuntimeError: ...
 attached to a different loop`, even when the pool has idle connections; an
 asyncpg connection is then also unusable from its own loop (`InterfaceError:
 cannot perform operation: another operation is in progress`). On SQLite,
-whose pool is forced to `pool_size=1`, a loop that waits for the connection
-raises `RuntimeError: <Queue> is bound to a different event loop`. modulith
-logs one warning the first time a second loop uses the engine. Keep every
-publish for one outbox engine on one loop; a larger pool does not help. Unlike the outbox store,
+connections work from any loop, but the pool's wait queue belongs to the first
+loop that ever waited for a free connection. Another loop that later has to
+wait raises `RuntimeError: <Queue> is bound to a different event loop`, and
+waiting happens only once every pooled and overflow connection is checked
+out, so the SQLite failure depends on load. modulith logs one warning the
+first time a second loop uses the engine. Keep every publish for one outbox
+engine on one loop; a larger pool only delays the SQLite failure and does not
+help on Postgres or MySQL. Unlike the outbox store,
 the database broker hands a call from another loop to the loop that owns its
 engine; see §A. This also applies to the store bound from `outbox_url`.
 

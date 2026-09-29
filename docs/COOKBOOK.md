@@ -171,11 +171,12 @@ Three sharp edges (the first two from `wrap_sync_listener`'s contract):
     app's own loop, the same `AsyncEngine` is shared across two loops. On
     Postgres and MySQL the first query one loop runs on a pooled connection the
     other loop opened raises `RuntimeError: ... attached to a different loop`;
-    no pool exhaustion is needed. On SQLite a loop that waits for the single
-    pooled connection raises `RuntimeError: <Queue> is bound to a different
-    event loop`. The outbox store, unlike the database
-    broker, does not hand calls to its engine's loop, and a larger pool does
-    not help. Keep publishes for one outbox engine on one loop.
+    no pool exhaustion is needed. On SQLite, connections work from any loop,
+    but once every pooled connection is checked out, a loop that waits for one
+    after another loop already has raises `RuntimeError: <Queue> is bound to a
+    different event loop`. The outbox store, unlike the database broker, does
+    not hand calls to its engine's loop, and a larger pool only delays the
+    SQLite failure. Keep publishes for one outbox engine on one loop.
   - **Database broker:** the broker submits the call to the loop that first
     used it, which in a worker is the app loop, and runs it there. That loop
     must stay running and unblocked, or the `publish_sync()` call waits for it
