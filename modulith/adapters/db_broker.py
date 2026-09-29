@@ -519,23 +519,25 @@ def _skip_locked_server_version(dialect: Any) -> tuple[int, ...] | None:
     """The connected MySQL-family server's version, ``None`` when unknown.
 
     SQLAlchemy's ``server_version_info`` keeps every number in ``VERSION()``:
-    MariaDB's ``5.5.5-`` compatibility prefix and distro package suffixes such
-    as ``-1:10.11.2+maria~ubu2204`` included. The dialect records the number
-    before the ``MariaDB`` token in ``_mariadb_normalized_version_info`` (the
-    whole tuple for MySQL). That field is private, so a dialect without it falls
-    back to the leading numbers, skipping a MariaDB ``5.5.5`` prefix.
+    MariaDB's ``5.5.5-`` compatibility prefix, the Enterprise Server build
+    number in ``10.6.12-8-MariaDB-enterprise`` and distro package suffixes such
+    as ``-1:10.11.2+maria~ubu2204`` included. The release is the first three of
+    those numbers after a MariaDB ``5.5.5`` prefix. SQLAlchemy's private
+    ``_mariadb_normalized_version_info`` takes the three numbers just before the
+    ``MariaDB`` token instead, which for Enterprise builds are minor, patch and
+    build, so it is consulted only to refuse a ``VERSION()`` with no number
+    before that token.
     """
-    if hasattr(dialect, "_mariadb_normalized_version_info"):
-        version = dialect._mariadb_normalized_version_info
-    else:
-        numbers = tuple(
-            part
-            for part in getattr(dialect, "server_version_info", None) or ()
-            if isinstance(part, int)
-        )
-        prefixed = getattr(dialect, "is_mariadb", False) and numbers[:3] == (5, 5, 5)
-        version = numbers[3:] if prefixed else numbers
-    return tuple(version[:3]) if version else None
+    numbers = tuple(
+        part
+        for part in getattr(dialect, "server_version_info", None) or ()
+        if isinstance(part, int)
+    )
+    if getattr(dialect, "is_mariadb", False) and numbers[:3] == (5, 5, 5):
+        numbers = numbers[3:]
+    if getattr(dialect, "_mariadb_normalized_version_info", None) == ():
+        return None
+    return numbers[:3] or None
 
 
 def _skip_locked_minimum(dialect: Any) -> tuple[int, ...]:
