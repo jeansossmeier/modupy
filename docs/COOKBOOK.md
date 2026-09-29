@@ -357,7 +357,7 @@ table. `claim_strategy` decides how those sweepers stay off each other's rows:
 | `claim_strategy` | Behaviour |
 |---|---|
 | `"lease"` (default) | claim a batch in one committed transaction, renew the lease while dispatching, fence the completion write on the claim token |
-| `"advisory_lock"` | hold a Postgres advisory lock per row for the dispatch. Rejected at `configure()` on a non-Postgres store. Lock connections come from a second pool sized like the engine's, so during a burst a process can hold up to 2×(`pool_size` + `max_overflow`) Postgres connections; budget `max_connections` for that. A dispatch that waits past `pool_timeout` for a lock connection leaves its row to the next sweep |
+| `"advisory_lock"` | hold a Postgres advisory lock per row for the dispatch. Rejected at `configure()` on a non-Postgres store. Lock connections come from a second pool sized like the engine's. With a `QueuePool` (the async engine default), a process can hold up to 2×(`pool_size` + `max_overflow`) Postgres connections during a burst and keeps up to `pool_size` idle lock connections afterwards; budget `max_connections` for that. `NullPool` and `max_overflow=-1` are unbounded: one lock connection per in-flight row. An after-commit dispatch that waits past `pool_timeout` for a lock connection logs a WARNING and leaves its row to the sweep, which delivers one row at a time, so a burst larger than the lock pool can serve within `pool_timeout` drains slowly |
 | `"none"` | no coordination — two sweepers may dispatch the same row. Warns at `configure()` |
 
 ```python
@@ -374,8 +374,29 @@ A lease shorter than a listener's runtime expires mid-dispatch and lets a peer
 legitimately reclaim the row — a duplicate delivery, not a bug. Raise
 `claim_lease_seconds` rather than lowering it to chase latency. The lease is
 also the crash-recovery bound: rows a crashed process was delivering are
-recovered once their lease expires, up to `claim_lease_seconds` plus
-`retry_interval_seconds` after the crash.
+recovered once their lease expires, normally within `claim_lease_seconds`
+plus `retry_interval_seconds` of the crash. Recovery takes longer when
+`retry_stale_seconds` exceeds the lease, while a slow sweep is still running,
+or while the runtime is not bootstrapped. A graceful stop that cancels a
+sweep leaves its whole claimed batch leased until the lease expires.
+
+Under `"advisory_lock"` a crashed process's rows are recovered at once when
+the process dies on a live host. After a host loss or a network partition
+they stay locked until Postgres drops the dead session through TCP
+keepalive, about 2 h 11 min with stock Linux defaults. Lower the server's
+keepalive settings to shorten that; lock connections use the engine's
+`connect_args`:
+
+```python
+engine = create_async_engine(
+    "postgresql+asyncpg://user:pass@db/app",
+    connect_args={"server_settings": {
+        "tcp_keepalives_idle": "60",
+        "tcp_keepalives_interval": "10",
+        "tcp_keepalives_count": "3",
+    }},  # psycopg: {"options": "-c tcp_keepalives_idle=60 -c ..."}
+)
+```
 
 The default strategy needs the lease columns, which arrive in migration
 `0003_outbox_claim_leases`: migrate to `head`, not to `0001_initial`. These are

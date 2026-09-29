@@ -74,6 +74,7 @@ try:
     from sqlalchemy import event as sa_event
     from sqlalchemy.dialects.mysql import LONGBLOB as MySQLLongBlob
     from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
     from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 except ImportError as exc:  # pragma: no cover — exercised in a subprocess test
@@ -975,7 +976,10 @@ class PostgresPublicationStore:
         exhaust the pool they wait on. A connection returns to the lock pool
         only when it provably holds no lock: the lock attempt returned false,
         or ``unlock_publication`` released the lock. Any other outcome
-        invalidates it, so a lock can never outlive its handle.
+        invalidates it, so a lock can never outlive its handle. When no lock
+        connection frees up within the pool's ``pool_timeout``, this raises
+        the outbox's lock-connection timeout, which its callers log as a
+        WARNING and leave the row to a later sweep.
         """
         if not self.supports_advisory_lock:
             raise ConfigurationError(
@@ -984,7 +988,10 @@ class PostgresPublicationStore:
                 f"{self._engine.dialect.name!r}"
             )
         lock_key = publication_id.int & 0x7FFFFFFFFFFFFFFF  # fit signed bigint
-        conn = await self._lock_connection_engine().connect()
+        try:
+            conn = await self._lock_connection_engine().connect()
+        except PoolTimeoutError as exc:
+            raise outbox._LockConnectionTimeout(str(exc)) from exc
         try:
             # AUTOCOMMIT: the lock query would otherwise autobegin a
             # transaction that stays open for the whole dispatch this handle
@@ -1075,10 +1082,16 @@ class PostgresPublicationStore:
         a process that dies between commit and claim leaves its rows for the
         restart sweep. A row it was already delivering under a lease stays
         claimed until that lease expires, so the first sweep after expiry
-        recovers it: up to ``claim_lease_seconds`` plus
-        ``retry_interval_seconds`` after the crash. An advisory lock dies with
-        its connection, so under ``"advisory_lock"`` the restart sweep
-        recovers such rows at once.
+        recovers it, normally within ``claim_lease_seconds`` plus
+        ``retry_interval_seconds`` of the crash. An advisory lock ends with
+        its Postgres session: at once when the process dies on a live host,
+        but after a host loss or a network partition only when Postgres
+        drops the dead session through TCP keepalive.
+
+        Under ``"advisory_lock"`` each delivery holds a lock-pool connection
+        while its listener runs. A task that finds no free lock connection
+        within ``pool_timeout`` logs a WARNING and leaves the untouched row to
+        the sweep, which delivers one row at a time.
         """
         token = _current_session.set(None)
         try:
@@ -1119,6 +1132,13 @@ class PostgresPublicationStore:
                     "(deleted before delivery?) — skipping",
                     publication_id,
                 )
+        except outbox._LockConnectionTimeout:
+            logger.warning(
+                "after-commit dispatch of publication %s got no advisory-lock "
+                "connection within the pool timeout; the row is untouched and "
+                "the outbox sweep will deliver it",
+                publication_id,
+            )
         except Exception:
             logger.exception("after-commit dispatch failed for %s", publication_id)
         finally:

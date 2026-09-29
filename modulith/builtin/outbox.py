@@ -13,10 +13,15 @@ Critical correctness properties:
      incomplete; the retry loop picks it up on restart (crash sweep). A row
      the dead process was delivering under a lease (``claim_strategy=
      "lease"``) stays claimed until that lease expires, so it is recovered by
-     the first sweep after expiry, up to ``claim_lease_seconds`` plus
-     ``retry_interval_seconds`` after the crash. An advisory lock is released
-     with the dead process's connection, so the crash sweep recovers those
-     rows at once.
+     the first sweep after expiry, normally within ``claim_lease_seconds``
+     plus ``retry_interval_seconds`` of the crash; a ``retry_stale_seconds``
+     above the lease, a slow sweep still running, or a runtime not yet
+     bootstrapped make it longer. An advisory lock ends with the dead
+     process's Postgres session. On a live host that is at once, so the
+     crash sweep recovers those rows immediately; after a host loss or a
+     network partition it is only when Postgres drops the dead session
+     through TCP keepalive (``tcp_keepalives_*``, about 2 h with stock
+     Linux defaults).
   3. At-least-once — a listener may be called more than once if delivery
      completes but completion-marking fails. Listeners must be idempotent.
   4. Non-reentrant *within a process* — the after-commit dispatch task and the
@@ -994,8 +999,18 @@ async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
             await _dispatch_with_lease_renewal(pub)
 
 
+class _LockConnectionTimeout(Exception):
+    """An advisory-locking store found no free lock connection within its
+    pool timeout. The row was not locked, read or charged an attempt."""
+
+
 async def _sweep_advisory(older_than: timedelta, *, runtime_ready: bool) -> None:
-    """Advisory-lock mode: hold a PG advisory lock through each dispatch."""
+    """Advisory-lock mode: hold a PG advisory lock through each dispatch.
+
+    When the lock pool has no free connection within its timeout, the
+    after-commit dispatches of a burst hold all of them. Waiting that timeout
+    again for every remaining row would only stretch this sweep, so the
+    sweep stops and the next one resumes the batch."""
     assert _store is not None
     pending = await _store.find_incomplete(older_than)
     if pending and not runtime_ready:
@@ -1010,7 +1025,16 @@ async def _sweep_advisory(older_than: timedelta, *, runtime_ready: bool) -> None
             continue
         if not _backoff_elapsed(pub) or _foreign_to_this_worker(pub):
             continue
-        await _dispatch_under_advisory_lock(pub)
+        try:
+            await _dispatch_under_advisory_lock(pub)
+        except _LockConnectionTimeout:
+            logger.warning(
+                "outbox sweep: no advisory-lock connection for publication %s "
+                "within the pool timeout; leaving it and the rest of this batch "
+                "to the next sweep",
+                pub.id,
+            )
+            return
 
 
 async def _dispatch_under_advisory_lock(publication: EventPublication) -> None:
