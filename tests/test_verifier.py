@@ -856,24 +856,29 @@ def test_package_dir_does_not_execute_ancestor_init(make_fake_app) -> None:
     assert "fakeapp" not in sys.modules
 
 
-def test_verify_reports_violation_when_other_namespace_portion_precedes_project(
-    monkeypatch, request, tmp_path
-) -> None:
-    """An editable install's .pth puts the project root after site-packages,
-    so another installed portion of a PEP 420 root comes first in the root's
-    namespace path. The app's package directory must still resolve to the
-    project's portion, or verify collects no imports and passes a violation."""
+def _reset_namespace_app() -> None:
     import sys
 
-    from typer.testing import CliRunner
-
-    from modulith.cli import app
     from modulith.runtime import _runtime
 
-    site = tmp_path / "site"
+    for name in list(sys.modules):
+        if name == "company" or name.startswith("company."):
+            del sys.modules[name]
+    _runtime._reset_for_testing()
+
+
+def _activate_namespace_portion_layout(root: Path, monkeypatch) -> tuple[Path, Path]:
+    """Build a ``company.shop`` app whose ``company`` namespace root has
+    another installed portion (``site``) ahead of the project's (``src``)
+    on ``sys.path`` — the editable-install layout. ``orders`` imports
+    ``billing._internal``, a no-internal-imports violation.
+
+    Returns ``(src, package_dir)``.
+    """
+    site = root / "site"
     (site / "company" / "common").mkdir(parents=True)
     (site / "company" / "common" / "__init__.py").write_text("x = 1\n")
-    src = tmp_path / "src"
+    src = root / "src"
     package_dir = src / "company" / "shop"
     for name in ("orders", "billing"):
         (package_dir / name).mkdir(parents=True)
@@ -883,18 +888,27 @@ def test_verify_reports_violation_when_other_namespace_portion_precedes_project(
     )
     (package_dir / "billing" / "__init__.py").write_text("")
     (package_dir / "billing" / "_internal.py").write_text("secret = 1\n")
+    _reset_namespace_app()
     monkeypatch.chdir(src)
     monkeypatch.syspath_prepend(str(src))
     monkeypatch.syspath_prepend(str(site))
     monkeypatch.setenv("MODULITH_PACKAGE", "company.shop")
+    return src, package_dir
 
-    def reset_namespace_app() -> None:
-        for name in list(sys.modules):
-            if name == "company" or name.startswith("company."):
-                del sys.modules[name]
-        _runtime._reset_for_testing()
 
-    request.addfinalizer(reset_namespace_app)
+def test_verify_reports_violation_when_other_namespace_portion_precedes_project(
+    monkeypatch, request, tmp_path
+) -> None:
+    """An editable install's .pth puts the project root after site-packages,
+    so another installed portion of a PEP 420 root comes first in the root's
+    namespace path. The app's package directory must still resolve to the
+    project's portion, or verify collects no imports and passes a violation."""
+    from typer.testing import CliRunner
+
+    from modulith.cli import app
+
+    request.addfinalizer(_reset_namespace_app)
+    _, package_dir = _activate_namespace_portion_layout(tmp_path, monkeypatch)
 
     result = CliRunner().invoke(app, ["verify"])
 
@@ -902,6 +916,51 @@ def test_verify_reports_violation_when_other_namespace_portion_precedes_project(
     assert "no-internal-imports" in result.output
     assert "company.shop.billing._internal" in result.output
     assert verifier._package_dir("company.shop") == package_dir
+
+
+def test_baseline_location_is_relative_when_other_namespace_portion_precedes_project(
+    monkeypatch, request, tmp_path
+) -> None:
+    from typer.testing import CliRunner
+
+    from modulith.cli import app
+
+    request.addfinalizer(_reset_namespace_app)
+    _activate_namespace_portion_layout(tmp_path, monkeypatch)
+    baseline = tmp_path / "baseline.json"
+
+    result = CliRunner().invoke(app, ["verify", "--update-baseline", "--baseline", str(baseline)])
+
+    assert result.exit_code == 0, result.output
+    locations = [entry["location"] for entry in json.loads(baseline.read_text())]
+    assert locations == ["company/shop/orders/__init__.py"]
+
+
+def test_baseline_from_one_checkout_grandfathers_namespace_portion_violation_in_another(
+    monkeypatch, request, tmp_path
+) -> None:
+    """Two copies of the same project at different absolute paths — a
+    developer's checkout and a CI runner's — must fingerprint the same
+    violation identically, or the ratchet reopens it on every other machine."""
+    from typer.testing import CliRunner
+
+    from modulith.cli import app
+
+    request.addfinalizer(_reset_namespace_app)
+    baseline = tmp_path / "baseline.json"
+
+    with monkeypatch.context() as first_checkout:
+        _activate_namespace_portion_layout(tmp_path / "alice", first_checkout)
+        written = CliRunner().invoke(
+            app, ["verify", "--update-baseline", "--baseline", str(baseline)]
+        )
+        assert written.exit_code == 0, written.output
+
+    _activate_namespace_portion_layout(tmp_path / "runner", monkeypatch)
+    result = CliRunner().invoke(app, ["verify", "--mode", "ratchet", "--baseline", str(baseline)])
+
+    assert result.exit_code == 0, result.output
+    assert "no-internal-imports" not in result.output
 
 
 # ---------------------------------------------------------------------------
