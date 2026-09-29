@@ -472,6 +472,54 @@ def test_proxy_transport_error_logs_omit_query_string_secrets(caplog) -> None:
     assert "/orders/ping" in caplog.text
 
 
+_FIRST_REPLICA = "http://orders-a"
+_SECOND_REPLICA = "http://orders-b"
+
+
+def _two_replica_rule() -> RoutingRule:
+    rule = RoutingRule("/orders", _FIRST_REPLICA, (_FIRST_REPLICA, _SECOND_REPLICA))
+    rule.mark_down(_FIRST_REPLICA)
+    return rule
+
+
+def test_proxy_relativizes_a_redirect_against_the_replica_that_served_it() -> None:
+    def replica(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "orders-b"
+        return httpx.Response(
+            307,
+            headers={"location": f"{_SECOND_REPLICA}/orders/items/"},
+            stream=httpx.ByteStream(b""),
+        )
+
+    app = create_proxy_app(
+        [_two_replica_rule()],
+        client=httpx.AsyncClient(transport=httpx.MockTransport(replica)),
+    )
+    with TestClient(app) as client:
+        resp = client.get("/orders/items", follow_redirects=False)
+
+    assert resp.status_code == 307
+    assert resp.headers["location"] == "/orders/items/"
+
+
+def test_proxy_logs_a_request_error_against_the_replica_that_served_it(caplog) -> None:
+    caplog.set_level("WARNING", logger="modulith.proxy")
+
+    def replica(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": str(request.url)})
+
+    app = create_proxy_app(
+        [_two_replica_rule()],
+        client=httpx.AsyncClient(transport=httpx.MockTransport(replica), follow_redirects=True),
+    )
+    with TestClient(app) as client:
+        resp = client.get("/orders/ping")
+
+    assert resp.status_code == 502
+    assert f"backend {_SECOND_REPLICA} returned no usable response" in caplog.text
+    assert _FIRST_REPLICA not in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # Bounded connect retry (worker startup/respawn bind window)
 # ---------------------------------------------------------------------------

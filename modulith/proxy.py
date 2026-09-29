@@ -651,7 +651,7 @@ def create_proxy_app(
                 # never-an-uncaught-500 contract documented above.
                 logger.warning(
                     "backend %s returned no usable response for %s: %s",
-                    rule.backend_url,
+                    backend,
                     upstream,
                     exc,
                 )
@@ -670,7 +670,7 @@ def create_proxy_app(
                 (k.lower().encode("latin-1"), v.encode("latin-1"))
                 for k, v in _relativize_location(
                     _filter_headers(_header_pairs(upstream_resp.headers.raw)),
-                    rule.backend_url,
+                    backend,
                 )
             ]
             return response
