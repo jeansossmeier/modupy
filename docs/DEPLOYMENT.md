@@ -800,7 +800,8 @@ Each module reports one of these states: `ok`, `unhealthy` (a replica
 answered `/health` with a non-200 status), `foreign deployment` (the port
 answered without this deployment's token: another deployment's worker, or an
 unrelated process, holds it), `unreachable` (a replica is
-mid-restart-backoff), or `failed (given up)` (the crash-loop breaker has
+mid-restart-backoff, or waiting, for up to 60 s, until a process the dead
+worker started releases the worker's port), or `failed (given up)` (the crash-loop breaker has
 given up on every replica). `failed (given up)` is only reported once every
 replica of that module is unreachable — a module with even one healthy
 replica reports `ok`.

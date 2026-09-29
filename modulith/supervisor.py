@@ -40,11 +40,12 @@ production runtime for users who don't want a separate orchestrator.
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import errno
 import logging
 import os
 import secrets
 import signal
+import socket
 import sys
 import time
 from collections.abc import Awaitable, Callable
@@ -99,10 +100,41 @@ async def _exited(proc: asyncio.subprocess.Process) -> int:
     finally:
         if not wait.done():
             wait.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            try:
                 await wait
+            except asyncio.CancelledError:
+                # A cancel aimed at this task while it awaits `wait` reaches
+                # it only through `wait`; swallowing that would lose it.
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise
     code = proc.returncode
     return code if code is not None else wait.result()
+
+
+# asyncio's create_server, which uvicorn binds the worker with, sets
+# SO_REUSEADDR by default on exactly these platforms
+# (asyncio.base_events.BaseEventLoop.create_server). The port probe mirrors it,
+# so it fails exactly when the worker's own bind would: on POSIX a TIME_WAIT
+# leftover does not count as held, and on Windows, where SO_REUSEADDR lets a
+# bind succeed on a port in use, it is not set.
+_REUSE_ADDRESS = os.name == "posix" and sys.platform != "cygwin"
+# The address every worker binds (see _default_command) and the proxy routes to.
+_WORKER_HOST = "127.0.0.1"
+# How often a respawn waiting for its port re-probes it.
+_PORT_POLL_INTERVAL = 0.1
+
+
+def _port_held(port: int) -> bool:
+    """Whether a worker's bind to ``port`` would fail because it is in use."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        if _REUSE_ADDRESS:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((_WORKER_HOST, port))
+        except OSError as exc:
+            return exc.errno == errno.EADDRINUSE
+    return False
 
 
 # Parent-death signal support (Linux only). libc is resolved in the *parent*
@@ -214,7 +246,7 @@ def _default_command(spec: WorkerSpec, port: int) -> list[str]:
         "modulith._worker:create_app",
         "--factory",
         "--host",
-        "127.0.0.1",
+        _WORKER_HOST,
         "--port",
         str(port),
     ]
@@ -481,6 +513,9 @@ class Supervisor:
         no healthy run in between, is abandoned (logged + marked failed)
         instead of respawned forever, and one that ran healthily long enough
         has its backoff AND crash streak reset.
+
+        Before each respawn the worker's port must be free (see
+        ``_await_port_release``): time spent waiting for it is not a crash.
         """
         policy = _RestartPolicy(
             initial_delay=self._restart_initial_delay,
@@ -525,6 +560,7 @@ class Supervisor:
                 pass
             else:
                 return  # stop() interrupted the backoff; do not respawn
+            await self._await_port_release(name, port)
             if self._stopping:
                 # Reachable: stop() may flip _stopping during the sleep above.
                 # mypy narrows it to False from the earlier check and can't
@@ -552,6 +588,40 @@ class Supervisor:
             # The loop's _exited(proc) + _stopping check handle the rest.
             if self._stopping and proc.returncode is None:  # type: ignore[unreachable]
                 proc.terminate()  # type: ignore[unreachable]
+
+    async def _await_port_release(self, name: str, port: int) -> None:
+        """Wait, up to ``restart_max_delay`` seconds, for ``port`` to be free.
+
+        A process the dead worker started (a fork-started pool child, say)
+        inherits its listening socket and can outlive it. Every respawn
+        would then fail to bind, and each failure would count as a crash,
+        so a hold of a few tens of seconds made the breaker abandon the
+        module for good. Waiting here costs no crash. Past the bound the
+        respawn goes ahead, and the breaker handles a port that stays held.
+        ``stop()`` ends the wait at once. The processes holding the port are
+        left alone.
+        """
+        if not _port_held(port):
+            return
+        bound = self._restart_max_delay
+        logger.warning(
+            "worker %s: port %d is still in use, probably by a process the dead "
+            "worker started; waiting up to %gs for it to be released before respawning",
+            name,
+            port,
+            bound,
+        )
+        deadline = time.monotonic() + bound
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=min(_PORT_POLL_INTERVAL, remaining)
+                )
+            except TimeoutError:
+                if not _port_held(port):
+                    return
+            else:
+                return
 
     async def _forward_logs(
         self, prefix: str, stream: asyncio.StreamReader, default_level: int
