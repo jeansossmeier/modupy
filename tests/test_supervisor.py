@@ -30,6 +30,7 @@ from modulith.supervisor import (
     Supervisor,
     WorkerSpec,
     _env_flag,
+    _exited,
     _RestartPolicy,
     _rules_from_specs,
     derive_specs_from_config,
@@ -1042,6 +1043,180 @@ async def test_stop_returns_within_its_timeout_while_a_descendant_holds_a_worker
         _kill_descendants(pid_file)
         for proc in procs:
             await asyncio.wait_for(proc.wait(), timeout=5.0)
+
+
+class _ExitedWithPipesHeld:
+    """A process that has exited while something still holds its pipes."""
+
+    returncode = 3
+
+    async def wait(self) -> int:
+        await asyncio.Event().wait()
+        return 3
+
+
+async def test_exited_passes_on_a_cancellation_aimed_at_its_caller() -> None:
+    task = asyncio.create_task(_exited(_ExitedWithPipesHeld()))  # type: ignore[arg-type]
+    await asyncio.sleep(0)  # the task now awaits its leftover wait() task
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+# A worker that listens on its port the way asyncio's create_server does. The
+# first run hands its listening socket to a helper that holds it for
+# argv[3] seconds, then dies; later runs serve, or exit 3 when the bind fails.
+# argv: port, pid file (also the first-run marker), helper hold seconds.
+_PORT_SHARING_WORKER = """
+import os, socket, subprocess, sys, time
+port, pid_file, hold = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+sock = socket.socket()
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    sock.bind(("127.0.0.1", port))
+except OSError as exc:
+    print("bind failed: %s" % exc, file=sys.stderr, flush=True)
+    sys.exit(3)
+sock.listen()
+if not os.path.exists(pid_file):
+    helper = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(%s)" % hold], pass_fds=[sock.fileno()]
+    )
+    with open(pid_file, "w") as f:
+        f.write("%d\\n" % helper.pid)
+    os._exit(3)
+print("serving", flush=True)
+time.sleep(30)
+"""
+
+
+def _port_sharing_builder(pid_file: Any, hold: float) -> Any:
+    return lambda spec, port: [
+        sys.executable,
+        "-c",
+        _PORT_SHARING_WORKER,
+        str(port),
+        str(pid_file),
+        str(hold),
+    ]
+
+
+def _messages(caplog: pytest.LogCaptureFixture, text: str, level: int) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == level and text in r.getMessage()]
+
+
+_POSIX_ONLY = pytest.mark.skipif(
+    sys.platform == "win32", reason="the worker hands its socket on through pass_fds"
+)
+
+
+@pytest.mark.real_process
+@_POSIX_ONLY
+async def test_respawn_waits_for_a_descendant_to_release_the_workers_port(
+    tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A descendant of the dead worker still listens on its port for a few
+    seconds. The respawn must wait for the port instead of failing to bind
+    until the crash-loop breaker gives up on the module."""
+    caplog.set_level(logging.INFO, logger="modulith.supervisor")
+    pid_file = tmp_path / "descendants"
+    port = _free_port()
+    notified: list[int] = []
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", port)],
+        command_builder=_port_sharing_builder(pid_file, 2.0),
+        restart_initial_delay=0.05,
+        restart_max_delay=10.0,
+        max_restarts=1,
+        restart_healthy_uptime=30.0,
+    )
+    sup.add_spawn_listener(notified.append)
+    try:
+        await sup.start()
+        deadline = time.monotonic() + 10.0
+        while not _messages(caplog, "[orders] serving", logging.INFO):
+            if sup.failed_instances() or time.monotonic() > deadline:
+                break
+            await asyncio.sleep(0.05)
+
+        assert sup.failed_instances() == frozenset()
+        assert _messages(caplog, "[orders] serving", logging.INFO) == ["[orders] serving"]
+        assert _messages(caplog, "bind failed", logging.WARNING) == []
+        assert notified == [port, port, port]  # spawn, exit, one respawn
+        waits = _messages(caplog, f"port {port}", logging.WARNING)
+        assert len(waits) == 1
+        assert "orders" in waits[0]
+        assert "10s" in waits[0]
+    finally:
+        _kill_descendants(pid_file)
+        await sup.stop()
+
+
+@pytest.mark.real_process
+@_POSIX_ONLY
+async def test_a_port_held_past_the_wait_still_ends_in_the_crash_loop_give_up(
+    tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="modulith.supervisor")
+    pid_file = tmp_path / "descendants"
+    port = _free_port()
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", port)],
+        command_builder=_port_sharing_builder(pid_file, 30.0),
+        restart_initial_delay=0.05,
+        restart_max_delay=0.3,
+        max_restarts=1,
+        restart_healthy_uptime=30.0,
+    )
+    try:
+        await sup.start()
+        deadline = time.monotonic() + 10.0
+        while not sup.failed_instances() and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+
+        assert sup.failed_instances() == frozenset({"orders"})
+        assert len(_messages(caplog, f"port {port}", logging.WARNING)) == 1
+        assert len(_messages(caplog, "bind failed", logging.WARNING)) == 1
+        assert len(_messages(caplog, "giving up", logging.ERROR)) == 1
+    finally:
+        _kill_descendants(pid_file)
+        await sup.stop()
+
+
+@pytest.mark.real_process
+@_POSIX_ONLY
+async def test_stop_interrupts_the_wait_for_a_held_port(
+    tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="modulith.supervisor")
+    pid_file = tmp_path / "descendants"
+    port = _free_port()
+    notified: list[int] = []
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", port)],
+        command_builder=_port_sharing_builder(pid_file, 30.0),
+        restart_initial_delay=0.05,
+        restart_max_delay=30.0,
+    )
+    sup.add_spawn_listener(notified.append)
+    try:
+        await sup.start()
+        deadline = time.monotonic() + 10.0
+        while not _messages(caplog, f"port {port}", logging.WARNING):
+            assert time.monotonic() < deadline, "the supervisor never waited for the port"
+            await asyncio.sleep(0.05)
+        assert notified == [port, port]  # the exit was announced before the wait
+
+        started = time.monotonic()
+        await sup.stop()
+
+        assert time.monotonic() - started < 1.5
+        assert notified == [port, port]  # nothing was respawned
+    finally:
+        _kill_descendants(pid_file)
+        await sup.stop()
 
 
 @pytest.mark.real_process
