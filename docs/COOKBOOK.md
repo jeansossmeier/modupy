@@ -595,7 +595,8 @@ OS failure or power loss. Delivery is at-least-once: a crash after a listener
 returns but before its ack commits can cause a duplicate, so listeners must be
 idempotent. Every publication, including one every group has already acked, is
 retained for `orphan_retention_seconds` (default 86400, 24 hours) and replayed
-once to every group that subscribes before expiry.
+once to every group that subscribes before expiry, as far as the store has room
+below its publish budget (see below).
 
 Payloads over `max_payload_bytes` are rejected before a transaction starts.
 `max_store_bytes` bounds what publishes may add to the database file
@@ -610,12 +611,17 @@ subscribe: a consumer write or subscription record the limit refuses is
 retried past it, so the database file can grow past `max_store_bytes` by the
 growth of rows it already holds (claims, error text, mark-mode completions,
 prune tombstones) while publishes stay refused. A subscribe replay never grows
-the store past its publish budget: it replays retained publications oldest
-first and stops 8 pages below the budget, logging one WARNING with the group,
-the target and the replayed and skipped counts. The skipped publications never
-reach that group; to replay them, stop its workers, run
-`modulith broker drop-group <group> --target <target>`, raise
-`max_store_bytes` and restart every process before they expire. This
+the store past its publish budget: it replays the retained publications the
+group lacks, oldest first, and stops 8 pages below the budget (halfway there
+under `completion_mode="mark"`, leaving room to claim and ack what it added),
+logging one WARNING with the group, the target and the replayed and skipped
+counts. The skipped publications reach that group only through another replay.
+To replay them without losing work, first let the group's workers drain its
+backlog on that target: `modulith broker drop-group <group> --target <target>`
+deletes every pending and claimed delivery the group holds there, replayed ones
+included, and a replay restores only publications still retained. Then stop
+the group's workers, run that drop-group, raise `max_store_bytes` and restart
+every process before the skipped publications expire. This
 also drains a store that filled before this release or whose `max_store_bytes`
 was lowered below its size; an existing larger file keeps its size. The
 `broker.db-wal` file is not counted: it grows to about 4 MiB (SQLite's

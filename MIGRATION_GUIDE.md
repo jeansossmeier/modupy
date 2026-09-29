@@ -392,7 +392,7 @@ the last commits must survive OS failure or power loss.
 Delivery is at-least-once. A crash after a listener returns but before its ack
 commits can deliver the event again, so make listeners idempotent. A publication
 without a registered group is retained for 24 hours and replayed to groups that
-subscribe before expiry.
+subscribe before expiry, while the store has room below its publish budget.
 
 Use canonical private paths rather than the legacy names:
 
@@ -413,7 +413,8 @@ messages before a publish transaction. `max_store_bytes` defaults to 1 GiB
 refused a small consumer reserve below it. Consumer writes can grow the file
 past it while they drain work the store already holds, and the `-wal` file is
 not counted. A subscribe replay stops short of the publish budget and logs a
-WARNING with the publications it skipped. Environment overrides are
+WARNING with the group, the target, and the counts of publications it replayed
+and skipped. Environment overrides are
 `MODULITH_BROKER_MAX_PAYLOAD_BYTES` and `MODULITH_BROKER_MAX_STORE_BYTES`.
 Remove legacy `shm_slot_size`; it is deprecated and ignored.
 

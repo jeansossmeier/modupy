@@ -1446,7 +1446,8 @@ def _sole_subscriber_warning(group: str, sole: list[str], broker: Any, scheme: s
         effect = (
             f"later publishes to them are kept for {broker.orphan_retention_seconds:g} s "
             "(orphan_retention_seconds) and replayed to a group that subscribes within "
-            "that time; after it they are discarded undelivered"
+            "that time while the store has room below its publish budget "
+            "(max_store_bytes); after it they are discarded undelivered"
         )
     elif broker.no_subscriber_policy == "error":
         effect = (

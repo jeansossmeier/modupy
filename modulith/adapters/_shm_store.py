@@ -116,6 +116,7 @@ class SqliteQueueStore:
             group,
             self._max_store_bytes,
             self._consumer_write,
+            self._completion_mode,
         )
 
     def get_subscriptions(self) -> dict[str, list[str]]:
