@@ -1444,6 +1444,29 @@ def test_outbox_store_error_does_not_prescribe_already_set_config(
     assert "MODULITH_OUTBOX_URL" in result.stderr
 
 
+def test_outbox_store_error_with_discovery_off_points_at_auto_discover(
+    make_fake_app, monkeypatch
+) -> None:
+    """With auto_discover off, bootstrap binds no store and imports no module.
+
+    outbox_url is already set, and an import-time ``outbox.configure()`` never
+    runs in a process that imports nothing, so neither is the remedy.
+    """
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_OUTBOX", "postgres")
+    monkeypatch.setenv("MODULITH_OUTBOX_URL", "postgresql+asyncpg://u:p@localhost/db")
+    monkeypatch.setenv("MODULITH_AUTO_DISCOVER", "false")
+    make_fake_app({"orders": ""})
+
+    result = runner.invoke(app, ["outbox", "status"])
+
+    assert result.exit_code == 1
+    assert "auto_discover is off" in result.stderr
+    assert "MODULITH_AUTO_DISCOVER=true" in result.stderr
+    assert "Set [tool.modulith].outbox_url" not in result.stderr
+    assert "module import time" not in result.stderr
+
+
 def test_outbox_status_uses_store_built_from_outbox_url(make_fake_app, monkeypatch, tmp_path):
     from sqlalchemy.ext.asyncio import create_async_engine
 

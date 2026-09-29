@@ -477,7 +477,9 @@ def _require_outbox_store() -> None:
     Which is why the remedy depends on what the configuration already says.
     Pointing at ``[tool.modulith].outbox`` unconditionally is a dead end once
     that key is set: on its own it binds nothing, and bootstrap builds a store
-    only when ``outbox_url`` is set too.
+    only when ``outbox_url`` is set too, and only with ``auto_discover`` on.
+    With discovery off the command imports no application module either, so
+    neither ``outbox_url`` nor an import-time ``configure()`` reaches it.
     """
     if outbox._store is not None:
         return
@@ -491,17 +493,25 @@ def _require_outbox_store() -> None:
         )
     else:
         cause = f"[tool.modulith].outbox is {configured!r} but no store is bound in this process"
-    typer.echo(
-        f"no outbox store: {cause}. Set [tool.modulith].outbox_url (env "
-        "MODULITH_OUTBOX_URL) to the outbox database's async SQLAlchemy URL and "
-        "bootstrap binds a store in every process, this one included. "
-        "Otherwise a store is bound only by calling "
-        "modulith.builtin.outbox.configure(store=..., serializer=...) — and the "
-        "outbox commands run in their own process, seeing only what bootstrap "
-        "imports, so that call has to run at module import time rather than "
-        "solely in an ASGI lifespan/startup hook.",
-        err=True,
-    )
+    if cfg is not None and not cfg.auto_discover:
+        remedy = (
+            "auto_discover is off, so bootstrap imports none of your modules and "
+            "binds no store here. When discovery can import your package, run the "
+            "command with auto_discover on (env MODULITH_AUTO_DISCOVER=true) and "
+            "outbox_url set (env MODULITH_OUTBOX_URL), and bootstrap binds the "
+            "store from outbox_url."
+        )
+    else:
+        remedy = (
+            "Set [tool.modulith].outbox_url (env MODULITH_OUTBOX_URL) to the "
+            "outbox database's async SQLAlchemy URL and bootstrap binds a store in "
+            "every process, this one included. Otherwise a store is bound only by "
+            "calling modulith.builtin.outbox.configure(store=..., serializer=...) — "
+            "and the outbox commands run in their own process, seeing only what "
+            "bootstrap imports, so that call has to run at module import time "
+            "rather than solely in an ASGI lifespan/startup hook."
+        )
+    typer.echo(f"no outbox store: {cause}. {remedy}", err=True)
     raise typer.Exit(code=1)
 
 
