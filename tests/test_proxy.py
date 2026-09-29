@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import warnings
 from collections.abc import MutableMapping
 from typing import Any
@@ -877,7 +878,8 @@ async def test_proxy_serves_150_concurrent_slow_requests_with_default_pool() -> 
 
 
 @pytest.mark.real_process
-async def test_proxy_answers_503_on_pool_exhaustion_without_marking_backend_down() -> None:
+async def test_proxy_answers_503_on_pool_exhaustion_without_marking_backend_down(caplog) -> None:
+    caplog.set_level("WARNING", logger="modulith.proxy")
     backend_port, proxy_port = _free_port(), _free_port()
     release, in_flight = asyncio.Event(), [0]
     rule = RoutingRule("/orders", f"http://127.0.0.1:{backend_port}")
@@ -906,6 +908,7 @@ async def test_proxy_answers_503_on_pool_exhaustion_without_marking_backend_down
 
     assert exhausted.status_code == 503
     assert exhausted.json() == {"detail": "proxy connection pool exhausted"}
+    assert "proxy request pool exhausted (all 1 connections in use)" in caplog.text
     assert down == {}
     assert (health.status_code, health.json()["backends"]) == (200, {"/orders": "ok"})
     assert held_resp.status_code == 200
@@ -1100,3 +1103,131 @@ async def test_identity_probe_refuses_an_oversized_health_body() -> None:
 
     assert resp.status_code == 503
     assert "/orders/x" not in hits
+
+
+async def _gated_worker(
+    token: str, gate: asyncio.Event, seen: list[str]
+) -> tuple[asyncio.Server, str]:
+    """Loopback worker that accepts every connection but answers nothing until
+    ``gate`` is set, then answers any path with this deployment's ``/health``."""
+    body = json.dumps({"status": "ok", "deployment": token}).encode()
+    answer = (
+        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n"
+        b"content-length: %d\r\n\r\n%s" % (len(body), body)
+    )
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            head = await reader.readuntil(b"\r\n\r\n")
+            seen.append(head.split(b" ", 2)[1].decode())
+            await gate.wait()
+            writer.write(answer)
+            await writer.drain()
+        except (OSError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0, backlog=2048)
+    return server, f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+
+
+async def _close_workers(*servers: asyncio.Server) -> None:
+    for server in servers:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_concurrent_requests_to_an_unverified_worker_share_one_identity_probe() -> None:
+    gate, seen = asyncio.Event(), list[str]()
+    server, url = await _gated_worker("tok", gate, seen)
+    rule = RoutingRule("/orders", url)
+    proxy_app = create_proxy_app([rule], deployment_token="tok")
+    try:
+        async with proxy_app.router.lifespan_context(proxy_app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+            ) as c:
+                calls = [asyncio.create_task(c.get("/orders/x")) for _ in range(20)]
+                await _wait_for(lambda: len(seen) >= 1, 10.0)
+                await asyncio.sleep(0.3)
+                calls[0].cancel()
+                await asyncio.sleep(0.1)
+                reads_while_pending = list(seen)
+                gate.set()
+                answers = await asyncio.gather(*calls[1:])
+    finally:
+        gate.set()
+        await _close_workers(server)
+
+    assert reads_while_pending == ["/health"]
+    assert [r.status_code for r in answers] == [200] * 19
+    assert seen.count("/health") == 1
+    assert rule.is_verified(url)
+
+
+async def test_a_stalled_unverified_worker_leaves_readiness_and_other_modules_serving() -> None:
+    stall, open_gate = asyncio.Event(), asyncio.Event()
+    open_gate.set()
+    a_seen: list[str] = []
+    a_server, a_url = await _gated_worker("tok", stall, a_seen)
+    b_server, b_url = await _gated_worker("tok", open_gate, [])
+    a_rule, b_rule = RoutingRule("/a", a_url), RoutingRule("/b", b_url)
+    proxy_app = create_proxy_app([a_rule, b_rule], deployment_token="tok")
+    try:
+        async with proxy_app.router.lifespan_context(proxy_app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy", timeout=30
+            ) as c:
+                stalled = [asyncio.create_task(c.get("/a/x")) for _ in range(100)]
+                await _wait_for(lambda: len(a_seen) >= 1, 10.0)
+                await asyncio.sleep(0.5)
+                readiness = await c.get("/_modulith/health")
+                b_rule.forget_identity(b_url)
+                b_resp = await c.get("/b/x")
+                stall.set()
+                a_codes = [r.status_code for r in await asyncio.gather(*stalled)]
+    finally:
+        stall.set()
+        await _close_workers(a_server, b_server)
+
+    assert readiness.json()["backends"] == {"/a": "unreachable", "/b": "ok"}
+    assert (b_resp.status_code, b_rule.is_verified(b_url)) == (200, True)
+    assert a_codes == [200] * 100
+
+
+async def test_health_probe_pool_exhaustion_names_the_probe_pool_and_its_limit(
+    monkeypatch, caplog
+) -> None:
+    caplog.set_level("WARNING", logger="modulith.proxy")
+    monkeypatch.setattr("modulith.proxy._PROBE_MAX_CONNECTIONS", 1)
+    stall, open_gate = asyncio.Event(), asyncio.Event()
+    open_gate.set()
+    a_seen: list[str] = []
+    a_server, a_url = await _gated_worker("tok", stall, a_seen)
+    b_server, b_url = await _gated_worker("tok", open_gate, [])
+    a_rule, b_rule = RoutingRule("/a", a_url), RoutingRule("/b", b_url)
+    proxy_app = create_proxy_app([a_rule, b_rule], deployment_token="tok")
+    try:
+        async with proxy_app.router.lifespan_context(proxy_app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy", timeout=30
+            ) as c:
+                held = asyncio.create_task(c.get("/a/x"))
+                await _wait_for(lambda: len(a_seen) >= 1, 10.0)
+                b_resp = await c.get("/b/x")
+                stall.set()
+                held_resp = await held
+    finally:
+        stall.set()
+        await _close_workers(a_server, b_server)
+
+    assert (b_resp.status_code, b_resp.json()) == (
+        503,
+        {"detail": "proxy connection pool exhausted"},
+    )
+    assert f"proxy health-probe pool exhausted (all 1 connections in use) for {b_url}/b/x" in (
+        caplog.text
+    )
+    assert "request pool" not in caplog.text
+    assert (b_url in b_rule._down, held_resp.status_code) == (False, 200)
