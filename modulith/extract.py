@@ -631,13 +631,19 @@ def _populate_extraction(
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
     written: list[str] = []
 
+    # A PEP 420 namespace root keeps no initializer, or it would hide the namespace's
+    # other portions (an installed company.common beside company.shop).
     current = output
-    for part in cfg.package.split("."):
+    for part, source_init in zip(
+        cfg.package.split("."),
+        _required_package_initializers(package_dir, cfg.package),
+        strict=True,
+    ):
         current /= part
-        current.mkdir(exist_ok=True)
-        init = current / "__init__.py"
-        init.write_text("", encoding="utf-8")
-        written.append(str(init.relative_to(output)))
+        if source_init.exists():
+            init = current / "__init__.py"
+            init.write_text("", encoding="utf-8")
+            written.append(str(init.relative_to(output)))
 
     def validate_source(src: Path) -> None:
         for path in (src, *src.rglob("*")):
