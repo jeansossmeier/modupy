@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import ntpath
 import os
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
 
-from modulith import __version__
+from modulith import __version__, extract
 from modulith.cli import app
 from modulith.config import Configuration
 from modulith.extract import _render_pyproject, _render_readme, write_extraction
@@ -823,6 +825,73 @@ def test_extract_import_gate_refuses_first_party_code_from_the_source_tree(
     assert "common.money" in result.output
     assert "outside the extracted service" in result.output
     assert not out_dir.exists()
+
+
+def test_import_gate_path_check_treats_another_drive_as_outside():
+    namespace: dict[str, object] = {"os": SimpleNamespace(path=ntpath)}
+    exec(extract._IMPORT_CHECK_UNDER, namespace)
+    under = namespace["under"]
+    assert callable(under)
+
+    assert under(r"C:\Python313\Lib\os.py", r"D:\proj") is False
+    assert under(r"C:\Users\me\site-packages\x.py", r"\\server\share\proj") is False
+    assert under(r"D:\proj\shop\orders\__init__.py", r"D:\proj") is True
+    assert under(r"D:\project\shop.py", r"D:\proj") is False
+
+
+def _venv_python(venv: Path) -> Path:
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True)
+    return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def _leaking_service(project: Path, tmp_path: Path, python: Path) -> Path:
+    """Lay out a monolith whose shop.orders imports stdlib, third-party and first-party code."""
+    purelib = subprocess.run(
+        [str(python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    Path(purelib, "thirdparty.py").write_text("VALUE = 1\n")
+    source_orders = "import json\nimport thirdparty\nfrom common.money import cents\n"
+    for tree in (project, tmp_path / "service"):
+        (tree / "shop").mkdir(parents=True)
+        (tree / "shop" / "__init__.py").write_text("")
+        (tree / "shop" / "orders.py").write_text(source_orders)
+    (project / "common").mkdir()
+    (project / "common" / "__init__.py").write_text("")
+    (project / "common" / "money.py").write_text("cents = 100\n")
+    return tmp_path / "service"
+
+
+def test_import_gate_reports_a_leak_when_the_project_root_is_the_virtualenv(monkeypatch, tmp_path):
+    project = tmp_path / "proj"
+    python = _venv_python(project)
+    service = _leaking_service(project, tmp_path, python)
+    monkeypatch.setattr(sys, "executable", str(python))
+    monkeypatch.setenv("PYTHONPATH", str(project))
+
+    with pytest.raises(ValueError) as excinfo:
+        extract._check_imports(service, "shop.orders", project)
+
+    message = str(excinfo.value)
+    assert (
+        f"cannot import shop.orders: ImportError: imported common, common.money from the "
+        f"source tree {os.path.realpath(project)}, outside the extracted service"
+    ) in message
+    assert "thirdparty" not in message
+    assert "json" not in message
+
+
+def test_import_gate_exempts_a_virtualenv_inside_the_project(monkeypatch, tmp_path):
+    project = tmp_path / "proj"
+    project.mkdir()
+    python = _venv_python(project / ".venv")
+    service = _leaking_service(project, tmp_path, python)
+    (service / "shop" / "orders.py").write_text("import json\nimport thirdparty\n")
+    monkeypatch.setattr(sys, "executable", str(python))
+
+    extract._check_imports(service, "shop.orders", project)
 
 
 def test_extract_import_gate_sees_the_extracted_tree_under_pythonsafepath(

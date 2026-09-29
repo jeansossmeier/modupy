@@ -166,24 +166,37 @@ def import_closure(rt: Runtime, module: str) -> tuple[list[str], list[str]]:
     return sorted(helpers), sorted(siblings)
 
 
-_IMPORT_CHECK = """
-import importlib, os, sys
+_IMPORT_CHECK_UNDER = """
+def under(path, parent):
+    try:
+        return os.path.commonpath([path, parent]) == parent
+    except ValueError:  # different drives on Windows
+        return False
+"""
+
+_IMPORT_CHECK = (
+    """
+import importlib, os, site, sys, sysconfig
 root, dotted, source = sys.argv[1:4]
 sys.path.insert(0, root)
 importlib.import_module(dotted)
-
-def under(path, parent):
-    return os.path.commonpath([path, parent]) == parent
-
+"""
+    + _IMPORT_CHECK_UNDER
+    + """
 root, source = os.path.realpath(root), os.path.realpath(source)
+# A prefix holding the project would exempt its first-party code too, so such
+# a prefix is replaced by the interpreter's library directories inside it.
 prefixes = {os.path.realpath(p) for p in (sys.prefix, sys.base_prefix, sys.exec_prefix)}
+libraries = [sysconfig.get_path(n) for n in ("stdlib", "platstdlib", "purelib", "platlib")]
+libraries += site.getsitepackages() + [site.getusersitepackages()]
+exempt = {p for p in prefixes if not under(source, p)} | {os.path.realpath(p) for p in libraries}
 leaked = sorted(
     name
     for name, mod in list(sys.modules.items())
     if isinstance(getattr(mod, "__file__", None), str)
     and under(os.path.realpath(mod.__file__), source)
     and not under(os.path.realpath(mod.__file__), root)
-    and not any(under(os.path.realpath(mod.__file__), p) for p in prefixes)
+    and not any(under(os.path.realpath(mod.__file__), p) for p in exempt)
 )
 if leaked:
     sys.exit(
@@ -192,6 +205,7 @@ if leaked:
         "under the package"
     )
 """
+)
 
 
 def _check_imports(root: Path, dotted: str, source: Path) -> None:
