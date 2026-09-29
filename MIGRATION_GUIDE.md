@@ -370,7 +370,8 @@ listener shapes behave differently:
   local in every worker. A non-externalized event it handles is then never
   routed to the broker, so a listener for that event in another worker
   does not receive it.
-- A listener in a plain, non-package file such as `myapp/shared.py` runs in
+- A listener in a plain, non-package file such as `myapp/shared.py`, or in
+  a namespace folder without `__init__.py` such as `myapp/common/`, runs in
   every worker whose module imports that file.
 
 Keep listeners inside module packages, and mark an event `@externalized`

@@ -660,9 +660,10 @@ uvicorn modulith._worker:create_app --factory \
     untagged. They are local in every worker, so a non-externalized event
     they handle is never routed to the broker, and a listener for that
     event in another worker does not receive it.
-  - A listener in a plain, non-package file (`app/shared.py`) belongs to
-    whichever module imported it in that process. It runs in every worker
-    whose module imports it.
+  - A listener in a plain, non-package file (`app/shared.py`) or in a
+    namespace folder without `__init__.py` (`app/common/audit.py`) belongs
+    to whichever module imported it in that process. It runs in every
+    worker whose module imports it.
 
   Keep listeners inside module packages, and mark an event `@externalized`
   when modules in other workers handle it

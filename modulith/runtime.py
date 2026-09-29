@@ -295,12 +295,14 @@ class Runtime:
         ``importing`` lists the modules being imported when the listener
         registered, innermost first (see _importing_module_names). The owner
         is the first that belongs to an application module package: a public
-        direct subpackage of the configured package, other than the contracts
-        module. A listener in a plain file such as ``app/shared.py`` is
-        credited to the module that imported it in this process, so every
-        worker that imports that file runs it. One registered outside any
-        module import (plugin code, a hook, a test) gets None and stays local
-        to every process.
+        direct subpackage of the configured package with an ``__init__.py``,
+        other than the contracts module. A listener in a plain file such as
+        ``app/shared.py``, or in a namespace folder without ``__init__.py``
+        such as ``app/common/``, is credited to the module that imported it
+        in this process, so every worker that imports that file runs it;
+        module discovery never reports such a folder, so no worker hosts it.
+        One registered outside any module import (plugin code, a hook, a
+        test) gets None and stays local to every process.
         """
         cfg = self._config
         if cfg is None or not cfg.package:
@@ -311,10 +313,12 @@ class Runtime:
                 continue
             segment = name[len(prefix) :].partition(".")[0]
             package = f"{prefix}{segment}"
+            module = sys.modules.get(package)
             if (
                 not segment.startswith("_")
                 and segment != cfg.contracts_module
-                and hasattr(sys.modules.get(package), "__path__")
+                and hasattr(module, "__path__")
+                and getattr(module, "__file__", None) is not None
             ):
                 return package
         return None

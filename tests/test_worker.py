@@ -500,6 +500,110 @@ def test_module_imported_by_entry_point_plugin_at_bootstrap_keeps_its_listeners(
     assert sorted(contracts.RUNS) == ["inventory.on_placed", "routing.audit"]
 
 
+def _namespace_helper_worker(make_fake_app, monkeypatch) -> Any:
+    make_fake_app(
+        {
+            "contracts": """
+                from dataclasses import dataclass
+                from modulith import event
+
+                RUNS: list[str] = []
+
+                @event
+                @dataclass(frozen=True)
+                class OrderPlaced:
+                    order_id: str
+
+                @event
+                @dataclass(frozen=True)
+                class Audited:
+                    audit_id: str
+            """,
+            "orders": """
+                from modulith import listener
+                from fakeapp.contracts import RUNS, OrderPlaced
+
+                @listener
+                async def on_placed(event: OrderPlaced) -> None:
+                    RUNS.append("orders.on_placed")
+            """,
+            "notifications": """
+                from modulith import listener
+                from fakeapp.contracts import RUNS, OrderPlaced
+                import fakeapp.orders
+                import fakeapp.shared
+                import fakeapp.common.audit
+
+                @listener
+                async def on_placed(event: OrderPlaced) -> None:
+                    RUNS.append("notifications.on_placed")
+            """,
+        },
+        extra_files={
+            "common/audit.py": """
+                from modulith import listener
+                from fakeapp.contracts import RUNS, Audited, OrderPlaced
+
+                @listener
+                async def audit_placed(event: OrderPlaced) -> None:
+                    RUNS.append("common.audit_placed")
+
+                @listener
+                async def audit(event: Audited) -> None:
+                    RUNS.append("common.audit")
+            """,
+            "shared.py": """
+                from modulith import listener
+                from fakeapp.contracts import RUNS, OrderPlaced
+
+                @listener
+                async def share_placed(event: OrderPlaced) -> None:
+                    RUNS.append("shared.share_placed")
+            """,
+        },
+    )
+    _set_worker_env(monkeypatch, "notifications")
+    create_app()
+    assert _runtime.broker_registry is not None
+    _runtime.broker_registry.register("test-noop-broker", _NoopBroker())
+    return sys.modules["fakeapp.contracts"]
+
+
+def test_namespace_folder_listener_runs_in_importing_worker(make_fake_app, monkeypatch) -> None:
+    contracts = _namespace_helper_worker(make_fake_app, monkeypatch)
+    assert sys.modules["fakeapp.common"].__file__ is None  # a PEP 420 namespace folder
+    assert "fakeapp.orders" in sys.modules  # the sibling really was imported
+
+    asyncio.run(_runtime.dispatch_local(contracts.OrderPlaced("o1"), _runtime.event_bus))
+
+    assert sorted(contracts.RUNS) == [
+        "common.audit_placed",
+        "notifications.on_placed",
+        "shared.share_placed",
+    ]
+
+
+def test_worker_consumes_event_types_of_namespace_folder_listeners(
+    make_fake_app, monkeypatch
+) -> None:
+    _namespace_helper_worker(make_fake_app, monkeypatch)
+    specs: list[ConsumerSpec] = []
+
+    def _capture(spec: ConsumerSpec) -> _NoopConsumer:
+        specs.append(spec)
+        return _NoopConsumer()
+
+    assert _runtime.consumer_registry is not None
+    _runtime.consumer_registry.register("test-noop-broker", _capture)
+
+    assert _build_consumer("notifications") is not None
+
+    assert sorted(specs[0].targets) == [
+        "fakeapp.contracts.Audited",
+        "fakeapp.contracts.OrderPlaced",
+    ]
+
+
 class _SessionScopedStore:
     def __init__(self) -> None:
         self.rows: dict[Any, EventPublication] = {}
