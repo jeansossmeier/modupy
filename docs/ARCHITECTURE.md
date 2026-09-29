@@ -344,7 +344,8 @@ only if** that transaction commits.
   psycopg's `options` connect argument replaces any `options` in the URL,
   such as a `search_path`.
   A process that hangs without exiting keeps its session, and so its locks,
-  until it resumes or is killed. Leave `idle_session_timeout` unset for the
+  until it resumes, or until it and every descendant forked from it have
+  exited. Leave `idle_session_timeout` unset for the
   outbox's role: a lock connection sits idle while its listener runs, so
   ending that session releases the lock mid-delivery and a peer's sweep can
   deliver the row again. Advisory locks need a server session that stays

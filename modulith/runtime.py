@@ -354,7 +354,9 @@ class Runtime:
         ``outbox_options`` are applied by the same ``configure()`` call that
         binds the store, so no after-commit dispatch runs without them. The
         retry loop starts on ``outbox.start()`` or the first transactional
-        publish; ``shutdown()`` disposes the store and its engine.
+        publish. ``shutdown()`` disposes the store and its engine, but only
+        process-topology workers call it; a single-process app stops the retry
+        loop with ``outbox.shutdown()``.
         """
         from .builtin import outbox
 
