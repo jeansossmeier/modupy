@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tomllib
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -906,3 +907,135 @@ def test_extract_import_gate_sees_the_extracted_tree_under_pythonsafepath(
 
     assert result.exit_code == 0, result.output
     assert (out_dir / "fakeapp" / "orders" / "__init__.py").read_text() == "VALUE = 1\n"
+
+
+def test_extract_copies_contracts_file_beside_same_named_non_package_dir(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "from fakeapp.contracts import OrderPlaced\n"},
+        extra_files={
+            "contracts.py": "OrderPlaced = object\n",
+            "contracts/order_placed.avsc": "{}\n",
+        },
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "fakeapp" / "contracts.py").read_text() == "OrderPlaced = object\n"
+    assert not (out_dir / "fakeapp" / "contracts").exists()
+
+
+def _dotted_contracts_app(make_fake_app, tmp_path, orders_source):
+    make_fake_app(
+        {"orders": orders_source},
+        extra_files={
+            "_shared/__init__.py": "from .fmt import fmt\n",
+            "_shared/fmt.py": "def fmt():\n    return 1\n",
+            "_shared/contracts/__init__.py": "",
+            "_shared/contracts/events.py": "OrderPlaced = object\n",
+        },
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith]\ncontracts_module = "_shared.contracts"\n'
+    )
+
+
+def test_extract_dotted_contracts_under_helper_package_whose_initializer_does_work(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    _dotted_contracts_app(
+        make_fake_app,
+        tmp_path,
+        "from fakeapp._shared.fmt import fmt\n"
+        "from fakeapp._shared.contracts.events import OrderPlaced\n",
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    shared = out_dir / "fakeapp" / "_shared"
+    assert (shared / "__init__.py").read_text() == "from .fmt import fmt\n"
+    assert (shared / "contracts" / "events.py").read_text() == "OrderPlaced = object\n"
+
+
+def test_extract_dotted_contracts_refuses_working_parent_initializer_not_copied_as_helper(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    _dotted_contracts_app(
+        make_fake_app, tmp_path, "from fakeapp._shared.contracts.events import OrderPlaced\n"
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 1, result.output
+    assert "_shared/__init__.py" in result.output
+    assert not out_dir.exists()
+
+
+def test_extract_keeps_namespace_root_without_initializer(monkeypatch, request, tmp_path):
+    site = tmp_path / "site"
+    (site / "company" / "common").mkdir(parents=True)
+    (site / "company" / "common" / "__init__.py").write_text("x = 1\n")
+    src = tmp_path / "src"
+    package_dir = src / "company" / "shop"
+    (package_dir / "orders").mkdir(parents=True)
+    (package_dir / "contracts").mkdir()
+    (package_dir / "__init__.py").write_text("")
+    (package_dir / "orders" / "__init__.py").write_text("from company.common import x\n")
+    (package_dir / "contracts" / "__init__.py").write_text("")
+    monkeypatch.chdir(src)
+    monkeypatch.syspath_prepend(str(site))
+    monkeypatch.syspath_prepend(str(src))
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join(filter(None, [str(site), os.environ.get("PYTHONPATH")]))
+    )
+    monkeypatch.setenv("MODULITH_PACKAGE", "company.shop")
+
+    def reset_namespace_app() -> None:
+        for name in list(sys.modules):
+            if name == "company" or name.startswith("company."):
+                del sys.modules[name]
+        _runtime._reset_for_testing()
+
+    request.addfinalizer(reset_namespace_app)
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert not (out_dir / "company" / "__init__.py").exists()
+    assert (out_dir / "company" / "shop" / "__init__.py").read_text() == ""
+    assert "company/__init__.py" not in result.output
+    assert "COPY company/ ./company/" in (out_dir / "Dockerfile").read_text()
+
+    dist_dir = tmp_path / "dist"
+    build = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
+            str(dist_dir),
+            str(out_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PIP_NO_INDEX": "1"},
+    )
+    assert build.returncode == 0, build.stdout + build.stderr
+    (wheel,) = dist_dir.glob("*.whl")
+    with zipfile.ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+    assert "company/shop/orders/__init__.py" in names
+    assert "company/__init__.py" not in names

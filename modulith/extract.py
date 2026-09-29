@@ -645,13 +645,19 @@ def _populate_extraction(
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
     written: list[str] = []
 
+    # A PEP 420 namespace root keeps no initializer, or it would hide the namespace's
+    # other portions (an installed company.common beside company.shop).
     current = output
-    for part in cfg.package.split("."):
+    for part, source_init in zip(
+        cfg.package.split("."),
+        _required_package_initializers(package_dir, cfg.package),
+        strict=True,
+    ):
         current /= part
-        current.mkdir(exist_ok=True)
-        init = current / "__init__.py"
-        init.write_text("", encoding="utf-8")
-        written.append(str(init.relative_to(output)))
+        if source_init.exists():
+            init = current / "__init__.py"
+            init.write_text("", encoding="utf-8")
+            written.append(str(init.relative_to(output)))
 
     def validate_source(src: Path) -> None:
         for path in (src, *src.rglob("*")):
@@ -694,20 +700,27 @@ def _populate_extraction(
 
     copy_rel(Path(*module.split(".")))
 
-    contracts_rel = Path(*cfg.contracts_module.split("."))
-    if (package_dir / contracts_rel).is_dir():
-        copy_rel(contracts_rel)
-    elif (package_dir / f"{contracts_rel}.py").is_file():
-        copy_rel(Path(f"{contracts_rel}.py"))
-
     helper_set = set(helpers)
+
+    def inside_helper(dotted: str) -> bool:
+        parts = dotted.split(".")
+        return any(".".join(parts[:depth]) in helper_set for depth in range(1, len(parts)))
+
     for helper in helpers:
-        parts = helper.split(".")
-        if any(".".join(parts[:depth]) in helper_set for depth in range(1, len(parts))):
+        if inside_helper(helper):
             continue  # already copied inside its ancestor package
         source = _source_path(package_dir, cfg.package, helper)
         if source is not None:
             copy_rel(source.relative_to(package_dir))
+
+    # Python's own order: a regular package, then a module file, then a namespace directory.
+    contracts = f"{cfg.package}.{cfg.contracts_module}"
+    contracts_rel = Path(*cfg.contracts_module.split("."))
+    contracts_src = _source_path(package_dir, cfg.package, contracts)
+    if contracts_src is None and (package_dir / contracts_rel).is_dir():
+        contracts_src = package_dir / contracts_rel
+    if contracts_src is not None and not inside_helper(contracts):
+        copy_rel(contracts_src.relative_to(package_dir))
 
     written.extend(
         _write_generated_files(
