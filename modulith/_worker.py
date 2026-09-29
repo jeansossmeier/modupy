@@ -78,6 +78,7 @@ def create_app() -> FastAPI:
 
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
+    from starlette.routing import Match
 
     from . import ModuleInfo, bootstrap, configure
     from .builtin import outbox
@@ -212,6 +213,27 @@ def create_app() -> FastAPI:
     if router is not None:
         app.include_router(router, prefix=f"/{module_name}")
         logger.info("mounted router for module %r under /%s", module_name, module_name)
+        # Asks each route whether it would answer GET /health, because FastAPI
+        # may keep an included router as one wrapper route rather than
+        # flattening its routes into app.routes.
+        probe_scope = {
+            "type": "http",
+            "path": "/health",
+            "root_path": "",
+            "method": "GET",
+            "headers": [],
+            "query_string": b"",
+        }
+        for route in app.router.routes:
+            if getattr(route, "endpoint", None) is health:
+                continue
+            if route.matches(probe_scope)[0] is Match.FULL:
+                logger.warning(
+                    "module %r route GET /health is unreachable: the worker's own "
+                    "/health answers that path first. Serve it from another path, "
+                    "such as /health/.",
+                    module_name,
+                )
     else:
         # A worker mounts exactly one thing: the module package's `router`.
         # Without it the worker still boots and still reports healthy, so an

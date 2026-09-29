@@ -742,8 +742,8 @@ The same URLs answer on each worker's **internal** port (9001+ by default; `modu
 Three consequences worth knowing:
 
 - The app-root paths belong to no module, so `/docs`, `/openapi.json` and `/redoc` return `404 {"detail": "no worker route for '/docs'"}`. Point client generators at a module URL.
-- Inside a module's prefix, the module's own routes win: a module named `docs` keeps every path under `/docs/*`, and a module defining its own `/docs` route keeps serving it. What loses the collision is the generated doc UI for that one module, never the application's route.
-- Each schema also lists the worker's own unprefixed `/health`, which the proxy does not forward. It answers on the internal port only, so strip it (or ignore the 404) in anything generated against the public port.
+- Inside a module's prefix, the module's own routes win: a module named `docs` keeps every path under `/docs/*`, and a module defining its own `/docs` route keeps serving it. What loses the collision is the generated doc UI for that one module, never the application's route. The one exception is the worker's own `GET /health`: in a module named `health` it answers before the module's root `GET` route, and startup logs a warning that the module route is unreachable. The module's other routes, including `/health/`, still reach it.
+- Each schema also lists the worker's own unprefixed `/health`. The proxy forwards `/health` only to a module named `health`, so strip it (or ignore the 404) in anything generated against the public port.
 
 **A merged, cross-module schema remains out of scope for the supervisor**, and not for want of plumbing:
 
@@ -770,7 +770,7 @@ Single-process topology is unaffected — modulith adds no HTTP routes there, so
 
 ## Health Checks and Monitoring
 
-Both probes are served by the reverse proxy on the port `modulith run` binds (8000 by default), and both need the actuator mounted — set `MODULITH_ACTUATOR_TOKEN` (see [Actuator Access](#actuator-access-_modulith)). Plain `/health` exists only on each worker's own internal port (9001+ by default, set by `--worker-port-base` / `worker_port_base` / `MODULITH_WORKER_PORT_BASE`) and 404s on the proxy; there is no `/ready` route. Each `modulith run` hands its workers a random deployment token that their `/health` echoes as `"deployment"`.
+Both probes are served by the reverse proxy on the port `modulith run` binds (8000 by default), and both need the actuator mounted — set `MODULITH_ACTUATOR_TOKEN` (see [Actuator Access](#actuator-access-_modulith)). Plain `/health` belongs to each worker's own internal port (9001+ by default, set by `--worker-port-base` / `worker_port_base` / `MODULITH_WORKER_PORT_BASE`). The proxy answers it with 404, except when a module is named `health`: the proxy then forwards it to that module's worker, and the worker's own `/health` answers. There is no `/ready` route. Each `modulith run` hands its workers a random deployment token that their `/health` echoes as `"deployment"`.
 
 ### Liveness Probe (Is the Proxy Running?)
 

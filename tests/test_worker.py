@@ -1480,6 +1480,37 @@ def test_a_module_named_health_cannot_shadow_the_workers_own_health(
     assert module_route.json() == {"module_says": "detail"}
 
 
+def test_a_module_route_the_workers_own_health_hides_is_warned_about_at_startup(
+    make_fake_app, monkeypatch, caplog
+) -> None:
+    make_fake_app(
+        {
+            "health": """
+                from fastapi import APIRouter
+
+                router = APIRouter()
+
+                @router.get("")
+                async def root():
+                    return {"module_says": "hi"}
+
+                @router.get("/detail")
+                async def detail():
+                    return {"module_says": "detail"}
+            """
+        }
+    )
+    _set_worker_env(monkeypatch, "health")
+
+    with caplog.at_level(logging.WARNING, logger="modulith.worker"):
+        create_app()
+
+    shadowed = [r.getMessage() for r in caplog.records if "unreachable" in r.getMessage()]
+    assert len(shadowed) == 1
+    assert "GET /health" in shadowed[0]
+    assert "/health/detail" not in shadowed[0]
+
+
 # ---------------------------------------------------------------------------
 # durable outbox wiring
 # ---------------------------------------------------------------------------
