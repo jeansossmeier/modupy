@@ -616,7 +616,7 @@ completion state. Torn, missing, stale, wrapped, or incompatible hints only
 delay consumers until their periodic SQLite safety poll.
 
 Subscriptions are persisted. Every publication is retained for
-`orphan_retention_seconds` (default 24 hours), so
+`orphan_retention_seconds` (default one hour), so
 groups that register after publication receive one replay before expiry, while
 the store has room below its publish budget, instead of losing the startup race. Claims use owner and generation fencing. Delivery
 is at-least-once: a process crash after listener completion but before the

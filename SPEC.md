@@ -884,7 +884,7 @@ hint to the file-backed mmap ring. The ring never contains payload or delivery
 state; missing, torn, stale, wrapped, or incompatible hints fall back to a
 periodic SQLite safety poll.
 
-Publications are retained for `orphan_retention_seconds` (default 24 hours),
+Publications are retained for `orphan_retention_seconds` (default one hour),
 even after every group has acknowledged them. A consumer group that subscribes
 after publication receives one replay before expiry while the store has room
 below its publish budget (see `max_store_bytes` below), preventing silent loss

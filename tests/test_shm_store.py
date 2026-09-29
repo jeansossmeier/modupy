@@ -848,7 +848,7 @@ async def test_subscribe_reconciles_exact_targets_without_dropping_existing_work
         await store.close()
 
 
-async def test_publication_replays_to_late_groups_within_24h(
+async def test_publication_replays_to_late_groups_within_the_default_hour(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "orphan.db"
@@ -860,7 +860,7 @@ async def test_publication_replays_to_late_groups_within_24h(
             path,
             "SELECT created_at, retained_until FROM shm_publication",
         )[0]
-        assert retained["retained_until"] - retained["created_at"] == pytest.approx(86400.0)
+        assert retained["retained_until"] - retained["created_at"] == pytest.approx(3600.0)
 
         first = (await store.claim("g1", consumer_name="worker-1"))[0]
         assert await store.ack(first["claim_token"], consumer_name="worker-1")

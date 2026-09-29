@@ -605,7 +605,7 @@ process restarts on the same disk. Only `FULL` promises the last commits across
 OS failure or power loss. Delivery is at-least-once: a crash after a listener
 returns but before its ack commits can cause a duplicate, so listeners must be
 idempotent. Every publication, including one every group has already acked, is
-retained for `orphan_retention_seconds` (default 86400, 24 hours) and replayed
+retained for `orphan_retention_seconds` (default 3600, one hour) and replayed
 once to every group that subscribes before expiry, as far as the store has room
 below its publish budget (see below).
 
@@ -651,7 +651,7 @@ consumed it, for `orphan_retention_seconds` after it is written, and, under
 `completion_mode = "mark"` or once dead-lettered, until `retention_age_seconds`
 (default 3 days) after completion. The store sustains about
 `max_store_bytes / (bytes per publication × the longest of those retentions)`
-publications per second: roughly 7/s for 1 KiB payloads and two groups with
+publications per second: roughly 165/s for 1 KiB payloads and two groups with
 the defaults in delete mode, and under 2.3/s in mark mode. Raise
 `max_store_bytes` or shorten `orphan_retention_seconds` (at most 100 years)
 before the store fills; publications already stored keep the retention they

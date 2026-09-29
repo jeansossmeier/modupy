@@ -518,7 +518,7 @@ ignore_missing_imports = true
 # url = "postgresql+asyncpg://..."       # selects database when broker is omitted
 # no_subscriber_policy = "error"   # "error" | "wait" | "store"
 # orphan_replay_policy = "ttl_all_groups"  # "ttl_all_groups" | "first_groups" | "expected_groups"
-# orphan_retention_seconds = 86400       # shm and database: replay window, default 24 h;
+# orphan_retention_seconds = 3600        # replay window: default 1 h on shm, 24 h on database;
 #                                        # shm keeps even acked publications this long
 
 [tool.modulith.workers]

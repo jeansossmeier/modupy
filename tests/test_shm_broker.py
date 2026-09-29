@@ -741,13 +741,13 @@ async def _publish_and_drain(instance: ShmBroker, count: int) -> int:
     return count
 
 
-async def test_orphan_retention_defaults_to_24_hours(tmp_path: Path) -> None:
+async def test_orphan_retention_defaults_to_one_hour(tmp_path: Path) -> None:
     db_path = tmp_path / "default-retention.db"
     instance = ShmBroker(shm_name="default-retention-hints", db_path=str(db_path))
     try:
         await instance.publish("events", b"payload")
 
-        assert _retention_windows(db_path) == [pytest.approx(86400.0)]
+        assert _retention_windows(db_path) == [pytest.approx(3600.0)]
     finally:
         await instance.close()
         instance._ring.unlink()
@@ -768,7 +768,7 @@ async def test_short_orphan_retention_frees_store_space_for_drained_publications
     )
     try:
         await default.subscribe(["events"], "workers")
-        # The drained store still fills: every acked publication is kept for 24 hours.
+        # The drained store still fills: every acked publication is kept for an hour.
         filled_after = await _publish_and_drain(default, attempts)
         assert filled_after < attempts
         assert _delivery_rows(default_path) == []

@@ -294,7 +294,7 @@ while any of these holds:
 
 - a subscribed group has not consumed it yet: an undelivered backlog, which
   includes a retired group that never consumes again;
-- it is younger than `orphan_retention_seconds` (default 86400), even after
+- it is younger than `orphan_retention_seconds` (default 3600), even after
   every group has acked it, so late subscribers can replay it;
 - a delivery of it is kept as a terminal row: every acked delivery under
   `completion_mode = "mark"`, and every dead letter in either mode, holds it
@@ -308,7 +308,7 @@ sustainable publications/s ≈ max_store_bytes / (bytes per publication × longe
 ```
 
 A 1 KiB payload with two subscribed groups uses about 1.8 KB of store, so the
-defaults (delete mode, no dead letters) sustain roughly 7 publications/s; under
+defaults (delete mode, no dead letters) sustain roughly 165 publications/s; under
 `completion_mode = "mark"` the 3-day terminal retention cuts that below
 2.3 publications/s. Above that rate, every publish fails with "SHM SQLite store
 is full". Size `max_store_bytes` (or `MODULITH_BROKER_MAX_STORE_BYTES`) for the
@@ -940,9 +940,9 @@ Step 6 depends on the broker:
     under `first_groups`), then pruned; under `expected_groups` it fans out
     at once to `expected_consumer_groups` and nothing is kept for a later
     subscriber;
-  - SHM broker: each is kept for `orphan_retention_seconds` and replayed to
-    a group that subscribes within it while the store has room below its
-    publish budget.
+  - SHM broker: each is kept for `orphan_retention_seconds` (3600 s by
+    default) and replayed to a group that subscribes within it while the
+    store has room below its publish budget.
 
   On the database broker with `no_subscriber_policy = "store"` and
   `orphan_replay_policy = "expected_groups"`, a group named in

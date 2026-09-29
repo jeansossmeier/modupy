@@ -402,8 +402,9 @@ the last commits must survive OS failure or power loss.
 
 Delivery is at-least-once. A crash after a listener returns but before its ack
 commits can deliver the event again, so make listeners idempotent. A publication
-without a registered group is retained for 24 hours and replayed to groups that
-subscribe before expiry, while the store has room below its publish budget.
+without a registered group is retained for `orphan_retention_seconds` (default
+one hour) and replayed to groups that subscribe before expiry, while the store
+has room below its publish budget.
 
 Use canonical private paths rather than the legacy names:
 

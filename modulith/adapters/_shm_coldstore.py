@@ -9,6 +9,7 @@ from typing import Any, cast
 from ..config import (
     DEFAULT_MAX_PAYLOAD_BYTES,
     DEFAULT_SHM_MAX_STORE_BYTES,
+    DEFAULT_SHM_ORPHAN_RETENTION_SECONDS,
     _validate_shm_broker_options,
 )
 from ._shm_executor import SerialStoreExecutor
@@ -28,7 +29,7 @@ class ShmColdStore(SerialStoreExecutor):
         *,
         synchronous: str = "NORMAL",
         completion_mode: str = "delete",
-        orphan_retention_seconds: float = 86400.0,
+        orphan_retention_seconds: float = DEFAULT_SHM_ORPHAN_RETENTION_SECONDS,
         retry_backoff_base_seconds: float = 0.05,
         retry_backoff_cap_seconds: float = 5.0,
         max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,

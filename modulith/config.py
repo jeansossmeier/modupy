@@ -39,6 +39,9 @@ _SHM_MAX_DISPATCH_CONCURRENCY = 1_000
 _SHM_MAX_DELIVERY_ATTEMPTS = 10_000
 DEFAULT_MAX_PAYLOAD_BYTES = 16 * 1024**2
 DEFAULT_SHM_MAX_STORE_BYTES = 1024**3
+# Shorter than the database broker's 24 h: every SHM publication, acked or not,
+# holds space in the max_store_bytes-bounded store for this long.
+DEFAULT_SHM_ORPHAN_RETENTION_SECONDS = 3600.0
 MAX_PAYLOAD_BYTES = 1024**3
 _SHM_MAX_STORE_BYTES = 1024**4
 
