@@ -804,6 +804,102 @@ def test_extract_leaves_imports_naming_no_source_file_to_the_import_gate(
     assert not (out_dir / "fakeapp" / "_generated.py").exists()
 
 
+def test_extract_keeps_a_namespace_helper_folder_out_of_module_discovery(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "from fakeapp.contracts import Money\n", "inventory": ""},
+        extra_files={
+            "contracts/__init__.py": "from fakeapp.common.money import Money\n",
+            "common/money.py": "class Money:\n    pass\n",
+        },
+    )
+    (tmp_path / "pyproject.toml").write_text("[tool.modulith]\nstrict_boundaries = true\n")
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "fakeapp" / "common" / "money.py").is_file()
+    assert not (out_dir / "fakeapp" / "common" / "__init__.py").exists()
+    monolith_verify = runner.invoke(app, ["verify"])
+    assert monolith_verify.exit_code == 0, monolith_verify.output
+    from modulith.builtin.discovery import modulith_discover_modules
+
+    monolith_modules = sorted(m.name for m in modulith_discover_modules("fakeapp"))
+    assert monolith_modules == ["contracts", "inventory", "orders"]
+
+    for name in list(sys.modules):
+        if name == "fakeapp" or name.startswith("fakeapp."):
+            del sys.modules[name]
+    _runtime._reset_for_testing()
+    monkeypatch.chdir(out_dir)
+    monkeypatch.syspath_prepend(str(out_dir))
+
+    extracted_verify = runner.invoke(app, ["verify"])
+
+    assert extracted_verify.exit_code == 0, extracted_verify.output
+    assert "contracts-is-sink" not in extracted_verify.output
+    extracted_modules = sorted(m.name for m in modulith_discover_modules("fakeapp"))
+    assert extracted_modules == ["contracts", "orders"]
+    assert Path(sys.modules["fakeapp"].__file__ or "").is_relative_to(out_dir)
+
+
+def test_write_extraction_mirrors_the_source_initializers_of_helper_parents(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": ""},
+        extra_files={
+            "shared/__init__.py": '"""Shared helpers."""\n',
+            "shared/fmt.py": "VALUE = 1\n",
+            "common/money.py": "VALUE = 2\n",
+            "contracts/__init__.py": "",
+        },
+    )
+    output = tmp_path / "orders-service"
+
+    write_extraction(
+        cfg=Configuration(package="fakeapp"),
+        module="orders",
+        package_dir=tmp_path / "fakeapp",
+        output=output,
+        helpers=["fakeapp.common.money", "fakeapp.shared.fmt"],
+        notes=[],
+    )
+
+    assert (output / "fakeapp" / "shared" / "__init__.py").read_text() == ""
+    assert (output / "fakeapp" / "shared" / "fmt.py").read_text() == "VALUE = 1\n"
+    assert not (output / "fakeapp" / "common" / "__init__.py").exists()
+    assert (output / "fakeapp" / "common" / "money.py").read_text() == "VALUE = 2\n"
+
+
+def test_extract_copies_helpers_imported_by_a_namespace_contracts_package(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "from fakeapp.contracts.events import OrderPlaced\n", "inventory": ""},
+        extra_files={
+            "contracts/events.py": (
+                "from fakeapp._money import Money\n\nclass OrderPlaced:\n    amount: Money\n"
+            ),
+            "_money.py": "Money = int\n",
+        },
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "fakeapp" / "_money.py").read_text() == "Money = int\n"
+    assert (out_dir / "fakeapp" / "contracts" / "events.py").is_file()
+    assert not (out_dir / "fakeapp" / "contracts" / "__init__.py").exists()
+    assert "- `fakeapp._money`" in (out_dir / "README.md").read_text()
+
+
 def test_extract_import_gate_refuses_first_party_code_from_the_source_tree(
     make_fake_app, monkeypatch, tmp_path
 ):
