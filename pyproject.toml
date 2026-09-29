@@ -112,7 +112,7 @@ database = [
     # perform when `cryptography` is present — required in practice for MySQL 8.
     # cryptography verified through 49.x (its installed test version); bound
     # tracks the next unverified release like every other extra here.
-    "cryptography>=41.0,<50.0",
+    "cryptography>=41.0,<51.0",
     "aiosqlite>=0.19,<1.0",
     "alembic>=1.13,<2.0",
     # PyMySQL 1.2.1 removed converters.escape_bytes_prefixed, which aiomysql
@@ -195,7 +195,7 @@ integration = [
     "asyncpg>=0.29,<1.0",
     "aiomysql>=0.2,<1.0",
     # aiomysql needs cryptography to auth against MySQL 8 (caching_sha2_password).
-    "cryptography>=41.0,<50.0",
+    "cryptography>=41.0,<51.0",
     "psycopg[binary]>=3.1,<4.0",
     # Capped like the `database` extra: aiomysql breaks on PyMySQL >= 1.2.1.
     "pymysql>=1.1,<1.2.1",
