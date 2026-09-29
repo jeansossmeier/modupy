@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
 import os
 import signal
+import socket
 import sys
 import time
 from typing import Any
@@ -31,6 +33,7 @@ from modulith.supervisor import (
     WorkerSpec,
     _env_flag,
     _exited,
+    _port_held,
     _RestartPolicy,
     _rules_from_specs,
     derive_specs_from_config,
@@ -1217,6 +1220,48 @@ async def test_stop_interrupts_the_wait_for_a_held_port(
     finally:
         _kill_descendants(pid_file)
         await sup.stop()
+
+
+class _SocketModuleOutOfDescriptors:
+    """The supervisor's ``socket`` module in a process at its descriptor limit."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(socket, name)
+
+    @staticmethod
+    def socket(*args: Any, **kwargs: Any) -> Any:
+        raise OSError(errno.EMFILE, "Too many open files")
+
+
+@pytest.mark.real_process
+async def test_a_port_probe_that_cannot_open_a_socket_keeps_the_worker_supervised(
+    monkeypatch, caplog
+) -> None:
+    caplog.set_level("ERROR", logger="modulith.supervisor")
+    monkeypatch.setattr("modulith.supervisor.socket", _SocketModuleOutOfDescriptors())
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", _free_port())],
+        command_builder=lambda spec, port: _CRASH,
+        restart_initial_delay=0.01,
+        restart_max_delay=0.01,
+        max_restarts=3,
+        restart_healthy_uptime=5.0,
+    )
+    try:
+        await sup.start()
+        for _ in range(300):  # bounded poll — no fixed-sleep synchronization
+            await asyncio.sleep(0.01)
+            if "orders" in sup._failed_instances:
+                break
+
+        assert "orders" in sup._failed_instances
+        assert any(r.levelname == "ERROR" for r in caplog.records)
+    finally:
+        await sup.stop()
+
+
+def test_a_port_the_probe_cannot_bind_at_all_reads_as_free() -> None:
+    assert _port_held(65536) is False
 
 
 @pytest.mark.real_process

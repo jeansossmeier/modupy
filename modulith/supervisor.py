@@ -126,14 +126,21 @@ _PORT_POLL_INTERVAL = 0.1
 
 
 def _port_held(port: int) -> bool:
-    """Whether a worker's bind to ``port`` would fail because it is in use."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        if _REUSE_ADDRESS:
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
+    """Whether a worker's bind to ``port`` would fail because it is in use.
+
+    Any other failure to probe (no descriptor left, a port out of range) reads
+    as free: the respawn then goes ahead, and its own error handling and the
+    crash-loop breaker report the problem instead of the monitor task dying.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            if _REUSE_ADDRESS:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind((_WORKER_HOST, port))
-        except OSError as exc:
-            return exc.errno == errno.EADDRINUSE
+    except OSError as exc:
+        return exc.errno == errno.EADDRINUSE
+    except OverflowError:
+        return False
     return False
 
 
