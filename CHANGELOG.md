@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- `bind_session()` and `unbind_session()` join the stable wiring API in `modulith.builtin.outbox`. `modulith.adapters.postgres_outbox` keeps both names as aliases of the same functions, so existing imports keep working
+- `[tool.modulith.outbox_options]` now also tunes the store bound from `outbox_url`: `dead_letter_after_attempts`, `retry_interval_seconds`, `retry_stale_seconds`, `max_retry_backoff_seconds` and `completion_mode` are validated at config load and forwarded to `outbox.configure()` with the claim keys. Unknown keys stay accepted, and omitted keys keep `configure()`'s defaults
+- `modulith migrate [REVISION] [--url URL] [--schema NAME]` runs the packaged Alembic migrations, which create the outbox and broker tables. Without `--url` it targets the configured `outbox_url` with the async driver swapped for a sync one (`asyncpg` to `psycopg`, `aiosqlite` to plain `sqlite`, `aiomysql` to `pymysql`). It reads configuration only, so it runs before any table exists, and it prints the target with the password masked
+
+### Changed
+
+- STABILITY.md now lists `outbox.start()`, `bind_session()`/`unbind_session()`, `PostgresPublicationStore`, the `outbox_url` configuration binding and the `modulith._worker:create_app` worker factory as wiring surface. The worker factory is covered because the manifests and Dockerfiles that `k8s-manifest` and `extract` generate start it
+- Generated output: `modulith extract`'s `.env.example` and README configure the runtime outbox with `MODULITH_OUTBOX` and `MODULITH_OUTBOX_URL`, name `MODULITH_DB_URL` as the URL only the Alembic migrations read, say the worker binds its store from `outbox_url`, and show `modulith run <pkg>:app --topology processes` for a local run. `modulith k8s-manifest`'s header says the `<package>-env` Secret must carry `MODULITH_OUTBOX_URL` when the outbox is durable
+- DEPLOYMENT, COOKBOOK, README, MIGRATION_GUIDE, ARCHITECTURE and SPEC were corrected where they contradicted the code: outbox wiring through `outbox_url`, `MODULITH_OUTBOX_URL` versus the Alembic-only `MODULITH_DB_URL`, committing before a route returns, span names, when boundaries are checked, and the Redis environment variables
+
+### Fixed
+
+- Reverse proxy: with a module scaled to several replicas, a redirect from any replica but the first no longer leaks that replica's internal address in `Location`, and request errors are logged against the replica that served the request
+
 ## [0.10.0] — 2026-09-29
 
 The `v0.10.0` tag first marked an unpublished build of 2026-09-02 and now marks this release. Where an entry below describes earlier behavior, that behavior may exist only in that unpublished build.
