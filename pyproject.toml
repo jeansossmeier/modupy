@@ -334,6 +334,7 @@ filterwarnings = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["examples/*/build"]
 
 [tool.coverage.run]
 source = ["modulith"]
@@ -382,6 +383,7 @@ warn_unreachable = true
 # files to map to `tests.*` module names (which the per-module strictness
 # relaxations below key on) instead of colliding top-level names.
 explicit_package_bases = true
+exclude = ["^examples/[^/]+/build/"]
 
 [[tool.mypy.overrides]]
 # pluggy's hookspec module-level decorator usage produces empty-body
@@ -455,7 +457,7 @@ ignore_missing_imports = true
 # py.typed (pyyaml's stubs live in the separate types-PyYAML package, which
 # the suite doesn't need — test code consumes safe_load output behind
 # isinstance narrowing).
-module = ["fakeapp", "fakeapp.*", "myapp", "myapp.*", "shop", "shop.*", "testcontainers.*", "docker", "docker.*", "yaml", "yaml.*"]
+module = ["fakeapp", "fakeapp.*", "myapp", "myapp.*", "shop", "shop.*", "marketplace", "marketplace.*", "marketplace_platform", "marketplace_platform.*", "testcontainers.*", "docker", "docker.*", "yaml", "yaml.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

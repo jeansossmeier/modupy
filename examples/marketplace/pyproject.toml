@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "marketplace"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["modupy[fastapi,cli,postgres,database,otel]"]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["marketplace"]
+
+[tool.modulith]
+package = "marketplace"
+outbox = "postgres"
+broker = "database"
+strict_boundaries = true
+actuator_mode = "token"
+
+# Tuned so a failing delivery is retried and dead-lettered within seconds.
+# Production keeps the defaults.
+[tool.modulith.outbox_options]
+retry_interval_seconds = 2
+retry_stale_seconds = 2
+max_retry_backoff_seconds = 4
+dead_letter_after_attempts = 3
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["marketplace", "marketplace_platform"]
+known-third-party = ["modulith"]

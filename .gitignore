@@ -248,3 +248,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# modulith schema fingerprint cache
+.modulith-schemas.json
