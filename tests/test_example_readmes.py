@@ -237,6 +237,20 @@ RUNBOOKS: dict[str, tuple[Section, ...]] = {
         ),
         Section("Clean up", (Step("docker compose down -v"),)),
     ),
+    "marketplace": (
+        Section(
+            "Check the architecture",
+            (
+                Step('pip install -e ".[test]"'),
+                Step("pytest"),
+                Step("modulith verify"),
+                Step("modulith docs --output-dir build/docs"),
+                Step("modulith openapi --output build/openapi.json"),
+                Step("modulith k8s-manifest --image marketplace:1.0.0 --output build/k8s.yaml"),
+            ),
+            repo_env=False,
+        ),
+    ),
 }
 
 
@@ -2130,7 +2144,14 @@ def test_the_repo_environment_stops_before_a_section_that_needs_the_wheel(tmp_pa
 
 @pytest.mark.real_process
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize("example", sorted(RUNBOOKS))
+@pytest.mark.parametrize(
+    "example",
+    sorted(
+        name
+        for name, sections in RUNBOOKS.items()
+        if any(section.steps for section in _repo_sections(sections))
+    ),
+)
 def test_readme_runbook_passes_in_the_repo_environment(example: str, tmp_path: Path) -> None:
     runbook = Runbook(EXAMPLES / example, RUNBOOKS[example], tmp_path / example)
 
