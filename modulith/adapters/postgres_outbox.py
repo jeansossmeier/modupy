@@ -85,7 +85,12 @@ except ImportError as exc:  # pragma: no cover — exercised in a subprocess tes
 
 from modulith import EventPublication
 from modulith.builtin import outbox
-from modulith.builtin.outbox import _bound_session, _current_session, _SessionBinding
+from modulith.builtin.outbox import (
+    _bound_session,
+    _current_session,
+    bind_session,
+    unbind_session,
+)
 from modulith.config import ConfigurationError
 
 logger = logging.getLogger("modulith.adapters.postgres")
@@ -1209,58 +1214,7 @@ class PostgresPublicationStore:
 # ---------------------------------------------------------------------------
 # Helpers exported for application setup
 # ---------------------------------------------------------------------------
-
-
-def bind_session(session: Any) -> Any:
-    """Bind a SQLAlchemy session to the current context.
-
-    Call at the start of a request/transaction so publish() finds the session
-    via ``_current_session``. Returns the contextvar token; pass it to
-    ``unbind_session`` when the request ends::
-
-        async def get_db_with_outbox():
-            async with async_session_maker() as session:
-                token = bind_session(session)
-                try:
-                    yield session
-                    await session.commit()
-                finally:
-                    unbind_session(token)
-
-    A publish while bound joins the session's open transaction (autobegun if
-    needed) and is delivered only when a later ``commit()`` covers it. The
-    ``commit()`` after ``yield`` covers publishes made after the route's own
-    commit, such as FastAPI ``BackgroundTasks``, which run before the
-    dependency's teardown. A transaction that ends uncommitted (rollback, or
-    the session closing) discards its publications and logs a WARNING naming
-    their event types.
-
-    A task created with ``asyncio.create_task`` inside the bound scope shares
-    the binding until ``unbind_session``: its publishes before then enlist in
-    this session under the same rule, and its publishes after then take the
-    unbound path (direct dispatch, no outbox row).
-    """
-    return _current_session.set(_SessionBinding(session))
-
-
-def unbind_session(token: Any) -> None:
-    """Undo a ``bind_session`` call, restoring whatever was bound before it.
-
-    Call with the token ``bind_session`` returned, once the request/
-    transaction it was bound for ends. Restores the *previous* binding
-    (``None`` at the outermost scope, or an outer session if this bind was
-    nested inside one) rather than unconditionally clearing it — the same
-    guarantee ``contextvars.ContextVar.reset()`` gives, which this wraps.
-    The binding also ends for every task that inherited it.
-
-    Unbinding neither commits nor discards: publications enlisted since the
-    last commit are still delivered if the session commits afterwards, and
-    are discarded, with a WARNING, if it closes or rolls back instead.
-    """
-    binding = _current_session.get()
-    _current_session.reset(token)
-    if isinstance(binding, _SessionBinding):
-        binding.session = None
+# bind_session and unbind_session are re-exported from modulith.builtin.outbox
 
 
 # ---------------------------------------------------------------------------

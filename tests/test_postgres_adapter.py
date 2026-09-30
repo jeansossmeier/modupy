@@ -177,6 +177,51 @@ async def test_bind_unbind_session_round_trip_restores_previous_binding(engine) 
         assert outbox._bound_session() is None
 
 
+def test_bind_session_is_exported_from_outbox_and_postgres_adapter() -> None:
+    """bind_session and unbind_session are stably exported from the outbox
+    wiring module, with the adapter re-exporting them as aliases."""
+    from modulith.adapters import postgres_outbox
+    from modulith.builtin import outbox as outbox_module
+
+    assert hasattr(outbox_module, "bind_session")
+    assert hasattr(outbox_module, "unbind_session")
+    assert hasattr(postgres_outbox, "bind_session")
+    assert hasattr(postgres_outbox, "unbind_session")
+
+    assert postgres_outbox.bind_session is outbox_module.bind_session
+    assert postgres_outbox.unbind_session is outbox_module.unbind_session
+
+    assert "bind_session" in outbox_module.__all__
+    assert "unbind_session" in outbox_module.__all__
+    assert "bind_session" in postgres_outbox.__all__
+    assert "unbind_session" in postgres_outbox.__all__
+
+
+async def test_unbind_session_with_raw_session_binding(engine) -> None:
+    """unbind_session correctly handles a raw session binding (not wrapped
+    in _SessionBinding), restoring the previous binding."""
+    from modulith.adapters.postgres_outbox import unbind_session
+
+    assert outbox._bound_session() is None
+
+    sessionmaker = async_sessionmaker(engine)
+    async with sessionmaker() as outer, sessionmaker() as inner:
+        outer_token = bind_session(outer)
+        assert outbox._bound_session() is outer
+
+        # Simulate a raw session binding (as though it came from an older
+        # codebase or internal path that set _current_session directly).
+        raw_inner_token = outbox._current_session.set(inner)
+        assert outbox._bound_session() is inner
+
+        # Unbind the raw session: should restore the outer _SessionBinding.
+        unbind_session(raw_inner_token)
+        assert outbox._bound_session() is outer
+
+        unbind_session(outer_token)
+        assert outbox._bound_session() is None
+
+
 # ---------------------------------------------------------------------------
 # save() inside a transaction + after-commit dispatch
 # ---------------------------------------------------------------------------

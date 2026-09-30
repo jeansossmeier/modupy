@@ -134,6 +134,59 @@ def _bound_session() -> Any | None:
     return value
 
 
+def bind_session(session: Any) -> Any:
+    """Bind a SQLAlchemy session to the current context.
+
+    Call at the start of a request/transaction so publish() finds the session
+    via ``_current_session``. Returns the contextvar token; pass it to
+    ``unbind_session`` when the request ends::
+
+        @app.post("/orders")
+        async def create_order(order_data: dict) -> dict:
+            async with async_session_maker() as session:
+                token = bind_session(session)
+                try:
+                    order = Order(**order_data)
+                    session.add(order)
+                    await publish(OrderCreated(order_id=order.id))
+                    await session.commit()
+                    return {"order_id": order.id}
+                finally:
+                    unbind_session(token)
+
+    A publish while bound joins the session's open transaction (autobegun if
+    needed) and is delivered only when a later ``commit()`` covers it. A
+    transaction that ends uncommitted (rollback, or the session closing)
+    discards its publications and logs a WARNING naming their event types.
+
+    A task created with ``asyncio.create_task`` inside the bound scope shares
+    the binding until ``unbind_session``: its publishes before then enlist in
+    this session under the same rule, and its publishes after then take the
+    unbound path (direct dispatch, no outbox row).
+    """
+    return _current_session.set(_SessionBinding(session))
+
+
+def unbind_session(token: Any) -> None:
+    """Undo a ``bind_session`` call, restoring whatever was bound before it.
+
+    Call with the token ``bind_session`` returned, once the request/
+    transaction it was bound for ends. Restores the *previous* binding
+    (``None`` at the outermost scope, or an outer session if this bind was
+    nested inside one) rather than unconditionally clearing it — the same
+    guarantee ``contextvars.ContextVar.reset()`` gives, which this wraps.
+    The binding also ends for every task that inherited it.
+
+    Unbinding neither commits nor discards: publications enlisted since the
+    last commit are still delivered if the session commits afterwards, and
+    are discarded, with a WARNING, if it closes or rolls back instead.
+    """
+    binding = _current_session.get()
+    _current_session.reset(token)
+    if isinstance(binding, _SessionBinding):
+        binding.session = None
+
+
 # Module-level state. Bound during configure().
 _store: PublicationStore | None = None
 _serializer: Any = None  # the EventSerializer instance
@@ -1419,6 +1472,7 @@ def _reset_for_testing() -> None:
 
 
 __all__ = [
+    "bind_session",
     "configure",
     "force_retry",
     "list_dead_lettered",
@@ -1431,4 +1485,5 @@ __all__ = [
     "shutdown",
     "start",
     "status",
+    "unbind_session",
 ]
