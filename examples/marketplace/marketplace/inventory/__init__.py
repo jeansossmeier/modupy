@@ -1,6 +1,6 @@
 from sqlalchemy import select
 
-from marketplace.contracts import StockRejected, StockReserved
+from marketplace.contracts import StockRejected, StockReleased, StockReserved
 from marketplace.db import engine
 from marketplace.inventory.tables import stock
 
@@ -13,4 +13,8 @@ async def stock_of(sku: str) -> int:
     return on_hand or 0
 
 
-__all__ = ["StockRejected", "StockReserved", "stock_of"]
+__all__ = ["StockRejected", "StockReleased", "StockReserved", "router", "stock_of"]
+
+# Process-per-module mode serves HTTP by mounting the `router` attribute of each
+# module package, so the router is re-exported here.
+from marketplace.inventory.api import router as router  # noqa: E402

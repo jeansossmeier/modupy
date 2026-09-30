@@ -2,7 +2,7 @@ from modulith import publish
 from sqlalchemy import insert, select
 
 from marketplace import catalog
-from marketplace.contracts import OrderCancelled, OrderPlaced
+from marketplace.contracts import OrderCancelled, OrderConfirmed, OrderPlaced, PaymentRequested
 from marketplace.db import engine, transaction
 from marketplace.orders.tables import order
 
@@ -48,7 +48,15 @@ async def status_of(order_id: str) -> dict[str, str | None]:
     return {"order_id": order_id, "status": row.status, "reason": row.reason}
 
 
-__all__ = ["OrderCancelled", "OrderPlaced", "place_order", "router", "status_of"]
+__all__ = [
+    "OrderCancelled",
+    "OrderConfirmed",
+    "OrderPlaced",
+    "PaymentRequested",
+    "place_order",
+    "router",
+    "status_of",
+]
 
 # Process-per-module mode serves HTTP by mounting the `router` attribute of each
 # module package, so the router is re-exported here.

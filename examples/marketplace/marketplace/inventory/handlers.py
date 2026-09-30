@@ -1,7 +1,14 @@
 from modulith import listener, publish
 from sqlalchemy import exists, insert, literal, select, update
 
-from marketplace.contracts import OrderPlaced, ProductListed, StockRejected, StockReserved
+from marketplace.contracts import (
+    OrderPlaced,
+    PaymentDeclined,
+    ProductListed,
+    StockRejected,
+    StockReleased,
+    StockReserved,
+)
 from marketplace.db import transaction
 from marketplace.inventory.tables import reservation, stock
 
@@ -17,6 +24,27 @@ async def on_product_listed(event: ProductListed) -> None:
                 ),
             )
         )
+
+
+@listener
+async def on_payment_declined(event: PaymentDeclined) -> None:
+    async with transaction() as session:
+        released = await session.execute(
+            update(reservation)
+            .where(reservation.c.order_id == event.order_id, reservation.c.status == "reserved")
+            .values(status="released")
+            .returning(reservation.c.sku, reservation.c.quantity)
+        )
+        row = released.one_or_none()
+        if row is None:
+            return
+
+        await session.execute(
+            update(stock)
+            .where(stock.c.sku == row.sku)
+            .values(on_hand=stock.c.on_hand + row.quantity)
+        )
+        await publish(StockReleased(order_id=event.order_id, sku=row.sku, quantity=row.quantity))
 
 
 @listener

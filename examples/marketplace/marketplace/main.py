@@ -6,6 +6,7 @@ from modulith import bootstrap
 from modulith.builtin import outbox
 
 from marketplace.db import engine
+from marketplace.inventory import router as inventory_router
 from marketplace.orders import router as orders_router
 
 
@@ -19,4 +20,5 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(inventory_router, prefix="/inventory")
 app.include_router(orders_router, prefix="/orders")
