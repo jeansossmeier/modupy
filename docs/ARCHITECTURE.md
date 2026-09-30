@@ -109,6 +109,29 @@ silently guess:
   a table. Silently skipping it would revert every setting (including
   `production = true`) to defaults with no warning.
 
+**`[tool.modulith.outbox_options]`.** Config load validates these eight keys
+whenever they are present. When bootstrap binds the store from `outbox_url` (a
+durable outbox and no store bound yet), `Runtime.bind_configured_outbox`
+forwards them to `outbox.configure()` in the same call that binds the store.
+The table gives each key's default, which is `configure()`'s own, and its
+check:
+
+| Key | Default | Accepted |
+|---|---|---|
+| `claim_strategy` | `"lease"` | `"lease"`, `"advisory_lock"`, `"none"` (§7.4) |
+| `claim_lease_seconds` | `60` | finite number > 0 |
+| `claim_batch_size` | `100` | integer > 0 |
+| `dead_letter_after_attempts` | `10` | integer > 0 |
+| `retry_interval_seconds` | `30` | finite number > 0 |
+| `retry_stale_seconds` | `30` | finite number > 0 |
+| `max_retry_backoff_seconds` | `300` | finite number > 0 |
+| `completion_mode` | `"update"` | `"update"`, `"delete"`, `"archive"` (§7.3) |
+
+Any other key in the table is accepted and ignored, so a `pyproject.toml`
+written for a newer release still loads. An application that calls
+`outbox.configure()` before bootstrap keeps its own store and settings:
+`outbox_url` and these keys are then not applied.
+
 Two cross-field safety checks run in `_validate()`:
 
 - **`production` + defaulted memory outbox → error.** Starting production on the
@@ -177,8 +200,26 @@ discovered via the `modulith` entry-point group in their `pyproject.toml`.
 `HealthAwareConsumer`, the optional capability a consumer may add so worker
 readiness checks can query it. Stores and
 serializers are "one wins" drivers: exactly one is active per app, wired
-**explicitly** at startup via
-`modulith.builtin.outbox.configure(store, serializer)`. There is no
+**explicitly** at startup, in one of two ways:
+
+- **Config binding.** With a durable `outbox` and an `outbox_url`, bootstrap
+  builds a `PostgresPublicationStore` and the plain `JsonEventSerializer` and
+  passes them, with the `outbox_options` tuning keys (§3), to
+  `outbox.configure()` unless the application already bound a store.
+- **Explicit wiring.** The application calls
+  `modulith.builtin.outbox.configure(store, serializer)` itself, with
+  `PostgresPublicationStore` from `modulith.adapters.postgres_outbox` or its
+  own store, before bootstrap. This is the path for a custom serializer or a
+  custom store.
+
+Either way a server calls `outbox.start()` from its ASGI startup, after
+`modulith.bootstrap()`, because `configure()` at import time runs before the
+event loop exists and the retry loop and crash sweep need it; it binds a
+session around the transaction that publishes with `outbox.bind_session()` and
+`outbox.unbind_session()`; and it calls `outbox.shutdown()` on the way out.
+All of those, and `PostgresPublicationStore`, are the documented wiring surface
+in [STABILITY.md](STABILITY.md), even though the module holding the store is
+otherwise an adapter internal. There is no
 entry-point auto-discovery for drivers — only hook plugins are discovered.
 Adapters implement a protocol by **duck typing**; they don't need to subclass
 it (`runtime_checkable` is there so apps can `isinstance`-check for
@@ -364,7 +405,8 @@ only if** that transaction commits.
 ### 7.3 Completion modes
 
 **SPEC §7.3.** When a listener succeeds, `mark_complete()` runs. The
-completion mode (set via `outbox.configure(completion_mode=...)`) decides the
+completion mode (set via `outbox.configure(completion_mode=...)` or
+`outbox_options.completion_mode`) decides the
 physical effect:
 
 - `update` — flip `completed_at` in place (default; keeps an audit trail),
@@ -398,8 +440,9 @@ this adapter against in-memory SQLite; the integration suite runs it against a
 real `postgres:16` via testcontainers.
 
 **Concurrent sweepers.** Two processes running the retry loop against one
-outbox table are coordinated by `outbox.configure(claim_strategy=...)`
-(`modulith/_claims.py`); the shipped default is `"lease"`:
+outbox table are coordinated by `outbox.configure(claim_strategy=...)` or
+`outbox_options.claim_strategy` (`modulith/_claims.py`); the shipped default
+is `"lease"`:
 
 | `claim_strategy` | How it coordinates | Cost |
 |---|---|---|
@@ -765,12 +808,15 @@ identical to single-process mode — that's the point.
   span (both in-memory and durable paths) and per-listener dispatch spans; when
   OTel is absent the plugin is inert. It rides the observe hooks, so it is
   shielded — a failing exporter can't affect delivery.
-- **Testing** (`modulith/testing.py`, SPEC Part XI): a pytest plugin providing
-  an autouse per-test isolation fixture (snapshots and restores `sys.modules`
-  and runtime state, ~100ms/test), a `modulith_isolated` marker for
-  subprocess-per-test isolation, a capture handle for asserting published
-  events, and a fluent `Scenario` API that publishes a trigger and polls for
-  the expected downstream events without `sleep`.
+- **Testing** (`modulith/testing.py`, SPEC Part XI): a pytest plugin whose
+  fixtures are opt-in, so a test gets one only by naming it as an argument.
+  `modulith_app` resets the runtime singleton around the test, drops modules
+  first imported during it, and hands back a capture handle for asserting
+  published events. `modulith_module("myapp.orders", mock_modules=[...])`
+  isolates one module from its siblings, with dotted module names. A
+  `modulith_isolated` marker runs a test in its own subprocess, and a fluent
+  `Scenario` API publishes a trigger and polls for the expected downstream
+  events without `sleep`.
 
 See the [COOKBOOK.md](COOKBOOK.md) for how to use these; see SPEC Parts X–XI
 for the full contract.

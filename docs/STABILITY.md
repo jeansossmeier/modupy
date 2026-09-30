@@ -83,10 +83,13 @@ gate registration.
 
 Drivers are wired **explicitly** at startup — there is no entry-point auto-discovery for them — so any durable deployment imports these directly (see [ARCHITECTURE.md §5.2](ARCHITECTURE.md#52-driver-protocols-exactly-one-wins)):
 
-- `modulith.builtin.outbox` — `configure()`, `status()`, `force_retry()`, `list_dead_lettered()`, `retry_all_dead_lettered()`, `purge_completed()`, `shutdown()`
+- `modulith.builtin.outbox` — `configure()`, `start()`, `shutdown()`, `bind_session()`, `unbind_session()`, `status()`, `force_retry()`, `list_dead_lettered()`, `retry_all_dead_lettered()`, `purge_completed()`
 - `modulith.serializers` — `JsonEventSerializer`
+- `modulith.adapters.postgres_outbox.PostgresPublicationStore` — the outbox store the wiring above hands to `configure()`. Only this class and the two aliases named under the adapter modules below carry the wiring guarantee; the rest of that module does not
+- `[tool.modulith] outbox_url` with `[tool.modulith.outbox_options]` — configuration binding: with a durable (non-`memory`) outbox, bootstrap builds a `PostgresPublicationStore` on the URL and forwards the tuning keys to `configure()`, unless the application already called `configure()`
+- `modulith._worker:create_app` — the per-module worker factory, started as `uvicorn modulith._worker:create_app --factory` with `MODULITH_MODULE` and `MODULITH_APP_PACKAGE` set. It is the supported deployment entry point for the manifests and Dockerfiles that `modulith k8s-manifest` and `modulith extract` generate, so the underscore exclusion below does not apply to this one name and its two environment variables
 
-**Stability**: weaker than the public API above, stronger than the adapter internals below. Signatures may change in a 0.x minor, but every change is documented in CHANGELOG.md with an upgrade note. Underscore-prefixed names are excluded — in particular `modulith.builtin.outbox._current_session`, which exists so adapters can bind to it (it may hold a binding holder, so read the bound session through `_bound_session()` in the same module); applications use `bind_session()`/`unbind_session()` from `modulith.adapters.postgres_outbox`.
+**Stability**: weaker than the public API above, stronger than the adapter internals below. Signatures may change in a 0.x minor, but every change is documented in CHANGELOG.md with an upgrade note. Other underscore-prefixed names are excluded — in particular `modulith.builtin.outbox._current_session`, which exists so adapters can bind to it (it may hold a binding holder, so read the bound session through `_bound_session()` in the same module); applications use `bind_session()`/`unbind_session()` from `modulith.builtin.outbox`.
 
 ---
 
@@ -94,7 +97,7 @@ Drivers are wired **explicitly** at startup — there is no entry-point auto-dis
 
 Modules under `modulith/adapters/*` are **implementation details** and may change without a major bump:
 
-- `modulith.adapters.postgres_outbox` — outbox store for Postgres, MySQL, and SQLite (one adapter; the URL picks the dialect)
+- `modulith.adapters.postgres_outbox` — outbox store for Postgres, MySQL, and SQLite (one adapter; the URL picks the dialect). Its `bind_session` and `unbind_session` are aliases of the `modulith.builtin.outbox` functions and carry the wiring guarantee above, as does `PostgresPublicationStore`
 - `modulith.adapters.db_broker` — relational-database broker internals
 - `modulith.adapters.redis_broker` — Redis Streams broker internals
 - `modulith.adapters.shm_broker` — local durable shared-memory broker internals

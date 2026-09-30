@@ -458,7 +458,7 @@ In `modulith/config.py`. Resolution order (highest priority first):
 3. `[tool.modulith]` section in pyproject.toml
 4. Hardcoded defaults
 
-Every *scalar* `Configuration` field has a `MODULITH_<KEY>` env var equivalent: `MODULITH_PACKAGE`, `MODULITH_CONTRACTS_MODULE`, `MODULITH_OUTBOX`, `MODULITH_TOPOLOGY`, `MODULITH_BROKER`, `MODULITH_PRODUCTION`, `MODULITH_AUTO_DISCOVER`, `MODULITH_OBSERVABILITY`, `MODULITH_VERIFY_MANIFESTS`, `MODULITH_SUBSCRIPTION_SOURCE`, `MODULITH_ACTUATOR_MODE`, `MODULITH_STRICT_BOUNDARIES`. Booleans accept `1`/`true`/`yes` and `0`/`false`/`no` (case-insensitive); any other non-empty value raises `ConfigurationError`. The dict-typed fields (`outbox_options`, `broker_options`, `workers`) have **no generic** env var — they come from the `[tool.modulith.*]` subtables in pyproject.toml. Adapter-specific env vars are separate contracts: SHM and database options use `MODULITH_BROKER_<KEY>`, Redis Streams reads `REDIS_URL`, `MODULITH_CONSUMER_GROUP`, `MODULITH_STREAM_PREFIX`, and `MODULITH_STREAM_MAXLEN`, and the packaged alembic runner reads `MODULITH_DB_URL`.
+Every *scalar* `Configuration` field has a `MODULITH_<KEY>` env var equivalent: `MODULITH_PACKAGE`, `MODULITH_CONTRACTS_MODULE`, `MODULITH_OUTBOX`, `MODULITH_OUTBOX_URL`, `MODULITH_TOPOLOGY`, `MODULITH_BROKER`, `MODULITH_SUBSCRIPTION_SOURCE`, `MODULITH_ACTUATOR_MODE`, `MODULITH_WORKER_PORT_BASE` (an integer), `MODULITH_PRODUCTION`, `MODULITH_AUTO_DISCOVER`, `MODULITH_OBSERVABILITY`, `MODULITH_VERIFY_MANIFESTS`, `MODULITH_STRICT_BOUNDARIES`. Booleans accept `1`/`true`/`yes` and `0`/`false`/`no` (case-insensitive); any other non-empty value raises `ConfigurationError`. The dict-typed fields (`outbox_options`, `broker_options`, `workers`) have **no generic** env var — they come from the `[tool.modulith.*]` subtables in pyproject.toml. Adapter-specific env vars are separate contracts: SHM and database options use `MODULITH_BROKER_<KEY>`, Redis Streams reads `REDIS_URL`, `MODULITH_CONSUMER_GROUP`, `MODULITH_STREAM_PREFIX`, and `MODULITH_STREAM_MAXLEN`, and the packaged alembic runner reads `MODULITH_DB_URL`.
 
 Validation happens before construction. Unknown keys raise `ConfigurationError` with the list of valid keys (catches typos). Production mode + default memory outbox raises (forces explicit opt-in for unsafe defaults). Process topology defaults to local `shm`; an URL/DSN without an explicit broker selects `database`. Explicit `shm` accepts filesystem paths only and rejects DSNs and SQLAlchemy/network URLs. SQL schema names must be portable unquoted identifiers at every entry point: loaded configuration, broker environment overrides, direct `DatabaseBroker` construction, `MODULITH_DB_SCHEMA`, and Alembic `-x schema=...`.
 
@@ -954,9 +954,11 @@ Extra: `modupy[otel]` (built-in plugin `modulith/builtin/observability.py`; a si
 
 `modulith/builtin/docs.py`. Generates:
 
-- `docs/architecture.mmd` — Mermaid C4 component diagram
-- `docs/modules/<name>.md` — Application Module Canvas (public API, events published, events consumed, dependencies, internals)
-- `docs/events.mmd` — Sequence diagram of event flows
+- `docs/modulith/architecture.mmd` — Mermaid C4 component diagram
+- `docs/modulith/modules/<name>.md` — Application Module Canvas (public API, events published, events consumed, dependencies, internals)
+- `docs/modulith/events.mmd` — Sequence diagram of event flows
+
+The default output directory is `docs/modulith`; `modulith docs --output-dir=DIR` redirects it.
 
 Mermaid over PlantUML because it renders natively on GitHub/GitLab. Canvas is markdown so it diffs cleanly in PRs.
 
@@ -969,16 +971,16 @@ Mermaid over PlantUML because it renders natively on GitHub/GitLab. Canvas is ma
 Ships bundled in the main distribution as `modulith/testing.py`, installed via the `modupy[test]` extra (registered under pytest's `pytest11` entry point, so the fixtures are available automatically). A standalone `pytest-modulith` package is a planned later split, not current reality. Provides:
 
 ```python
-# Automatic per-test isolation (autouse fixture)
+# Per-test isolation (opt-in: request the fixture by name)
 def test_orders_publishes_correctly(modulith_app):
-    # Fresh runtime, fresh event bus, fresh module state
+    # Fresh runtime singleton; modules first imported here are dropped on teardown
     from myapp.orders import create_order
     asyncio.run(create_order("123"))
     assert modulith_app.published_events_of_type(OrderCreated) == [...]
 
 # Module-isolated tests
 def test_orders_in_isolation(modulith_module):
-    with modulith_module("orders", mock_modules=["inventory", "payments"]):
+    with modulith_module("myapp.orders", mock_modules=["myapp.inventory", "myapp.payments"]):
         ...
 
 # Scenario API for event-driven flows
@@ -1008,7 +1010,7 @@ class Scenario:
 
 Implementation strategy: subprocess-per-test for the strictest isolation mode. Fork overhead is fine for integration tests in CI; not for unit tests on save.
 
-For non-isolated tests, the plugin handles state reset via session fixtures: clears event bus, drops listeners, restores `sys.modules` to a snapshot. The user never thinks about it.
+For non-isolated tests, the fixtures handle state reset, but only for the tests that request them. `modulith_app` resets the runtime singleton before and after the test and, on teardown, drops every non-`modulith` module first imported during it. `modulith_module` removes the application package's modules from `sys.modules` for the duration of the `with` block, installs `MagicMock` stand-ins for `mock_modules`, and restores `sys.modules` and the manifest registry on exit. Names are dotted module paths: `"myapp.orders"`, not `"orders"`.
 
 ### 11.4 Subprocess-Per-Test Mode
 
@@ -1338,11 +1340,16 @@ per-file plan is omitted rather than maintained here in parallel.
 
 ### Examples: `examples/`
 
-| File | Status | Notes |
+Three runnable examples of growing scale, then three single-file extension references.
+
+| Example | Status | Notes |
 |---|---|---|
-| `redis_streams_broker.py` | ✅ | Complete broker adapter (example scheme `redis-streams-example`) |
-| `naming_convention_verifier.py` | ✅ | Custom verification rule |
-| `demo_app/` | ✅ | Runnable three-module shop wired purely through events |
+| `quickstart/` (package `myapp`) | ✅ | Small: three modules plus contracts, wired purely through events; the same code runs single-process and under `--topology=processes`. No infrastructure |
+| `demo_app/` (package `shop`) | ✅ | Mid: three modules plus contracts with per-module persistence, idempotent listeners, the durable outbox through `outbox_url`, `modulith migrate` and the outbox CLI, and process-per-module on the default SHM broker. A SQLite file; Docker only to swap in Postgres and Redis |
+| `marketplace/` (packages `marketplace`, `marketplace_platform`) | ✅ | Large: seven modules plus contracts, with a separate platform package registered as a plugin. Docker Postgres |
+| `naming_convention_verifier.py` | ✅ | Reference: a custom verification rule |
+| `redis_streams_broker.py` | ✅ | Reference: a producer-side broker adapter (example scheme `redis-streams-example`); cross-process delivery also needs a consumer for the same scheme |
+| `versioned_json_serializer.py` | ✅ | Reference: a custom outbox storage serializer |
 
 ### Top-level
 
