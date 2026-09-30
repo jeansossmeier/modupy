@@ -10,7 +10,9 @@ README shape the reader below would silently skip:
 - no command sits where the reader cannot see it (other fence tags, indented
   fences, a bare ``cd``/``source``/``.``, an inline ``#`` on a serve step);
 - the README's ``pip install`` lines name exactly the dependencies the example
-  declares.
+  declares;
+- the examples index (``examples/README.md``) runs nothing, since no runbook
+  reads it and a command there would go untested.
 
 The reader (``readme_commands``) and the data model are module-level so the
 executors that run a runbook import them from here.
@@ -228,6 +230,17 @@ def placement_problems(readme: Path, steps: Sequence[Step]) -> list[str]:
     for command, step in zip(commands, steps, strict=False):
         if step.serve and _has_inline_comment(command.text):
             problems.append(f"{readme}:{command.line}: inline '#' comment on a serve step")
+    return problems
+
+
+def index_problems(index: Path) -> list[str]:
+    """Every fence in the examples index that a reader could run as shell."""
+    problems = placement_problems(index, ())
+    problems.extend(
+        f"{index}:{block.line - 1}: bash fence (commands belong in an example's README)"
+        for block in fenced_blocks(index)
+        if block.lang == "bash"
+    )
     return problems
 
 
@@ -565,3 +578,18 @@ def test_quickstart_runbook_flags_serves_and_eventual_reads() -> None:
         "curl -s localhost:8000/inventory/ord-1",
     ]
     assert sum(s.eventually for s in steps) == 2
+
+
+def test_index_refuses_a_bash_fence_with_its_file_and_line(tmp_path: Path) -> None:
+    index = _readme(tmp_path, "intro", "```bash", "pytest", "```")
+
+    problems = index_problems(index)
+
+    assert len(problems) == 1
+    assert problems[0].startswith(f"{index}:2:")
+
+
+def test_examples_index_runs_nothing() -> None:
+    problems = index_problems(EXAMPLES / "README.md")
+
+    assert not problems, "\n".join(problems)
