@@ -21,13 +21,22 @@ executors that run a runbook import them from here.
 from __future__ import annotations
 
 import difflib
+import os
 import re
 import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
 import tomllib
-from collections.abc import Sequence
+import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import chain
 from pathlib import Path
+from typing import Any, NoReturn
 
 import pytest
 from packaging.requirements import Requirement
@@ -280,6 +289,186 @@ def requirements_problem(readme: Path, pyproject: Path) -> str:
         f"declared but not installed {sorted(declared - installed)}; "
         f"installed but not declared {sorted(installed - declared)}"
     )
+
+
+STEP_TIMEOUT = 300.0
+SCRUBBED_PREFIXES = ("MODULITH_", "UVICORN_", "PYTEST_", "OTEL_", "COMPOSE_")
+SCRUBBED_NAMES = ("PYTHONPATH", "REDIS_URL", "ENV")
+COPY_IGNORE = shutil.ignore_patterns(
+    ".venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "*.db",
+    ".modulith",
+    "build",
+)
+PYTEST_ELAPSED = re.compile(r" in \d+(?:\.\d+)?s")
+PYTEST_COUNT = re.compile(r"(\d+) (\w+)")
+
+
+class RunbookFailure(AssertionError):
+    """A runbook step that broke its README's promise; the message carries the transcript."""
+
+
+def child_env(base: Mapping[str, str], workdir: Path) -> dict[str, str]:
+    """``base`` without the settings that would steer a README's commands, plus the workdir's own.
+
+    ``PYTHONPATH`` is dropped and never set: uvicorn, ``python -m`` and the ``modulith`` CLI
+    put the project directory on ``sys.path`` themselves, which is the behaviour under test.
+    """
+    env = {
+        name: value
+        for name, value in base.items()
+        if not name.startswith(SCRUBBED_PREFIXES) and name not in SCRUBBED_NAMES
+    }
+    env["PATH"] = os.pathsep.join(filter(None, [str(Path(sys.executable).parent), env.get("PATH")]))
+    env["XDG_STATE_HOME"] = str(workdir / ".state")
+    env["COMPOSE_PROJECT_NAME"] = f"modupy-readme-{uuid.uuid4().hex[:12]}"
+    return env
+
+
+def copy_example(source: Path, workdir: Path) -> None:
+    shutil.copytree(source, workdir, ignore=COPY_IGNORE)
+
+
+def _run_shell(
+    command: str, env: Mapping[str, str], cwd: Path, timeout: float, *, merge: bool = True
+) -> tuple[int | None, str, str]:
+    """``bash -c command`` in its own session: ``(exit code, stdout, stderr)``.
+
+    stderr is folded into stdout when ``merge``. The exit code is ``None`` after
+    ``timeout``, when the whole process group has been killed.
+    """
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        process = subprocess.Popen(
+            ["bash", "-c", command],
+            cwd=cwd,
+            env=dict(env),
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=out if merge else err,
+            start_new_session=True,
+        )
+        code: int | None
+        try:
+            code = process.wait(timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            code = None
+        texts = []
+        for stream in (out, err):
+            stream.seek(0)
+            texts.append(stream.read().decode(errors="replace"))
+        return code, texts[0], texts[1]
+
+
+def _missing_line(expected: Sequence[str], output: str) -> str | None:
+    """The first expected line that is not a whole output line after the previous match."""
+    lines = [line.rstrip() for line in output.splitlines()]
+    position = 0
+    for line in (text.rstrip() for text in expected):
+        if not line:
+            continue
+        try:
+            position = lines.index(line, position) + 1
+        except ValueError:
+            return line
+    return None
+
+
+def _pytest_problem(output: str) -> str:
+    """Why a pytest run does not count as a pass, judged by its summary line; empty when it does."""
+    counts: dict[str, int] = {}
+    for line in reversed(output.splitlines()):
+        elapsed = PYTEST_ELAPSED.search(line)
+        if elapsed:
+            counts = {word: int(n) for n, word in PYTEST_COUNT.findall(line[: elapsed.start()])}
+            break
+    for word in ("failed", "error", "errors", "skipped"):
+        if counts.get(word):
+            return f"pytest: {counts[word]} {word}"
+    return "" if counts.get("passed") else "pytest: no test passed"
+
+
+def _shown(output: str) -> str:
+    return output if not output or output.endswith("\n") else output + "\n"
+
+
+class Runbook:
+    """One README run in one temp copy of its example, the way a reader works down a terminal.
+
+    Sections run in order in the copy, so files and ``export`` lines carry from one to the
+    next. Step N is the README's command N; its expected output comes from the README.
+    """
+
+    def __init__(
+        self,
+        source: Path,
+        sections: Sequence[Section],
+        workdir: Path,
+        *,
+        timeout: float = STEP_TIMEOUT,
+    ) -> None:
+        self.sections = sections
+        self.workdir = workdir
+        self.timeout = timeout
+        self.readme = source / "README.md"
+        self.commands = readme_commands(self.readme)
+        steps = sum(len(section.steps) for section in sections)
+        if steps != len(self.commands):
+            raise ValueError(
+                f"{self.readme}: the runbook lists {steps} steps but the README has "
+                f"{len(self.commands)} commands"
+            )
+        copy_example(source, workdir)
+        self.env = child_env(os.environ, workdir)
+        self._log: list[str] = []
+
+    @property
+    def transcript(self) -> str:
+        return "".join(self._log)
+
+    def run_section(self, position: int) -> None:
+        first = sum(len(section.steps) for section in self.sections[:position])
+        for number, step in enumerate(self.sections[position].steps, start=first):
+            self._run_step(step, self.commands[number])
+
+    def _fail(self, command: Command, reason: str) -> NoReturn:
+        raise RunbookFailure(f"{self.readme}:{command.line}: {reason}\n\n{self.transcript}")
+
+    def _run_step(self, step: Step, command: Command) -> None:
+        if step.serve or step.eventually:
+            raise NotImplementedError(f"{'serve' if step.serve else 'eventually'} steps")
+        words = step.command.split()
+        if words[:2] == ["pip", "install"]:
+            self._log.append(f"$ {step.command}\n(skipped: pip install in the repo environment)\n")
+        elif words[:1] == ["export"]:
+            self._export(step, command)
+        else:
+            code, output, _ = _run_shell(step.command, self.env, self.workdir, self.timeout)
+            self._log.append(f"$ {step.command}\n{_shown(output)}")
+            self._check_exit(step, command, code)
+            if words[:1] == ["pytest"] and (problem := _pytest_problem(output)):
+                self._fail(command, problem)
+            if (line := _missing_line(command.output, output)) is not None:
+                self._fail(command, f"expected line {line!r} not found, in order, in the output")
+
+    def _export(self, step: Step, command: Command) -> None:
+        code, stdout, stderr = _run_shell(
+            f"{step.command}; env -0", self.env, self.workdir, self.timeout, merge=False
+        )
+        self._log.append(f"$ {step.command}\n{_shown(stderr)}")
+        self._check_exit(step, command, code)
+        self.env = dict(item.split("=", 1) for item in stdout.split("\0") if "=" in item)
+
+    def _check_exit(self, step: Step, command: Command, code: int | None) -> None:
+        if code is None:
+            self._fail(command, f"timed out after {self.timeout:g}s")
+        if code != step.exit_code:
+            self._fail(command, f"exit {code}, expected {step.exit_code}")
 
 
 def _readme(tmp_path: Path, *lines: str) -> Path:
@@ -593,3 +782,360 @@ def test_examples_index_runs_nothing() -> None:
     problems = index_problems(EXAMPLES / "README.md")
 
     assert not problems, "\n".join(problems)
+
+
+def _bash(*lines: str) -> list[str]:
+    return ["```bash", *lines, "```"]
+
+
+def _runbook(
+    tmp_path: Path,
+    *readme_lines: str,
+    steps: Sequence[Step] | None = None,
+    sections: Sequence[Section] | None = None,
+    files: Mapping[str, str] | None = None,
+    timeout: float = 30.0,
+) -> Runbook:
+    source = tmp_path / "example"
+    source.mkdir(parents=True)
+    (source / "README.md").write_text("\n".join(readme_lines) + "\n", encoding="utf-8")
+    for name, text in (files or {}).items():
+        (source / name).parent.mkdir(parents=True, exist_ok=True)
+        (source / name).write_text(text, encoding="utf-8")
+    if sections is None:
+        listed = steps or tuple(Step(c.text) for c in readme_commands(source / "README.md"))
+        sections = (Section("all", tuple(listed)),)
+    return Runbook(source, sections, tmp_path / "work", timeout=timeout)
+
+
+def _run(tmp_path: Path, *readme_lines: str, **kwargs: Any) -> Runbook:
+    runbook = _runbook(tmp_path, *readme_lines, **kwargs)
+    for position in range(len(runbook.sections)):
+        runbook.run_section(position)
+    return runbook
+
+
+def _failure(tmp_path: Path, *readme_lines: str, **kwargs: Any) -> str:
+    with pytest.raises(RunbookFailure) as caught:
+        _run(tmp_path, *readme_lines, **kwargs)
+    return str(caught.value)
+
+
+def _reason(message: str) -> str:
+    return message.splitlines()[0]
+
+
+def test_a_step_runs_from_the_copy_root_and_leaves_the_example_untouched(tmp_path: Path) -> None:
+    runbook = _run(
+        tmp_path,
+        *_bash("$ pwd", str(tmp_path / "work"), "$ echo made > made.txt"),
+    )
+
+    assert (tmp_path / "work" / "made.txt").read_text() == "made\n"
+    assert not (tmp_path / "example" / "made.txt").exists()
+    assert runbook.workdir == tmp_path / "work"
+
+
+def test_the_copy_leaves_out_environments_caches_databases_and_build_output(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "example"
+    for name in (".venv/bin/python", "pkg/__pycache__/x.pyc", ".pytest_cache/v", ".mypy_cache/m"):
+        (source / name).parent.mkdir(parents=True, exist_ok=True)
+        (source / name).write_text("x")
+    for name in (".ruff_cache/r", "build/lib/y.py", ".modulith/state", "shop.db"):
+        (source / name).parent.mkdir(parents=True, exist_ok=True)
+        (source / name).write_text("x")
+    for name in ("pkg/app.py", "builder.py", "README.md"):
+        (source / name).parent.mkdir(parents=True, exist_ok=True)
+        (source / name).write_text("x")
+
+    copy_example(source, tmp_path / "work")
+
+    kept = sorted(
+        p.relative_to(tmp_path / "work").as_posix()
+        for p in (tmp_path / "work").rglob("*")
+        if p.is_file()
+    )
+    assert kept == ["README.md", "builder.py", "pkg/app.py"]
+
+
+def test_sections_share_one_copy_and_an_export_reaches_later_sections(tmp_path: Path) -> None:
+    sections = (
+        Section("first", (Step("export GREETING=hello"), Step("echo kept > note.txt"))),
+        Section("second", (Step("echo $GREETING"), Step("cat note.txt"))),
+    )
+    readme = (
+        "## first",
+        *_bash("export GREETING=hello", "echo kept > note.txt"),
+        "## second",
+        *_bash("$ echo $GREETING", "hello", "$ cat note.txt", "kept"),
+    )
+
+    _run(tmp_path, *readme, sections=sections)
+
+    assert "GREETING" not in os.environ
+
+
+def test_an_export_evaluates_command_substitution_like_a_terminal(tmp_path: Path) -> None:
+    _run(
+        tmp_path,
+        *_bash("$ export STAMP=$(echo computed)", "$ echo $STAMP", "computed"),
+    )
+
+
+def test_an_export_that_bash_cannot_parse_fails_the_step(tmp_path: Path) -> None:
+    message = _failure(tmp_path, *_bash("export BAD=("))
+
+    assert "export BAD=(" in message
+    assert "syntax error" in message
+
+
+def test_a_step_that_does_not_export_does_not_change_the_environment(tmp_path: Path) -> None:
+    message = _failure(
+        tmp_path,
+        *_bash("$ FOO=bar true", '$ echo "[${FOO-}]"', "[bar]"),
+    )
+
+    assert "\n[]\n" in message
+
+
+def test_pip_install_is_skipped_in_the_repo_environment(tmp_path: Path) -> None:
+    runbook = _run(
+        tmp_path,
+        *_bash(
+            "$ pip install modupy-package-that-does-not-exist-anywhere", "$ echo after", "after"
+        ),
+    )
+
+    assert "skipped" in runbook.transcript
+
+
+def test_a_command_that_only_mentions_pip_install_is_not_skipped(tmp_path: Path) -> None:
+    message = _failure(tmp_path, *_bash("echo pip install nothing; false"))
+
+    assert "exit 1" in message
+
+
+def _pytest_example(*tests: str) -> dict[str, str]:
+    return {"tests/test_it.py": "import pytest\n\n" + "\n\n".join(tests) + "\n"}
+
+
+PASSING = "def test_ok():\n    assert True"
+SKIPPED = "def test_skipped():\n    pytest.skip('no')"
+FAILING = "def test_bad():\n    assert False"
+XFAIL = "@pytest.mark.xfail\ndef test_expected_failure():\n    assert False"
+BROKEN = "def test_error(missing_fixture):\n    pass"
+
+
+def test_a_pytest_step_passes_when_something_passed_and_nothing_else_happened(
+    tmp_path: Path,
+) -> None:
+    runbook = _run(tmp_path, *_bash("pytest"), files=_pytest_example(PASSING))
+
+    assert "1 passed" in runbook.transcript
+
+
+@pytest.mark.parametrize(
+    ("tests", "command", "reason"),
+    [
+        ((PASSING, SKIPPED), "pytest", "skipped"),
+        ((PASSING, FAILING), "pytest || true", "failed"),
+        ((PASSING, BROKEN), "pytest || true", "error"),
+        ((XFAIL,), "pytest", "no test passed"),
+        ((PASSING,), "pytest -k nomatch || true", "no test passed"),
+    ],
+    ids=["skipped", "failed", "errored", "nothing-passed", "nothing-collected"],
+)
+def test_a_pytest_step_fails_on_skipped_failed_errored_or_no_passes(
+    tmp_path: Path, tests: tuple[str, ...], command: str, reason: str
+) -> None:
+    message = _failure(tmp_path, *_bash(command), files=_pytest_example(*tests))
+
+    assert reason in _reason(message)
+
+
+def test_a_failing_pytest_step_fails_on_its_exit_code(tmp_path: Path) -> None:
+    message = _failure(tmp_path, *_bash("pytest"), files=_pytest_example(FAILING))
+
+    assert "exit 1" in _reason(message)
+
+
+def test_expected_lines_may_have_unshown_lines_between_them(tmp_path: Path) -> None:
+    _run(tmp_path, *_bash("$ printf 'a\\nb\\nc\\nd\\n'", "a", "c"))
+
+
+def test_blank_expected_lines_and_trailing_spaces_are_ignored(tmp_path: Path) -> None:
+    _run(tmp_path, *_bash("$ printf 'x   \\n\\ny\\n'", "x", "", "", "y"))
+
+
+def test_a_final_line_without_a_newline_counts_as_a_line(tmp_path: Path) -> None:
+    _run(tmp_path, *_bash("$ printf 'a\\nbody'", "a", "body"))
+
+
+def test_stderr_is_merged_into_the_matched_output(tmp_path: Path) -> None:
+    _run(tmp_path, *_bash("$ echo oops >&2", "oops"))
+
+
+def test_expected_lines_out_of_order_fail(tmp_path: Path) -> None:
+    message = _failure(tmp_path, *_bash("$ printf 'a\\nb\\n'", "b", "a"))
+
+    assert "'a'" in _reason(message)
+
+
+def test_a_prefix_of_an_output_line_is_not_a_match(tmp_path: Path) -> None:
+    message = _failure(tmp_path, *_bash("$ echo abc", "ab"))
+
+    assert "'ab'" in _reason(message)
+
+
+def test_a_missing_expected_line_is_named_with_the_actual_output(tmp_path: Path) -> None:
+    message = _failure(tmp_path, *_bash("$ printf 'a\\nb\\n'", "a", "gone", "b"))
+
+    assert "'gone'" in _reason(message)
+    assert "\na\nb\n" in message
+
+
+def test_a_non_zero_exit_fails_the_step(tmp_path: Path) -> None:
+    message = _failure(tmp_path, *_bash("echo before; exit 3"))
+
+    assert "exit 3" in _reason(message)
+    assert "before" in message
+
+
+def test_a_declared_exit_code_passes_and_any_other_exit_fails(tmp_path: Path) -> None:
+    _run(
+        tmp_path,
+        *_bash("$ echo shown; exit 3", "shown"),
+        steps=(Step("echo shown; exit 3", exit_code=3),),
+    )
+
+    wrong = _failure(tmp_path / "wrong", *_bash("exit 4"), steps=(Step("exit 4", exit_code=3),))
+    clean = _failure(tmp_path / "clean", *_bash("true"), steps=(Step("true", exit_code=3),))
+
+    assert "exit 4" in _reason(wrong)
+    assert "exit 0" in _reason(clean)
+
+
+def test_a_step_that_outlives_its_timeout_fails_with_its_partial_output(tmp_path: Path) -> None:
+    message = _failure(tmp_path, *_bash("echo started; sleep 60"), timeout=1.0)
+
+    assert "timed out" in _reason(message)
+    assert "started" in message
+
+
+def test_a_timeout_kills_the_whole_process_group(tmp_path: Path) -> None:
+    message = _failure(tmp_path, *_bash("sleep 60 & echo child=$!; wait"), timeout=1.0)
+
+    child = int(re.search(r"child=(\d+)", message.split("\n$ ", 1)[1]).group(1))  # type: ignore[union-attr]
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"child {child} survived the timeout")
+
+
+def test_a_step_leads_its_own_session(tmp_path: Path) -> None:
+    _run(
+        tmp_path,
+        *_bash(
+            "$ exec python -c 'import os; print(os.getsid(0) == os.getpid())'",
+            "True",
+        ),
+    )
+
+
+def test_the_failure_shows_every_command_as_executed_with_its_output(tmp_path: Path) -> None:
+    message = _failure(tmp_path, *_bash("echo one", "echo two; false"))
+
+    assert "$ echo one\none\n" in message
+    assert "$ echo two; false\ntwo\n" in message
+    assert "README.md:" in message
+
+
+def test_the_runbook_and_the_readme_must_list_the_same_number_of_commands(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"2 steps.*1 command"):
+        _runbook(tmp_path, *_bash("true"), steps=(Step("true"), Step("false")))
+
+
+@pytest.mark.parametrize("flag", ["serve", "eventually"])
+def test_a_serve_or_eventually_step_is_refused_not_run_as_a_plain_step(
+    tmp_path: Path, flag: str
+) -> None:
+    with pytest.raises(NotImplementedError, match=flag):
+        _run(tmp_path, *_bash("true"), steps=(Step("true", **{flag: True}),))
+
+
+PARENT_ENV = {
+    "MODULITH_BROKER": "redis",
+    "UVICORN_PORT": "1",
+    "PYTEST_ADDOPTS": "-x",
+    "OTEL_SDK_DISABLED": "false",
+    "COMPOSE_FILE": "elsewhere.yml",
+    "COMPOSE_PROJECT_NAME": "parent",
+    "PYTHONPATH": "/somewhere",
+    "REDIS_URL": "redis://elsewhere",
+    "ENV": "/etc/profile",
+}
+
+
+def test_the_child_environment_drops_the_parent_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name, value in PARENT_ENV.items():
+        monkeypatch.setenv(name, value)
+
+    runbook = _run(tmp_path, *_bash("env"))
+
+    names = {line.partition("=")[0] for line in runbook.transcript.splitlines()}
+    assert not names & (set(PARENT_ENV) - {"COMPOSE_PROJECT_NAME"})
+    assert "PYTEST_CURRENT_TEST" not in names
+    assert "COMPOSE_PROJECT_NAME=parent" not in runbook.transcript
+    assert "COMPOSE_PROJECT_NAME" in names
+
+
+def test_the_child_environment_is_the_scrubbed_parent_plus_the_workdir_settings(
+    tmp_path: Path,
+) -> None:
+    base = {**PARENT_ENV, "PATH": "/usr/bin", "HOME": "/home/x", "LANG": "C"}
+
+    env = child_env(base, tmp_path / "work")
+
+    assert set(env) == {
+        "PATH",
+        "HOME",
+        "LANG",
+        "XDG_STATE_HOME",
+        "COMPOSE_PROJECT_NAME",
+    }
+    assert env["HOME"] == "/home/x"
+    assert env["XDG_STATE_HOME"].startswith(str(tmp_path / "work"))
+    assert env["COMPOSE_PROJECT_NAME"] != "parent"
+
+
+def test_each_child_environment_gets_its_own_compose_project(tmp_path: Path) -> None:
+    names = {child_env({}, tmp_path)["COMPOSE_PROJECT_NAME"] for _ in range(3)}
+
+    assert len(names) == 3
+
+
+def test_the_interpreters_bin_directory_leads_the_path(tmp_path: Path) -> None:
+    env = child_env({"PATH": "/usr/bin"}, tmp_path)
+
+    assert env["PATH"] == f"{Path(sys.executable).parent}{os.pathsep}/usr/bin"
+
+
+def test_python_in_a_step_is_the_running_interpreters_python(tmp_path: Path) -> None:
+    _run(
+        tmp_path,
+        *_bash("$ command -v python", str(Path(sys.executable).parent / "python")),
+    )
+
+
+def test_the_child_environment_never_sets_pythonpath(tmp_path: Path) -> None:
+    assert "PYTHONPATH" not in child_env({"PYTHONPATH": "/x"}, tmp_path)
+    assert "PYTHONPATH" not in child_env({}, tmp_path)
