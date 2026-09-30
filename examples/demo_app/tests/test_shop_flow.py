@@ -1,20 +1,19 @@
 from pathlib import Path
 
+# aiosqlite, sqlalchemy.ext.asyncio and sqlalchemy.orm stay at module scope on
+# purpose: modulith_app drops every module first imported during a test, and
+# SQLAlchemy cannot be re-imported once its compiled extensions are dropped.
 import aiosqlite  # noqa: F401
-import pytest
 import sqlalchemy.ext.asyncio
 import sqlalchemy.orm  # noqa: F401
 from fastapi.testclient import TestClient
 from modulith.testing import ModulithTestApp, Scenario
-
-# The three imports above stay at module scope on purpose: modulith_app drops
-# every module first imported during a test, and SQLAlchemy cannot be
-# re-imported once its compiled extensions are dropped.
+from pytest import MonkeyPatch, mark
 
 ORDER = {"order_id": "o-1", "customer_id": "alice", "total": 19.99}
 
 
-def create_schema(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def create_schema(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("MODULITH_OUTBOX_URL", f"sqlite+aiosqlite:///{tmp_path / 'shop.db'}")
     from shop.schema import create_tables
 
@@ -22,7 +21,7 @@ def create_schema(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 
 def test_an_order_flows_through_all_three_modules(
-    modulith_app: ModulithTestApp, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    modulith_app: ModulithTestApp, monkeypatch: MonkeyPatch, tmp_path: Path
 ) -> None:
     create_schema(monkeypatch, tmp_path)
     from shop.main import app
@@ -41,7 +40,7 @@ def test_an_order_flows_through_all_three_modules(
 
 
 def test_each_event_is_published_once(
-    modulith_app: ModulithTestApp, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    modulith_app: ModulithTestApp, monkeypatch: MonkeyPatch, tmp_path: Path
 ) -> None:
     create_schema(monkeypatch, tmp_path)
     from shop.contracts.events import OrderPlaced, StockReserved
@@ -55,7 +54,7 @@ def test_each_event_is_published_once(
 
 
 def test_a_duplicate_order_id_is_rejected_without_a_second_event(
-    modulith_app: ModulithTestApp, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    modulith_app: ModulithTestApp, monkeypatch: MonkeyPatch, tmp_path: Path
 ) -> None:
     create_schema(monkeypatch, tmp_path)
     from shop.contracts.events import OrderPlaced
@@ -73,7 +72,7 @@ def test_a_duplicate_order_id_is_rejected_without_a_second_event(
 def test_a_redelivered_order_reserves_stock_once(
     scenario: Scenario,
     modulith_app: ModulithTestApp,
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     create_schema(monkeypatch, tmp_path)
@@ -87,7 +86,7 @@ def test_a_redelivered_order_reserves_stock_once(
     assert modulith_app.published_events_of_type(StockReserved) == [StockReserved(order_id="o-1")]
 
 
-@pytest.mark.parametrize(
+@mark.parametrize(
     ("module", "route"),
     [
         ("orders", "/orders/{order_id}"),
@@ -97,7 +96,7 @@ def test_a_redelivered_order_reserves_stock_once(
 )
 def test_a_worker_mounts_only_its_own_router(
     modulith_app: ModulithTestApp,
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: MonkeyPatch,
     tmp_path: Path,
     module: str,
     route: str,
