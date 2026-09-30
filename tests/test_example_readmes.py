@@ -1194,6 +1194,21 @@ def test_runbook_has_one_section_per_readme_heading_in_order(example: str) -> No
     assert from_runbook == from_readme
 
 
+@pytest.mark.parametrize(
+    "project", sorted(path.parent.name for path in EXAMPLES.glob("*/pyproject.toml"))
+)
+def test_every_example_project_has_a_runbook_that_installs_and_tests_it(project: str) -> None:
+    leads = [
+        step.command.split()[:2] for section in RUNBOOKS.get(project, ()) for step in section.steps
+    ]
+
+    assert ["pip", "install"] in leads, f"RUNBOOKS has no step installing examples/{project}"
+    if (EXAMPLES / project / "tests").is_dir():
+        assert ["pytest"] in (lead[:1] for lead in leads), (
+            f"RUNBOOKS has no pytest step for examples/{project}/tests"
+        )
+
+
 def test_quickstart_runbook_flags_serves_and_eventual_reads() -> None:
     steps = [step for section in RUNBOOKS["quickstart"] for step in section.steps]
 
