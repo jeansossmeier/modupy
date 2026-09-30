@@ -288,7 +288,8 @@ dead-lettered: 0
 ## Stage 4b: processes over Redis Streams
 
 Stop the server with Ctrl-C. Events between the processes can travel over
-Redis Streams instead of the default broker; the outbox goes back to SQLite.
+Redis Streams instead of the default broker. The outbox goes back to SQLite,
+so this stage changes only the broker.
 
 ```bash
 pip install 'modupy[redis]'
