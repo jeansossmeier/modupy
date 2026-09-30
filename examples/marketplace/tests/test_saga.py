@@ -54,6 +54,12 @@ def test_a_paid_order_is_confirmed_shipped_and_its_stock_stays_reserved(
         )
         shipment = eventually(lambda: client.get("/shipping/o-100").json(), has_status("booked"))
         on_hand = client.get("/inventory/SKU-MUG").json()
+        notifications = eventually(
+            lambda: client.get("/notifications/o-100").json(), lambda found: len(found) == 3
+        )
+        totals = eventually(
+            lambda: client.get("/reporting/summary").json(), lambda found: found["shipped"] == 1
+        )
 
     assert confirmed == {"order_id": "o-100", "status": "confirmed", "reason": None}
     assert shipment == {
@@ -63,6 +69,12 @@ def test_a_paid_order_is_confirmed_shipped_and_its_stock_stays_reserved(
         "tracking_number": "TRK-o-100",
     }
     assert on_hand == {"sku": "SKU-MUG", "on_hand": 8}
+    assert notifications == [
+        {"kind": "received", "message": "order received"},
+        {"kind": "confirmed", "message": "order confirmed"},
+        {"kind": "shipped", "message": "shipped with DHL, tracking TRK-o-100"},
+    ]
+    assert totals == {"confirmed": 1, "cancelled": 0, "shipped": 1, "revenue_cents": 2400}
 
 
 def test_a_missing_shipping_zone_dead_letters_the_booking_until_the_operator_retries(
@@ -92,7 +104,20 @@ def test_a_missing_shipping_zone_dead_letters_the_booking_until_the_operator_ret
             lambda: portal.call(outbox.status),
             lambda counts: counts["dead_lettered"] == 0 and counts["incomplete"] == 0,
         )
+        notifications = eventually(
+            lambda: client.get("/notifications/o-300").json(),
+            lambda found: len(found) == 3,
+            seconds=60,
+        )
+        totals = eventually(
+            lambda: client.get("/reporting/summary").json(), lambda found: found["shipped"] == 1
+        )
 
+    assert notifications[-1] == {
+        "kind": "shipped",
+        "message": "shipped with PostNZ, tracking TRK-o-300",
+    }
+    assert totals == {"confirmed": 1, "cancelled": 0, "shipped": 1, "revenue_cents": 1200}
     assert placed.status_code == 200
     assert stuck["dead_lettered"] == 1
     assert before_retry["status"] == "requested"
@@ -122,9 +147,20 @@ def test_a_declined_order_is_cancelled_only_after_its_stock_is_back_on_hand(
             lambda: client.get("/orders/o-200").json(), has_status("confirmed", "cancelled")
         )
         on_hand = client.get("/inventory/SKU-MUG").json()
+        notifications = eventually(
+            lambda: client.get("/notifications/o-200").json(), lambda found: len(found) == 2
+        )
+        totals = eventually(
+            lambda: client.get("/reporting/summary").json(), lambda found: found["cancelled"] == 1
+        )
 
     assert cancelled == {"order_id": "o-200", "status": "cancelled", "reason": "payment declined"}
     assert on_hand == {"sku": "SKU-MUG", "on_hand": 10}
+    assert notifications == [
+        {"kind": "received", "message": "order received"},
+        {"kind": "cancelled", "message": "order cancelled: payment declined"},
+    ]
+    assert totals == {"confirmed": 0, "cancelled": 1, "shipped": 0, "revenue_cents": 0}
 
 
 def test_a_redelivered_payment_request_captures_once(
@@ -174,7 +210,18 @@ def test_an_order_beyond_stock_is_cancelled_as_out_of_stock(
         cancelled = eventually(
             lambda: client.get("/orders/o-200").json(), has_status("confirmed", "cancelled")
         )
+        notifications = eventually(
+            lambda: client.get("/notifications/o-200").json(), lambda found: len(found) == 2
+        )
+        totals = eventually(
+            lambda: client.get("/reporting/summary").json(), lambda found: found["cancelled"] == 1
+        )
 
     assert placed.status_code == 200
     assert placed.json() == {"order_id": "o-200", "status": "placed"}
     assert cancelled == {"order_id": "o-200", "status": "cancelled", "reason": "out of stock"}
+    assert notifications == [
+        {"kind": "received", "message": "order received"},
+        {"kind": "cancelled", "message": "order cancelled: out of stock"},
+    ]
+    assert totals == {"confirmed": 0, "cancelled": 1, "shipped": 0, "revenue_cents": 0}

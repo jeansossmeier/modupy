@@ -4,8 +4,10 @@ from sqlalchemy import exists, insert, literal, select
 
 import marketplace.catalog.tables
 import marketplace.inventory.tables
+import marketplace.notifications.tables
 import marketplace.orders.tables
-import marketplace.payments.tables  # noqa: F401
+import marketplace.payments.tables
+import marketplace.reporting.tables  # noqa: F401
 from marketplace.db import engine, metadata
 from marketplace.shipping.tables import zone
 

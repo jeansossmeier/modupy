@@ -32,6 +32,9 @@ retry_stale_seconds = 2
 max_retry_backoff_seconds = 4
 dead_letter_after_attempts = 3
 
+[tool.modulith.workers]
+reporting = 2
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

@@ -8,7 +8,9 @@ from modulith.testing import ModulithTestApp
 SIBLINGS = [
     "marketplace.catalog",
     "marketplace.inventory",
+    "marketplace.notifications",
     "marketplace.payments",
+    "marketplace.reporting",
     "marketplace.shipping",
 ]
 
