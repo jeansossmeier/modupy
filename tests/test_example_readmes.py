@@ -449,23 +449,44 @@ class RunbookFailure(AssertionError):
     """A runbook step that broke its README's promise; the message carries the transcript."""
 
 
+def _without_interpreter_bin(path: str) -> list[str]:
+    """The ``PATH`` entries minus the running interpreter's ``bin``, unless that is a system one."""
+    interpreter_bin = Path(sys.executable).parent
+    entries = path.split(os.pathsep)
+    if (interpreter_bin / "bash").exists():
+        return entries
+    return [
+        entry
+        for entry in entries
+        if not entry or Path(entry).resolve() != interpreter_bin.resolve()
+    ]
+
+
 def child_env(base: Mapping[str, str], workdir: Path, venv: Path | None = None) -> dict[str, str]:
     """``base`` without the settings that would steer a README's commands, plus the workdir's own.
 
     ``PYTHONPATH`` is dropped and never set: uvicorn, ``python -m`` and the ``modulith`` CLI
     put the project directory on ``sys.path`` themselves, which is the behaviour under test.
-    With ``venv``, that environment's ``bin`` leads ``PATH`` instead of the running
-    interpreter's, so nothing installed for the tests can answer for a missing install.
+    With ``venv``, that environment's ``bin`` leads ``PATH`` and the running interpreter's
+    ``bin`` (found by resolved path, so links and duplicates go too) is dropped, so nothing
+    installed for the tests, in a venv or system-wide, answers for a missing install. A
+    directory that also holds ``bash`` is a system ``bin`` and stays, since the README's
+    own ``bash``, ``curl`` and ``docker`` live there.
     """
     env = {
         name: value
         for name, value in base.items()
         if not name.startswith(SCRUBBED_PREFIXES) and name not in SCRUBBED_NAMES
     }
-    bin_dir = venv / "bin" if venv else Path(sys.executable).parent
-    env["PATH"] = os.pathsep.join(filter(None, [str(bin_dir), env.get("PATH")]))
     if venv:
+        env["PATH"] = os.pathsep.join(
+            filter(None, [str(venv / "bin"), *_without_interpreter_bin(env.get("PATH", ""))])
+        )
         env["VIRTUAL_ENV"] = str(venv)
+    else:
+        env["PATH"] = os.pathsep.join(
+            filter(None, [str(Path(sys.executable).parent), env.get("PATH")])
+        )
     env["XDG_STATE_HOME"] = str(workdir / ".state")
     env["COMPOSE_PROJECT_NAME"] = f"modupy-readme-{uuid.uuid4().hex[:12]}"
     return env
@@ -2151,6 +2172,49 @@ def test_the_wheel_environment_leads_the_path_with_the_venv_and_not_the_running_
 
     assert env["PATH"] == f"{venv}/bin{os.pathsep}/opt/base/bin"
     assert env["VIRTUAL_ENV"] == str(venv)
+
+
+def _interpreter_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, with_bash: bool) -> Path:
+    """A bin directory that holds the running interpreter and ``fake-tool``, and leads ``PATH``."""
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    tool = bin_dir / "fake-tool"
+    tool.write_text("#!/bin/sh\necho fake-tool ran\n")
+    tool.chmod(0o755)
+    if with_bash:
+        (bin_dir / "bash").symlink_to(shutil.which("bash") or "/bin/bash")
+    linked = tmp_path / "linked"
+    linked.symlink_to(bin_dir)
+    monkeypatch.setattr(sys, "executable", str(bin_dir / "python"))
+    monkeypatch.setenv("PATH", os.pathsep.join([str(bin_dir), str(linked), os.environ["PATH"]]))
+    return bin_dir
+
+
+def test_a_tool_only_the_running_interpreter_provides_is_missing_in_the_wheel_lane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _interpreter_bin(tmp_path, monkeypatch, with_bash=False)
+    venv, _log = _fake_venv(tmp_path)
+    readme = _bash("$ fake-tool", "fake-tool ran")
+
+    _run(tmp_path / "repo", *readme)
+    message = _failure(
+        tmp_path / "wheel",
+        *_bash("$ command -v fake-tool"),
+        steps=(Step("command -v fake-tool"),),
+        venv=venv,
+    )
+
+    assert "exit 1" in _reason(message)
+
+
+def test_a_bin_directory_that_also_holds_bash_stays_on_the_wheel_lane_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _interpreter_bin(tmp_path, monkeypatch, with_bash=True)
+    venv, _log = _fake_venv(tmp_path)
+
+    _run(tmp_path / "wheel", *_bash("$ fake-tool", "fake-tool ran"), venv=venv)
 
 
 def test_the_wheel_lane_runs_every_section_where_the_repo_lane_stops(
