@@ -276,9 +276,76 @@ incomplete:    0
 dead-lettered: 0
 ```
 
-### 5. Clean up
+### 5. Extract a service
 
-Stop the platform with Ctrl-C, then remove Postgres and its volume:
+`notifications` imports only the contracts and `marketplace.db`, so it can
+leave. `modulith extract` copies it into a project of its own, with the
+contracts and `db.py` it needs. `orders` cannot: it declares a dependency on
+`catalog`, and extraction refuses a module that still imports another one.
+The platform keeps running while you extract.
+
+```bash
+$ modulith extract notifications --output build/notifications-service
+extracted 'notifications' to build/notifications-service (12 file(s)):
+  marketplace/__init__.py
+  marketplace/notifications/__init__.py
+  marketplace/notifications/_manifest.py
+  marketplace/notifications/api.py
+  marketplace/notifications/handlers.py
+  marketplace/notifications/tables.py
+  marketplace/db.py
+  marketplace/contracts/__init__.py
+  pyproject.toml
+  Dockerfile
+  .env.example
+  README.md
+```
+
+Serve the extracted service beside the platform. Its ports differ, because the
+platform holds 8000 and 9001 to 9008. It has no `main.py` either, yet it traces:
+the plugin installs a tracer provider named `marketplace-<module>` in every
+process, and `OTEL_TRACES_EXPORTER=console` prints each span. The worker's lines
+carry its name in brackets; the spans themselves also hold ids and times, which
+are left out. The two lines below appear once an event reaches the service, in
+the order the exporter writes them.
+
+```bash
+$ cd build/notifications-service && OTEL_TRACES_EXPORTER=console modulith run marketplace:app --topology processes --port 8100 --worker-port-base 9101
+INFO:  discovered 2 module(s): contracts, notifications
+modulith → process-per-module: 1 worker(s) [notifications:9101], reverse proxy on http://0.0.0.0:8100
+INFO:  [notifications]     "name": "modulith.event.dispatch",
+INFO:  [notifications]             "service.name": "marketplace-notifications"
+```
+
+The extracted service joins the database broker's `modulith-notifications`
+group, the group the platform's own `notifications` worker is in. While both
+run, nothing is published, so no event is split between them.
+
+Now stop the platform with Ctrl-C and start `orders` alone as a single
+monolith, isolated from every other module. It takes over port 8000:
+
+```bash
+$ modulith dev marketplace.main:app --isolate orders
+modulith: --isolate='orders' restricts this deployment to that module only — every other discovered module is not started and its routes 404
+modulith → process-per-module: 1 worker(s) [orders:9001], reverse proxy on http://127.0.0.1:8000
+```
+
+An order placed there publishes `OrderPlaced` to the broker. Port 8000 no longer
+has a `notifications` module, so it answers 404; the extracted service on port
+8100 receives the event and records the notice:
+
+```bash
+$ curl -sX POST localhost:8000/orders -H 'content-type: application/json' -d '{"order_id": "o-400", "customer_id": "dana", "sku": "SKU-MUG", "quantity": 1, "card_token": "tok_visa", "country": "US"}'
+{"order_id":"o-400","status":"placed"}
+$ curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/notifications/o-400
+404
+$ curl -s localhost:8100/notifications/o-400
+[{"kind":"received","message":"order received"}]
+```
+
+### 6. Clean up
+
+Stop both services with Ctrl-C, then remove Postgres and its volume:
 
 ```bash
 docker compose down -v

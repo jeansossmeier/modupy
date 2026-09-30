@@ -304,6 +304,23 @@ RUNBOOKS: dict[str, tuple[Section, ...]] = {
                 Step("curl -s localhost:8000/notifications/o-300", eventually=True),
                 Step("curl -s localhost:8000/reporting/summary", eventually=True),
                 Step("modulith outbox status", eventually=True),
+                Step("modulith extract notifications --output build/notifications-service"),
+                Step(
+                    "cd build/notifications-service && OTEL_TRACES_EXPORTER=console "
+                    "modulith run marketplace:app --topology processes "
+                    "--port 8100 --worker-port-base 9101",
+                    serve=True,
+                ),
+                Step("modulith dev marketplace.main:app --isolate orders", serve=True),
+                Step(
+                    "curl -sX POST localhost:8000/orders -H 'content-type: application/json' "
+                    '-d \'{"order_id": "o-400", "customer_id": "dana", "sku": "SKU-MUG", '
+                    '"quantity": 1, "card_token": "tok_visa", "country": "US"}\''
+                ),
+                Step(
+                    "curl -s -o /dev/null -w '%{http_code}\\n' localhost:8000/notifications/o-400"
+                ),
+                Step("curl -s localhost:8100/notifications/o-400", eventually=True),
                 Step("docker compose down -v"),
             ),
         ),

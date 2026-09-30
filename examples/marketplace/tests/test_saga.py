@@ -58,7 +58,8 @@ def test_a_paid_order_is_confirmed_shipped_and_its_stock_stays_reserved(
             lambda: client.get("/notifications/o-100").json(), lambda found: len(found) == 3
         )
         totals = eventually(
-            lambda: client.get("/reporting/summary").json(), lambda found: found["shipped"] == 1
+            lambda: client.get("/reporting/summary").json(),
+            lambda found: found["confirmed"] == 1 and found["shipped"] == 1,
         )
 
     assert confirmed == {"order_id": "o-100", "status": "confirmed", "reason": None}
@@ -110,7 +111,8 @@ def test_a_missing_shipping_zone_dead_letters_the_booking_until_the_operator_ret
             seconds=60,
         )
         totals = eventually(
-            lambda: client.get("/reporting/summary").json(), lambda found: found["shipped"] == 1
+            lambda: client.get("/reporting/summary").json(),
+            lambda found: found["confirmed"] == 1 and found["shipped"] == 1,
         )
 
     assert notifications[-1] == {
