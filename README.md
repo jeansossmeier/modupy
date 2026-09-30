@@ -5,103 +5,101 @@
 [![Python Versions](https://img.shields.io/pypi/pyversions/modupy)](https://pypi.org/project/modupy/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-> **The modular monolith for Python: start as one process, grow into
-> process-per-module, extract a service only when it pays.** Modules with
-> enforced boundaries, events instead of cross-module calls, a transactional
-> outbox for crash-safe delivery, and a supervisor that runs the very same
-> code one-process-per-module when a module outgrows the rest.
->
-> Inspired by [Spring Modulith](https://spring.io/projects/spring-modulith).
+**Start as one app. Grow into processes and services without re-architecting.**
 
----
+modulith helps you build a Python backend as a **modular monolith**: one codebase, split into modules that talk through events and can't reach into each other's code.
+On day one it is a plain FastAPI app.
+As your company grows, the same code runs one process per module, scales the busy parts, keeps events safe in your database, and splits a module off into its own service.
+Each step is a config change, a command or a few lines of wiring, never a rewrite.
 
-## Start small. Grow without the rewrite.
+```bash
+pip install 'modupy[fastapi,cli]'
+```
 
-Every stage below runs the same application code. What changes between them
-is a line of `pyproject.toml` or a CLI flag: listeners stay `@listener`, URLs
-stay identical, and nothing is rewritten for the messaging layer.
+[Quickstart](#quickstart) · [How it grows](#how-it-grows-with-your-company) · [Ready for AI](#ready-for-ai) · [Examples](#examples) · [Docs](#documentation)
 
-**Day one: one process, zero infrastructure.** `pip install modupy` brings in
-exactly one dependency, `pluggy`. Modules are subpackages of your app; they
-talk through `@event`, `@listener` and `publish()`; you run
-`uvicorn myapp.main:app` as you always have. Boundaries are checked by static
-AST analysis: `modulith verify` fails CI on boundary violations, and with
-`strict_boundaries = true` the same check also runs at load time. Broker and outbox are in-memory, so there is nothing to provision.
+> Pre-1.0 alpha: breaking changes can land in 0.x releases. See [Status](#status).
 
-**Durable: two config lines and three steps.** `outbox = "postgres"` plus
-`outbox_url`, the async SQLAlchemy URL of your business database (Postgres,
-MySQL or SQLite), makes the outbox transactional in every process while module
-discovery (`auto_discover`) stays on, its default: events are stored durably
-and delivered at-least-once after commit, and process crashes and
-transaction rollbacks stay consistent. The steps are: run `modulith migrate`
-(the Alembic migrations ship inside the package, and the chain also creates
-the `broker_*` tables); bind a session around each transaction with
-`bind_session` and `unbind_session` from `modulith.builtin.outbox`, and commit
-before the route returns; and, in a single-process app, call
-`modulith.bootstrap()` and then `outbox.start()` in the lifespan, with
-`outbox.shutdown()` on exit, so rows a crashed process left undelivered are
-retried at startup rather than after the first publish. [`examples/demo_app`](examples/demo_app)
-shows all three
-([DEPLOYMENT.md](docs/DEPLOYMENT.md#durable-single-process-outbox-pattern)).
+## Why modulith
 
-**Process-per-module: one flag, still one host.**
-`modulith run myapp.main:app --topology=processes` gives each module its own
-process behind a single reverse-proxy port. The supervisor restarts crashed
-workers with exponential backoff and a crash-loop breaker, and the default
-SHM broker is a stdlib-only SQLite queue, so still no extra service to run.
-One hot module? `[tool.modulith.workers] reports = 4`.
+Most backends end up in one of two painful places:
 
-**Multi-host: swap the broker.** `broker = "redis-streams"` or
-`broker = "database"` (Postgres / MySQL) carries events across machines.
-`modulith k8s-manifest` emits a Deployment and Service per module plus one
-Ingress, `modulith openapi` merges every module's spec into one document,
-`modulith doctor` runs nine operational and architectural checks, and the
-`otel` extra adds an OpenTelemetry span per publication and per listener
-dispatch.
+- **A big ball of mud.** One app where everything imports everything. It is quick to start, then every change breaks something far away, and splitting it up means a rewrite.
+- **Microservices too early.** Network calls, a dozen deploy pipelines and a platform team, long before your traffic needs them.
 
-**Microservice: only when it pays.** `modulith extract <module>` scaffolds a
-standalone service from one module: its package tree plus `pyproject.toml`,
-`Dockerfile`, `README.md` and `.env.example`. The rest of the monolith keeps
-publishing through the broker and the extracted service subscribes. The
-service binds its outbox store from `MODULITH_OUTBOX_URL` and, when the outbox
-is not `memory`, refuses to start without one. Extraction copies the package-level helpers the module
-and its contracts import, transitively. It refuses a module with outbound
-boundary violations, tables shared with another module, or imports of another
-declared module unless you pass `--force`, and the generated README records
-what you overrode. It then imports the extracted module in a subprocess and
-fails, naming the missing import, if that import fails or loads first-party
-code from outside the extracted tree, so the service's third-party
-dependencies must be installed. `--force` never overrides that import check:
-a module-level import of another declared module still fails it, so only a
-deferred one (inside a function) can be forced through.
+modulith is the path in between:
 
-Adopting on an existing codebase? `modulith audit` writes a `MIGRATION.md`
-for it. `modulith verify --update-baseline` records today's violations in
-`.modulith-baseline.json`, which you commit, and `modulith verify
---mode=ratchet` then forbids new ones.
+- **Modules with walls.** Each module is a Python package with a public API. Names that start with `_` are private, and `modulith verify` fails your build when another module imports them.
+- **Events instead of calls.** A module publishes `OrderCreated`, and every module that cares reacts to it. The publisher never needs to know who is listening.
+- **One codebase, any shape.** The same modules run in one process, in one process per module, or as separate services. Config picks the shape.
+- **No lost events.** With the outbox on, an event published inside your database transaction is saved with your data, then retried until it is delivered or set aside as a *dead letter* you can replay.
 
-Where this stands, honestly: **pre-1.0 alpha**. Breaking changes may land in
-0.x minor releases and are always listed in [CHANGELOG.md](CHANGELOG.md).
-Every push runs ~2,380 hermetic tests on Python 3.11, 3.12 and 3.13 (Linux,
-with the SHM broker additionally on macOS and Windows) plus 116 integration
-tests against real Postgres, MySQL and Redis containers, which include every
-example README run from the built wheel.
+## How it grows with your company
 
----
+| When your company… | You change… | You get… |
+|---|---|---|
+| ships its first version | nothing: `uvicorn myapp.main:app` | one process, zero infrastructure |
+| adds engineers and teams | [`modulith verify`](#1-keep-modules-independent) in CI | boundaries nobody breaks by accident |
+| can't afford to lose data | [`outbox = "postgres"`](#2-never-lose-an-event), your database URL and a session around each write | events saved with your data, retried, and kept as dead letters if they keep failing |
+| sees one feature get busy | [`--topology processes`](#3-give-busy-modules-their-own-processes) plus a worker count | one process per module, and more of them for the busy one |
+| outgrows one server | [`broker = "redis-streams"`](#4-spread-across-machines) | events that travel between machines |
+| gives a team its own service | [`modulith extract <module>`](#5-split-off-a-service) | a standalone service built from one module |
 
-## Status
+Your events and listeners never change.
+The only code you add is a few lines of session wiring for the outbox, and your URLs stay the same as long as `main.py` mounts each module's `router` at `/<module>`, as the quickstart does.
 
-The core, the transactional outbox, the tooling and the process-per-module
-runtime are code-complete and green under `pytest`, `mypy --strict` and
-`ruff`; what remains before 1.0 is adapter breadth. [ROADMAP.md](ROADMAP.md)
-has the plan, [SPEC.md](SPEC.md) every design decision, and
-[`examples/quickstart`](examples/quickstart) is the project below, ready to
-run, and [`examples/demo_app`](examples/demo_app) is a runnable three-module
-shop wired purely through events.
+## Ready for AI
 
----
+### Call an LLM without slowing down your API
+
+Model calls are slow, rate-limited and sometimes fail.
+Give them their own module and trigger them with an event:
+
+```python
+# myapp/assistant/__init__.py, a new module that nothing else imports
+from modulith import listener
+
+from myapp.contracts.events import OrderCreated
+
+
+@listener
+async def write_thank_you_note(event: OrderCreated) -> None:
+    note = await llm.generate(f"Write a two-line thank-you note for order {event.order_id}")
+    await notes.save(event.order_id, note)  # llm and notes: your model client and your storage
+```
+
+Then choose how it runs. The listener does not change:
+
+- **With the outbox on** and the order published inside its database session ([step 2](#2-never-lose-an-event)), the note is written after the order commits, in the background, so placing an order stays fast. A failed model call is retried with backoff, up to 10 attempts by default, then kept as a dead letter. `modulith outbox dead-letter --retry-all` replays it by running the listener inside that command, so run it where your model credentials are.
+- **In its own processes** ([step 3](#3-give-busy-modules-their-own-processes)), a slow model cannot hold up your API, and `assistant = 4` under `[tool.modulith.workers]` gives the assistant four of them. There the broker retries a failed call instead, 5 times by default, and keeps its dead letters itself.
+- **As its own service** ([step 5](#5-split-off-a-service)), `modulith extract assistant` moves it onto GPU machines or to another team, while the rest of the app keeps publishing the same events.
+
+In the default single process, `publish()` waits for every listener and re-raises the first error, so a slow or failing model call slows down or fails the order request.
+With the outbox or a broker, events are delivered at least once, so make listeners safe to run twice, for example by skipping an order that already has a note.
+
+### Keep AI coding assistants inside the lines
+
+Coding assistants write code fast, and they import whatever makes it work.
+Say one fixes a bug in `payments` by adding `from myapp.orders import _orders`:
+
+```bash
+$ modulith verify
+
+payments:
+  [ERROR] no-internal-imports: payments imports _orders from orders, reaching into orders's private package. Cross-module access must go through orders's public API.  (myapp/payments/__init__.py:1)
+
+1 error(s), 0 warning(s)
+```
+
+It exits with code 1, so CI fails.
+Add it to your agent's instructions (`AGENTS.md`, `CLAUDE.md`) and the agent can catch the mistake before you see it.
+Small modules with a public API also keep the context an assistant needs small, and `modulith docs` draws Mermaid diagrams of how your modules connect.
 
 ## The 30-second pitch
+
+Three modules and one shared contract.
+`orders` publishes an event, `payments` and `inventory` react to it, and no module imports another.
+An event is any class marked `@event`; a frozen dataclass is the recommended shape.
 
 ```python
 # myapp/contracts/events.py
@@ -121,12 +119,6 @@ class OrderCreated:
 class PaymentReceived:
     order_id: str
 ```
-
-An event is any class marked `@event`; a frozen dataclass is the recommended
-shape because its value semantics give the outbox reliable round-trip
-fidelity (Cookbook recipes
-[1](docs/COOKBOOK.md#1-define-an-event-and-a-listener) and
-[2](docs/COOKBOOK.md#2-share-event-types-through-a-contracts-module)).
 
 ```python
 # myapp/orders/__init__.py
@@ -161,6 +153,21 @@ from myapp.orders.api import router as router  # noqa: E402
 ```
 
 ```python
+# myapp/payments/__init__.py
+from modulith import listener, publish
+
+from myapp.contracts.events import OrderCreated, PaymentReceived
+
+
+@listener
+async def charge(event: OrderCreated) -> None:
+    await publish(PaymentReceived(order_id=event.order_id))  # your real charge goes here
+```
+
+<details>
+<summary>The other three files: the orders routes, the inventory module and the app</summary>
+
+```python
 # myapp/orders/api.py
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -184,26 +191,6 @@ async def get_fulfilment(order_id: str) -> dict[str, str | bool]:
     if not is_fulfilled(order_id):
         raise HTTPException(status_code=404, detail="order not fulfilled")
     return {"order_id": order_id, "fulfilled": True}
-```
-
-The routes sit at the router root and `main.py` mounts the router under
-`/orders` — the same prefix a process-per-module worker uses, so both
-topologies serve the identical URLs, `POST /orders` and
-`GET /orders/{order_id}/fulfilment`.
-
-Two more modules react to `OrderCreated`. Neither is called by `orders`, and
-`orders` imports neither:
-
-```python
-# myapp/payments/__init__.py
-from modulith import listener, publish
-
-from myapp.contracts.events import OrderCreated, PaymentReceived
-
-
-@listener
-async def charge(event: OrderCreated) -> None:
-    await publish(PaymentReceived(order_id=event.order_id))  # your real charge goes here
 ```
 
 ```python
@@ -230,9 +217,6 @@ async def get_reservation(order_id: str) -> dict[str, str | bool]:
     return {"order_id": order_id, "reserved": True}
 ```
 
-`payments` has no HTTP surface, so it has no `router`. `inventory` defines
-its router in its own `__init__.py`.
-
 ```python
 # myapp/main.py
 import logging
@@ -249,8 +233,11 @@ app.include_router(orders_router, prefix="/orders")
 app.include_router(inventory_router, prefix="/inventory")
 
 # That's it. Modules auto-discovered. Listeners auto-registered.
-# Transactional outbox available with two config lines (outbox, outbox_url).
 ```
+
+</details>
+
+Run it:
 
 ```bash
 $ uvicorn myapp.main:app
@@ -262,15 +249,15 @@ INFO:modulith:outbox disabled — set [tool.modulith].outbox = 'postgres' for du
 INFO:modulith:ready
 ```
 
+modulith starts lazily, so its log lines appear on the first `publish()`: the order below.
+
 ```bash
 $ curl -sX POST localhost:8000/orders \
       -H 'content-type: application/json' -d '{"customer_id": "alice"}'
 {"order_id":"ord-1"}
 ```
 
-The order fans out through events, not calls: `payments` charged it and
-published `PaymentReceived`, which `orders` handled, while `inventory`
-reserved the stock.
+The order fanned out through events: `payments` charged it and published `PaymentReceived`, which marked it fulfilled, while `inventory` reserved the stock.
 
 ```bash
 $ curl -s localhost:8000/orders/ord-1/fulfilment
@@ -278,14 +265,6 @@ $ curl -s localhost:8000/orders/ord-1/fulfilment
 $ curl -s localhost:8000/inventory/ord-1
 {"order_id":"ord-1","reserved":true}
 ```
-
-The banner goes through the standard `modulith` logger at INFO level, which
-is why `main.py` calls `logging.basicConfig(level=logging.INFO)` under plain
-`uvicorn`; `modulith dev` and `modulith run` set the level from `--log-level`
-themselves. Bootstrap is lazy, so the banner appears on the first `publish()`
-— the `curl` above — not at process start.
-
----
 
 ## Quickstart
 
@@ -295,83 +274,73 @@ themselves. Bootstrap is lazy, so the banner appears on the first `publish()`
 pip install 'modupy[fastapi,cli]'
 ```
 
-- `pip install modupy` — framework only; `pluggy` is its single dependency
-- `pip install 'modupy[postgres]'` — adds the Postgres outbox
-- `pip install 'modupy[database]'` — adds the database broker
-- `pip install 'modupy[all]'` — installs everything
+`fastapi` brings FastAPI and uvicorn, and `cli` adds the `modulith` command.
+The other extras are `postgres` (the durable outbox), `redis` and `database` (brokers for more than one machine), `otel` (tracing), `test` (what the pytest fixtures use) and `all`.
+The core alone, `pip install modupy`, has one dependency: `pluggy`.
+The package is called `modupy` on PyPI because the name `modulith` was taken there; you still `import modulith` and run `modulith`.
 
-The `fastapi` extra (`fastapi`, `uvicorn`, `httpx`) is what the quickstart
-and the reverse proxy need; the `cli` extra adds the `modulith` command. The
-distribution is `modupy` on PyPI because the `modulith` name there belongs to
-an unrelated project — the import name and the CLI are both `modulith`.
+> The outbox wiring in [step 2](#2-never-lose-an-event) (`bind_session`, `modulith migrate` and the retry settings) arrives in the first release after 0.10.0. Until then, install from this repository: `pip install 'modupy[fastapi,cli] @ git+https://github.com/jeansossmeier/modupy'`.
 
-### Define modules as subpackages
+### Lay out your project
 
-```
-myproject/                         # project root
-├── pyproject.toml                 # [project].name or [tool.modulith].package
-│                                  # — required by the CLI, see below
+```text
+myproject/
+├── pyproject.toml          # names your package: [project] name = "myapp"
 └── myapp/
     ├── __init__.py
-    ├── contracts/
-    │   ├── __init__.py            # shared event definitions
+    ├── contracts/          # the events that modules share
+    │   ├── __init__.py
     │   └── events.py
+    ├── orders/             # a module: a package with a public API
+    │   ├── __init__.py     # public functions, plus `router` re-exported from api.py
+    │   ├── _internal/      # private: other modules may not import it
+    │   ├── api.py          # FastAPI routes
+    │   └── handlers.py     # @listener functions, imported by __init__.py
     ├── inventory/
     │   └── __init__.py
-    ├── orders/
-    │   ├── __init__.py            # public API + `router` re-export
-    │   ├── _internal/             # private — verifier blocks cross-module access
-    │   ├── api.py                 # FastAPI router — re-exported by __init__.py
-    │   └── handlers.py            # @listener functions (import from __init__.py!)
     ├── payments/
     │   └── __init__.py
-    └── main.py                    # FastAPI app
+    └── main.py             # the FastAPI app
 ```
 
-Every module directory needs an `__init__.py` — a namespace package is
-skipped silently — and `@listener` functions must be reachable from it
-(e.g. `from . import handlers`) to register at startup.
+Three rules keep this working:
 
-**Re-export each module's router from its `__init__.py`.** Under
-`--topology=processes` there is no `main.py` in the worker: each worker
-imports its own module package and mounts its `router` attribute under
-`/<module>`. Sibling modules that package imports are loaded too, but their
-listeners run only in their owner's worker. A router wired only through
-`main.py` serves nothing there —
-every route answers 404 while the worker reports healthy, and the worker log
-carries a warning naming the missing `router`. Cookbook recipe
-[8](docs/COOKBOOK.md#8-go-process-per-module-and-externalize-an-event) shows
-the re-export in context. A module with no HTTP surface needs no `router`; it
-still gets a worker and still consumes events.
+- Every module is a package with an `__init__.py`, and its `@listener` functions must be imported from there (for example `from . import handlers`) so they register.
+- Names that start with `_` are private to their module.
+- A module with routes re-exports its `router` from `__init__.py`, because a module running in its own process serves exactly that `router` under `/<module>`. A listener-only module like `payments` needs none.
 
-`pyproject.toml` is optional under `uvicorn` but required by every CLI command
-except `audit`. The minimum:
+The CLI finds your package through `pyproject.toml`, and one pytest setting lets your tests import it:
 
 ```toml
-# myproject/pyproject.toml
 [project]
 name = "myapp"
 version = "0.1.0"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
 ```
 
-### Run normally
+### Run it
 
 ```bash
 uvicorn myapp.main:app --reload
 ```
 
-Package detection, module discovery and listener registration are automatic
-and run at the first `publish()`. A durable outbox also needs the three steps under
-**Durable** above, including `modulith.bootstrap()` at startup. Call
-it at startup too when a manifest or boundary violation should stop the server
-from starting rather than fail its first `publish()`.
+Check the boundaries:
 
-### Run the same code process-per-module
+```bash
+$ modulith verify
+✓ no boundary violations
+```
+
+### Run the same code, one process per module
 
 ```bash
 $ modulith run myapp.main:app --topology=processes
 modulith → process-per-module: 3 worker(s) [inventory:9001, orders:9002, payments:9003], reverse proxy on http://0.0.0.0:8000
 ```
+
+Each module now runs in its own process behind one public port, so the URLs do not change:
 
 ```bash
 $ curl -sX POST localhost:8000/orders \
@@ -379,9 +348,7 @@ $ curl -sX POST localhost:8000/orders \
 {"order_id":"ord-1"}
 ```
 
-Each event now crosses a process boundary, so give the order a moment before
-reading it back; until `payments` has charged it, the fulfilment route
-answers 404.
+Events now cross process boundaries, so give the order a moment: until `payments` has charged it, the fulfilment route answers 404.
 
 ```bash
 $ curl -s localhost:8000/orders/ord-1/fulfilment
@@ -390,153 +357,315 @@ $ curl -s localhost:8000/inventory/ord-1
 {"order_id":"ord-1","reserved":true}
 ```
 
-The reverse proxy is the only public port and routes `/<module>/...` to that
-module's worker, so the URL is unchanged. `contracts` holds event
-definitions, not behaviour, so it gets no worker; every worker imports it
-directly. Cross-module events route through the configured broker
-automatically; mark an event `@externalized` when remote workers must consume
-it *in addition to* local listeners, or
-`@externalized(target="scheme:destination")` to pin its destination.
+`contracts` only defines events, so it gets no process of its own.
+The warnings at startup are about the default broker's production settings, which [step 3](#3-give-busy-modules-their-own-processes) covers.
 
----
+### Test it
 
-## Configuration
+modulith's pytest fixtures run a whole event flow in one process, with no server:
 
-Everything is in `pyproject.toml`. Defaults are good enough that most
-users never set anything beyond `outbox` and `outbox_url`:
+```python
+from modulith.testing import Scenario
+
+
+def test_an_order_gets_paid(scenario: Scenario) -> None:
+    from myapp.contracts.events import PaymentReceived
+    from myapp.orders import create_order
+
+    payment = scenario.call(create_order, "alice").expect_event(PaymentReceived).within(seconds=2)
+
+    assert payment.order_id == "ord-1"
+```
+
+Save it under `tests/`; the imports sit inside the test because each test gets a fresh copy of your modules.
+
+```bash
+pip install pytest
+pytest
+```
+
+## Grow it, step by step
+
+### 1. Keep modules independent
+
+Put the boundary check in CI, so nobody, human or AI, quietly couples two modules:
+
+```yaml
+# .github/workflows/ci.yml, in the job that installs your app's dependencies
+- run: pip install 'modupy[cli]'
+- run: modulith verify
+```
+
+As teams take ownership, give each module a manifest.
+modulith checks it when it boots, and `verify` uses it to police dependencies and table ownership:
+
+```python
+# myapp/orders/_manifest.py, optional
+from modulith import declare_module
+
+declare_module(
+    publishes=["OrderCreated"],
+    owns_tables=["orders_order"],
+    declared_dependencies=["contracts"],
+)
+```
+
+Set `strict_boundaries = true` and modulith refuses to boot on any boundary violation, warnings included.
+`verify` and `--topology processes` then fail before anything starts; in a single process, call `bootstrap()` at startup ([step 2](#2-never-lose-an-event) shows where) to fail there rather than at the first `publish()`.
+Single-process `modulith dev` only warns, so a violation never stops your dev server.
+
+### 2. Never lose an event
+
+The outbox writes each event you publish inside a database session into the same transaction as your data.
+If the transaction rolls back, the event is gone too; if the process crashes after the commit, the event is still there and is delivered after the app restarts.
+A `publish()` outside a session is delivered directly and saves nothing, so the session wiring below is required.
+
+```bash
+pip install 'modupy[postgres]'   # for MySQL or SQLite, use 'modupy[database]'
+```
 
 ```toml
 [tool.modulith]
-package = "myapp"               # falls back to [project].name
-outbox = "postgres"             # default "memory" — switch for production
-outbox_url = "postgresql+asyncpg://app@db/app"  # the business database; binds the store everywhere while auto_discover is on
-broker = "redis-streams"        # default "memory" (single) / "shm" (processes)
-topology = "single"             # "single" | "processes"
+outbox = "postgres"                              # the SQL outbox: Postgres, MySQL or SQLite
+outbox_url = "postgresql+asyncpg://app@db/app"   # your business database, or MODULITH_OUTBOX_URL
+```
+
+```bash
+modulith migrate   # creates the outbox tables in that database
+```
+
+Publish inside your transaction:
+
+```python
+# in myapp/orders/__init__.py
+from uuid import uuid4
+
+from modulith import publish
+from modulith.builtin.outbox import bind_session, unbind_session
+
+from myapp.contracts.events import OrderCreated
+
+
+async def create_order(customer_id: str) -> str:
+    order_id = str(uuid4())
+    async with sessionmaker() as session:  # your SQLAlchemy async sessionmaker
+        token = bind_session(session)
+        try:
+            session.add(Order(id=order_id, customer_id=customer_id))  # your model
+            await publish(OrderCreated(order_id=order_id))
+            await session.commit()  # the order and its event are saved together
+        finally:
+            unbind_session(token)
+    return order_id
+```
+
+And start the outbox with your app:
+
+```python
+# in myapp/main.py
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from modulith import bootstrap
+from modulith.builtin import outbox
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    bootstrap()
+    outbox.start()  # also redelivers what a crashed process left undelivered
+    yield
+    await outbox.shutdown()
+
+
+app = FastAPI(lifespan=lifespan)
+```
+
+Watch delivery, and fix it when a listener keeps failing:
+
+```bash
+modulith outbox status                    # incomplete, completed and dead-lettered counts
+modulith outbox dead-letter --retry-all   # replay the events whose listeners gave up
+```
+
+Retries are tuned under `[tool.modulith.outbox_options]`.
+[`examples/demo_app`](examples/demo_app) runs all of this on SQLite, then on Postgres.
+
+### 3. Give busy modules their own processes
+
+One flag runs every module in its own process, behind one public port:
+
+```bash
+modulith run myapp.main:app --topology processes
+```
+
+Give a busy module more processes:
+
+```toml
+[tool.modulith.workers]
+reports = 4   # every other module keeps the default of 1
+```
+
+Each process has its own memory and the proxy spreads requests across them, so keep that module's state in your database.
+A supervisor restarts a crashed worker after 1, 2, 4, 8, then 16 seconds, and gives up after six crashes in a row, leaving that module down until you fix it.
+Events between processes travel through a built-in queue on the same machine, so there is still nothing extra to install; in production, set its `state_dir` under `[tool.modulith.broker_options]` ([DEPLOYMENT.md](docs/DEPLOYMENT.md#process-per-module-topology)).
+
+### 4. Spread across machines
+
+Swap the broker, and events travel between hosts:
+
+```toml
+[tool.modulith]
+topology = "processes"
+broker = "redis-streams"   # reads REDIS_URL; pip install 'modupy[redis]'
+```
+
+Rather not run Redis?
+`broker = "database"` puts the queue in Postgres or MySQL instead: install `modupy[database]` and set `url` under `[tool.modulith.broker_options]` ([Cookbook](docs/COOKBOOK.md#use-a-shared-database-broker)).
+Delivery is at least once, so listeners must be safe to run twice.
+Then place modules on different machines: `modulith k8s-manifest` ([step 6](#6-run-it-in-production)) writes one Deployment per module, or start a single module anywhere with `MODULITH_MODULE=reports MODULITH_APP_PACKAGE=myapp uvicorn modulith._worker:create_app --factory`.
+
+### 5. Split off a service
+
+When a module needs its own deploys, its own team or its own hardware, extract it:
+
+```bash
+modulith extract payments --output payments-service
+cd payments-service
+cp .env.example .env   # then fill in your broker and database settings
+docker build -t payments-service .
+docker run --env-file .env -p 8000:8000 payments-service
+```
+
+This builds on step 4: the rest of the app must run with `topology = "processes"` and a shared broker, which `extract` also reads to pick the service's drivers.
+The service gets the module, its contracts, a `pyproject.toml`, a `Dockerfile`, a `README.md` and a `.env.example`.
+The rest of the app keeps publishing the same events through the broker, and the new service consumes them. Then delete the module from the main app, because while both run they split its events.
+`extract` refuses a module that still reaches into other modules or shares their tables, so the check from step 1 is what makes splitting safe.
+
+### 6. Run it in production
+
+```bash
+modulith k8s-manifest --image myapp:1.0.0   # a Deployment and a Service per module, plus one Ingress
+modulith openapi --output openapi.json      # one OpenAPI spec covering every module
+modulith doctor                             # architecture and operations health checks
+```
+
+`k8s-manifest` needs the shared broker from [step 4](#4-spread-across-machines).
+Install `modupy[otel]` and configure an OpenTelemetry tracer provider, and every publish and every listener call gets a span.
+
+## Already have a codebase?
+
+Adopt modulith one module at a time:
+
+```bash
+modulith audit                      # proposes modules and writes MIGRATION.md with a readiness score
+modulith verify --update-baseline   # accepts today's violations; commit .modulith-baseline.json
+modulith verify --mode=ratchet      # from now on, fails only on new violations
+```
+
+Keep `strict_boundaries` off while you adopt: with it on, `verify` fails at boot on the very violations the baseline should record.
+[MIGRATION_GUIDE.md](MIGRATION_GUIDE.md) walks through the whole move.
+
+## Configuration
+
+Everything lives in `pyproject.toml`, and the defaults need no changes to get started:
+
+```toml
+[tool.modulith]
+package = "myapp"                                # default: [project].name
+outbox = "postgres"                              # default: "memory"
+outbox_url = "postgresql+asyncpg://app@db/app"
+topology = "processes"                           # default: "single"
+broker = "redis-streams"                         # with processes, default "shm" ("database" if a broker url is set)
+strict_boundaries = true                         # refuse to boot on any boundary violation
 
 [tool.modulith.workers]
 default = 1
-reports = 4                     # this module gets 4 workers
+reports = 4
 ```
 
-Any *scalar* key has a `MODULITH_*` environment equivalent
-(`MODULITH_OUTBOX`, `MODULITH_BROKER`, `MODULITH_PRODUCTION`, …). The
-table-valued keys — `outbox_options`, `broker_options`, `workers` — are
-pyproject-only, though the SHM and database brokers lift their own
-`MODULITH_BROKER_<KEY>` variables on top and the Redis Streams broker reads
-`REDIS_URL`, `MODULITH_BROKER_DLQ_MAX_STREAM_LEN`,
-`MODULITH_BROKER_MAX_PAYLOAD_BYTES` and its stream variables (see the
-`modulith.adapters.redis_broker` docstring).
-
-Under `topology = "processes"` an omitted broker defaults to `shm`: despite
-the name, a same-host durable SQLite queue with at-least-once delivery, so
-listeners must be idempotent. Its default store location is keyed on the
-package's install path, so production deploys must set `state_dir` (see
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)). Use `redis-streams` or `database` (Postgres /
-MySQL) for cross-host delivery. Every option is documented in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
-[docs/COOKBOOK.md](docs/COOKBOOK.md): how settings resolve in §3, outbox claim
-strategies and retries in §7, SHM sizing and payload caps and database-broker
-polling, retention and dead-lettering in §8, and actuator protection in §10.
-
----
+Every setting directly under `[tool.modulith]` can also come from an environment variable, such as `MODULITH_OUTBOX_URL` or `MODULITH_BROKER`.
+[API_REFERENCE.md](docs/API_REFERENCE.md#configuration) lists every setting and its default, [ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how settings resolve (§3), outbox retries (§7) and brokers (§8), and [DEPLOYMENT.md](docs/DEPLOYMENT.md#actuator-access-_modulith) covers securing the actuator endpoints.
 
 ## CLI
 
-```bash
-modulith dev myapp.main:app       # like uvicorn --reload, with banner +
-                                  # boundary warnings at startup (non-fatal)
-modulith run myapp.main:app --topology=processes # production, process-per-module
-modulith verify --mode=ratchet    # boundary checks for CI
-                                  # (ERROR-severity failures always fatal)
-modulith verify --update-baseline # record today's violations as the baseline
-                                  # to commit (--mode=ratchet reads it)
-modulith docs                     # generate Mermaid diagrams + canvas
-modulith audit                    # analyze existing codebase for migration
-                                  # (writes MIGRATION.md; --output to change)
-modulith extract <module>         # scaffold a standalone service from one
-                                  # module (pyproject, Dockerfile, README)
-modulith k8s-manifest             # generate per-module Deployment/Service +
-                                  # one Ingress for --topology=processes
-modulith openapi                  # merge every module's OpenAPI doc into one
-                                  # build-time spec (schemas prefixed per module)
-modulith doctor                   # nine operational + architectural health checks
-modulith migrate [REVISION]       # apply the packaged outbox + broker_* Alembic
-                                  # migrations to outbox_url (--url, --schema)
-modulith outbox status            # outbox metrics (needs a durable outbox —
-                                  # the default 'memory' store has nothing to
-                                  # report and exits 1)
-modulith broker drop-group <group> [--target <target>]
-                                  # remove a retired module's consumer group, or
-                                  # only its stale targets (shm/database brokers;
-                                  # asks to confirm)
-modulith info                     # show detected config
-```
+| Command | What it does | When you use it |
+|---|---|---|
+| `modulith dev myapp.main:app` | runs with auto-reload and prints boundary warnings at startup | local development |
+| `modulith run myapp.main:app` | runs for production; add `--topology processes` for one process per module | deploying |
+| `modulith verify` | checks module boundaries and exits 1 on a violation | CI, and AI agents |
+| `modulith info` | shows the detected package, modules and settings | finding your way |
+| `modulith docs` | writes Mermaid diagrams of your modules to `docs/modulith` | onboarding |
+| `modulith doctor` | reports architecture and operations health | reviews and incidents |
+| `modulith migrate` | creates the outbox and database-broker tables | deploying |
+| `modulith outbox status` | counts incomplete, completed and dead-lettered events | operations |
+| `modulith outbox dead-letter` | lists dead-lettered events, or replays them with `--retry-all` | incidents |
+| `modulith broker drop-group <group>` | removes a retired module's consumer group | operations |
+| `modulith extract <module>` | turns one module into a standalone service | splitting a service off |
+| `modulith k8s-manifest` | writes Kubernetes manifests, one Deployment per module | deploying |
+| `modulith openapi` | merges every module's API into one OpenAPI file | API portals and clients |
+| `modulith audit` | assesses an existing codebase and writes `MIGRATION.md` | adopting modulith |
 
-`modulith dev` and `modulith run` take `--log-level` (default `info`,
-propagated to every worker); that default is what makes the banner, the
-boundary warnings and each worker's `[<module>]` output visible. The CLI
-needs a `pyproject.toml` — `[tool.modulith].package`, falling back to
-`[project].name` — in the current directory or a parent; `MODULITH_PACKAGE`
-is the escape hatch when there is none. Exit codes: **0** success, **1**
-violations or user error, **2** internal error or CLI usage error (click's
-convention). Set `strict_boundaries = true` in `[tool.modulith]` to make
-WARNING-severity findings fatal too in `verify`, `run` and
-`dev --topology=processes`; single-process `modulith dev` stays warn-only by
-design. `extract`, `k8s-manifest` and `openapi` import your application to
-build their artifacts — run them only against trusted source.
+Commands that inspect your modules find your package through `[tool.modulith].package`, else `[project].name`.
+Every command except `audit` and `migrate` imports your modules, `verify` included, so run them only on code you trust and where your app's dependencies are installed.
+`modulith dev` and `modulith run` take `--log-level` (default `info`) for the supervisor and every worker; in one process they hand over to uvicorn, so modulith's startup banner shows only if your app configures logging, as `myapp/main.py` does.
+With `strict_boundaries = true`, `verify`, `run --topology processes` and `dev --topology=processes` fail on warnings too; a single-process `run` fails when the app first boots modulith, and single-process `modulith dev` stays warn-only by design.
+Exit codes: 0 for success, 1 for violations or bad input, 2 for an internal error or a CLI usage error.
 
----
+## Examples
+
+CI runs every command in every example's README exactly as written, from a fresh install of the built package.
+
+| Example | Size | What it shows |
+|---|---|---|
+| [`quickstart`](examples/quickstart) | small: 3 modules | the code above, in one process and in one process per module |
+| [`demo_app`](examples/demo_app) | mid: a shop with a database | the durable outbox on SQLite, `modulith migrate`, a scaled module, then Postgres and Redis |
+| [`marketplace`](examples/marketplace) | large: 7 modules | a payment saga that undoes itself on failure, dead-letter recovery, a team boundary rule shipped as a plugin, tracing, Kubernetes and extracting a service |
+
+Single-file plugin examples: [a verifier rule](examples/naming_convention_verifier.py), [a Redis Streams broker](examples/redis_streams_broker.py) and [a storage serializer](examples/versioned_json_serializer.py).
+
+## Is modulith right for you?
+
+It fits teams of roughly 3 to 15 engineers building a Python product, often B2B SaaS, who want to put off microservices for as long as possible without painting themselves into a corner.
+If that is not you, it may not be the right fit; [SPEC.md](SPEC.md) Part II explains who it is for.
+
+| | modulith | FastAPI + folders | FastAPI + Celery + import-linter | Microservices |
+|---|---|---|---|---|
+| Module boundaries | ✓ enforced | ✗ convention only | ✓ enforced by import-linter | ✓ enforced by the network |
+| Events between modules | ✓ in-process or through a broker | ✗ do it yourself | ✓ Celery | ✓ broker only |
+| Transactional outbox | ✓ built in | ✗ do it yourself | ✗ do it yourself | ✗ do it yourself, per service |
+| One process per module | ✓ one flag | ✗ | ✗ Celery workers split by task queue, not by module | n/a, already separate |
+| Split a module into a service | ✓ `modulith extract` | ✗ by hand | ✗ by hand | n/a, already separate |
+| Adopting on an existing codebase | ✓ baseline and ratchet | n/a | ✓ | ✗ a rewrite |
+| Operational complexity | low | lowest | medium | highest |
+
+modulith is inspired by [Spring Modulith](https://spring.io/projects/spring-modulith).
+
+## Status
+
+modulith is a **pre-1.0 alpha**: breaking changes may land in 0.x minor releases, and each one is listed in [CHANGELOG.md](CHANGELOG.md).
+The core, the transactional outbox, the tooling and the process-per-module runtime are code-complete and pass `pytest`, `mypy --strict` and `ruff`; more adapters follow after 1.0, as users ask for them ([ROADMAP.md](ROADMAP.md)).
+Every pull request and every push to `main` runs ~2,380 hermetic tests on Python 3.11, 3.12 and 3.13 (Linux, with the SHM broker also on macOS and Windows), plus 116 integration tests against real Postgres, MySQL and Redis containers, which include every example README run from the built wheel.
+[STABILITY.md](docs/STABILITY.md) states what stays stable across 0.x releases.
 
 ## Documentation
 
-- **[SPEC.md](SPEC.md)** — complete project specification, every design decision (this is the canonical reference)
-- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — how modulith works internally: runtime, plugin contract, outbox, cross-process delivery, verifier
-- **[docs/COOKBOOK.md](docs/COOKBOOK.md)** — task-oriented recipes for common jobs
-- **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)** — the public API surface (generated from docstrings via `scripts/gen_api_reference.py`)
-- **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** — Docker/Kubernetes topologies, scaling strategies, health probes, operational playbooks
-- **[docs/STABILITY.md](docs/STABILITY.md)** — what is guaranteed across 0.x releases and on the way to 1.0
-- **[ROADMAP.md](ROADMAP.md)** — phase plan with checkboxes and kill criteria
-- **[MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)** — adopting on existing codebases
-- **[CONTRIBUTING.md](CONTRIBUTING.md)** — development setup, both test suites, lint and type checks
-- **[examples/quickstart](examples/quickstart)** — the pitch above as a runnable project, with its own tests
-- **[examples/demo_app](examples/demo_app)** — a runnable three-module shop; the fastest way to see modulith end-to-end
-
-Single-file plugin examples (a Redis Streams broker, a naming-convention
-verifier) live in `examples/`.
-
----
-
-## Comparison to alternatives
-
-| | modulith | Spring Modulith | bare FastAPI + folders | FastAPI + Celery + import-linter | microservices |
-|---|---|---|---|---|---|
-| Module boundaries | ✓ enforced | ✓ enforced | ✗ convention only | ✓ import-linter enforces | ✓ network-enforced |
-| Event-driven IPC | ✓ in-process or broker | ✓ in-process or broker | ✗ DIY | ✓ Celery | ✓ broker-only |
-| Transactional outbox | ✓ built-in | ✓ built-in | ✗ DIY | ✗ hand-rolled | ✓ DIY per service |
-| Migration path | ✓ ratchet from existing | ✓ ratchet | n/a | ✓ from existing | ✗ rewrite |
-| Process-per-module | ✓ optional | ✗ | ✗ | ✗ broker-based only | n/a — already separate |
-| Operational complexity | low | low | lowest | medium | highest |
-| Python | ✓ | ✗ Java | ✓ | ✓ | ✓ |
-
-The modulith pattern fits teams of 3-15 engineers building B2B SaaS in
-Python who want to delay microservices for as long as possible. If
-that's not you, modulith may not be the right fit. See SPEC.md Part II
-for the audience analysis.
-
----
+- [SPEC.md](SPEC.md): the full specification and every design decision
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how modulith works inside, from the runtime and plugins to the outbox, cross-process delivery and the verifier
+- [docs/COOKBOOK.md](docs/COOKBOOK.md): step-by-step recipes for common jobs
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): Docker and Kubernetes, scaling, health probes and operations
+- [docs/API_REFERENCE.md](docs/API_REFERENCE.md): the public API, generated from docstrings
+- [docs/STABILITY.md](docs/STABILITY.md): what is guaranteed across 0.x releases
+- [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md): adopting modulith in an existing codebase
+- [ROADMAP.md](ROADMAP.md): what comes next
+- [CHANGELOG.md](CHANGELOG.md): what changed in each release
 
 ## Contributing
 
-The design is opinionated; please read [SPEC.md](SPEC.md) before opening
-large PRs. The plugin contract (13 hookspecs, 5 protocols) is the most stable
-part of the project — additions are easy, signature changes require strong
-justification — and [STABILITY.md](docs/STABILITY.md) states what is
-guaranteed across 0.x releases. Development setup and both test suites (the
-hermetic default and the Docker-backed integration suite) are in
-[CONTRIBUTING.md](CONTRIBUTING.md).
-
----
+The design is opinionated, so please read [SPEC.md](SPEC.md) before opening a large PR.
+The plugin contract (13 hookspecs, 5 protocols) is the most stable part of the project: additions are easy, and signature changes need strong justification.
+Development setup and both test suites, the hermetic default and the Docker-backed integration suite, are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Copyright 2026 Jean Sossmeier. Apache-2.0 — see [LICENSE](LICENSE).
+Copyright 2026 Jean Sossmeier. Apache-2.0, see [LICENSE](LICENSE).
