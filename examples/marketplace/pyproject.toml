@@ -12,7 +12,10 @@ dependencies = ["modupy[fastapi,cli,postgres,database,otel]"]
 test = ["pytest", "pytest-asyncio"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["marketplace"]
+packages = ["marketplace", "marketplace_platform"]
+
+[project.entry-points."modulith"]
+marketplace_platform = "marketplace_platform"
 
 [tool.modulith]
 package = "marketplace"
