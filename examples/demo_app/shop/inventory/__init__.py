@@ -1,66 +1,31 @@
-"""Inventory module — reserves stock in reaction to orders.
-
-The ``@listener`` registers automatically when modulith discovers this module;
-no wiring code is needed. After reserving, it publishes ``StockReserved`` so
-downstream modules (notifications) can react in turn — a chain of independent
-modules, each ignorant of the others.
-
-Also exposes a read-only ``router`` for inspecting reserved stock, mounted at
-``/inventory`` by ``shop.main`` (single-process) and ``modulith._worker``
-(process-per-module), so ``GET /inventory/reserved`` works in both topologies.
-"""
-
-from __future__ import annotations
-
-from collections import deque
-
-from fastapi import APIRouter
-
+from fastapi import APIRouter, HTTPException
 from modulith import listener, publish
+from modulith.builtin.outbox import bind_session, unbind_session
+
 from shop.contracts.events import OrderPlaced, StockReserved
-
-reserved: deque[StockReserved] = deque(maxlen=1000)
-
-# The idempotency guard's memory, oldest-first. It outlives the ``reserved``
-# inspection window so a late redelivery is still suppressed, but it is
-# bounded too: past GUARD_MEMORY orders the oldest id is forgotten.
-GUARD_MEMORY = 10_000
-_reserved_order_ids: dict[str, None] = {}
-_in_flight: set[str] = set()
+from shop.database import sessionmaker
+from shop.inventory.models import Reservation
 
 router = APIRouter()
 
 
 @listener
 async def reserve_stock(event: OrderPlaced) -> None:
-    """Reserve stock for a placed order, then announce the reservation.
-
-    Guarded by order_id membership: outbox delivery is at-least-once
-    (``modulith/builtin/outbox.py`` module docstring — a listener may be
-    called more than once), so a redelivered OrderPlaced must not reserve
-    stock (or publish StockReserved) twice.
-
-    The order is recorded only after ``publish`` returns. A failed publish
-    raises, the event is redelivered, and the redelivery publishes again
-    instead of being swallowed as a duplicate. A delivery that arrives while
-    the same order is still publishing is dropped: if that publish fails, its
-    own redelivery publishes.
-    """
-    if event.order_id in _reserved_order_ids or event.order_id in _in_flight:
-        return
-    _in_flight.add(event.order_id)
-    try:
-        evt = StockReserved(order_id=event.order_id)
-        await publish(evt)
-        _reserved_order_ids[event.order_id] = None
-        if len(_reserved_order_ids) > GUARD_MEMORY:
-            del _reserved_order_ids[next(iter(_reserved_order_ids))]
-        reserved.append(evt)
-    finally:
-        _in_flight.discard(event.order_id)
+    async with sessionmaker() as session:
+        token = bind_session(session)
+        try:
+            if await session.get(Reservation, event.order_id) is not None:
+                return
+            await publish(StockReserved(order_id=event.order_id))
+            session.add(Reservation(order_id=event.order_id))
+            await session.commit()
+        finally:
+            unbind_session(token)
 
 
-@router.get("/reserved")
-async def list_reserved() -> dict[str, list[str]]:
-    """Inspect which orders currently have stock reserved."""
-    return {"reserved": [evt.order_id for evt in reserved]}
+@router.get("/reservations/{order_id}")
+async def read_reservation(order_id: str) -> dict[str, str | bool]:
+    async with sessionmaker() as session:
+        if await session.get(Reservation, order_id) is None:
+            raise HTTPException(status_code=404, detail="no reservation")
+    return {"order_id": order_id, "reserved": True}

@@ -1,89 +1,34 @@
-# Demo app configuration.
-#
-# The presence of [tool.modulith] here lets the CLI auto-detect the
-# application package when you run `modulith verify` / `modulith info` /
-# `modulith docs` from this directory. The CLI also puts the directory holding
-# this file on sys.path, so the uninstalled `shop` package imports without any
-# PYTHONPATH prefix.
-
 [project]
 name = "modulith-demo-shop"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["modupy[fastapi,cli]"]
+dependencies = ["modupy[fastapi,cli,postgres]", "aiosqlite"]
 
 [project.optional-dependencies]
-# Durable transactional outbox (Postgres-backed, or SQLite for zero-infra).
-# Combines outbox delivery reliability with single-process or multi-process topology.
-durable = ["modupy[postgres]", "aiosqlite"]
-
-# Cross-process via Redis Streams broker.
-# Requires redis-streams to be enabled in [tool.modulith].
 redis = ["modupy[redis]"]
-
-# Cross-process via relational database broker (Postgres/MySQL/SQLite).
-# Zero-infra default uses SQLite; Postgres uses the same outbox DB.
-database = ["modupy[database]", "aiosqlite"]
-
-# OpenTelemetry auto-instrumentation for distributed tracing.
-otel = ["modupy[otel]"]
-
-# Test suite dependencies (pytest, pytest-asyncio, mock DBs).
-test = ["modupy[test]", "pytest", "pytest-asyncio"]
-
-# All features (all brokers, observability, test infrastructure).
-all = ["modupy[fastapi,cli,postgres,redis,database,otel,test]", "aiosqlite"]
+test = ["pytest", "pytest-asyncio"]
 
 [tool.modulith]
 package = "shop"
-# contracts_module defaults to "contracts" (this demo uses that convention);
-# set it here to use a different name for the shared-events subpackage.
 
-# --- PROFILE: Default (single-process, in-memory, zero-infra) ---
-# This is the default — no configuration needed. Suitable for development
-# and learning. Single ASGI app, no workers, no database, events live in RAM.
-# Run: modulith dev shop.main:app
+[tool.modulith.workers]
+inventory = 2
 
-# --- PROFILE: Durable transactional outbox (single-process + reliable delivery) ---
-# Ensures messages are persisted before the API response returns.
-# Reads MODULITH_OUTBOX and MODULITH_DB_URL environment variables.
-# Suitable for systems requiring durability guarantees.
-#
-# Uncomment to enable:
-# outbox = "postgres"
-# Set MODULITH_DB_URL to one of:
-#   sqlite+aiosqlite:///./demo.db                (zero-infra SQLite)
-#   postgresql+asyncpg://user:pass@localhost/db  (Postgres via docker-compose)
+[tool.modulith.broker_options]
+state_dir = ".modulith"
 
-# --- PROFILE: Cross-process via database broker (multi-process + zero-infra) ---
-# Distributes work across multiple processes using a relational database
-# as the inter-process message bus. Uses SQLite by default (zero-infra).
-# Reads MODULITH_BROKER, MODULITH_BROKER_URL, MODULITH_BROKER_POLL_INTERVAL_MS.
-# Run: modulith run shop.main:app --topology processes
-#
-# Uncomment to enable:
-# broker = "database"
-# topology = "processes"
-# [tool.modulith.broker_options]
-# url = "sqlite+aiosqlite:////absolute/path/to/demo-broker.db"
-# poll_interval_ms = 100
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
 
-# --- PROFILE: Cross-process via Redis Streams broker (multi-process + Redis) ---
-# Distributes work across multiple processes using Redis Streams as the
-# inter-process message bus. Requires docker-compose up -d redis.
-# Reads MODULITH_BROKER, REDIS_URL, MODULITH_STREAM_PREFIX.
-# Run: modulith run shop.main:app --topology processes
-#
-# Uncomment to enable:
-# broker = "redis-streams"
-# topology = "processes"
-# [tool.modulith.broker_options]
-# url = "redis://:modulith@localhost:6379"
-# stream_prefix = "modulith.demo"
+[tool.ruff]
+line-length = 100
+target-version = "py311"
 
-# --- Per-module concurrency (optional) ---
-# Customize the number of workers per module in multi-process topology.
-# Omit to use the default (1 worker per module).
-# [tool.modulith.workers]
-# default = 1
-# reports = 2  # Example: "reports" module gets 2 workers
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["shop"]
+known-third-party = ["modulith"]

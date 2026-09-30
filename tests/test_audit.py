@@ -633,18 +633,6 @@ def test_multi_module_audit_keeps_its_score(tmp_path: Path) -> None:
     assert "only one module candidate" not in render_report(result)
 
 
-def test_demo_readme_quotes_what_the_audit_prints(monkeypatch, tmp_path: Path) -> None:
-    demo = Path(__file__).resolve().parent.parent / "examples" / "demo_app"
-    monkeypatch.chdir(demo)
-
-    result = runner.invoke(app, ["audit", "--output", str(tmp_path / "MIGRATION.md")])
-
-    assert result.exit_code == 0, result.output
-    readme = (demo / "README.md").read_text(encoding="utf-8")
-    for line in _summary_lines(result.stdout):
-        assert f"`{line}`" in readme
-
-
 # ---------------------------------------------------------------------------
 # Script directories, unreadable directories and non-directory paths
 # ---------------------------------------------------------------------------

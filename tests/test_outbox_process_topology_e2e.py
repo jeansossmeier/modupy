@@ -8,14 +8,15 @@ worker's transaction is stored as an outbox row in that transaction and, after
 commit, delivered through the SQLite database broker to the billing worker's
 listener.
 
-Spawns real uvicorn subprocesses (slow) -> ``@pytest.mark.integration``, like
-``test_demo_app_topology.py``; no server or container is needed.
+Spawns real uvicorn subprocesses (slow) -> ``@pytest.mark.integration``; no
+server or container is needed.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from textwrap import dedent
 
@@ -183,7 +184,7 @@ async def test_transactional_publish_in_one_worker_is_stored_and_delivered_in_an
         await supervisor.stop()
 
     async with engine.connect() as conn:
-        orders = (await conn.execute(text("SELECT id FROM orders"))).scalars().all()
+        orders: Sequence[str] = (await conn.execute(text("SELECT id FROM orders"))).scalars().all()
         rows = (
             await conn.execute(
                 text("SELECT listener, completed_at IS NOT NULL FROM event_publications")

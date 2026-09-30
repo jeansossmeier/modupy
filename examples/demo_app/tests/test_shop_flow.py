@@ -1,89 +1,116 @@
-"""Zero-infra example tests for the demo shop, using the modulith pytest plugin.
+from pathlib import Path
 
-Runs against the real ``shop`` package (auto-discovered, default in-memory
-bus) — no Docker, no external services. Demonstrates the ``scenario`` and
-``modulith_app`` fixtures the plugin ships (auto-loaded via the ``pytest11``
-entry point) as living documentation for anyone building their own modulith
-app's tests.
-"""
-
-from __future__ import annotations
-
+import aiosqlite  # noqa: F401
+import pytest
+import sqlalchemy.ext.asyncio
+import sqlalchemy.orm  # noqa: F401
+from fastapi.testclient import TestClient
 from modulith.testing import ModulithTestApp, Scenario
 
+# The three imports above stay at module scope on purpose: modulith_app drops
+# every module first imported during a test, and SQLAlchemy cannot be
+# re-imported once its compiled extensions are dropped.
 
-def _bootstrap_shop() -> None:
-    """Configure and bootstrap the real ``shop`` package for a test."""
-    from modulith import configure
-    from modulith.runtime import _runtime
-
-    configure(package="shop", auto_discover=True)
-    _runtime.ensure_bootstrapped()
+ORDER = {"order_id": "o-1", "customer_id": "alice", "total": 19.99}
 
 
-def test_order_placed_triggers_stock_reserved_via_scenario(scenario: Scenario) -> None:
-    """``scenario.publish(...).expect_event(...).within(...)`` across modules."""
-    from shop.contracts.events import OrderPlaced, StockReserved
+def create_schema(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("MODULITH_OUTBOX_URL", f"sqlite+aiosqlite:///{tmp_path / 'shop.db'}")
+    from shop.schema import create_tables
 
-    _bootstrap_shop()
-
-    result = (
-        scenario.publish(OrderPlaced(order_id="s-1", customer_id="cust-1", total=9.99))
-        .expect_event(StockReserved)
-        .matching(lambda e: e.order_id == "s-1")
-        .within(seconds=2)
-    )
-
-    assert isinstance(result, StockReserved)
-    assert result.order_id == "s-1"
+    create_tables()
 
 
-async def test_place_order_is_captured_by_modulith_app(modulith_app: ModulithTestApp) -> None:
-    """``modulith_app`` captures every event ``place_order`` publishes."""
-    from shop.contracts.events import OrderPlaced
-    from shop.orders import place_order
-
-    _bootstrap_shop()
-
-    order_id = await place_order(customer_id="c-9", total=3.5)
-
-    captured = modulith_app.published_events_of_type(OrderPlaced)
-    assert any(evt.order_id == order_id for evt in captured)
-
-
-async def test_reserve_stock_dedup_survives_1000_order_boundary(
-    modulith_app: ModulithTestApp,
+def test_an_order_flows_through_all_three_modules(
+    modulith_app: ModulithTestApp, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """At-least-once redelivery is deduped even after 1000 intervening orders."""
+    create_schema(monkeypatch, tmp_path)
+    from shop.main import app
+
+    with TestClient(app) as client:
+        created = client.post("/orders", json=ORDER)
+        order = client.get("/orders/o-1")
+        reservation = client.get("/inventory/reservations/o-1")
+        notification = client.get("/notifications/o-1")
+
+    assert created.status_code == 200
+    assert created.json() == {"order_id": "o-1"}
+    assert order.json() == ORDER
+    assert reservation.json() == {"order_id": "o-1", "reserved": True}
+    assert notification.json() == {"order_id": "o-1", "notified": True}
+
+
+def test_each_event_is_published_once(
+    modulith_app: ModulithTestApp, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    create_schema(monkeypatch, tmp_path)
     from shop.contracts.events import OrderPlaced, StockReserved
-    from shop.inventory import reserve_stock
-    from shop.inventory import reserved as reserved_deque
-    from shop.orders import place_order
+    from shop.main import app
 
-    _bootstrap_shop()
+    with TestClient(app) as client:
+        client.post("/orders", json=ORDER)
 
-    target_event = OrderPlaced(order_id="target-123", customer_id="c-target", total=1.0)
-    await reserve_stock(target_event)
-    modulith_app.reset()
+    assert modulith_app.published_events_of_type(OrderPlaced) == [OrderPlaced(**ORDER)]
+    assert modulith_app.published_events_of_type(StockReserved) == [StockReserved(order_id="o-1")]
 
-    for i in range(1000):
-        await place_order(customer_id=f"c-{i}", total=float(i))
 
-    target_exists_after_eviction = any(
-        evt.order_id == target_event.order_id for evt in reserved_deque
-    )
-    assert not target_exists_after_eviction, (
-        "Target should be evicted from bounded deque after 1000 intervening orders"
-    )
+def test_a_duplicate_order_id_is_rejected_without_a_second_event(
+    modulith_app: ModulithTestApp, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    create_schema(monkeypatch, tmp_path)
+    from shop.contracts.events import OrderPlaced
+    from shop.main import app
 
-    modulith_app.reset()
+    with TestClient(app) as client:
+        first = client.post("/orders", json=ORDER)
+        second = client.post("/orders", json=ORDER)
 
-    await reserve_stock(target_event)
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert len(modulith_app.published_events_of_type(OrderPlaced)) == 1
 
-    redelivered_stock_reserved = modulith_app.published_events_of_type(StockReserved)
-    target_reservations = [
-        evt for evt in redelivered_stock_reserved if evt.order_id == target_event.order_id
-    ]
-    assert len(target_reservations) == 0, (
-        "Redelivered event should be deduped and not republish StockReserved"
-    )
+
+def test_a_redelivered_order_reserves_stock_once(
+    scenario: Scenario,
+    modulith_app: ModulithTestApp,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    create_schema(monkeypatch, tmp_path)
+    from shop.contracts.events import OrderPlaced, StockReserved
+
+    placed = OrderPlaced(**ORDER)
+
+    scenario.publish(placed).expect_event(StockReserved).within(seconds=2)
+    scenario.publish(placed).expect_event(OrderPlaced).within(seconds=2)
+
+    assert modulith_app.published_events_of_type(StockReserved) == [StockReserved(order_id="o-1")]
+
+
+@pytest.mark.parametrize(
+    ("module", "route"),
+    [
+        ("orders", "/orders/{order_id}"),
+        ("inventory", "/inventory/reservations/{order_id}"),
+        ("notifications", "/notifications/{order_id}"),
+    ],
+)
+def test_a_worker_mounts_only_its_own_router(
+    modulith_app: ModulithTestApp,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    module: str,
+    route: str,
+) -> None:
+    from modulith._worker import create_app
+
+    monkeypatch.setenv("MODULITH_OUTBOX_URL", f"sqlite+aiosqlite:///{tmp_path / 'shop.db'}")
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv("MODULITH_MODULE", module)
+    monkeypatch.setenv("MODULITH_APP_PACKAGE", "shop")
+
+    paths = create_app().openapi()["paths"]
+
+    assert route in paths
+    mounted = {path.split("/")[1] for path in paths}
+    assert mounted & {"orders", "inventory", "notifications"} == {module}
