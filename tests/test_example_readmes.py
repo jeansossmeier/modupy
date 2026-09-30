@@ -375,6 +375,33 @@ def _finish(process: subprocess.Popen[bytes], timeout: float) -> int | None:
     return status
 
 
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _stop_group(process: subprocess.Popen[bytes], wait: float) -> None:
+    """Give the group ``wait`` seconds to end after SIGINT, then SIGKILL what is left.
+
+    The leader is reaped as soon as it exits, so only live members keep the group
+    alive. The kernel does not hand out a process id that still names a process
+    group, so a group that is still alive cannot belong to anything else.
+    """
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        process.poll()
+        if not _group_alive(process.pid):
+            break
+        time.sleep(0.05)
+    if _group_alive(process.pid):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+
+
 def _run_shell(
     command: str, env: Mapping[str, str], cwd: Path, timeout: float, *, merge: bool = True
 ) -> tuple[int | None, str, str]:
@@ -550,7 +577,7 @@ class Runbook:
         raise RunbookFailure(f"{self.readme}:{command.line}: {reason}\n\n{self.transcript}")
 
     def _ports(self) -> dict[int, int]:
-        return {port: at for serve in self._serves for port, at in serve.ports.items()}
+        return {port: at for serve in self._serves for port, at in serve.mapped().items()}
 
     def _run_step(self, step: Step, command: Command) -> None:
         words = step.command.split()
@@ -597,32 +624,28 @@ class Runbook:
 
     def _serve(self, step: Step, command: Command) -> None:
         text = step.command
-        workers = re.search(r"--topology[= ]processes", text) is not None
         base = _free_port_block(PORT_BLOCK)
         ports = {_option(text, "--port", 8000): base}
-        if workers:
-            first = _option(text, "--worker-port-base", 9001)
-            ports.update({first + offset: base + 1 + offset for offset in range(PORT_BLOCK - 1)})
+        first = _option(text, "--worker-port-base", 9001)
+        workers = {first + offset: base + 1 + offset for offset in range(PORT_BLOCK - 1)}
         for holder in [serve for serve in self._serves if serve.ports.keys() & ports.keys()]:
             self._stop_serve(holder, check=True)
-        executed = _rewrite(text, {**self._ports(), **ports})
+        executed = _rewrite(text, {**self._ports(), **ports, **workers})
         if not re.search(r"(?<![\w-])--port[= ]", text):
             executed += f" --port {base}"
-        if workers and not re.search(r"(?<![\w-])--worker-port-base[= ]", text):
-            executed += f" --worker-port-base {base + 1}"
         self._log.append(f"$ {executed}\n(serve)\n")
         log = self.workdir / f".serve-{len(self.pgids)}.log"
         with log.open("wb") as out:
             process = subprocess.Popen(
                 ["bash", "-c", executed],
                 cwd=self.workdir,
-                env=self.env,
+                env={**self.env, "MODULITH_WORKER_PORT_BASE": str(base + 1)},
                 stdin=subprocess.DEVNULL,
                 stdout=out,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-        serve = _Serve(executed, command, process, log, ports)
+        serve = _Serve(executed, command, process, log, ports, workers)
         self._serves.append(serve)
         self.pgids.append(process.pid)
         self._await_ready(serve, base)
@@ -645,11 +668,9 @@ class Runbook:
     def _not_ready(self, serve: _Serve, base: int) -> str:
         if _http_status(base, "/") is None:
             return f"no HTTP answer on port {base}"
-        if len(serve.ports) == 1:
-            return ""
         banner = WORKER_BANNER.search(serve.text())
         if banner is None:
-            return "no worker banner in the log yet"
+            return ""
         for port in re.findall(r":(\d+)", banner.group(1)):
             if _http_status(int(port), "/health") != 200:
                 return f"GET /health on worker port {port} did not answer 200"
@@ -670,7 +691,7 @@ class Runbook:
         self._serves.remove(serve)
         with contextlib.suppress(ProcessLookupError):
             os.killpg(serve.process.pid, signal.SIGINT)
-        _finish(serve.process, self.stop_wait)
+        _stop_group(serve.process, self.stop_wait)
         log = serve.text()
         self._log.append(f"[log of {serve.executed}]\n{_shown(log)}")
         line = _missing_line(serve.command.output, _map_back(log, documented))
@@ -699,9 +720,14 @@ class _Serve:
     process: subprocess.Popen[bytes]
     log: Path
     ports: dict[int, int]
+    workers: dict[int, int]
 
     def text(self) -> str:
         return self.log.read_text(encoding="utf-8", errors="replace")
+
+    def mapped(self) -> dict[int, int]:
+        """The ports this serve is known to hold; its workers count once its banner names them."""
+        return {**self.ports, **self.workers} if WORKER_BANNER.search(self.text()) else self.ports
 
 
 def _readme(tmp_path: Path, *lines: str) -> Path:
@@ -1431,18 +1457,28 @@ def test_a_free_port_block_is_bindable_all_at_once() -> None:
 
 
 SERVER = """
+import os
 import signal
+import subprocess
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+SLOW_CHILD = (
+    "import pathlib, signal, time, os; "
+    "signal.signal(signal.SIGINT, lambda *_: (time.sleep(1), "
+    "pathlib.Path('child.done').write_text('done'), os._exit(0))); "
+    "[time.sleep(0.1) for _ in iter(int, 1)]"
+)
 
 
 def option(flag, default):
     return int(sys.argv[sys.argv.index(flag) + 1]) if flag in sys.argv else default
 
 
-port, workers = option("--port", 8000), option("--worker-port-base", 9001)
+port = option("--port", 8000)
+workers = option("--worker-port-base", int(os.environ.get("MODULITH_WORKER_PORT_BASE", "9001")))
 if "--exit" in sys.argv:
     sys.exit(3)
 if "--ignore-sigint" in sys.argv:
@@ -1467,7 +1503,9 @@ def serve(number, broken=False):
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
-if "--topology=processes" in sys.argv:
+if "--slow-child" in sys.argv:
+    subprocess.Popen([sys.executable, "-c", SLOW_CHILD])
+if "--topology=processes" in sys.argv or "--with-workers" in sys.argv:
     for offset in (0, 1, 2):
         serve(workers + offset, broken="--broken-worker" in sys.argv)
     print(
@@ -1538,9 +1576,81 @@ def test_a_processes_serve_gets_a_worker_port_base_and_its_banner_maps_back(
         files=SERVED,
     )
 
-    executed = re.search(r"--port (\d+) --worker-port-base (\d+)\n", runbook.transcript)
+    assert "--worker-port-base" not in runbook.transcript.split("\n[log of")[0]
+    assert _all_gone(runbook)
+
+
+def test_a_serve_with_no_port_flag_puts_its_workers_on_the_allocated_block_through_the_environment(
+    tmp_path: Path,
+) -> None:
+    command = "python server.py --with-workers"
+    runbook = _run(
+        tmp_path,
+        *_bash(
+            f"$ {command}",
+            "3 worker(s) [inventory:9001, orders:9002, payments:9003], "
+            "reverse proxy on http://0.0.0.0:8000",
+            "$ curl -s localhost:9003/health",
+            "hello from 9003",
+        ),
+        steps=(Step(command, serve=True), Step("curl -s localhost:9003/health")),
+        files=SERVED,
+    )
+
+    executed = re.search(r"\$ python server\.py --with-workers --port (\d+)\n", runbook.transcript)
     assert executed is not None
-    assert int(executed.group(2)) == int(executed.group(1)) + 1
+    base = int(executed.group(1))
+    assert f"[inventory:{base + 1}, orders:{base + 2}, payments:{base + 3}]" in runbook.transcript
+    assert "--worker-port-base" not in runbook.transcript.split("\n[log of")[0]
+    assert _all_gone(runbook)
+
+
+def test_the_worker_port_variable_belongs_to_its_serve_step_only(tmp_path: Path) -> None:
+    command = "python server.py --with-workers"
+    runbook = _run(
+        tmp_path,
+        *_bash(f"$ {command}", "$ printenv MODULITH_WORKER_PORT_BASE"),
+        steps=(
+            Step(command, serve=True),
+            Step("printenv MODULITH_WORKER_PORT_BASE", exit_code=1),
+        ),
+        files=SERVED,
+    )
+
+    assert "MODULITH_WORKER_PORT_BASE" not in runbook.env
+
+
+def test_an_explicit_worker_port_base_flag_wins_over_the_variable(tmp_path: Path) -> None:
+    command = "python server.py --with-workers --worker-port-base 9001"
+    runbook = _run(
+        tmp_path,
+        *_bash(
+            f"$ {command}",
+            "3 worker(s) [inventory:9001, orders:9002, payments:9003], "
+            "reverse proxy on http://0.0.0.0:8000",
+        ),
+        steps=(Step(command, serve=True),),
+        files=SERVED,
+    )
+
+    executed = next(line for line in runbook.transcript.splitlines() if line.startswith("$ python"))
+    assert executed.count("--worker-port-base") == 1
+    assert "9001" not in executed
+    assert _all_gone(runbook)
+
+
+def test_a_group_member_finishing_its_graceful_shutdown_is_not_killed(tmp_path: Path) -> None:
+    command = "python server.py --slow-child"
+
+    runbook = _run(
+        tmp_path,
+        *_bash(f"$ {command}"),
+        steps=(Step(command, serve=True),),
+        files=SERVED,
+        stop_wait=20.0,
+    )
+
+    assert (runbook.workdir / "child.done").read_text() == "done"
     assert _all_gone(runbook)
 
 
