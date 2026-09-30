@@ -209,12 +209,9 @@ async def test_unbind_session_with_raw_session_binding(engine) -> None:
         outer_token = bind_session(outer)
         assert outbox._bound_session() is outer
 
-        # Simulate a raw session binding (as though it came from an older
-        # codebase or internal path that set _current_session directly).
         raw_inner_token = outbox._current_session.set(inner)
         assert outbox._bound_session() is inner
 
-        # Unbind the raw session: should restore the outer _SessionBinding.
         unbind_session(raw_inner_token)
         assert outbox._bound_session() is outer
 

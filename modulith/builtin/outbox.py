@@ -137,22 +137,23 @@ def _bound_session() -> Any | None:
 def bind_session(session: Any) -> Any:
     """Bind a SQLAlchemy session to the current context.
 
-    Call at the start of a request/transaction so publish() finds the session
-    via ``_current_session``. Returns the contextvar token; pass it to
-    ``unbind_session`` when the request ends::
+    Call at the start of a transaction so publish() finds the session via
+    ``_current_session``. Returns the contextvar token; pass it to
+    ``unbind_session`` when the transaction ends::
 
-        @app.post("/orders")
-        async def create_order(order_data: dict) -> dict:
+        async def place_order(order_id: str) -> None:
             async with async_session_maker() as session:
                 token = bind_session(session)
                 try:
-                    order = Order(**order_data)
-                    session.add(order)
-                    await publish(OrderCreated(order_id=order.id))
+                    session.add(Order(id=order_id))
+                    await publish(OrderPlaced(order_id=order_id))
                     await session.commit()
-                    return {"order_id": order.id}
                 finally:
                     unbind_session(token)
+
+    Commit before the route returns, as ``place_order`` does. FastAPI runs a
+    ``yield`` dependency's teardown after the response is sent, so a commit
+    there can fail after the client has already received a 200.
 
     A publish while bound joins the session's open transaction (autobegun if
     needed) and is delivered only when a later ``commit()`` covers it. A
