@@ -1,7 +1,8 @@
 # modulith Cookbook
 
 Task-oriented recipes for common jobs. Each one uses only the documented public
-API (see [API_REFERENCE.md](API_REFERENCE.md)); for the design behind them see
+API (see [API_REFERENCE.md](API_REFERENCE.md)) plus the documented wiring
+surface (see [STABILITY.md](STABILITY.md)); for the design behind them see
 [ARCHITECTURE.md](ARCHITECTURE.md) and [SPEC.md](../SPEC.md). The runnable
 end-to-end version of recipes 1–5 lives in
 [`examples/demo_app`](../examples/demo_app).
@@ -15,10 +16,13 @@ end-to-end version of recipes 1–5 lives in
 5. [Declare a manifest and let bootstrap verify it](#5-declare-a-manifest-and-let-bootstrap-verify-it)
 6. [Enable the durable Postgres outbox](#6-enable-the-durable-postgres-outbox)
     - [Coordinating concurrent sweepers](#coordinating-concurrent-sweepers)
+    - [Putting the outbox in a per-module schema](#putting-the-outbox-in-a-per-module-schema)
 7. [Choose an outbox completion mode](#7-choose-an-outbox-completion-mode)
 8. [Go process-per-module and externalize an event](#8-go-process-per-module-and-externalize-an-event)
     - [Durable local SHM default](#durable-local-shm-default)
     - [Use a shared database broker](#use-a-shared-database-broker)
+    - [No-subscriber and orphan-replay policies](#no-subscriber-and-orphan-replay-policies)
+    - [Declaring broker destinations](#declaring-broker-destinations)
 9. [Test an event flow with the pytest plugin](#9-test-an-event-flow-with-the-pytest-plugin)
 10. [Enforce boundaries in CI](#10-enforce-boundaries-in-ci)
 11. [Extend modulith with a plugin](#11-extend-modulith-with-a-plugin)
@@ -54,7 +58,14 @@ async def reserve_stock(event: OrderPlaced) -> None:
 The event type is inferred from the annotation, so `@listener` needs no
 arguments. Listeners may be `async def` (preferred) or plain `def` (recipe 4).
 Multiple listeners can subscribe to the same event; they run concurrently and
-one failing does not block the others.
+one failing does not block the others. Once they have all finished, `publish()`
+re-raises the first failure, in registration order, to the publisher. That
+holds for the in-memory path; under the durable outbox (recipe 6) listeners run
+after commit, so a failure is retried and never reaches the publisher.
+
+Dispatch is by exact type: a listener receives only events whose class is the
+annotated one. A listener annotated with a base class does not receive its
+subclasses' events, so give each event type its own listener.
 
 > **Registration timing.** Discovery imports each module *package*, so keep
 > `@listener` functions reachable from the module's `__init__.py` (e.g.
@@ -222,7 +233,7 @@ declare_module(
     consumes=["OrderPlaced"],
     publishes=["StockReserved"],
     listeners=[handlers.reserve_stock],
-    owns_tables=["stock_levels"],
+    owns_tables=["inventory_stock_levels"],
     declared_dependencies=["contracts"],
 )
 ```
@@ -236,8 +247,10 @@ empty list** means "depends on nothing" (deny-all, contracts excepted).
 **Per-module DB schema ownership.** Every table a module defines belongs in
 its `owns_tables` list. The table's name then carries the module as either a
 prefix (`inventory_stock_levels`) or a DB schema (`inventory.stock_levels`) —
-`owns_tables` itself always holds the bare table name (`stock_levels`); a DB
-schema is where the table lives, not part of its identity. If a module
+`owns_tables` holds the name the module passes to `Table("...")` or sets as
+`__tablename__`: `inventory_stock_levels` under the prefix convention above,
+the bare `stock_levels` under a DB schema, which is where the table lives, not
+part of its name. If a module
 declares a non-empty `owns_tables`, the verifier's `data-ownership` rule warns
 on any table the module defines (`Table("x")` or `__tablename__`) but doesn't
 list — the manifest is meant to stay a complete inventory of the module's
@@ -252,21 +265,40 @@ informational, not a failure.
 **Goal:** stop losing events on crash — deliver at-least-once, atomically with
 the business transaction.
 
-Install the extra and select the adapter:
+Install the extras (`postgres` for the store and the migrations, `cli` for the
+`modulith` command) and point modulith at the database that holds your business
+data:
 
 ```bash
-pip install 'modupy[postgres]'
+pip install 'modupy[postgres,cli]'
 ```
 
 ```toml
 # pyproject.toml
 [tool.modulith]
 outbox = "postgres"
+outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTBOX_URL
 ```
 
-Run the packaged Alembic migration (modulith ships its alembic config inside the
-installed package; alembic runs on a **sync** driver even if your app uses
-asyncpg):
+Bootstrap builds a `PostgresPublicationStore` on its own engine for that URL
+and binds it in every process, so the `modulith outbox` commands see the same
+store. Apply the packaged migrations with `modulith migrate`. It migrates
+`outbox_url` by default, swapping the async driver for the sync one Alembic
+runs on (`+asyncpg` becomes `+psycopg`, `+aiosqlite` plain `sqlite`,
+`+aiomysql` `+pymysql`), and prints the target with the password masked:
+
+```bash
+modulith migrate                          # to head, on outbox_url
+modulith migrate --url 'postgresql+psycopg://user:pass@localhost/mydb'
+modulith migrate --schema orders          # Postgres only; see the per-module schema below
+```
+
+The chain also creates the `broker_*` tables of the database broker (recipe 8)
+in that database. They stay unused unless you select that broker.
+
+Alembic's own command works as the alternative. modulith ships its alembic
+config inside the installed package, and `MODULITH_DB_URL` (a sync-driver URL)
+is the variable it reads:
 
 ```bash
 MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
@@ -274,16 +306,85 @@ MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
   upgrade head
 ```
 
-Wire your SQLAlchemy session to modulith at startup, and bind the session per
-request so `publish()` calls inside it are captured by the outbox:
+The store is only half of the wiring. Bind a SQLAlchemy session around each
+business transaction so the `publish()` calls inside it are captured by the
+outbox. The service function binds, publishes, commits and unbinds before the
+route returns:
+
+```python
+# myapp/orders/__init__.py
+from modulith import publish
+from modulith.builtin.outbox import bind_session, unbind_session
+from myapp.contracts.events import OrderPlaced
+from myapp.db import async_session_maker, Order   # your engine, sessionmaker and model
+
+async def place_order(order_id: str, customer_id: str, total: float) -> None:
+    async with async_session_maker() as session:
+        token = bind_session(session)
+        try:
+            session.add(Order(id=order_id, customer_id=customer_id, total=total))
+            await publish(OrderPlaced(order_id=order_id, customer_id=customer_id, total=total))
+            await session.commit()   # the order row and the event commit together
+        finally:
+            unbind_session(token)
+```
+
+Put the commit in the service function, or in a `transaction()` helper you own
+that wraps this bind-publish-commit-unbind sequence. Do not put it in a `yield`
+dependency's teardown: FastAPI runs that teardown after the response is sent,
+so a commit that fails there still answers 200.
+
+Now a `publish()` inside a bound transaction is persisted atomically with your
+data: a rollback discards the event (no ghosts), a commit guarantees delivery
+(no losses), and listeners are retried at-least-once after commit. Because
+delivery is at-least-once, **listeners must be idempotent**.
+
+A publish joins whatever transaction the bound session has open, and only a
+later `commit()` delivers it. A transaction that ends uncommitted (a rollback,
+or the session closing) discards its publications, and the adapter logs a
+WARNING naming their event types. A publish made after `unbind_session` is not
+transactional: it dispatches directly, with no outbox row, exactly like a
+publish outside any bound scope.
+
+A task started with `asyncio.create_task` inside the bound scope inherits the
+binding only until `unbind_session`. Its publishes before then join the
+session's open transaction, under the same rule: they are delivered only if a
+later commit covers them. Its publishes after then are not transactional. For
+a durable publish from such a task, open and bind a session in the task itself.
+Inspect the queue with `modulith outbox status`; a persistently-failing
+publication is dead-lettered after 10 attempts.
+
+`bind_session` and `unbind_session` live in `modulith.builtin.outbox`. The
+older `modulith.adapters.postgres_outbox` import path still works, as aliases
+of the same functions.
+
+Bootstrap runs lazily, at the first `publish()`, and every sweep skips its rows
+until the runtime is bootstrapped. Call `modulith.bootstrap()` and then
+`outbox.start()` in your ASGI lifespan's startup half, so rows a crashed
+process left undelivered are swept at startup instead of waiting for the first
+transactional publish. In a single-process app, call `outbox.shutdown()` in the
+lifespan's teardown to stop the retry loop; the store bound from `outbox_url`
+is disposed only by process-topology workers. The outbox table must live in the
+database that holds your business data, or the row and your data cannot commit
+in one transaction. Under `--topology processes`, `main.py` (its lifespan and
+middleware) does not run in workers; with `outbox_url` set, each worker binds
+the store itself. See
+[DEPLOYMENT.md's Durable Single-Process recipe](DEPLOYMENT.md#durable-single-process-outbox-pattern)
+for the full pattern.
+
+**Wiring the store yourself.** Bind the store in code, with your own engine,
+when you need what `outbox_url` does not offer: `connect_args` or a
+`schema_translate_map` on the engine, a custom serializer, an application that
+runs with `auto_discover = false`, or the graceful shutdown order below.
+`outbox_url` binds only while `auto_discover` is on, because the
+deserialization allowlist comes from the discovered listeners. A store you bind
+with `outbox.configure()` before bootstrap wins, and no second store is built.
+The tuning keywords (`claim_strategy`, `completion_mode`, ...) are the same
+ones `[tool.modulith.outbox_options]` forwards; see recipe 7.
 
 ```python
 # myapp/main.py
-from modulith.adapters.postgres_outbox import (
-    PostgresPublicationStore,
-    bind_session,
-    unbind_session,
-)
+from modulith.adapters.postgres_outbox import PostgresPublicationStore
 from modulith.builtin import outbox
 from modulith.serializers import JsonEventSerializer
 from myapp.contracts.events import OrderPlaced, StockReserved
@@ -298,57 +399,17 @@ outbox.configure(
     serializer=JsonEventSerializer(allowed_event_types=[OrderPlaced, StockReserved]),
     completion_mode="update",
 )
-
-async def get_db():
-    async with async_session_maker() as session:
-        token = bind_session(session)
-        try:
-            yield session
-            await session.commit()  # commits publishes made after the route's own commit
-        finally:
-            unbind_session(token)
 ```
-
-Now a `publish()` inside a bound transaction is persisted atomically with your
-data: a rollback discards the event (no ghosts), a commit guarantees delivery
-(no losses), and listeners are retried at-least-once after commit. Because
-delivery is at-least-once, **listeners must be idempotent**.
-
-A publish joins whatever transaction the bound session has open, and only a
-later `commit()` delivers it. After the route calls `session.commit()`, the
-session stays bound until the dependency's teardown, and FastAPI runs
-`BackgroundTasks` *before* that teardown. A publish from a background task, or
-from route code after its commit, therefore joins a fresh transaction. The
-`commit()` after `yield` above commits it. It is skipped when the route raises,
-so a failed request still discards its events. Without that commit, closing the
-session discards those publications, and the adapter logs a WARNING naming
-their event types.
-
-A task started with `asyncio.create_task` inside the request inherits the
-binding only until `unbind_session`. Its publishes before then join the
-session's open transaction, under the same rule: they are delivered only if a
-later commit covers them. Its publishes after then are not transactional: they
-dispatch directly, with no outbox row, exactly like a publish outside any
-request. For a durable publish from such a task, open and bind a session in
-the task itself. Inspect the queue
-with `modulith outbox status`; a persistently-failing publication is
-dead-lettered after 10 attempts.
 
 A module-scope `outbox.configure()` runs before the server's event loop exists,
 so it cannot start the retry loop: call `modulith.bootstrap()` and then
-`outbox.start()` in your ASGI lifespan's startup half. Every sweep skips its
-rows until the runtime is bootstrapped, so without both calls undelivered rows
-from a crashed process can wait until the first transactional publish. The outbox table must live in the database
-that holds your business data, or the row and your data cannot commit in one
-transaction. Under `--topology processes`, `main.py` (its lifespan, middleware
-and this wiring) does not run in workers; bind the store from the module's
-import or a `modulith_after_module_load` hook instead.
+`outbox.start()` in the lifespan's startup half, as above. Under
+`--topology processes`, `main.py` does not run in workers, so bind the store
+from the module's import or a `modulith_after_module_load` hook instead.
 
 On shutdown, drain the retry loop instead of letting the process die mid-flight
 — call `store.dispose()`, then `outbox.shutdown()`, then dispose the engine, in
-that order, from an ASGI lifespan or equivalent shutdown hook. See
-[DEPLOYMENT.md's Durable Single-Process recipe](DEPLOYMENT.md#durable-single-process-outbox-pattern)
-for the full pattern.
+that order, from an ASGI lifespan or equivalent shutdown hook.
 
 ### Coordinating concurrent sweepers
 
@@ -418,7 +479,7 @@ The default strategy needs the lease columns, which arrive in migration
 `0003_outbox_claim_leases`: migrate to `head`, not to `0001_initial`. In your
 own `outbox.configure()` call, `claim_strategy`, `claim_lease_seconds` and
 `claim_batch_size` are keyword arguments. When the runtime binds the store from
-`outbox_url`, it applies those three keys from `[tool.modulith.outbox_options]`
+`outbox_url`, it applies the same keys from `[tool.modulith.outbox_options]`
 — see the note under recipe 7.
 
 ### Putting the outbox in a per-module schema
@@ -436,8 +497,12 @@ async_engine = create_async_engine(db_url).execution_options(
 store = PostgresPublicationStore(engine=async_engine)
 ```
 
-Run the migration against the same schema with `-x schema=<name>` or
-`MODULITH_DB_SCHEMA`:
+Run the migration against the same schema with `modulith migrate --schema
+<name>`, or with Alembic's `-x schema=<name>` or `MODULITH_DB_SCHEMA`:
+
+```bash
+modulith migrate --schema orders
+```
 
 ```bash
 MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
@@ -481,11 +546,32 @@ outbox.configure(store=store, serializer=serializer, completion_mode="archive")
 ```
 
 With `"archive"`, trim old archive rows past their retention with
-`modulith outbox purge`. The runtime reads only the claim keys of
-`[tool.modulith.outbox_options]` (`claim_strategy`, `claim_lease_seconds`,
-`claim_batch_size`), and only when it binds the store from `outbox_url`. It
-does not read `completion_mode` there, so set the mode here in the wiring
-code, as an `outbox.configure()` keyword argument, not in pyproject.
+`modulith outbox purge`. When the runtime binds the store from `outbox_url`,
+set the mode in pyproject instead: `[tool.modulith.outbox_options]` validates
+`completion_mode` and forwards it to `outbox.configure()`.
+
+```toml
+[tool.modulith.outbox_options]
+completion_mode = "archive"
+```
+
+The same table carries the other outbox tuning, and only when the runtime binds
+the store from `outbox_url`. It validates these eight keys and forwards them as
+the matching `outbox.configure()` keyword arguments:
+
+| Key | Value |
+|---|---|
+| `claim_strategy` | `"lease"`, `"advisory_lock"` or `"none"` (recipe 6) |
+| `claim_lease_seconds` | positive finite number |
+| `claim_batch_size` | positive integer |
+| `dead_letter_after_attempts` | positive integer |
+| `retry_interval_seconds` | positive finite number |
+| `retry_stale_seconds` | positive finite number |
+| `max_retry_backoff_seconds` | positive finite number |
+| `completion_mode` | `"update"`, `"delete"` or `"archive"` |
+
+A key outside these eight is accepted and ignored. A store you bind yourself
+with `outbox.configure()` takes these settings as keyword arguments instead.
 
 ---
 
@@ -507,15 +593,19 @@ default = 1
 reports = 4            # the reports module gets 4 worker processes
 ```
 
-Cross-module events now have to leave the process. Mark the events that remote
-workers must consume with `@externalized` — this routes the event to the broker
-**in addition to** any local listeners (fan-out across processes):
+Cross-module events now have to leave the process, and they need no marker to
+do it. An event with no listener in the publishing process routes to the broker
+under the default target `{broker}:{event-fqn}`: the `OrderPlaced` that `orders`
+publishes and only `inventory` consumes reaches the `inventory` worker as is.
+`@externalized` covers the two cases that rule misses. Marked events go to the
+broker **in addition to** any local listeners (fan-out across processes), and
+`target=` pins the destination:
 
 ```python
 from dataclasses import dataclass
 from modulith import event, externalized
 
-@externalized                                  # default target: {broker}:{event-fqn}
+@externalized                                  # local listeners AND remote workers; target {broker}:{event-fqn}
 @event
 @dataclass(frozen=True)
 class OrderPlaced:
@@ -541,7 +631,7 @@ modulith run myapp.main:app --topology=processes
 The supervisor spawns one uvicorn subprocess per module (restarting crashes with
 backoff), and the reverse proxy routes each request to the right worker by URL
 prefix. In single-process topology `@externalized` is an inert marker, so you can
-add it before you need multi-process and it costs nothing until then.
+add it before you need it and it costs nothing until then.
 
 **Expose each module's HTTP routes as `router` on the module package.** A worker
 mounts the `router` attribute of the module package it hosts — `myapp.orders` —
@@ -815,15 +905,22 @@ modulith verify                       # exit 1 on ERROR-severity violations
 modulith verify --fail-on-warnings    # also fail on WARNING-severity findings
 ```
 
-Adopting on a messy existing codebase? Generate a ratcheting baseline that
-grandfathers today's violations, then fail only on **new** ones:
+Adopting on a messy existing codebase? Record a ratcheting baseline that
+grandfathers today's violations, then fail only on **new** ones. `--mode=ratchet`
+does not create the baseline: `--update-baseline` writes it, to
+`.modulith-baseline.json` unless you pass `--baseline`, and you commit that file.
+Until it exists, ratchet mode grandfathers nothing and behaves like a strict run:
 
 ```bash
-modulith verify --mode=ratchet
+modulith verify --update-baseline     # record today's violations; exits 0
+git add .modulith-baseline.json && git commit -m "Record the boundary baseline"
+modulith verify --mode=ratchet        # fail only on violations not in the baseline
 ```
 
 The baseline is count-aware: it records existing violations by a stable hash, so
-you can enforce "no new violations" while paying down the old ones over time. Add
+you can enforce "no new violations" while paying down the old ones over time.
+Rerun `--update-baseline` after paying some down, to lower what is
+grandfathered. Add
 the check to CI (exit code `0` = clean, `1` = violations or a bad flag *value*,
 `2` = an internal error or a CLI usage error such as an unknown option — click's
 convention). `--fail-on-warnings` makes the gate cover every new violation, not
