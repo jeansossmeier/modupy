@@ -5,11 +5,18 @@ from unittest.mock import AsyncMock
 import pytest
 from modulith.testing import ModulithTestApp
 
+SIBLINGS = [
+    "marketplace.catalog",
+    "marketplace.inventory",
+    "marketplace.payments",
+    "marketplace.shipping",
+]
+
 
 async def test_the_order_total_uses_the_catalog_price(
     marketplace: ModulithTestApp, modulith_module: Callable[..., Any]
 ) -> None:
-    with modulith_module("marketplace.orders", mock_modules=["marketplace.catalog"]):
+    with modulith_module("marketplace.orders", mock_modules=SIBLINGS):
         from marketplace import catalog
         from marketplace.contracts import OrderPlaced
         from marketplace.orders import place_order, status_of
@@ -35,7 +42,7 @@ async def test_the_order_total_uses_the_catalog_price(
 async def test_reserved_stock_requests_payment_once_even_when_redelivered(
     marketplace: ModulithTestApp, modulith_module: Callable[..., Any]
 ) -> None:
-    with modulith_module("marketplace.orders", mock_modules=["marketplace.catalog"]):
+    with modulith_module("marketplace.orders", mock_modules=SIBLINGS):
         from marketplace import catalog
         from marketplace.contracts import PaymentRequested, StockReserved
         from marketplace.orders import place_order, status_of
@@ -57,7 +64,7 @@ async def test_reserved_stock_requests_payment_once_even_when_redelivered(
 async def test_a_captured_payment_confirms_the_order_once_even_when_redelivered(
     marketplace: ModulithTestApp, modulith_module: Callable[..., Any]
 ) -> None:
-    with modulith_module("marketplace.orders", mock_modules=["marketplace.catalog"]):
+    with modulith_module("marketplace.orders", mock_modules=SIBLINGS):
         from marketplace import catalog
         from marketplace.contracts import OrderConfirmed, PaymentCaptured, StockReserved
         from marketplace.orders import place_order, status_of
@@ -90,7 +97,7 @@ async def test_a_captured_payment_confirms_the_order_once_even_when_redelivered(
 async def test_released_stock_cancels_the_order_once_even_when_redelivered(
     marketplace: ModulithTestApp, modulith_module: Callable[..., Any]
 ) -> None:
-    with modulith_module("marketplace.orders", mock_modules=["marketplace.catalog"]):
+    with modulith_module("marketplace.orders", mock_modules=SIBLINGS):
         from marketplace import catalog
         from marketplace.contracts import (
             OrderCancelled,
@@ -127,7 +134,7 @@ async def test_released_stock_cancels_the_order_once_even_when_redelivered(
 async def test_an_order_for_an_unlisted_sku_is_refused_and_stores_nothing(
     marketplace: ModulithTestApp, modulith_module: Callable[..., Any]
 ) -> None:
-    with modulith_module("marketplace.orders", mock_modules=["marketplace.catalog"]):
+    with modulith_module("marketplace.orders", mock_modules=SIBLINGS):
         from marketplace import catalog
         from marketplace.orders import place_order, status_of
 
