@@ -20,21 +20,26 @@ executors that run a runbook import them from here.
 
 from __future__ import annotations
 
+import contextlib
 import difflib
+import http.client
 import os
 import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import tomllib
+import urllib.error
+import urllib.request
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from itertools import chain
+from itertools import chain, takewhile
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -42,7 +47,7 @@ import pytest
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
-from conftest import Block, fenced_blocks
+from conftest import Block, _free_port_block, fenced_blocks
 
 REPO = Path(__file__).resolve().parent.parent
 EXAMPLES = REPO / "examples"
@@ -292,6 +297,11 @@ def requirements_problem(readme: Path, pyproject: Path) -> str:
 
 
 STEP_TIMEOUT = 300.0
+STOP_WAIT = 30.0
+READY_TIMEOUT = 60.0
+EVENTUALLY_TIMEOUT = 60.0
+EVENTUALLY_INTERVAL = 0.5
+PORT_BLOCK = 12
 SCRUBBED_PREFIXES = ("MODULITH_", "UVICORN_", "PYTEST_", "OTEL_", "COMPOSE_")
 SCRUBBED_NAMES = ("PYTHONPATH", "REDIS_URL", "ENV")
 COPY_IGNORE = shutil.ignore_patterns(
@@ -304,6 +314,12 @@ COPY_IGNORE = shutil.ignore_patterns(
     ".modulith",
     "build",
 )
+PORT_POSITION = re.compile(
+    r"((?<![\w-])--port[= ]|(?<![\w-])--worker-port-base[= ]|localhost:|127\.0\.0\.1:)(\d+)"
+)
+PORT_NUMBER = re.compile(r"(?<!\d)\d{2,5}(?!\d)")
+WORKER_BANNER = re.compile(r"worker\(s\) \[([^\]]*)\]")
+NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 PYTEST_ELAPSED = re.compile(r" in \d+(?:\.\d+)?s")
 PYTEST_COUNT = re.compile(r"(\d+) (\w+)")
 
@@ -333,13 +349,39 @@ def copy_example(source: Path, workdir: Path) -> None:
     shutil.copytree(source, workdir, ignore=COPY_IGNORE)
 
 
+def _exit_status(process: subprocess.Popen[bytes]) -> int | None:
+    """The exit status of a finished process, without reaping it; ``None`` while it runs.
+
+    An unreaped process keeps its pid, so the process group it leads can still be
+    signalled without the pid having been handed to anything else.
+    """
+    result = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    return None if result is None else result.si_status
+
+
+def _finish(process: subprocess.Popen[bytes], timeout: float) -> int | None:
+    """Wait up to ``timeout`` for the group leader, then kill its whole group and reap it.
+
+    Returns the leader's exit status, or ``None`` when it outlived ``timeout``.
+    """
+    deadline = time.monotonic() + timeout
+    status = _exit_status(process)
+    while status is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+        status = _exit_status(process)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+    return status
+
+
 def _run_shell(
     command: str, env: Mapping[str, str], cwd: Path, timeout: float, *, merge: bool = True
 ) -> tuple[int | None, str, str]:
     """``bash -c command`` in its own session: ``(exit code, stdout, stderr)``.
 
-    stderr is folded into stdout when ``merge``. The exit code is ``None`` after
-    ``timeout``, when the whole process group has been killed.
+    stderr is folded into stdout when ``merge``. Whatever the step left running in its
+    process group is killed when it ends. The exit code is ``None`` after ``timeout``.
     """
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         process = subprocess.Popen(
@@ -351,13 +393,7 @@ def _run_shell(
             stderr=out if merge else err,
             start_new_session=True,
         )
-        code: int | None
-        try:
-            code = process.wait(timeout)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-            code = None
+        code = _finish(process, timeout)
         texts = []
         for stream in (out, err):
             stream.seek(0)
@@ -393,6 +429,52 @@ def _pytest_problem(output: str) -> str:
     return "" if counts.get("passed") else "pytest: no test passed"
 
 
+def _rewrite(command: str, ports: Mapping[int, int]) -> str:
+    """``command`` with each documented port in a port position swapped for its allocated one."""
+    return PORT_POSITION.sub(
+        lambda found: found.group(1) + str(ports.get(int(found.group(2)), found.group(2))),
+        command,
+    )
+
+
+def _map_back(text: str, ports: Mapping[int, int]) -> str:
+    """``text`` with every allocated port number swapped back for its documented one."""
+    documented = {allocated: port for port, allocated in ports.items()}
+    return PORT_NUMBER.sub(
+        lambda found: str(documented.get(int(found.group()), found.group())), text
+    )
+
+
+def _option(command: str, flag: str, default: int) -> int:
+    found = re.search(rf"(?<![\w-]){flag}[= ](\d+)", command)
+    return int(found.group(1)) if found else default
+
+
+def _repo_sections(sections: Sequence[Section]) -> list[Section]:
+    """The leading sections a runbook can run in the repo environment."""
+    return list(
+        takewhile(
+            lambda section: (
+                section.repo_env
+                and not any(step.command.split()[:1] == ["docker"] for step in section.steps)
+            ),
+            sections,
+        )
+    )
+
+
+def _http_status(port: int, path: str) -> int | None:
+    """The status of ``GET path`` on a local port; ``None`` when nothing answers."""
+    try:
+        with NO_PROXY.open(f"http://127.0.0.1:{port}{path}", timeout=2) as response:
+            status: int = response.status
+            return status
+    except urllib.error.HTTPError as error:
+        return error.code
+    except (OSError, http.client.HTTPException):
+        return None
+
+
 def _shown(output: str) -> str:
     return output if not output or output.endswith("\n") else output + "\n"
 
@@ -411,10 +493,19 @@ class Runbook:
         workdir: Path,
         *,
         timeout: float = STEP_TIMEOUT,
+        stop_wait: float = STOP_WAIT,
+        ready_timeout: float = READY_TIMEOUT,
+        eventually_timeout: float = EVENTUALLY_TIMEOUT,
+        eventually_interval: float = EVENTUALLY_INTERVAL,
     ) -> None:
         self.sections = sections
         self.workdir = workdir
         self.timeout = timeout
+        self.stop_wait = stop_wait
+        self.ready_timeout = ready_timeout
+        self.eventually_timeout = eventually_timeout
+        self.eventually_interval = eventually_interval
+        self.pgids: list[int] = []
         self.readme = source / "README.md"
         self.commands = readme_commands(self.readme)
         steps = sum(len(section.steps) for section in sections)
@@ -426,49 +517,191 @@ class Runbook:
         copy_example(source, workdir)
         self.env = child_env(os.environ, workdir)
         self._log: list[str] = []
+        self._serves: list[_Serve] = []
 
     @property
     def transcript(self) -> str:
-        return "".join(self._log)
+        running = "".join(
+            f"[log so far of {serve.executed}]\n{_shown(serve.text())}" for serve in self._serves
+        )
+        return "".join(self._log) + running
+
+    def run_repo_environment(self) -> None:
+        """Run the leading sections that need neither Docker nor the built wheel."""
+        for position in range(len(_repo_sections(self.sections))):
+            self.run_section(position)
 
     def run_section(self, position: int) -> None:
-        first = sum(len(section.steps) for section in self.sections[:position])
-        for number, step in enumerate(self.sections[position].steps, start=first):
-            self._run_step(step, self.commands[number])
+        section = self.sections[position]
+        first = sum(len(earlier.steps) for earlier in self.sections[:position])
+        completed = False
+        try:
+            for number, step in enumerate(section.steps, start=first):
+                self._run_step(step, self.commands[number])
+            completed = True
+        finally:
+            try:
+                self._stop_serves(check=completed)
+            finally:
+                if any(step.command.split()[:1] == ["docker"] for step in section.steps):
+                    self._compose_down()
 
     def _fail(self, command: Command, reason: str) -> NoReturn:
         raise RunbookFailure(f"{self.readme}:{command.line}: {reason}\n\n{self.transcript}")
 
+    def _ports(self) -> dict[int, int]:
+        return {port: at for serve in self._serves for port, at in serve.ports.items()}
+
     def _run_step(self, step: Step, command: Command) -> None:
-        if step.serve or step.eventually:
-            raise NotImplementedError(f"{'serve' if step.serve else 'eventually'} steps")
         words = step.command.split()
-        if words[:2] == ["pip", "install"]:
+        if step.serve:
+            self._serve(step, command)
+        elif words[:2] == ["pip", "install"]:
             self._log.append(f"$ {step.command}\n(skipped: pip install in the repo environment)\n")
         elif words[:1] == ["export"]:
             self._export(step, command)
         else:
-            code, output, _ = _run_shell(step.command, self.env, self.workdir, self.timeout)
-            self._log.append(f"$ {step.command}\n{_shown(output)}")
-            self._check_exit(step, command, code)
-            if words[:1] == ["pytest"] and (problem := _pytest_problem(output)):
-                self._fail(command, problem)
-            if (line := _missing_line(command.output, output)) is not None:
-                self._fail(command, f"expected line {line!r} not found, in order, in the output")
+            self._plain(step, command)
+
+    def _plain(self, step: Step, command: Command) -> None:
+        executed = _rewrite(step.command, self._ports())
+        deadline = time.monotonic() + self.eventually_timeout
+        while True:
+            code, output, _ = _run_shell(executed, self.env, self.workdir, self.timeout)
+            problem = self._problem(step, command, code, output)
+            if not problem or not step.eventually or time.monotonic() >= deadline:
+                break
+            time.sleep(self.eventually_interval)
+        self._log.append(f"$ {executed}\n{_shown(output)}")
+        if problem:
+            retried = f" (still, after {self.eventually_timeout:g}s of retries)"
+            self._fail(command, problem + (retried if step.eventually else ""))
+
+    def _problem(self, step: Step, command: Command, code: int | None, output: str) -> str:
+        if problem := _exit_problem(step, code, self.timeout):
+            return problem
+        if step.command.split()[:1] == ["pytest"] and (problem := _pytest_problem(output)):
+            return problem
+        line = _missing_line(command.output, _map_back(output, self._ports()))
+        return "" if line is None else f"expected line {line!r} not found, in order, in the output"
 
     def _export(self, step: Step, command: Command) -> None:
+        executed = _rewrite(step.command, self._ports())
         code, stdout, stderr = _run_shell(
-            f"{step.command}; env -0", self.env, self.workdir, self.timeout, merge=False
+            f"{executed}; env -0", self.env, self.workdir, self.timeout, merge=False
         )
-        self._log.append(f"$ {step.command}\n{_shown(stderr)}")
-        self._check_exit(step, command, code)
+        self._log.append(f"$ {executed}\n{_shown(stderr)}")
+        if problem := _exit_problem(step, code, self.timeout):
+            self._fail(command, problem)
         self.env = dict(item.split("=", 1) for item in stdout.split("\0") if "=" in item)
 
-    def _check_exit(self, step: Step, command: Command, code: int | None) -> None:
-        if code is None:
-            self._fail(command, f"timed out after {self.timeout:g}s")
-        if code != step.exit_code:
-            self._fail(command, f"exit {code}, expected {step.exit_code}")
+    def _serve(self, step: Step, command: Command) -> None:
+        text = step.command
+        workers = re.search(r"--topology[= ]processes", text) is not None
+        base = _free_port_block(PORT_BLOCK)
+        ports = {_option(text, "--port", 8000): base}
+        if workers:
+            first = _option(text, "--worker-port-base", 9001)
+            ports.update({first + offset: base + 1 + offset for offset in range(PORT_BLOCK - 1)})
+        for holder in [serve for serve in self._serves if serve.ports.keys() & ports.keys()]:
+            self._stop_serve(holder, check=True)
+        executed = _rewrite(text, {**self._ports(), **ports})
+        if not re.search(r"(?<![\w-])--port[= ]", text):
+            executed += f" --port {base}"
+        if workers and not re.search(r"(?<![\w-])--worker-port-base[= ]", text):
+            executed += f" --worker-port-base {base + 1}"
+        self._log.append(f"$ {executed}\n(serve)\n")
+        log = self.workdir / f".serve-{len(self.pgids)}.log"
+        with log.open("wb") as out:
+            process = subprocess.Popen(
+                ["bash", "-c", executed],
+                cwd=self.workdir,
+                env=self.env,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        serve = _Serve(executed, command, process, log, ports)
+        self._serves.append(serve)
+        self.pgids.append(process.pid)
+        self._await_ready(serve, base)
+
+    def _await_ready(self, serve: _Serve, base: int) -> None:
+        deadline = time.monotonic() + self.ready_timeout
+        while True:
+            status = _exit_status(serve.process)
+            if status is not None:
+                self._fail(serve.command, f"serve exited with code {status} before it was ready")
+            problem = self._not_ready(serve, base)
+            if not problem:
+                return
+            if time.monotonic() >= deadline:
+                self._fail(
+                    serve.command, f"serve not ready after {self.ready_timeout:g}s: {problem}"
+                )
+            time.sleep(0.1)
+
+    def _not_ready(self, serve: _Serve, base: int) -> str:
+        if _http_status(base, "/") is None:
+            return f"no HTTP answer on port {base}"
+        if len(serve.ports) == 1:
+            return ""
+        banner = WORKER_BANNER.search(serve.text())
+        if banner is None:
+            return "no worker banner in the log yet"
+        for port in re.findall(r":(\d+)", banner.group(1)):
+            if _http_status(int(port), "/health") != 200:
+                return f"GET /health on worker port {port} did not answer 200"
+        return ""
+
+    def _stop_serves(self, *, check: bool) -> None:
+        failure: RunbookFailure | None = None
+        for serve in list(self._serves):
+            try:
+                self._stop_serve(serve, check=check)
+            except RunbookFailure as error:
+                failure = failure or error
+        if failure:
+            raise failure
+
+    def _stop_serve(self, serve: _Serve, *, check: bool) -> None:
+        documented = self._ports()
+        self._serves.remove(serve)
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(serve.process.pid, signal.SIGINT)
+        _finish(serve.process, self.stop_wait)
+        log = serve.text()
+        self._log.append(f"[log of {serve.executed}]\n{_shown(log)}")
+        line = _missing_line(serve.command.output, _map_back(log, documented))
+        if check and line is not None:
+            self._fail(
+                serve.command,
+                f"serve output: expected line {line!r} not found, in order, in its log",
+            )
+
+    def _compose_down(self) -> None:
+        command = "docker compose down -v --remove-orphans"
+        _code, output, _ = _run_shell(command, self.env, self.workdir, self.timeout)
+        self._log.append(f"$ {command}\n{_shown(output)}")
+
+
+def _exit_problem(step: Step, code: int | None, timeout: float) -> str:
+    if code is None:
+        return f"timed out after {timeout:g}s"
+    return "" if code == step.exit_code else f"exit {code}, expected {step.exit_code}"
+
+
+@dataclass
+class _Serve:
+    executed: str
+    command: Command
+    process: subprocess.Popen[bytes]
+    log: Path
+    ports: dict[int, int]
+
+    def text(self) -> str:
+        return self.log.read_text(encoding="utf-8", errors="replace")
 
 
 def _readme(tmp_path: Path, *lines: str) -> Path:
@@ -795,6 +1028,7 @@ def _runbook(
     sections: Sequence[Section] | None = None,
     files: Mapping[str, str] | None = None,
     timeout: float = 30.0,
+    **options: float,
 ) -> Runbook:
     source = tmp_path / "example"
     source.mkdir(parents=True)
@@ -805,7 +1039,7 @@ def _runbook(
     if sections is None:
         listed = steps or tuple(Step(c.text) for c in readme_commands(source / "README.md"))
         sections = (Section("all", tuple(listed)),)
-    return Runbook(source, sections, tmp_path / "work", timeout=timeout)
+    return Runbook(source, sections, tmp_path / "work", timeout=timeout, **options)
 
 
 def _run(tmp_path: Path, *readme_lines: str, **kwargs: Any) -> Runbook:
@@ -815,10 +1049,16 @@ def _run(tmp_path: Path, *readme_lines: str, **kwargs: Any) -> Runbook:
     return runbook
 
 
-def _failure(tmp_path: Path, *readme_lines: str, **kwargs: Any) -> str:
+def _broken(tmp_path: Path, *readme_lines: str, **kwargs: Any) -> tuple[Runbook, str]:
+    runbook = _runbook(tmp_path, *readme_lines, **kwargs)
     with pytest.raises(RunbookFailure) as caught:
-        _run(tmp_path, *readme_lines, **kwargs)
-    return str(caught.value)
+        for position in range(len(runbook.sections)):
+            runbook.run_section(position)
+    return runbook, str(caught.value)
+
+
+def _failure(tmp_path: Path, *readme_lines: str, **kwargs: Any) -> str:
+    return _broken(tmp_path, *readme_lines, **kwargs)[1]
 
 
 def _reason(message: str) -> str:
@@ -1062,14 +1302,6 @@ def test_the_runbook_and_the_readme_must_list_the_same_number_of_commands(tmp_pa
         _runbook(tmp_path, *_bash("true"), steps=(Step("true"), Step("false")))
 
 
-@pytest.mark.parametrize("flag", ["serve", "eventually"])
-def test_a_serve_or_eventually_step_is_refused_not_run_as_a_plain_step(
-    tmp_path: Path, flag: str
-) -> None:
-    with pytest.raises(NotImplementedError, match=flag):
-        _run(tmp_path, *_bash("true"), steps=(Step("true", **{flag: True}),))
-
-
 PARENT_ENV = {
     "MODULITH_BROKER": "redis",
     "UVICORN_PORT": "1",
@@ -1139,3 +1371,465 @@ def test_python_in_a_step_is_the_running_interpreters_python(tmp_path: Path) -> 
 def test_the_child_environment_never_sets_pythonpath(tmp_path: Path) -> None:
     assert "PYTHONPATH" not in child_env({"PYTHONPATH": "/x"}, tmp_path)
     assert "PYTHONPATH" not in child_env({}, tmp_path)
+
+
+PORTS = {8000: 41000, 9001: 41001, 9002: 41002, 9003: 41003}
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "curl localhost:8000/orders",
+        "curl -s 127.0.0.1:9002/health",
+        "python server.py --port 8000 --worker-port-base 9001",
+        "python server.py --port=8000",
+        "curl localhost:9001",
+    ],
+)
+def test_rewriting_a_command_and_mapping_it_back_is_symmetric(command: str) -> None:
+    rewritten = _rewrite(command, PORTS)
+
+    assert rewritten != command
+    assert "8000" not in rewritten and "9001" not in rewritten and "9002" not in rewritten
+    assert _map_back(rewritten, PORTS) == command
+
+
+def test_only_ports_in_a_port_position_are_rewritten() -> None:
+    command = 'curl localhost:1234 -d \'{"port": 8000, "n": 9001}\' https://example.com:8000/x'
+
+    assert _rewrite(command, PORTS) == command
+
+
+def test_a_worker_banner_maps_back_to_its_documented_ports() -> None:
+    banner = (
+        "3 worker(s) [inventory:41001, orders:41002, payments:41003], "
+        "reverse proxy on http://0.0.0.0:41000"
+    )
+
+    assert _map_back(banner, PORTS) == (
+        "3 worker(s) [inventory:9001, orders:9002, payments:9003], "
+        "reverse proxy on http://0.0.0.0:8000"
+    )
+
+
+def test_mapping_back_leaves_longer_numbers_alone() -> None:
+    assert _map_back("pid 410010 at 41000 after 4100", PORTS) == "pid 410010 at 8000 after 4100"
+
+
+def test_a_free_port_block_is_bindable_all_at_once() -> None:
+    base = _free_port_block(PORT_BLOCK)
+    held: list[socket.socket] = []
+    try:
+        for port in range(base, base + PORT_BLOCK):
+            held.append(socket.socket())
+            held[-1].bind(("127.0.0.1", port))
+    finally:
+        for sock in held:
+            sock.close()
+
+    assert len(held) == PORT_BLOCK
+
+
+SERVER = """
+import signal
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+def option(flag, default):
+    return int(sys.argv[sys.argv.index(flag) + 1]) if flag in sys.argv else default
+
+
+port, workers = option("--port", 8000), option("--worker-port-base", 9001)
+if "--exit" in sys.argv:
+    sys.exit(3)
+if "--ignore-sigint" in sys.argv:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = f"hello from {self.server.server_port}".encode()
+        self.send_response(503 if self.path == "/health" and self.server.broken else 200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def serve(number, broken=False):
+    server = HTTPServer(("127.0.0.1", number), Handler)
+    server.broken = broken
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+
+if "--topology=processes" in sys.argv:
+    for offset in (0, 1, 2):
+        serve(workers + offset, broken="--broken-worker" in sys.argv)
+    print(
+        f"3 worker(s) [inventory:{workers}, orders:{workers + 1}, payments:{workers + 2}], "
+        f"reverse proxy on http://0.0.0.0:{port}",
+        flush=True,
+    )
+if "--no-listen" not in sys.argv:
+    serve(port)
+print(f"listening on {port}", flush=True)
+try:
+    while True:
+        time.sleep(0.1)
+except KeyboardInterrupt:
+    pass
+"""
+
+SERVED = {"server.py": SERVER}
+SERVE = Step("python server.py", serve=True)
+HELLO = "curl -s localhost:8000/hello"
+
+
+def _group_gone(pgid: int, seconds: float = 5.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _all_gone(runbook: Runbook) -> bool:
+    return bool(runbook.pgids) and all(_group_gone(pgid) for pgid in runbook.pgids)
+
+
+def test_a_serve_is_reached_at_its_documented_port_and_its_log_matches_at_stop(
+    tmp_path: Path,
+) -> None:
+    runbook = _run(
+        tmp_path,
+        *_bash("$ python server.py", "listening on 8000", f"$ {HELLO}", "hello from 8000"),
+        steps=(SERVE, Step(HELLO)),
+        files=SERVED,
+    )
+
+    assert re.search(r"\$ python server\.py --port \d+\n", runbook.transcript)
+    assert "--port 8000" not in runbook.transcript
+    assert _all_gone(runbook)
+
+
+def test_a_processes_serve_gets_a_worker_port_base_and_its_banner_maps_back(
+    tmp_path: Path,
+) -> None:
+    command = "python server.py --topology=processes"
+    runbook = _run(
+        tmp_path,
+        *_bash(
+            f"$ {command}",
+            "3 worker(s) [inventory:9001, orders:9002, payments:9003], "
+            "reverse proxy on http://0.0.0.0:8000",
+            "listening on 8000",
+            "$ curl -s localhost:9002/health",
+            "hello from 9002",
+        ),
+        steps=(Step(command, serve=True), Step("curl -s localhost:9002/health")),
+        files=SERVED,
+    )
+
+    executed = re.search(r"--port (\d+) --worker-port-base (\d+)\n", runbook.transcript)
+    assert executed is not None
+    assert int(executed.group(2)) == int(executed.group(1)) + 1
+    assert _all_gone(runbook)
+
+
+def test_explicit_port_flags_are_rewritten_not_appended(tmp_path: Path) -> None:
+    command = "python server.py --topology=processes --port 8000 --worker-port-base 9001"
+    runbook = _run(
+        tmp_path,
+        *_bash(
+            f"$ {command}",
+            "3 worker(s) [inventory:9001, orders:9002, payments:9003], "
+            "reverse proxy on http://0.0.0.0:8000",
+        ),
+        steps=(Step(command, serve=True),),
+        files=SERVED,
+    )
+
+    executed = next(line for line in runbook.transcript.splitlines() if line.startswith("$ python"))
+    assert executed.count("--port") == 1
+    assert executed.count("--worker-port-base") == 1
+    assert "8000" not in executed and "9001" not in executed
+
+
+def test_a_serve_whose_log_lacks_an_expected_line_fails_when_it_stops(tmp_path: Path) -> None:
+    runbook, message = _broken(
+        tmp_path,
+        *_bash("$ python server.py", "never printed"),
+        steps=(SERVE,),
+        files=SERVED,
+    )
+
+    assert "'never printed'" in _reason(message)
+    assert "listening on" in message
+    assert _all_gone(runbook)
+
+
+@pytest.mark.parametrize(
+    ("flags", "reason"),
+    [
+        ("--no-listen", "no HTTP answer"),
+        ("--topology=processes --broken-worker", "/health"),
+        ("--exit", "exited with code 3"),
+    ],
+    ids=["app-port-silent", "worker-unhealthy", "exits-early"],
+)
+def test_a_serve_that_never_becomes_ready_fails_and_is_stopped(
+    tmp_path: Path, flags: str, reason: str
+) -> None:
+    command = f"python server.py {flags}"
+
+    runbook, message = _broken(
+        tmp_path,
+        *_bash(f"$ {command}"),
+        steps=(Step(command, serve=True),),
+        files=SERVED,
+        ready_timeout=1.0,
+    )
+
+    assert reason in _reason(message)
+    assert _all_gone(runbook)
+
+
+def test_a_serve_that_stops_on_sigint_is_stopped_without_waiting_out_the_timeout(
+    tmp_path: Path,
+) -> None:
+    started = time.monotonic()
+
+    runbook = _run(
+        tmp_path, *_bash("$ python server.py"), steps=(SERVE,), files=SERVED, stop_wait=20.0
+    )
+
+    assert time.monotonic() - started < 10.0
+    assert _all_gone(runbook)
+
+
+def test_a_serve_that_ignores_sigint_is_killed_after_the_wait(tmp_path: Path) -> None:
+    command = "python server.py --ignore-sigint"
+    started = time.monotonic()
+
+    runbook = _run(
+        tmp_path,
+        *_bash(f"$ {command}"),
+        steps=(Step(command, serve=True),),
+        files=SERVED,
+        stop_wait=1.0,
+    )
+
+    assert time.monotonic() - started >= 1.0
+    assert _all_gone(runbook)
+
+
+def test_a_step_that_fails_mid_section_still_stops_the_serve_and_keeps_its_own_reason(
+    tmp_path: Path,
+) -> None:
+    runbook, message = _broken(
+        tmp_path,
+        *_bash("$ python server.py", "never printed", "$ false"),
+        steps=(SERVE, Step("false")),
+        files=SERVED,
+    )
+
+    assert "exit 1" in _reason(message)
+    assert "listening on" in message
+    assert _all_gone(runbook)
+
+
+def test_serves_on_different_documented_ports_run_together_and_a_repeat_stops_only_its_holder(
+    tmp_path: Path,
+) -> None:
+    other = "python server.py --port 8100"
+    runbook = _run(
+        tmp_path,
+        *_bash(
+            "$ python server.py",
+            f"$ {other}",
+            f"$ {HELLO}",
+            "hello from 8000",
+            "$ curl -s localhost:8100/hello",
+            "hello from 8100",
+            f"$ {other}",
+            f"$ {HELLO}",
+            "hello from 8000",
+        ),
+        steps=(
+            SERVE,
+            Step(other, serve=True),
+            Step(HELLO),
+            Step("curl -s localhost:8100/hello"),
+            Step(other, serve=True),
+            Step(HELLO),
+        ),
+        files=SERVED,
+    )
+
+    first, second, third = re.findall(r"\$ python server\.py --port (\d+)\n", runbook.transcript)
+    text = runbook.transcript
+    assert text.index(f"listening on {second}\n") < text.index(
+        f"$ python server.py --port {third}\n"
+    )
+    assert text.index(f"listening on {first}\n") > text.index(
+        f"$ python server.py --port {third}\n"
+    )
+    assert _all_gone(runbook)
+
+
+def test_a_background_child_of_a_finished_step_is_killed(tmp_path: Path) -> None:
+    runbook = _run(tmp_path, *_bash("sleep 60 & echo child=$!"))
+
+    child = int(re.search(r"child=(\d+)", runbook.transcript.split("\n$ ", 1)[-1]).group(1))  # type: ignore[union-attr]
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    pytest.fail(f"child {child} outlived its step")
+
+
+COUNTED = "n=$(cat n 2>/dev/null || echo 0); n=$((n+1)); echo $n > n; "
+
+
+def _attempts(runbook: Runbook) -> int:
+    return int((runbook.workdir / "n").read_text())
+
+
+def test_an_eventually_step_reruns_until_its_output_matches(tmp_path: Path) -> None:
+    command = COUNTED + "if [ $n -ge 3 ]; then echo ready; else echo waiting; fi"
+
+    runbook = _run(
+        tmp_path,
+        *_bash(f"$ {command}", "ready"),
+        steps=(Step(command, eventually=True),),
+        eventually_interval=0.05,
+    )
+
+    assert _attempts(runbook) == 3
+
+
+def test_a_step_that_is_not_eventually_runs_once(tmp_path: Path) -> None:
+    command = COUNTED + "echo waiting"
+    runbook, _message = _broken(tmp_path, *_bash(f"$ {command}", "ready"))
+
+    assert _attempts(runbook) == 1
+
+
+def test_an_eventually_step_that_never_matches_fails_showing_only_the_last_run(
+    tmp_path: Path,
+) -> None:
+    command = COUNTED + 'echo "run $n"'
+
+    runbook, message = _broken(
+        tmp_path,
+        *_bash(f"$ {command}", "ready"),
+        steps=(Step(command, eventually=True),),
+        eventually_timeout=1.0,
+        eventually_interval=0.1,
+    )
+
+    attempts = _attempts(runbook)
+    assert attempts > 2
+    assert "retries" in _reason(message)
+    assert f"run {attempts}\n" in message
+    assert "run 1\n" not in message
+
+
+def _fake_docker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "docker.log"
+    script = bin_dir / "docker"
+    script.write_text(
+        '#!/bin/sh\necho "$* foo=$FOO project=$COMPOSE_PROJECT_NAME" >> "$DOCKER_LOG"\n'
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("DOCKER_LOG", str(log))
+    return log
+
+
+@pytest.mark.parametrize("tail", [(), ("false",)], ids=["passes", "fails"])
+def test_a_docker_section_ends_with_compose_down_in_the_section_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tail: tuple[str, ...]
+) -> None:
+    log = _fake_docker(tmp_path, monkeypatch)
+    commands = ["export FOO=bar", "docker compose up -d", *tail]
+    section = Section("db", tuple(Step(command) for command in commands))
+
+    with contextlib.suppress(RunbookFailure):
+        runbook = _runbook(tmp_path / "run", *_bash(*commands), sections=(section,))
+        runbook.run_section(0)
+    lines = log.read_text().splitlines()
+
+    assert lines[0].startswith("compose up -d")
+    assert lines[-1] == (
+        f"compose down -v --remove-orphans foo=bar project={runbook.env['COMPOSE_PROJECT_NAME']}"
+    )
+
+
+def test_a_section_without_a_docker_step_never_runs_compose_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = _fake_docker(tmp_path, monkeypatch)
+
+    _run(tmp_path / "run", *_bash("echo hi"))
+
+    assert not log.exists()
+
+
+def test_the_repo_environment_stops_before_a_docker_section(tmp_path: Path) -> None:
+    sections = (
+        Section("one", (Step("echo x > one"),)),
+        Section("two", (Step("docker compose up"),)),
+        Section("three", (Step("echo x > three"),)),
+    )
+    runbook = _runbook(
+        tmp_path,
+        *_bash("echo x > one", "docker compose up", "echo x > three"),
+        sections=sections,
+    )
+
+    runbook.run_repo_environment()
+
+    assert (runbook.workdir / "one").exists()
+    assert not (runbook.workdir / "three").exists()
+
+
+def test_the_repo_environment_stops_before_a_section_that_needs_the_wheel(tmp_path: Path) -> None:
+    sections = (
+        Section("one", (Step("echo x > one"),)),
+        Section("wheel", (Step("echo x > wheel"),), repo_env=False),
+    )
+    runbook = _runbook(tmp_path, *_bash("echo x > one", "echo x > wheel"), sections=sections)
+
+    runbook.run_repo_environment()
+
+    assert (runbook.workdir / "one").exists()
+    assert not (runbook.workdir / "wheel").exists()
+
+
+@pytest.mark.real_process
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize("example", sorted(RUNBOOKS))
+def test_readme_runbook_passes_in_the_repo_environment(example: str, tmp_path: Path) -> None:
+    runbook = Runbook(EXAMPLES / example, RUNBOOKS[example], tmp_path / example)
+
+    runbook.run_repo_environment()
+
+    serves = sum(
+        step.serve for section in _repo_sections(RUNBOOKS[example]) for step in section.steps
+    )
+    assert len(runbook.pgids) == serves
+    assert all(_group_gone(pgid) for pgid in runbook.pgids)

@@ -94,6 +94,30 @@ def _free_port() -> int:
     return port
 
 
+def _free_port_block(size: int) -> int:
+    """The first of ``size`` consecutive free TCP ports.
+
+    ``_free_port`` picks the first port; the rest are probed the same way, by
+    binding and releasing. A proxy plus its workers need adjacent ports, which
+    ``size`` calls to ``_free_port`` would not give.
+    """
+    while True:
+        base = _free_port()
+        if base + size > 65535:
+            continue
+        held: list[socket.socket] = []
+        try:
+            for port in range(base + 1, base + size):
+                held.append(socket.socket())
+                held[-1].bind(("127.0.0.1", port))
+        except OSError:
+            continue
+        finally:
+            for sock in held:
+                sock.close()
+        return base
+
+
 async def _serve(app: Any, port: int, http: Any) -> tuple[Any, asyncio.Task[None]]:
     """Serve ``app`` with uvicorn on ``port`` in this loop; return once it listens."""
     import uvicorn
