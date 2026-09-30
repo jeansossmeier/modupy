@@ -4,8 +4,8 @@ The large example: seven modules that separate teams could own, a checkout
 saga with compensation, and a Postgres that every process shares. It shows
 what only a big codebase needs: rules the whole team checks automatically,
 operators who recover failed work by command, and one module lifted out into a
-service of its own. It does not repeat the smaller examples' lessons, so read [`quickstart`](../quickstart) and
-[`demo_app`](../demo_app) first.
+service of its own. It does not repeat the smaller examples' lessons, so read
+[`quickstart`](../quickstart) and [`demo_app`](../demo_app) first.
 
 `orders` accepts an order and asks for stock. `inventory` reserves it, or
 releases it again when the payment is declined. `payments` charges a card
@@ -52,8 +52,9 @@ The suite needs no Docker. The saga tests run against a SQLite file that
 None of the commands below opens a database connection: `marketplace.db` reads
 `MODULITH_OUTBOX_URL` only when a request or a listener first needs the engine.
 The project's `database` broker is another matter. With no
-`MODULITH_BROKER_URL`, each command falls back to an embedded SQLite file
-under `$XDG_STATE_HOME/modulith/` and prints a notice naming it.
+`MODULITH_BROKER_URL`, each command falls back to an embedded SQLite file in
+your user state directory (`~/.local/state/modulith/` on Linux) and prints a
+notice naming it.
 
 ```bash
 $ modulith verify
