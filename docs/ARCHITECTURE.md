@@ -110,9 +110,11 @@ silently guess:
   `production = true`) to defaults with no warning.
 
 **`[tool.modulith.outbox_options]`.** Config load validates these eight keys
-whenever they are present. When bootstrap binds the store from `outbox_url` (a
+whenever they are present. When the store is bound from `outbox_url` (a
 durable outbox and no store bound yet), `Runtime.bind_configured_outbox`
 forwards them to `outbox.configure()` in the same call that binds the store.
+Bootstrap makes that call only while `auto_discover` is on (the default);
+every process-topology worker makes it after importing its module.
 The table gives each key's default, which is `configure()`'s own, and its
 check:
 
@@ -202,10 +204,12 @@ readiness checks can query it. Stores and
 serializers are "one wins" drivers: exactly one is active per app, wired
 **explicitly** at startup, in one of two ways:
 
-- **Config binding.** With a durable `outbox` and an `outbox_url`, bootstrap
+- **Config binding.** With a durable `outbox` and an `outbox_url`, modulith
   builds a `PostgresPublicationStore` and the plain `JsonEventSerializer` and
   passes them, with the `outbox_options` tuning keys (§3), to
-  `outbox.configure()` unless the application already bound a store.
+  `outbox.configure()` unless the application already bound a store. Bootstrap
+  does this only while `auto_discover` is on; every process-topology worker
+  does it after importing its module.
 - **Explicit wiring.** The application calls
   `modulith.builtin.outbox.configure(store, serializer)` itself, with
   `PostgresPublicationStore` from `modulith.adapters.postgres_outbox` or its
