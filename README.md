@@ -82,9 +82,10 @@ for it. `modulith verify --update-baseline` records today's violations in
 
 Where this stands, honestly: **pre-1.0 alpha**. Breaking changes may land in
 0.x minor releases and are always listed in [CHANGELOG.md](CHANGELOG.md).
-Every push runs ~1,770 hermetic tests on Python 3.11, 3.12 and 3.13 (Linux,
-with the SHM broker additionally on macOS and Windows) plus 91 integration
-tests against real Postgres, MySQL and Redis containers.
+Every push runs ~2,380 hermetic tests on Python 3.11, 3.12 and 3.13 (Linux,
+with the SHM broker additionally on macOS and Windows) plus 116 integration
+tests against real Postgres, MySQL and Redis containers, which include every
+example README run from the built wheel.
 
 ---
 
