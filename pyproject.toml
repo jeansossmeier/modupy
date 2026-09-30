@@ -314,7 +314,7 @@ faulthandler_timeout = 300
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
-    "integration: requires an external service (Redis, Postgres); skipped unless reachable",
+    "integration: needs Docker or the network (testcontainers, docker compose, installs into fresh venvs)",
     "modulith_isolated: run this test in a subprocess for full module isolation",
     "real_process: real subprocess/signal tests that need no Docker",
 ]

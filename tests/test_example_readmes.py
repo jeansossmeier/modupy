@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import difflib
 import http.client
+import json
 import os
 import re
 import shlex
@@ -35,8 +36,10 @@ import tempfile
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import chain, takewhile
@@ -47,7 +50,7 @@ import pytest
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
-from conftest import Block, _free_port_block, fenced_blocks
+from conftest import Block, _docker_available, _free_port_block, fenced_blocks
 
 REPO = Path(__file__).resolve().parent.parent
 EXAMPLES = REPO / "examples"
@@ -328,18 +331,23 @@ class RunbookFailure(AssertionError):
     """A runbook step that broke its README's promise; the message carries the transcript."""
 
 
-def child_env(base: Mapping[str, str], workdir: Path) -> dict[str, str]:
+def child_env(base: Mapping[str, str], workdir: Path, venv: Path | None = None) -> dict[str, str]:
     """``base`` without the settings that would steer a README's commands, plus the workdir's own.
 
     ``PYTHONPATH`` is dropped and never set: uvicorn, ``python -m`` and the ``modulith`` CLI
     put the project directory on ``sys.path`` themselves, which is the behaviour under test.
+    With ``venv``, that environment's ``bin`` leads ``PATH`` instead of the running
+    interpreter's, so nothing installed for the tests can answer for a missing install.
     """
     env = {
         name: value
         for name, value in base.items()
         if not name.startswith(SCRUBBED_PREFIXES) and name not in SCRUBBED_NAMES
     }
-    env["PATH"] = os.pathsep.join(filter(None, [str(Path(sys.executable).parent), env.get("PATH")]))
+    bin_dir = venv / "bin" if venv else Path(sys.executable).parent
+    env["PATH"] = os.pathsep.join(filter(None, [str(bin_dir), env.get("PATH")]))
+    if venv:
+        env["VIRTUAL_ENV"] = str(venv)
     env["XDG_STATE_HOME"] = str(workdir / ".state")
     env["COMPOSE_PROJECT_NAME"] = f"modupy-readme-{uuid.uuid4().hex[:12]}"
     return env
@@ -347,6 +355,33 @@ def child_env(base: Mapping[str, str], workdir: Path) -> dict[str, str]:
 
 def copy_example(source: Path, workdir: Path) -> None:
     shutil.copytree(source, workdir, ignore=COPY_IGNORE)
+
+
+def create_wheel_venv(venv: Path, wheel: Path) -> None:
+    """A fresh ``python -m venv`` at ``venv`` holding ``wheel`` and its dependencies, no extras."""
+    for command in (
+        [sys.executable, "-m", "venv", str(venv)],
+        [str(venv / "bin" / "python"), "-m", "pip", "install", str(wheel)],
+    ):
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        assert result.returncode == 0, f"{' '.join(command)} exited {result.returncode}\n" + (
+            result.stdout + result.stderr
+        )
+
+
+def wheel_provenance_problem(venv: Path, wheel: Path) -> str:
+    """Why ``venv``'s modupy is not ``wheel``, judged by pip's ``direct_url.json``; empty when it is."""
+    pattern = "lib/python*/site-packages/modupy-*.dist-info/direct_url.json"
+    records = sorted(venv.glob(pattern))
+    if not records:
+        return f"{venv / pattern} does not exist: modupy was not installed from a local file"
+    url: str = json.loads(records[0].read_text(encoding="utf-8"))["url"]
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == "file":
+        installed = Path(urllib.request.url2pathname(parsed.path)).resolve()
+        if installed == wheel.resolve():
+            return ""
+    return f"{records[0]} names {url}, not the session-built wheel {wheel}"
 
 
 def _exit_status(process: subprocess.Popen[bytes]) -> int | None:
@@ -477,14 +512,15 @@ def _option(command: str, flag: str, default: int) -> int:
     return int(found.group(1)) if found else default
 
 
+def _has_docker_step(steps: Sequence[Step]) -> bool:
+    return any(step.command.split()[:1] == ["docker"] for step in steps)
+
+
 def _repo_sections(sections: Sequence[Section]) -> list[Section]:
     """The leading sections a runbook can run in the repo environment."""
     return list(
         takewhile(
-            lambda section: (
-                section.repo_env
-                and not any(step.command.split()[:1] == ["docker"] for step in section.steps)
-            ),
+            lambda section: section.repo_env and not _has_docker_step(section.steps),
             sections,
         )
     )
@@ -519,6 +555,7 @@ class Runbook:
         sections: Sequence[Section],
         workdir: Path,
         *,
+        venv: Path | None = None,
         timeout: float = STEP_TIMEOUT,
         stop_wait: float = STOP_WAIT,
         ready_timeout: float = READY_TIMEOUT,
@@ -542,7 +579,8 @@ class Runbook:
                 f"{len(self.commands)} commands"
             )
         copy_example(source, workdir)
-        self.env = child_env(os.environ, workdir)
+        self.venv = venv
+        self.env = child_env(os.environ, workdir, venv)
         self._log: list[str] = []
         self._serves: list[_Serve] = []
 
@@ -558,6 +596,11 @@ class Runbook:
         for position in range(len(_repo_sections(self.sections))):
             self.run_section(position)
 
+    def run_built_wheel(self) -> None:
+        """Run every section, Docker ones included, in the venv this runbook was given."""
+        for position in range(len(self.sections)):
+            self.run_section(position)
+
     def run_section(self, position: int) -> None:
         section = self.sections[position]
         first = sum(len(earlier.steps) for earlier in self.sections[:position])
@@ -570,7 +613,7 @@ class Runbook:
             try:
                 self._stop_serves(check=completed)
             finally:
-                if any(step.command.split()[:1] == ["docker"] for step in section.steps):
+                if _has_docker_step(section.steps):
                     self._compose_down()
 
     def _fail(self, command: Command, reason: str) -> NoReturn:
@@ -583,7 +626,7 @@ class Runbook:
         words = step.command.split()
         if step.serve:
             self._serve(step, command)
-        elif words[:2] == ["pip", "install"]:
+        elif words[:2] == ["pip", "install"] and self.venv is None:
             self._log.append(f"$ {step.command}\n(skipped: pip install in the repo environment)\n")
         elif words[:1] == ["export"]:
             self._export(step, command)
@@ -1054,6 +1097,7 @@ def _runbook(
     sections: Sequence[Section] | None = None,
     files: Mapping[str, str] | None = None,
     timeout: float = 30.0,
+    venv: Path | None = None,
     **options: float,
 ) -> Runbook:
     source = tmp_path / "example"
@@ -1065,7 +1109,7 @@ def _runbook(
     if sections is None:
         listed = steps or tuple(Step(c.text) for c in readme_commands(source / "README.md"))
         sections = (Section("all", tuple(listed)),)
-    return Runbook(source, sections, tmp_path / "work", timeout=timeout, **options)
+    return Runbook(source, sections, tmp_path / "work", timeout=timeout, venv=venv, **options)
 
 
 def _run(tmp_path: Path, *readme_lines: str, **kwargs: Any) -> Runbook:
@@ -1941,5 +1985,209 @@ def test_readme_runbook_passes_in_the_repo_environment(example: str, tmp_path: P
     serves = sum(
         step.serve for section in _repo_sections(RUNBOOKS[example]) for step in section.steps
     )
+    assert len(runbook.pgids) == serves
+    assert all(_group_gone(pgid) for pgid in runbook.pgids)
+
+
+def _fake_venv(tmp_path: Path) -> tuple[Path, Path]:
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    log = tmp_path / "pip.log"
+    pip = venv / "bin" / "pip"
+    pip.write_text(f'#!/bin/sh\necho "$* in $VIRTUAL_ENV" >> "{log}"\n')
+    pip.chmod(0o755)
+    return venv, log
+
+
+def test_pip_install_runs_literally_in_the_wheel_environment(tmp_path: Path) -> None:
+    venv, log = _fake_venv(tmp_path)
+    readme = _bash("pip install 'some-package[extra]'")
+
+    repo = _run(tmp_path / "repo", *readme)
+    wheel = _runbook(tmp_path / "wheel", *readme, venv=venv)
+    wheel.run_built_wheel()
+
+    assert "skipped" in repo.transcript
+    assert "skipped" not in wheel.transcript
+    assert log.read_text() == f"install some-package[extra] in {venv}\n"
+
+
+def test_a_wheel_step_resolves_its_tools_inside_the_venv(tmp_path: Path) -> None:
+    venv, _log = _fake_venv(tmp_path)
+
+    _runbook(
+        tmp_path / "wheel",
+        *_bash("$ command -v pip", f"{venv}/bin/pip", "$ printenv VIRTUAL_ENV", str(venv)),
+        venv=venv,
+    ).run_built_wheel()
+
+
+def test_the_wheel_environment_leads_the_path_with_the_venv_and_not_the_running_interpreter(
+    tmp_path: Path,
+) -> None:
+    venv = tmp_path / "venv"
+
+    env = child_env(
+        {"PATH": "/opt/base/bin", "VIRTUAL_ENV": "/elsewhere"}, tmp_path / "work", venv=venv
+    )
+
+    assert env["PATH"] == f"{venv}/bin{os.pathsep}/opt/base/bin"
+    assert env["VIRTUAL_ENV"] == str(venv)
+
+
+def test_the_wheel_lane_runs_every_section_where_the_repo_lane_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docker_log = _fake_docker(tmp_path, monkeypatch)
+    venv, _log = _fake_venv(tmp_path)
+    sections = (
+        Section("one", (Step("touch one"),)),
+        Section("two", (Step("docker compose up"),)),
+        Section("three", (Step("touch three"),), repo_env=False),
+    )
+    readme = _bash("touch one", "docker compose up", "touch three")
+
+    repo = _runbook(tmp_path / "repo", *readme, sections=sections)
+    repo.run_repo_environment()
+    assert (repo.workdir / "one").exists()
+    assert not (repo.workdir / "three").exists()
+    assert not docker_log.exists()
+
+    wheel = _runbook(tmp_path / "wheel", *readme, sections=sections, venv=venv)
+    wheel.run_built_wheel()
+
+    assert (wheel.workdir / "one").exists()
+    assert (wheel.workdir / "three").exists()
+    assert [line.split()[:2] for line in docker_log.read_text().splitlines()] == [
+        ["compose", "up"],
+        ["compose", "down"],
+    ]
+
+
+def _record(venv: Path, url: str | None) -> None:
+    info = venv / "lib" / "python3.11" / "site-packages" / "modupy-0.10.0.dist-info"
+    info.mkdir(parents=True)
+    if url is not None:
+        (info / "direct_url.json").write_text(json.dumps({"url": url, "archive_info": {}}))
+
+
+def test_provenance_accepts_the_session_built_wheel(tmp_path: Path) -> None:
+    wheel = tmp_path / "dist" / "modupy-0.10.0-py3-none-any.whl"
+    _record(tmp_path / "venv", wheel.as_uri())
+
+    assert wheel_provenance_problem(tmp_path / "venv", wheel) == ""
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://files.pythonhosted.org/packages/ab/modupy-0.10.0-py3-none-any.whl",
+        "file:///elsewhere/dist/modupy-0.10.0-py3-none-any.whl",
+        "file:///home/somebody/modupy",
+    ],
+    ids=["pypi", "another-wheel", "source-tree"],
+)
+def test_provenance_names_the_url_of_anything_but_the_session_built_wheel(
+    tmp_path: Path, url: str
+) -> None:
+    wheel = tmp_path / "dist" / "modupy-0.10.0-py3-none-any.whl"
+    _record(tmp_path / "venv", url)
+
+    problem = wheel_provenance_problem(tmp_path / "venv", wheel)
+
+    assert url in problem
+    assert str(wheel) in problem
+
+
+@pytest.mark.parametrize("dist_info", [False, True], ids=["no-dist-info", "no-direct-url-file"])
+def test_provenance_names_the_missing_file(tmp_path: Path, dist_info: bool) -> None:
+    venv = tmp_path / "venv"
+    (venv / "lib" / "python3.11" / "site-packages").mkdir(parents=True)
+    if dist_info:
+        _record(venv, None)
+
+    problem = wheel_provenance_problem(venv, tmp_path / "modupy-0.10.0-py3-none-any.whl")
+
+    assert "direct_url.json" in problem
+    assert str(venv) in problem
+
+
+def _stub_wheel(directory: Path) -> Path:
+    directory.mkdir(parents=True)
+    wheel = directory / "modupy-0.0.1-py3-none-any.whl"
+    info = "modupy-0.0.1.dist-info"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            f"{info}/METADATA", "Metadata-Version: 2.1\nName: modupy\nVersion: 0.0.1\n"
+        )
+        archive.writestr(
+            f"{info}/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+        archive.writestr(f"{info}/RECORD", f"{info}/METADATA,,\n{info}/WHEEL,,\n{info}/RECORD,,\n")
+    return wheel
+
+
+def test_a_wheel_venv_holds_the_wheel_and_pips_record_of_it_passes_the_provenance_check(
+    tmp_path: Path,
+) -> None:
+    wheel = _stub_wheel(tmp_path / "dist")
+    other = _stub_wheel(tmp_path / "other")
+    venv = tmp_path / "venv"
+
+    create_wheel_venv(venv, wheel)
+
+    assert wheel_provenance_problem(venv, wheel) == ""
+    assert wheel.as_uri() in wheel_provenance_problem(venv, other)
+
+
+def test_a_wheel_venv_that_cannot_install_its_wheel_fails_naming_it(tmp_path: Path) -> None:
+    missing = tmp_path / "dist" / "modupy-0.0.1-py3-none-any.whl"
+
+    with pytest.raises(AssertionError, match=re.escape(missing.name)):
+        create_wheel_venv(tmp_path / "venv", missing)
+
+
+@pytest.fixture(scope="session")
+def built_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    dist = tmp_path_factory.mktemp("dist")
+    build = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
+            str(dist),
+            str(REPO),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert build.returncode == 0, build.stdout + build.stderr
+    (wheel,) = dist.glob("*.whl")
+    return wheel
+
+
+@pytest.mark.integration
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize("example", sorted(RUNBOOKS))
+def test_readme_runbook_passes_from_the_built_wheel(
+    example: str, tmp_path: Path, built_wheel: Path
+) -> None:
+    sections = RUNBOOKS[example]
+    if any(_has_docker_step(section.steps) for section in sections) and not _docker_available():
+        pytest.skip(f"the {example} runbook has a docker step and no Docker daemon is reachable")
+    venv = tmp_path / "venv"
+    create_wheel_venv(venv, built_wheel)
+    runbook = Runbook(EXAMPLES / example, sections, tmp_path / example, venv=venv)
+
+    runbook.run_built_wheel()
+
+    problem = wheel_provenance_problem(venv, built_wheel)
+    assert not problem, problem
+    serves = sum(step.serve for section in sections for step in section.steps)
     assert len(runbook.pgids) == serves
     assert all(_group_gone(pgid) for pgid in runbook.pgids)
