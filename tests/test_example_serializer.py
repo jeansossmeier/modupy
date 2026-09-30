@@ -126,12 +126,13 @@ async def test_outbox_configure_stores_versioned_envelope(tmp_path: Path) -> Non
         f"sqlite+aiosqlite:///{tmp_path / 'outbox.db'}",
         poolclass=NullPool,
     )
+    store = PostgresPublicationStore(engine=engine)
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
         serializer = example.VersionedJsonSerializer(allowed_event_types=[OrderPlacedEvent])
-        outbox.configure(PostgresPublicationStore(engine=engine), serializer, start_loop=False)
+        outbox.configure(store, serializer, start_loop=False)
         _runtime.configure(package="test_example", auto_discover=False)
         _runtime.ensure_bootstrapped()
 
@@ -159,6 +160,7 @@ async def test_outbox_configure_stores_versioned_envelope(tmp_path: Path) -> Non
             "body": {"customer_id": "c-env", "order_id": "o-env", "total": 2.5},
         }
     finally:
+        await store.dispose()
         await engine.dispose()
         _runtime._reset_for_testing()
         outbox._reset_for_testing()
