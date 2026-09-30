@@ -213,20 +213,35 @@ uv add 'modupy[postgres]'
 ```toml
 [tool.modulith]
 outbox = "postgres"
+outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # your business database
 ```
 
-The completion mode (`"update"` keeps history visible; `"delete"` and
-`"archive"` are the alternatives) is passed to `outbox.configure()` in
-the wiring code below. The runtime reads only the claim keys of
-`[tool.modulith.outbox_options]` (`claim_strategy`, `claim_lease_seconds`,
-`claim_batch_size`), and only when it binds the store from `outbox_url`.
-Those three keys are validated; any other key in the table is accepted
-and ignored. An application that binds its own store, as the wiring code
-below does, passes the claim settings to `outbox.configure()` as keyword
-arguments.
+`outbox_url` is the async SQLAlchemy URL of the database your business data
+lives in. With it set, modulith binds the outbox store for you. The tuning
+knobs live in `[tool.modulith.outbox_options]`, and the runtime validates and
+forwards eight keys to `outbox.configure()` when it binds the store from
+`outbox_url`: `claim_strategy`, `claim_lease_seconds`, `claim_batch_size`,
+`dead_letter_after_attempts`, `retry_interval_seconds`, `retry_stale_seconds`,
+`max_retry_backoff_seconds` and `completion_mode` (`"update"` keeps history
+visible; `"delete"` and `"archive"` are the alternatives). Any other key in
+the table is accepted and ignored. An application that binds its own store, as
+the manual wiring below does, passes these settings to `outbox.configure()` as
+keyword arguments.
 
-Run the packaged schema migration. modulith ships its alembic config
-*inside* the installed package (your project needs no alembic.ini), so
+Run the packaged schema migration. `modulith migrate` applies it to
+`outbox_url`, swapping the async driver for the sync one Alembic runs on, and
+prints the target with the password masked:
+
+```bash
+modulith migrate
+```
+
+Pass `--url <sqlalchemy url>` to migrate another database, and a revision
+(`modulith migrate <revision>`) to stop short of `head`. The chain creates the
+outbox tables and also the `broker_*` tables of the database broker.
+
+The raw Alembic command remains the alternative. modulith ships its alembic
+config *inside* the installed package (your project needs no alembic.ini), so
 point alembic's `-c` at it and supply the database URL via the
 `MODULITH_DB_URL` env var (alembic runs on a **sync** driver, e.g.
 `postgresql+psycopg://`, even if your app connects with asyncpg):
@@ -242,12 +257,14 @@ fails with "No 'script_location' key found" because there is no
 alembic.ini in your project root.)
 
 To put the outbox tables in a Postgres schema named after a module instead of
-`public`, add `-x schema=<name>` (or set `MODULITH_DB_SCHEMA`) — Postgres only;
+`public`, pass `modulith migrate --schema <name>`, or add `-x schema=<name>`
+(or set `MODULITH_DB_SCHEMA`) to the raw command — Postgres only;
 other dialects log a warning and ignore it. This is separate from, but usually
 paired with, the database broker's own `broker_options.schema` /
 `MODULITH_BROKER_SCHEMA` knob.
 
-Alembic's `-x` is a global option and must precede the command:
+With the raw command, Alembic's `-x` is a global option and must precede the
+command:
 
 ```bash
 MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
@@ -262,20 +279,59 @@ database-broker construction. Enabling a named schema does not move data: if
 no history, migration stops until you back up, explicitly move and verify the
 tables, then rerun it.
 
-Wire your SQLAlchemy session to modulith:
+Bind your SQLAlchemy session to modulith around each transaction. The service
+function binds, publishes, commits and unbinds before the route returns:
+
+```python
+# app/orders/service.py
+from modulith import publish
+from modulith.builtin.outbox import bind_session, unbind_session
+
+from app.contracts.events import OrderCreated  # your event types
+
+
+async def place_order(order_id: str) -> None:
+    async with async_session_maker() as session:
+        token = bind_session(session)
+        try:
+            session.add(Order(id=order_id))
+            await publish(OrderCreated(order_id=order_id))
+            await session.commit()
+        finally:
+            # bind_session returned this token; reset it when the transaction ends.
+            unbind_session(token)
+```
+
+Commit inside the function, not in the teardown of a `yield` dependency:
+FastAPI runs that teardown after the response is sent, so a commit that fails
+there still answers 200. Wrap the same four steps in a `transaction()` helper
+if many routes need them.
+
+Call `modulith.bootstrap()` and then `outbox.start()` in your ASGI lifespan's
+startup half, and `await outbox.shutdown()` in its shutdown half: module-scope
+code runs before the server's event loop exists, so `configure()` there cannot
+start the retry loop that redelivers rows a crashed process left behind, and
+that loop skips every row until bootstrap has run. Keep the outbox table in the
+same database as your business data, or the row and your data cannot commit in
+one transaction. Under `--topology processes`, `main.py` does not run in
+workers. Set `[tool.modulith].outbox_url` (env `MODULITH_OUTBOX_URL`) and
+modulith binds the store in every process-topology worker and, while
+`auto_discover` is on (the default), in the single-process server and the
+`modulith outbox` CLI; without discovery, call `outbox.configure()` yourself. A
+worker with a durable `outbox` and no store refuses to start.
+
+To bind your own store or serializer instead of `outbox_url`, call
+`outbox.configure()` yourself, at startup:
+
 ```python
 # app/main.py
-from modulith.adapters.postgres_outbox import (
-    PostgresPublicationStore,
-    bind_session,
-    unbind_session,
-)
+from modulith.adapters.postgres_outbox import PostgresPublicationStore
 from modulith.builtin import outbox
 from modulith.serializers import JsonEventSerializer
 
 from app.contracts.events import OrderCreated  # your event types
 
-# At startup. allowed_event_types is JsonEventSerializer's deserialization
+# allowed_event_types is JsonEventSerializer's deserialization
 # allowlist — recommended in production wherever payloads can originate
 # outside the trusted process boundary (a shared outbox table, a broker):
 # deserialize() imports the module named in the record's event_type, so
@@ -286,30 +342,9 @@ outbox.configure(
     serializer=JsonEventSerializer(allowed_event_types=[OrderCreated]),
     completion_mode="update",  # "update" (default) | "delete" | "archive"
 )
-
-# In your dependency for getting a DB session
-async def get_db():
-    async with async_session_maker() as session:
-        token = bind_session(session)
-        try:
-            yield session
-        finally:
-            # bind_session returned this token; reset it when the request ends.
-            unbind_session(token)
 ```
 
-Call `modulith.bootstrap()` and then `outbox.start()` in your ASGI lifespan's
-startup half: module-scope code runs before the server's event loop exists, so
-`configure()` there cannot start the retry loop that redelivers rows a crashed
-process left behind, and that loop skips every row until bootstrap has run. Keep
-the outbox table in the same database as your business data, or the row and
-your data cannot commit in one transaction. Under `--topology processes`,
-`main.py` does not run in workers. Set `[tool.modulith].outbox_url` (env
-`MODULITH_OUTBOX_URL`) to that database's async SQLAlchemy URL and modulith
-binds the store in every process-topology worker and, while `auto_discover` is
-on (the default), in the single-process server and the `modulith outbox` CLI;
-without discovery, call `outbox.configure()` yourself. A worker with a durable
-`outbox` and no store refuses to start.
+The session binding above is the same either way.
 
 Upgrading with rows still in the outbox: a callable-instance or bound-method
 listener registered from a module is now stored as

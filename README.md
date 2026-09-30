@@ -25,18 +25,23 @@ stay identical, and nothing is rewritten for the messaging layer.
 exactly one dependency, `pluggy`. Modules are subpackages of your app; they
 talk through `@event`, `@listener` and `publish()`; you run
 `uvicorn myapp.main:app` as you always have. Boundaries are checked by static
-AST analysis at load time, and `modulith verify` fails CI on boundary
-violations. Broker and outbox are in-memory, so there is nothing to provision.
+AST analysis: `modulith verify` fails CI on boundary violations, and with
+`strict_boundaries = true` the same check also runs at load time. Broker and outbox are in-memory, so there is nothing to provision.
 
-**Durable: two config lines.** `outbox = "postgres"` plus `outbox_url`, the
-async SQLAlchemy URL of your business database (Postgres, MySQL or SQLite),
-makes the outbox transactional in every process while module discovery
-(`auto_discover`) stays on, its default: events are stored durably
+**Durable: two config lines and three steps.** `outbox = "postgres"` plus
+`outbox_url`, the async SQLAlchemy URL of your business database (Postgres,
+MySQL or SQLite), makes the outbox transactional in every process while module
+discovery (`auto_discover`) stays on, its default: events are stored durably
 and delivered at-least-once after commit, and process crashes and
-transaction rollbacks stay consistent. The Alembic migrations ship inside the
-package. A single-process app calls `modulith.bootstrap()` and then
-`outbox.start()` in its lifespan, so rows a crashed process left undelivered
-are retried at startup rather than after the first publish
+transaction rollbacks stay consistent. The steps are: run `modulith migrate`
+(the Alembic migrations ship inside the package, and the chain also creates
+the `broker_*` tables); bind a session around each transaction with
+`bind_session` and `unbind_session` from `modulith.builtin.outbox`, and commit
+before the route returns; and, in a single-process app, call
+`modulith.bootstrap()` and then `outbox.start()` in the lifespan, with
+`outbox.shutdown()` on exit, so rows a crashed process left undelivered are
+retried at startup rather than after the first publish. [`examples/demo_app`](examples/demo_app)
+shows all three
 ([DEPLOYMENT.md](docs/DEPLOYMENT.md#durable-single-process-outbox-pattern)).
 
 **Process-per-module: one flag, still one host.**
@@ -57,8 +62,9 @@ dispatch.
 **Microservice: only when it pays.** `modulith extract <module>` scaffolds a
 standalone service from one module: its package tree plus `pyproject.toml`,
 `Dockerfile`, `README.md` and `.env.example`. The rest of the monolith keeps
-publishing through the broker and the extracted service subscribes; you wire
-its outbox yourself. Extraction copies the package-level helpers the module
+publishing through the broker and the extracted service subscribes. The
+service binds its outbox store from `MODULITH_OUTBOX_URL` and, when the outbox
+is not `memory`, refuses to start without one. Extraction copies the package-level helpers the module
 and its contracts import, transitively. It refuses a module with outbound
 boundary violations, tables shared with another module, or imports of another
 declared module unless you pass `--force`, and the generated README records
@@ -70,8 +76,9 @@ a module-level import of another declared module still fails it, so only a
 deferred one (inside a function) can be forced through.
 
 Adopting on an existing codebase? `modulith audit` writes a `MIGRATION.md`
-for it, and `modulith verify --mode=ratchet` baselines today's violations and
-forbids new ones.
+for it. `modulith verify --update-baseline` records today's violations in
+`.modulith-baseline.json`, which you commit, and `modulith verify
+--mode=ratchet` then forbids new ones.
 
 Where this stands, honestly: **pre-1.0 alpha**. Breaking changes may land in
 0.x minor releases and are always listed in [CHANGELOG.md](CHANGELOG.md).
@@ -353,8 +360,8 @@ uvicorn myapp.main:app --reload
 ```
 
 Package detection, module discovery and listener registration are automatic
-and run at the first `publish()`. A durable outbox needs
-`modulith.bootstrap()` at startup, as described under **Durable** above. Call
+and run at the first `publish()`. A durable outbox also needs the three steps under
+**Durable** above, including `modulith.bootstrap()` at startup. Call
 it at startup too when a manifest or boundary violation should stop the server
 from starting rather than fail its first `publish()`.
 
@@ -415,18 +422,20 @@ Any *scalar* key has a `MODULITH_*` environment equivalent
 table-valued keys — `outbox_options`, `broker_options`, `workers` — are
 pyproject-only, though the SHM and database brokers lift their own
 `MODULITH_BROKER_<KEY>` variables on top and the Redis Streams broker reads
-`REDIS_URL`.
+`REDIS_URL`, `MODULITH_BROKER_DLQ_MAX_STREAM_LEN`,
+`MODULITH_BROKER_MAX_PAYLOAD_BYTES` and its stream variables (see the
+`modulith.adapters.redis_broker` docstring).
 
 Under `topology = "processes"` an omitted broker defaults to `shm`: despite
 the name, a same-host durable SQLite queue with at-least-once delivery, so
 listeners must be idempotent. Its default store location is keyed on the
 package's install path, so production deploys must set `state_dir` (see
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)). Use `redis-streams` or `database` (Postgres /
-MySQL) for cross-host delivery. Every option — outbox claim strategies, SHM
-sizing and payload caps, database-broker polling, retention and
-dead-lettering, actuator protection — is documented in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §8 and
-[docs/COOKBOOK.md](docs/COOKBOOK.md).
+MySQL) for cross-host delivery. Every option is documented in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
+[docs/COOKBOOK.md](docs/COOKBOOK.md): how settings resolve in §3, outbox claim
+strategies and retries in §7, SHM sizing and payload caps and database-broker
+polling, retention and dead-lettering in §8, and actuator protection in §10.
 
 ---
 
@@ -438,6 +447,8 @@ modulith dev myapp.main:app       # like uvicorn --reload, with banner +
 modulith run myapp.main:app --topology=processes # production, process-per-module
 modulith verify --mode=ratchet    # boundary checks for CI
                                   # (ERROR-severity failures always fatal)
+modulith verify --update-baseline # record today's violations as the baseline
+                                  # to commit (--mode=ratchet reads it)
 modulith docs                     # generate Mermaid diagrams + canvas
 modulith audit                    # analyze existing codebase for migration
                                   # (writes MIGRATION.md; --output to change)
@@ -448,6 +459,8 @@ modulith k8s-manifest             # generate per-module Deployment/Service +
 modulith openapi                  # merge every module's OpenAPI doc into one
                                   # build-time spec (schemas prefixed per module)
 modulith doctor                   # nine operational + architectural health checks
+modulith migrate [REVISION]       # apply the packaged outbox + broker_* Alembic
+                                  # migrations to outbox_url (--url, --schema)
 modulith outbox status            # outbox metrics (needs a durable outbox —
                                   # the default 'memory' store has nothing to
                                   # report and exits 1)
