@@ -28,13 +28,13 @@ async def test_transaction_commits_business_rows_and_outbox_rows_together(
         await publish(listed)
         assert received == []
 
-    counts = await delivered(1)
+    counts = await delivered(2)
     async with engine().connect() as connection:
         stored = await connection.scalar(select(func.count()).select_from(product))
 
     assert stored == 1
     assert received == [listed]
-    assert counts == {"incomplete": 0, "completed": 1, "dead_lettered": 0}
+    assert counts == {"incomplete": 0, "completed": 2, "dead_lettered": 0}
 
 
 async def test_transaction_rolls_back_business_rows_and_outbox_rows_on_error(
@@ -89,9 +89,9 @@ async def test_a_publish_after_the_transaction_is_no_longer_transactional(
     listed = ProductListed(sku="SKU-MUG", name="Stoneware mug", price_cents=1200, stock=10)
     async with transaction():
         await publish(listed)
-    await delivered(1)
+    await delivered(2)
 
     await publish(listed)
 
     assert received == [listed, listed]
-    assert await delivered(1) == {"incomplete": 0, "completed": 1, "dead_lettered": 0}
+    assert await delivered(2) == {"incomplete": 0, "completed": 2, "dead_lettered": 0}

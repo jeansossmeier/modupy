@@ -1,3 +1,6 @@
+import sqlite3
+from contextlib import closing
+
 import pytest
 from modulith.testing import ModulithTestApp
 
@@ -35,12 +38,17 @@ async def test_price_of_an_unlisted_sku_is_a_lookup_error(marketplace: ModulithT
         await price_of("SKU-NOPE")
 
 
-async def test_the_catalog_command_lists_a_product_and_leaves_nothing_undelivered(
-    database: str,
-) -> None:
+def test_the_catalog_command_delivers_the_listing_to_inventory(database: str) -> None:
     listed = run_python("-m", "marketplace.catalog", "SKU-MUG", "Stoneware mug", "1200", "10")
     status = run_python("-m", "modulith", "outbox", "status")
 
+    with closing(sqlite3.connect(database.removeprefix("sqlite+aiosqlite:///"))) as connection:
+        on_hand = connection.execute("SELECT on_hand FROM inventory_stock").fetchall()
     assert listed.returncode == 0, listed.stderr
     assert status.returncode == 0, status.stderr
-    assert "incomplete:    0" in status.stdout.splitlines()
+    assert status.stdout.splitlines() == [
+        "incomplete:    0",
+        "completed:     1",
+        "dead-lettered: 0",
+    ]
+    assert on_hand == [(10,)]

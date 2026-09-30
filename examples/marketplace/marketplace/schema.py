@@ -1,6 +1,8 @@
 import asyncio
 
-import marketplace.catalog.tables  # noqa: F401
+import marketplace.catalog.tables
+import marketplace.inventory.tables
+import marketplace.orders.tables  # noqa: F401
 from marketplace.db import engine, metadata
 
 

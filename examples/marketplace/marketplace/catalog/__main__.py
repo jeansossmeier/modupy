@@ -9,6 +9,7 @@ from marketplace.db import engine
 
 
 async def run(sku: str, name: str, price_cents: int, stock: int) -> None:
+    outbox.start()
     try:
         await list_product(sku, name, price_cents, stock)
         async with asyncio.timeout(30):
