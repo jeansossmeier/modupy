@@ -27,15 +27,18 @@ MODULITH_BROKER=memory uvicorn myapp.main:app --workers 1
 
 Add persistence without splitting processes: publish events atomically with your domain transaction.
 
-In `myapp/main.py`, keep `outbox.configure()` at module import time (the CLI
-outbox tooling below depends on that — see **Outbox operations**), and add a
-lifespan that starts and stops the retry loop. Module-scope code runs before
-the server's event loop exists, so `outbox.configure()` there cannot start the
-retry loop: call `modulith.bootstrap()` and then `outbox.start()` in the
-lifespan's startup half. Every sweep skips its rows until the runtime is
-bootstrapped, and bootstrap otherwise first runs at the first `publish()`, so
-without both calls rows a crashed process left undelivered can wait until this
-process's first transactional publish. A bare module-scope `outbox.configure()` with no
+Three steps make it durable. Set `outbox_url` so modulith binds the store in
+every process, the `modulith outbox` CLI included (see **Binding the store from
+configuration** and **Outbox operations**). Create the outbox tables with
+`modulith migrate`. Then wrap each business transaction in a bound session, as
+`bind_session` below shows. `myapp/main.py` needs only a lifespan that starts
+and stops the retry loop. Module-scope code runs before the server's event loop
+exists, so a module-scope `outbox.configure()` cannot start the retry loop:
+call `modulith.bootstrap()` and then `outbox.start()` in the lifespan's
+startup half. Every sweep skips its rows until the runtime is bootstrapped,
+and bootstrap otherwise first runs at the first `publish()`, so without both
+calls rows a crashed process left undelivered can wait until this process's
+first transactional publish. A bare module-scope `outbox.configure()` with no
 matching `outbox.shutdown()` leaves the retry loop and the DB engine's
 connection pool running until the process is killed instead of draining
 gracefully. The outbox table must live in the same database as your business
@@ -64,8 +67,11 @@ outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTB
   process-topology worker, and the `modulith outbox ...` commands.
 - A store the application binds with `outbox.configure()` before bootstrap
   wins, and no second store is built.
-- The claim settings in `[tool.modulith.outbox_options]` (`claim_strategy`,
-  `claim_lease_seconds`, `claim_batch_size`) apply to that store.
+- The settings in `[tool.modulith.outbox_options]` apply to that store:
+  `claim_strategy`, `claim_lease_seconds`, `claim_batch_size`,
+  `dead_letter_after_attempts`, `retry_interval_seconds`,
+  `retry_stale_seconds`, `max_retry_backoff_seconds` and `completion_mode`
+  (`update`, `delete` or `archive`).
 - The deserialization allowlist is the event types of the process's own
   listeners.
 - The binding needs module discovery (`auto_discover`, the default) outside a
@@ -74,8 +80,27 @@ outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTB
   `modulith outbox` commands then bind no store, because they import none of
   your modules; run them with `MODULITH_AUTO_DISCOVER=true` when discovery can
   import the package.
-- The outbox table must already exist (run the shipped Alembic migrations);
-  the URL must name the database holding your business tables.
+- The outbox table must already exist; the URL must name the database holding
+  your business tables. `modulith migrate` creates it. It migrates `outbox_url`
+  by default, swapping the async driver for the sync one Alembic runs on
+  (`+asyncpg` becomes `+psycopg`, `+aiosqlite` plain `sqlite`, `+aiomysql`
+  `+pymysql`), and prints the target with the password masked. The same
+  migration chain also creates the `broker_*` tables of the database broker,
+  which stay unused unless you select that broker.
+
+  ```bash
+  modulith migrate                                    # to head, on outbox_url
+  modulith migrate --url 'postgresql+psycopg://user:pass@localhost/mydb'
+  ```
+
+  The raw Alembic command is the alternative. `MODULITH_DB_URL` (a
+  sync-driver URL) is the variable it reads:
+
+  ```bash
+  MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
+    alembic -c "$(python -c 'import modulith.adapters, pathlib; print(pathlib.Path(modulith.adapters.__file__).parent / "alembic.ini")')" \
+    upgrade head
+  ```
 - In a single-process app, call `modulith.bootstrap()` and then
   `outbox.start()` in the lifespan's startup half. Bootstrap binds the store,
   and it is lazy: without the explicit call it first runs at the first
@@ -103,6 +128,12 @@ registered from an application module is stored as
 delivered per module. Rows written by an earlier release under the bare
 `<class module>.<ClassName>` id no longer match a listener: drain them
 (`modulith outbox status` shows none incomplete) before upgrading.
+
+**Wiring the store yourself.** Bind the store in code, with your own engine,
+when `outbox_url` does not offer what you need: `connect_args` or a
+`schema_translate_map` on the engine, a custom serializer, an application that
+runs with `auto_discover = false`, or the graceful drain order below:
+
 ```python
 from contextlib import asynccontextmanager
 
@@ -146,11 +177,17 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)  # or your own ASGI app with an equivalent shutdown hook
 ```
 
-Then run:
+Then create the tables and run. With a store you wire yourself, `outbox_url` is
+unset, so pass the database to `modulith migrate` as `--url`:
+
 ```bash
 pip install 'modupy[fastapi,cli,postgres]'
+modulith migrate --url 'postgresql+asyncpg://user:pass@localhost/mydb'
 MODULITH_OUTBOX=postgres uvicorn myapp.main:app --workers 1
 ```
+
+With `outbox_url` set (`MODULITH_OUTBOX_URL` works too), `modulith migrate` needs
+no `--url`.
 
 **What changes:**
 - Event publication is deferred until your domain transaction commits (the outbox pattern).
@@ -188,7 +225,7 @@ engine; see §A. This also applies to the store bound from `outbox_url`.
 - If `inventory` publishes a downstream event (e.g., `StockReserved` → `notifications`), that hop is **not durable by default**—it rides the in-memory bus.
 - A listener takes exactly one argument — the event. No session is injected, and `publish()` takes no `session=` keyword. For a durable cascade, the listener opens its own session and binds it, so `publish()` finds it and enlists the outbox row in that transaction:
   ```python
-  from modulith.adapters.postgres_outbox import bind_session, unbind_session
+  from modulith.builtin.outbox import bind_session, unbind_session
 
   @listener
   async def on_order_placed(event: OrderPlaced) -> None:
@@ -203,7 +240,17 @@ engine; see §A. This also applies to the store bound from `outbox_url`.
           finally:
               unbind_session(token)
   ```
-  `examples/demo_app/shop/orders/api.py` uses the same `bind_session`/`unbind_session` pair, wrapped in a FastAPI dependency.
+  A route handler follows the same pattern: it calls a service function (or a
+  `transaction()` helper you own) that binds, publishes, commits and unbinds
+  before the route returns. Do not commit in a `yield` dependency's teardown:
+  FastAPI runs it after the response is sent, so a commit that fails there
+  still answers 200. `examples/demo_app` does this in
+  `shop/orders/__init__.py::place_order` (called by the route in
+  `shop/orders/api.py`) and in the `reserve_stock` listener of
+  `shop/inventory/__init__.py`, which binds its own session for the durable
+  cascade.
+  `bind_session` and `unbind_session` live in `modulith.builtin.outbox`; the
+  `modulith.adapters.postgres_outbox` import path still works as aliases.
 
 **Outbox operations:**
 
@@ -215,13 +262,17 @@ modulith outbox dead-letter         # inspect stuck events
 ```
 
 These run in the CLI's **own** process and operate on the store that process
-wires. They cannot reach into a separately-running server: `outbox.configure()`
-binds the store in the calling process, and nothing is shared across process
-boundaries. So they work only when your bootstrap module — the one the CLI
+binds. They cannot reach into a separately-running server: the store binds in
+the calling process, and nothing is shared across process boundaries. With
+`outbox_url` set (and `auto_discover` on, the default), bootstrap binds the
+store from that URL in the CLI process too, so the commands work against the
+same database the server writes to, as they do in the durable stages of
+`examples/demo_app`. Without
+`outbox_url` they work only when your bootstrap module — the one the CLI
 imports via `[tool.modulith]` — calls `outbox.configure()` at import time. An
-app that wires the outbox inside a FastAPI lifespan instead (as
-`examples/demo_app` does) gets "no store wired" from the CLI even while the
-server is up; inspect that outbox through the running app.
+app that wires the outbox only inside a FastAPI lifespan gets "no outbox store"
+from the CLI even while the server is up, and the message names the remedy;
+inspect that outbox through the running app, or set `outbox_url`.
 
 **Per-module Postgres schema.** To keep a module's outbox and broker tables in a DB schema named after the module (see [per-module DB schema ownership](COOKBOOK.md) in the Cookbook), pass `schema_translate_map` to the engine before handing it to `PostgresPublicationStore` — the store takes the app's engine and saves through the app's bound session, so the map applies to every statement it issues, no store-level code change needed:
 
@@ -238,8 +289,9 @@ only; other dialects warn and ignore it). When neither is set, the broker
 falls back to `MODULITH_DB_SCHEMA` — the same variable the migrations
 read — so the runtime tracks whatever schema was migrated by default; an
 explicit `broker_options.schema`/`MODULITH_BROKER_SCHEMA` still wins over
-that fallback. Migrations use `MODULITH_DB_SCHEMA` or the packaged command's
-global `-x` option before `upgrade`:
+that fallback. Migrations use `MODULITH_DB_SCHEMA` or `modulith migrate
+--schema orders`. The raw alternative is the packaged command's global `-x`
+option before `upgrade`:
 `alembic -c <packaged-alembic.ini> -x schema=orders upgrade head`.
 Schema identifiers receive the same validation through every entry point.
 Enabling a named migration schema does not move data and refuses to abandon
@@ -367,7 +419,8 @@ MODULITH_BROKER=database \
 > **Single-host only.** All workers must access the same SQLite file, so this mode works only on a single machine (or a shared filesystem volume). For multi-host deployments, use Postgres or Redis instead.
 
 Adopting the packaged Alembic migrations after the broker has already
-self-bootstrapped its own tables is supported: `alembic upgrade head` stamps
+self-bootstrapped its own tables is supported: `modulith migrate --url <broker
+url>` (or the raw `alembic upgrade head`) stamps
 cleanly over a database the broker created, since migrations `0002` and
 `0004` inspect the schema first and skip any table/index that already
 exists rather than failing on a duplicate.
@@ -468,13 +521,15 @@ MODULITH_BROKER=redis-streams \
 
 **Tuning:**
 
-The Redis adapter reads exactly four environment variables:
+The Redis adapter reads six environment variables:
 
 ```bash
 export REDIS_URL=redis://localhost:6379        # connection URL
 export MODULITH_STREAM_PREFIX=myapp            # stream key prefix
 export MODULITH_CONSUMER_GROUP=myapp-workers   # consumer group name
 export MODULITH_STREAM_MAXLEN=100000           # XADD MAXLEN ~ cap (see caveat above)
+export MODULITH_BROKER_DLQ_MAX_STREAM_LEN=1000000  # dead-letter stream cap (default: 10x the stream cap)
+export MODULITH_BROKER_MAX_PAYLOAD_BYTES=1048576   # producer-side payload cap (default 16 MiB)
 ```
 
 The consumer-loop settings have no environment variable — set them in `pyproject.toml`:
@@ -503,9 +558,10 @@ MODULITH_BROKER=database \
 
 Uses the `broker_message` and `broker_subscription` tables with `FOR UPDATE SKIP LOCKED` claims for lock-free fan-out. Supports multi-host deployments.
 
-As with the SQLite broker above, running `alembic upgrade head` after the
-broker has already self-bootstrapped is supported — migrations `0002` and
-`0004` skip tables/indexes that already exist rather than failing.
+As with the SQLite broker above, running `modulith migrate` (or the raw
+`alembic upgrade head`) after the broker has already self-bootstrapped is
+supported — migrations `0002` and `0004` skip tables/indexes that already exist
+rather than failing.
 
 **Tuning:**
 
@@ -519,15 +575,27 @@ export MODULITH_BROKER_POLL_INTERVAL_MS=1000      # how often to check for new e
 
 ## Docker Deployment
 
+Your application's `pyproject.toml` declares modupy and its extras as a
+dependency (`dependencies = ["modupy[fastapi,cli,postgres]"]`, or
+`modupy[fastapi,cli,database]` for the database broker). The extras belong to
+modupy, not to your project, so `pip install '.[fastapi,cli,postgres]'` finds
+none. Copy the source before installing, because `pip install .` builds
+your package. The Dockerfile `modulith extract` generates follows the same
+order.
+
 ### Single-Process
 
 ```dockerfile
 FROM python:3.11-slim
 WORKDIR /app
-COPY pyproject.toml uv.lock ./
-RUN pip install -e '.[fastapi,cli,postgres]'
-COPY . .
+COPY pyproject.toml ./
+COPY myapp/ ./myapp/
+RUN pip install --no-cache-dir .
 EXPOSE 8000
+ENV MODULITH_OUTBOX=postgres
+# Pass MODULITH_OUTBOX_URL (the business database's async SQLAlchemy URL) in at
+# run time and never bake it into the image; run `modulith migrate` once per
+# release with the same variable set.
 CMD ["uvicorn", "myapp.main:app", "--host", "0.0.0.0"]
 ```
 
@@ -536,9 +604,9 @@ CMD ["uvicorn", "myapp.main:app", "--host", "0.0.0.0"]
 ```dockerfile
 FROM python:3.11-slim
 WORKDIR /app
-COPY pyproject.toml uv.lock ./
-RUN pip install -e '.[fastapi,cli,database]'
-COPY . .
+COPY pyproject.toml ./
+COPY myapp/ ./myapp/
+RUN pip install --no-cache-dir .
 EXPOSE 8000-8100
 ENV MODULITH_BROKER=database
 ENV MODULITH_BROKER_URL=postgresql+asyncpg://...
@@ -606,12 +674,17 @@ spec:
           env:
             - name: MODULITH_OUTBOX
               value: "postgres"
-            - name: MODULITH_DB_URL
+            - name: MODULITH_OUTBOX_URL   # async SQLAlchemy URL of the business database
               valueFrom:
                 secretKeyRef:
                   name: db-creds
                   key: url
 ```
+
+`MODULITH_OUTBOX_URL` is the URL the running app binds its outbox store to;
+`MODULITH_DB_URL` is only the sync-driver URL the Alembic migrations read. Run
+`modulith migrate` as a release step (a Job or an init container) with
+`MODULITH_OUTBOX_URL` set.
 
 ### Process-Per-Module: Generated Manifests
 
@@ -649,8 +722,20 @@ kubectl create secret generic myapp-broker \
 ```
 
 The manifest comments include the selected namespace in both Secret-creation
-commands. Each container also references an optional `<package>-env` Secret via
-`envFrom` for additional variables such as `MODULITH_DB_URL`. Readiness uses
+commands. Each container also references a `<package>-env` Secret via `envFrom`
+for additional variables. The reference is `optional: true`, so applying the
+manifest never requires the Secret, but whenever `outbox` is not `memory` it
+must carry `MODULITH_OUTBOX_URL`, the business database's async SQLAlchemy URL
+(unless the image's `[tool.modulith]` already sets `outbox_url`). A pod with a
+durable outbox and no store refuses to start:
+
+```bash
+kubectl create secret generic myapp-env \
+  --from-literal=MODULITH_OUTBOX_URL=<async SQLAlchemy URL> --namespace prod
+```
+
+`MODULITH_DB_URL` is not a runtime variable; it feeds the migrations only.
+Readiness uses
 `httpGet /health`; liveness uses `tcpSocket` so a temporary broker outage does
 not crash-loop a healthy pod. No `resources` or Secret objects are emitted.
 
@@ -881,9 +966,12 @@ Restart a worker whose health stays `degraded` longer than you can tolerate; on 
 ### Event Metrics
 
 If OpenTelemetry is enabled (`modupy[otel]`), spans are emitted for:
-- `modulith.publish` — an event was published
-- `modulith.listen` — an event was dispatched to a listener
-- `modulith.outbox.dispatch` — the outbox dispatched a batch
+- `modulith.event.publish` — an event was published
+- `modulith.event.dispatch` — an event was dispatched to a listener
+
+There is no outbox span. On the durable path the publish span brackets writing
+the outbox row, and the dispatch spans that run after commit are not parented
+to it.
 
 Export spans to Prometheus, Jaeger, or your observability stack.
 
@@ -1048,7 +1136,9 @@ hard-killed supervisor from leaving workers behind is Linux-only.
    - Fast to iterate
    - All modules in one process
 
-2. **Add durability** — `MODULITH_OUTBOX=postgres`
+2. **Add durability** — `MODULITH_OUTBOX=postgres` plus `MODULITH_OUTBOX_URL` (or `[tool.modulith].outbox_url`)
+   - `MODULITH_OUTBOX=postgres` alone persists nothing: the store binds only from `outbox_url` (or an explicit `outbox.configure()`), and only a session bound around each transaction (`bind_session`) lets `publish()` enlist the outbox row
+   - Run `modulith migrate` to create the outbox tables, and add `bootstrap()`, `outbox.start()` and `outbox.shutdown()` to the lifespan
    - Same single-process deployment
    - Events now persist; listeners are at-least-once
 
@@ -1063,7 +1153,7 @@ hard-killed supervisor from leaving workers behind is Linux-only.
    - Copies the module, its contracts and every package-level helper module they import, transitively, into `--output` (default `<module>-service/`) and generates a `pyproject.toml`, `Dockerfile`, `README.md`, and `.env.example` to run it against `modulith._worker:create_app`. Contracts resolve as Python imports them: a `contracts.py` wins over a same-named directory without `__init__.py`, and a contracts directory without `__init__.py` has its files scanned for helper imports like any contracts package. A package ancestor with no `__init__.py` in the source (a PEP 420 namespace root such as `company/` for `package = "company.shop"`) gets none in the output either, so other portions of that namespace stay importable. The same holds for a helper's parent folder: one without `__init__.py` in the source (such as `shop/common/` holding `money.py`) stays a namespace folder in the output, so the service discovers no extra module; one with an `__init__.py` gets an empty initializer
    - Blocked (exit 1) by the module's own outbound boundary violations, tables it shares with another module, or a runtime import of another declared module from any copied file — `--force` overrides only these three and records what it overrode in the generated README; a non-empty `--output` directory is never overridable
    - Before publishing, imports the extracted module in a subprocess from the staged tree and exits 1 naming the failing import if that fails, or if the import loads first-party code from the source tree outside the extracted copy (reachable through `PYTHONPATH` or an editable install), so the service's third-party dependencies must be installed where you run `extract`. First-party code is anything under the directory that holds the app's top-level package. Modules under the interpreter's prefixes, standard library and site-packages directories are exempt, except that a directory containing that source tree exempts nothing: a virtualenv inside the project stays exempt, and a project inside a virtualenv is still checked (on Windows, `site.getsitepackages()` lists the virtualenv root itself). When the app resolves to an installed copy in the interpreter's site-packages or user site (a plain or `--user` `pip install`), only the app's own top-level package counts as first-party there, and other installed distributions stay exempt. A directory the app was installed into with `pip install --target` or `--prefix` and reached through `PYTHONPATH`, a `.pth` file or any other `sys.path` entry is not one of the interpreter's library directories, so everything in it counts as first-party: `extract` reports the app's dependencies installed there and exits 1. `--force` never overrides this import check, so a module-level import of another declared module fails even when forced; only a deferred one (inside a function) can be forced through
-   - Other modules keep sending events via the broker; the extracted service subscribes and acts. The outbox is not auto-wired (the app's `main.py` is not copied), so code the worker imports must call `outbox.configure()` itself
+   - Other modules keep sending events via the broker; the extracted service subscribes and acts. The service binds its outbox store from `MODULITH_OUTBOX_URL` (`[tool.modulith].outbox_url`) at startup, and refuses to start without a store when `MODULITH_OUTBOX` is not `memory` (unless module code it imports binds one itself with `outbox.configure()`): the app's `main.py` is not copied, so its lifespan wiring never runs. The generated `.env.example` and README list `MODULITH_OUTBOX` and `MODULITH_OUTBOX_URL`
 
 This path is why modulith exists: **every module is a potential microservice, but you pay that cost only when it's profitable.**
 
@@ -1098,7 +1188,9 @@ This path is why modulith exists: **every module is a potential microservice, bu
 
 Broker and outbox settings are covered in the topology sections above
 (`MODULITH_BROKER`, `MODULITH_BROKER_<KEY>`, `MODULITH_OUTBOX`,
-`MODULITH_DB_URL`). These are the remaining process-level knobs:
+`MODULITH_OUTBOX_URL`). `MODULITH_DB_URL` is not a runtime variable: it is the
+sync-driver URL the raw Alembic command reads, and `modulith migrate` reads
+`outbox_url` instead. These are the remaining process-level knobs:
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -1126,5 +1218,5 @@ Broker and outbox settings are covered in the topology sections above
 
 - For **detailed internal architecture**, see [docs/ARCHITECTURE.md](ARCHITECTURE.md)
 - For **API reference**, see [docs/API_REFERENCE.md](API_REFERENCE.md)
-- For **working examples**, see [examples/demo_app](../examples/demo_app)
+- For **working examples**, see [examples/demo_app](../examples/demo_app): three modules whose stages (in-memory, durable outbox, process-per-module, Postgres, Redis) are switched by configuration, with the outbox bound from `outbox_url` and service functions that bind, publish, commit and unbind. [examples/README.md](../examples/README.md) lists the smaller and larger projects
 - For **testing**, see [Cookbook §9](COOKBOOK.md#9-test-an-event-flow-with-the-pytest-plugin)

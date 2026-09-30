@@ -4,8 +4,9 @@ Task-oriented recipes for common jobs. Each one uses only the documented public
 API (see [API_REFERENCE.md](API_REFERENCE.md)) plus the documented wiring
 surface (see [STABILITY.md](STABILITY.md)); for the design behind them see
 [ARCHITECTURE.md](ARCHITECTURE.md) and [SPEC.md](../SPEC.md). The runnable
-end-to-end version of recipes 1–5 lives in
-[`examples/demo_app`](../examples/demo_app).
+end-to-end version of recipes 1–3, 5, 6 and 8 lives in
+[`examples/demo_app`](../examples/demo_app). Recipe 4 (`publish_sync`) is not
+in it: the demo publishes from async code only.
 
 **Contents**
 
