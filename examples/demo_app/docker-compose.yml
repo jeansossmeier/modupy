@@ -1,22 +1,16 @@
-# Docker Compose services for modulith demo (OPTIONAL).
+# Infrastructure for the shop's stage 4 (see README.md). Stages 1 to 3 need none.
 #
-# These services are only needed for the "real" (non-SQLite) variants:
-# - Postgres for durable outbox or database broker
-# - Redis for redis-streams broker
+#   postgres  stage 4a: the transactional outbox on Postgres
+#   redis     stage 4b: the process-per-module topology over Redis Streams
 #
-# By default, the demo runs zero-infra with SQLite files (no services needed).
-# The durable outbox and database-broker profiles use SQLite by default;
-# this compose file is only for Postgres outbox or Redis broker modes.
+# Both publish on non-default ports of the loopback interface, so a Postgres or
+# Redis of your own on 5432 or 6379 never collides with them. The credentials
+# are throwaway demo values committed to this repo, which is why the ports stay
+# on 127.0.0.1: never widen them to 0.0.0.0 on a shared network.
 #
-# Both services carry throwaway demo credentials that are committed to this
-# repo, so their ports are published on 127.0.0.1 only — never widen that to
-# 0.0.0.0 on a shared network.
-#
-# Usage:
-#   docker-compose up -d
-#   Export MODULITH_DB_URL or REDIS_URL into your shell (see .env.example),
-#   then run the app.
-
+#   docker compose up -d --wait postgres
+#   docker compose up -d --wait redis
+#   docker compose down -v
 
 services:
   postgres:
@@ -27,16 +21,14 @@ services:
       POSTGRES_PASSWORD: modulith
       POSTGRES_DB: modulith
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:55433:5432"
     volumes:
-      # Named volume so `docker compose down` doesn't wipe the durable outbox
-      # data mode C is demonstrating — see the README's down-vs-stop note.
       - modulith-postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U modulith"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      interval: 1s
+      timeout: 3s
+      retries: 30
 
   redis:
     # Pinned 2026-07-14: re-pinning after testing is the deliberate update path.
@@ -45,12 +37,12 @@ services:
     # once the port is published, so require one explicitly.
     command: ["redis-server", "--requirepass", "modulith"]
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:56379:6379"
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a modulith ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      interval: 1s
+      timeout: 3s
+      retries: 30
 
 volumes:
   modulith-postgres-data:

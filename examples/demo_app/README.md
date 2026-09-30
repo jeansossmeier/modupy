@@ -1,297 +1,326 @@
-# modulith demo — the shop
+# The shop
 
-A minimal but complete modular monolith built with modulith. Three modules
-collaborate purely through events:
+The mid-size example: one shop, three modules, four ways to run it. The code
+never changes between stages; environment variables change where events live
+and how many processes serve them.
 
-```
-POST /orders
-   │
-   ▼
-┌──────────┐  OrderPlaced   ┌────────────┐  StockReserved  ┌────────────────┐
-│  orders  │ ─────────────▶ │ inventory  │ ──────────────▶ │ notifications  │
-└──────────┘                └────────────┘                 └────────────────┘
-```
+`orders` accepts an order and publishes `OrderPlaced`. `inventory` reserves the
+stock and publishes `StockReserved`. `notifications` records the notice. No
+module imports another module, only the shared events.
 
-No module imports another module's code. They share the event vocabulary in
-`shop/contracts/events.py` and communicate through the in-memory event bus.
-Adding, removing, or splitting a module out to its own process changes none of
-the others.
+- [`shop/contracts/events.py`](shop/contracts/events.py): the two events
+- [`shop/orders/`](shop/orders): `place_order`, and the `POST /orders` and `GET /orders/{id}` routes
+- [`shop/inventory/`](shop/inventory): the `reserve_stock` listener and its reservation route
+- [`shop/notifications/`](shop/notifications): the `notify_customer` listener and its route
+- [`shop/database.py`](shop/database.py): one SQLite (or Postgres) database for business rows and outbox rows
+- [`shop/main.py`](shop/main.py): the FastAPI app and its lifespan
+- [`tests/`](tests): the flows under `pytest`
 
-## Layout
+Every command below runs from this directory, exactly as written. CI executes
+them, so the output shown is the output you get. Server logs also carry
+process ids and access lines, which are left out. Every stage places an order
+with an id of its own (`o-1`, `o-2`, ...) because `shop.db` keeps the earlier
+stages' orders, and a repeated id is answered with 409.
 
-```
-shop/
-├── contracts/
-│   └── events.py            # OrderPlaced, StockReserved  (shared vocabulary)
-├── orders/
-│   ├── __init__.py          # place_order() → publishes OrderPlaced; re-exports `router`
-│   ├── _manifest.py         # declared contract (verified at startup)
-│   └── api.py               # FastAPI router: POST /orders
-├── inventory/
-│   ├── __init__.py          # @listener reserve_stock → publishes StockReserved; `router`
-│   └── _manifest.py
-├── notifications/
-│   ├── __init__.py          # @listener notify_customer; `router`
-│   └── _manifest.py
-└── main.py                  # FastAPI app (includes all three module routers)
-```
-
-Every module package exposes its HTTP routes as a `router` attribute — the
-orders module re-exports the one defined in `orders/api.py`. That attribute is
-what the process-per-module worker mounts under `/<module>` (modes D and E
-below), so a router left reachable only as `orders.api.router` would give
-healthy workers and a 404 on every route. `shop/main.py` mounts the same three
-routers under the same prefixes, which is why `POST /orders` and
-`GET /inventory/reserved` are the same URLs in every mode.
-
-## Run it
-
-From this directory (`examples/demo_app`), pick a deployment mode below.
-
-### A. Zero-config (default: in-memory, single-process)
-
-The simplest path — no database, no Docker, all events live in RAM:
-
-```bash
-pip install 'modupy[fastapi,cli]'
-uvicorn shop.main:app --reload
-#   …or with the CLI (adds the modulith banner):
-# modulith dev shop.main:app
-
-# In another terminal:
-curl -X POST localhost:8000/orders \
-     -H 'content-type: application/json' \
-     -d '{"customer_id":"c-1","total":19.99}'
-# → {"order_id": "…"}  — the event chain fans out across modules in-memory.
-```
-
-### B. Durable transactional outbox on SQLite
-
-Persists orders and events atomically in a local SQLite file (zero infrastructure):
+## Look before you run
 
 ```bash
 pip install 'modupy[fastapi,cli,postgres]' aiosqlite
-MODULITH_OUTBOX=postgres MODULITH_DB_URL=sqlite+aiosqlite:///./demo.db \
-  uvicorn shop.main:app
-
-# In another terminal:
-curl -X POST localhost:8000/orders \
-     -H 'content-type: application/json' \
-     -d '{"customer_id":"c-1","total":19.99}'
 ```
 
-**What changes:** The order row AND the `OrderPlaced` event are persisted in the
-same transaction. After commit, the event is dispatched to listeners. Listeners
-must be idempotent (at-least-once delivery).
-
-**Only hop 1 is durable.** The outbox persists `OrderPlaced` (orders →
-inventory) atomically with the order row, but the after-commit dispatch that
-delivers it is deliberately session-less (`postgres_outbox.py`'s
-`_dispatch_after_commit`), so `inventory`'s own `StockReserved` publish
-(inventory → notifications) rides the in-memory bus, not the outbox — a crash
-between the two hops loses the second one. A production listener that wants a
-durable cascade must bind its own session and publish inside it (see
-`shop.orders.api.get_session`, which binds the session, and
-`post_order`, which commits it before responding). Because outbox delivery is
-at-least-once, `inventory.reserve_stock` and `notifications.notify_customer`
-each guard against a redelivered event with an `order_id` membership check
-before acting. `reserve_stock` records an order only after its `StockReserved`
-publish returns, so a redelivery that follows a failed publish retries it.
-
-### C. Durable outbox on Postgres
-
-Same as mode B, but on a persistent Postgres database:
+The project is not installed: `uvicorn` and `modulith` both put the current
+directory on the import path, and `pyproject.toml` names the package (`shop`).
+The `postgres` extra brings Alembic and the drivers that `modulith migrate` and
+stage 4a need; `aiosqlite` serves the SQLite stages.
 
 ```bash
-docker compose up -d postgres
-MODULITH_OUTBOX=postgres \
-  MODULITH_DB_URL=postgresql+asyncpg://modulith:modulith@localhost:5432/modulith \
-  uvicorn shop.main:app
+$ modulith info
+modulith
+  package: shop
 
-# Test it:
-curl -X POST localhost:8000/orders \
-     -H 'content-type: application/json' \
-     -d '{"customer_id":"c-1","total":19.99}'
+  modules (4):
+    - contracts  (shop.contracts)  [no manifest]
+    - inventory  (shop.inventory)  [manifest]
+    - notifications  (shop.notifications)  [manifest]
+    - orders  (shop.orders)  [manifest]
+
+  configuration:
+    outbox:        memory
+    broker:        memory
+    topology:      single
+    observability: None
+    production:    False
+$ modulith verify
+✓ no boundary violations
+$ modulith docs
+generated 6 file(s) in docs/modulith:
+  architecture.mmd
+  modules/contracts.md
+  modules/inventory.md
+  modules/notifications.md
+  modules/orders.md
+  events.mmd
 ```
 
-**`down` vs `stop`:** the `postgres` service's data lives in the
-`modulith-postgres-data` named volume in `docker-compose.yml`, so both
-`docker compose stop` and `docker compose down` preserve it across restarts —
-only `docker compose down -v` (or an explicit `docker volume rm`) deletes it.
-
-**Startup warning in modes D and E.** `modulith run` binds `0.0.0.0`, and the
-default `actuator_mode="auto"` will not serve an unauthenticated `/_modulith/*`
-on a non-loopback bind. With no `MODULITH_ACTUATOR_TOKEN` exported the
-supervisor logs a warning and leaves the actuator unmounted — the demo's own
-routes below are unaffected, so you can ignore it. Export a token
-(`export MODULITH_ACTUATOR_TOKEN="$(openssl rand -hex 32)"`) if you want the
-topology/health endpoints; see
-[docs/DEPLOYMENT.md §Actuator Access](../../docs/DEPLOYMENT.md#actuator-access-_modulith).
-
-### D. Process-per-module topology over SQLite database broker
-
-Distributes modules across separate workers using SQLite as the inter-process
-message bus (zero infrastructure):
+## Run its tests
 
 ```bash
-pip install 'modupy[fastapi,cli,database]' aiosqlite
-MODULITH_BROKER=database \
-  MODULITH_BROKER_URL=sqlite+aiosqlite:///$(pwd)/demo-broker.db \
-  modulith run shop.main:app --topology processes
-
-# In another terminal, test it:
-curl -X POST localhost:8000/orders \
-     -H 'content-type: application/json' \
-     -d '{"customer_id":"c-1","total":19.99}'
-
-# Inspect routed events:
-curl localhost:8000/inventory/reserved
-curl localhost:8000/notifications/sent
+pip install pytest pytest-asyncio
+pytest
 ```
 
-**What changes:** Each module runs in its own worker process behind a reverse
-proxy. The `@listener` decorators on `@externalized` events are no-ops in
-single-process mode but enable cross-process delivery here.
+Every test points `MODULITH_OUTBOX_URL` at a database in its own temporary
+directory before it imports `shop`, so the stages below start from an empty
+`shop.db`.
 
-**Env var vs `--topology` flag:** commands D and E pass `--topology processes`
-rather than also setting `MODULITH_TOPOLOGY=processes` — the process
-subcommands always pass `topology="processes"` as an explicit configuration
-override (`modulith/cli.py`, `_configure_process_runtime`), which wins over
-any `MODULITH_TOPOLOGY` env var under the documented pyproject-then-env-
-then-explicit-override precedence, so setting the env var here would be
-redundant.
+## Stage 1: in-memory events
 
-### E. Process topology over Redis Streams
-
-Distributes modules across workers using Redis (requires Redis running):
+The default configuration needs no infrastructure: events live in memory and
+each listener runs inline, inside the publisher's transaction. Create the
+tables, then start the app:
 
 ```bash
-pip install 'modupy[fastapi,cli,redis]'
-docker compose up -d redis
-MODULITH_BROKER=redis-streams \
-  REDIS_URL=redis://:modulith@localhost:6379 \
-  modulith run shop.main:app --topology processes
-
-# Test it:
-curl -X POST localhost:8000/orders \
-     -H 'content-type: application/json' \
-     -d '{"customer_id":"c-1","total":19.99}'
-curl localhost:8000/inventory/reserved
-curl localhost:8000/notifications/sent
+python -m shop.schema
 ```
-
-### F. CLI operations (modes A–E compatible)
-
-The `modulith` CLI auto-detects the `shop` package via `[tool.modulith]` in
-`pyproject.toml`, and puts the directory holding that `pyproject.toml` on
-`sys.path` before running the command (`modulith/cli.py`,
-`_add_project_root_to_syspath`). So `shop` is importable from this directory
-even though it lives here rather than in site-packages — no `PYTHONPATH=.`
-prefix is needed on any `modulith` command in this file. (`modulith dev` and
-single-process `modulith run` hand off to `uvicorn`, which adds the current
-directory itself, exactly as mode A does.)
 
 ```bash
-modulith info      # detected package, modules, manifests, plugins
-modulith verify    # boundary checks — this demo passes clean
-modulith docs      # Mermaid architecture + event-flow diagrams + module canvases → writes into docs/modulith/ (gitignored)
-modulith doctor    # health check on wired drivers and stores
+$ uvicorn shop.main:app
+INFO:     Waiting for application startup.
+INFO:modulith:detected application package 'shop'
+INFO:modulith:discovered 4 module(s): contracts, inventory, notifications, orders
+INFO:modulith:outbox=memory, broker=memory, topology=single
+INFO:modulith:outbox disabled — set [tool.modulith].outbox = 'postgres' for durable event delivery
+INFO:modulith:ready
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 ```
 
-(`modulith audit` is deliberately absent: it is the migration-readiness scanner
-for codebases that have *not* adopted modulith yet. Run here, it audits the
-`shop` package and reports `readiness score: 33/100` and
-`3 cross-module import pattern(s), 0 shared table(s)`. All three patterns are
-`shop/main.py` importing each module's router, plus the orders models' `Base`
-for table creation — composition-root wiring the scanner cannot tell from
-coupling. The modules themselves talk
-only through `contracts` and events. It also writes a `MIGRATION.md` into the
-directory it runs from. `verify` is the boundary check for a modulith-native
-codebase.)
-
-**Important caveat:** The `modulith outbox status|retry <id>|purge|dead-letter`
-subcommands operate on a **wired outbox store**. This demo wires the store
-inside the FastAPI app's lifespan (in `shop/main.py`), not at bare CLI
-bootstrap. So `modulith outbox status` reports "no store wired," and `modulith
-doctor` notes that the outbox is configured but no store is active. This is by
-design: stores are initialized by the application at startup, not
-auto-discovered.
-
-Running the app in another terminal does not change that — `outbox.configure()`
-binds the store in the *calling process*, and the CLI is a different process
-with nothing shared between them. The subcommands are usable only from a
-process that wires the store itself, i.e. an app whose bootstrap module
-(imported by the CLI via `[tool.modulith]`) calls `outbox.configure()` at import
-time. This demo wires it in the lifespan instead, so its outbox is inspectable
-through the running app, not through the CLI.
-
-### G. Testing your modules
-
-The demo includes tests using the `modupy[test]` extra and pytest plugin:
+In another terminal, place an order and read back what the three modules made
+of it:
 
 ```bash
-pip install 'modupy[fastapi,cli,test]' pytest pytest-asyncio
-pytest tests/
+$ curl -sX POST localhost:8000/orders \
+      -H 'content-type: application/json' \
+      -d '{"order_id": "o-1", "customer_id": "alice", "total": 19.99}'
+{"order_id":"o-1"}
+$ curl -s localhost:8000/orders/o-1
+{"order_id":"o-1","customer_id":"alice","total":19.99}
+$ curl -s localhost:8000/inventory/reservations/o-1
+{"order_id":"o-1","reserved":true}
+$ curl -s localhost:8000/notifications/o-1
+{"order_id":"o-1","notified":true}
 ```
 
-Example test from `test_shop_flow.py`:
+`place_order` publishes `OrderPlaced` first and only then adds the order row,
+and it never flushes in between. Under the memory outbox `reserve_stock` runs
+inline while the order's transaction is still open; a flushed order row would
+hold SQLite's write lock and block the listener's own session.
 
-```python
-def test_order_placed_triggers_stock_reserved_via_scenario(scenario: Scenario) -> None:
-    """``scenario.publish(...).expect_event(...).within(...)`` across modules."""
-    result = (
-        scenario.publish(OrderPlaced(order_id="s-1", customer_id="cust-1", total=9.99))
-        .expect_event(StockReserved)
-        .matching(lambda e: e.order_id == "s-1")
-        .within(seconds=2)
-    )
-    assert isinstance(result, StockReserved)
-```
+Each service function and listener binds a session, publishes, commits and
+unbinds before it returns. The route therefore answers only after the commit:
+a failed commit is a 500, never a false 200. And each listener checks for its
+row by primary key first, so a redelivered event changes nothing.
 
-The `scenario` and `modulith_app` fixtures are provided by the `modupy[test]`
-extra and auto-loaded via the pytest11 plugin entry point.
+## Stage 2: a durable outbox on SQLite
 
-### H. OpenTelemetry (optional, any mode)
-
-Enable distributed tracing (console exporter):
+Now the order row and its events commit together. The outbox lives in the same
+`shop.db` as the business tables; `modulith migrate` adds the outbox tables.
 
 ```bash
-pip install 'modupy[otel]'
-MODULITH_DEMO_OTEL=1 uvicorn shop.main:app
+export MODULITH_OUTBOX=postgres MODULITH_OUTBOX_URL=sqlite+aiosqlite:///shop.db
 ```
 
-Spans print to the console. Without a configured OpenTelemetry exporter, spans
-are no-ops (no overhead).
-
-### I. Custom serializer for outbox storage (optional, modes B or C)
-
-Demonstrates pluggable outbox storage serializers (independent of the broker
-wire format, which is fixed JSON in v1):
+The outbox setting is named `postgres` because that is the SQL outbox adapter;
+the URL decides which database it talks to.
 
 ```bash
-MODULITH_OUTBOX=postgres MODULITH_DEMO_SERIALIZER=custom \
-  MODULITH_DB_URL=sqlite+aiosqlite:///./demo.db \
-  uvicorn shop.main:app
+$ python -m shop.schema
+$ modulith migrate
+migrated sqlite:///shop.db to head
 ```
 
-The `VersionedJsonSerializer` in `shop/serialization.py` wraps the default
-JSON serializer in a versioned envelope for storage only — the broker still
-uses the fixed JSON wire format internally.
+Stop the stage 1 server with Ctrl-C if it still runs, then start this one:
 
-## What it demonstrates
+```bash
+$ uvicorn shop.main:app
+INFO:modulith:detected application package 'shop'
+INFO:modulith:discovered 4 module(s): contracts, inventory, notifications, orders
+INFO:modulith:outbox=postgres, broker=memory, topology=single
+INFO:modulith:ready
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+```
 
-- **Auto-discovery** — modules are subpackages of `shop`; listeners register
-  with no wiring code.
-- **Event-driven boundaries** — cross-module communication is `publish()` +
-  `@listener`, never a direct import.
-- **The contracts module** — shared event types live in `shop/contracts`, so
-  producers and consumers depend on a schema, not on each other.
-- **Manifests** — each module declares what it publishes/consumes; modulith
-  verifies that against reality at startup (a listener that fails to register
-  aborts the boot instead of silently dropping events).
-- **Durable outbox** — transactional persistence of order + event (mode B, C).
-- **Process-per-module topologies** — each module runs as its own worker,
-  communicating via database or Redis (modes D, E).
-- **Pluggable serializers** — custom storage serializers for the outbox (mode I).
-- **OpenTelemetry integration** — distributed tracing across modules (mode H).
-- **Testing with scenarios** — high-level assertions on event chains (mode G).
+```bash
+$ curl -sX POST localhost:8000/orders \
+      -H 'content-type: application/json' \
+      -d '{"order_id": "o-2", "customer_id": "alice", "total": 19.99}'
+{"order_id":"o-2"}
+```
+
+Delivery now happens after the commit, so the notification appears a moment
+after the order does. The status command reads the outbox from the same file
+the app writes:
+
+```bash
+$ curl -s localhost:8000/notifications/o-2
+{"order_id":"o-2","notified":true}
+$ modulith outbox status
+incomplete:    0
+completed:     2
+dead-lettered: 0
+```
+
+## Stage 2 afterwards: what the outbox kept
+
+Stop the server with Ctrl-C. The two publications, `OrderPlaced` and
+`StockReserved`, are rows in `shop.db`, so they are still there with no process
+running:
+
+```bash
+$ modulith outbox status
+incomplete:    0
+completed:     2
+dead-lettered: 0
+$ modulith doctor
+modulith doctor
+
+✓ boundary health — 0 violation(s)
+✓ outbox health — 0 incomplete, 2 completed, 0 dead-lettered
+✓ listener registration — 2 declared listener(s), all registered
+overall: ok
+```
+
+## Stage 3: the same code, one process per module
+
+Nothing in `shop/` changes. The `inventory = 2` line in `pyproject.toml` gives
+that module two workers, so it takes ports 9001 and 9002. `--host 127.0.0.1`
+keeps every port on loopback, which is also what lets the operational
+endpoints answer without a token. Startup logs several warnings about the
+default broker; they are for production deployments and do not affect this
+walkthrough. Four processes now write the one `shop.db`; SQLite serializes
+them, and each write waits its turn.
+
+```bash
+export MODULITH_OUTBOX=postgres MODULITH_OUTBOX_URL=sqlite+aiosqlite:///shop.db
+```
+
+```bash
+$ modulith run shop.main:app --topology processes --host 127.0.0.1
+modulith → process-per-module: 3 worker(s) [inventory:9001, notifications:9003, orders:9004], reverse proxy on http://127.0.0.1:8000
+```
+
+```bash
+$ curl -s localhost:8000/_modulith/health
+{"status":"ok","backends":{"/inventory":"ok","/notifications":"ok","/orders":"ok"}}
+$ curl -sX POST localhost:8000/orders \
+      -H 'content-type: application/json' \
+      -d '{"order_id": "o-3", "customer_id": "alice", "total": 19.99}'
+{"order_id":"o-3"}
+```
+
+Each event now crosses a process boundary, so give the order a moment before
+reading it back:
+
+```bash
+$ curl -s localhost:8000/orders/o-3
+{"order_id":"o-3","customer_id":"alice","total":19.99}
+$ curl -s localhost:8000/inventory/reservations/o-3
+{"order_id":"o-3","reserved":true}
+$ curl -s localhost:8000/notifications/o-3
+{"order_id":"o-3","notified":true}
+$ modulith outbox status
+incomplete:    0
+completed:     4
+dead-lettered: 0
+```
+
+The counts include stage 2's two publications, because both stages share
+`shop.db`.
+
+## Stage 3 afterwards: the outbox after the drain
+
+Stop the supervisor with Ctrl-C. It signals every worker and waits for them to
+finish what they were delivering, so nothing is left half done:
+
+```bash
+$ modulith outbox status
+incomplete:    0
+completed:     4
+dead-lettered: 0
+```
+
+## Stage 4a: the outbox on Postgres
+
+Stage 4 needs Docker. `docker-compose.yml` publishes Postgres on port 55433 of
+the loopback interface, so a Postgres of your own on 5432 does not collide.
+
+```bash
+docker compose up -d --wait postgres
+```
+
+Only the URL changes; the code is the same:
+
+```bash
+export MODULITH_OUTBOX=postgres MODULITH_OUTBOX_URL=postgresql+asyncpg://modulith:modulith@localhost:55433/modulith
+```
+
+```bash
+$ python -m shop.schema
+$ modulith migrate
+migrated postgresql+psycopg://modulith:***@localhost:55433/modulith to head
+$ uvicorn shop.main:app
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+```
+
+```bash
+$ curl -sX POST localhost:8000/orders \
+      -H 'content-type: application/json' \
+      -d '{"order_id": "o-4", "customer_id": "alice", "total": 19.99}'
+{"order_id":"o-4"}
+$ curl -s localhost:8000/notifications/o-4
+{"order_id":"o-4","notified":true}
+$ modulith outbox status
+incomplete:    0
+completed:     2
+dead-lettered: 0
+```
+
+## Stage 4b: processes over Redis Streams
+
+Stop the server with Ctrl-C. Events between the processes can travel over
+Redis Streams instead of the default broker; the outbox goes back to SQLite.
+
+```bash
+pip install 'modupy[redis]'
+docker compose up -d --wait redis
+```
+
+```bash
+export MODULITH_OUTBOX=postgres MODULITH_OUTBOX_URL=sqlite+aiosqlite:///shop.db MODULITH_BROKER=redis-streams REDIS_URL=redis://:modulith@localhost:56379
+```
+
+```bash
+$ modulith run shop.main:app --topology processes --host 127.0.0.1
+modulith → process-per-module: 3 worker(s) [inventory:9001, notifications:9003, orders:9004], reverse proxy on http://127.0.0.1:8000
+```
+
+```bash
+$ curl -sX POST localhost:8000/orders \
+      -H 'content-type: application/json' \
+      -d '{"order_id": "o-5", "customer_id": "alice", "total": 19.99}'
+{"order_id":"o-5"}
+$ curl -s localhost:8000/orders/o-5
+{"order_id":"o-5","customer_id":"alice","total":19.99}
+$ curl -s localhost:8000/inventory/reservations/o-5
+{"order_id":"o-5","reserved":true}
+$ curl -s localhost:8000/notifications/o-5
+{"order_id":"o-5","notified":true}
+```
+
+## Clean up
+
+Stop the supervisor with Ctrl-C, then remove the containers and their volumes:
+
+```bash
+docker compose down -v
+```

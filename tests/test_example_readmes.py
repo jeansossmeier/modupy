@@ -119,6 +119,124 @@ RUNBOOKS: dict[str, tuple[Section, ...]] = {
             (Step("pip install pytest"), Step("pytest")),
         ),
     ),
+    "demo_app": (
+        Section(
+            "Look before you run",
+            (
+                Step("pip install 'modupy[fastapi,cli,postgres]' aiosqlite"),
+                Step("modulith info"),
+                Step("modulith verify"),
+                Step("modulith docs"),
+            ),
+        ),
+        Section(
+            "Run its tests",
+            (Step("pip install pytest pytest-asyncio"), Step("pytest")),
+        ),
+        Section(
+            "Stage 1: in-memory events",
+            (
+                Step("python -m shop.schema"),
+                Step("uvicorn shop.main:app", serve=True),
+                Step(
+                    "curl -sX POST localhost:8000/orders -H 'content-type: application/json' "
+                    '-d \'{"order_id": "o-1", "customer_id": "alice", "total": 19.99}\''
+                ),
+                Step("curl -s localhost:8000/orders/o-1"),
+                Step("curl -s localhost:8000/inventory/reservations/o-1"),
+                Step("curl -s localhost:8000/notifications/o-1"),
+            ),
+        ),
+        Section(
+            "Stage 2: a durable outbox on SQLite",
+            (
+                Step(
+                    "export MODULITH_OUTBOX=postgres MODULITH_OUTBOX_URL=sqlite+aiosqlite:///shop.db"
+                ),
+                Step("python -m shop.schema"),
+                Step("modulith migrate"),
+                Step("uvicorn shop.main:app", serve=True),
+                Step(
+                    "curl -sX POST localhost:8000/orders -H 'content-type: application/json' "
+                    '-d \'{"order_id": "o-2", "customer_id": "alice", "total": 19.99}\''
+                ),
+                Step("curl -s localhost:8000/notifications/o-2", eventually=True),
+                Step("modulith outbox status", eventually=True),
+            ),
+        ),
+        Section(
+            "Stage 2 afterwards: what the outbox kept",
+            (Step("modulith outbox status"), Step("modulith doctor")),
+        ),
+        Section(
+            "Stage 3: the same code, one process per module",
+            (
+                Step(
+                    "export MODULITH_OUTBOX=postgres MODULITH_OUTBOX_URL=sqlite+aiosqlite:///shop.db"
+                ),
+                Step(
+                    "modulith run shop.main:app --topology processes --host 127.0.0.1",
+                    serve=True,
+                ),
+                Step("curl -s localhost:8000/_modulith/health"),
+                Step(
+                    "curl -sX POST localhost:8000/orders -H 'content-type: application/json' "
+                    '-d \'{"order_id": "o-3", "customer_id": "alice", "total": 19.99}\''
+                ),
+                Step("curl -s localhost:8000/orders/o-3", eventually=True),
+                Step("curl -s localhost:8000/inventory/reservations/o-3", eventually=True),
+                Step("curl -s localhost:8000/notifications/o-3", eventually=True),
+                Step("modulith outbox status", eventually=True),
+            ),
+        ),
+        Section(
+            "Stage 3 afterwards: the outbox after the drain",
+            (Step("modulith outbox status"),),
+        ),
+        Section(
+            "Stage 4a: the outbox on Postgres",
+            (
+                Step("docker compose up -d --wait postgres"),
+                Step(
+                    "export MODULITH_OUTBOX=postgres "
+                    "MODULITH_OUTBOX_URL=postgresql+asyncpg://modulith:modulith@localhost:55433/modulith"
+                ),
+                Step("python -m shop.schema"),
+                Step("modulith migrate"),
+                Step("uvicorn shop.main:app", serve=True),
+                Step(
+                    "curl -sX POST localhost:8000/orders -H 'content-type: application/json' "
+                    '-d \'{"order_id": "o-4", "customer_id": "alice", "total": 19.99}\''
+                ),
+                Step("curl -s localhost:8000/notifications/o-4", eventually=True),
+                Step("modulith outbox status", eventually=True),
+            ),
+        ),
+        Section(
+            "Stage 4b: processes over Redis Streams",
+            (
+                Step("pip install 'modupy[redis]'"),
+                Step("docker compose up -d --wait redis"),
+                Step(
+                    "export MODULITH_OUTBOX=postgres "
+                    "MODULITH_OUTBOX_URL=sqlite+aiosqlite:///shop.db "
+                    "MODULITH_BROKER=redis-streams REDIS_URL=redis://:modulith@localhost:56379"
+                ),
+                Step(
+                    "modulith run shop.main:app --topology processes --host 127.0.0.1",
+                    serve=True,
+                ),
+                Step(
+                    "curl -sX POST localhost:8000/orders -H 'content-type: application/json' "
+                    '-d \'{"order_id": "o-5", "customer_id": "alice", "total": 19.99}\''
+                ),
+                Step("curl -s localhost:8000/orders/o-5", eventually=True),
+                Step("curl -s localhost:8000/inventory/reservations/o-5", eventually=True),
+                Step("curl -s localhost:8000/notifications/o-5", eventually=True),
+            ),
+        ),
+        Section("Clean up", (Step("docker compose down -v"),)),
+    ),
 }
 
 
