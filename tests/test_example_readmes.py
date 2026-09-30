@@ -250,6 +250,63 @@ RUNBOOKS: dict[str, tuple[Section, ...]] = {
             ),
             repo_env=False,
         ),
+        Section(
+            "Run the platform, then extract a service",
+            (
+                Step("docker compose up -d --wait postgres"),
+                Step(
+                    "export MODULITH_OUTBOX_URL=postgresql+asyncpg://marketplace:marketplace"
+                    "@localhost:55432/marketplace "
+                    "MODULITH_BROKER_URL=postgresql+asyncpg://marketplace:marketplace"
+                    "@localhost:55432/marketplace "
+                    "MODULITH_ACTUATOR_TOKEN=local-demo-token"
+                ),
+                Step("modulith migrate"),
+                Step("python -m marketplace.schema"),
+                Step('python -m marketplace.catalog SKU-MUG "Stoneware mug" 1200 10'),
+                Step("modulith doctor"),
+                Step("modulith run marketplace.main:app --topology processes", serve=True),
+                Step(
+                    "curl -s localhost:8000/_modulith/health "
+                    '-H "authorization: Bearer $MODULITH_ACTUATOR_TOKEN"'
+                ),
+                Step("curl -s -o /dev/null -w '%{http_code}\\n' localhost:8000/_modulith/health"),
+                Step(
+                    "curl -sX POST localhost:8000/orders -H 'content-type: application/json' "
+                    '-d \'{"order_id": "o-100", "customer_id": "alice", "sku": "SKU-MUG", '
+                    '"quantity": 2, "card_token": "tok_visa", "country": "US"}\''
+                ),
+                Step("curl -s localhost:8000/notifications/o-100", eventually=True),
+                Step("curl -s localhost:8000/orders/o-100"),
+                Step("curl -s localhost:8000/shipping/o-100"),
+                Step("curl -s localhost:8000/inventory/SKU-MUG"),
+                Step(
+                    "curl -sX POST localhost:8000/orders -H 'content-type: application/json' "
+                    '-d \'{"order_id": "o-200", "customer_id": "bob", "sku": "SKU-MUG", '
+                    '"quantity": 3, "card_token": "tok_declined", "country": "DE"}\''
+                ),
+                Step("curl -s localhost:8000/notifications/o-200", eventually=True),
+                Step("curl -s localhost:8000/orders/o-200"),
+                Step("curl -s localhost:8000/inventory/SKU-MUG"),
+                Step("curl -s localhost:8000/shipping/o-200"),
+                Step(
+                    "curl -sX POST localhost:8000/orders -H 'content-type: application/json' "
+                    '-d \'{"order_id": "o-300", "customer_id": "carol", "sku": "SKU-MUG", '
+                    '"quantity": 1, "card_token": "tok_visa", "country": "NZ"}\''
+                ),
+                Step("modulith outbox dead-letter --list", eventually=True),
+                Step("curl -s localhost:8000/shipping/o-300"),
+                Step(
+                    "curl -sX PUT localhost:8000/shipping/zones/NZ "
+                    "-H 'content-type: application/json' -d '{\"carrier\": \"NZPost\"}'"
+                ),
+                Step("modulith outbox dead-letter --retry-all"),
+                Step("curl -s localhost:8000/notifications/o-300", eventually=True),
+                Step("curl -s localhost:8000/reporting/summary", eventually=True),
+                Step("modulith outbox status", eventually=True),
+                Step("docker compose down -v"),
+            ),
+        ),
     ),
 }
 
