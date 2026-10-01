@@ -922,3 +922,30 @@ def test_dev_warn_only_cannot_disarm_strict_boundaries_in_production(
 
     with pytest.raises(ConfigurationError, match="boundary violations detected"):
         _runtime.ensure_bootstrapped()
+
+
+class _TeamRulePlugin:
+    @hookimpl
+    def modulith_verify_module(self, module: Any, all_modules: Any) -> list[Any]:
+        from modulith import Violation
+
+        return [Violation(rule="team-rule", message="team convention broken", module=module.name)]
+
+
+def test_strict_boundaries_blocks_bootstrap_on_a_plugin_rule_violation(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", strict_boundaries=True)
+    _runtime._extra_plugins.append(_TeamRulePlugin())
+
+    with pytest.raises(ConfigurationError, match="team-rule"):
+        _runtime.ensure_bootstrapped()
+
+
+def test_disabled_rules_lets_strict_boundaries_boot_past_a_plugin_rule(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", strict_boundaries=True, verify_disabled_rules=("team-rule",))
+    _runtime._extra_plugins.append(_TeamRulePlugin())
+
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime._bootstrapped

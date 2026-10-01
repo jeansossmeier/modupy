@@ -47,6 +47,7 @@ only new violations fail the build.
 from __future__ import annotations
 
 import ast
+import difflib
 import hashlib
 import importlib.util
 import json
@@ -55,6 +56,8 @@ from collections import Counter
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import pluggy
 
 from modulith import ModuleInfo, Violation, hookimpl
 from modulith.types import ViolationSeverity
@@ -98,13 +101,7 @@ def _configured_contracts_module() -> str:
     return cfg.contracts_module if cfg is not None else CONTRACTS_MODULE
 
 
-def _configured_disabled_rules() -> frozenset[str]:
-    """The rule names disabled via runtime config, or none.
-
-    Mirrors ``_configured_contracts_module``: read lazily from the runtime
-    config so ``[tool.modulith.verify].disabled_rules`` is honored.
-    Logs a warning for any configured rule names not in RULE_NAMES.
-    """
+def _disabled_rules_from_config() -> frozenset[str]:
     try:
         from ..runtime import _runtime
 
@@ -113,12 +110,28 @@ def _configured_disabled_rules() -> frozenset[str]:
         return frozenset()
     if cfg is None:
         return frozenset()
-    disabled = frozenset(cfg.verify_disabled_rules)
-    unknown = disabled - RULE_NAMES
-    if unknown:
-        unknown_str = ", ".join(sorted(unknown))
+    return frozenset(cfg.verify_disabled_rules)
+
+
+def _configured_disabled_rules() -> frozenset[str]:
+    """The rule names disabled via runtime config, or none.
+
+    Mirrors ``_configured_contracts_module``: read lazily from the runtime
+    config so ``[tool.modulith.verify].disabled_rules`` is honored.
+    Plugin rules are legitimate names this module cannot know, so only a
+    name that nearly matches a built-in rule — a typo — draws a warning.
+    """
+    disabled = _disabled_rules_from_config()
+    typos = sorted(
+        name
+        for name in disabled - RULE_NAMES
+        if difflib.get_close_matches(name, RULE_NAMES, n=1, cutoff=0.8)
+    )
+    if typos:
         known_str = ", ".join(sorted(RULE_NAMES))
-        logger.warning(f"disabled_rules names no known rule: {unknown_str} (known: {known_str})")
+        logger.warning(
+            f"disabled_rules names no known rule: {', '.join(typos)} (known: {known_str})"
+        )
     return disabled
 
 
@@ -1037,6 +1050,27 @@ def _check_contracts_is_sink(
 # ---------------------------------------------------------------------------
 
 
+def collect_violations(
+    modules: list[ModuleInfo], plugin_manager: pluggy.PluginManager
+) -> list[Violation]:
+    """Every boundary violation: all plugins' per-module rules plus cycle detection.
+
+    The single collection point for ``modulith verify``, ``modulith doctor`` and
+    the strict_boundaries bootstrap. Violations of a rule named in
+    ``[tool.modulith.verify].disabled_rules`` are dropped here, whichever plugin
+    emitted them; ``parse-error`` is never dropped.
+    """
+    violations: list[Violation] = []
+    for module in modules:
+        for result in plugin_manager.hook.modulith_verify_module(
+            module=module, all_modules=modules
+        ):
+            violations.extend(result)
+    violations.extend(detect_cycles(modules))
+    disabled = _disabled_rules_from_config() - {"parse-error"}
+    return [v for v in violations if v.rule not in disabled]
+
+
 def detect_cycles(all_modules: list[ModuleInfo]) -> list[Violation]:
     """Find cyclic dependencies in the module graph (one Violation per cycle)."""
     names = {m.name for m in all_modules}
@@ -1277,6 +1311,7 @@ def write_baseline(path: Path, violations: list[Violation]) -> None:
 __all__ = [
     "BaselineEntry",
     "ImportRecord",
+    "collect_violations",
     "detect_cycles",
     "filter_against_baseline",
     "load_baseline",

@@ -148,16 +148,10 @@ def _parse_file(path: Path) -> ast.Module | None:
 
 def _check_boundary_health(rt: Runtime) -> HealthCheck:
     """Run the verifier; report violation count and baseline drift."""
-    from .builtin.verifier import detect_cycles, filter_against_baseline, load_baseline
+    from .builtin.verifier import collect_violations, filter_against_baseline, load_baseline
     from .types import ViolationSeverity
 
-    modules = rt.modules
-    pm = rt.plugin_manager
-    violations = []
-    for module in modules:
-        for result in pm.hook.modulith_verify_module(module=module, all_modules=modules):
-            violations.extend(result)
-    violations.extend(detect_cycles(modules))
+    violations = collect_violations(rt.modules, rt.plugin_manager)
 
     errors = [v for v in violations if v.severity is ViolationSeverity.ERROR]
     warnings = [v for v in violations if v.severity is ViolationSeverity.WARNING]

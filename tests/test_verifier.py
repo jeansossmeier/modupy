@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from modulith import ModuleInfo, Violation
+from modulith import ModuleInfo, Violation, hookimpl
 from modulith.builtin import verifier
 from modulith.builtin.verifier import (
     BaselineEntry,
@@ -1080,6 +1080,116 @@ def test_disabled_rules_no_warning_for_known_rule(make_fake_app, monkeypatch, ca
     assert not any(
         "disabled_rules names no known rule" in record.message for record in caplog.records
     ), f"Unexpected warning for known rule, got: {[r.message for r in caplog.records]}"
+
+
+# ---------------------------------------------------------------------------
+# collect_violations: disabled_rules applies to plugin rules too
+# ---------------------------------------------------------------------------
+
+
+class _TeamRulePlugin:
+    @hookimpl
+    def modulith_verify_module(self, module: ModuleInfo, all_modules: list[ModuleInfo]):
+        return [Violation(rule="team-rule", message="team convention broken", module=module.name)]
+
+
+def _disable_rules(monkeypatch, *names: str) -> None:
+    from unittest.mock import MagicMock
+
+    mock_runtime = MagicMock()
+    mock_runtime.config.verify_disabled_rules = names
+    monkeypatch.setattr("modulith.runtime._runtime", mock_runtime, raising=False)
+
+
+def _plugin_manager(*, load_builtins: bool):
+    from modulith.manager import create_plugin_manager
+
+    return create_plugin_manager(
+        extra_plugins=[_TeamRulePlugin()], load_entrypoints=False, load_builtins=load_builtins
+    )
+
+
+def test_collect_violations_keeps_plugin_rule_when_not_disabled(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+
+    violations = verifier.collect_violations(
+        [_module("orders")], _plugin_manager(load_builtins=False)
+    )
+
+    assert [v.rule for v in violations] == ["team-rule"]
+
+
+def test_collect_violations_drops_a_disabled_plugin_rule(make_fake_app, monkeypatch) -> None:
+    make_fake_app({"orders": ""})
+    _disable_rules(monkeypatch, "team-rule")
+
+    violations = verifier.collect_violations(
+        [_module("orders")], _plugin_manager(load_builtins=False)
+    )
+
+    assert violations == []
+
+
+def test_collect_violations_disabled_rules_still_skips_builtin_rules(
+    make_fake_app, monkeypatch
+) -> None:
+    make_fake_app(
+        {
+            "orders": "from fakeapp.inventory._internal.store import Repo",
+            "inventory": "",
+        }
+    )
+    mods = [_module("orders"), _module("inventory")]
+    pm = _plugin_manager(load_builtins=True)
+
+    assert "no-internal-imports" in {v.rule for v in verifier.collect_violations(mods, pm)}
+
+    _disable_rules(monkeypatch, "no-internal-imports")
+
+    rules = {v.rule for v in verifier.collect_violations(mods, pm)}
+    assert "no-internal-imports" not in rules
+    assert "team-rule" in rules
+
+
+def test_collect_violations_disabled_rules_skips_cycle_detection(
+    make_fake_app, monkeypatch
+) -> None:
+    make_fake_app({"a": "from fakeapp.b import x", "b": "from fakeapp.a import y"})
+    mods = [_module("a"), _module("b")]
+    pm = _plugin_manager(load_builtins=False)
+
+    assert "no-cyclic-dependency" in {v.rule for v in verifier.collect_violations(mods, pm)}
+
+    _disable_rules(monkeypatch, "no-cyclic-dependency")
+
+    assert "no-cyclic-dependency" not in {v.rule for v in verifier.collect_violations(mods, pm)}
+
+
+def test_collect_violations_cannot_disable_parse_error(make_fake_app, monkeypatch) -> None:
+    make_fake_app({"orders": "def broken(:\n"})
+    _disable_rules(monkeypatch, "parse-error")
+
+    violations = verifier.collect_violations(
+        [_module("orders")], _plugin_manager(load_builtins=True)
+    )
+
+    assert "parse-error" in {v.rule for v in violations}
+
+
+def test_unknown_disabled_rule_warns_only_for_a_near_miss_of_a_builtin_name(
+    monkeypatch, caplog
+) -> None:
+    import logging
+
+    _disable_rules(monkeypatch, "no-internal-import", "team-rule")
+
+    with caplog.at_level(logging.WARNING, logger="modulith.verifier"):
+        assert verifier._configured_disabled_rules() == {"no-internal-import", "team-rule"}
+
+    warnings = [r.message for r in caplog.records if "disabled_rules" in r.message]
+    assert len(warnings) == 1
+    assert "no-internal-import" in warnings[0]
+    assert "team-rule" not in warnings[0]
 
 
 # Keep ImportRecord referenced for import-time coverage of the dataclass.

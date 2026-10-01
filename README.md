@@ -390,7 +390,7 @@ def test_an_order_gets_paid(scenario: Scenario) -> None:
 Save it under `tests/`; the imports sit inside the test because each test gets a fresh copy of your modules.
 
 ```bash
-pip install pytest
+pip install pytest httpx2
 pytest
 ```
 
@@ -623,6 +623,7 @@ Every setting directly under `[tool.modulith]` can also come from an environment
 | `modulith audit` | assesses an existing codebase and writes `MIGRATION.md` | adopting modupy |
 
 Commands that inspect your modules find your package through `[tool.modulith].package`, else `[project].name`.
+`disabled_rules = ["use-contracts"]` under `[tool.modulith.verify]` turns off boundary rules by their rule name, whether a built-in rule or one a plugin contributes, in `verify`, `doctor` and the `strict_boundaries` startup check; `parse-error` cannot be turned off.
 Every command except `audit` and `migrate` imports your modules, `verify` included, so run them only on code you trust and where your app's dependencies are installed.
 `modulith dev` and `modulith run` take `--log-level` (default `info`) for the supervisor and every worker; in one process they hand over to uvicorn, so modupy's startup banner shows only if your app configures logging, as `myapp/main.py` does.
 With `strict_boundaries = true`, `verify`, `run --topology processes` and `dev --topology=processes` fail on warnings too; a single-process `run` fails when the app first boots modupy, and single-process `modulith dev` stays warn-only by design.

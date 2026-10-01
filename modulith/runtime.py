@@ -1013,13 +1013,7 @@ class Runtime:
                 from .builtin import verifier
                 from .config import ConfigurationError
 
-                violations: list[Any] = []
-                for module in modules:
-                    for result in plugin_manager.hook.modulith_verify_module(
-                        module=module, all_modules=modules
-                    ):
-                        violations.extend(result)
-                violations.extend(verifier.detect_cycles(modules))
+                violations = verifier.collect_violations(modules, plugin_manager)
                 if violations and not _inspection_bootstrap.get():
                     details = "\n  - ".join(
                         f"[{v.severity.value.upper()}] {v.module}: {v.rule}: {v.message}"

@@ -402,14 +402,7 @@ def _write_baseline_or_exit(baseline: Path, violations: list[Violation]) -> None
 
 def _collect_violations(rt: Runtime) -> list[Violation]:
     """Aggregate every boundary rule: plugin verify hooks + cycle detection."""
-    modules = rt.modules
-    pm = rt.plugin_manager
-    violations: list[Violation] = []
-    for module in modules:
-        for result in pm.hook.modulith_verify_module(module=module, all_modules=modules):
-            violations.extend(result)
-    violations.extend(verifier.detect_cycles(modules))
-    return violations
+    return verifier.collect_violations(rt.modules, rt.plugin_manager)
 
 
 def _echo_violation_warnings(violations: list[Violation]) -> None:

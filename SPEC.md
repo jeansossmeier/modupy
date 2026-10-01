@@ -595,9 +595,11 @@ For brownfield adoption, run:
 modulith verify --mode=ratchet --baseline=.modulith-baseline.json
 ```
 
-`[tool.modulith.verify]` is reserved for a future config-backed default. The
-current implementation intentionally ignores that subtable for forward
-compatibility; use the CLI flags above today.
+`[tool.modulith.verify]` is otherwise reserved for future config-backed defaults;
+use the CLI flags above today. Its one live key is `disabled_rules`, a list of
+rule names that turns those rules off by name, plugin-contributed rules
+included, everywhere verification runs (`modulith verify`, `modulith doctor` and
+the `strict_boundaries` startup check). `parse-error` cannot be disabled.
 
 The baseline file records existing violations. The verifier:
 - Passes any violation listed in the baseline (grandfathered)

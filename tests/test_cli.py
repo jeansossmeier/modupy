@@ -31,7 +31,7 @@ import click
 import pytest
 from typer.testing import CliRunner
 
-from modulith import EventPublication
+from modulith import EventPublication, Violation, hookimpl
 from modulith.builtin import outbox
 from modulith.cli import _parse_duration, app
 from modulith.serializers import JsonEventSerializer
@@ -891,6 +891,59 @@ def test_verify_under_strict_boundaries_reports_violations_and_exits_one(
     assert result.exit_code == 1, result.output
     assert "no-internal-imports" in result.output
     assert "boundary violations detected with strict_boundaries" not in result.output
+
+
+class _TeamRulePlugin:
+    @hookimpl
+    def modulith_verify_module(self, module, all_modules):
+        return [Violation(rule="team-rule", message="team convention broken", module=module.name)]
+
+
+def test_verify_fails_on_a_plugin_rule_violation(make_fake_app, monkeypatch):
+    from modulith.runtime import _runtime
+
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    _runtime._extra_plugins.append(_TeamRulePlugin())
+
+    result = runner.invoke(app, ["verify"])
+
+    assert result.exit_code == 1, result.output
+    assert "team-rule" in result.output
+
+
+def test_verify_disabled_rules_turns_off_a_plugin_rule(make_fake_app, monkeypatch, tmp_path):
+    from modulith.runtime import _runtime
+
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith.verify]\ndisabled_rules = ["team-rule"]\n'
+    )
+    _runtime._extra_plugins.append(_TeamRulePlugin())
+
+    result = runner.invoke(app, ["verify"])
+
+    assert result.exit_code == 0, result.output
+    assert "team-rule" not in result.output
+
+
+def test_verify_unknown_disabled_rule_still_reports_builtin_violations(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "from fakeapp.inventory._internal import secret\n", "inventory": ""},
+        extra_files={"inventory/_internal.py": "secret = 1\n"},
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith.verify]\ndisabled_rules = ["team-rule"]\n'
+    )
+
+    result = runner.invoke(app, ["verify"])
+
+    assert result.exit_code == 1, result.output
+    assert "no-internal-imports" in result.output
 
 
 def test_verify_unimportable_package_exits_one(make_fake_app, monkeypatch):

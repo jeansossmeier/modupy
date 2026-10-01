@@ -23,7 +23,7 @@ from uuid import UUID, uuid4
 import pytest
 from typer.testing import CliRunner
 
-from modulith import EventPublication, configure
+from modulith import EventPublication, Violation, configure, hookimpl
 from modulith.adapters._shm_ring import ShmRing
 from modulith.builtin import outbox
 from modulith.cli import app
@@ -33,6 +33,7 @@ from modulith.doctor import (
     render_report,
     run_doctor,
 )
+from modulith.runtime import _runtime
 from modulith.serializers import JsonEventSerializer
 
 runner = CliRunner()
@@ -157,6 +158,31 @@ def test_boundary_health_error_on_internal_import(make_fake_app) -> None:
     check = _check(report, "boundary health")
     assert check.status == "error"
     assert any("private" in d for d in check.details)
+
+
+class _TeamRulePlugin:
+    @hookimpl
+    def modulith_verify_module(self, module, all_modules):
+        return [Violation(rule="team-rule", message="team convention broken", module=module.name)]
+
+
+def test_boundary_health_reports_a_plugin_rule_violation(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp")
+    _runtime._extra_plugins.append(_TeamRulePlugin())
+
+    check = _check(run_doctor(), "boundary health")
+
+    assert check.status == "error"
+    assert any("team convention broken" in d for d in check.details)
+
+
+def test_boundary_health_honors_disabled_rules_for_a_plugin_rule(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", verify_disabled_rules=("team-rule",))
+    _runtime._extra_plugins.append(_TeamRulePlugin())
+
+    assert _check(run_doctor(), "boundary health").status == "ok"
 
 
 # ---------------------------------------------------------------------------
