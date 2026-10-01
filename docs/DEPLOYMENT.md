@@ -103,6 +103,16 @@ outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTB
     alembic -c "$(python -c 'import modulith.adapters, pathlib; print(pathlib.Path(modulith.adapters.__file__).parent / "alembic.ini")')" \
     upgrade head
   ```
+
+  The chain records its revision in its own table, `modulith_alembic_version`
+  (in the migration schema when one is set), so it can share a database with
+  your application's Alembic history in `alembic_version`. Installs migrated
+  by an earlier release tracked modulith in `alembic_version`. The first run
+  of either command above moves that revision into `modulith_alembic_version`
+  before upgrading, inside the upgrade's transaction on PostgreSQL. It moves
+  only revisions from modulith's own chain, leaves any other row in place, and
+  drops `alembic_version` only when nothing else remains in it. No migration
+  runs twice.
 - In a single-process app, call `modulith.bootstrap()` and then
   `outbox.start()` in the lifespan's startup half. Bootstrap binds the store,
   and it is lazy: without the explicit call it first runs at the first

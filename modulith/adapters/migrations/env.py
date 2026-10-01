@@ -11,9 +11,13 @@ variable, or the ``sqlalchemy.url`` config option. This keeps the migrations
 runnable against Postgres in production and SQLite in tests without editing
 ``alembic.ini``.
 
+The revision is tracked in ``modulith_alembic_version``, leaving Alembic's
+default ``alembic_version`` to the application's own history; an install
+that still tracks modulith there is moved over before the upgrade runs.
+
 The target schema (Postgres only) is resolved the same way from ``-x
 schema=...`` or ``MODULITH_DB_SCHEMA``: it routes every migrated table,
-including ``alembic_version``, into that schema via a
+including ``modulith_alembic_version``, into that schema via a
 ``schema_translate_map`` rather than editing table objects.
 """
 
@@ -24,10 +28,14 @@ import os
 from typing import Any
 
 from alembic import context
-from alembic.script import ScriptDirectory
 from sqlalchemy import engine_from_config, inspect, pool, text
 
 from modulith.adapters.db_broker import broker_schema
+from modulith.adapters.migrations.version_table import (
+    VERSION_TABLE,
+    move_legacy_revision,
+    read_revision_table,
+)
 from modulith.adapters.postgres_outbox import Base
 from modulith.config import _validate_sql_schema
 
@@ -66,15 +74,9 @@ def _guard_named_schema_transition(connection: Any, schema: str) -> None:
     }
     public_tables = set(inspector.get_table_names(schema="public"))
     existing = sorted(public_tables & managed_tables)
-    if "alembic_version" in public_tables:
-        revision_ids = {
-            revision.revision for revision in ScriptDirectory.from_config(config).walk_revisions()
-        }
-        public_revisions = set(
-            connection.execute(text("SELECT version_num FROM public.alembic_version")).scalars()
-        )
-        if public_revisions & revision_ids:
-            existing.append("alembic_version")
+    history = read_revision_table(connection, "public")
+    if history is not None and history[1]:
+        existing.append(history[0])
     if existing:
         names = ", ".join(existing)
         raise SystemExit(
@@ -95,6 +97,7 @@ def run_migrations_offline() -> None:
     context.configure(
         url=_resolve_url(),
         target_metadata=target_metadata,
+        version_table=VERSION_TABLE,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
     )
@@ -125,7 +128,10 @@ def run_migrations_online() -> None:
                 )
                 schema = None
         context.configure(
-            connection=connection, target_metadata=target_metadata, **configure_kwargs
+            connection=connection,
+            target_metadata=target_metadata,
+            version_table=VERSION_TABLE,
+            **configure_kwargs,
         )
         with context.begin_transaction():
             if schema:
@@ -142,6 +148,7 @@ def run_migrations_online() -> None:
                 # CREATE TABLE that preceded it.
                 quoted_schema = connection.dialect.identifier_preparer.quote_schema(schema)
                 connection.execute(text(f"SET search_path TO {quoted_schema}, public"))
+            move_legacy_revision(context.get_context(), schema)
             context.run_migrations()
 
 

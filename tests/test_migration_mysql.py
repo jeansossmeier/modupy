@@ -63,7 +63,7 @@ def _drop(engine) -> None:
         # MySQL enforces FK/other constraints across drops within a session;
         # disabling checks for the cleanup avoids ordering the drops by hand.
         conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
-        for tbl in (*_TABLES, *_BROKER_TABLES, "alembic_version"):
+        for tbl in (*_TABLES, *_BROKER_TABLES, "modulith_alembic_version", "alembic_version"):
             conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
         conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
 

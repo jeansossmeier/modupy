@@ -2547,7 +2547,7 @@ def _sqlite_tables(db_file: Path) -> set[str]:
 
 def _sqlite_revision(db_file: Path) -> str:
     with sqlite3.connect(db_file) as conn:
-        (revision,) = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+        (revision,) = conn.execute("SELECT version_num FROM modulith_alembic_version").fetchone()
     return str(revision)
 
 
@@ -2585,6 +2585,25 @@ def test_migrate_applies_the_packaged_chain_to_the_configured_outbox_url(
         "broker_subscription",
         "broker_message",
     } <= _sqlite_tables(db_file)
+    assert _sqlite_revision(db_file) == _packaged_head()
+
+
+def test_migrate_moves_a_revision_tracked_in_alembic_version_to_its_own_table(
+    tmp_path, monkeypatch
+) -> None:
+    db_file = tmp_path / "legacy.db"
+    _migrate_project(tmp_path, monkeypatch)
+    assert runner.invoke(app, ["migrate", "--url", f"sqlite:///{db_file}"]).exit_code == 0
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("DROP TABLE IF EXISTS modulith_alembic_version")
+        conn.execute("DROP TABLE IF EXISTS alembic_version")
+        conn.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) PRIMARY KEY)")
+        conn.execute("INSERT INTO alembic_version VALUES (?)", (_packaged_head(),))
+
+    result = runner.invoke(app, ["migrate", "--url", f"sqlite:///{db_file}"])
+
+    assert result.exit_code == 0, result.output
+    assert "alembic_version" not in _sqlite_tables(db_file)
     assert _sqlite_revision(db_file) == _packaged_head()
 
 

@@ -35,7 +35,7 @@ MIGRATIONS = Path(adapters_pkg.__file__).parent / "migrations"
 _TABLES = ("event_publications", "event_publications_archive")
 # Database-broker tables. Listed here so the fixture drops them too —
 # otherwise the first `upgrade head` leaves them behind and every subsequent
-# one fails re-creating an already-existing table (alembic_version is dropped).
+# one fails re-creating an already-existing table (both version tables are dropped).
 _BROKER_TABLES = (
     "broker_retained_delivery",
     "broker_retained_message",
@@ -59,7 +59,7 @@ def _cfg(url: str) -> Config:
 
 def _drop(engine) -> None:
     with engine.begin() as conn:
-        for tbl in (*_TABLES, *_BROKER_TABLES, "alembic_version"):
+        for tbl in (*_TABLES, *_BROKER_TABLES, "modulith_alembic_version", "alembic_version"):
             conn.execute(text(f"DROP TABLE IF EXISTS {tbl} CASCADE"))
 
 
@@ -293,13 +293,13 @@ def test_alembic_upgrade_head_with_schema_env_var_scopes_all_tables(
     clean_pg, isolated_pg_schema, monkeypatch
 ) -> None:
     """MODULITH_DB_SCHEMA routes both the outbox/broker tables and
-    ``alembic_version`` into a dedicated schema, stays idempotent across a
+    ``modulith_alembic_version`` into a dedicated schema, stays idempotent across a
     second upgrade, and downgrade base leaves that schema empty."""
     url, engine = clean_pg
     schema = isolated_pg_schema
     monkeypatch.setenv("MODULITH_DB_SCHEMA", schema)
     cfg = _cfg(url)
-    expected_tables = {*_TABLES, *_BROKER_TABLES, "alembic_version"}
+    expected_tables = {*_TABLES, *_BROKER_TABLES, "modulith_alembic_version"}
 
     command.upgrade(cfg, "head")
 
@@ -313,9 +313,45 @@ def test_alembic_upgrade_head_with_schema_env_var_scopes_all_tables(
 
     command.downgrade(cfg, "base")
     # downgrade base clears the version row but — same as the unscoped
-    # Postgres/SQLite downgrade tests above — never drops alembic_version
+    # Postgres/SQLite downgrade tests above — never drops the version table
     # itself; only the migrated tables are gone.
-    assert set(inspect(engine).get_table_names(schema=schema)) <= {"alembic_version"}
+    assert set(inspect(engine).get_table_names(schema=schema)) <= {"modulith_alembic_version"}
+
+
+def test_upgrade_moves_a_legacy_revision_inside_the_named_schema(
+    clean_pg, isolated_pg_schema, monkeypatch
+) -> None:
+    """An install that tracked modulith in ``<schema>.alembic_version`` has
+    its revision moved into ``<schema>.modulith_alembic_version`` in the same
+    transaction as the upgrade, without re-running any migration."""
+    url, engine = clean_pg
+    schema = isolated_pg_schema
+    monkeypatch.setenv("MODULITH_DB_SCHEMA", schema)
+    cfg = _cfg(url)
+    command.upgrade(cfg, "head")
+    with engine.begin() as conn:
+        conn.execute(text(f'DROP TABLE "{schema}".modulith_alembic_version'))
+        conn.execute(
+            text(
+                f'CREATE TABLE "{schema}".alembic_version (version_num VARCHAR(32) NOT NULL, '
+                "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
+            )
+        )
+        conn.execute(
+            text(
+                f"INSERT INTO \"{schema}\".alembic_version VALUES ('0007_outbox_dispatch_started')"
+            )
+        )
+
+    command.upgrade(cfg, "head")
+
+    tables = set(inspect(engine).get_table_names(schema=schema))
+    assert "alembic_version" not in tables
+    with engine.connect() as conn:
+        assert conn.execute(
+            text(f'SELECT version_num FROM "{schema}".modulith_alembic_version')
+        ).scalar_one() == ("0007_outbox_dispatch_started")
+    assert "modulith_alembic_version" not in inspect(engine).get_table_names(schema="public")
 
 
 def test_enabling_named_schema_refuses_to_abandon_public_migration_history(
@@ -330,7 +366,7 @@ def test_enabling_named_schema_refuses_to_abandon_public_migration_history(
         command.upgrade(cfg, "head")
 
     public_tables = set(inspect(engine).get_table_names(schema="public"))
-    assert {*_TABLES, *_BROKER_TABLES, "alembic_version"} <= public_tables
+    assert {*_TABLES, *_BROKER_TABLES, "modulith_alembic_version"} <= public_tables
     assert isolated_pg_schema not in inspect(engine).get_schema_names()
 
 
@@ -349,7 +385,7 @@ def test_named_schema_guard_ignores_unrelated_public_alembic_history(
         assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
             "unrelated_revision"
         )
-    assert {*_TABLES, *_BROKER_TABLES, "alembic_version"} == set(
+    assert {*_TABLES, *_BROKER_TABLES, "modulith_alembic_version"} == set(
         inspect(engine).get_table_names(schema=isolated_pg_schema)
     )
 
@@ -388,7 +424,7 @@ def test_named_schema_guard_rejects_public_tables_with_stale_target_history(
         command.upgrade(cfg, "head")
 
     target_tables = set(inspect(engine).get_table_names(schema=isolated_pg_schema))
-    assert target_tables == {"alembic_version"}
+    assert target_tables == {"modulith_alembic_version"}
     public_tables = set(inspect(engine).get_table_names(schema="public"))
     assert {*_TABLES, *_BROKER_TABLES} <= public_tables
 

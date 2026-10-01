@@ -847,6 +847,11 @@ MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
   upgrade head
 ```
 
+The chain tracks its revision in `modulith_alembic_version`, not Alembic's
+default `alembic_version`, so it runs in a database that has its own Alembic
+history. A revision from the packaged chain still found in `alembic_version`
+is moved to `modulith_alembic_version` on the next migration run.
+
 ### 10.2 Redis Streams Broker
 
 Extra: `modupy[redis]` (`modulith/adapters/redis_broker.py`). Implements `Broker` against `redis.asyncio`. It is an explicit networked choice for process-per-module deployments.

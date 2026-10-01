@@ -89,7 +89,7 @@ async def test_alembic_upgrade_head_after_broker_self_bootstrap(tmp_path: Path) 
     broker path). Adopting the outbox afterwards runs ``upgrade head`` against
     that same database, so the broker revisions must stamp through objects that
     are already there instead of dying on 'table already exists' and pinning
-    ``alembic_version`` at 0001 forever."""
+    ``modulith_alembic_version`` at 0001 forever."""
     from modulith.adapters.db_broker import DatabaseBroker
 
     db = tmp_path / "race.db"
@@ -105,7 +105,7 @@ async def test_alembic_upgrade_head_after_broker_self_bootstrap(tmp_path: Path) 
 
     conn = sqlite3.connect(db)
     try:
-        versions = {r[0] for r in conn.execute("SELECT version_num FROM alembic_version")}
+        versions = {r[0] for r in conn.execute("SELECT version_num FROM modulith_alembic_version")}
     finally:
         conn.close()
     assert versions == {"0007_outbox_dispatch_started"}
@@ -345,6 +345,8 @@ def test_alembic_offline_mode_emits_full_ddl(tmp_path: Path, capsys) -> None:
     assert "CREATE TABLE broker_retained_message (" in ddl
     assert "CREATE TABLE broker_retained_delivery (" in ddl
     assert "ix_broker_message_claim" in ddl
+    assert "CREATE TABLE modulith_alembic_version (" in ddl
+    assert "CREATE TABLE alembic_version (" not in ddl
     # Offline mode renders SQL only — the database file is never created.
     assert not db.exists()
 
@@ -427,3 +429,132 @@ def test_alembic_rejects_invalid_schema_before_opening_a_connection(
         command.upgrade(_cfg(db), "head", sql=True)
 
     assert not db.exists()
+
+
+HEAD = "0007_outbox_dispatch_started"
+BUSINESS_REVISION = "business_rev_1"
+
+
+def _versions(db_path: Path, table: str) -> set[str]:
+    conn = sqlite3.connect(db_path)
+    try:
+        return {r[0] for r in conn.execute(f"SELECT version_num FROM {table}")}
+    finally:
+        conn.close()
+
+
+def _legacy_install(db_path: Path, migrated_to: str | None, *version_rows: str) -> None:
+    """Build the pre-``modulith_alembic_version`` layout: the schema migrated to
+    ``migrated_to`` with every tracked revision in Alembic's default table."""
+    if migrated_to is not None:
+        command.upgrade(_cfg(db_path), migrated_to)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DROP TABLE IF EXISTS modulith_alembic_version")
+        conn.execute("DROP TABLE IF EXISTS alembic_version")
+        conn.execute(
+            "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL, "
+            "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
+        )
+        conn.executemany("INSERT INTO alembic_version VALUES (?)", [(r,) for r in version_rows])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _upgrade_steps(caplog: Any) -> list[str]:
+    """``"<from> -> <to>"`` for every revision Alembic ran."""
+    prefix = "Running upgrade "
+    return [
+        record.getMessage().removeprefix(prefix).split(",")[0]
+        for record in caplog.records
+        if record.getMessage().startswith(prefix)
+    ]
+
+
+def test_fresh_upgrade_tracks_the_revision_in_modulith_alembic_version(tmp_path: Path) -> None:
+    db = tmp_path / "fresh.db"
+    command.upgrade(_cfg(db), "head")
+
+    assert "alembic_version" not in _objects(db, "table")
+    assert _versions(db, "modulith_alembic_version") == {HEAD}
+
+
+def test_upgrade_moves_a_legacy_head_revision_without_rerunning_migrations(
+    tmp_path: Path, caplog: Any
+) -> None:
+    db = tmp_path / "legacy-head.db"
+    _legacy_install(db, HEAD, HEAD)
+
+    with caplog.at_level(logging.INFO, logger="alembic.runtime.migration"):
+        command.upgrade(_cfg(db), "head")
+
+    assert _upgrade_steps(caplog) == []
+    assert "alembic_version" not in _objects(db, "table")
+    assert _versions(db, "modulith_alembic_version") == {HEAD}
+
+
+def test_upgrade_moves_a_legacy_mid_chain_revision_then_continues_from_it(
+    tmp_path: Path, caplog: Any
+) -> None:
+    db = tmp_path / "legacy-mid.db"
+    _legacy_install(db, "0005_outbox_scan_indexes", "0005_outbox_scan_indexes")
+
+    with caplog.at_level(logging.INFO, logger="alembic.runtime.migration"):
+        command.upgrade(_cfg(db), "head")
+
+    assert _upgrade_steps(caplog) == [
+        "0005_outbox_scan_indexes -> 0006_broker_dispatch_started",
+        "0006_broker_dispatch_started -> 0007_outbox_dispatch_started",
+    ]
+    assert "alembic_version" not in _objects(db, "table")
+    assert _versions(db, "modulith_alembic_version") == {HEAD}
+
+
+def test_upgrade_leaves_a_business_alembic_revision_untouched(tmp_path: Path) -> None:
+    db = tmp_path / "business.db"
+    _legacy_install(db, None, BUSINESS_REVISION)
+
+    command.upgrade(_cfg(db), "head")
+
+    assert _versions(db, "alembic_version") == {BUSINESS_REVISION}
+    assert _versions(db, "modulith_alembic_version") == {HEAD}
+    assert "event_publications" in _objects(db, "table")
+
+
+def test_upgrade_moves_only_the_modulith_row_out_of_a_shared_alembic_version(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "shared.db"
+    _legacy_install(db, HEAD, HEAD, BUSINESS_REVISION)
+
+    command.upgrade(_cfg(db), "head")
+
+    assert _versions(db, "alembic_version") == {BUSINESS_REVISION}
+    assert _versions(db, "modulith_alembic_version") == {HEAD}
+
+
+def test_read_revision_table_finds_the_revision_in_either_layout(tmp_path: Path) -> None:
+    from sqlalchemy import create_engine
+
+    from modulith.adapters.migrations.version_table import read_revision_table
+
+    def read(db_path: Path) -> tuple[str, frozenset[str]] | None:
+        engine = create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.connect() as connection:
+                return read_revision_table(connection, None)
+        finally:
+            engine.dispose()
+
+    current = tmp_path / "current.db"
+    command.upgrade(_cfg(current), "head")
+    legacy = tmp_path / "legacy.db"
+    _legacy_install(legacy, "0003_outbox_claim_leases", "0003_outbox_claim_leases", "x")
+    business = tmp_path / "business.db"
+    _legacy_install(business, None, BUSINESS_REVISION)
+
+    assert read(current) == ("modulith_alembic_version", frozenset({HEAD}))
+    assert read(legacy) == ("alembic_version", frozenset({"0003_outbox_claim_leases"}))
+    assert read(business) == ("alembic_version", frozenset())
+    assert read(tmp_path / "empty.db") is None
