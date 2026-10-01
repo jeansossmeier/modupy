@@ -20,7 +20,7 @@ A default-lane test starts the SHM broker for a `fakeapp` project without redire
 ## Proposed Solution
 Add an autouse fixture in `tests/conftest.py` that points the state directory into `tmp_path`.
 
-Setting `XDG_STATE_HOME` covers Linux only. On macOS, `_default_state_home` returns `~/Library/Application Support`, and on Windows it returns `LOCALAPPDATA`. The fixture must therefore also set `HOME` and `LOCALAPPDATA`, or patch `_default_state_home`.
+Setting `XDG_STATE_HOME` covers Linux only. On macOS, `_default_state_home` returns `~/Library/Application Support`, and on Windows it returns `LOCALAPPDATA`. The fixture must therefore also set `HOME` and `LOCALAPPDATA`, or patch `_default_state_home`. `tests/test_shm_broker.py::_redirect_default_state_home` already sets all three for four SHM tests and can move into the fixture.
 
 To find the leaking test, run the suite in halves and watch for a new directory.
 

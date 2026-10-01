@@ -1266,6 +1266,19 @@ async def test_sole_subscriber_targets_lists_targets_no_other_group_holds(
     assert await broker.sole_subscriber_targets("modulith-orders") == []
 
 
+def _redirect_default_state_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point the default state home into ``tmp_path`` on every platform, so no
+    test opens a store under the real user's home. Linux reads XDG_STATE_HOME,
+    Windows LOCALAPPDATA and macOS ~/Library/Application Support
+    (modulith/adapters/_state_path.py::_default_state_home)."""
+    home = tmp_path / "home"
+    state_home = home / "Library" / "Application Support"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    monkeypatch.setenv("LOCALAPPDATA", str(state_home))
+    return state_home
+
+
 @pytest.mark.parametrize(
     "options",
     [{}, {"sqlite_path": "custom/q.db"}, {"state_dir": "STATE", "sqlite_path": "q.db"}],
@@ -1275,11 +1288,11 @@ def test_shm_store_path_matches_the_opened_store_without_creating_it(
 ) -> None:
     from modulith.adapters.shm_broker import _resolve_shm_paths, shm_store_path
 
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    state_home = _redirect_default_state_home(monkeypatch, tmp_path)
     options = {k: v.replace("STATE", str(tmp_path / "explicit")) for k, v in options.items()}
 
     predicted = shm_store_path("fakeapp", options)
-    assert not (tmp_path / "state-home").exists()
+    assert not state_home.exists()
     assert not (tmp_path / "explicit").exists()
 
     _, opened, _ = _resolve_shm_paths("fakeapp", options)
@@ -1330,8 +1343,7 @@ async def test_registration_logs_default_state_directory_at_info(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     make_fake_app({"orders": ""})
-    state_home = tmp_path / "state-home"
-    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    state_home = _redirect_default_state_home(monkeypatch, tmp_path)
     monkeypatch.delenv("MODULITH_BROKER_STATE_DIR", raising=False)
     with caplog.at_level(logging.INFO, logger="modulith.adapters.shm"):
         configure(package="fakeapp", topology="processes", broker="shm")
@@ -1358,7 +1370,7 @@ async def test_worker_given_supervisors_default_state_directory_logs_it_as_defau
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     make_fake_app({"orders": ""})
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    _redirect_default_state_home(monkeypatch, tmp_path)
     forwarded = default_state_directory("fakeapp")
     monkeypatch.setenv("MODULITH_BROKER_STATE_DIR", str(forwarded))
     with caplog.at_level(logging.INFO, logger="modulith.adapters.shm"):
@@ -1408,7 +1420,7 @@ async def test_registration_logs_absolute_sqlite_path_as_the_explicit_store(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     make_fake_app({"orders": ""})
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    _redirect_default_state_home(monkeypatch, tmp_path)
     monkeypatch.delenv("MODULITH_BROKER_STATE_DIR", raising=False)
     pinned = tmp_path / "pinned" / "broker.db"
     monkeypatch.setenv("MODULITH_BROKER_SQLITE_PATH", str(pinned))
