@@ -94,24 +94,18 @@ def _importing_module_names() -> tuple[str, ...]:
     return tuple(names)
 
 
-def _enable_sqlite_wal(engine: Any) -> None:
-    """Run ``PRAGMA journal_mode=WAL`` on every new connection of ``engine``.
+def _set_journal_mode_wal(dbapi_connection: Any, _record: Any) -> None:
+    """``connect`` listener that runs ``PRAGMA journal_mode=WAL``.
 
     The pragma is the only change: unlike the database broker's
     ``_install_sqlite_pragmas``, it leaves ``busy_timeout`` and
     ``synchronous`` at SQLite's defaults, so the outbox keeps its durability.
-    Registered on the ``sync_engine``'s ``connect`` event, the way that
-    function does for an aiosqlite engine.
     """
-    from sqlalchemy import event
-
-    @event.listens_for(engine.sync_engine, "connect")
-    def _set_wal(dbapi_connection: Any, _record: Any) -> None:
-        cursor = dbapi_connection.cursor()
-        try:
-            cursor.execute("PRAGMA journal_mode=WAL")
-        finally:
-            cursor.close()
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+    finally:
+        cursor.close()
 
 
 class Runtime:
@@ -389,7 +383,9 @@ class Runtime:
         ``outbox.start()`` or the first transactional publish.
         ``outbox_options.sqlite_wal = true`` switches a SQLite ``outbox_url``
         database to WAL journal mode on every connection of the engine built
-        here; unset, the database's journal mode is never touched.
+        here. Any other database ignores it, so one pyproject can serve a
+        SQLite development setup and a Postgres deployment; unset, the
+        database's journal mode is never touched.
         ``shutdown()`` disposes the store and its engine, but only
         process-topology workers call it; a single-process app stops the retry
         loop with ``outbox.shutdown()``.
@@ -399,6 +395,7 @@ class Runtime:
         cfg = self._config
         if cfg is None or cfg.outbox == "memory" or not cfg.outbox_url or outbox._store is not None:
             return
+        from sqlalchemy import event
         from sqlalchemy.ext.asyncio import create_async_engine
 
         from .adapters.postgres_outbox import PostgresPublicationStore
@@ -421,8 +418,8 @@ class Runtime:
         if bus is None:
             bus = self._event_bus
         engine = create_async_engine(cfg.outbox_url)
-        if cfg.outbox_options.get("sqlite_wal"):
-            _enable_sqlite_wal(engine)
+        if cfg.outbox_options.get("sqlite_wal") and engine.dialect.name == "sqlite":
+            event.listen(engine.sync_engine, "connect", _set_journal_mode_wal)
         store = PostgresPublicationStore(engine)
         event_types = self.local_event_types(bus) if bus is not None else []
         outbox.configure(store, JsonEventSerializer(allowed_event_types=event_types), **tuning)

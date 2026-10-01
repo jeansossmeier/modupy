@@ -152,7 +152,8 @@ A ninth key, `sqlite_wal`, is validated too but is not a `configure()`
 setting: `bind_configured_outbox` applies it to the engine it builds, running
 `PRAGMA journal_mode=WAL` on every new connection. It accepts `true` or `false`
 (off by default, so a database file's journal mode is never changed unless
-asked), and with it set `outbox_url` must name SQLite or config load raises.
+asked). It applies to SQLite only and is ignored for other databases, so one
+pyproject can serve a SQLite development setup and a Postgres deployment.
 DEPLOYMENT.md covers what WAL changes on disk.
 
 Any other key in the table is accepted and ignored, so a `pyproject.toml`

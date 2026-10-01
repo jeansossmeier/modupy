@@ -82,8 +82,10 @@ outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTB
   run together. WAL is persistent: once set it stays in the database file, and
   removing the key or setting `false` does not switch it back. It adds `-wal`
   and `-shm` files beside the database and cannot be used on network
-  filesystems. The key is a configuration error with a non-SQLite `outbox_url`.
-  An application that builds its own engine for `outbox.configure()` gets the
+  filesystems. The key applies to SQLite only and is ignored for other
+  databases, so one pyproject can serve a SQLite development setup and a
+  Postgres deployment. An application that builds its own engine for
+  `outbox.configure()` gets the
   same effect with a `connect` listener running `PRAGMA journal_mode=WAL`
   (see the Cookbook), or by setting WAL once on the file with
   `sqlite3 app.db 'PRAGMA journal_mode=WAL'`.

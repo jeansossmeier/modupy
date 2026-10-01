@@ -32,6 +32,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -47,7 +48,7 @@ from modulith.adapters.postgres_outbox import (
 from modulith.adapters.shm_broker import ShmBroker
 from modulith.builtin import outbox
 from modulith.config import ConfigurationError
-from modulith.runtime import _runtime
+from modulith.runtime import _runtime, _set_journal_mode_wal
 from modulith.serializers import JsonEventSerializer
 
 # ---------------------------------------------------------------------------
@@ -2802,6 +2803,36 @@ def test_outbox_url_leaves_the_journal_mode_alone_unless_sqlite_wal_is_true(
     modes = _journal_modes_after_binding_outbox_url(make_fake_app, db, options)
 
     assert modes == (expected, expected)
+
+
+@pytest.mark.parametrize(
+    ("url", "installed"),
+    [
+        ("sqlite+aiosqlite:///{db}", True),
+        ("postgresql+asyncpg://app:s3cret@db.internal/app", False),
+    ],
+    ids=["sqlite", "postgresql"],
+)
+def test_outbox_url_sqlite_wal_listener_is_installed_only_on_a_sqlite_engine(
+    make_fake_app: Any, tmp_path: Path, url: str, installed: bool
+) -> None:
+    make_fake_app(_ORDERS_APP)
+    _runtime.configure(
+        package="fakeapp",
+        outbox="postgres",
+        outbox_url=url.format(db=tmp_path / "app.db"),
+        outbox_options={"sqlite_wal": True},
+    )
+    _runtime.ensure_bootstrapped()
+    assert _runtime._owned_outbox is not None
+    store, engine = _runtime._owned_outbox
+    bound = (
+        type(store).__name__,
+        sqlalchemy_event.contains(engine.sync_engine, "connect", _set_journal_mode_wal),
+    )
+    asyncio.run(_runtime.shutdown())
+
+    assert bound == ("PostgresPublicationStore", installed)
 
 
 _FAILING_LISTENER_APP = {

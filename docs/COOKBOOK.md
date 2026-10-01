@@ -675,7 +675,8 @@ the engine the runtime builds from a SQLite `outbox_url`. `true` runs
 `PRAGMA journal_mode=WAL` on every connection; it is off by default, and modupy
 never changes a database file's journal mode unless asked. WAL persists in the
 database file, adds `-wal` and `-shm` files and cannot be used on network
-filesystems. With a non-SQLite `outbox_url` the key is a configuration error.
+filesystems. It applies to SQLite only and is ignored for other databases, so
+one pyproject can serve a SQLite development setup and a Postgres deployment.
 An engine you build yourself for `outbox.configure()` gets the same effect with
 a `connect` listener, or by setting WAL once on the file:
 

@@ -731,14 +731,16 @@ _POSITIVE_SECONDS_KEYS = (
 _POSITIVE_INTEGER_KEYS = ("claim_batch_size", "dead_letter_after_attempts")
 
 
-def _validate_outbox_options(options: dict[str, Any], outbox_url: str | None = None) -> None:
+def _validate_outbox_options(options: dict[str, Any]) -> None:
     """Validate the keys of [tool.modulith.outbox_options] that
     ``Runtime.bind_configured_outbox`` forwards to ``outbox.configure()``
     (claim, retry, dead-letter and completion settings), plus the
-    ``sqlite_wal`` flag it applies to the engine it builds, when present.
-    ``sqlite_wal`` needs ``outbox_url`` to name SQLite when one is set. Other
-    keys in that table are intentionally NOT validated here — outbox_options
-    is a forward-compatible passthrough (see _read_pyproject).
+    ``sqlite_wal`` flag it applies to a SQLite engine, when present.
+    ``sqlite_wal`` is not checked against ``outbox_url``: any other database
+    ignores it, so one pyproject can serve a SQLite development setup and a
+    Postgres deployment. Other keys in that table are intentionally NOT
+    validated here — outbox_options is a forward-compatible passthrough (see
+    _read_pyproject).
     """
     if "claim_strategy" in options and options["claim_strategy"] not in VALID_CLAIM_STRATEGIES:
         raise ConfigurationError(
@@ -768,18 +770,10 @@ def _validate_outbox_options(options: dict[str, Any], outbox_url: str | None = N
                 raise ConfigurationError(
                     f"outbox_options.{key} must be a positive integer, got {value!r}"
                 )
-    if "sqlite_wal" in options:
-        if type(options["sqlite_wal"]) is not bool:
-            raise ConfigurationError(
-                f"outbox_options.sqlite_wal must be true or false, got {options['sqlite_wal']!r}"
-            )
-        # Name the dialect only: a full URL would put its password in the message.
-        dialect = outbox_url.partition(":")[0].partition("+")[0] if outbox_url else "sqlite"
-        if dialect != "sqlite":
-            raise ConfigurationError(
-                "outbox_options.sqlite_wal applies to SQLite only: set outbox_url to a "
-                f"sqlite+aiosqlite:///<path> URL or remove the key (outbox_url uses {dialect!r})"
-            )
+    if "sqlite_wal" in options and type(options["sqlite_wal"]) is not bool:
+        raise ConfigurationError(
+            f"outbox_options.sqlite_wal must be true or false, got {options['sqlite_wal']!r}"
+        )
 
 
 def _validate_redis_broker_options(options: dict[str, Any]) -> None:
@@ -947,7 +941,7 @@ def _validate(data: dict[str, Any]) -> None:
 
     outbox_options = data.get("outbox_options")
     if outbox_options is not None:
-        _validate_outbox_options(outbox_options, data.get("outbox_url"))
+        _validate_outbox_options(outbox_options)
 
     broker_options = data.get("broker_options")
     if data.get("broker", "memory") == "redis-streams" and broker_options is not None:
