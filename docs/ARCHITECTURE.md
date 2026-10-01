@@ -46,9 +46,10 @@ processes through a broker — decided entirely by configuration at bootstrap.
 (`publish_sync`) are thin wrappers over it.
 
 The runtime **bootstraps lazily** — it initializes on first use (the first
-`publish()`), not at import or process start. This is why the startup banner in
-a uvicorn app appears after uvicorn's own lines, on the first request that
-publishes an event, rather than at process launch (README "30-second pitch").
+`publish()` or `publish_sync()`), not at import or process start. This is why
+the startup banner in a uvicorn app appears after uvicorn's own lines, on the
+first request that publishes an event, rather than at process launch (README
+"30-second pitch").
 
 Bootstrap builds everything in local variables first, so a failure while building leaves the runtime untouched and the next call tries again:
 
@@ -323,6 +324,15 @@ flowchart TD
    `publish()` then re-raises the first listener error.
    On the durable path they fire after commit (§7.1).
 
+On the in-memory path, which is every publish under the memory outbox, the
+listeners run inside `publish()`, so they run while the publisher's transaction
+is still open. On a SQLite file, a publisher that has already flushed a write
+holds the file's write lock, and a listener that writes in its own transaction
+waits on that lock until SQLite's busy timeout runs out. The listener then
+fails with `database is locked`, and `publish()` re-raises the failure. Publish
+before you flush, as `place_order` in the
+[demo app](../examples/demo_app/shop/orders/__init__.py) does.
+
 ### The four contexts, one API
 
 - **Async, no transaction** → in-memory concurrent dispatch.
@@ -336,6 +346,14 @@ flowchart TD
   is deliberately distinct from a `TimeoutError` raised *by* a listener, so the
   framework never swallows a genuine application failure as a budget overrun.
   That persistent daemon-thread loop is a second event loop.
+  - **Bootstrap:** the first `publish_sync()` bootstraps the runtime on that
+    loop's thread, inside its timeout, so a startup slower than the timeout
+    raises `PublishSyncTimeout`. With a durable outbox bound from `outbox_url`,
+    that bootstrap also starts the retry loop and its crash sweep on that loop,
+    so rows a crashed run left undelivered wait for that first call. Calling
+    `modulith.bootstrap()` first takes the bootstrap out of the timeout, but
+    sync code has no running loop for it to start the retry loop on: the loop
+    then starts at the first publish made inside a bound session.
   - **Outbox:** an outbox `AsyncEngine` also driven by `await publish()` on the
     app loop is shared across both loops. On Postgres and MySQL the first query
     one loop runs on a connection the other loop opened raises `RuntimeError:

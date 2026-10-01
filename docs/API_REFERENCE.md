@@ -154,6 +154,17 @@ listener already blocking inside an executor thread still runs to
 completion there, but the abandoned dispatch no longer accumulates on
 the shared persistent loop).
 
+The first call also bootstraps modulith, lazily, as the first
+``publish()`` does. The bootstrap runs on the daemon-thread loop's
+thread and inside that call's ``timeout``: one slower than ``timeout``
+raises PublishSyncTimeout, and a failing one raises its error from this
+call. With a durable outbox bound from ``outbox_url``, it also starts
+the outbox retry loop, and its crash-recovery sweep, on that loop. Call
+``bootstrap()`` before the first publish_sync() to run startup outside
+``timeout``. Called from sync code, ``bootstrap()`` starts no retry
+loop, because no event loop is running on that thread: the retry loop
+then starts at the first publish made inside a bound session.
+
 Calling publish_sync() while modulith is bootstrapping on this same
 thread (module code imported by discovery) raises RuntimeError
 immediately instead of deadlocking against the bootstrap lock until the

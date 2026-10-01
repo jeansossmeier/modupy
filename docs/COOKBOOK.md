@@ -169,6 +169,19 @@ bound (recipe 6) the same call persists the event durably and dispatches after
 commit. **Your code does not change between those modes** — only configuration
 does.
 
+Under the memory outbox (`outbox = "memory"`, the default) `publish()` runs the
+listeners inline. It returns only after they have finished, while your own
+transaction is still open. On a SQLite file that matters once you have flushed
+a write: the flush takes the file's write lock, and your transaction keeps it
+until it ends. A listener that writes in its own transaction then waits on that
+lock until SQLite's busy timeout runs out (5 s with the default
+`sqlite+aiosqlite` driver), fails with `database is locked`, and `publish()`
+re-raises that failure to you.
+
+So publish before you flush. `place_order` in the
+[demo app](../examples/demo_app/shop/orders/__init__.py) publishes `OrderPlaced`
+first, then adds the order row, and commits once.
+
 ---
 
 ## 4. Publish from sync code (views, scripts)
@@ -241,6 +254,19 @@ Three sharp edges (the first two from `wrap_sync_listener`'s contract):
 `publish_sync()` takes a `timeout` (default 30s) and raises `PublishSyncTimeout`
 if a listener deadlocks. Do **not** call it from inside async code on the loop's
 own thread — it raises `RuntimeError` telling you to `await publish()` instead.
+
+The first `publish_sync()` also bootstraps modupy, lazily, as the first
+`await publish()` does. It runs the bootstrap on the daemon-thread loop's thread
+and inside that call's `timeout`, so a startup slower than the timeout raises
+`PublishSyncTimeout`, and a failing one raises its error from that first
+publish. With the durable outbox (recipe 6) bound from `outbox_url`, the same
+bootstrap starts the retry loop and its crash-recovery sweep on that loop, so
+rows a crashed run left undelivered wait for that first call.
+
+Call `modulith.bootstrap()` before the first `publish_sync()` to run startup,
+and surface its errors, at a point you choose and outside the timeout. It does
+not start the retry loop: sync code has no running loop to start it on, so the
+loop starts at the first publish made inside a bound session.
 
 ---
 
