@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
+import click
 import pytest
 from typer.testing import CliRunner
 
@@ -462,7 +463,7 @@ def test_extract_force_help_states_the_import_check_is_never_overridden():
     result = runner.invoke(app, ["extract", "--help"])
 
     assert result.exit_code == 0, result.output
-    help_text = " ".join(result.stdout.replace("│", " ").split())
+    help_text = " ".join(click.unstyle(result.stdout).replace("│", " ").split())
     assert "never overrides the import check" in help_text
 
 
