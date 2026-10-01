@@ -481,6 +481,89 @@ async def test_wait_for_dispatch_is_cross_loop_safe(engine: Any) -> None:
     assert store._inflight == set()
 
 
+async def test_wait_for_dispatch_returns_when_a_finished_task_awaits_its_done_callback(
+    engine: Any,
+) -> None:
+    """A task leaves _inflight through a done callback, which the loop runs
+    one step after the task finishes. wait_for_dispatch() entered in between
+    found the finished task still in flight. On Python 3.12+ asyncio.gather()
+    over finished tasks completes without yielding, so the loop never got to
+    run the callback: wait_for_dispatch() spun forever and blocked its event
+    loop, and Runtime.shutdown() hung."""
+    store = PostgresPublicationStore(engine=engine)
+
+    async def drain_right_after_a_task_finishes() -> None:
+        async def finished() -> None:
+            return None
+
+        task = asyncio.get_running_loop().create_task(finished())
+        store._inflight.add(task)
+        task.add_done_callback(store._inflight.discard)
+        await asyncio.sleep(0)  # the task finishes; its done callback is queued behind this step
+        assert task.done() and task in store._inflight
+        await store.wait_for_dispatch()
+
+    outcome: list[BaseException | None] = []
+
+    def drain() -> None:
+        try:
+            asyncio.run(drain_right_after_a_task_finishes())
+        except BaseException as exc:
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+
+    # A spin that never yields cannot be timed out from its own loop.
+    thread = threading.Thread(target=drain, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive(), "wait_for_dispatch() spun without yielding to its event loop"
+    assert outcome == [None]
+    assert store._inflight == set()
+
+
+async def test_wait_for_dispatch_stops_waiting_for_a_task_whose_loop_closed(
+    engine: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """sync._run_nested_dispatch closes its loop without cancelling the tasks
+    still on it, so an after-commit task started there never takes another
+    step. wait_for_dispatch() polled such a task forever. It drops the task
+    with a warning instead, as outbox.shutdown() does for a stranded retry
+    task; the publication stays incomplete for the retry sweep."""
+    store = PostgresPublicationStore(engine=engine)
+    foreign_loop = asyncio.new_event_loop()
+    started = threading.Event()
+
+    async def blocked() -> None:
+        started.set()
+        await asyncio.get_running_loop().create_future()
+
+    def create_blocked_task() -> None:
+        task = foreign_loop.create_task(blocked())
+        # Pending forever by construction; asyncio would log that when the task is collected.
+        task._log_destroy_pending = False  # type: ignore[attr-defined]
+        store._inflight.add(task)
+        task.add_done_callback(store._inflight.discard)
+
+    thread = threading.Thread(target=foreign_loop.run_forever)
+    thread.start()
+    foreign_loop.call_soon_threadsafe(create_blocked_task)
+    assert started.wait(timeout=2), "the foreign-loop task never started"
+
+    with caplog.at_level(logging.WARNING, logger="modulith.adapters.postgres"):
+        waiting = asyncio.create_task(store.wait_for_dispatch())
+        await asyncio.sleep(0)  # wait_for_dispatch() starts polling the foreign task
+        await asyncio.sleep(0)
+        foreign_loop.call_soon_threadsafe(foreign_loop.stop)
+        thread.join(timeout=2)
+        foreign_loop.close()
+        await asyncio.wait_for(waiting, timeout=2)
+
+    assert store._inflight == set()
+    assert any("closed event loop" in r.getMessage() for r in caplog.records), caplog.records
+
+
 # ---------------------------------------------------------------------------
 # Non-UTC-aware timestamps must round-trip as the same instant
 # ---------------------------------------------------------------------------

@@ -1290,21 +1290,41 @@ class PostgresPublicationStore:
         one is drained by polling ``task.done()`` instead — the same
         technique ``modulith.builtin.outbox.shutdown()`` uses for the retry
         task.
+
+        A finished task is dropped here instead of waiting for the done
+        callback that removes it, which its loop runs one step later: on
+        Python 3.12+ ``asyncio.gather()`` over finished tasks completes
+        without yielding, so waiting for that callback spun forever without
+        letting the loop run it. A task on a closed loop never finishes; it is
+        dropped with a WARNING, as ``outbox.shutdown()`` drops a stranded
+        retry task, and the retry sweep delivers its publication.
         """
-        while self._inflight:
+        while True:
             try:
                 running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
             except RuntimeError:
                 running = None
-            pending = list(self._inflight)
+            pending = []
+            for task in list(self._inflight):
+                if not task.done() and not task.get_loop().is_closed():
+                    pending.append(task)
+                    continue
+                self._inflight.discard(task)
+                if not task.done():
+                    logger.warning(
+                        "after-commit dispatch task %s was stranded on a closed event loop; "
+                        "the retry sweep delivers its publication instead",
+                        task.get_name(),
+                    )
+            if not pending:
+                return
             same_loop = [task for task in pending if task.get_loop() is running]
             foreign_loop = [task for task in pending if task.get_loop() is not running]
             awaitables: list[Any] = []
             if same_loop:
                 awaitables.append(asyncio.gather(*same_loop, return_exceptions=True))
             awaitables.extend(_poll_until_done(task) for task in foreign_loop)
-            if awaitables:
-                await asyncio.gather(*awaitables)
+            await asyncio.gather(*awaitables)
 
     async def dispose(self) -> None:
         """Drain in-flight dispatches and deactivate this store.
@@ -1371,8 +1391,9 @@ def _reset_for_testing() -> None:
 
 async def _poll_until_done(task: asyncio.Task[None]) -> None:
     """Wait for a foreign-loop task without awaiting it directly (that raises
-    "Task ... attached to a different loop"). Used by ``wait_for_dispatch``."""
-    while not task.done():
+    "Task ... attached to a different loop"), or until its loop closes, after
+    which it never finishes. Used by ``wait_for_dispatch``."""
+    while not task.done() and not task.get_loop().is_closed():
         await asyncio.sleep(0.01)
 
 
