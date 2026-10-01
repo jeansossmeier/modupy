@@ -1085,7 +1085,10 @@ async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
         return
     for index, pub in enumerate(claimed):
         if _stop_requested.is_set():
-            await _release_claims(claimed[index:])
+            # Rows another task here is delivering keep their claim, as below.
+            with _inflight_lock:
+                undelivered = [p for p in claimed[index:] if p.id not in _inflight_ids]
+            await _release_claims(undelivered)
             return
         if pub.attempt_count >= _dead_letter_after_attempts:
             if pub.claim_token:

@@ -2276,6 +2276,65 @@ async def test_shutdown_between_lease_rows_releases_the_rest_uncharged(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_shutdown_between_lease_rows_keeps_the_claim_of_a_row_delivered_elsewhere(
+    tmp_path: Path,
+) -> None:
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def held(event: OutboxEvent) -> None:
+        entered.set()
+        await gate.wait()
+        received.append(event.value)
+
+    _bootstrap_with_listener(held)
+    engine, store = await _sqlite_outbox(tmp_path)
+    try:
+        start = datetime.now(UTC) - timedelta(seconds=10)
+        first, second, third = [
+            _make_pub(held, value=v, published_at=start + timedelta(seconds=v)) for v in (1, 2, 3)
+        ]
+        for pub in (first, second, third):
+            await store.save(pub)
+        outbox.configure(
+            store,
+            JsonEventSerializer(),
+            claim_strategy="lease",
+            claim_lease_seconds=60.0,
+            retry_interval_seconds=60,
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        with outbox._inflight_lock:
+            outbox._inflight_ids.add(third.id)
+
+        stopping = asyncio.create_task(outbox.shutdown())
+        await asyncio.sleep(0.05)
+        gate.set()
+        await asyncio.wait_for(stopping, timeout=5)
+
+        assert received == [1]
+        async with async_sessionmaker(engine)() as session:
+            rows = {
+                row.id: row
+                for row in (await session.execute(select(EventPublicationRow))).scalars()
+            }
+        assert (
+            rows[second.id].attempt_count,
+            rows[second.id].claim_token,
+            rows[second.id].completed_at,
+        ) == (0, None, None)
+        kept = rows[third.id]
+        assert kept.claim_token is not None
+        assert kept.claim_owner is not None
+        assert (kept.attempt_count, kept.dispatch_started, kept.completed_at) == (0, False, None)
+    finally:
+        with outbox._inflight_lock:
+            outbox._inflight_ids.discard(third.id)
+        await store.dispose()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_cancels_a_store_call_that_outlasts_the_grace_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

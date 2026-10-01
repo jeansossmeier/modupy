@@ -37,11 +37,11 @@ The crash sweep competing with after-commit claims was ruled out: the drain arm 
 ## Resolution (2026-10-01)
 `outbox.shutdown()` now stops the retry loop cooperatively, so a cancellation no longer lands inside a store statement or a listener delivery:
 - A loop sleeping between sweeps is cancelled at once.
-- A loop inside a sweep gets a stop request. The store call or delivery in flight completes. Each sweep checks the request before each row, and the lease sweep releases its undispatched rows uncharged with `renew_claim(id, token, 0.0)`.
+- A loop inside a sweep gets a stop request. The store call or delivery in flight completes. Each sweep checks the request before each row, and the lease sweep releases its undispatched rows uncharged with `renew_claim(id, token, 0.0)`. A row another task in the process is delivering keeps its claim, as in the normal sweep.
 - If the sweep has not returned within `_shutdown_grace_seconds` (10 s), shutdown falls back to cancelling, as before.
 
 Regression tests:
-- `tests/test_outbox.py`: `test_shutdown_lets_an_in_flight_store_call_finish_then_dispatches_nothing`, `test_shutdown_between_lease_rows_releases_the_rest_uncharged` (on the SQLite store), `test_shutdown_cancels_a_store_call_that_outlasts_the_grace_bound`, `test_shutdown_cancels_a_sleeping_retry_loop_at_once`.
+- `tests/test_outbox.py`: `test_shutdown_lets_an_in_flight_store_call_finish_then_dispatches_nothing`, `test_shutdown_between_lease_rows_releases_the_rest_uncharged` and `test_shutdown_between_lease_rows_keeps_the_claim_of_a_row_delivered_elsewhere` (on the SQLite store), `test_shutdown_cancels_a_store_call_that_outlasts_the_grace_bound`, `test_shutdown_cancels_a_sleeping_retry_loop_at_once`.
 - `tests/test_outbox_claims.py`: `test_shutdown_from_another_loop_lets_the_in_flight_store_call_finish`, `test_a_retry_loop_started_after_shutdown_dispatches_again`.
 
 Other cancellations of an aiosqlite statement on a rollback-journal database can still leave the same zombie read lock, for example application code that wraps queries in `asyncio.timeout`. WAL mode on the outbox engine would cover those as well; it is not part of this change.
