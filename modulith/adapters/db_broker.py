@@ -137,6 +137,7 @@ import logging
 import math
 import os
 import random
+import re
 import weakref
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import AsyncExitStack
@@ -515,68 +516,74 @@ def _is_pg_namespace_unique_race(exc: BaseException) -> bool:
     return sqlstate == "23505" and constraint == "pg_namespace_nspname_index"
 
 
-def _skip_locked_server_version(dialect: Any) -> tuple[int, ...] | None:
-    """The connected MySQL-family server's version, ``None`` when unknown.
+_VERSION_SEPARATOR = re.compile(r"[.\-+]")
+_VERSION_TOKEN = re.compile(r"(\d+)(?:a|b|c)?|(MariaDB\w*)")
 
-    SQLAlchemy's ``server_version_info`` keeps every number in ``VERSION()``:
-    MariaDB's ``5.5.5-`` compatibility prefix, the Enterprise Server build
-    number in ``10.6.12-8-MariaDB-enterprise`` and distro package suffixes such
-    as ``-1:10.11.2+maria~ubu2204`` included. The release is the first three of
-    those numbers after a MariaDB ``5.5.5`` prefix. SQLAlchemy's private
-    ``_mariadb_normalized_version_info`` takes the three numbers just before the
-    ``MariaDB`` token instead, which for Enterprise builds are minor, patch and
-    build, so it is consulted only to refuse a ``VERSION()`` with no number
-    before that token.
+
+def _mysql_family_release(
+    dialect: Any, reported: str | None
+) -> tuple[bool, tuple[int, ...] | None]:
+    """Whether the server is MariaDB, and its release (``None`` when unknown).
+
+    ``reported`` is the server's own ``VERSION()``. The release is its first
+    three numbers, after MariaDB's ``5.5.5-`` compatibility prefix, and unknown
+    when no number precedes the ``MariaDB`` token. The dialect's parsed
+    ``server_version_info`` is not used: SQLAlchemy 2.1 keeps only the three
+    numbers just before that token, which for Enterprise builds such as
+    ``10.6.12-8-MariaDB-enterprise`` are minor, patch and build.
     """
-    numbers = tuple(
-        part
-        for part in getattr(dialect, "server_version_info", None) or ()
-        if isinstance(part, int)
-    )
-    if getattr(dialect, "is_mariadb", False) and numbers[:3] == (5, 5, 5):
-        numbers = numbers[3:]
-    if getattr(dialect, "_mariadb_normalized_version_info", None) == ():
-        return None
-    return numbers[:3] or None
+    mariadb = bool(getattr(dialect, "is_mariadb", False))
+    if reported is None:
+        return mariadb, None
+    numbers: list[int] = []
+    for token in _VERSION_SEPARATOR.split(reported):
+        match = _VERSION_TOKEN.fullmatch(token)
+        if match is None:
+            continue
+        if match.group(2):
+            if numbers[:3] == [5, 5, 5]:
+                numbers = numbers[3:]
+            return True, tuple(numbers[:3]) or None
+        numbers.append(int(match.group(1)))
+    return mariadb, tuple(numbers[:3]) or None
 
 
-def _skip_locked_minimum(dialect: Any) -> tuple[int, ...]:
-    if getattr(dialect, "is_mariadb", False):
-        return _MARIADB_SKIP_LOCKED_MINIMUM
-    return _MYSQL_SKIP_LOCKED_MINIMUM
+def _skip_locked_minimum(mariadb: bool) -> tuple[int, ...]:
+    return _MARIADB_SKIP_LOCKED_MINIMUM if mariadb else _MYSQL_SKIP_LOCKED_MINIMUM
 
 
-def _supports_skip_locked(engine: Any) -> bool:
+def _supports_skip_locked(engine: Any, reported: str | None) -> bool:
     """True when ``engine``'s connected server supports ``FOR UPDATE SKIP LOCKED``.
 
-    Postgres always does. MySQL does from 8.0.1 and MariaDB from 10.6; older
-    servers reject the clause as a syntax error, and an unknown version is
-    never assumed to parse it. SQLite has no row locking and raises a
-    CompileError if the clause is issued, so the claim query gates on this
-    before adding ``.with_for_update(skip_locked=True)``.
+    Postgres always does. MySQL does from 8.0.1 and MariaDB from 10.6, judged
+    by ``reported``, the server's ``VERSION()``; older servers reject the clause
+    as a syntax error, and an unknown version is never assumed to parse it.
+    SQLite has no row locking and raises a CompileError if the clause is
+    issued, so the claim query gates on this before adding
+    ``.with_for_update(skip_locked=True)``.
     """
     dialect = engine.dialect
     if dialect.name not in _SKIP_LOCKED_DIALECTS:
         return False
     if dialect.name not in _MYSQL_FAMILY_DIALECTS:
         return True
-    version = _skip_locked_server_version(dialect)
-    return version is not None and version >= _skip_locked_minimum(dialect)
+    mariadb, release = _mysql_family_release(dialect, reported)
+    return release is not None and release >= _skip_locked_minimum(mariadb)
 
 
-def _require_skip_locked(engine: Any) -> None:
+def _require_skip_locked(engine: Any, reported: str | None) -> None:
     """Reject a MySQL-family server that cannot run the locked claim.
 
     The plain claim is not a fallback there: under InnoDB REPEATABLE READ two
     consumers' consistent reads return the same pending rows and both claim them.
     """
     dialect = engine.dialect
-    if dialect.name not in _MYSQL_FAMILY_DIALECTS or _supports_skip_locked(engine):
+    if dialect.name not in _MYSQL_FAMILY_DIALECTS or _supports_skip_locked(engine, reported):
         return
-    version = _skip_locked_server_version(dialect)
-    server = "MariaDB" if getattr(dialect, "is_mariadb", False) else "MySQL"
-    shown = "unknown" if version is None else ".".join(map(str, version))
-    minimum = ".".join(map(str, _skip_locked_minimum(dialect)))
+    mariadb, release = _mysql_family_release(dialect, reported)
+    server = "MariaDB" if mariadb else "MySQL"
+    shown = "unknown" if release is None else ".".join(map(str, release))
+    minimum = ".".join(map(str, _skip_locked_minimum(mariadb)))
     raise ConfigurationError(
         f"The database broker claims messages with FOR UPDATE SKIP LOCKED, which the "
         f"connected {server} server {shown} does not support; {server} {minimum} or "
@@ -1100,10 +1107,22 @@ class DatabaseBroker:
         # _schema_locks above.
         self._used_loop_ref: weakref.ReferenceType[asyncio.AbstractEventLoop] | None = None
         self._cross_loop_warned = False
+        self._server_version: str | None = None
 
     @property
     def engine(self) -> Any:
         return self._engine
+
+    async def _mysql_server_version(self) -> str | None:
+        """The MySQL-family server's ``VERSION()``, read once per broker; ``None``
+        on other dialects, which the SKIP LOCKED gate judges by name alone."""
+        if self._engine.dialect.name not in _MYSQL_FAMILY_DIALECTS:
+            return None
+        if self._server_version is None:
+            async with self._engine.connect() as conn:
+                result = await conn.exec_driver_sql("SELECT VERSION()")
+                self._server_version = str(result.scalar_one())
+        return self._server_version
 
     def _schema_is_ready(self) -> bool:
         """Indirection over ``self._schema_ready`` so the double-checked-lock
@@ -1724,7 +1743,7 @@ class DatabaseBroker:
         if not targets:
             return
         await self._ensure_schema()
-        _require_skip_locked(self._engine)
+        _require_skip_locked(self._engine, await self._mysql_server_version())
         _, subscription, _ = broker_schema()
         retained, _ = _retained_tables()
         ordered_targets = sorted(set(targets))
@@ -1860,7 +1879,8 @@ class DatabaseBroker:
         see ``_supports_skip_locked`` and the module docstring.
         """
         await self._ensure_schema()
-        _require_skip_locked(self._engine)
+        server_version = await self._mysql_server_version()
+        _require_skip_locked(self._engine, server_version)
         from sqlalchemy import and_, or_, select, update
 
         _, _, message = broker_schema()
@@ -1887,7 +1907,7 @@ class DatabaseBroker:
             )
             if targets is not None:
                 stmt = stmt.where(message.c.target.in_(list(targets)))
-            if _supports_skip_locked(self._engine):
+            if _supports_skip_locked(self._engine, server_version):
                 stmt = stmt.with_for_update(skip_locked=True)
             result = await conn.execute(stmt)
             rows = [dict(row._mapping) for row in result]

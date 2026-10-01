@@ -2767,14 +2767,6 @@ _MYSQL_URL = "mysql+aiomysql://user@localhost/db"
 _MARIADB_URL = "mariadb+aiomysql://user@localhost/db"
 
 
-def _engine_reporting(url: str, version: str) -> Any:
-    """An engine whose dialect has parsed ``version`` as it does on first connect."""
-    engine = create_async_engine(url)
-    dialect: Any = engine.dialect
-    dialect._parse_server_version(version)
-    return engine
-
-
 _SKIP_LOCKED_SERVERS = [
     (_MYSQL_URL, "5.5.5-10.6.12-MariaDB"),
     (_MYSQL_URL, "10.11.2-MariaDB-1:10.11.2+maria~ubu2204"),
@@ -2814,10 +2806,10 @@ def _expected_refusal(server: str) -> str:
 
 @pytest.mark.parametrize(("url", "version"), _SKIP_LOCKED_SERVERS)
 def test_skip_locked_gate_accepts_servers_that_support_the_clause(url: str, version: str) -> None:
-    engine = _engine_reporting(url, version)
+    engine = create_async_engine(url)
 
-    assert _supports_skip_locked(engine) is True
-    _require_skip_locked(engine)
+    assert _supports_skip_locked(engine, version) is True
+    _require_skip_locked(engine, version)
 
 
 @pytest.mark.parametrize(
@@ -2833,36 +2825,30 @@ def test_skip_locked_gate_refuses_servers_older_than_the_clause(
 ) -> None:
     from modulith import ConfigurationError
 
-    engine = _engine_reporting(url, version)
+    engine = create_async_engine(url)
 
-    assert _supports_skip_locked(engine) is False
+    assert _supports_skip_locked(engine, version) is False
     with pytest.raises(ConfigurationError, match=re.escape(_expected_refusal(server))):
-        _require_skip_locked(engine)
+        _require_skip_locked(engine, version)
 
 
 @pytest.mark.parametrize(
-    ("url", "version", "server"),
-    [*((url, version, None) for url, version in _SKIP_LOCKED_SERVERS), *_PRE_SKIP_LOCKED_SERVERS],
+    ("version", "parsed", "supported"),
+    [
+        ("10.6.12-8-MariaDB-enterprise", (6, 12, 8), True),
+        ("10.5.23-MariaDB-1:10.5.23+maria~ubu2204", (11, 4, 2), False),
+    ],
 )
-def test_skip_locked_gate_reads_the_version_without_sqlalchemys_mariadb_field(
-    monkeypatch: pytest.MonkeyPatch, url: str, version: str, server: str | None
+def test_skip_locked_gate_decides_from_the_reported_version_not_sqlalchemys_parse(
+    version: str, parsed: tuple[int, ...], supported: bool
 ) -> None:
-    from sqlalchemy.dialects.mysql.base import MySQLDialect
+    """SQLAlchemy 2.1 keeps only the three numbers before the MariaDB token, so
+    it reads ``10.6.12-8-MariaDB-enterprise`` as 6.12.8. The gate must judge the
+    server by its own ``VERSION()``, whatever the dialect parsed."""
+    engine = create_async_engine(_MARIADB_URL)
+    engine.dialect.server_version_info = parsed
 
-    from modulith import ConfigurationError
-
-    engine = _engine_reporting(url, version)
-    monkeypatch.delattr(MySQLDialect, "_mariadb_normalized_version_info")
-    del engine.dialect._mariadb_normalized_version_info
-    assert not hasattr(engine.dialect, "_mariadb_normalized_version_info")
-
-    if server is None:
-        assert _supports_skip_locked(engine) is True
-        _require_skip_locked(engine)
-    else:
-        assert _supports_skip_locked(engine) is False
-        with pytest.raises(ConfigurationError, match=re.escape(_expected_refusal(server))):
-            _require_skip_locked(engine)
+    assert _supports_skip_locked(engine, version) is supported
 
 
 def test_skip_locked_gate_refuses_a_mysql_server_whose_version_is_not_yet_known() -> None:
@@ -2870,14 +2856,14 @@ def test_skip_locked_gate_refuses_a_mysql_server_whose_version_is_not_yet_known(
 
     engine = create_async_engine(_MYSQL_URL)
 
-    assert _supports_skip_locked(engine) is False
+    assert _supports_skip_locked(engine, None) is False
     with pytest.raises(ConfigurationError, match="MySQL server unknown does not support"):
-        _require_skip_locked(engine)
+        _require_skip_locked(engine, None)
 
 
 def test_skip_locked_gate_selects_lockable_dialects_only() -> None:
-    assert _supports_skip_locked(create_async_engine("postgresql+asyncpg://u@localhost/db"))
-    assert not _supports_skip_locked(create_async_engine("sqlite+aiosqlite://"))
+    assert _supports_skip_locked(create_async_engine("postgresql+asyncpg://u@localhost/db"), None)
+    assert not _supports_skip_locked(create_async_engine("sqlite+aiosqlite://"), None)
 
 
 # ---------------------------------------------------------------------------

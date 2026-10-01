@@ -1,8 +1,8 @@
 ---
 type: tech-debt
-debt_status: open
+debt_status: resolved
 created: 2026-09-29
-updated: 2026-09-30
+updated: 2026-10-01
 category: Testing
 impact: High - 50+ test failures in default lane when SQLAlchemy 2.1.1 is installed (CI-affecting)
 effort: Medium - Add raising=False flag and guard deletion
@@ -33,3 +33,10 @@ That covers only the default-lane `delattr` cases. The integration test needs th
 CI installs dependencies without a lock file, so it resolves SQLAlchemy 2.1.1 and these tests fail there. The same tests pass under SQLAlchemy versions that still define the attribute. [Tool-Verified]
 
 On 2026-09-30 the full integration lane gave 2 failed and 114 passed, with 0 skipped; the 2 failures are the integration cases above. Neither test file was changed on `feat/examples-ladder`. [Tool-Verified]
+
+## Resolution (2026-10-01)
+The description above understated the impact: on SQLAlchemy 2.1 the product refused supported servers, not only the tests. SQLAlchemy 2.1.1 stores in `server_version_info` only the three numbers before the `MariaDB` token, so `10.6.12-8-MariaDB-enterprise` read as 6.12.8, and `_supports_skip_locked` refused a MariaDB Enterprise 10.6 server at consumer start. [Tool-Verified]
+
+`DatabaseBroker._mysql_server_version` now reads the server's `VERSION()` once per broker, and the gate takes the release from that string (`modulith/adapters/db_broker.py::_mysql_family_release`), so SQLAlchemy 2.0 and 2.1 give the same answer. The integration test simulates an older server by rewriting that `SELECT VERSION()` in a `before_cursor_execute` listener instead of writing SQLAlchemy's private dialect fields. Unit and integration tests pass on SQLAlchemy 2.0.51 and 2.1.1. [Tool-Verified]
+
+Still open upstream: SQLAlchemy 2.1.1 itself raises `NotImplementedError` while connecting to a MariaDB Enterprise 11 server, because it reads `11.4.2-1-MariaDB-enterprise` as 4.2.1, below its 5.0.2 minimum. [Tool-Verified]

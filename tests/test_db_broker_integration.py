@@ -739,31 +739,29 @@ async def test_publish_from_the_sync_api_loop_uses_the_engine_owning_loop(
 )
 async def test_mysql_server_without_skip_locked_is_rejected_at_startup(
     broker_engine: Any,
-    monkeypatch: pytest.MonkeyPatch,
     reported: str,
     version: tuple[int, ...],
     minimum: str,
 ) -> None:
+    from sqlalchemy import event
+
     from modulith import ConfigurationError
 
-    dialect = broker_engine.dialect
-    # Everything _parse_server_version (and the MariaDB switch it makes) sets, so
-    # the fixture's teardown talks to the real MySQL server with its own state.
-    for name in (
-        "server_version_info",
-        "is_mariadb",
-        "_mariadb_normalized_version_info",
-        "preparer",
-        "identifier_preparer",
-        "delete_returning",
-        "insert_returning",
-    ):
-        monkeypatch.setattr(dialect, name, getattr(dialect, name))
-    dialect._parse_server_version(reported)
-    broker = DatabaseBroker(engine=broker_engine)
+    def report_an_older_server(
+        conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool
+    ) -> tuple[str, Any]:
+        if statement == "SELECT VERSION()":
+            return f"SELECT '{reported}'", parameters
+        return statement, parameters
 
-    with pytest.raises(ConfigurationError) as excinfo:
-        await broker.subscribe([_TARGET], "g")
+    sync_engine = broker_engine.sync_engine
+    event.listen(sync_engine, "before_cursor_execute", report_an_older_server, retval=True)
+    try:
+        broker = DatabaseBroker(engine=broker_engine)
+        with pytest.raises(ConfigurationError) as excinfo:
+            await broker.subscribe([_TARGET], "g")
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", report_an_older_server)
 
     message = str(excinfo.value)
     assert ".".join(map(str, version)) in message
