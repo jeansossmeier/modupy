@@ -29,6 +29,7 @@ from typing import Any
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
@@ -580,6 +581,52 @@ def test_redis_extra_floor_supports_aclose() -> None:
     reqs = _optional_dependencies()["redis"]
     assert any(re.match(r"redis>=5\.0\.1\b", req) for req in reqs), (
         f"redis extra {reqs!r} must floor at >=5.0.1 (5.0.0 has close() but not aclose())"
+    )
+
+
+TEST_CLIENT_IMPORT = re.compile(
+    r"^\s*(?:from|import)\s+(?:fastapi|starlette)\.testclient\b", re.MULTILINE
+)
+
+
+def _projects_testing_with_the_starlette_client() -> list[Path]:
+    projects = [
+        REPO_ROOT,
+        *sorted(p.parent for p in (REPO_ROOT / "examples").glob("*/pyproject.toml")),
+    ]
+    return [
+        project
+        for project in projects
+        if any(
+            TEST_CLIENT_IMPORT.search(source.read_text(encoding="utf-8"))
+            for source in (project / "tests").rglob("*.py")
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "project",
+    _projects_testing_with_the_starlette_client(),
+    ids=lambda project: project.relative_to(REPO_ROOT).as_posix(),
+)
+def test_projects_using_the_starlette_test_client_declare_httpx2(project: Path) -> None:
+    """Starlette's test client imports ``httpx2`` first and falls back to ``httpx`` with a
+    StarletteDeprecationWarning, so ``-W error`` fails the import of any project that
+    tests with it and does not install ``httpx2``."""
+    with (project / "pyproject.toml").open("rb") as fh:
+        extras = tomllib.load(fh)["project"]["optional-dependencies"]
+    names = {Requirement(req).name for req in extras["test"]}
+    assert "httpx2" in names, (
+        f"{project.name}: the `test` extra must declare httpx2, it declares {sorted(names)}"
+    )
+
+
+def test_test_extra_floors_httpx2_at_the_release_starlette_accepts() -> None:
+    """Starlette's own ``full`` extra requires ``httpx2>=2.0.0``; the test client is not
+    exercised against an older release."""
+    reqs = _optional_dependencies()["test"]
+    assert any(re.match(r"httpx2>=2\.0\b", req) for req in reqs), (
+        f"test extra {reqs!r} must floor httpx2 at >=2.0"
     )
 
 

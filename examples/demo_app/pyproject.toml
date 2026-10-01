@@ -6,7 +6,7 @@ dependencies = ["modupy[fastapi,cli,postgres]", "aiosqlite"]
 
 [project.optional-dependencies]
 redis = ["modupy[redis]"]
-test = ["pytest", "pytest-asyncio"]
+test = ["pytest", "pytest-asyncio", "httpx2"]
 
 [tool.modulith]
 package = "shop"

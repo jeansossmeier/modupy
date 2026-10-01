@@ -5,7 +5,7 @@ requires-python = ">=3.11"
 dependencies = ["modupy[fastapi,cli]"]
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "httpx2"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

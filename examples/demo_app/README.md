@@ -65,7 +65,7 @@ generated 6 file(s) in docs/modulith:
 ## Run its tests
 
 ```bash
-pip install pytest pytest-asyncio
+pip install pytest pytest-asyncio httpx2
 pytest
 ```
 

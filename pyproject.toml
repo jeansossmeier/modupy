@@ -171,6 +171,10 @@ test = [
     # (yaml.safe_load) to execute the integration lane's guard logic against
     # synthetic pytest summaries — the CI-drift guards run in the default lane.
     "pyyaml>=6.0,<7.0",
+    # fastapi.testclient (Starlette's TestClient) imports httpx2 first and falls back
+    # to httpx with a StarletteDeprecationWarning. 2.0 is the floor Starlette's own
+    # `full` extra declares; the `fastapi` extra keeps httpx for modulith/proxy.py.
+    "httpx2>=2.0,<3.0",
     "modupy[redis,otel,fastapi,cli]",
 ]
 

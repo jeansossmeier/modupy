@@ -116,7 +116,7 @@ RUNBOOKS: dict[str, tuple[Section, ...]] = {
         ),
         Section(
             "Run its tests",
-            (Step("pip install pytest"), Step("pytest")),
+            (Step("pip install pytest httpx2"), Step("pytest")),
         ),
     ),
     "demo_app": (
@@ -131,7 +131,7 @@ RUNBOOKS: dict[str, tuple[Section, ...]] = {
         ),
         Section(
             "Run its tests",
-            (Step("pip install pytest pytest-asyncio"), Step("pytest")),
+            (Step("pip install pytest pytest-asyncio httpx2"), Step("pytest")),
         ),
         Section(
             "Stage 1: in-memory events",

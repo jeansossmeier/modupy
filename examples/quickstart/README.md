@@ -131,6 +131,6 @@ The tests drive the same flows in one process with modupy's test fixtures,
 without starting a server:
 
 ```bash
-pip install pytest
+pip install pytest httpx2
 pytest
 ```
