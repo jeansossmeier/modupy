@@ -12,6 +12,7 @@ import json
 import re
 import sys
 import types as types_module
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from textwrap import dedent
@@ -943,6 +944,239 @@ def test_public_name_imported_from_a_submodule_is_not_flagged(make_fake_app) -> 
     mods = [_module("orders"), _module("inventory")]
     violations = verifier.modulith_verify_module(_module("orders"), mods)
     assert all(v.rule != "no-internal-imports" for v in violations)
+
+
+# ---------------------------------------------------------------------------
+# Package-level imports (``from <app> import <sibling>`` and ``from .. import
+# <sibling>``) trigger every rule the direct form triggers
+# ---------------------------------------------------------------------------
+
+SIBLING_IMPORT_FORMS = {
+    "direct": "import fakeapp.inventory",
+    "package": "from fakeapp import inventory",
+    "package_aliased": "from fakeapp import inventory as stock",
+    "relative": "from .. import inventory",
+}
+
+
+@pytest.fixture
+def declare_no_dependencies() -> Iterator[Callable[[str], None]]:
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+
+    def declare(package: str) -> None:
+        manifest_module._manifests[package] = Manifest(package=package, declared_dependencies=())
+
+    yield declare
+    manifest_module._reset_for_testing()
+
+
+def _rule_hits(violations: list[Violation], rule: str) -> list[tuple[str, ViolationSeverity]]:
+    return [(v.module, v.severity) for v in violations if v.rule == rule]
+
+
+@pytest.mark.parametrize("form", ["package", "package_aliased", "relative"])
+def test_package_level_sibling_import_fires_undeclared_dependency_like_direct(
+    make_fake_app, declare_no_dependencies, form: str
+) -> None:
+    """Rule 3: ``from fakeapp import inventory`` imports ``fakeapp.inventory``
+    exactly as ``import fakeapp.inventory`` does, so it breaks a deny-all
+    manifest at the same severity."""
+    declare_no_dependencies("fakeapp.orders")
+    mods = [_module("orders"), _module("inventory")]
+    make_fake_app({"orders": SIBLING_IMPORT_FORMS["direct"], "inventory": ""})
+    direct = verifier.modulith_verify_module(_module("orders"), mods)
+    make_fake_app({"orders": SIBLING_IMPORT_FORMS[form]})
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    hits = [v for v in violations if v.rule == "undeclared-dependency"]
+    assert _rule_hits(direct, "undeclared-dependency")
+    assert _rule_hits(violations, "undeclared-dependency") == _rule_hits(
+        direct, "undeclared-dependency"
+    )
+    assert len(hits) == 1
+    assert "from inventory" in hits[0].message
+    assert hits[0].location == "fakeapp/orders/__init__.py:1"
+
+
+@pytest.mark.parametrize("form", ["package", "package_aliased", "relative"])
+def test_package_level_sibling_import_fires_contracts_is_sink_like_direct(
+    make_fake_app, form: str
+) -> None:
+    """Rule 6: contracts importing an application module through the
+    package is the same breach as the direct import."""
+    make_fake_app({"contracts": SIBLING_IMPORT_FORMS["direct"], "inventory": ""})
+    mods = [_module("contracts"), _module("inventory")]
+    direct = _rule_hits(
+        verifier.modulith_verify_module(_module("contracts"), mods), "contracts-is-sink"
+    )
+    make_fake_app({"contracts": SIBLING_IMPORT_FORMS[form]})
+    violations = verifier.modulith_verify_module(_module("contracts"), mods)
+    assert direct
+    assert _rule_hits(violations, "contracts-is-sink") == direct
+
+
+@pytest.mark.parametrize("form", ["package", "package_aliased", "relative"])
+def test_package_level_sibling_import_is_a_dependency_cycle_like_direct(
+    make_fake_app, form: str
+) -> None:
+    """Rule 2: a runtime package-level import is an edge of the module graph."""
+    make_fake_app({"orders": SIBLING_IMPORT_FORMS["direct"], "inventory": "import fakeapp.orders"})
+    mods = [_module("orders"), _module("inventory")]
+    direct = detect_cycles(mods)
+    make_fake_app({"orders": SIBLING_IMPORT_FORMS[form]})
+    cycles = detect_cycles(mods)
+    assert len(direct) == 1
+    assert [(v.rule, v.severity, v.module) for v in cycles] == [
+        (v.rule, v.severity, v.module) for v in direct
+    ]
+
+
+def test_type_checking_package_level_import_is_checked_but_not_a_cycle(
+    make_fake_app, declare_no_dependencies
+) -> None:
+    """A guarded package-level import keeps the direct form's treatment:
+    boundary rules see it, cycle detection does not."""
+    make_fake_app(
+        {
+            "orders": """
+                from typing import TYPE_CHECKING
+
+                if TYPE_CHECKING:
+                    from fakeapp import inventory
+            """,
+            "inventory": "import fakeapp.orders",
+        }
+    )
+    declare_no_dependencies("fakeapp.orders")
+    mods = [_module("orders"), _module("inventory")]
+    assert detect_cycles(mods) == []
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    assert _rule_hits(violations, "undeclared-dependency") != []
+
+
+def test_package_level_import_of_a_private_submodule_fires_rule_1_like_direct(
+    make_fake_app,
+) -> None:
+    """Rule 1: a private subpackage reached through the package is flagged
+    for the package-level and relative spellings as for ``import ...``."""
+    extra = {"inventory/_internal/__init__.py": ""}
+    sources = {
+        "direct": "import fakeapp.inventory._internal",
+        "package": "from fakeapp.inventory import _internal",
+        "relative": "from ..inventory import _internal",
+    }
+    hits = {}
+    for name, source in sources.items():
+        make_fake_app({"orders": source, "inventory": ""}, extra_files=extra)
+        mods = [_module("orders"), _module("inventory")]
+        violations = verifier.modulith_verify_module(_module("orders"), mods)
+        hits[name] = _rule_hits(violations, "no-internal-imports")
+    assert hits["direct"]
+    assert hits["package"] == hits["direct"]
+    assert hits["relative"] == hits["direct"]
+
+
+def test_package_level_import_keeps_type_names_for_rule_4(make_fake_app) -> None:
+    """Rule 4: a submodule imported beside a type name must not hide the
+    type name; the submodule alone carries no names, as ``import`` doesn't."""
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp.inventory import models, StockItem
+            """,
+            "inventory": "",
+        },
+        extra_files={"inventory/models.py": ""},
+    )
+    mods = [_module("orders"), _module("inventory")]
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    contracts = [v for v in violations if v.rule == "use-contracts"]
+    assert len(contracts) == 1
+    assert "StockItem" in contracts[0].message
+
+    make_fake_app({"orders": "from fakeapp import inventory"})
+    violations = verifier.modulith_verify_module(_module("orders"), mods)
+    assert _rule_hits(violations, "use-contracts") == []
+
+
+def test_one_import_statement_naming_two_siblings_yields_one_violation_each(
+    make_fake_app, declare_no_dependencies
+) -> None:
+    make_fake_app(
+        {
+            "orders": "",
+            "inventory": "",
+            "billing": "from fakeapp import orders, inventory",
+        }
+    )
+    declare_no_dependencies("fakeapp.billing")
+    mods = [_module("orders"), _module("inventory"), _module("billing")]
+    violations = verifier.modulith_verify_module(_module("billing"), mods)
+    messages = [v.message for v in violations if v.rule == "undeclared-dependency"]
+    assert len(messages) == 2
+    assert sum("from orders" in m for m in messages) == 1
+    assert sum("from inventory" in m for m in messages) == 1
+
+
+def test_importing_a_plain_attribute_of_a_package_is_not_a_submodule_import(
+    make_fake_app,
+) -> None:
+    """``from fakeapp.orders import OrderCreated`` stays an import of
+    ``fakeapp.orders``: ``OrderCreated`` is not a module on disk."""
+    make_fake_app(
+        {
+            "inventory": "from fakeapp.orders import OrderCreated, handlers_missing",
+            "orders": "",
+        }
+    )
+    module = _module("inventory")
+    imports = verifier._collect_imports(module)
+    assert [(r.target_module, r.imported_names) for r in imports] == [
+        ("fakeapp.orders", ["OrderCreated", "handlers_missing"])
+    ]
+
+
+def test_package_level_import_of_shared_helper_is_not_a_boundary_violation(
+    make_fake_app, declare_no_dependencies
+) -> None:
+    """A top-level helper of the app package that is not an application
+    module (a shared ``db`` module, a ``shared`` package) is not a sibling."""
+    make_fake_app(
+        {
+            "orders": """
+                from fakeapp import db, shared, VERSION
+                from fakeapp import db as database
+                from .. import shared as shared_again
+            """,
+            "inventory": "",
+        },
+        extra_files={"db.py": "", "shared/__init__.py": ""},
+    )
+    declare_no_dependencies("fakeapp.orders")
+    mods = [_module("orders"), _module("inventory")]
+    assert verifier.modulith_verify_module(_module("orders"), mods) == []
+
+
+def test_application_module_importing_its_own_submodules_is_clean(
+    make_fake_app, declare_no_dependencies
+) -> None:
+    make_fake_app(
+        {
+            "orders": """
+                from . import service
+                from fakeapp.orders import handlers
+                from fakeapp import orders
+                from .. import contracts
+            """,
+            "inventory": "",
+            "contracts": "",
+        },
+        extra_files={"orders/service.py": "", "orders/handlers/__init__.py": ""},
+    )
+    declare_no_dependencies("fakeapp.orders")
+    mods = [_module("orders"), _module("inventory"), _module("contracts")]
+    assert verifier.modulith_verify_module(_module("orders"), mods) == []
 
 
 # ---------------------------------------------------------------------------

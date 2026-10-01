@@ -4,7 +4,11 @@ Walks every ``.py`` file under each application module with ``ast.parse()``,
 collects imports (and table references), and emits ``Violation``s for any
 cross-module access that breaks the rules. Source is parsed, never executed.
 ``importlib.import_module(<literal>)`` and ``__import__(<literal>)`` calls
-are collected alongside static imports; a dynamically computed target
+are collected alongside static imports. ``from <pkg> import <name>`` (and
+the relative ``from .. import <name>``) counts as an import of ``<pkg>.<name>``
+when that is a module or package on disk, so ``from myapp import orders``
+breaks the same rules ``import myapp.orders`` does; a plain attribute
+stays an import of ``<pkg>``. A dynamically computed target
 (a variable, a call result) cannot be resolved statically and is an
 undetected residual limitation, not a guarantee.
 
@@ -222,6 +226,21 @@ def _package_dir(package: str) -> Path | None:
     return None
 
 
+def _is_submodule(package: str, name: str) -> bool:
+    """True when ``from <package> import <name>`` binds a submodule on disk.
+
+    A plain attribute stays an import of *package*. A ``_``-prefixed name is
+    never split off: application modules are never private, and rule 1 already
+    reads such names from the import statement itself.
+    """
+    if name == "*" or name.startswith("_"):
+        return False
+    directory = _package_dir(package)
+    if directory is None:
+        return False
+    return (directory / name).is_dir() or (directory / f"{name}.py").is_file()
+
+
 def _is_type_checking(test: ast.expr, aliases: Collection[str] = ("TYPE_CHECKING",)) -> bool:
     """True for ``if TYPE_CHECKING:`` guards.
 
@@ -311,18 +330,33 @@ class _ImportCollector(ast.NodeVisitor):
                 if alias.name == "import_module":
                     self._import_module_aliases.add(alias.asname or alias.name)
         target = self._resolve(node)
-        names = [a.name for a in node.names]
-        locals_ = [a.asname or a.name for a in node.names]
-        self.records.append(
-            ImportRecord(
-                self.source_file,
-                node.lineno,
-                target,
-                names,
-                local_names=locals_,
-                type_only=self._type_only_depth > 0,
+        type_only = self._type_only_depth > 0
+        remaining = []
+        for alias in node.names:
+            if _is_submodule(target, alias.name):
+                self.records.append(
+                    ImportRecord(
+                        self.source_file,
+                        node.lineno,
+                        f"{target}.{alias.name}",
+                        [],
+                        local_names=[],
+                        type_only=type_only,
+                    )
+                )
+            else:
+                remaining.append(alias)
+        if remaining:
+            self.records.append(
+                ImportRecord(
+                    self.source_file,
+                    node.lineno,
+                    target,
+                    [a.name for a in remaining],
+                    local_names=[a.asname or a.name for a in remaining],
+                    type_only=type_only,
+                )
             )
-        )
 
     def visit_Call(self, node: ast.Call) -> None:
         target = self._dynamic_import_target(node.func, node.args)
