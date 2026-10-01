@@ -174,6 +174,6 @@ The differentiator. Makes "modupy now, microservices later" credible.
 - [ ] MongoDB outbox store (`modupy[mongo]`)
 - [ ] AWS SQS broker (`modupy[sqs]`)
 - [ ] Subinterpreter topology (when 3.13 ecosystem ready)
-- [ ] Django integration (separate package: `django-modulith`)
+- [ ] Django integration (separate package: `django-modupy`)
 
 These are demand-driven. Ship them when users actually ask, not before.

@@ -149,7 +149,7 @@ cli = [
 ]
 
 # Test plugin (separate package conceptually, but shipped inside modupy as
-# this extra; a standalone pytest-modulith remains a possible future split).
+# this extra; a standalone pytest-modupy remains a possible future split).
 #
 # This extra must install everything the default (non-integration) test suite
 # imports at collection time, so `pip install modupy[test] && pytest` is

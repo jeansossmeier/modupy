@@ -75,7 +75,7 @@ gate registration.
 - Markers: `modulith_isolated`, `modulith_no_outbox`
 - Ini option: `modulith_isolated_timeout` (seconds an isolated test's subprocess may run; default 300)
 
-**Stability**: same as the public API — a rename or signature change is a major-version event, because test suites depend on these by name in every test function's arguments. The plugin is expected to move into a standalone `pytest-modulith` distribution in a future release; that split will keep the fixture, marker, and ini-option names identical, and will be documented in CHANGELOG.md.
+**Stability**: same as the public API — a rename or signature change is a major-version event, because test suites depend on these by name in every test function's arguments. The plugin is expected to move into a standalone `pytest-modupy` distribution in a future release; that split will keep the fixture, marker, and ini-option names identical, and will be documented in CHANGELOG.md.
 
 ---
 

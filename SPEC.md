@@ -977,7 +977,7 @@ Mermaid over PlantUML because it renders natively on GitHub/GitLab. Canvas is ma
 
 ### 11.1 The pytest Plugin
 
-Ships bundled in the main distribution as `modulith/testing.py`, installed via the `modupy[test]` extra (registered under pytest's `pytest11` entry point, so the fixtures are available automatically). A standalone `pytest-modulith` package is a planned later split, not current reality. Provides:
+Ships bundled in the main distribution as `modulith/testing.py`, installed via the `modupy[test]` extra (registered under pytest's `pytest11` entry point, so the fixtures are available automatically). A standalone `pytest-modupy` package is a planned later split, not current reality. Provides:
 
 ```python
 # Per-test isolation (opt-in: request the fixture by name)
@@ -1237,7 +1237,7 @@ The minimum scope where modupy provides value over "FastAPI plus folders."
 ### Phase 2: v1.1 Polish (2-3 weeks)
 
 **Should-ship:**
-1. **The pytest plugin** (planned then as a separate `pytest-modulith` package; shipped instead as the `modupy[test]` extra). ~200 lines.
+1. **The pytest plugin** (planned then as a separate `pytest-modupy` package; shipped instead as the `modupy[test]` extra). ~200 lines.
 2. **Scenario API**. ~100 lines.
 3. **Audit tool** (`modulith audit`) — `modulith/audit.py`. ~150 lines.
 4. **Doctor command** (`modulith doctor`) — `modulith/doctor.py`. ~120 lines.
@@ -1375,7 +1375,7 @@ Three runnable examples of growing scale, then three single-file extension refer
 
 The original plan floated separately-published packages. The shipped decision
 is **extras of the single `modupy` distribution** (see Part X): the test
-plugin is `modupy[test]` (standalone `pytest-modulith` remains a possible
+plugin is `modupy[test]` (standalone `pytest-modupy` remains a possible
 v2 split), the Postgres outbox is `modupy[postgres]`, the Redis broker is
 `modupy[redis]`. A Kafka adapter (whether extra or package) is Phase 4.
 

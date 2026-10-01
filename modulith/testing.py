@@ -10,7 +10,7 @@ unconditional — fixtures and markers load in any pytest run where modupy
 is installed, regardless of which extras were requested at install time.
 The `modupy[test]` extra only adds the libraries the fixtures need (e.g.
 `httpx` for `modulith_app`'s test client); it does not gate registration.
-Eventually the plugin may move into a standalone `pytest-modulith`
+Eventually the plugin may move into a standalone `pytest-modupy`
 distribution (v2) — separate release cadence, smaller install for users
 who only test — but the fixture/marker names will stay identical.
 
