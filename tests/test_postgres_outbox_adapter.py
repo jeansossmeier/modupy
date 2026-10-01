@@ -781,7 +781,7 @@ async def _assert_concurrent_sweepers_claim_each_row_once(
                 result = await s.execute(
                     select(EventPublicationRow.id, EventPublicationRow.claim_token)
                 )
-                stored = dict(result.tuples().all())
+                stored = {row_id: token for row_id, token in result}
             returned = {p.id: p.claim_token for batch in batches for p in batch}
             assert returned == stored
     finally:
