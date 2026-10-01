@@ -1,4 +1,4 @@
-# Contributing to modulith
+# Contributing to modupy
 
 ## Development Setup
 

@@ -1,4 +1,4 @@
-# modulith — Complete Project Specification
+# modupy — Complete Project Specification
 
 > A Spring Modulith-inspired modular monolith framework for Python. This document is the single source of truth for the project: every design decision, every interface, every file, every gap, every mitigation, every phase. An LLM reading this document plus the accompanying source tree should be able to execute the project to v1 without external context.
 
@@ -31,7 +31,7 @@
 
 ### 1.1 What This Is
 
-`modulith` is a Python library that supports the modular monolith architectural pattern. It provides:
+modupy (which installs the `modulith` package) is a Python library that supports the modular monolith architectural pattern. It provides:
 
 - **Module structure with enforced boundaries** — packages within an application that have public APIs and private internals, with violations caught at verification time.
 - **Event-driven inter-module communication** — modules talk to each other through events, not direct calls, keeping coupling low.
@@ -57,7 +57,7 @@ The phrase "no rewrites for the messaging layer" is doing important work. We pro
 
 ### 1.4 What Success Looks Like
 
-A team installs modulith, restructures their FastAPI app into subpackages, sprinkles `@event` and `@listener` decorators, and ships to production. Six months later, one module needs more CPU; they flip a flag and that module runs in its own process. Two years later, one module needs to be its own service for organizational reasons; they extract it with the contracts module already documenting the API surface. At every step, the code that didn't need to change didn't change.
+A team installs modupy, restructures their FastAPI app into subpackages, sprinkles `@event` and `@listener` decorators, and ships to production. Six months later, one module needs more CPU; they flip a flag and that module runs in its own process. Two years later, one module needs to be its own service for organizational reasons; they extract it with the contracts module already documenting the API surface. At every step, the code that didn't need to change didn't change.
 
 ### 1.5 What Failure Looks Like
 
@@ -69,7 +69,7 @@ A solo developer's portfolio piece that demonstrates ambition without execution.
 
 ### 2.1 Who This Is For
 
-The realistic addressable market: **teams of 3-15 engineers building B2B SaaS in Python who are scaling a single application past one team's worth of code and want to delay microservices for as long as possible.** That's the segment where modulith is materially better than "FastAPI plus folders."
+The realistic addressable market: **teams of 3-15 engineers building B2B SaaS in Python who are scaling a single application past one team's worth of code and want to delay microservices for as long as possible.** That's the segment where modupy is materially better than "FastAPI plus folders."
 
 Specifically:
 - Teams using FastAPI, Starlette, or Flask, on Python 3.11+
@@ -81,7 +81,7 @@ Specifically:
 ### 2.2 Who This Is Not For
 
 Equally important to be honest about:
-- **Solo developers on small apps** — you don't have the structural pain modulith solves
+- **Solo developers on small apps** — you don't have the structural pain modupy solves
 - **Teams already on microservices** — you've paid the cost; coming back to a monolith is rare
 - **Teams using Django** — different conventions, different ORM, different ecosystem; we don't fight Django
 - **Sync-only codebases that won't go async** — the outbox requires async DB integration to be production-grade
@@ -89,12 +89,12 @@ Equally important to be honest about:
 
 ### 2.3 The Adoption Calculus
 
-For modulith to succeed:
+For modupy to succeed:
 - The benefit must clear the bar of "what FastAPI plus folders gives you for free"
 - The migration cost on existing codebases must be small enough to try on a Friday
 - The transactional outbox specifically must be production-grade — that's the one feature competitors don't have
 
-If those three things hold, modulith is genuinely useful. If any one fails, modulith is architecture for its own sake.
+If those three things hold, modupy is genuinely useful. If any one fails, modupy is architecture for its own sake.
 
 ---
 
@@ -143,13 +143,13 @@ Modern Python is async; SQLAlchemy 2.0 is async-first. The framework assumes `as
 
 ### 3.6 Honest About What We Don't Do
 
-The single most important framing principle: **we don't lie about our limitations.** The "modulith now, microservices later" pitch has a hidden cliff (shared databases, shared transactions). We document the cliff, give users tools to measure their proximity to it, and let them make informed decisions. The first time we oversell and a user hits the cliff in production, we lose them and they tell their network. Honest framing is risk management.
+The single most important framing principle: **we don't lie about our limitations.** The "modupy now, microservices later" pitch has a hidden cliff (shared databases, shared transactions). We document the cliff, give users tools to measure their proximity to it, and let them make informed decisions. The first time we oversell and a user hits the cliff in production, we lose them and they tell their network. Honest framing is risk management.
 
 ---
 
 ## Part IV — The Plugin Contract
 
-The plugin contract is the most stable part of modulith. Once published, every plugin ever written depends on it. Additions are fine; signature changes are major-version events.
+The plugin contract is the most stable part of modupy. Once published, every plugin ever written depends on it. Additions are fine; signature changes are major-version events.
 
 ### 4.1 The Thirteen Hookspecs
 
@@ -470,7 +470,7 @@ The `explicit_keys: frozenset[str]` field tracks which values were set vs defaul
 
 In `modulith/discovery.py`. Two strategies:
 
-1. **Call-stack walking** (`_detect_from_caller_stack`): use `sys._getframe()` to walk back from the modulith bootstrap call. Skip frames inside modulith itself, stdlib, and site-packages. Return the top-level package of the first user-code frame.
+1. **Call-stack walking** (`_detect_from_caller_stack`): use `sys._getframe()` to walk back from the modupy bootstrap call. Skip frames inside the `modulith` package, the stdlib and `__main__`, but not site-packages: an installed application lives there. Return the top-level package of the first frame left. A third-party library that bootstraps modupy for the application can therefore be detected as the application, so installed deployments set the package explicitly.
 
 2. **pyproject.toml** (`_detect_from_pyproject_name`): walk up from cwd looking for `pyproject.toml`, read `[project].name`, and replace hyphens with underscores — the conventional distribution-name → import-package mapping. (This is *not* PEP 503, which governs package-index name normalization and collapses hyphens/dots/underscores to `-`, the opposite direction.)
 
@@ -604,7 +604,7 @@ The baseline file records existing violations. The verifier:
 - Fails any new violation
 - `modulith verify --update-baseline` regenerates the file after refactoring
 
-Same pattern as `mypy --strict` rolling out gradually. The baseline diff in git review shows what got fixed and what got worse. This is the single biggest adoption lever — without it, modulith is "for new projects only."
+Same pattern as `mypy --strict` rolling out gradually. The baseline diff in git review shows what got fixed and what got worse. This is the single biggest adoption lever — without it, modupy is "for new projects only."
 
 ### 8.4 The Audit Tool
 
@@ -613,7 +613,7 @@ Same pattern as `mypy --strict` rolling out gradually. The baseline diff in git 
 - Proposed module structure based on folder layout: each top-level subdirectory of the audited root is a module candidate. At a project root whose only application directory is one package, or `src/` holding one package, the audited root is that package; tests, docs, scripts, examples, migrations, virtualenvs, hidden and build directories are ignored when deciding. The command prints the root it chose.
 - List of cross-module imports that would become violations
 - List of shared database tables that need ownership decisions
-- Modulith-readiness score (0-100): percentage of cross-module interactions that go through events vs direct calls. With fewer than two module candidates the score is reported as not applicable, with a warning. It is also not applicable, with a warning naming the packages, when no import crosses candidates but some imports name packages below the audited folder that are not module candidates.
+- modupy-readiness score (0-100): percentage of cross-module interactions that go through events vs direct calls. With fewer than two module candidates the score is reported as not applicable, with a warning. It is also not applicable, with a warning naming the packages, when no import crosses candidates but some imports name packages below the audited folder that are not module candidates.
 
 Output is Markdown. Teams can run it on Friday afternoon, generate a baseline, have green CI on Monday, then tighten over weeks.
 
@@ -637,7 +637,7 @@ Same machinery as `modulith doctor` in Spring Modulith's spirit but expanded to 
 
 ## Part IX — Process-Per-Module Runtime
 
-The v2 wedge. The feature that makes "modulith now, microservices later" credible.
+The v2 wedge. The feature that makes "modupy now, microservices later" credible.
 
 ![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](docs/images/processes.svg)
 
@@ -1076,7 +1076,7 @@ Uniform across every command:
 
 - **0** — success. Warnings may still have been reported (verify's WARNING-severity violations without `--fail-on-warnings`, `dev`'s startup boundary warnings, doctor's warn-tier checks).
 - **1** — violations or user error *within a recognized command line*: failed verification, invalid flag **values**/arguments (typo'd `--mode`/`--topology` values are rejected loudly, never silently defaulted), configuration errors, unknown ids, missing uvicorn, unwritable `--baseline` paths.
-- **2** — unexpected internal errors (a modulith bug; traceback printed to stderr) **and CLI usage errors** (a missing required argument, an unknown option): the CLI is built on click, whose convention exits 2 for usage errors — modulith follows it rather than fighting the framework.
+- **2** — unexpected internal errors (a modupy bug; traceback printed to stderr) **and CLI usage errors** (a missing required argument, an unknown option): the CLI is built on click, whose convention exits 2 for usage errors — modupy follows it rather than fighting the framework.
 
 `modulith verify` exits 0 when no ERROR-severity violations are reported (strict) or none are new relative to the baseline (ratchet); `--fail-on-warnings` opts in to failing on WARNING-severity findings too. `modulith doctor` exits 1 only when a check reports an error, so both drop into CI as a single line.
 
@@ -1091,7 +1091,7 @@ Uniform across every command:
 
 ### `modulith run` semantics
 
-`modulith run` is `modulith dev` minus reload, plus production-mode toggles. In `--topology=processes`, it spawns the supervisor. Designed to be the actual production entrypoint for users who want modulith to manage their topology, but optional — running each worker as a vanilla uvicorn process is also supported.
+`modulith run` is `modulith dev` minus reload, plus production-mode toggles. In `--topology=processes`, it spawns the supervisor. Designed to be the actual production entrypoint for users who want modupy to manage their topology, but optional — running each worker as a vanilla uvicorn process is also supported.
 
 ---
 
@@ -1167,12 +1167,12 @@ From the brutal-truth analysis. Each gap has a concrete mitigation.
 
 **Mitigation:** the contracts module pattern ([§5.3](#53-the-contracts-module-pattern)). Events live in `myapp.contracts.*`, a sink in the dependency graph. Verifier treats it specially. For distributed deployments, `contracts` becomes versioned (a dedicated `schema_version` broker header is planned — see [§5.3](#53-the-contracts-module-pattern) for what ships today).
 
-### Gap 2: The "modulith now, microservices later" promise has a hidden cliff
+### Gap 2: The "modupy now, microservices later" promise has a hidden cliff
 
 **Mitigation:** module-level data ownership rules ([§8.1](#81-the-default-rules)) + `modulith doctor` ([§8.5](#85-the-doctor-command)). Users see their split-readiness as a number. We document the cliff explicitly: "no rewrites for the messaging layer; database boundaries are a separate decision." Tooling now closes part of that data half: `doctor`'s process-split readiness check counts cross-module table references (not just imports) and reports tables not prefixed with their owning module's name; the verifier's `data-ownership` rule detects `ForeignKey("table.col")` string literals pointing at another module's table, not just `Table()`/`__tablename__` declarations; a per-module Postgres schema knob (`broker_options.schema`/`MODULITH_BROKER_SCHEMA` for the broker, `-x schema=`/`MODULITH_DB_SCHEMA` for migrations) gives modules physically separate storage; and `modulith extract` refuses (without `--force`) to scaffold a module that still shares a table with another module. What remains manual: actually moving a shared table's data to its owning module, and choosing the schema-vs-prefix convention per table — the tooling detects and reports the coupling, it does not resolve it.
 
 Enabling a named migration schema does not move existing data. If the target
-has no Alembic history while `public` contains Modulith tables or history, the
+has no Alembic history while `public` contains modupy tables or history, the
 migration refuses to create a second history until operators back up,
 explicitly move and verify the data, and rerun it.
 
@@ -1188,7 +1188,7 @@ explicitly move and verify the data, and rerun it.
 
 **Mitigation:** the bundled pytest plugin, installed via `modupy[test]` ([Part XI](#part-xi--testing)). Auto-reset between tests, subprocess-per-test for isolation, Scenario API for event-driven flows.
 
-### Gap 6: No story for adopting modulith on existing codebases
+### Gap 6: No story for adopting modupy on existing codebases
 
 **Mitigation:** ratcheting verifier ([§8.3](#83-ratcheting-mode)) + `modulith audit` ([§8.4](#84-the-audit-tool)). Teams adopt on Friday, ratchet on Monday, tighten over weeks.
 
@@ -1220,7 +1220,7 @@ Time-boxed phases. Each has explicit kill criteria.
 
 ### Phase 1: v1 Essentials (4-6 weeks)
 
-The minimum scope where modulith provides value over "FastAPI plus folders."
+The minimum scope where modupy provides value over "FastAPI plus folders."
 
 **Must-ship:**
 1. **Sync entrypoint** (`publish_sync()`, sync `@listener` support) — `modulith/sync.py`. ~150 lines.
@@ -1508,7 +1508,7 @@ For future-self and contributors. Major decisions and their rationale.
 - **Why three plugin shapes?** Drivers, dispatch, hooks have genuinely different shapes. Forcing all into one mechanism makes the wrong one awkward.
 - **Why lazy bootstrap?** "Just import and use" is the adoption-critical UX. Eager bootstrap requires explicit setup which adds learning curve.
 - **Why contracts module?** Spring uses module-public events; we add a separate contracts package because it's cleaner for distributed deployment versioning.
-- **Why ratcheting verifier?** Brownfield is where adoption happens. Without ratcheting, modulith is for new projects only.
+- **Why ratcheting verifier?** Brownfield is where adoption happens. Without ratcheting, modupy is for new projects only.
 - **Why subprocess-per-test in pytest plugin?** Python's import system is global and side-effectful. Subprocess is the only correct isolation; cost is acceptable for integration tests.
 - **Why Mermaid over PlantUML?** Renders natively on GitHub/GitLab. PlantUML needs a separate server.
 - **Why time-box phases?** Side projects of this scope don't ship. Phases with kill criteria are the only mechanism that produces a v1.

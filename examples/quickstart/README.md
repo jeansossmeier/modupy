@@ -1,6 +1,6 @@
 # Quickstart
 
-The smallest complete modulith project: three modules and a contracts package,
+The smallest complete modupy project: three modules and a contracts package,
 no database, no broker, nothing to start first. It is the code from the root
 [README](../../README.md#the-30-second-pitch), file for file. Orders publish
 `OrderCreated`; `payments` charges it and publishes `PaymentReceived`;
@@ -127,7 +127,7 @@ $ curl -s localhost:8000/inventory/ord-1
 
 ## Run its tests
 
-The tests drive the same flows in one process with modulith's test fixtures,
+The tests drive the same flows in one process with modupy's test fixtures,
 without starting a server:
 
 ```bash

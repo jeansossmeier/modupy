@@ -1,6 +1,6 @@
-# modulith Architecture Guide
+# modupy Architecture Guide
 
-How modulith works internally — the runtime, the plugin contract, the
+How modupy works internally — the runtime, the plugin contract, the
 transactional outbox, cross-process delivery, and the boundary verifier. This
 is the "how it fits together" companion to the reference material:
 
@@ -10,15 +10,17 @@ is the "how it fits together" companion to the reference material:
   public surface (`modulith.__all__`).
 - **[COOKBOOK.md](COOKBOOK.md)** is task-oriented recipes.
 
-If you only want to *use* modulith, start with the [README](../README.md) and
+If you only want to *use* modupy, start with the [README](../README.md) and
 the [demo app](../examples/demo_app). Read this guide when you want to know why
 the framework behaves the way it does, or you're writing a plugin/adapter.
+modupy installs the `modulith` package, so you `import modulith` and run
+`modulith`.
 
 ---
 
 ## 1. The core idea: one codebase, three deployment tiers
 
-modulith is built around a single promise (SPEC §1.2): your module code —
+modupy is built around a single promise (SPEC §1.2): your module code —
 `@event`, `@listener`, `publish()` — does not change as you move through three
 runtime tiers. Only configuration does.
 
@@ -187,7 +189,7 @@ packages, multi-root projects, filesystem manifests.
 
 ## 5. The plugin contract
 
-**SPEC Part IV.** Everything modulith does beyond the bare event bus is a
+**SPEC Part IV.** Everything modupy does beyond the bare event bus is a
 plugin. There are three distinct extension mechanisms, chosen by shape (SPEC
 §3.3):
 
@@ -220,7 +222,7 @@ readiness checks can query it. Stores and
 serializers are "one wins" drivers: exactly one is active per app, wired
 **explicitly** at startup, in one of two ways:
 
-- **Config binding.** With a durable `outbox` and an `outbox_url`, modulith
+- **Config binding.** With a durable `outbox` and an `outbox_url`, modupy
   builds a `PostgresPublicationStore` and the plain `JsonEventSerializer` and
   passes them, with the `outbox_options` tuning keys (§3), to
   `outbox.configure()` unless the application already bound a store. Bootstrap
@@ -740,7 +742,7 @@ consumer. While the batch runs, the consumer renews its claims every
 the stuck rows. With one worker per module, the default, no peer exists.
 Past that deadline the consumer's health reports `degraded`, naming the stuck
 event type, target and row. It also logs one ERROR line that names the same
-rows. The listener is never cancelled, because modulith cannot know whether
+rows. The listener is never cancelled, because modupy cannot know whether
 its side effects are safe to interrupt. The remedy is a restart: an orchestrator
 that restarts a worker on degraded health (see DEPLOYMENT "Health Checks and
 Monitoring") frees it, and the restarted consumer reclaims the stuck rows. The
@@ -898,7 +900,7 @@ surfaces by cost (`modulith/manifest.py` module docstring):
   cycles, cross-module imports match `declared_dependencies`, the contracts
   module is a sink, and best-effort data-ownership (`owns_tables`). It supports
   a **ratcheting baseline** (count-aware): grandfather existing violations by a
-  stable hash so you can adopt modulith on a messy codebase and enforce
+  stable hash so you can adopt modupy on a messy codebase and enforce
   "no new violations" while paying down the old ones.
 
 `consumes` is descriptive only (drives docs/audit) — no single process knows

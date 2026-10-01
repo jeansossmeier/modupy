@@ -82,7 +82,7 @@ $ modulith verify
 ✓ no boundary violations
 ```
 
-`verify` applies modulith's own boundary rules, and one of the team's:
+`verify` applies modupy's own boundary rules, and one of the team's:
 `marketplace_platform` refuses any module that owns a table not named
 `<module>_...`, so the owner of every table is obvious from its name. The same
 rule runs each time the app starts, because `pyproject.toml` sets

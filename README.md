@@ -1,4 +1,4 @@
-# modulith
+# modupy
 
 [![CI Status](https://github.com/jeansossmeier/modupy/actions/workflows/ci.yml/badge.svg)](https://github.com/jeansossmeier/modupy/actions?query=workflow%3ACI)
 [![PyPI Version](https://img.shields.io/pypi/v/modupy)](https://pypi.org/project/modupy/)
@@ -9,7 +9,7 @@
 
 ![The same three modules in three shapes: one process on day one, one process per module when a feature gets busy, and payments split off into its own service](docs/images/growth.svg)
 
-modulith helps you build a Python backend as a **modular monolith**: one codebase, split into modules that talk through events and can't reach into each other's code.
+modupy helps you build a Python backend as a **modular monolith**: one codebase, split into modules that talk through events and can't reach into each other's code.
 On day one it is a plain FastAPI app.
 As your company grows, the same code runs one process per module, scales the busy parts, keeps events safe in your database, and splits a module off into its own service.
 Each step is a config change, a command or a few lines of wiring, never a rewrite.
@@ -18,18 +18,21 @@ Each step is a config change, a command or a few lines of wiring, never a rewrit
 pip install 'modupy[fastapi,cli]'
 ```
 
+modupy installs the `modulith` package, so you `import modulith`, run the `modulith` command and configure `[tool.modulith]`.
+`pip install modulith` installs an unrelated project.
+
 [Quickstart](#quickstart) · [How it grows](#how-it-grows-with-your-company) · [Ready for AI](#ready-for-ai) · [Examples](#examples) · [Docs](#documentation)
 
 > Pre-1.0 alpha: breaking changes can land in 0.x releases. See [Status](#status).
 
-## Why modulith
+## Why modupy
 
 Most backends end up in one of two painful places:
 
 - **A big ball of mud.** One app where everything imports everything. It is quick to start, then every change breaks something far away, and splitting it up means a rewrite.
 - **Microservices too early.** Network calls, a dozen deploy pipelines and a platform team, long before your traffic needs them.
 
-modulith is the path in between:
+modupy is the path in between:
 
 - **Modules with walls.** Each module is a Python package with a public API. Names that start with `_` are private, and `modulith verify` fails your build when another module imports them.
 - **Events instead of calls.** A module publishes `OrderCreated`, and every module that cares reacts to it. The publisher never needs to know who is listening.
@@ -255,7 +258,7 @@ INFO:modulith:outbox disabled — set [tool.modulith].outbox = 'postgres' for du
 INFO:modulith:ready
 ```
 
-modulith starts lazily, so its log lines appear on the first `publish()`: the order below.
+modupy starts lazily, so its log lines appear on the first `publish()`: the order below.
 
 ```bash
 $ curl -sX POST localhost:8000/orders \
@@ -283,7 +286,6 @@ pip install 'modupy[fastapi,cli]'
 `fastapi` brings FastAPI and uvicorn, and `cli` adds the `modulith` command.
 The other extras are `postgres` (the durable outbox), `redis` and `database` (brokers for more than one machine), `otel` (tracing), `test` (what the pytest fixtures use) and `all`.
 The core alone, `pip install modupy`, has one dependency: `pluggy`.
-The package is called `modupy` on PyPI because the name `modulith` was taken there; you still `import modulith` and run `modulith`.
 
 > The outbox wiring in [step 2](#2-never-lose-an-event) (`bind_session`, `modulith migrate` and the retry settings) arrives in the first release after 0.10.0. Until then, install from this repository: `pip install 'modupy[fastapi,cli] @ git+https://github.com/jeansossmeier/modupy'`.
 
@@ -370,7 +372,7 @@ The warnings at startup are about the default broker's production settings, whic
 
 ### Test it
 
-modulith's pytest fixtures run a whole event flow in one process, with no server:
+modupy's pytest fixtures run a whole event flow in one process, with no server:
 
 ```python
 from modulith.testing import Scenario
@@ -409,7 +411,7 @@ Put the boundary check in CI, so nobody, human or AI, quietly couples two module
 ```
 
 As teams take ownership, give each module a manifest.
-modulith checks it when it boots, and `verify` uses it to police dependencies and table ownership:
+modupy checks it when it boots, and `verify` uses it to police dependencies and table ownership:
 
 ```python
 # myapp/orders/_manifest.py, optional
@@ -422,7 +424,7 @@ declare_module(
 )
 ```
 
-Set `strict_boundaries = true` and modulith refuses to boot on any boundary violation, warnings included.
+Set `strict_boundaries = true` and modupy refuses to boot on any boundary violation, warnings included.
 `verify` and `--topology processes` then fail before anything starts; in a single process, call `bootstrap()` at startup ([step 2](#2-never-lose-an-event) shows where) to fail there rather than at the first `publish()`.
 Single-process `modulith dev` only warns, so a violation never stops your dev server.
 
@@ -569,7 +571,7 @@ Install `modupy[otel]` and configure an OpenTelemetry tracer provider, and every
 
 ## Already have a codebase?
 
-Adopt modulith one module at a time:
+Adopt modupy one module at a time:
 
 ```bash
 modulith audit                      # proposes modules and writes MIGRATION.md with a readiness score
@@ -618,12 +620,12 @@ Every setting directly under `[tool.modulith]` can also come from an environment
 | `modulith extract <module>` | turns one module into a standalone service | splitting a service off |
 | `modulith k8s-manifest` | writes Kubernetes manifests, one Deployment per module | deploying |
 | `modulith openapi` | merges every module's API into one OpenAPI file | API portals and clients |
-| `modulith audit` | assesses an existing codebase and writes `MIGRATION.md` | adopting modulith |
+| `modulith audit` | assesses an existing codebase and writes `MIGRATION.md` | adopting modupy |
 
 Commands that inspect your modules find your package through `[tool.modulith].package`, else `[project].name`.
 Every command except `audit` and `migrate` imports your modules, `verify` included, so run them only on code you trust and where your app's dependencies are installed.
-`modulith dev` and `modulith run` take `--log-level` (default `info`) for the supervisor and every worker; in one process they hand over to uvicorn, so modulith's startup banner shows only if your app configures logging, as `myapp/main.py` does.
-With `strict_boundaries = true`, `verify`, `run --topology processes` and `dev --topology=processes` fail on warnings too; a single-process `run` fails when the app first boots modulith, and single-process `modulith dev` stays warn-only by design.
+`modulith dev` and `modulith run` take `--log-level` (default `info`) for the supervisor and every worker; in one process they hand over to uvicorn, so modupy's startup banner shows only if your app configures logging, as `myapp/main.py` does.
+With `strict_boundaries = true`, `verify`, `run --topology processes` and `dev --topology=processes` fail on warnings too; a single-process `run` fails when the app first boots modupy, and single-process `modulith dev` stays warn-only by design.
 Exit codes: 0 for success, 1 for violations or bad input, 2 for an internal error or a CLI usage error.
 
 ## Examples
@@ -638,12 +640,12 @@ CI runs every command in every example's README exactly as written, from a fresh
 
 Single-file plugin examples: [a verifier rule](examples/naming_convention_verifier.py), [a Redis Streams broker](examples/redis_streams_broker.py) and [a storage serializer](examples/versioned_json_serializer.py).
 
-## Is modulith right for you?
+## Is modupy right for you?
 
 It fits teams of roughly 3 to 15 engineers building a Python product, often B2B SaaS, who want to put off microservices for as long as possible without painting themselves into a corner.
 If that is not you, it may not be the right fit; [SPEC.md](SPEC.md) Part II explains who it is for.
 
-| | modulith | FastAPI + folders | FastAPI + Celery + import-linter | Microservices |
+| | modupy | FastAPI + folders | FastAPI + Celery + import-linter | Microservices |
 |---|---|---|---|---|
 | Module boundaries | ✓ enforced | ✗ convention only | ✓ enforced by import-linter | ✓ enforced by the network |
 | Events between modules | ✓ in-process or through a broker | ✗ do it yourself | ✓ Celery | ✓ broker only |
@@ -653,11 +655,11 @@ If that is not you, it may not be the right fit; [SPEC.md](SPEC.md) Part II expl
 | Adopting on an existing codebase | ✓ baseline and ratchet | n/a | ✓ | ✗ a rewrite |
 | Operational complexity | low | lowest | medium | highest |
 
-modulith is inspired by [Spring Modulith](https://spring.io/projects/spring-modulith).
+modupy is inspired by [Spring Modulith](https://spring.io/projects/spring-modulith).
 
 ## Status
 
-modulith is a **pre-1.0 alpha**: breaking changes may land in 0.x minor releases, and each one is listed in [CHANGELOG.md](CHANGELOG.md).
+modupy is a **pre-1.0 alpha**: breaking changes may land in 0.x minor releases, and each one is listed in [CHANGELOG.md](CHANGELOG.md).
 The core, the transactional outbox, the tooling and the process-per-module runtime are code-complete and pass `pytest`, `mypy --strict` and `ruff`; more adapters follow after 1.0, as users ask for them ([ROADMAP.md](ROADMAP.md)).
 Every pull request and every push to `main` runs ~2,380 hermetic tests on Python 3.11, 3.12 and 3.13 (Linux, with the SHM broker also on macOS and Windows), plus 116 integration tests against real Postgres, MySQL and Redis containers, which include every example README run from the built wheel.
 [STABILITY.md](docs/STABILITY.md) states what stays stable across 0.x releases.
@@ -665,12 +667,12 @@ Every pull request and every push to `main` runs ~2,380 hermetic tests on Python
 ## Documentation
 
 - [SPEC.md](SPEC.md): the full specification and every design decision
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how modulith works inside, from the runtime and plugins to the outbox, cross-process delivery and the verifier
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how modupy works inside, from the runtime and plugins to the outbox, cross-process delivery and the verifier
 - [docs/COOKBOOK.md](docs/COOKBOOK.md): step-by-step recipes for common jobs
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): Docker and Kubernetes, scaling, health probes and operations
 - [docs/API_REFERENCE.md](docs/API_REFERENCE.md): the public API, generated from docstrings
 - [docs/STABILITY.md](docs/STABILITY.md): what is guaranteed across 0.x releases
-- [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md): adopting modulith in an existing codebase
+- [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md): adopting modupy in an existing codebase
 - [ROADMAP.md](ROADMAP.md): what comes next
 - [CHANGELOG.md](CHANGELOG.md): what changed in each release
 

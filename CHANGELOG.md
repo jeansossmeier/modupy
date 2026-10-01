@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to modulith are documented here.
+All notable changes to modupy are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
@@ -21,8 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - STABILITY.md now lists `outbox.start()`, `bind_session()`/`unbind_session()`, `PostgresPublicationStore`, the `outbox_url` configuration binding and the `modulith._worker:create_app` worker factory as wiring surface. The worker factory is covered because the manifests and Dockerfiles that `k8s-manifest` and `extract` generate start it
 - Generated output: `modulith extract`'s `.env.example` and README configure the runtime outbox with `MODULITH_OUTBOX` and `MODULITH_OUTBOX_URL`, name `MODULITH_DB_URL` as the URL only the Alembic migrations read, say the worker binds its store from `outbox_url`, and show `modulith run <pkg>:app --topology processes` for a local run. `modulith k8s-manifest`'s header says the `<package>-env` Secret must carry `MODULITH_OUTBOX_URL` when the outbox is durable
-- DEPLOYMENT, COOKBOOK, README, MIGRATION_GUIDE, ARCHITECTURE and SPEC were corrected where they contradicted the code: outbox wiring through `outbox_url`, `MODULITH_OUTBOX_URL` versus the Alembic-only `MODULITH_DB_URL`, committing before a route returns, span names, when boundaries are checked, and the Redis environment variables
+- DEPLOYMENT, COOKBOOK, README, MIGRATION_GUIDE, ARCHITECTURE and SPEC were corrected where they contradicted the code: outbox wiring through `outbox_url`, `MODULITH_OUTBOX_URL` versus the Alembic-only `MODULITH_DB_URL`, committing before a route returns, span names, when boundaries are checked, the Redis environment variables, and package auto-detection, which never skips site-packages frames
 - `examples/demo_app` drops its environment-toggled modes A–I, its `.env.example` and the demo-only `MODULITH_DEMO_*` variables. Its README now runs the same code through stages that differ only in configuration
+- The documentation calls the project modupy, the name of its repository and PyPI distribution. The README and each guide say that modupy installs the `modulith` package and command, and the README adds that `pip install modulith` installs an unrelated project. Code names are unchanged
 
 ### Fixed
 

@@ -1,4 +1,4 @@
-# modulith Cookbook
+# modupy Cookbook
 
 Task-oriented recipes for common jobs. Each one uses only the documented public
 API (see [API_REFERENCE.md](API_REFERENCE.md)) plus the documented wiring
@@ -7,6 +7,9 @@ surface (see [STABILITY.md](STABILITY.md)); for the design behind them see
 end-to-end version of recipes 1–3, 5, 6 and 8 lives in
 [`examples/demo_app`](../examples/demo_app). Recipe 4 (`publish_sync`) is not
 in it: the demo publishes from async code only.
+
+modupy installs the `modulith` package, so you `import modulith` and run
+`modulith`.
 
 **Contents**
 
@@ -26,7 +29,7 @@ in it: the demo publishes from async code only.
     - [Declaring broker destinations](#declaring-broker-destinations)
 9. [Test an event flow with the pytest plugin](#9-test-an-event-flow-with-the-pytest-plugin)
 10. [Enforce boundaries in CI](#10-enforce-boundaries-in-ci)
-11. [Extend modulith with a plugin](#11-extend-modulith-with-a-plugin)
+11. [Extend modupy with a plugin](#11-extend-modupy-with-a-plugin)
 
 ---
 
@@ -246,7 +249,7 @@ own thread — it raises `RuntimeError` telling you to `await publish()` instead
 **Goal:** turn silent drift (a module that failed to import, a renamed event)
 into a loud startup failure.
 
-Add a `_manifest.py` at module scope declaring the module's contract. modulith
+Add a `_manifest.py` at module scope declaring the module's contract. modupy
 reads it at startup and checks it against reality.
 
 ```python
@@ -259,7 +262,7 @@ declare_module(
 )
 ```
 
-At bootstrap (when `verify_manifests` is on, the default) modulith verifies two
+At bootstrap (when `verify_manifests` is on, the default) modupy verifies two
 cheap things: every declared `listeners` entry actually registered against the
 bus, and every `publishes` name is defined in the package namespace. A mismatch
 aborts boot with a `file:line` instead of silently dropping events. Declaring
@@ -310,7 +313,7 @@ informational, not a failure.
 the business transaction.
 
 Install the extras (`postgres` for the store and the migrations, `cli` for the
-`modulith` command) and point modulith at the database that holds your business
+`modulith` command) and point modupy at the database that holds your business
 data:
 
 ```bash
@@ -340,7 +343,7 @@ modulith migrate --schema orders          # Postgres only; see the per-module sc
 The chain also creates the `broker_*` tables of the database broker (recipe 8)
 in that database. They stay unused unless you select that broker.
 
-Alembic's own command works as the alternative. modulith ships its alembic
+Alembic's own command works as the alternative. modupy ships its alembic
 config inside the installed package, and `MODULITH_DB_URL` (a sync-driver URL)
 is the variable it reads:
 
@@ -594,7 +597,7 @@ construction. Like the outbox knob above, it applies only on Postgres; other
 dialects log a warning and ignore it.
 
 Enabling a named migration schema never moves existing data. If the target has
-no Alembic history while `public` contains Modulith tables or history, the
+no Alembic history while `public` contains modupy tables or history, the
 migration refuses to create a second history. Back up the database, explicitly
 move and verify the tables, then rerun the command.
 
@@ -654,7 +657,7 @@ with `outbox.configure()` takes these settings as keyword arguments instead.
 keeping the same module code.
 
 Switch topology to process-per-module. With no broker or URL configured,
-modulith selects the stdlib-only, durable local `shm` broker:
+modupy selects the stdlib-only, durable local `shm` broker:
 
 ```toml
 # pyproject.toml
@@ -859,7 +862,7 @@ with `MODULITH_BROKER_MAX_PAYLOAD_BYTES`, `MODULITH_BROKER_MAX_STORE_BYTES`, and
 
 Explicit `broker = "shm"` rejects DSNs and SQLAlchemy/network URLs. If the
 broker name is omitted but `broker_options.url`/`dsn` (or the equivalent
-environment variable) exists, modulith infers the `database` adapter instead.
+environment variable) exists, modupy infers the `database` adapter instead.
 
 ### Use a shared database broker
 
@@ -1072,11 +1075,11 @@ imports or event interactions; `actuator_mode="token"` without
 
 ---
 
-## 11. Extend modulith with a plugin
+## 11. Extend modupy with a plugin
 
 **Goal:** add your own verification rule, broker, or documentation output.
 
-modulith's own behavior is built from plugins, and yours load exactly the same
+modupy's own behavior is built from plugins, and yours load exactly the same
 way — via the `modulith` entry-point group. No application code changes; install
 the package and the plugin's hooks run.
 

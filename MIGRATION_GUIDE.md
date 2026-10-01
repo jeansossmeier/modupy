@@ -1,8 +1,8 @@
 # Migration Guide
 
-> How to adopt modulith on an existing FastAPI application. The path
-> matters because brownfield is where most adoption happens; greenfield
-> is rare.
+> How to adopt modupy (which installs the `modulith` package) on an
+> existing FastAPI application. The path matters because brownfield is
+> where most adoption happens; greenfield is rare.
 
 This guide assumes you have a FastAPI app of moderate size (50k-200k
 lines), structured as folders without enforced boundaries, with at
@@ -12,7 +12,7 @@ still works but specific commands differ — see the SPEC.md notes on
 your stack.
 
 The migration has seven steps. Steps 1-3 are mandatory for any
-modulith adoption. Steps 4-5 are optional but recommended — they are
+modupy adoption. Steps 4-5 are optional but recommended — they are
 where the payoff is (events, then the transactional outbox). Steps 6-7
 are optional and gated on real need.
 
@@ -47,7 +47,7 @@ so it can be committed and diffed. The report holds:
 - A list of cross-module imports that would become violations
 - A list of database tables that multiple parts of the code touch (these
   are your future ownership decisions)
-- A "modulith-readiness score" (0-100) based on how much of your
+- A "modupy-readiness score" (0-100) based on how much of your
   cross-module communication already goes through indirection. With only
   one module candidate there are no boundaries to measure, so the audit
   warns and reports the score as not applicable. A loose-script directory
@@ -61,7 +61,7 @@ boundaries. The audit is a starting point, not a verdict.
 **Time-box:** the team should agree on a module structure within 2
 hours. If you can't, the modulith pattern probably isn't the right
 abstraction for your codebase, or the team isn't aligned on the
-domain — neither of which modulith fixes.
+domain — neither of which modupy fixes.
 
 ## Step 2 — Restructure files (the boring weekend)
 
@@ -103,7 +103,7 @@ app/
 ```
 
 Imports change shape but the logic is identical. Run your existing test
-suite to verify nothing broke. **At this point modulith is doing nothing
+suite to verify nothing broke. **At this point modupy is doing nothing
 yet — you've just reorganized files.**
 
 ## Step 3 — Generate baseline and add CI verification
@@ -137,7 +137,7 @@ flowchart LR
     G --> B
 ```
 
-This is where modulith starts being useful. The verifier prevents the
+This is where modupy starts being useful. The verifier prevents the
 common pattern where someone "just imports something quickly" across
 module boundaries and the codebase erodes over time. Existing problems
 stay; new ones don't.
@@ -213,7 +213,7 @@ flowchart TB
         direction LR
         o2["orders"] -->|"imports OrderCreated"| c["contracts"]
         i2["inventory"] -->|"imports OrderCreated"| c
-        o2 -.->|"publishes"| m(["modulith"])
+        o2 -.->|"publishes"| m(["modupy"])
         m -.->|"delivers OrderCreated"| i2
     end
     before ~~~ after
@@ -250,7 +250,7 @@ outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # your business da
 ```
 
 `outbox_url` is the async SQLAlchemy URL of the database your business data
-lives in. With it set, modulith binds the outbox store for you. The tuning
+lives in. With it set, modupy binds the outbox store for you. The tuning
 knobs live in `[tool.modulith.outbox_options]`, and the runtime validates and
 forwards eight keys to `outbox.configure()` when it binds the store from
 `outbox_url`: `claim_strategy`, `claim_lease_seconds`, `claim_batch_size`,
@@ -273,7 +273,7 @@ Pass `--url <sqlalchemy url>` to migrate another database, and a revision
 (`modulith migrate <revision>`) to stop short of `head`. The chain creates the
 outbox tables and also the `broker_*` tables of the database broker.
 
-The raw Alembic command remains the alternative. modulith ships its alembic
+The raw Alembic command remains the alternative. modupy ships its alembic
 config *inside* the installed package (your project needs no alembic.ini), so
 point alembic's `-c` at it and supply the database URL via the
 `MODULITH_DB_URL` env var (alembic runs on a **sync** driver, e.g.
@@ -308,11 +308,11 @@ MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
 Schema names must be portable unquoted SQL identifiers. The same validation
 applies to configuration, environment variables, Alembic `-x`, and direct
 database-broker construction. Enabling a named schema does not move data: if
-`public` already contains Modulith tables or Alembic history and the target has
+`public` already contains modupy tables or Alembic history and the target has
 no history, migration stops until you back up, explicitly move and verify the
 tables, then rerun it.
 
-Bind your SQLAlchemy session to modulith around each transaction. The service
+Bind your SQLAlchemy session to modupy around each transaction. The service
 function binds, publishes, commits and unbinds before the route returns:
 
 ```python
@@ -348,7 +348,7 @@ that loop skips every row until bootstrap has run. Keep the outbox table in the
 same database as your business data, or the row and your data cannot commit in
 one transaction. Under `--topology processes`, `main.py` does not run in
 workers. Set `[tool.modulith].outbox_url` (env `MODULITH_OUTBOX_URL`) and
-modulith binds the store in every process-topology worker and, while
+modupy binds the store in every process-topology worker and, while
 `auto_discover` is on (the default), in the single-process server and the
 `modulith outbox` CLI; without discovery, call `outbox.configure()` yourself. A
 worker with a durable `outbox` and no store refuses to start.
@@ -389,7 +389,7 @@ Now `publish()` calls inside a transaction are atomically persisted.
 Process crashes don't lose events. Rolled-back transactions don't leak
 ghost events. Listeners are called at-least-once after commit.
 
-**This is the feature that justifies modulith over "FastAPI plus
+**This is the feature that justifies modupy over "FastAPI plus
 folders."** Without it, you have a structural pattern. With it, you
 have actual delivery guarantees.
 
@@ -577,7 +577,7 @@ and fails if that import fails or loads code from the source tree outside the
 extracted service; `--force` does not bypass that check either, so a
 module-level import of another module fails even with `--force`.
 
-Modulith doesn't do the database split for you (that's a real data
+modupy doesn't do the database split for you (that's a real data
 migration project) but the contracts module, the events, and now
 `modulith extract` give you the API boundary and the scaffolding. You're
 extracting infrastructure, not code.
@@ -605,7 +605,7 @@ call raises `TimeoutError`; pass `timeout=None` to disable the bound.
 Sync `@listener` functions are also accepted — they run in the event
 loop's executor.
 
-**"Tests are flaky after adding modulith."** Add the pytest plugin:
+**"Tests are flaky after adding modupy."** Add the pytest plugin:
 `pip install 'modupy[test]'`. The `modulith_app` fixture handles
 state reset between tests, which fixes 90% of test isolation issues.
 
@@ -615,9 +615,9 @@ prescribe a structure. Your team knows your domain.
 
 ---
 
-## When modulith is the wrong choice
+## When modupy is the wrong choice
 
-Skip modulith if:
+Skip modupy if:
 - You're a solo developer on a small app — you don't have enough
   structural pain for the abstraction to pay off
 - You're already on microservices — coming back to a monolith is rare
@@ -625,10 +625,10 @@ Skip modulith if:
 - Your team is fully sync — the outbox requires async DB integration
   to be production-grade
 - You have no events anywhere yet and aren't willing to introduce them
-  — modulith is fundamentally event-driven; without that, you're just
+  — modupy is fundamentally event-driven; without that, you're just
   using folders and getting almost no benefit
 
-If two or more of these apply, modulith is probably architecture for
+If two or more of these apply, modupy is probably architecture for
 its own sake. FastAPI plus folders plus discipline goes further than
 people give it credit for.
 

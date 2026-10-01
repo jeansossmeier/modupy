@@ -1,12 +1,12 @@
-# modulith Stability & Versioning
+# modupy Stability & Versioning
 
-This guide explains API stability guarantees for modulith 0.x and what to expect as we move toward 1.0.
+This guide explains API stability guarantees for modupy 0.x and what to expect as we move toward 1.0. modupy installs the `modulith` package.
 
 ---
 
 ## Pre-1.0 SemVer: 0.x releases
 
-modulith follows [Semantic Versioning](https://semver.org/). Until 1.0, **breaking changes may occur in minor releases** (0.9 → 0.10) and **are always documented in CHANGELOG.md**. Patch releases (0.9.0 → 0.9.1) never break the public API.
+modupy follows [Semantic Versioning](https://semver.org/). Until 1.0, **breaking changes may occur in minor releases** (0.9 → 0.10) and **are always documented in CHANGELOG.md**. Patch releases (0.9.0 → 0.9.1) never break the public API.
 
 | Release | Breaking changes allowed? | Documented in | Upgrade effort |
 |---------|--------------------------|---------------|----------------|
@@ -27,11 +27,11 @@ The public API is defined by exports in `modulith/__init__.py`:
 - `Configuration`, `ConfigurationError` — config contract and errors
 - `PublishSyncTimeout` — raised by `publish_sync()` when its timeout elapses
 
-**Plugin authors** (extending modulith):
+**Plugin authors** (extending modupy):
 - `hookimpl` — hook-implementation marker (plugins implement hookspecs in `modulith.hooks`)
 - Protocols: `Broker`, `Consumer`, `EventSerializer`, `PublicationStore` — driver contracts
 - `Manifest`, `declare_module`, `get_manifest` — module registration and introspection
-- `create_plugin_manager` — build a pluggy manager pre-registered with modulith's hookspecs
+- `create_plugin_manager` — build a pluggy manager pre-registered with modupy's hookspecs
 
 **Registry** (advanced, rarely needed):
 - `BrokerRegistry`, `ConsumerRegistry`, `ConsumerSpec` — broker and consumer management
@@ -86,7 +86,7 @@ Drivers are wired **explicitly** at startup — there is no entry-point auto-dis
 - `modulith.builtin.outbox` — `configure()`, `start()`, `shutdown()`, `bind_session()`, `unbind_session()`, `status()`, `force_retry()`, `list_dead_lettered()`, `retry_all_dead_lettered()`, `purge_completed()`
 - `modulith.serializers` — `JsonEventSerializer`
 - `modulith.adapters.postgres_outbox.PostgresPublicationStore` — the outbox store the wiring above hands to `configure()`. Only this class and the two aliases named under the adapter modules below carry the wiring guarantee; the rest of that module does not
-- `[tool.modulith] outbox_url` with `[tool.modulith.outbox_options]` — configuration binding: with a durable (non-`memory`) outbox, modulith builds a `PostgresPublicationStore` on the URL and forwards the tuning keys to `configure()`, unless the application already called `configure()`. In the single-process server and the CLI this happens only while `auto_discover` is on (the default); every process-topology worker binds regardless
+- `[tool.modulith] outbox_url` with `[tool.modulith.outbox_options]` — configuration binding: with a durable (non-`memory`) outbox, modupy builds a `PostgresPublicationStore` on the URL and forwards the tuning keys to `configure()`, unless the application already called `configure()`. In the single-process server and the CLI this happens only while `auto_discover` is on (the default); every process-topology worker binds regardless
 - `modulith._worker:create_app` — the per-module worker factory, started as `uvicorn modulith._worker:create_app --factory` with `MODULITH_MODULE` and `MODULITH_APP_PACKAGE` set. It is the supported deployment entry point for the manifests and Dockerfiles that `modulith k8s-manifest` and `modulith extract` generate, so the underscore exclusion below does not apply to this one name and its two environment variables
 
 **Stability**: weaker than the public API above, stronger than the adapter internals below. Signatures may change in a 0.x minor, but every change is documented in CHANGELOG.md with an upgrade note. Other underscore-prefixed names are excluded — in particular `modulith.builtin.outbox._current_session`, which exists so adapters can bind to it (it may hold a binding holder, so read the bound session through `_bound_session()` in the same module); applications use `bind_session()`/`unbind_session()` from `modulith.builtin.outbox`.

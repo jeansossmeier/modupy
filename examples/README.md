@@ -1,6 +1,6 @@
 # Examples
 
-Three runnable projects, each one step up in scale, plus three single-file references for extending modulith. CI executes every command in each project's README exactly as written, so the README is the tutorial and the test at once.
+Three runnable projects, each one step up in scale, plus three single-file references for extending modupy. CI executes every command in each project's README exactly as written, so the README is the tutorial and the test at once.
 
 | Project | Scale | What it teaches | Infrastructure |
 |---|---|---|---|

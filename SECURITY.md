@@ -2,7 +2,7 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in modulith, please report it using GitHub's private security advisory feature:
+If you discover a security vulnerability in modupy, please report it using GitHub's private security advisory feature:
 
 1. Go to https://github.com/jeansossmeier/modupy
 2. Click the **Security** tab

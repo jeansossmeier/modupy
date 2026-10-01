@@ -1,6 +1,6 @@
 # Deployment Guide
 
-This guide covers scaling modulith from a single-process monolith to a distributed topology of separate worker processes.
+This guide covers scaling modupy from a single-process monolith to a distributed topology of separate worker processes. modupy installs the `modulith` package, so you `import modulith` and run `modulith`.
 
 ---
 
@@ -29,7 +29,7 @@ MODULITH_BROKER=memory uvicorn myapp.main:app --workers 1
 
 Add persistence without splitting processes: publish events atomically with your domain transaction.
 
-Three steps make it durable. Set `outbox_url` so modulith binds the store in
+Three steps make it durable. Set `outbox_url` so modupy binds the store in
 every process, the `modulith outbox` CLI included (see **Binding the store from
 configuration** and **Outbox operations**). Create the outbox tables with
 `modulith migrate`. Then wrap each business transaction in a bound session, as
@@ -64,7 +64,7 @@ outbox = "postgres"
 outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTBOX_URL
 ```
 
-- modulith builds a `PostgresPublicationStore` on its own engine for that URL
+- modupy builds a `PostgresPublicationStore` on its own engine for that URL
   and binds it in every process: the single-process server, each
   process-topology worker, and the `modulith outbox ...` commands.
 - A store the application binds with `outbox.configure()` before bootstrap
@@ -215,7 +215,7 @@ connections work from any loop, but the pool's wait queue belongs to the first
 loop that ever waited for a free connection. Another loop that later has to
 wait raises `RuntimeError: <Queue> is bound to a different event loop`, and
 waiting happens only once every pooled and overflow connection is checked
-out, so the SQLite failure depends on load. modulith logs one warning the
+out, so the SQLite failure depends on load. modupy logs one warning the
 first time a second loop uses the engine. Keep every publish for one outbox
 engine on one loop; a larger pool only delays the SQLite failure and does not
 help on Postgres or MySQL. Unlike the outbox store,
@@ -297,7 +297,7 @@ option before `upgrade`:
 `alembic -c <packaged-alembic.ini> -x schema=orders upgrade head`.
 Schema identifiers receive the same validation through every entry point.
 Enabling a named migration schema does not move data and refuses to abandon
-existing Modulith tables or Alembic history in `public`; see
+existing modupy tables or Alembic history in `public`; see
 [Migration Guide](../MIGRATION_GUIDE.md) Step 5.
 
 ---
@@ -459,7 +459,7 @@ This has two consequences:
   ownership. A call that is submitted in the instant the owner stops can wait
   indefinitely, because no loop is left to run it.
 
-modulith logs one warning the first time a call arrives from a second loop.
+modupy logs one warning the first time a call arrives from a second loop.
 
 The database broker needs `FOR UPDATE SKIP LOCKED` to claim messages: MySQL
 8.0.1 or newer, or MariaDB 10.6 or newer. A consumer connected to an older
@@ -931,7 +931,7 @@ exits with that actionable installation instruction. Options: `--output`
 imports application modules, run it only against trusted source. Alternatively,
 keep a checked-in schema generated from the single-process app.
 
-Single-process topology is unaffected — modulith adds no HTTP routes there, so `/docs` is whatever your own FastAPI app configures.
+Single-process topology is unaffected — modupy adds no HTTP routes there, so `/docs` is whatever your own FastAPI app configures.
 
 ---
 
@@ -1008,7 +1008,7 @@ readinessProbe:
         value: "Bearer <actuator token>"
 ```
 
-In single-process topology there is no proxy and no actuator: modulith adds no HTTP routes, so probe whatever endpoint your own app exposes.
+In single-process topology there is no proxy and no actuator: modupy adds no HTTP routes, so probe whatever endpoint your own app exposes.
 
 **Per-worker-pod probes (generated manifests).** The manifests `modulith k8s-manifest` generates probe each worker pod directly rather than through the proxy: readiness is `httpGet /health` on the container port, and liveness is a `tcpSocket` check on the same port. `/health` returns 503 while that worker's broker consumer isn't ready, which readiness correctly treats as not-yet-serving; liveness intentionally does not use `httpGet`, since a worker whose broker connection is temporarily down would otherwise get killed and restarted for no reason.
 
@@ -1021,7 +1021,7 @@ A failure on one target never clears because another target succeeded. The excep
 
 **When a stalled consumer degrades `/health`.** A consumer that stops making progress reports `degraded` (503) even when no broker call has failed:
 
-- **A listener that never returns** (database and SHM brokers). The consumer claims nothing new until every row of its current batch has finished. Once a batch has run longer than `reclaim_stale_seconds * 10` (default 600 s), health reports `degraded` with the stuck event type, target and row. The consumer also logs an ERROR line starting `claim renewal for group ... exceeded` that names the same rows. The listener keeps running, because modulith never cancels user code. The consumer recovers only when the listener returns.
+- **A listener that never returns** (database and SHM brokers). The consumer claims nothing new until every row of its current batch has finished. Once a batch has run longer than `reclaim_stale_seconds * 10` (default 600 s), health reports `degraded` with the stuck event type, target and row. The consumer also logs an ERROR line starting `claim renewal for group ... exceeded` that names the same rows. The listener keeps running, because modupy never cancels user code. The consumer recovers only when the listener returns.
 - **A Redis server that stops answering.** Health reports `degraded` ("no broker read completed in N s") once a read has waited `5 * poll_block_ms + 1 s`. The consumer logs one WARNING per stall. The Redis client's socket timeout (see [Redis Streams Broker](#b-redis-streams-broker)) then fails the hung read. The consumer logs `broker read failed`, backs off and retries, and health stays `degraded` until a read succeeds.
 
 Restart a worker whose health stays `degraded` longer than you can tolerate; on a stuck listener a restart is the only remedy. The restarted consumer reclaims the stuck rows and charges each one a delivery attempt, so a listener that hangs on every delivery ends in the dead-letter state after `max_delivery_attempts`. The generated Kubernetes manifests do not do this for you: liveness is a `tcpSocket` check, so a degraded worker is only taken out of readiness. Add a liveness `httpGet /health` (with a generous `failureThreshold`) or an external watchdog if you want automatic restarts.
@@ -1181,7 +1181,7 @@ group.
 ### Recovering from Broker Failure
 
 **Publishing (every broker):**
-- A direct `publish()` raises the broker's error to its caller. Modulith keeps no in-memory buffer of events it could not send
+- A direct `publish()` raises the broker's error to its caller. modupy keeps no in-memory buffer of events it could not send
 - Inside a bound outbox session, the broker send is saved as an outbox row in your transaction and made after the commit. While the broker is down the row stays in the outbox and the retry loop sends it again, until `dead_letter_after_attempts` (10 by default) failed attempts dead-letter it. `modulith outbox dead-letter --retry-all` resubmits dead-lettered rows once the broker is back
 
 **Consuming (every broker):**
@@ -1266,7 +1266,7 @@ hard-killed supervisor from leaving workers behind is Linux-only.
    - Before publishing, imports the extracted module in a subprocess from the staged tree and exits 1 naming the failing import if that fails, or if the import loads first-party code from the source tree outside the extracted copy (reachable through `PYTHONPATH` or an editable install), so the service's third-party dependencies must be installed where you run `extract`. First-party code is anything under the directory that holds the app's top-level package. Modules under the interpreter's prefixes, standard library and site-packages directories are exempt, except that a directory containing that source tree exempts nothing: a virtualenv inside the project stays exempt, and a project inside a virtualenv is still checked (on Windows, `site.getsitepackages()` lists the virtualenv root itself). When the app resolves to an installed copy in the interpreter's site-packages or user site (a plain or `--user` `pip install`), only the app's own top-level package counts as first-party there, and other installed distributions stay exempt. A directory the app was installed into with `pip install --target` or `--prefix` and reached through `PYTHONPATH`, a `.pth` file or any other `sys.path` entry is not one of the interpreter's library directories, so everything in it counts as first-party: `extract` reports the app's dependencies installed there and exits 1. `--force` never overrides this import check, so a module-level import of another declared module fails even when forced; only a deferred one (inside a function) can be forced through
    - Other modules keep sending events via the broker; the extracted service subscribes and acts. The service binds its outbox store from `MODULITH_OUTBOX_URL` (`[tool.modulith].outbox_url`) at startup, and refuses to start without a store when `MODULITH_OUTBOX` is not `memory` (unless module code it imports binds one itself with `outbox.configure()`): the app's `main.py` is not copied, so its lifespan wiring never runs. The generated `.env.example` and README list `MODULITH_OUTBOX` and `MODULITH_OUTBOX_URL`
 
-This path is why modulith exists: **every module is a potential microservice, but you pay that cost only when it's profitable.**
+This path is why modupy exists: **every module is a potential microservice, but you pay that cost only when it's profitable.**
 
 ---
 
