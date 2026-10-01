@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="880" height="420" viewBox="0 0 880 420" role="img" aria-labelledby="growth-title growth-desc">
-<title id="growth-title">The same modulith code in three shapes</title>
-<desc id="growth-desc">Day one: the orders, payments and inventory modules run in one process, and an OrderCreated event fans out from orders to payments and inventory. When a feature gets busy: one process per module on one machine, behind a proxy on port 8000, with two inventory processes and a built-in broker carrying events between them. When a module becomes a service: modulith extract payments moves payments onto its own machine, and a Redis or database broker carries the same events between the app and the new service. In every shape, modulith verify keeps the modules apart and the outbox keeps their events safe.</desc>
+<title id="growth-title">The same modupy code in three shapes</title>
+<desc id="growth-desc">Day one: the orders, payments and inventory modules run in one process, and an OrderCreated event fans out from orders to payments and inventory. When a feature gets busy: one process per module on one machine, behind a proxy on port 8000, with two inventory processes and a built-in broker carrying events between them. When a module becomes a service: modulith extract payments moves payments onto its own machine, and a Redis, database or other broker carries the same events between the app and the new service. In every shape, modulith verify keeps the modules apart and the outbox keeps their events safe.</desc>
 <style>
 .card{fill:#f6f8fa;stroke:#d0d7de}
 .box{fill:#ffffff;stroke:#d0d7de;stroke-width:1.5}
@@ -98,8 +98,8 @@
 <text class="m inventory-t" x="787" y="132" text-anchor="middle">inventory</text>
 <path class="ev" d="M685 164 V180"/>
 <path class="ev" d="M787 164 V180"/>
-<rect class="bus" x="632" y="180" width="208" height="28" rx="8"/>
-<text class="bus-t" x="736" y="199" text-anchor="middle">Redis or database broker</text>
+<rect class="bus" x="620" y="180" width="232" height="28" rx="8"/>
+<text class="bus-t" x="736" y="199" text-anchor="middle">Redis / database / other broker</text>
 <path class="ev" d="M736 208 V224"/>
 <rect class="machine" x="620" y="224" width="232" height="72" rx="10"/>
 <text class="c" x="632" y="242">payments-service</text>

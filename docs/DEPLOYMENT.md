@@ -713,7 +713,7 @@ flowchart TD
     si --> din
     sb["Secret myapp-broker<br>created by you"] -.->|"MODULITH_BROKER_URL"| deps
     se["Secret myapp-env<br>created by you"] -.->|"envFrom, optional"| deps
-    deps --> broker[("Shared broker")]
+    deps --> broker[("Shared broker<br>Redis / database / other")]
 ```
 
 Options: `--output` (default `modulith-k8s.yaml`, `-` for stdout), `--image`
@@ -798,7 +798,7 @@ The workers of one module share a consumer group (`modulith-<module>`), so each 
 
 ```mermaid
 flowchart LR
-    pub["orders publishes<br>OrderPlaced"] --> broker[("Broker")]
+    pub["orders publishes<br>OrderPlaced"] --> broker[("Broker<br>SHM / Redis / database / other")]
     broker -->|"one worker takes it"| inv
     broker -->|"its own copy"| ntf
     subgraph inv["modulith-inventory"]

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="880" height="440" viewBox="0 0 880 440" role="img" aria-labelledby="proc-title proc-desc">
 <title id="proc-title">What modulith run --topology processes starts</title>
-<desc id="proc-desc">One command starts a main process and one worker process per module, all on one machine. The main process holds the reverse proxy on port 8000, which sends /inventory requests to the inventory worker on port 9001 and /orders requests to the orders worker on port 9002, and the supervisor, which restarts a crashed worker after 1, 2, 4, 8 and 16 seconds and gives up after six crashes in a row. The payments worker on port 9003 serves no routes and only runs its listener. The workers exchange events through the built-in SHM broker. The contracts module gets no worker, and a Redis or database broker lets the workers span machines.</desc>
+<desc id="proc-desc">One command starts a main process and one worker process per module, all on one machine. The main process holds the reverse proxy on port 8000, which sends /inventory requests to the inventory worker on port 9001 and /orders requests to the orders worker on port 9002, and the supervisor, which restarts a crashed worker after 1, 2, 4, 8 and 16 seconds and gives up after six crashes in a row. The payments worker on port 9003 serves no routes and only runs its listener. The workers exchange events through the built-in SHM broker. The contracts module gets no worker, and a Redis, database or other broker lets the workers span machines.</desc>
 <style>
 .card{fill:#f6f8fa;stroke:#d0d7de}
 .box{fill:#ffffff;stroke:#d0d7de;stroke-width:1.5}
@@ -96,5 +96,5 @@
 <text class="bus-t" x="492" y="367" text-anchor="middle">built-in SHM broker: events between workers, kept durably on this machine</text>
 
 <text class="s" x="144" y="404">contracts gets no worker: it only defines events</text>
-<text class="s" x="840" y="404" text-anchor="end">a Redis or database broker lets workers span machines</text>
+<text class="s" x="840" y="404" text-anchor="end">a Redis, database or other broker lets workers span machines</text>
 </svg>

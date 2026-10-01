@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="880" height="360" viewBox="0 0 880 360" role="img" aria-labelledby="ai-title ai-desc">
 <title id="ai-title">Where a slow LLM call runs</title>
-<desc id="ai-desc">Two timelines for a POST /orders request whose OrderCreated event triggers a listener that calls an LLM. In one process, by default, publish() waits for the listener, so the customer waits for the whole model call before getting 200 OK. With the outbox or a worker process, the request saves the order and returns 200 OK at once, and the listener's model call runs afterwards in the background. A failed call is retried and then kept as a dead letter: 10 attempts with the outbox, 5 with a broker. To get more model throughput, set assistant = 4 under [tool.modulith.workers], or run modulith extract assistant.</desc>
+<desc id="ai-desc">Two timelines for a POST /orders request whose OrderCreated event triggers a listener that calls an LLM. In one process, by default, publish() waits for the listener, so the customer waits for the whole model call before getting 200 OK. With the outbox or a worker process, the request saves the order and returns 200 OK at once, and the listener's model call runs afterwards in the background. A failed call is retried and then kept as a dead letter: 10 attempts with the outbox, 5 with a broker. To get more model throughput, set assistant = 4 under [tool.modulith.workers] to run four workers making model API calls.</desc>
 <style>
 .card{fill:#f6f8fa;stroke:#d0d7de}
 .box{fill:#ffffff;stroke:#d0d7de;stroke-width:1.5}
@@ -88,5 +88,5 @@
 <path class="wire" d="M224 312 H846" marker-end="url(#ai-head)"/>
 <text class="s" x="214" y="316" text-anchor="end">time</text>
 
-<text class="s" x="24" y="340">Need more model throughput? <tspan class="c">assistant = 4</tspan> under <tspan class="c">[tool.modulith.workers]</tspan>, or <tspan class="c">modulith extract assistant</tspan> onto GPU machines.</text>
+<text class="s" x="24" y="340">Need more model throughput? <tspan class="c">assistant = 4</tspan> under <tspan class="c">[tool.modulith.workers]</tspan> runs four workers making model API calls.</text>
 </svg>

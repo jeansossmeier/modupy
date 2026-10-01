@@ -79,7 +79,7 @@ Then choose how it runs. The listener does not change:
 
 - **With the outbox on** and the order published inside its database session ([step 2](#2-never-lose-an-event)), the note is written after the order commits, in the background, so placing an order stays fast. A failed model call is retried with backoff, up to 10 attempts by default, then kept as a dead letter. `modulith outbox dead-letter --retry-all` replays it by running the listener inside that command, so run it where your model credentials are.
 - **In its own processes** ([step 3](#3-give-busy-modules-their-own-processes)), a slow model cannot hold up your API, and `assistant = 4` under `[tool.modulith.workers]` gives the assistant four of them. There the broker retries a failed call instead, 5 times by default, and keeps its dead letters itself.
-- **As its own service** ([step 5](#5-split-off-a-service)), `modulith extract assistant` moves it onto GPU machines or to another team, while the rest of the app keeps publishing the same events.
+- **As its own service** ([step 5](#5-split-off-a-service)), `modulith extract assistant` gives it its own deploys, scaling and model API keys, or hands it to another team, while the rest of the app keeps publishing the same events.
 
 In the default single process, `publish()` waits for every listener and re-raises the first error, so a slow or failing model call slows down or fails the order request.
 With the outbox or a broker, events are delivered at least once, so make listeners safe to run twice, for example by skipping an order that already has a note.
