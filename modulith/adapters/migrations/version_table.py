@@ -40,16 +40,23 @@ def read_revision_table(
 ) -> tuple[str, frozenset[str]] | None:
     """The table that tracks modulith's revision, with the chain revisions it holds.
 
-    ``modulith_alembic_version`` wins when it exists; an install not yet moved
-    falls back to ``alembic_version``. ``None`` means neither table exists.
+    The first of ``modulith_alembic_version`` and ``alembic_version`` holding a
+    chain revision wins, so an install not yet moved is found even beside an
+    empty ``modulith_alembic_version`` left by an interrupted move. With no
+    chain revision anywhere, the first existing table is returned with an
+    empty set; ``None`` means neither table exists.
     """
     inspector = inspect(connection)
+    empty: tuple[str, frozenset[str]] | None = None
     for name in (VERSION_TABLE, LEGACY_VERSION_TABLE):
         if inspector.has_table(name, schema=schema):
             table = _version_table(name, schema)
             stored: list[str] = list(connection.execute(select(table.c.version_num)).scalars())
-            return name, frozenset(stored) & chain_revisions()
-    return None
+            revisions = frozenset(stored) & chain_revisions()
+            if revisions:
+                return name, revisions
+            empty = empty or (name, revisions)
+    return empty
 
 
 def move_legacy_revision(migration_context: MigrationContext, schema: str | None) -> None:

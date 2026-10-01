@@ -494,6 +494,34 @@ def test_upgrade_moves_a_legacy_head_revision_without_rerunning_migrations(
     assert _versions(db, "modulith_alembic_version") == {HEAD}
 
 
+def _add_empty_modulith_version_table(db_path: Path) -> None:
+    """What an interrupted move leaves behind: the new table created, its row never written."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TABLE modulith_alembic_version (version_num VARCHAR(32) NOT NULL, "
+            "CONSTRAINT modulith_alembic_version_pkc PRIMARY KEY (version_num))"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_upgrade_moves_a_legacy_revision_past_an_empty_modulith_alembic_version(
+    tmp_path: Path, caplog: Any
+) -> None:
+    db = tmp_path / "interrupted.db"
+    _legacy_install(db, HEAD, HEAD)
+    _add_empty_modulith_version_table(db)
+
+    with caplog.at_level(logging.INFO, logger="alembic.runtime.migration"):
+        command.upgrade(_cfg(db), "head")
+
+    assert _upgrade_steps(caplog) == []
+    assert "alembic_version" not in _objects(db, "table")
+    assert _versions(db, "modulith_alembic_version") == {HEAD}
+
+
 def test_upgrade_moves_a_legacy_mid_chain_revision_then_continues_from_it(
     tmp_path: Path, caplog: Any
 ) -> None:
@@ -553,8 +581,12 @@ def test_read_revision_table_finds_the_revision_in_either_layout(tmp_path: Path)
     _legacy_install(legacy, "0003_outbox_claim_leases", "0003_outbox_claim_leases", "x")
     business = tmp_path / "business.db"
     _legacy_install(business, None, BUSINESS_REVISION)
+    interrupted = tmp_path / "interrupted.db"
+    _legacy_install(interrupted, "0003_outbox_claim_leases", "0003_outbox_claim_leases")
+    _add_empty_modulith_version_table(interrupted)
 
     assert read(current) == ("modulith_alembic_version", frozenset({HEAD}))
     assert read(legacy) == ("alembic_version", frozenset({"0003_outbox_claim_leases"}))
+    assert read(interrupted) == ("alembic_version", frozenset({"0003_outbox_claim_leases"}))
     assert read(business) == ("alembic_version", frozenset())
     assert read(tmp_path / "empty.db") is None
