@@ -365,8 +365,41 @@ def test_dev_port_collision_names_only_remedies_dev_accepts(make_fake_app, monke
     )
 
     assert result.exit_code == 1, result.output
-    assert "--worker-port-base" not in result.output
+    assert "--worker-port-base" in result.output
     assert "MODULITH_WORKER_PORT_BASE" in result.output
+
+
+@pytest.mark.parametrize(
+    "pyproject_base,argv,expected",
+    [
+        (None, [], [9001, 9002]),
+        (19001, [], [19001, 19002]),
+        (19001, ["--worker-port-base", "29001"], [29001, 29002]),
+    ],
+)
+def test_dev_processes_topology_accepts_worker_port_base(
+    make_fake_app, tmp_path, monkeypatch, pyproject_base, argv, expected
+):
+    make_fake_app({"orders": "", "inventory": ""})
+    if pyproject_base is not None:
+        (tmp_path / "pyproject.toml").write_text(
+            f'[tool.modulith]\npackage = "fakeapp"\nworker_port_base = {pyproject_base}\n'
+        )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["dev", "fakeapp:app", "--topology", "processes", *argv])
+
+    assert result.exit_code == 0, result.output
+    assert [s.port for s in captured["specs"]] == expected
 
 
 def test_single_process_run_banner_has_a_space_after_the_arrow(monkeypatch):
@@ -2688,6 +2721,49 @@ def test_masked_url_hides_only_the_password() -> None:
     masked = _masked_url("postgresql+psycopg://user:s3cret@db.example/app?sslmode=require")
 
     assert masked == "postgresql+psycopg://user:***@db.example/app?sslmode=require"
+
+
+def test_masked_url_hides_query_parameter_password() -> None:
+    from modulith.cli import _masked_url
+
+    masked = _masked_url("postgresql+psycopg://user@db.example/app?password=secret&sslmode=require")
+
+    assert masked == "postgresql+psycopg://user@db.example/app?password=***&sslmode=require"
+    assert "secret" not in masked
+    assert "sslmode=require" in masked
+
+
+def test_masked_url_hides_secret_query_parameters() -> None:
+    from modulith.cli import _masked_url
+
+    test_cases = [
+        ("postgresql://host/db?token=abc123", "token=***"),
+        ("postgresql://host/db?secret=xyz", "secret=***"),
+        ("postgresql://host/db?apikey=key123", "apikey=***"),
+        ("postgresql://host/db?api_key=key456", "api_key=***"),
+        ("postgresql://host/db?passwd=pass123", "passwd=***"),
+        ("postgresql://host/db?pwd=pass456", "pwd=***"),
+        ("postgresql://host/db?PASSWORD=upper", "PASSWORD=***"),
+        ("postgresql://host/db?Token=mixed", "Token=***"),
+        ("postgresql://host/db?sslpassword=keypass", "sslpassword=***"),
+    ]
+
+    for url, expected_hidden in test_cases:
+        masked = _masked_url(url)
+        assert expected_hidden in masked, f"Failed for {url}"
+
+
+def test_masked_url_keeps_non_secret_query_parameters_visible() -> None:
+    from modulith.cli import _masked_url
+
+    masked = _masked_url("postgresql://user@host/db?password=secret&sslmode=require&pool_size=10")
+
+    assert "password=***" in masked
+    assert "sslmode=require" in masked
+    assert "pool_size=10" in masked
+    assert "secret" not in masked
+    assert "require" in masked
+    assert "10" in masked
 
 
 def test_migrate_failure_reports_an_error_without_leaking_the_password(

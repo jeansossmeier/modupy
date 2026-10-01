@@ -904,7 +904,7 @@ def _check_proxy_port(specs: list[WorkerSpec], proxy_port: int) -> None:
             raise ConfigurationError(
                 f"proxy port {proxy_port} is also assigned to worker {spec.module_name!r} "
                 f"(ports {spec.port}-{spec.port + max(1, spec.worker_count) - 1}); "
-                "choose another --port or move the workers with "
+                "choose another --port or move the workers with --worker-port-base, "
                 "[tool.modulith] worker_port_base or MODULITH_WORKER_PORT_BASE"
             )
 

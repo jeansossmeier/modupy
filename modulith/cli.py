@@ -829,6 +829,13 @@ def dev(
     log_level: str = typer.Option(
         "info", help="debug | info | warning | error | critical (applies to workers too)"
     ),
+    worker_port_base: int | None = typer.Option(
+        None,
+        min=1,
+        max=65535,
+        help=r"First worker port under --topology processes (default: \[tool.modulith] "
+        "worker_port_base, else 9001); replicas take the following ports",
+    ),
 ) -> None:
     """Run the application in development mode.
 
@@ -864,6 +871,7 @@ def dev(
             port=port,
             log_level=level,
             verify_warn=True,
+            worker_port_base=worker_port_base,
         )
         return
 
@@ -1810,9 +1818,27 @@ def _migration_url(url: str) -> str:
 
 
 def _masked_url(url: str) -> str:
+    from urllib.parse import parse_qsl, urlparse, urlunparse
+
     from sqlalchemy.engine import make_url
 
-    return make_url(url).render_as_string(hide_password=True)
+    masked_base = make_url(url).render_as_string(hide_password=True)
+
+    parsed = urlparse(masked_base)
+    if not parsed.query:
+        return masked_base
+
+    secret_words = ("password", "passwd", "pwd", "secret", "token", "apikey", "api_key")
+    params = parse_qsl(parsed.query, keep_blank_values=True)
+
+    masked_params = [
+        (k, "***" if any(word in k.lower() for word in secret_words) else v) for k, v in params
+    ]
+
+    new_query = "&".join(f"{k}={v}" for k, v in masked_params)
+    return urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment)
+    )
 
 
 @app.command()

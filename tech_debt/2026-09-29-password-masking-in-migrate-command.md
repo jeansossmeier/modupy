@@ -1,8 +1,8 @@
 ---
 type: tech-debt
-debt_status: open
+debt_status: resolved
 created: 2026-09-29
-updated: 2026-09-29
+updated: 2026-10-01
 category: Security
 impact: Low - Passwords in query parameters are not masked in CLI output
 effort: Low - Extend masking to handle query parameter secrets
@@ -21,3 +21,6 @@ Either: 1) also redact query parameters whose names mark secrets (`password`, `t
 
 ## Context
 Verified with SQLAlchemy 2.1.1's `make_url` on both URL shapes. [Tool-Verified]
+
+## Resolution
+Extended `_masked_url` to parse and redact query parameters whose names match secret keywords (case-insensitive): `password`, `passwd`, `pwd`, `secret`, `token`, `apikey`, `api_key`. All secret parameters now render as `***` while non-secret parameters remain visible. Tests cover user-info passwords, query parameters with all secret keyword variants, and non-secret parameters.
