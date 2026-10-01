@@ -246,6 +246,10 @@ sequenceDiagram
     end
 ```
 
+The stories below run three of these endings. The fourth happens when an order
+asks for more than is on hand: `inventory` publishes `StockRejected`, and
+`orders` cancels the order with the reason `out of stock`.
+
 **A paid order.** `orders` publishes `OrderPlaced`. `inventory` reserves the
 stock, `orders` asks for payment, `payments` captures it, and `orders` confirms.
 `shipping` books a carrier and `notifications` writes the shipped notice.
