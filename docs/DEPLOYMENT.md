@@ -886,6 +886,24 @@ export MODULITH_ACTUATOR_TOKEN="$(openssl rand -hex 32)"
 
 When a token is configured, every actuator request must carry `Authorization: Bearer <token>` or it gets 401.
 
+The `/_modulith/topology` endpoint returns the list of modules and their backend replicas:
+
+```json
+{
+  "routes": [
+    {
+      "prefix": "/orders",
+      "backend": "http://127.0.0.1:9001",
+      "replicas": ["http://127.0.0.1:9001", "http://127.0.0.1:9002"]
+    }
+  ]
+}
+```
+
+- `prefix`: URL prefix of the module (e.g., `/orders`)
+- `backend`: the first replica's URL (kept for backwards compatibility with single-replica modules)
+- `replicas`: list of all replica URLs in spawn order; for a single-replica module, this list contains one URL
+
 ---
 
 ## API Documentation (`/<module>/docs`, `/<module>/openapi.json`)

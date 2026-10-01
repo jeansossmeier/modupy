@@ -206,7 +206,39 @@ def test_topology_actuator_lists_routes(proxy_app) -> None:
         resp = client.get("/_modulith/topology")
     assert resp.status_code == 200
     routes = resp.json()["routes"]
-    assert {"prefix": "/orders", "backend": "http://orders-worker"} in routes
+    order_route = next(r for r in routes if r["prefix"] == "/orders")
+    assert order_route["prefix"] == "/orders"
+    assert order_route["backend"] == "http://orders-worker"
+
+
+def test_topology_includes_replicas_list(proxy_app) -> None:
+    with TestClient(proxy_app) as client:
+        resp = client.get("/_modulith/topology")
+    assert resp.status_code == 200
+    routes = resp.json()["routes"]
+    order_route = next(r for r in routes if r["prefix"] == "/orders")
+    assert "replicas" in order_route
+    assert order_route["replicas"] == ["http://orders-worker"]
+
+
+def test_topology_lists_all_replicas_for_scaled_module() -> None:
+    upstream = _upstream_app()
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=upstream))
+    rules = [
+        RoutingRule(
+            prefix="/orders",
+            backend_url="http://orders-1",
+            backend_urls=("http://orders-1", "http://orders-2"),
+        )
+    ]
+    app = create_proxy_app(rules, client=client)
+    with TestClient(app) as test_client:
+        resp = test_client.get("/_modulith/topology")
+    assert resp.status_code == 200
+    routes = resp.json()["routes"]
+    order_route = next(r for r in routes if r["prefix"] == "/orders")
+    assert order_route["backend"] == "http://orders-1"
+    assert order_route["replicas"] == ["http://orders-1", "http://orders-2"]
 
 
 def test_health_actuator_reports_backend_status(proxy_app) -> None:

@@ -396,7 +396,16 @@ def create_proxy_app(
             denied = _actuator_auth_response(request)
             if denied is not None:
                 return denied
-            return {"routes": [{"prefix": r.prefix, "backend": r.backend_url} for r in rules]}
+            return {
+                "routes": [
+                    {
+                        "prefix": r.prefix,
+                        "backend": r.backend_url,
+                        "replicas": list(r.backend_urls),
+                    }
+                    for r in rules
+                ]
+            }
 
         @app.get("/_modulith/live", response_model=None)
         async def live(request: Request) -> dict[str, Any] | JSONResponse:
