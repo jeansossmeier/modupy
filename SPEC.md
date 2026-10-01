@@ -45,7 +45,9 @@ It is inspired by Spring Modulith, which provides similar capabilities for Sprin
 
 The project's value proposition is a single sentence with three escape valves:
 
-> **`modulith dev` for development, `modulith dev --topology=processes` when one module needs its own CPU, `modulith deploy` when one module needs its own container — same code, no rewrites for the messaging layer.**
+> **`modulith dev` for development, `modulith dev --topology=processes` when one module needs its own CPU, `modulith extract` when one module needs its own container — same code, no rewrites for the messaging layer.**
+
+![The same three modules in three shapes: one process on day one, one process per module when a feature gets busy, and payments split off into its own service](docs/images/growth.svg)
 
 The phrase "no rewrites for the messaging layer" is doing important work. We promise zero-rewrite for events, listeners, and module structure. We do not promise zero-rewrite for shared databases, shared transactions, or shared in-memory state. Those are separate decisions a user makes consciously, ideally early.
 
@@ -504,6 +506,8 @@ Without an outbox: publish an event inside a DB transaction. Transaction commits
 
 With an outbox: publish writes to a database table in the same transaction as the business work. After commit, a dispatcher picks up the row and delivers to the listener. If the dispatcher crashes mid-delivery, the row stays incomplete and gets retried on restart.
 
+![One commit saves the order and one event_publications row per listener; after the commit each listener runs in the background, and a failing one is retried, then dead-lettered](docs/images/outbox.svg)
+
 **Guarantee: at-least-once delivery, transaction-aligned.** Listeners must be idempotent.
 
 ### 7.2 SQLAlchemy Integration
@@ -567,6 +571,9 @@ The built-in verifier in `modulith/builtin/verifier.py` ships these rules:
 3. **Declared dependencies match observed** — if a manifest declares `declared_dependencies=["payments"]`, only those modules may be imported (when manifest is present)
 4. **Events flow through contracts module** — cross-module type imports must come from `myapp.contracts.*`, not from another module's package
 5. **Module data ownership** — when manifests declare `owns_tables=[...]`, queries against another module's tables are violations, including a `ForeignKey("table.col")` string literal pointing at a table another module owns; a module with a non-empty `owns_tables` also gets a warning for any table it defines but omits from that list, so the manifest stays a complete inventory
+6. **Contracts is a sink** — every module may import from the contracts module, and the contracts module may not import any application module
+
+![payments may import the public API of orders and the events in contracts, but modulith verify refuses an import of a private name such as _orders](docs/images/boundaries.svg)
 
 ### 8.2 The AST-Based Verifier
 
@@ -631,6 +638,8 @@ Same machinery as `modulith doctor` in Spring Modulith's spirit but expanded to 
 ## Part IX — Process-Per-Module Runtime
 
 The v2 wedge. The feature that makes "modulith now, microservices later" credible.
+
+![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](docs/images/processes.svg)
 
 ### 9.1 The Topology Decision
 
