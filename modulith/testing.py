@@ -156,6 +156,9 @@ def modulith_app() -> Iterator[ModulithTestApp]:
 # ---------------------------------------------------------------------------
 
 
+_UNSET: Any = object()
+
+
 @contextlib.contextmanager
 def _module_isolation(
     target_module: str,
@@ -186,6 +189,13 @@ def _module_isolation(
     and hits its "already declared" guard. So manifest entries under the
     application package are snapshotted and cleared here too, and restored
     alongside ``sys.modules`` on exit.
+
+    The retained ancestor packages also hold each imported child as an
+    attribute, which ``from pkg import sibling`` reads instead of
+    ``sys.modules``. Those attributes are cleared for the removed modules and
+    pointed at the mocks, so a mocked sibling stays the mock however it is
+    reached, including after a bootstrap whose auto-discovery imports the
+    application package; they are restored on exit.
     """
     mocks = mock_modules or []
     app_package = target_module.split(".")[0]
@@ -194,6 +204,18 @@ def _module_isolation(
     }
     snapshot = dict(sys.modules)
     manifest_snapshot = dict(manifest._manifests)
+    attr_snapshot: list[tuple[Any, str, Any]] = []
+
+    def bind(name: str, module: Any) -> None:
+        parent_name, _, attr = name.rpartition(".")
+        parent = sys.modules.get(parent_name) if parent_name in ancestors else None
+        if parent is None:
+            return
+        attr_snapshot.append((parent, attr, vars(parent).get(attr, _UNSET)))
+        if module is _UNSET:
+            vars(parent).pop(attr, None)
+        else:
+            setattr(parent, attr, module)
 
     for name in list(sys.modules):
         if not (name == app_package or name.startswith(app_package + ".")):
@@ -201,23 +223,34 @@ def _module_isolation(
         if name in ancestors:
             continue
         del sys.modules[name]
+        bind(name, _UNSET)
 
     for package in list(manifest._manifests):
         if package == app_package or package.startswith(app_package + "."):
             del manifest._manifests[package]
 
     for name in mocks:
-        sys.modules[name] = unittest.mock.MagicMock(name=name)
-
-    importlib.import_module(target_module)
+        mock = unittest.mock.MagicMock(name=name)
+        sys.modules[name] = mock
+        bind(name, mock)
 
     try:
+        importlib.import_module(target_module)
         yield
     finally:
         for name in set(sys.modules) - set(snapshot):
             del sys.modules[name]
+            parent_name, _, attr = name.rpartition(".")
+            parent = sys.modules.get(parent_name) if parent_name in ancestors else None
+            if parent is not None:
+                vars(parent).pop(attr, None)
         for name, module in snapshot.items():
             sys.modules[name] = module
+        for parent, attr, original in reversed(attr_snapshot):
+            if original is _UNSET:
+                vars(parent).pop(attr, None)
+            else:
+                setattr(parent, attr, original)
         manifest._manifests.clear()
         manifest._manifests.update(manifest_snapshot)
 

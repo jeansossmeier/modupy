@@ -216,6 +216,42 @@ def test_modulith_module_reimports_target_after_mocking_siblings(
     assert sys.modules["fakeapp.orders"].VALUE == "real-inv"
 
 
+def test_modulith_module_mock_survives_auto_discovering_bootstrap(
+    make_fake_app, modulith_module
+) -> None:
+    """Bootstrap's auto-discovery walks the app package on disk and imports
+    every sibling it finds. A sibling named in ``mock_modules`` must stay the
+    mock for the whole block — whether it is reached through ``sys.modules``,
+    ``from fakeapp import inventory`` or the target's own import."""
+    import importlib
+    import sys
+    from unittest.mock import MagicMock
+
+    from modulith.decorators import configure
+    from modulith.runtime import _runtime
+
+    make_fake_app(
+        {
+            "orders": "from fakeapp.inventory import VALUE\nfrom fakeapp import inventory\n",
+            "inventory": "VALUE = 'real-inv'",
+        }
+    )
+    importlib.import_module("fakeapp.orders")  # real inventory is imported and attached to fakeapp
+    real_inventory = sys.modules["fakeapp.inventory"]
+
+    with modulith_module("fakeapp.orders", mock_modules=["fakeapp.inventory"]):
+        configure(package="fakeapp")
+        _runtime.ensure_bootstrapped()
+
+        assert isinstance(sys.modules["fakeapp.inventory"], MagicMock)
+        orders = sys.modules["fakeapp.orders"]
+        assert isinstance(orders.VALUE, MagicMock)
+        assert isinstance(orders.inventory, MagicMock)
+        assert isinstance(importlib.import_module("fakeapp").inventory, MagicMock)
+
+    assert importlib.import_module("fakeapp").inventory is real_inventory
+
+
 def test_modulith_module_reenters_when_target_already_declared_a_manifest(
     make_fake_app, modulith_module
 ) -> None:
