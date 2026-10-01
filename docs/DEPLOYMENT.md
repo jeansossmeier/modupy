@@ -1227,6 +1227,22 @@ group.
 - A direct `publish()` raises the broker's error to its caller. modupy keeps no in-memory buffer of events it could not send
 - Inside a bound outbox session, the broker send is saved as an outbox row in your transaction and made after the commit. While the broker is down the row stays in the outbox and the retry loop sends it again, until `dead_letter_after_attempts` (10 by default) failed attempts dead-letter it. `modulith outbox dead-letter --retry-all` resubmits dead-lettered rows once the broker is back
 
+**Dead-lettered deliveries (database broker only):**
+
+```bash
+modulith broker dead-letter               # list them, with attempts and last error (--list is the default)
+modulith broker dead-letter --retry-all   # make every one claimable again, attempts reset
+```
+
+A delivery is dead-lettered after `max_delivery_attempts` failed dispatches or
+reclaims, or at once when its payload cannot be read. Each belongs to one
+consumer group, so `--retry-all` hands it back only to that group; a group that
+already completed the same message does not receive it again. `--list` and
+`--retry-all` are mutually exclusive. The command runs against the broker store
+the service is configured with, and exits 1 with `no database broker tables` if
+that store has none. The shm and Redis brokers do not support it yet, and exit 1
+saying so. For the outbox, use `modulith outbox dead-letter`.
+
 **Consuming (every broker):**
 - A failed broker call is logged and retried under capped exponential backoff, 0.05 s doubling up to 5 s. `/health` reports `degraded` until that call succeeds again
 - A message that a stopped or crashed consumer left claimed or pending is delivered again once it has sat idle for `reclaim_stale_seconds` (database and SHM) or `reclaim_min_idle_ms` (Redis). Consumers reclaim it themselves: the supervisor takes no part, and nothing rebalances

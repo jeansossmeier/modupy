@@ -957,6 +957,14 @@ Timing (claim visibility, the reclaim window, retry backoff, prune age) is
 gated on the **database server clock**, so producers and competing consumers on
 different hosts stay consistent without a synchronized wall clock.
 
+A delivery that fails `max_delivery_attempts` times, or that a consumer
+crashes on that often, stays in `broker_message` as a dead letter until prune
+removes it. `modulith broker dead-letter` lists them with their last error;
+`modulith broker dead-letter --retry-all` makes every one claimable again with
+its attempts reset. Each dead letter belongs to one consumer group, so only
+that group's consumer receives it again and a group that already handled the
+message does not. Only the database broker supports this command so far.
+
 With `broker = "database"`, a bare `@externalized` event's default target is
 `database:{event-fqn}`; pin one explicitly with
 `@externalized(target="database:orders.placed")` exactly as with Redis. Every

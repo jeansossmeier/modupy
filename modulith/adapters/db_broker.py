@@ -160,6 +160,7 @@ from ..config import (
     MAX_PAYLOAD_BYTES,
     _validate_sql_schema,
 )
+from ._dead_letter import DeadLetter
 from ._polling_consumer import PollingConsumer
 from ._state_path import resolve_state_file
 
@@ -2443,6 +2444,84 @@ class DatabaseBroker:
 
         removed: tuple[int, int] = await self._write(op)
         return removed
+
+    @_on_owning_loop
+    async def list_dead_letters(
+        self, *, after: tuple[datetime, str] | None = None, limit: int = 100
+    ) -> list[DeadLetter]:
+        """One page of dead-lettered deliveries, oldest first by ``(created_at, id)``.
+
+        ``after`` is the ``cursor`` of the last entry of the previous page.
+        Every entry is one group's delivery of a message, so a message that
+        died for two groups is listed twice. Expects the broker tables to
+        exist; it never creates them.
+        """
+        from sqlalchemy import and_, or_, select
+
+        _, _, message = broker_schema()
+
+        async def op(conn: Any) -> list[DeadLetter]:
+            stmt = (
+                select(message)
+                .where(message.c.status == "dead")
+                .order_by(message.c.created_at, message.c.id)
+                .limit(limit)
+            )
+            if after is not None:
+                created_at, row_id = after
+                stmt = stmt.where(
+                    or_(
+                        message.c.created_at > created_at,
+                        and_(message.c.created_at == created_at, message.c.id > row_id),
+                    )
+                )
+            return [
+                DeadLetter(
+                    id=str(row["id"]),
+                    target=str(row["target"]),
+                    consumer_group=str(row["consumer_group"]),
+                    event_type=row["event_type"],
+                    attempts=int(row["attempts"]),
+                    last_error=row["last_error"],
+                    created_at=row["created_at"],
+                )
+                for row in (await conn.execute(stmt)).mappings()
+            ]
+
+        page: list[DeadLetter] = await self._write(op)
+        return page
+
+    @_on_owning_loop
+    async def retry_dead_letters(self) -> int:
+        """Make every dead-lettered delivery claimable again; return how many.
+
+        Each row is already addressed to one consumer group, so only that
+        group's consumer receives it again; rows other groups completed are
+        not touched. Attempts and the recorded error are cleared. Expects the
+        broker tables to exist; it never creates them.
+        """
+        from sqlalchemy import update
+
+        _, _, message = broker_schema()
+
+        async def op(conn: Any) -> int:
+            result = await conn.execute(
+                update(message)
+                .where(message.c.status == "dead")
+                .values(
+                    status="pending",
+                    attempts=0,
+                    last_error=None,
+                    available_at=await self._now(conn),
+                    claimed_at=None,
+                    claimed_by=None,
+                    dispatch_started=False,
+                )
+            )
+            return _rowcount(result)
+
+        count: int = await self._write(op)
+        return count
 
 
 # ---------------------------------------------------------------------------

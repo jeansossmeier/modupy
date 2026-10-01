@@ -616,6 +616,7 @@ Every setting directly under `[tool.modulith]` can also come from an environment
 | `modulith migrate` | creates the outbox and database-broker tables | deploying |
 | `modulith outbox status` | counts incomplete, completed and dead-lettered events | operations |
 | `modulith outbox dead-letter` | lists dead-lettered events, or replays them with `--retry-all` | incidents |
+| `modulith broker dead-letter` | lists dead-lettered broker deliveries, or resubmits them with `--retry-all` (database broker only) | incidents |
 | `modulith broker drop-group <group>` | removes a retired module's consumer group | operations |
 | `modulith extract <module>` | turns one module into a standalone service | splitting a service off |
 | `modulith k8s-manifest` | writes Kubernetes manifests, one Deployment per module | deploying |

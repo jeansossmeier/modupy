@@ -2575,6 +2575,147 @@ def test_broker_drop_group_does_not_create_a_missing_database_store(
     assert not db_file.exists()
 
 
+def _seed_dead_delivery(url: str) -> str:
+    """One message fanned out to two groups: orders dead-letters it, billing completes it."""
+    from modulith.adapters.db_broker import DatabaseBroker
+
+    async def seed() -> str:
+        broker = DatabaseBroker(url=url)
+        try:
+            await broker.subscribe(["t.Order"], "modulith-orders")
+            await broker.subscribe(["t.Order"], "modulith-billing")
+            await broker.publish("t.Order", b"{}", {"event_type": "t.Order"})
+            (orders,) = await broker.claim_batch(
+                "modulith-orders", batch_size=5, consumer_name="o1"
+            )
+            (billing,) = await broker.claim_batch(
+                "modulith-billing", batch_size=5, consumer_name="b1"
+            )
+            await broker.fail(
+                orders["id"], "boom: listener raised", consumer_name="o1", max_attempts=1
+            )
+            await broker.ack(billing["id"], consumer_name="b1")
+            return str(orders["id"])
+        finally:
+            await broker.close()
+
+    return asyncio.run(seed())
+
+
+def _claim_for(url: str, group: str) -> list[dict]:
+    from modulith.adapters.db_broker import DatabaseBroker
+
+    async def claim() -> list[dict]:
+        broker = DatabaseBroker(url=url)
+        try:
+            return await broker.claim_batch(group, batch_size=5, consumer_name="again")
+        finally:
+            await broker.close()
+
+    return asyncio.run(claim())
+
+
+@pytest.mark.parametrize("flags", [[], ["--list"]])
+def test_broker_dead_letter_lists_an_exhausted_delivery_with_its_error(
+    make_fake_app, monkeypatch, tmp_path, flags
+):
+    make_fake_app({"orders": ""})
+    url = _database_project(tmp_path, monkeypatch, tmp_path / "broker.db")
+    row_id = _seed_dead_delivery(url)
+
+    result = runner.invoke(app, ["broker", "dead-letter", *flags])
+
+    assert result.exit_code == 0, result.output
+    assert "1 dead-lettered message(s):" in result.output
+    assert (
+        f"  {row_id}  t.Order  target=t.Order  group=modulith-orders  attempts=1  "
+        "last_error=boom: listener raised"
+    ) in result.output
+
+
+def test_broker_dead_letter_retry_all_reaches_only_the_group_whose_delivery_died(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    url = _database_project(tmp_path, monkeypatch, tmp_path / "broker.db")
+    row_id = _seed_dead_delivery(url)
+
+    result = runner.invoke(app, ["broker", "dead-letter", "--retry-all"])
+
+    assert result.exit_code == 0, result.output
+    assert "resubmitted 1 dead-lettered message(s)" in result.output
+    assert _claim_for(url, "modulith-billing") == []
+    assert [row["id"] for row in _claim_for(url, "modulith-orders")] == [row_id]
+
+
+def test_broker_dead_letter_with_nothing_dead_says_so(make_fake_app, monkeypatch, tmp_path):
+    from modulith.adapters.db_broker import DatabaseBroker
+
+    make_fake_app({"orders": ""})
+    url = _database_project(tmp_path, monkeypatch, tmp_path / "broker.db")
+
+    async def seed() -> None:
+        broker = DatabaseBroker(url=url)
+        try:
+            await broker.subscribe(["t.Order"], "modulith-orders")
+        finally:
+            await broker.close()
+
+    asyncio.run(seed())
+
+    result = runner.invoke(app, ["broker", "dead-letter", "--list"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().endswith("no dead-lettered messages")
+
+
+def test_broker_dead_letter_flag_conflict_is_reported_before_any_environment_check(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    state_home = tmp_path / "empty-state-home"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+
+    result = runner.invoke(app, ["broker", "dead-letter", "--list", "--retry-all"])
+
+    assert result.exit_code == 1
+    assert "--list and --retry-all are mutually exclusive" in result.stderr
+    assert "no shm broker store" not in result.output
+    assert not state_home.exists()
+
+
+@pytest.mark.parametrize("flags", [[], ["--retry-all"]])
+def test_broker_dead_letter_names_a_broker_without_the_methods(
+    make_fake_app, monkeypatch, tmp_path, flags
+):
+    from modulith.adapters.db_broker import DatabaseBroker
+
+    make_fake_app({"orders": ""})
+    _database_project(tmp_path, monkeypatch, tmp_path / "broker.db")
+    monkeypatch.delattr(DatabaseBroker, "list_dead_letters")
+    monkeypatch.delattr(DatabaseBroker, "retry_dead_letters")
+
+    result = runner.invoke(app, ["broker", "dead-letter", *flags])
+
+    assert result.exit_code == 1, result.output
+    assert "broker 'database' does not support dead-letter inspection" in result.stderr
+
+
+def test_broker_dead_letter_does_not_create_a_missing_database_store(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    db_file = tmp_path / "absent.db"
+    _database_project(tmp_path, monkeypatch, db_file)
+
+    result = runner.invoke(app, ["broker", "dead-letter"])
+
+    assert result.exit_code == 1, result.output
+    assert "no database broker tables" in result.stderr
+    assert not db_file.exists()
+
+
 # ---------------------------------------------------------------------------
 # modulith migrate
 # ---------------------------------------------------------------------------

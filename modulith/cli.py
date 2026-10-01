@@ -1433,8 +1433,8 @@ broker_app = typer.Typer(help="Broker operational commands.")
 app.add_typer(broker_app, name="broker")
 
 
-def _exit_unless_shm_store_exists() -> None:
-    """Exit 1 when the shm store drop-group would act on does not exist.
+def _exit_unless_shm_store_exists(outcome: str = "nothing was removed") -> None:
+    """Exit 1 when the shm store a broker command would act on does not exist.
 
     Bootstrapping the shm broker creates its state directory and SQLite
     file, so the check has to run first, from configuration alone.
@@ -1454,7 +1454,7 @@ def _exit_unless_shm_store_exists() -> None:
         return
     if not path.is_file():
         typer.echo(
-            f"error: no shm broker store at {path}; nothing was removed. Run this with "
+            f"error: no shm broker store at {path}; {outcome}. Run this with "
             "the service's broker configuration (state_dir or MODULITH_BROKER_STATE_DIR).",
             err=True,
         )
@@ -1619,6 +1619,88 @@ def broker_drop_group(
         f"dropped {scope}: {subscriptions} subscription(s), "
         f"{deliveries} pending or claimed delivery(ies)"
     )
+
+
+_DEAD_LETTER_PAGE_SIZE = 100
+
+
+def _dead_letter_broker(rt: Runtime, scheme: str) -> Any | None:
+    """The registered broker when it offers dead-letter listing and retry."""
+    registry = rt.broker_registry
+    if registry is None or scheme not in registry.schemes():
+        return None
+    broker = registry.get(scheme)
+    if all(callable(getattr(broker, m, None)) for m in ("list_dead_letters", "retry_dead_letters")):
+        return broker
+    return None
+
+
+@broker_app.command("dead-letter")
+def broker_dead_letter(
+    retry_all: bool = typer.Option(
+        False, "--retry-all", help="Resubmit every dead-lettered message."
+    ),
+    list_dead: bool = typer.Option(False, "--list", help="List dead-lettered messages (default)."),
+) -> None:
+    """List dead-lettered broker deliveries for inspection, or resubmit them all.
+
+    Listing is the default; ``--list`` makes it explicit and is refused with
+    ``--retry-all``. A resubmitted delivery reaches only the consumer group
+    whose delivery died. Supported by the database broker.
+    """
+    # The flag conflict is an argument error: report it before any environment check.
+    if retry_all and list_dead:
+        typer.echo("--list and --retry-all are mutually exclusive", err=True)
+        raise typer.Exit(code=1)
+
+    _runtime.configure(topology="processes")
+    _exit_unless_shm_store_exists("nothing was listed or resubmitted")
+    rt = _bootstrap_or_exit()
+    cfg = rt.config
+    assert cfg is not None
+    broker = _dead_letter_broker(rt, cfg.broker)
+    if broker is None:
+        typer.echo(
+            f"error: broker {cfg.broker!r} does not support dead-letter inspection", err=True
+        )
+        raise typer.Exit(code=1)
+
+    async def run() -> int | list[Any]:
+        # One event loop for every call: the database broker binds its engine
+        # to the loop that first used it.
+        if cfg.broker == "database" and not await broker.has_schema():
+            typer.echo(
+                f"error: no database broker tables at {broker.store_location}; "
+                "nothing was listed or resubmitted. Run this with the service's "
+                "broker configuration.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if retry_all:
+            return int(await broker.retry_dead_letters())
+        dead: list[Any] = []
+        after = None
+        while True:
+            page = await broker.list_dead_letters(after=after, limit=_DEAD_LETTER_PAGE_SIZE)
+            dead.extend(page)
+            if len(page) < _DEAD_LETTER_PAGE_SIZE:
+                return dead
+            after = page[-1].cursor
+
+    outcome = asyncio.run(run())
+    if isinstance(outcome, int):
+        typer.echo(f"resubmitted {outcome} dead-lettered message(s)")
+        return
+    if not outcome:
+        typer.echo("no dead-lettered messages")
+        return
+    typer.echo(f"{len(outcome)} dead-lettered message(s):")
+    for entry in outcome:
+        typer.echo(
+            f"  {entry.id}  {entry.event_type}  target={entry.target}  "
+            f"group={entry.consumer_group}  attempts={entry.attempts}  "
+            f"last_error={entry.last_error}"
+        )
 
 
 @outbox_app.command("status")

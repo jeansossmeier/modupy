@@ -50,6 +50,7 @@ from modulith import (
     event,
     hookimpl,
 )
+from modulith.adapters._dead_letter import DeadLetter
 from modulith.adapters._state_path import _namespace
 from modulith.adapters.db_broker import (
     _SQLITE_BUSY_MAX_RETRIES,
@@ -4691,6 +4692,125 @@ async def test_drop_group_removes_a_retired_groups_subscription_and_undelivered_
     assert groups == {"modulith-orders"}
     assert message_groups == {"modulith-orders"}
     assert await broker.drop_group("modulith-retired") == (0, 0)
+
+
+async def test_list_dead_letters_reports_each_dead_delivery_with_its_error(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker.subscribe(["t.A"], "modulith-orders")
+    await broker.publish("t.A", b"x", {"event_type": "t.A"})
+    (row,) = await broker.claim_batch("modulith-orders", batch_size=5, consumer_name="c1")
+    await broker.fail(row["id"], "boom", consumer_name="c1", max_attempts=1)
+
+    dead = await broker.list_dead_letters()
+
+    assert dead == [
+        DeadLetter(
+            id=row["id"],
+            target="t.A",
+            consumer_group="modulith-orders",
+            event_type="t.A",
+            attempts=1,
+            last_error="boom",
+            created_at=dead[0].created_at,
+        )
+    ]
+    assert dead[0].cursor == (dead[0].created_at, row["id"])
+
+
+async def test_list_dead_letters_skips_rows_that_are_not_dead(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker.subscribe(["t.A"], "modulith-orders")
+    await broker.publish("t.A", b"x", {"event_type": "t.A"})
+    await broker.publish("t.A", b"y", {"event_type": "t.A"})
+    assert len(await broker.claim_batch("modulith-orders", batch_size=1, consumer_name="c1")) == 1
+
+    assert await broker.list_dead_letters() == []
+
+
+async def test_list_dead_letters_pages_by_keyset_without_gaps_or_repeats(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker.subscribe(["t.A"], "modulith-orders")
+    ids = [
+        await _insert(
+            engine,
+            id=f"m{i}",
+            target="t.A",
+            group="modulith-orders",
+            status="dead",
+            age_seconds=10 - i,
+        )
+        for i in range(5)
+    ]
+    await _insert(
+        engine, id="alive", target="t.A", group="modulith-orders", status="pending", age_seconds=1
+    )
+
+    seen: list[str] = []
+    after = None
+    while page := await broker.list_dead_letters(after=after, limit=2):
+        assert len(page) <= 2
+        seen.extend(entry.id for entry in page)
+        after = page[-1].cursor
+
+    assert seen == ids
+
+
+async def test_retry_dead_letters_resubmits_only_the_group_whose_delivery_died(
+    engine: Any,
+) -> None:
+    broker = DatabaseBroker(engine=engine, completion_mode="mark")
+    await broker.subscribe(["t.A"], "modulith-orders")
+    await broker.subscribe(["t.A"], "modulith-billing")
+    await broker.publish("t.A", b"x", {"event_type": "t.A"})
+    (orders,) = await broker.claim_batch("modulith-orders", batch_size=5, consumer_name="o1")
+    (billing,) = await broker.claim_batch("modulith-billing", batch_size=5, consumer_name="b1")
+    await broker.fail(orders["id"], "boom", consumer_name="o1", max_attempts=1)
+    await broker.ack(billing["id"], consumer_name="b1")
+
+    assert await broker.retry_dead_letters() == 1
+
+    assert await broker.list_dead_letters() == []
+    assert await broker.claim_batch("modulith-billing", batch_size=5, consumer_name="b2") == []
+    (again,) = await broker.claim_batch("modulith-orders", batch_size=5, consumer_name="o2")
+    assert (again["id"], again["attempts"], again["last_error"]) == (orders["id"], 0, None)
+    assert await _fetch_statuses(engine) == ["claimed", "done"]
+
+
+async def test_retry_dead_letters_clears_claim_fields_and_makes_the_row_due_now(
+    engine: Any,
+) -> None:
+    from sqlalchemy import select
+
+    broker = DatabaseBroker(engine=engine)
+    await broker.subscribe(["t.A"], "modulith-orders")
+    await broker.publish("t.A", b"x", {"event_type": "t.A"})
+    (row,) = await broker.claim_batch("modulith-orders", batch_size=5, consumer_name="c1")
+    await broker.renew_claims([row["id"]], consumer_name="c1", start_dispatch=True)
+    await broker.fail(row["id"], "boom", consumer_name="c1", max_attempts=1)
+
+    await broker.retry_dead_letters()
+
+    _, _, message = broker_schema()
+    async with engine.connect() as conn:
+        (stored,) = (await conn.execute(select(message))).mappings().all()
+    assert (
+        stored["status"],
+        stored["attempts"],
+        stored["last_error"],
+        stored["claimed_at"],
+        stored["claimed_by"],
+        stored["dispatch_started"],
+    ) == ("pending", 0, None, None, None, False)
+    assert len(await broker.claim_batch("modulith-orders", batch_size=5, consumer_name="c2")) == 1
+
+
+async def test_retry_dead_letters_with_nothing_dead_returns_zero(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker.subscribe(["t.A"], "modulith-orders")
+    await broker.publish("t.A", b"x", {"event_type": "t.A"})
+
+    assert await broker.retry_dead_letters() == 0
+    assert await _fetch_statuses(engine) == ["pending"]
 
 
 async def test_group_backlog_reports_undelivered_rows_of_an_unsubscribed_group(
