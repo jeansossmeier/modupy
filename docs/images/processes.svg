@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="440" viewBox="0 0 880 440" role="img" aria-labelledby="proc-title proc-desc">
+<title id="proc-title">What modulith run --topology processes starts</title>
+<desc id="proc-desc">One command starts a main process and one worker process per module, all on one machine. The main process holds the reverse proxy on port 8000, which sends /inventory requests to the inventory worker on port 9001 and /orders requests to the orders worker on port 9002, and the supervisor, which restarts a crashed worker after 1, 2, 4, 8 and 16 seconds and gives up after six crashes in a row. The payments worker on port 9003 serves no routes and only runs its listener. The workers exchange events through the built-in SHM broker. The contracts module gets no worker, and a Redis or database broker lets the workers span machines.</desc>
+<style>
+.card{fill:#f6f8fa;stroke:#d0d7de}
+.box{fill:#ffffff;stroke:#d0d7de;stroke-width:1.5}
+.sub{fill:#f6f8fa;stroke:#d0d7de;stroke-width:1.2}
+.machine{fill:none;stroke:#8c959f;stroke-width:1.5;stroke-dasharray:6 5}
+.b{font:600 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328}
+.t{font:500 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328}
+.s{font:400 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#59636e}
+.c{font:500 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#59636e}
+.m{font:600 14px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif}
+.orders{fill:#ddf4ff;stroke:#0969da;stroke-width:1.5}.orders-t{fill:#0550ae}
+.payments{fill:#dafbe1;stroke:#1a7f37;stroke-width:1.5}.payments-t{fill:#116329}
+.inventory{fill:#fff8c5;stroke:#9a6700;stroke-width:1.5}.inventory-t{fill:#7d4e00}
+.bus{fill:#ffeff7;stroke:#bf3989;stroke-width:1.5}
+.bus-t{font:600 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#99286e}
+.ev{fill:none;stroke:#bf3989;stroke-width:1.5;stroke-dasharray:4 3}
+.evhead{fill:#bf3989}
+.wire{fill:none;stroke:#8c959f;stroke-width:1.5}
+.head{fill:#8c959f}
+@media (prefers-color-scheme:dark){
+.card{fill:#161b22;stroke:#30363d}
+.box{fill:#0d1117;stroke:#3d444d}
+.sub{fill:#161b22;stroke:#3d444d}
+.machine{stroke:#656c76}
+.b,.t{fill:#e6edf3}
+.s,.c{fill:#9198a1}
+.orders{fill:#172b45;stroke:#4493f8}.orders-t{fill:#79c0ff}
+.payments{fill:#17311f;stroke:#3fb950}.payments-t{fill:#7ee787}
+.inventory{fill:#33290f;stroke:#d29922}.inventory-t{fill:#e3b341}
+.bus{fill:#36192b;stroke:#db61a2}.bus-t{fill:#ff9bce}
+.ev{stroke:#db61a2}.evhead{fill:#db61a2}
+.wire{stroke:#656c76}.head{fill:#656c76}
+}
+</style>
+<defs>
+<marker id="proc-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker>
+<marker id="proc-evhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="evhead" d="M0,0 L10,5 L0,10 z"/></marker>
+</defs>
+<rect class="card" x="0.5" y="0.5" width="879" height="439" rx="12"/>
+
+<!-- one command, one machine -->
+<rect class="machine" x="124" y="20" width="736" height="400" rx="14"/>
+<text class="c" x="140" y="44">modulith run myapp.main:app --topology processes</text>
+<text class="s" x="844" y="44" text-anchor="end">one machine</text>
+
+<!-- main process: proxy + supervisor -->
+<rect class="box" x="144" y="60" width="696" height="112" rx="10"/>
+<text class="s" x="158" y="78">main process</text>
+<rect class="sub" x="158" y="88" width="332" height="72" rx="8"/>
+<text class="b" x="172" y="108">reverse proxy <tspan class="c">:8000</tspan></text>
+<text class="c" x="172" y="129">/inventory/… → inventory :9001</text>
+<text class="c" x="172" y="148">/orders/… → orders :9002</text>
+<rect class="sub" x="504" y="88" width="322" height="72" rx="8"/>
+<text class="b" x="518" y="108">supervisor</text>
+<text class="s" x="518" y="129">restarts crashed workers after 1, 2, 4, 8, 16 s</text>
+<text class="s" x="518" y="148">gives up after 6 crashes in a row</text>
+
+<!-- the client -->
+<rect class="box" x="12" y="108" width="68" height="32" rx="8"/>
+<text class="t" x="46" y="129" text-anchor="middle">client</text>
+<text class="s" x="101" y="116" text-anchor="middle">HTTP</text>
+<path class="wire" d="M80 124 H157" marker-end="url(#proc-head)"/>
+
+<!-- HTTP into the workers -->
+<path class="wire" d="M248 160 V214" marker-end="url(#proc-head)"/>
+<path class="wire" d="M476 160 V214" marker-end="url(#proc-head)"/>
+<text class="s" x="508" y="204">worker processes, started by the supervisor</text>
+
+<!-- workers -->
+<rect class="inventory" x="144" y="216" width="208" height="90" rx="10"/>
+<text class="m inventory-t" x="160" y="241">inventory</text>
+<text class="c" x="336" y="241" text-anchor="end">:9001</text>
+<text class="c" x="160" y="266">serves /inventory</text>
+<text class="c" x="160" y="287">@listener reserve()</text>
+
+<rect class="orders" x="388" y="216" width="208" height="90" rx="10"/>
+<text class="m orders-t" x="404" y="241">orders</text>
+<text class="c" x="580" y="241" text-anchor="end">:9002</text>
+<text class="c" x="404" y="266">serves /orders</text>
+<text class="c" x="404" y="287">@listener on_payment()</text>
+
+<rect class="payments" x="632" y="216" width="208" height="90" rx="10"/>
+<text class="m payments-t" x="648" y="241">payments</text>
+<text class="c" x="824" y="241" text-anchor="end">:9003</text>
+<text class="c" x="648" y="266">no routes</text>
+<text class="c" x="648" y="287">@listener charge()</text>
+
+<!-- events between workers -->
+<path class="ev" d="M248 308 V344" marker-start="url(#proc-evhead)" marker-end="url(#proc-evhead)"/>
+<path class="ev" d="M492 308 V344" marker-start="url(#proc-evhead)" marker-end="url(#proc-evhead)"/>
+<path class="ev" d="M736 308 V344" marker-start="url(#proc-evhead)" marker-end="url(#proc-evhead)"/>
+<rect class="bus" x="144" y="346" width="696" height="34" rx="8"/>
+<text class="bus-t" x="492" y="367" text-anchor="middle">built-in SHM broker: events between workers, kept durably on this machine</text>
+
+<text class="s" x="144" y="404">contracts gets no worker: it only defines events</text>
+<text class="s" x="840" y="404" text-anchor="end">a Redis or database broker lets workers span machines</text>
+</svg>

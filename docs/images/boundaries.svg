@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="420" viewBox="0 0 880 420" role="img" aria-labelledby="walls-title walls-desc">
+<title id="walls-title">What modulith verify allows between modules</title>
+<desc id="walls-desc">The payments module may import the public API of orders, such as is_fulfilled, and may import events from contracts. Importing a private name of orders, such as _orders, is refused by the no-internal-imports rule. Every module may import contracts, and contracts imports no module. modulith verify also checks the rules no-cyclic-dependency, use-contracts, undeclared-dependency, contracts-is-sink and data-ownership, the last one as a warning.</desc>
+<style>
+.card{fill:#f6f8fa;stroke:#d0d7de}
+.box{fill:#ffffff;stroke:#d0d7de;stroke-width:1.5}
+.private{fill:#ffffff;stroke:#cf222e;stroke-width:1.5;stroke-dasharray:6 4}
+.b{font:600 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328}
+.s{font:400 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#59636e}
+.c{font:500 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#59636e}
+.f{font:500 12.5px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#1f2328}
+.r{font:500 11px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#59636e}
+.m{font:600 14px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif}
+.orders{fill:#ddf4ff;stroke:#0969da;stroke-width:1.5}.orders-t{fill:#0550ae}
+.payments{fill:#dafbe1;stroke:#1a7f37;stroke-width:1.5}.payments-t{fill:#116329}
+.contracts{fill:#eaeef2;stroke:#8c959f;stroke-width:1.5}.contracts-t{fill:#424a53}
+.yes{fill:none;stroke:#1a7f37;stroke-width:1.75}.yes-h{fill:#1a7f37}
+.yes-t{font:600 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1a7f37}
+.no{fill:none;stroke:#cf222e;stroke-width:1.75}.no-f{fill:#cf222e}
+.no-t{font:600 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#cf222e}
+.no-c{font:500 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#cf222e}
+.x{stroke:#ffffff;stroke-width:2.2;stroke-linecap:round}
+.chip{fill:#ffffff;stroke:#d0d7de}
+@media (prefers-color-scheme:dark){
+.card{fill:#161b22;stroke:#30363d}
+.box,.chip{fill:#0d1117;stroke:#3d444d}
+.private{fill:#0d1117;stroke:#f85149}
+.b,.f{fill:#e6edf3}
+.s,.c,.r{fill:#9198a1}
+.orders{fill:#172b45;stroke:#4493f8}.orders-t{fill:#79c0ff}
+.payments{fill:#17311f;stroke:#3fb950}.payments-t{fill:#7ee787}
+.contracts{fill:#262c36;stroke:#656c76}.contracts-t{fill:#d1d7e0}
+.yes{stroke:#3fb950}.yes-h{fill:#3fb950}.yes-t{fill:#3fb950}
+.no{stroke:#f85149}.no-f{fill:#f85149}.no-t,.no-c{fill:#ff7b72}
+.x{stroke:#0d1117}
+}
+</style>
+<defs>
+<marker id="walls-yes" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="yes-h" d="M0,0 L10,5 L0,10 z"/></marker>
+</defs>
+<rect class="card" x="0.5" y="0.5" width="879" height="419" rx="12"/>
+
+<!-- payments, the importer -->
+<rect class="payments" x="32" y="112" width="180" height="112" rx="10"/>
+<text class="m payments-t" x="122" y="164" text-anchor="middle">payments</text>
+<text class="s" x="122" y="184" text-anchor="middle">imports from…</text>
+
+<!-- orders, with its public API and its private names -->
+<rect class="orders" x="400" y="56" width="448" height="224" rx="10"/>
+<text class="m orders-t" x="416" y="82">orders</text>
+<text class="s" x="428" y="108">public API</text>
+<rect class="box" x="428" y="118" width="164" height="28" rx="6"/>
+<text class="f" x="442" y="137">create_order()</text>
+<rect class="box" x="428" y="154" width="164" height="28" rx="6"/>
+<text class="f" x="442" y="173">is_fulfilled()</text>
+<rect class="box" x="428" y="190" width="164" height="28" rx="6"/>
+<text class="f" x="442" y="209">router</text>
+<rect class="private" x="620" y="96" width="212" height="168" rx="8"/>
+<text class="s" x="636" y="120">private to orders</text>
+<rect class="chip" x="636" y="130" width="180" height="28" rx="6"/>
+<text class="c" x="650" y="149">_orders</text>
+<rect class="chip" x="636" y="166" width="180" height="28" rx="6"/>
+<text class="c" x="650" y="185">_fulfilled</text>
+<rect class="chip" x="636" y="202" width="180" height="28" rx="6"/>
+<text class="c" x="650" y="221">_internal/</text>
+
+<!-- allowed: the public API -->
+<path class="yes" d="M212 168 H424" marker-end="url(#walls-yes)"/>
+<text class="yes-t" x="318" y="158" text-anchor="middle">✓ the public API</text>
+
+<!-- refused: a private name -->
+<path class="no" d="M180 112 V34 H726 V84"/>
+<circle class="no-f" cx="726" cy="96" r="11"/>
+<path class="x" d="M721.5 91.5 L730.5 100.5 M730.5 91.5 L721.5 100.5"/>
+<text class="no-t" x="300" y="26">✗ a private name</text>
+<text class="no-c" x="420" y="26">from myapp.orders import _orders</text>
+<text class="no-c" x="716" y="49" text-anchor="end">no-internal-imports</text>
+
+<!-- contracts, shared by everyone -->
+<path class="yes" d="M122 224 V310" marker-end="url(#walls-yes)"/>
+<path class="yes" d="M510 280 V310" marker-end="url(#walls-yes)"/>
+<text class="yes-t" x="132" y="272">✓ events</text>
+<rect class="contracts" x="32" y="312" width="816" height="36" rx="8"/>
+<text class="m contracts-t" x="48" y="335" style="font-size:13px">contracts</text>
+<text class="c" x="132" y="335">OrderCreated</text>
+<text class="c" x="236" y="335">PaymentReceived</text>
+<text class="s" x="832" y="335" text-anchor="end">every module may import it, and it imports no module</text>
+
+<!-- the other rules -->
+<text class="s" x="32" y="391">verify also checks</text>
+<rect class="chip" x="146" y="376" width="148" height="24" rx="12"/>
+<text class="r" x="220" y="392" text-anchor="middle">no-cyclic-dependency</text>
+<rect class="chip" x="302" y="376" width="104" height="24" rx="12"/>
+<text class="r" x="354" y="392" text-anchor="middle">use-contracts</text>
+<rect class="chip" x="414" y="376" width="156" height="24" rx="12"/>
+<text class="r" x="492" y="392" text-anchor="middle">undeclared-dependency</text>
+<rect class="chip" x="578" y="376" width="128" height="24" rx="12"/>
+<text class="r" x="642" y="392" text-anchor="middle">contracts-is-sink</text>
+<rect class="chip" x="714" y="376" width="134" height="24" rx="12"/>
+<text class="r" x="781" y="392" text-anchor="middle">data-ownership ⚠</text>
+</svg>

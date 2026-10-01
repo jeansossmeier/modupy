@@ -7,6 +7,8 @@
 
 **Start as one app. Grow into processes and services without re-architecting.**
 
+![The same three modules in three shapes: one process on day one, one process per module when a feature gets busy, and payments split off into its own service](docs/images/growth.svg)
+
 modulith helps you build a Python backend as a **modular monolith**: one codebase, split into modules that talk through events and can't reach into each other's code.
 On day one it is a plain FastAPI app.
 As your company grows, the same code runs one process per module, scales the busy parts, keeps events safe in your database, and splits a module off into its own service.
@@ -68,6 +70,8 @@ async def write_thank_you_note(event: OrderCreated) -> None:
     await notes.save(event.order_id, note)  # llm and notes: your model client and your storage
 ```
 
+![In one process the customer waits for the LLM call; with the outbox or a worker process the request returns at once, and the call runs and retries in the background](docs/images/ai-listener.svg)
+
 Then choose how it runs. The listener does not change:
 
 - **With the outbox on** and the order published inside its database session ([step 2](#2-never-lose-an-event)), the note is written after the order commits, in the background, so placing an order stays fast. A failed model call is retried with backoff, up to 10 attempts by default, then kept as a dead letter. `modulith outbox dead-letter --retry-all` replays it by running the listener inside that command, so run it where your model credentials are.
@@ -100,6 +104,8 @@ Small modules with a public API also keep the context an assistant needs small, 
 Three modules and one shared contract.
 `orders` publishes an event, `payments` and `inventory` react to it, and no module imports another.
 An event is any class marked `@event`; a frozen dataclass is the recommended shape.
+
+![orders publishes OrderCreated, which payments and inventory receive; payments publishes PaymentReceived, which orders receives; both events live in contracts](docs/images/event-flow.svg)
 
 ```python
 # myapp/contracts/events.py
@@ -340,6 +346,8 @@ $ modulith run myapp.main:app --topology=processes
 modulith → process-per-module: 3 worker(s) [inventory:9001, orders:9002, payments:9003], reverse proxy on http://0.0.0.0:8000
 ```
 
+![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](docs/images/processes.svg)
+
 Each module now runs in its own process behind one public port, so the URLs do not change:
 
 ```bash
@@ -388,6 +396,10 @@ pytest
 
 ### 1. Keep modules independent
 
+A module may call another module's public functions and use the events in `contracts`; `modulith verify` refuses the rest:
+
+![payments may import the public API of orders and the events in contracts, but modulith verify refuses an import of a private name such as _orders](docs/images/boundaries.svg)
+
 Put the boundary check in CI, so nobody, human or AI, quietly couples two modules:
 
 ```yaml
@@ -419,6 +431,8 @@ Single-process `modulith dev` only warns, so a violation never stops your dev se
 The outbox writes each event you publish inside a database session into the same transaction as your data.
 If the transaction rolls back, the event is gone too; if the process crashes after the commit, the event is still there and is delivered after the app restarts.
 A `publish()` outside a session is delivered directly and saves nothing, so the session wiring below is required.
+
+![One commit saves the order and one event_publications row per listener; after the commit each listener runs in the background, and a failing one is retried, then dead-lettered](docs/images/outbox.svg)
 
 ```bash
 pip install 'modupy[postgres]'   # for MySQL or SQLite, use 'modupy[database]'

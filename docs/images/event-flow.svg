@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="360" viewBox="0 0 880 360" role="img" aria-labelledby="flow-title flow-desc">
+<title id="flow-title">How the quickstart's modules talk through events</title>
+<desc id="flow-desc">POST /orders calls create_order in the orders module, which publishes OrderCreated. The payments listener charge and the inventory listener reserve both receive it. charge publishes PaymentReceived, which the orders listener on_payment receives. Both event types live in the contracts module, so no module imports another.</desc>
+<style>
+.card{fill:#f6f8fa;stroke:#d0d7de}
+.box{fill:#ffffff;stroke:#d0d7de;stroke-width:1.5}
+.s{font:400 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#59636e}
+.c{font:500 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#59636e}
+.f{font:500 12.5px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#1f2328}
+.tag{font:500 11px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#59636e}
+.m{font:600 14px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif}
+.orders{fill:#ddf4ff;stroke:#0969da;stroke-width:1.5}.orders-t{fill:#0550ae}
+.payments{fill:#dafbe1;stroke:#1a7f37;stroke-width:1.5}.payments-t{fill:#116329}
+.inventory{fill:#fff8c5;stroke:#9a6700;stroke-width:1.5}.inventory-t{fill:#7d4e00}
+.contracts{fill:#eaeef2;stroke:#8c959f;stroke-width:1.5}.contracts-t{fill:#424a53}
+.bus{fill:#ffeff7;stroke:#bf3989;stroke-width:1.5}
+.ev-t{font:600 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#99286e}
+.ev{fill:none;stroke:#bf3989;stroke-width:1.5;stroke-dasharray:4 3}
+.evhead{fill:#bf3989}
+.wire{fill:none;stroke:#8c959f;stroke-width:1.5}
+.head{fill:#8c959f}
+@media (prefers-color-scheme:dark){
+.card{fill:#161b22;stroke:#30363d}
+.box{fill:#0d1117;stroke:#3d444d}
+.f{fill:#e6edf3}
+.s,.c,.tag{fill:#9198a1}
+.orders{fill:#172b45;stroke:#4493f8}.orders-t{fill:#79c0ff}
+.payments{fill:#17311f;stroke:#3fb950}.payments-t{fill:#7ee787}
+.inventory{fill:#33290f;stroke:#d29922}.inventory-t{fill:#e3b341}
+.contracts{fill:#262c36;stroke:#656c76}.contracts-t{fill:#d1d7e0}
+.bus{fill:#36192b;stroke:#db61a2}.ev-t{fill:#ff9bce}
+.ev{stroke:#db61a2}.evhead{fill:#db61a2}
+.wire{stroke:#656c76}.head{fill:#656c76}
+}
+</style>
+<defs>
+<marker id="flow-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker>
+<marker id="flow-evhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="evhead" d="M0,0 L10,5 L0,10 z"/></marker>
+</defs>
+<rect class="card" x="0.5" y="0.5" width="879" height="359" rx="12"/>
+
+<!-- the request -->
+<text class="c" x="138" y="168" text-anchor="middle">POST /orders</text>
+<path class="wire" d="M80 178 H198" marker-end="url(#flow-head)"/>
+
+<!-- orders -->
+<rect class="orders" x="200" y="70" width="220" height="150" rx="10"/>
+<text class="m orders-t" x="310" y="95" text-anchor="middle">orders</text>
+<rect class="box" x="216" y="110" width="188" height="36" rx="7"/>
+<text class="f" x="230" y="133">on_payment()</text>
+<text class="tag" x="392" y="132" text-anchor="end">@listener</text>
+<rect class="box" x="216" y="160" width="188" height="36" rx="7"/>
+<text class="f" x="230" y="183">create_order()</text>
+
+<!-- OrderCreated fans out -->
+<path class="ev" d="M404 178 H450"/>
+<rect class="bus" x="450" y="167" width="120" height="22" rx="11"/>
+<text class="ev-t" x="510" y="182" text-anchor="middle">OrderCreated</text>
+
+<!-- payments -->
+<rect class="payments" x="600" y="50" width="200" height="100" rx="10"/>
+<text class="m payments-t" x="700" y="75" text-anchor="middle">payments</text>
+<rect class="box" x="616" y="88" width="168" height="36" rx="7"/>
+<text class="f" x="630" y="111">charge()</text>
+<text class="tag" x="772" y="110" text-anchor="end">@listener</text>
+
+<!-- inventory -->
+<rect class="inventory" x="600" y="190" width="200" height="100" rx="10"/>
+<text class="m inventory-t" x="700" y="215" text-anchor="middle">inventory</text>
+<rect class="box" x="616" y="228" width="168" height="36" rx="7"/>
+<text class="f" x="630" y="251">reserve()</text>
+<text class="tag" x="772" y="250" text-anchor="end">@listener</text>
+<path class="ev" d="M570 178 C594 178 588 106 614 106" marker-end="url(#flow-evhead)"/>
+<path class="ev" d="M570 178 C594 178 588 246 614 246" marker-end="url(#flow-evhead)"/>
+
+<!-- PaymentReceived comes back -->
+<path class="ev" d="M700 50 V28 H575"/>
+<rect class="bus" x="435" y="17" width="140" height="22" rx="11"/>
+<text class="ev-t" x="505" y="32" text-anchor="middle">PaymentReceived</text>
+<path class="ev" d="M435 28 H310 V68" marker-end="url(#flow-evhead)"/>
+
+<!-- contracts -->
+<rect class="contracts" x="200" y="306" width="600" height="36" rx="8"/>
+<text class="m contracts-t" x="220" y="329" style="font-size:13px">contracts</text>
+<text class="c" x="304" y="329">OrderCreated</text>
+<text class="c" x="410" y="329">PaymentReceived</text>
+<text class="s" x="780" y="329" text-anchor="end">the events every module imports</text>
+</svg>

@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="360" viewBox="0 0 880 360" role="img" aria-labelledby="ai-title ai-desc">
+<title id="ai-title">Where a slow LLM call runs</title>
+<desc id="ai-desc">Two timelines for a POST /orders request whose OrderCreated event triggers a listener that calls an LLM. In one process, by default, publish() waits for the listener, so the customer waits for the whole model call before getting 200 OK. With the outbox or a worker process, the request saves the order and returns 200 OK at once, and the listener's model call runs afterwards in the background. A failed call is retried and then kept as a dead letter: 10 attempts with the outbox, 5 with a broker. To get more model throughput, set assistant = 4 under [tool.modulith.workers], or run modulith extract assistant.</desc>
+<style>
+.card{fill:#f6f8fa;stroke:#d0d7de}
+.box{fill:#ffffff;stroke:#d0d7de;stroke-width:1.5}
+.b{font:600 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328}
+.s{font:400 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#59636e}
+.c{font:500 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#59636e}
+.bar{font:600 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif}
+.orders{fill:#ddf4ff;stroke:#0969da;stroke-width:1.5}.orders-t{fill:#0550ae}
+.ai{fill:#fbefff;stroke:#8250df;stroke-width:1.5}.ai-t{fill:#6639ba}
+.aiwire{fill:none;stroke:#8250df;stroke-width:1.5;stroke-dasharray:4 3}
+.ev{fill:none;stroke:#bf3989;stroke-width:1.5;stroke-dasharray:4 3}
+.evhead{fill:#bf3989}
+.wire{fill:none;stroke:#8c959f;stroke-width:1.5}
+.head{fill:#8c959f}
+.divider{stroke:#d0d7de;stroke-width:1;stroke-dasharray:3 4}
+.bad{fill:none;stroke:#cf222e;stroke-width:1.5}.bad-t{font:600 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#cf222e}
+.good{fill:none;stroke:#1a7f37;stroke-width:1.5}.good-t{font:600 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1a7f37}
+.okdot{fill:#1a7f37}.faildot{fill:#cf222e}
+.mark{stroke:#ffffff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;fill:none}
+.ok200{font:600 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#1f2328}
+@media (prefers-color-scheme:dark){
+.card{fill:#161b22;stroke:#30363d}
+.box{fill:#0d1117;stroke:#3d444d}
+.b,.ok200{fill:#e6edf3}
+.s,.c{fill:#9198a1}
+.orders{fill:#172b45;stroke:#4493f8}.orders-t{fill:#79c0ff}
+.ai{fill:#2b2842;stroke:#ab7df8}.ai-t{fill:#d2a8ff}
+.aiwire{stroke:#ab7df8}
+.ev{stroke:#db61a2}.evhead{fill:#db61a2}
+.wire{stroke:#656c76}.head{fill:#656c76}
+.divider{stroke:#30363d}
+.bad{stroke:#f85149}.bad-t{fill:#ff7b72}
+.good{stroke:#3fb950}.good-t{fill:#3fb950}
+.okdot{fill:#3fb950}.faildot{fill:#f85149}
+.mark{stroke:#0d1117}
+}
+</style>
+<defs>
+<marker id="ai-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker>
+<marker id="ai-evhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="evhead" d="M0,0 L10,5 L0,10 z"/></marker>
+</defs>
+<rect class="card" x="0.5" y="0.5" width="879" height="359" rx="12"/>
+
+<text class="b" x="24" y="34" style="font-size:15px">Where a slow LLM call runs</text>
+
+<!-- lane 1: one process, the default -->
+<text class="b" x="24" y="94">One process (default)</text>
+<text class="s" x="24" y="112">publish() waits for listeners</text>
+<path class="bad" d="M224 76 V68 H688 V76"/>
+<text class="bad-t" x="456" y="60" text-anchor="middle">the customer waits for the model</text>
+<rect class="orders" x="224" y="84" width="82" height="28" rx="6"/>
+<text class="bar orders-t" x="265" y="103" text-anchor="middle">save order</text>
+<rect class="ai" x="310" y="84" width="378" height="28" rx="6"/>
+<text class="bar ai-t" x="499" y="103" text-anchor="middle">LLM writes the thank-you note</text>
+<rect class="box" x="698" y="87" width="66" height="22" rx="11"/>
+<text class="ok200" x="731" y="102" text-anchor="middle">200 OK</text>
+
+<path class="divider" d="M20 140 H860"/>
+
+<!-- lane 2: the outbox, or a worker process -->
+<text class="b" x="24" y="196">Outbox or worker process</text>
+<text class="s" x="24" y="214">the listener runs afterwards</text>
+<path class="good" d="M224 178 V170 H306 V178"/>
+<text class="good-t" x="306" y="162" text-anchor="middle">the customer waits only for this</text>
+<rect class="orders" x="224" y="186" width="82" height="28" rx="6"/>
+<text class="bar orders-t" x="265" y="205" text-anchor="middle">save order</text>
+<rect class="box" x="314" y="189" width="66" height="22" rx="11"/>
+<text class="ok200" x="347" y="204" text-anchor="middle">200 OK</text>
+
+<text class="s" x="404" y="205">then, in the background:</text>
+<path class="ev" d="M290 214 V256 H330" marker-end="url(#ai-evhead)"/>
+<rect class="ai" x="332" y="242" width="188" height="28" rx="6"/>
+<text class="bar ai-t" x="426" y="261" text-anchor="middle">LLM call</text>
+<circle class="faildot" cx="520" cy="256" r="9"/>
+<path class="mark" d="M516.5 252.5 L523.5 259.5 M523.5 252.5 L516.5 259.5"/>
+<path class="aiwire" d="M529 256 H582"/>
+<text class="s" x="556" y="236" text-anchor="middle">retry</text>
+<rect class="ai" x="584" y="242" width="216" height="28" rx="6"/>
+<text class="bar ai-t" x="692" y="261" text-anchor="middle">LLM call, note saved</text>
+<circle class="okdot" cx="800" cy="256" r="9"/>
+<path class="mark" d="M795.5 256.5 L798.5 259.5 L804.5 252.5"/>
+<text class="s" x="332" y="292">A failed call is retried, then kept as a dead letter: 10 attempts with the outbox, 5 with a broker.</text>
+
+<!-- time -->
+<path class="wire" d="M224 312 H846" marker-end="url(#ai-head)"/>
+<text class="s" x="214" y="316" text-anchor="end">time</text>
+
+<text class="s" x="24" y="340">Need more model throughput? <tspan class="c">assistant = 4</tspan> under <tspan class="c">[tool.modulith.workers]</tspan>, or <tspan class="c">modulith extract assistant</tspan> onto GPU machines.</text>
+</svg>

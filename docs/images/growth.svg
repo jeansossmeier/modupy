@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="420" viewBox="0 0 880 420" role="img" aria-labelledby="growth-title growth-desc">
+<title id="growth-title">The same modulith code in three shapes</title>
+<desc id="growth-desc">Day one: the orders, payments and inventory modules run in one process, and an OrderCreated event fans out from orders to payments and inventory. When a feature gets busy: one process per module on one machine, behind a proxy on port 8000, with two inventory processes and a built-in broker carrying events between them. When a module becomes a service: modulith extract payments moves payments onto its own machine, and a Redis or database broker carries the same events between the app and the new service. In every shape, modulith verify keeps the modules apart and the outbox keeps their events safe.</desc>
+<style>
+.card{fill:#f6f8fa;stroke:#d0d7de}
+.box{fill:#ffffff;stroke:#d0d7de;stroke-width:1.5}
+.machine{fill:none;stroke:#8c959f;stroke-width:1.5;stroke-dasharray:6 5}
+.h{font:600 15px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328}
+.t{font:500 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328}
+.s{font:400 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#59636e}
+.c{font:500 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#59636e}
+.m{font:600 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif}
+.orders{fill:#ddf4ff;stroke:#0969da;stroke-width:1.5}.orders-t{fill:#0550ae}
+.payments{fill:#dafbe1;stroke:#1a7f37;stroke-width:1.5}.payments-t{fill:#116329}
+.inventory{fill:#fff8c5;stroke:#9a6700;stroke-width:1.5}.inventory-t{fill:#7d4e00}
+.bus{fill:#ffeff7;stroke:#bf3989;stroke-width:1.5}
+.bus-t{font:600 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#99286e}
+.ev-t{font:600 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#99286e}
+.ev{fill:none;stroke:#bf3989;stroke-width:1.5;stroke-dasharray:4 3}
+.evhead{fill:#bf3989}
+.wire{fill:none;stroke:#8c959f;stroke-width:1.5}
+.head{fill:#8c959f}
+.band{fill:#ffffff;stroke:#d0d7de}
+@media (prefers-color-scheme:dark){
+.card{fill:#161b22;stroke:#30363d}
+.box,.band{fill:#0d1117;stroke:#3d444d}
+.machine{stroke:#656c76}
+.h,.t{fill:#e6edf3}
+.s,.c{fill:#9198a1}
+.orders{fill:#172b45;stroke:#4493f8}.orders-t{fill:#79c0ff}
+.payments{fill:#17311f;stroke:#3fb950}.payments-t{fill:#7ee787}
+.inventory{fill:#33290f;stroke:#d29922}.inventory-t{fill:#e3b341}
+.bus{fill:#36192b;stroke:#db61a2}.bus-t,.ev-t{fill:#ff9bce}
+.ev{stroke:#db61a2}.evhead{fill:#db61a2}
+.wire{stroke:#656c76}.head{fill:#656c76}
+}
+</style>
+<defs>
+<marker id="growth-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker>
+<marker id="growth-evhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="evhead" d="M0,0 L10,5 L0,10 z"/></marker>
+</defs>
+<rect class="card" x="0.5" y="0.5" width="879" height="419" rx="12"/>
+
+<!-- Day one: one process -->
+<text class="h" x="136" y="40" text-anchor="middle">Day one</text>
+<text class="s" x="136" y="60" text-anchor="middle">one app, one process</text>
+<rect class="box" x="32" y="80" width="208" height="216" rx="10"/>
+<rect class="orders" x="88" y="104" width="96" height="38" rx="8"/>
+<text class="m orders-t" x="136" y="128" text-anchor="middle">orders</text>
+<path class="ev" d="M136 142 V164"/>
+<rect class="bus" x="84" y="164" width="104" height="22" rx="11"/>
+<text class="ev-t" x="136" y="179" text-anchor="middle">OrderCreated</text>
+<path class="ev" d="M126 186 C126 208 86 206 86 230" marker-end="url(#growth-evhead)"/>
+<path class="ev" d="M146 186 C146 208 186 206 186 230" marker-end="url(#growth-evhead)"/>
+<rect class="payments" x="40" y="232" width="92" height="38" rx="8"/>
+<text class="m payments-t" x="86" y="256" text-anchor="middle">payments</text>
+<rect class="inventory" x="140" y="232" width="92" height="38" rx="8"/>
+<text class="m inventory-t" x="186" y="256" text-anchor="middle">inventory</text>
+<text class="c" x="136" y="326" text-anchor="middle">uvicorn myapp.main:app</text>
+
+<path class="wire" d="M256 188 H278" marker-end="url(#growth-head)"/>
+
+<!-- A feature gets busy: one process per module -->
+<text class="h" x="432" y="40" text-anchor="middle">A feature gets busy</text>
+<text class="s" x="432" y="60" text-anchor="middle">one process per module</text>
+<rect class="machine" x="292" y="80" width="280" height="216" rx="10"/>
+<text class="s" x="304" y="98">one machine</text>
+<rect class="box" x="306" y="108" width="252" height="30" rx="8"/>
+<text class="t" x="432" y="128" text-anchor="middle">proxy <tspan class="c">:8000</tspan></text>
+<path class="wire" d="M345 138 V164" marker-end="url(#growth-head)"/>
+<path class="wire" d="M519 138 V158" marker-end="url(#growth-head)"/>
+<rect class="orders" x="306" y="166" width="78" height="38" rx="8"/>
+<text class="m orders-t" x="345" y="190" text-anchor="middle">orders</text>
+<rect class="payments" x="393" y="166" width="78" height="38" rx="8"/>
+<text class="m payments-t" x="432" y="190" text-anchor="middle">payments</text>
+<rect class="inventory" x="486" y="160" width="78" height="38" rx="8"/>
+<rect class="inventory" x="480" y="166" width="78" height="38" rx="8"/>
+<text class="m inventory-t" x="519" y="190" text-anchor="middle">inventory</text>
+<circle class="inventory" cx="562" cy="160" r="11"/>
+<text class="m inventory-t" x="562" y="164.5" text-anchor="middle" style="font-size:11px">×2</text>
+<path class="ev" d="M345 204 V232"/>
+<path class="ev" d="M432 204 V232"/>
+<path class="ev" d="M519 204 V232"/>
+<rect class="bus" x="306" y="232" width="252" height="30" rx="8"/>
+<text class="bus-t" x="432" y="252" text-anchor="middle">events · built-in broker</text>
+<text class="c" x="432" y="326" text-anchor="middle">--topology processes</text>
+
+<path class="wire" d="M584 188 H606" marker-end="url(#growth-head)"/>
+
+<!-- A module becomes a service -->
+<text class="h" x="736" y="40" text-anchor="middle">A module becomes a service</text>
+<text class="s" x="736" y="60" text-anchor="middle">same events, across machines</text>
+<rect class="machine" x="620" y="80" width="232" height="84" rx="10"/>
+<text class="s" x="632" y="98">app</text>
+<rect class="orders" x="640" y="108" width="90" height="38" rx="8"/>
+<text class="m orders-t" x="685" y="132" text-anchor="middle">orders</text>
+<rect class="inventory" x="742" y="108" width="90" height="38" rx="8"/>
+<text class="m inventory-t" x="787" y="132" text-anchor="middle">inventory</text>
+<path class="ev" d="M685 164 V180"/>
+<path class="ev" d="M787 164 V180"/>
+<rect class="bus" x="632" y="180" width="208" height="28" rx="8"/>
+<text class="bus-t" x="736" y="199" text-anchor="middle">Redis or database broker</text>
+<path class="ev" d="M736 208 V224"/>
+<rect class="machine" x="620" y="224" width="232" height="72" rx="10"/>
+<text class="c" x="632" y="242">payments-service</text>
+<rect class="payments" x="691" y="250" width="90" height="38" rx="8"/>
+<text class="m payments-t" x="736" y="274" text-anchor="middle">payments</text>
+<text class="c" x="736" y="326" text-anchor="middle">modulith extract payments</text>
+
+<!-- What stays the same -->
+<rect class="band" x="20" y="344" width="840" height="60" rx="10"/>
+<text class="h" x="440" y="369" text-anchor="middle">Same modules, same events, same code: configuration picks the shape.</text>
+<text class="s" x="440" y="390" text-anchor="middle">In every shape, modulith verify keeps the modules apart and the outbox keeps their events safe.</text>
+</svg>

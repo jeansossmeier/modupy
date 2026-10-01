@@ -7,6 +7,8 @@ no database, no broker, nothing to start first. It is the code from the root
 `orders` marks the order fulfilled; `inventory` reserves stock. No module
 imports another module, only the shared events.
 
+![orders publishes OrderCreated, which payments and inventory receive; payments publishes PaymentReceived, which orders receives; both events live in contracts](../../docs/images/event-flow.svg)
+
 - [`myapp/contracts/events.py`](myapp/contracts/events.py): the two events
 - [`myapp/orders/`](myapp/orders): creates orders and reads back fulfilment
 - [`myapp/payments/`](myapp/payments): listener only, so it has no `router`
@@ -95,6 +97,8 @@ Stop the server first. The application code does not change:
 $ modulith run myapp.main:app --topology=processes
 modulith → process-per-module: 3 worker(s) [inventory:9001, orders:9002, payments:9003], reverse proxy on http://0.0.0.0:8000
 ```
+
+![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](../../docs/images/processes.svg)
 
 Each module now runs in its own process behind one public port, and events
 cross the process boundary through the default broker. Startup logs several

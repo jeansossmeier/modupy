@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="420" viewBox="0 0 880 420" role="img" aria-labelledby="outbox-title outbox-desc">
+<title id="outbox-title">How the transactional outbox keeps events safe</title>
+<desc id="outbox-desc">Your code binds a session, adds the order, publishes OrderCreated and commits. The single commit writes the order row to orders_order and one row per listener to event_publications, one for charge and one for reserve. After the commit, in the background, each listener runs and its row is marked completed. If the transaction rolls back, the order and its event are discarded together. If a listener keeps failing, only its row is retried with backoff, and after 10 attempts it becomes a dead letter that modulith outbox dead-letter --retry-all replays. If the process crashes, committed rows stay incomplete, and bootstrap() and outbox.start() deliver them when the app starts again.</desc>
+<style>
+.card{fill:#f6f8fa;stroke:#d0d7de}
+.box{fill:#ffffff;stroke:#d0d7de;stroke-width:1.5}
+.db{fill:#ffffff;stroke:#8c959f;stroke-width:1.5}
+.row{fill:#f6f8fa;stroke:#d0d7de}
+.b{font:600 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328}
+.s{font:400 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#59636e}
+.c{font:500 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#59636e}
+.f{font:500 12.5px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#1f2328}
+.k{fill:#8250df}
+.ok{font:600 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1a7f37}
+.payments{fill:#dafbe1;stroke:#1a7f37;stroke-width:1.5}.payments-t{fill:#116329}
+.inventory{fill:#fff8c5;stroke:#9a6700;stroke-width:1.5}.inventory-t{fill:#7d4e00}
+.ev{fill:none;stroke:#bf3989;stroke-width:1.5;stroke-dasharray:4 3}
+.evhead{fill:#bf3989}
+.wire{fill:none;stroke:#8c959f;stroke-width:1.5}
+.head{fill:#8c959f}
+@media (prefers-color-scheme:dark){
+.card{fill:#161b22;stroke:#30363d}
+.box,.db{fill:#0d1117;stroke:#3d444d}
+.db{stroke:#656c76}
+.row{fill:#161b22;stroke:#3d444d}
+.b,.f{fill:#e6edf3}
+.s,.c{fill:#9198a1}
+.k{fill:#d2a8ff}
+.ok{fill:#3fb950}
+.payments{fill:#17311f;stroke:#3fb950}.payments-t{fill:#7ee787}
+.inventory{fill:#33290f;stroke:#d29922}.inventory-t{fill:#e3b341}
+.ev{stroke:#db61a2}.evhead{fill:#db61a2}
+.wire{stroke:#656c76}.head{fill:#656c76}
+}
+</style>
+<defs>
+<marker id="outbox-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker>
+<marker id="outbox-evhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="evhead" d="M0,0 L10,5 L0,10 z"/></marker>
+</defs>
+<rect class="card" x="0.5" y="0.5" width="879" height="419" rx="12"/>
+
+<!-- 1. your code -->
+<text class="s" x="20" y="34">your code</text>
+<rect class="box" x="20" y="44" width="270" height="132" rx="10"/>
+<text class="f" x="36" y="74"><tspan class="k">bind_session</tspan>(session)</text>
+<text class="f" x="36" y="98">session.add(order)</text>
+<text class="f" x="36" y="122">await <tspan class="k">publish</tspan>(OrderCreated(…))</text>
+<text class="f" x="36" y="146">await session.<tspan class="k">commit</tspan>()</text>
+<path class="wire" d="M290 110 H330" marker-end="url(#outbox-head)"/>
+
+<!-- 2. one commit, one database -->
+<text class="s" x="450" y="34" text-anchor="middle">your database</text>
+<path class="db" d="M334 52 V188 A116 12 0 0 0 566 188 V52"/>
+<ellipse class="db" cx="450" cy="52" rx="116" ry="12"/>
+<text class="c" x="352" y="88">orders_order</text>
+<rect class="row" x="352" y="94" width="196" height="22" rx="4"/>
+<text class="f" x="362" y="110">ord-1</text>
+<text class="c" x="352" y="138">event_publications</text>
+<rect class="row" x="352" y="144" width="196" height="22" rx="4"/>
+<text class="f" x="362" y="160">OrderCreated → charge</text>
+<rect class="row" x="352" y="170" width="196" height="22" rx="4"/>
+<text class="f" x="362" y="186">OrderCreated → reserve</text>
+<text class="s" x="450" y="222" text-anchor="middle">one commit saves both, or neither</text>
+
+<!-- 3. after the commit -->
+<text class="s" x="740" y="34" text-anchor="middle">after the commit, in the background</text>
+<rect class="payments" x="620" y="74" width="240" height="40" rx="8"/>
+<text class="f payments-t" x="636" y="99">charge()</text>
+<text class="ok" x="846" y="99" text-anchor="end">✓ completed</text>
+<rect class="inventory" x="620" y="144" width="240" height="40" rx="8"/>
+<text class="f inventory-t" x="636" y="169">reserve()</text>
+<text class="ok" x="846" y="169" text-anchor="end">✓ completed</text>
+<path class="ev" d="M548 155 C588 155 582 94 618 94" marker-end="url(#outbox-evhead)"/>
+<path class="ev" d="M548 181 C588 181 582 164 618 164" marker-end="url(#outbox-evhead)"/>
+<text class="s" x="740" y="210" text-anchor="middle">the request has already returned</text>
+
+<!-- when something goes wrong -->
+<text class="s" x="20" y="254">when something goes wrong</text>
+<rect class="box" x="20" y="264" width="270" height="138" rx="10"/>
+<text class="b" x="36" y="290">The transaction rolls back</text>
+<text class="s" x="36" y="314">The order and its event are discarded</text>
+<text class="s" x="36" y="332">together, so nothing is delivered.</text>
+
+<rect class="box" x="305" y="264" width="270" height="138" rx="10"/>
+<text class="b" x="321" y="290">A listener keeps failing</text>
+<text class="s" x="321" y="314">Only its row is retried, with backoff.</text>
+<text class="s" x="321" y="332">After 10 attempts it becomes a dead</text>
+<text class="s" x="321" y="350">letter, which this command replays:</text>
+<text class="c" x="321" y="374">modulith outbox dead-letter \</text>
+<text class="c" x="321" y="391" xml:space="preserve">    --retry-all</text>
+
+<rect class="box" x="590" y="264" width="270" height="138" rx="10"/>
+<text class="b" x="606" y="290">The process crashes</text>
+<text class="s" x="606" y="314">Committed rows stay incomplete. When</text>
+<text class="s" x="606" y="332">the app starts again, <tspan class="c">bootstrap()</tspan></text>
+<text class="s" x="606" y="350">and <tspan class="c">outbox.start()</tspan> deliver them.</text>
+</svg>
