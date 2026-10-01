@@ -1047,6 +1047,15 @@ async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
             if pub.claim_token:
                 await _store.renew_claim(pub.id, pub.claim_token, 0.0)  # type: ignore[attr-defined]
             continue
+        with _inflight_lock:
+            delivering_here = pub.id in _inflight_ids
+        if delivering_here:
+            # Another task in this process is delivering the row, so the
+            # dispatch below would skip it. Re-arming first would mark the row
+            # started, and its next claim would charge an interruption that
+            # never happened (PostgresPublicationStore.claim_batch). Holding the
+            # claim unrenewed keeps peers off the row until it lapses, uncharged.
+            continue
         # ``claim_batch`` stamps ONE shared expiry on the whole batch, but the
         # rows dispatch serially: a slow head of the batch can leave the tail's
         # lease expired before its turn, and a peer sweeper reclaims it. Re-arm
@@ -1183,6 +1192,27 @@ async def _dispatch_with_lease_renewal(publication: EventPublication) -> None:
     renew_task = asyncio.create_task(_renew_loop())
     try:
         await _dispatch_publication(publication)
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling() > 0:
+            # A stop cancelled the listener mid-delivery. Release the row so a
+            # peer takes it at once, and so its next claim does not count the
+            # stop as an interrupted delivery (PostgresPublicationStore.claim_batch).
+            # A listener that raised CancelledError itself keeps its claim, so
+            # it is charged like any other interrupted delivery.
+            stop.set()
+            renew_task.cancel()
+            store_any: Any = _store
+            try:
+                await store_any.renew_claim(publication.id, token, 0.0)
+            except Exception:
+                logger.warning(
+                    "could not release publication %s after its delivery was "
+                    "cancelled; it is delivered again once its lease expires",
+                    publication.id,
+                    exc_info=True,
+                )
+        raise
     finally:
         stop.set()
         renew_task.cancel()

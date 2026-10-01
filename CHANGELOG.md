@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - Reverse proxy: with a module scaled to several replicas, a redirect from any replica but the first no longer leaks that replica's internal address in `Location`, and request errors are logged against the replica that served the request
+- Durable outbox, default `"lease"` strategy: a listener that kills its process (out of memory, a crash in native code) is no longer redelivered on every restart without ever dead-lettering. Its interrupted delivery now counts as a failed attempt when the row is claimed again, so the row backs off and dead-letters like one whose listener raised. Rows claimed in the same batch that had not reached their listener are reclaimed without a charge, and a graceful stop releases the delivery it cancels instead of leaving it leased. A listener that raises `CancelledError` while nothing is stopping the outbox is charged like an interrupted delivery. The outbox gains `event_publications.dispatch_started` through migration `0007_outbox_dispatch_started`
+- Bootstrap: when binding the store from `outbox_url` fails, the bootstrap now rolls back like any other failed step. Before, the configuration stayed installed, and a retry in the same process came up with no listeners for the modules the first attempt had imported
+
+### Upgrade notes
+
+- Durable outbox: run `modulith migrate` (migration `0007_outbox_dispatch_started`) before starting this version. On an outbox table without the new column every durable publish, claim and delivery fails, while `modulith outbox status` and `modulith doctor` still print counts and can report the outbox healthy. Tables created from the ORM metadata already have the column, and the migration skips it there
 
 ## [0.10.0] — 2026-09-29
 

@@ -449,11 +449,21 @@ A background retry loop drives redelivery:
   sweep only takes rows at least that old. It also takes longer while the
   previous sweep is still dispatching a slow batch, because the interval
   counts from the end of that sweep. And no sweep recovers anything while
-  the runtime is not bootstrapped. A crash, or a graceful stop that cancels
-  a sweep, leaves leased the row being delivered and every row of its
-  claimed batch the sweep had not reached yet, and those rows wait out the
-  lease the same way. Rows the sweep had already delivered, failed or
+  the runtime is not bootstrapped. A crash leaves leased the row being
+  delivered and every row of its claimed batch the sweep had not reached
+  yet, and those rows wait out the lease the same way. A graceful stop that
+  cancels a sweep releases the row being delivered at once, and leaves only
+  the unreached rows leased. Rows the sweep had already delivered, failed or
   released are not leased.
+- A delivery cut off mid-listener counts as a failed attempt. The claim
+  marks a row's dispatch as started (`dispatch_started`, migration `0007`)
+  just before its listener runs, and the next claim of a lapsed row with
+  that mark charges it one attempt, as if the listener had raised. A
+  listener that keeps killing its process therefore backs off and
+  dead-letters instead of being redelivered on every restart. Rows that
+  only waited in a claimed batch, and rows a graceful stop released, come
+  back uncharged. Under `"advisory_lock"` and `"none"` nothing records that
+  a delivery started, so such a row is redelivered without limit there.
 - Rows committed but not yet claimed, and rows under `"none"`, are recovered
   by the startup sweep.
 - Under `"advisory_lock"` the row's lock lives as long as the dead process's
@@ -522,10 +532,11 @@ revisions. Always migrate to `head` (`alembic upgrade head` against the
 packaged `alembic.ini` — see [MIGRATION_GUIDE.md](../MIGRATION_GUIDE.md), the
 outbox migration step): `0001_initial` alone is **not** enough for the shipped
 default, because the lease columns (`claim_owner`, `claim_token`,
-`claim_until`) arrive in `0003_outbox_claim_leases` and the claim/scan indexes
-in `0005_outbox_scan_indexes`. Against a `0001`-shaped schema the blast
-radius is not confined to delivery: `EventPublicationRow` maps
-`claim_owner`/`claim_token`/`claim_until` unconditionally, so `save()`'s
+`claim_until`) arrive in `0003_outbox_claim_leases`, the claim/scan indexes
+in `0005_outbox_scan_indexes`, and `dispatch_started` in
+`0007_outbox_dispatch_started`. Against a schema missing any of those columns
+the blast radius is not confined to delivery: `EventPublicationRow` maps
+every one of them unconditionally, so `save()`'s
 bound-session path enlists a row naming those columns in the caller's own
 session, and the caller's business `commit()` — not just the sweep — fails
 outright on the missing column. The sweep's own claim query fails the same

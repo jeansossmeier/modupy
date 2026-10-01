@@ -10,6 +10,7 @@ events and bounded DB polls, never with bare sleeps.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 from dataclasses import dataclass
@@ -1295,6 +1296,312 @@ async def test_after_commit_claim_expires_so_a_crashed_delivery_is_recovered(
 
     assert held == []
     assert [p.id for p in reclaimed] == [pub.id]
+
+
+# ---------------------------------------------------------------------------
+# A delivery cut off mid-flight counts as an attempt
+# ---------------------------------------------------------------------------
+
+
+async def _expire_claims(engine: Any) -> None:
+    """Let every lease run out without waiting for it."""
+    async with async_sessionmaker(engine)() as s:
+        await s.execute(
+            update(EventPublicationRow)
+            .where(EventPublicationRow.claim_until.is_not(None))
+            .values(claim_until=datetime.now(UTC) - timedelta(seconds=1))
+        )
+        await s.commit()
+
+
+async def _claim_start_and_die(
+    store: PostgresPublicationStore, engine: Any
+) -> list[EventPublication]:
+    """Claim like a sweeper, start each delivery with the renewal the sweep
+    makes just before the listener runs, then die: nothing completes, fails or
+    releases the rows, and their leases run out."""
+    claimed = await store.claim_batch(
+        owner="doomed", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+    for pub in claimed:
+        assert pub.claim_token is not None
+        assert await store.renew_claim(pub.id, pub.claim_token, 60) is True
+    await _expire_claims(engine)
+    return claimed
+
+
+async def _stored_row(engine: Any, publication_id: Any) -> EventPublicationRow:
+    async with async_sessionmaker(engine)() as s:
+        row = await s.get(EventPublicationRow, publication_id)
+    assert row is not None
+    return row
+
+
+@contextlib.asynccontextmanager
+async def _mysql_engine(mysql_url: str) -> Any:
+    engine = create_async_engine(mysql_url)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+    try:
+        yield engine
+    finally:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+        await engine.dispose()
+
+
+async def _assert_an_interrupted_delivery_is_charged_until_it_dead_letters(
+    engine: Any,
+) -> None:
+    """A listener that kills its process never reaches the failure path, so
+    its claim just lapses. Each later claim must charge that row an attempt,
+    or the row is redelivered on every restart and never dead-letters."""
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=2)
+    pub = _pub(1, published_at=datetime.now(UTC) - timedelta(seconds=5))
+    await store.save(pub)
+
+    [first] = await _claim_start_and_die(store, engine)
+    [second] = await _claim_start_and_die(store, engine)
+    third = await _claim_start_and_die(store, engine)
+
+    assert first.attempt_count == 0
+    assert second.attempt_count == 1
+    assert second.last_error is not None and "interrupted" in second.last_error
+    assert second.last_attempt_at is not None
+    assert third == []
+    row = await _stored_row(engine, pub.id)
+    assert row.attempt_count == 2
+    assert row.is_dead_lettered is True
+    assert row.claim_token is None
+
+
+async def _assert_a_claimed_row_never_started_is_not_charged(engine: Any) -> None:
+    """A sweep claims a whole batch, then delivers its rows one at a time.
+    Rows still waiting their turn when the process died never reached a
+    listener, so reclaiming them must not charge them."""
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1, published_at=datetime.now(UTC) - timedelta(seconds=5))
+    await store.save(pub)
+    await store.claim_batch(
+        owner="doomed", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+    await _expire_claims(engine)
+
+    reclaimed = await store.claim_batch(
+        owner="peer", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+
+    assert [(p.id, p.attempt_count, p.last_error) for p in reclaimed] == [(pub.id, 0, None)]
+
+
+async def test_an_interrupted_delivery_is_charged_until_it_dead_letters_on_sqlite(
+    engine: Any,
+) -> None:
+    await _assert_an_interrupted_delivery_is_charged_until_it_dead_letters(engine)
+
+
+async def test_a_claimed_row_never_started_is_not_charged_on_sqlite(engine: Any) -> None:
+    await _assert_a_claimed_row_never_started_is_not_charged(engine)
+
+
+@pytest.mark.integration
+async def test_an_interrupted_delivery_is_charged_until_it_dead_letters_on_mysql(
+    mysql_url: str,
+) -> None:
+    async with _mysql_engine(mysql_url) as engine:
+        await _assert_an_interrupted_delivery_is_charged_until_it_dead_letters(engine)
+
+
+@pytest.mark.integration
+async def test_a_claimed_row_never_started_is_not_charged_on_mysql(mysql_url: str) -> None:
+    async with _mysql_engine(mysql_url) as engine:
+        await _assert_a_claimed_row_never_started_is_not_charged(engine)
+
+
+@pytest.mark.integration
+async def test_an_interrupted_delivery_is_charged_until_it_dead_letters_on_postgres(
+    pg_engine: Any,
+) -> None:
+    await _assert_an_interrupted_delivery_is_charged_until_it_dead_letters(pg_engine)
+
+
+@pytest.mark.integration
+async def test_a_claimed_row_never_started_is_not_charged_on_postgres(pg_engine: Any) -> None:
+    await _assert_a_claimed_row_never_started_is_not_charged(pg_engine)
+
+
+async def test_a_released_claim_is_not_charged(engine: Any) -> None:
+    """A sweeper releases a claimed row it will not deliver yet: one still in
+    backoff, one only a sibling worker can deliver, or any row while the
+    runtime is still starting. Nothing was attempted, so claiming the row
+    again must not charge it."""
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1)
+    await store.save(pub)
+    [claimed] = await store.claim_batch(
+        owner="sweeper", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+    assert claimed.claim_token is not None
+    assert await store.renew_claim(pub.id, claimed.claim_token, 0.0) is True
+
+    [again] = await store.claim_batch(
+        owner="sweeper", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+
+    assert again.attempt_count == 0
+    assert again.last_error is None
+
+
+async def test_a_sweep_delivery_cancelled_by_shutdown_releases_its_claim(engine: Any) -> None:
+    """Stopping the outbox cancels a delivery the sweep is running. The row
+    must be released rather than left to lapse, so a peer can claim it at
+    once and the stop is not charged as an interrupted delivery."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    entered = asyncio.Event()
+
+    async def hangs(event: G04Event) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    _bootstrap_with_listener(hangs)
+    pub = _pub(1, hangs)
+    await store.save(pub)
+
+    sweep = asyncio.create_task(outbox._sweep(timedelta(0)))
+    await entered.wait()
+    sweep.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sweep
+
+    reclaimed = await store.claim_batch(
+        owner="peer", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+    assert [(p.id, p.attempt_count) for p in reclaimed] == [(pub.id, 0)]
+
+
+async def test_a_cancelled_delivery_whose_release_fails_still_stops(
+    engine: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When the release after a cancelled delivery fails too (the database is
+    going away with the process), the cancellation must still propagate, and
+    the row falls back to its lease."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    entered = asyncio.Event()
+
+    async def hangs(event: G04Event) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    _bootstrap_with_listener(hangs)
+    pub = _pub(1, hangs)
+    await store.save(pub)
+    renew_claim = store.renew_claim
+
+    async def release_fails(publication_id: Any, token: str, lease_seconds: float) -> bool:
+        if lease_seconds <= 0:
+            raise OSError("connection lost")
+        return await renew_claim(publication_id, token, lease_seconds)
+
+    monkeypatch.setattr(store, "renew_claim", release_fails)
+    sweep = asyncio.create_task(outbox._sweep(timedelta(0)))
+    await entered.wait()
+    sweep.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sweep
+
+    assert "could not release publication" in caplog.text
+    held = await store.claim_batch(
+        owner="peer", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+    assert held == []
+
+
+async def test_a_listener_raising_cancelled_error_is_charged_like_an_interrupted_delivery(
+    engine: Any,
+) -> None:
+    """A listener can raise CancelledError while nothing is stopping the
+    outbox, for instance by awaiting a task another component cancelled. Only
+    a stop releases the claim, so this row is charged when its lease lapses
+    and a listener that always does this dead-letters."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+
+    async def cancelled_from_inside(event: G04Event) -> None:
+        raise asyncio.CancelledError
+
+    _bootstrap_with_listener(cancelled_from_inside)
+    pub = _pub(1, cancelled_from_inside)
+    await store.save(pub)
+
+    sweep = asyncio.create_task(outbox._sweep(timedelta(0)))
+    with pytest.raises(asyncio.CancelledError):
+        await sweep
+    await _expire_claims(engine)
+
+    [again] = await store.claim_batch(
+        owner="peer", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+    assert again.attempt_count == 1
+
+
+async def test_a_sweep_skipping_a_row_this_process_is_delivering_charges_nothing(
+    engine: Any,
+) -> None:
+    """force_retry delivers a row without claiming it, so a sweep in the same
+    process can claim that row mid-delivery. The sweep leaves the delivery to
+    force_retry, and once its lease lapses only the real failure counts."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fails_when_released(event: G04Event) -> None:
+        entered.set()
+        await release.wait()
+        raise RuntimeError("boom")
+
+    _bootstrap_with_listener(fails_when_released)
+    pub = _pub(1, fails_when_released)
+    await store.save(pub)
+
+    retry = asyncio.create_task(outbox.force_retry(pub.id))
+    await entered.wait()
+    await outbox._sweep(timedelta(0))
+    release.set()
+    await retry
+    await _expire_claims(engine)
+
+    [again] = await store.claim_batch(
+        owner="peer", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+    assert (again.attempt_count, again.last_error) == (1, "boom")
+
+
+async def test_a_dead_letter_reopened_for_retry_is_not_charged_an_earlier_interruption(
+    engine: Any,
+) -> None:
+    """retry_all_dead_lettered reopens a dead row through save() with a fresh
+    budget. An interruption from before the row died must not be charged
+    against that budget."""
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=2)
+    pub = _pub(1, published_at=datetime.now(UTC) - timedelta(seconds=5))
+    await store.save(pub)
+    await _claim_start_and_die(store, engine)
+    pub.attempt_count = 2
+    pub.last_error = "boom"
+    await store.save(pub)
+    pub.attempt_count = 0
+    pub.last_error = None
+    await store.save(pub)
+
+    [reopened] = await store.claim_batch(
+        owner="peer", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+
+    assert (reopened.attempt_count, reopened.last_error) == (0, None)
 
 
 # ---------------------------------------------------------------------------

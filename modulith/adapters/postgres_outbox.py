@@ -147,6 +147,10 @@ class EventPublicationRow(Base):
     claim_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
     claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     claim_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Keep in lockstep with migrations/versions/0007_outbox_dispatch_started.py.
+    dispatch_started: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
 
     __table_args__ = (
         # Partial index keeps the pending-rows scan small even with millions
@@ -354,18 +358,27 @@ def _row_to_pub(row: EventPublicationRow) -> EventPublication:
     )
 
 
+_INTERRUPTED_DELIVERY = "delivery interrupted: its claim lapsed before the listener finished"
+
+
 async def _try_claim_row(
     s: AsyncSession,
     publication_id: UUID,
     *,
-    owner: str,
-    token: str,
+    previous_token: str | None,
     now: datetime,
-    until: datetime,
+    values: dict[str, Any],
 ) -> bool:
-    """Claim one row with a conditional UPDATE that re-checks claimability
-    (incomplete, not dead-lettered, no live lease). Only a rowcount of 1
-    counts as claimed; the caller commits."""
+    """Write ``values`` to one row with a conditional UPDATE that re-checks it
+    is still claimable as the caller read it: incomplete, not dead-lettered,
+    no live lease, and still carrying ``previous_token`` (None for a row never
+    claimed or released since). Only a rowcount of 1 counts; the caller
+    commits."""
+    token_unchanged = (
+        EventPublicationRow.claim_token.is_(None)
+        if previous_token is None
+        else EventPublicationRow.claim_token == previous_token
+    )
     result = await s.execute(
         update(EventPublicationRow)
         .where(
@@ -376,11 +389,30 @@ async def _try_claim_row(
                 EventPublicationRow.claim_until.is_(None),
                 EventPublicationRow.claim_until <= now,
             ),
+            token_unchanged,
         )
-        .values(claim_owner=owner, claim_token=token, claim_until=until)
+        .values(**values)
         .execution_options(synchronize_session=False)
     )
     return cast(CursorResult[Any], result).rowcount == 1
+
+
+def _log_interrupted_deliveries(charged: list[tuple[UUID, int, bool]]) -> None:
+    for publication_id, attempts, dead in charged:
+        if dead:
+            logger.error(
+                "publication %s dead-lettered after %d attempt(s): %s",
+                publication_id,
+                attempts,
+                _INTERRUPTED_DELIVERY,
+            )
+        else:
+            logger.warning(
+                "publication %s: %s; recorded as attempt %d",
+                publication_id,
+                _INTERRUPTED_DELIVERY,
+                attempts,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -516,7 +548,9 @@ class PostgresPublicationStore:
         attempt/error/dead-letter fields. It never reopens an
         already-completed row: a stale failed re-save (e.g. the crash sweep
         racing the after-commit task) must not resurrect a delivered
-        publication by blanking ``completed_at``.
+        publication by blanking ``completed_at``. Reopening a dead-lettered
+        row clears ``dispatch_started``, so the fresh budget is not charged
+        for an interruption from before the row died.
         """
         session = _bound_session()
         dead = publication.attempt_count >= self.dead_letter_after_attempts
@@ -543,6 +577,8 @@ class PostgresPublicationStore:
             if existing.completed_at is not None:
                 # Already delivered — never reopen. Drop this stale re-save.
                 return
+            if existing.is_dead_lettered and not dead:
+                existing.dispatch_started = False
             existing.attempt_count = publication.attempt_count
             existing.last_error = publication.last_error
             existing.last_attempt_at = _to_utc(publication.last_attempt_at)
@@ -769,6 +805,17 @@ class PostgresPublicationStore:
         Returned publications carry a fresh ``claim_token`` (bearer for
         ``renew_claim``/``complete_claim``/``fail_claim``); ``claim_owner`` is
         stored for operator diagnostics only — fencing is always by token.
+
+        A claimable row with ``dispatch_started`` set was handed to its
+        listener under a claim that then lapsed without a completion, a
+        failure or a release: the delivery was cut off, typically by a process
+        that died inside the listener, so ``fail_claim`` never ran. Claiming it
+        charges that attempt (``_interrupted_delivery_charge``); a row the
+        charge takes to the dead-letter threshold is dead-lettered instead of
+        claimed, so a listener that keeps killing its process stops being
+        redelivered. Rows that only waited in a claimed batch never had the
+        flag set, so they come back uncharged. ``renew_claim`` sets it: the
+        sweep renews each row just before handing it to its listener.
         """
         now = datetime.now(UTC)
         cutoff = now - older_than
@@ -799,16 +846,41 @@ class PostgresPublicationStore:
             if not self._supports_skip_locked:
                 return await self._claim_unlocked(s, rows, owner=owner, now=now, until=until)
             claimed: list[EventPublication] = []
+            charged: list[tuple[UUID, int, bool]] = []
             for row in rows:
+                if row.dispatch_started:
+                    for key, value in self._interrupted_delivery_charge(
+                        row.attempt_count, now
+                    ).items():
+                        setattr(row, key, value)
+                    charged.append((row.id, row.attempt_count, row.is_dead_lettered))
+                    if row.is_dead_lettered:
+                        row.claim_owner = row.claim_token = row.claim_until = None
+                        continue
                 token = uuid4().hex
                 row.claim_owner = owner
                 row.claim_token = token
                 row.claim_until = until
+                row.dispatch_started = False
                 pub = _row_to_pub(row)
                 pub.claim_token = token
                 claimed.append(pub)
             await s.commit()
+            _log_interrupted_deliveries(charged)
             return claimed
+
+    def _interrupted_delivery_charge(self, attempt_count: int, now: datetime) -> dict[str, Any]:
+        """The failure record of a delivery whose claim lapsed, as
+        ``fail_claim`` would have written it, dead-lettering at the same
+        threshold."""
+        attempts = attempt_count + 1
+        return {
+            "attempt_count": attempts,
+            "last_error": _INTERRUPTED_DELIVERY,
+            "last_attempt_at": now,
+            "is_dead_lettered": attempts >= self.dead_letter_after_attempts,
+            "dispatch_started": False,
+        }
 
     async def _claim_unlocked(
         self,
@@ -825,20 +897,45 @@ class PostgresPublicationStore:
         our SELECT leaves ``claim_until`` in the future, so our UPDATE matches
         nothing and the row is dropped from the batch. Rows are updated in
         primary-key order so concurrent claimers take row locks in the same
-        order and cannot deadlock each other."""
-        tokens: dict[UUID, str] = {}
+        order and cannot deadlock each other. The UPDATE also pins the token
+        it read, so the charge for an interrupted delivery (see
+        ``claim_batch``) is computed from the row state it replaces. The
+        candidates stay untouched in memory: the session would otherwise flush
+        them unconditionally at commit."""
+        claimed: dict[UUID, EventPublication] = {}
+        charged: list[tuple[UUID, int, bool]] = []
         for row in sorted(rows, key=lambda r: str(r.id)):
             token = uuid4().hex
-            if await _try_claim_row(s, row.id, owner=owner, token=token, now=now, until=until):
-                tokens[row.id] = token
+            values: dict[str, Any] = {
+                "claim_owner": owner,
+                "claim_token": token,
+                "claim_until": until,
+                "dispatch_started": False,
+            }
+            charge: dict[str, Any] = {}
+            if row.dispatch_started:
+                charge = self._interrupted_delivery_charge(row.attempt_count, now)
+                values.update(charge)
+                if charge["is_dead_lettered"]:
+                    values.update(claim_owner=None, claim_token=None, claim_until=None)
+            if not await _try_claim_row(
+                s, row.id, previous_token=row.claim_token, now=now, values=values
+            ):
+                continue
+            if charge:
+                charged.append((row.id, charge["attempt_count"], charge["is_dead_lettered"]))
+                if charge["is_dead_lettered"]:
+                    continue
+            pub = _row_to_pub(row)
+            if charge:
+                pub.attempt_count = charge["attempt_count"]
+                pub.last_error = charge["last_error"]
+                pub.last_attempt_at = now
+            pub.claim_token = token
+            claimed[row.id] = pub
         await s.commit()
-        claimed: list[EventPublication] = []
-        for row in rows:
-            if row.id in tokens:
-                pub = _row_to_pub(row)
-                pub.claim_token = tokens[row.id]
-                claimed.append(pub)
-        return claimed
+        _log_interrupted_deliveries(charged)
+        return [claimed[row.id] for row in rows if row.id in claimed]
 
     async def _claim_publication(
         self, publication_id: UUID, *, owner: str, lease_seconds: float
@@ -846,13 +943,24 @@ class PostgresPublicationStore:
         """Claim one row with the same lease-conditional UPDATE as
         ``claim_batch`` and commit. Returns the claimed publication carrying
         its ``claim_token``, or None when the row is completed, dead-lettered,
-        gone, or under another claimant's live lease."""
+        gone, or claimed by anyone — a lapsed claim is left to ``claim_batch``,
+        which charges it. The caller delivers the row at once, so the claim
+        marks its dispatch as started."""
         now = datetime.now(UTC)
         until = now + timedelta(seconds=lease_seconds)
         token = uuid4().hex
         async with self._open_session() as s:
             claimed = await _try_claim_row(
-                s, publication_id, owner=owner, token=token, now=now, until=until
+                s,
+                publication_id,
+                previous_token=None,
+                now=now,
+                values={
+                    "claim_owner": owner,
+                    "claim_token": token,
+                    "claim_until": until,
+                    "dispatch_started": True,
+                },
             )
             await s.commit()
             if not claimed:
@@ -873,12 +981,30 @@ class PostgresPublicationStore:
         completion check: an unfenced completion (``mark_complete``) keeps
         the token in place.
 
-        Also used by the outbox retry loop to voluntarily release a claim
-        early (``lease_seconds=0.0``) when a claimed row turns out not to be
-        due for retry yet (backoff), instead of holding it idle for the full
-        lease and blocking every other sweeper from picking it up sooner.
+        A positive renewal also marks the row's dispatch as started: the sweep
+        renews each row just before handing it to its listener, and renews it
+        again only while that listener runs. ``claim_batch`` charges a lapsed
+        claim only when this mark is set.
+
+        A ``lease_seconds`` of zero or less releases the claim instead,
+        clearing it entirely: the outbox retry loop releases a claimed row it
+        will not deliver yet (backoff, a sibling worker's row, a runtime still
+        starting), and a delivery cancelled by a stop, rather than hold it for
+        the full lease. A released row is never charged.
         """
-        until = datetime.now(UTC) + timedelta(seconds=lease_seconds)
+        values: dict[str, Any]
+        if lease_seconds <= 0:
+            values = {
+                "claim_owner": None,
+                "claim_token": None,
+                "claim_until": None,
+                "dispatch_started": False,
+            }
+        else:
+            values = {
+                "claim_until": datetime.now(UTC) + timedelta(seconds=lease_seconds),
+                "dispatch_started": True,
+            }
         async with self._open_session() as s:
             stmt = (
                 update(EventPublicationRow)
@@ -887,7 +1013,7 @@ class PostgresPublicationStore:
                     EventPublicationRow.claim_token == token,
                     EventPublicationRow.completed_at.is_(None),
                 )
-                .values(claim_until=until)
+                .values(**values)
             )
             result = await s.execute(stmt)
             await s.commit()
@@ -958,6 +1084,7 @@ class PostgresPublicationStore:
                     claim_owner=None,
                     claim_token=None,
                     claim_until=None,
+                    dispatch_started=False,
                 )
             )
             result = await s.execute(stmt)
