@@ -121,8 +121,21 @@ your CI:
 - run: modulith verify --mode=ratchet
 ```
 
-Now boundaries are enforced **going forward**: any new violation fails
-the build. Existing violations are tracked but don't block you.
+Now boundaries are enforced **going forward**: any new error-level violation
+fails the build (add `--fail-on-warnings` to fail on warnings too). Existing
+violations are tracked but don't block you.
+
+Violations enter the baseline once and leave it as you fix them:
+
+```mermaid
+flowchart LR
+    A["modulith verify<br>--mode=ratchet<br>--update-baseline"] --> B[".modulith-baseline.json<br>every existing violation"]
+    B --> C{"CI on every PR:<br>modulith verify<br>--mode=ratchet"}
+    C -->|"a new error"| D["Build fails"]
+    C -->|"only baselined ones"| E["Build passes"]
+    F["A PR fixes<br>a violation"] --> G["modulith verify<br>--update-baseline<br>rewrites a smaller file"]
+    G --> B
+```
 
 This is where modulith starts being useful. The verifier prevents the
 common pattern where someone "just imports something quickly" across
@@ -140,7 +153,7 @@ event.
 
 Before, in `orders/_internal/service.py`:
 ```python
-from inventory._internal.service import reserve_stock  # cross-module call
+from app.inventory._internal.service import reserve_stock  # cross-module call
 
 async def create_order(customer_id):
     order_id = await persist(...)
@@ -188,6 +201,24 @@ That last import matters: module discovery imports each module *package*
 (its `__init__.py`), not every submodule — a `@listener` in `handlers.py`
 only registers if the package imports it (or a `_manifest.py` declares it).
 
+Solid arrows are imports, dotted arrows are the event at runtime:
+
+```mermaid
+flowchart TB
+    subgraph before["Before"]
+        direction LR
+        o1["orders"] -->|"imports reserve_stock<br>a private import"| i1["inventory._internal"]
+    end
+    subgraph after["After"]
+        direction LR
+        o2["orders"] -->|"imports OrderCreated"| c["contracts"]
+        i2["inventory"] -->|"imports OrderCreated"| c
+        o2 -.->|"publishes"| m(["modulith"])
+        m -.->|"delivers OrderCreated"| i2
+    end
+    before ~~~ after
+```
+
 Same logic. Different coupling. The orders module no longer knows that
 inventory exists; it just announces what happened. **Do this one
 cross-module call at a time** — each PR is small and reversible.
@@ -203,6 +234,8 @@ import or event interactions, and any shared-table dependency still blocks
 safe extraction.
 
 ## Step 5 — Enable the transactional outbox (production-grade delivery)
+
+![One commit saves the order and one event_publications row per listener; after the commit each listener runs in the background, and a failing one is retried, then dead-lettered](docs/images/outbox.svg)
 
 When you have real users in production and event loss matters:
 
@@ -364,6 +397,8 @@ have actual delivery guarantees.
 
 ## Step 6 (optional) — Process-per-module (when one module needs more CPU)
 
+![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](docs/images/processes.svg)
+
 When a single module starts saturating your one process — typically
 reports/analytics modules that do heavy CPU work in Python — promote
 it to its own process:
@@ -503,22 +538,44 @@ service:
 4. Database split happens here — usually the hardest part
 
 `modulith extract <module>` scaffolds step 1-3's plumbing — it copies the
-module plus its contracts into a standalone service tree with a generated
-wheel-buildable `pyproject.toml`, `Dockerfile`, and `README.md` — but it refuses (exit 1,
+module, its contracts and the package-level helpers they import into a
+standalone service tree with a generated wheel-buildable `pyproject.toml`,
+`Dockerfile`, `.env.example` and `README.md` — but it refuses (exit 1,
 overridable with `--force`) when the module still shares a table with
 another module, since that's exactly the coupling a process split can't
-paper over. If a `ForeignKey("table.col")` string literal exists somewhere in
-your codebase pointing at a table another module owns, `modulith verify`
-surfaces it as a `data-ownership` warning; run `modulith verify
---update-baseline` to grandfather existing findings the same way you would
-any other ratcheted violation (Step 3), then work through them before or
-after extraction.
+paper over. It refuses on the same terms when the module itself still breaks
+a boundary rule, when it imports another module, or when the shared-table
+scan could not parse a file. A baselined violation counts: it would still
+break the extracted service. If a `ForeignKey("table.col")` string literal
+exists somewhere in your codebase pointing at a table another module owns,
+`modulith verify` surfaces it as a `data-ownership` warning; run `modulith
+verify --update-baseline` to grandfather existing findings the same way you
+would any other ratcheted violation (Step 3). That silences CI only:
+`modulith extract` still stops at them, so work through them before
+extracting, or pass `--force` and fix them afterwards.
+
+`modulith extract orders` runs these checks, in this order:
+
+```mermaid
+flowchart LR
+    A["modulith extract orders"] --> B{"Blockers found<br>and no --force?"}
+    B -->|"no"| C{"Output and source<br>paths safe?"}
+    C -->|"yes"| D["Build in a<br>staging directory"]
+    D --> E{"Staged module<br>imports cleanly?"}
+    E -->|"yes"| F["Move staging<br>to the output"]
+    B -->|"yes"| X["Exit 1"]
+    C -->|"no, --force<br>cannot help"| X
+    E -->|"no, --force<br>cannot help"| X
+```
 
 Extraction imports the configured application and module packages, so run it
 only against trusted source. It stages output before publishing it and rejects
 non-empty targets, output symlinks, output inside the source package, and
-source symlinks that escape the package; `--force` does not bypass these path
-safety rules.
+any symlink in the copied source; `--force` does not bypass these path safety
+rules. Before publishing, it imports the staged module in a fresh interpreter
+and fails if that import fails or loads code from the source tree outside the
+extracted service; `--force` does not bypass that check either, so a
+module-level import of another module fails even with `--force`.
 
 Modulith doesn't do the database split for you (that's a real data
 migration project) but the contracts module, the events, and now
@@ -539,7 +596,9 @@ outbox-side. Use deterministic IDs and `INSERT ... ON CONFLICT DO NOTHING`
 patterns or check-then-act with an idempotency key.
 
 **"Sync FastAPI views can't await publish()."** Use `publish_sync()`.
-It detects context (running loop or not) and dispatches correctly.
+It dispatches on its own background loop, so it works from a sync view or a
+script, but it raises `RuntimeError` when called on an event loop's own thread
+(use `await publish()` there).
 It blocks until dispatch completes, bounded by its `timeout` keyword
 (seconds, default 30.0) — on expiry the dispatch is cancelled and the
 call raises `TimeoutError`; pass `timeout=None` to disable the bound.

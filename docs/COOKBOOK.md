@@ -64,6 +64,27 @@ re-raises the first failure, in registration order, to the publisher. That
 holds for the in-memory path; under the durable outbox (recipe 6) listeners run
 after commit, so a failure is retried and never reaches the publisher.
 
+On the in-memory path, one failing listener plays out like this:
+
+```mermaid
+sequenceDiagram
+    participant P as Publisher
+    participant B as publish()
+    participant LA as Listener A
+    participant LB as Listener B
+    P->>B: await publish(OrderPlaced)
+    Note over B: Finds the listeners by exact event type
+    par concurrently
+        B->>LA: OrderPlaced
+    and
+        B->>LB: OrderPlaced
+    end
+    LA--xB: raises
+    LB-->>B: returns
+    Note over B: Waits until every listener is done
+    B--xP: re-raises the first failure in registration order
+```
+
 Dispatch is by exact type: a listener receives only events whose class is the
 annotated one. A listener annotated with a base class does not receive its
 subclasses' events, so give each event type its own listener.
@@ -170,6 +191,26 @@ def send_receipt(event: OrderPlaced) -> None:   # sync listener, runs in a threa
     mailer.send(event.customer_id, event.order_id)
 ```
 
+`publish_sync()` hands the dispatch to a loop on its own thread and waits for it:
+
+```mermaid
+sequenceDiagram
+    participant C as Caller thread
+    participant L as Daemon-thread loop
+    participant E as Executor threads
+    C->>L: submit the publish, then wait
+    par async listeners
+        L->>L: run on the loop
+    and def listeners
+        L->>E: run in the executor
+    end
+    alt done within the timeout
+        L-->>C: return, or raise the first failure
+    else timeout, 30 s by default
+        L--xC: PublishSyncTimeout, dispatch cancelled
+    end
+```
+
 Three sharp edges (the first two from `wrap_sync_listener`'s contract):
 
 - Only **synchronous** SQLAlchemy sessions work inside a sync listener's
@@ -262,6 +303,8 @@ informational, not a failure.
 ---
 
 ## 6. Enable the durable Postgres outbox
+
+![One commit saves the order and one event_publications row per listener; after the commit each listener runs in the background, and a failing one is retried, then dead-lettered](images/outbox.svg)
 
 **Goal:** stop losing events on crash — deliver at-least-once, atomically with
 the business transaction.
@@ -428,13 +471,40 @@ outbox.configure(
     store=store,
     serializer=serializer,
     claim_strategy="lease",     # default
-    claim_lease_seconds=60.0,   # must exceed your slowest listener
+    claim_lease_seconds=60.0,   # must exceed the longest loop stall
     claim_batch_size=100,       # rows claimed per sweep
 )
 ```
 
-A lease shorter than a listener's runtime expires mid-dispatch and lets a peer
-legitimately reclaim the row — a duplicate delivery, not a bug. Raise
+Two sweepers under the default `"lease"` strategy:
+
+```mermaid
+sequenceDiagram
+    participant A as Sweeper A
+    participant T as Outbox table
+    participant B as Sweeper B
+    A->>T: claim a batch: lease and token
+    B->>T: claim a batch
+    T-->>B: skips rows under A's live lease
+    loop while a listener runs
+        A->>T: renew every third of the lease
+    end
+    alt A finishes in time
+        A->>T: complete, with its token
+        T-->>A: row done
+    else A stalls and the lease expires
+        B->>T: claim a batch
+        T-->>B: the row, with a new token
+        A->>T: complete, with the old token
+        T-->>A: refused as stale
+    end
+```
+
+The lease renews every third of its length while a listener runs, so a slow
+listener keeps its row. A lease expires mid-dispatch only when renewal cannot
+run: a listener that blocks the event loop for longer than the lease, or
+renewals that keep failing for longer than it. A peer can then legitimately
+reclaim the row — a duplicate delivery, not a bug. Raise
 `claim_lease_seconds` rather than lowering it to chase latency. The lease is
 also the crash-recovery bound: rows a crashed process was delivering are
 recovered once their lease expires, normally within `claim_lease_seconds`
@@ -578,6 +648,8 @@ with `outbox.configure()` takes these settings as keyword arguments instead.
 
 ## 8. Go process-per-module and externalize an event
 
+![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](images/processes.svg)
+
 **Goal:** run one module in its own process (its own CPU/memory budget) while
 keeping the same module code.
 
@@ -617,6 +689,20 @@ class OrderPlaced:
 @dataclass(frozen=True)
 class StockReserved:
     order_id: str
+```
+
+In a worker, each `publish()` takes one of these routes
+([ARCHITECTURE.md](ARCHITECTURE.md) §8.1 has the full decision):
+
+```mermaid
+flowchart LR
+    P["publish(event)"] --> L{"Listener in the<br>publishing process?"}
+    L -->|"yes"| R["Run the local<br>listeners"]
+    L -->|"no"| B["Send to the broker"]
+    R --> X{"Marked @externalized<br>or plugin-routed?"}
+    X -->|"yes"| B
+    X -->|"no"| D["Stays in<br>this process"]
+    B --> W["Listeners in<br>other workers"]
 ```
 
 Run it under the supervisor + reverse proxy. Both extras are required here even
@@ -672,6 +758,24 @@ subscriptions, claims, retries, and acknowledgements. The mmap ring stores only
 advisory committed-sequence hints; consumers safely poll SQLite when a hint is
 missing, corrupt, stale, or wrapped. A successful `publish()` has already
 committed to SQLite.
+
+One publication, from commit to ack:
+
+```mermaid
+sequenceDiagram
+    participant P as Publisher worker
+    participant S as SQLite store
+    participant H as mmap ring
+    participant C as Consumer worker
+    P->>S: commit the publication
+    P->>H: write a sequence hint
+    C->>H: idle, so read hints
+    H-->>C: a newer sequence
+    C->>S: claim a batch
+    C->>C: run the listeners
+    C->>S: ack the delivery
+    Note over H,C: Lost hints cost latency, never a message
+```
 
 By default its absolute, package-namespaced files live in the platform's private
 per-user state directory, under a name that digests the package's resolved
@@ -817,7 +921,7 @@ group yet, `no_subscriber_policy` decides what happens:
 
 | Policy | Behavior |
 |--------|----------|
-| `error` (default) | Raise `NoSubscribersError` immediately; readiness stays degraded until subscriptions exist |
+| `error` (default) | Raise `NoSubscribersError` immediately; no row is written |
 | `wait` | Poll for subscribers until `no_subscriber_wait_timeout_seconds` |
 | `store` | Persist a retained source message and replay per `orphan_replay_policy` |
 
@@ -828,6 +932,31 @@ delivery rows for configured groups). A group listed in
 `expected_consumer_groups` keeps receiving rows even after `modulith broker
 drop-group` removes its subscription; remove it from that setting when you
 retire its module.
+
+The replay policies differ in when each group gets its delivery row:
+
+```mermaid
+sequenceDiagram
+    participant P as Publisher
+    participant B as Database broker
+    participant G as Consumer group
+    Note over P,G: store mode, no group has subscribed yet
+    P->>B: publish
+    alt ttl_all_groups
+        B->>B: retain the message until it expires
+        G->>B: any group subscribes in time
+        B-->>G: replay a copy to that group
+    else first_groups
+        B->>B: retain the message
+        G->>B: the first groups subscribe
+        B-->>G: replay to them, then delete it
+    else expected_groups
+        B->>B: queue a row per configured group
+        Note over B: nothing is retained
+        G->>B: a group subscribes later
+        Note over B,G: nothing is replayed
+    end
+```
 
 ### Declaring broker destinations
 
@@ -894,6 +1023,8 @@ subprocess.
 ---
 
 ## 10. Enforce boundaries in CI
+
+![payments may import the public API of orders and the events in contracts, but modulith verify refuses an import of a private name such as _orders](images/boundaries.svg)
 
 **Goal:** stop new cross-module boundary violations from merging, without having
 to fix every existing one first.
