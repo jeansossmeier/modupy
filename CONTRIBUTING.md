@@ -26,7 +26,7 @@ There are two test suites. Both require the dev setup above.
 pytest -m "not integration" -v --tb=short
 ```
 
-This runs the full default suite (~1,770 tests) against in-memory SQLite,
+This runs the full default suite (~2,380 tests) against in-memory SQLite,
 temporary files, and real in-process brokers.
 
 **Integration suite** (requires Docker):
@@ -82,6 +82,15 @@ oversized insert fails with error 1406 rather than truncating quietly. Use the
 compiles each revision's DDL for every dialect without needing a server, and
 `tests/test_migration_mysql.py` / `test_migration_postgres.py` run
 `alembic upgrade head` against real ones.
+
+## Diagrams in the Docs
+
+The illustrations in `docs/images/` are hand-written SVG files.
+Each one carries its light and dark colours in a `prefers-color-scheme` media query, plus an opaque background, so it stays readable on GitHub in either theme; when you change a colour, change it in both palettes.
+A module keeps one colour in every illustration (orders blue, payments green, inventory amber, the AI module purple), and events are pink.
+
+Diagrams inside Markdown files are GitHub-native `mermaid` code blocks.
+Leave out `%%{init}%%`, `classDef` and `style` lines: GitHub themes Mermaid for light and dark by itself, and a custom colour breaks one of the two.
 
 ## Before Opening a Pull Request
 
