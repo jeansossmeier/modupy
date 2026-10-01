@@ -111,20 +111,23 @@ def modulith_app() -> Iterator[ModulithTestApp]:
 
     Resets the global runtime singleton, registers an event-capturing spy
     plugin, and yields a handle exposing what was published and dispatched.
-    On teardown the runtime is reset again and ANY module first imported
-    during the test — application, third-party, or stdlib — is dropped from
-    ``sys.modules`` so import-time state can't leak into the next test.
-    Only ``modulith``'s own modules are preserved: their identity backs the
-    runtime singleton and other global state.
+    On teardown the runtime is reset again and every module of the
+    application package first imported during the test is dropped from
+    ``sys.modules`` so import-time state can't leak into the next test. The
+    package is the one the test configured or bootstrapped (``configure(package=...)``
+    or the resolved ``Configuration.package``); a test that did neither
+    purges nothing. Third-party, stdlib and ``modulith``'s own modules are
+    never dropped: libraries such as SQLAlchemy cannot be re-imported, and
+    ``modulith``'s identity backs the runtime singleton and other global state.
 
-    Two consequences of the delete-and-reimport strategy for modules kept
-    alive across the test boundary: a re-import yields *new* class objects
-    (``isinstance`` checks against instances created in an earlier test
-    fail), and a module whose import-time side effects register against a
-    persistent external registry (e.g. a prometheus_client-style collector)
-    can crash on re-registration in a later test. Import such modules at
-    collection time (module scope / conftest), before this fixture's
-    snapshot, so they are never deleted.
+    Two consequences of the delete-and-reimport strategy for the application's
+    modules: a re-import yields *new* class objects (``isinstance`` checks
+    against instances created in an earlier test fail), and an application
+    module whose import-time side effects register against a persistent
+    external registry (e.g. a prometheus_client-style collector) can crash on
+    re-registration in a later test. Import such modules at collection time
+    (module scope / conftest), before this fixture's snapshot, so they are
+    never deleted.
     """
     from .runtime import _runtime
 
@@ -137,11 +140,15 @@ def modulith_app() -> Iterator[ModulithTestApp]:
     try:
         yield test_app
     finally:
+        config = _runtime._config
+        package = (
+            config.package if config is not None else _runtime._config_overrides.get("package")
+        )
         _runtime._reset_for_testing()
-        for name in set(sys.modules) - snapshot:
-            if name.split(".")[0] == "modulith":
-                continue
-            del sys.modules[name]
+        if package:
+            for name in set(sys.modules) - snapshot:
+                if name == package or name.startswith(package + "."):
+                    del sys.modules[name]
 
 
 # ---------------------------------------------------------------------------

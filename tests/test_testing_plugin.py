@@ -71,6 +71,46 @@ def test_modulith_app_captures_listener_dispatch(modulith_app) -> None:
     assert OrderPlaced(order_id="b2") in [evt for _, evt in modulith_app.listener_calls]
 
 
+_APP_PURGE_TESTS = """
+import importlib
+import sys
+
+from modulith.decorators import configure
+from modulith.runtime import _runtime
+
+BOOTSTRAP = {bootstrap}
+
+
+def test_first_imports_a_library_and_an_app_module(modulith_app):
+    configure(package="purgeapp", auto_discover=False)
+    if BOOTSTRAP:
+        _runtime.ensure_bootstrapped()
+    importlib.import_module("purgelib")
+    importlib.import_module("purgeapp.orders")
+
+
+def test_second_sees_only_the_app_module_purged():
+    assert "purgelib" in sys.modules
+    assert "purgeapp.orders" not in sys.modules
+"""
+
+
+@pytest.mark.parametrize("bootstrap", [False, True], ids=["configured", "bootstrapped"])
+def test_modulith_app_purges_only_the_applications_modules(pytester, bootstrap: bool) -> None:
+    """Dropping third-party modules between tests breaks libraries that cannot
+    be re-imported (SQLAlchemy's compiled extensions) and strands hooks bound
+    to the discarded copy, so teardown removes only the application package's
+    modules — whether the package came from ``configure`` or from bootstrap."""
+    pytester.makepyfile(purgelib="VALUE = 1\n")
+    pytester.mkpydir("purgeapp")
+    pytester.mkpydir("purgeapp/orders")
+    pytester.makepyfile(test_purge=_APP_PURGE_TESTS.format(bootstrap=bootstrap))
+
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider")
+
+    result.assert_outcomes(passed=2)
+
+
 # ---------------------------------------------------------------------------
 # scenario — fluent event-flow assertions
 # ---------------------------------------------------------------------------
