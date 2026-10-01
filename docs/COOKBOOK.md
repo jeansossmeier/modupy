@@ -670,8 +670,32 @@ the matching `outbox.configure()` keyword arguments:
 | `max_retry_backoff_seconds` | positive finite number |
 | `completion_mode` | `"update"`, `"delete"` or `"archive"` |
 
-A key outside these eight is accepted and ignored. A store you bind yourself
-with `outbox.configure()` takes these settings as keyword arguments instead.
+`sqlite_wal` is the one key that is not a `configure()` setting: it applies to
+the engine the runtime builds from a SQLite `outbox_url`. `true` runs
+`PRAGMA journal_mode=WAL` on every connection; it is off by default, and modupy
+never changes a database file's journal mode unless asked. WAL persists in the
+database file, adds `-wal` and `-shm` files and cannot be used on network
+filesystems. With a non-SQLite `outbox_url` the key is a configuration error.
+An engine you build yourself for `outbox.configure()` gets the same effect with
+a `connect` listener, or by setting WAL once on the file:
+
+```python
+from sqlalchemy import event
+from sqlalchemy.ext.asyncio import create_async_engine
+
+engine = create_async_engine("sqlite+aiosqlite:///app.db")
+
+
+@event.listens_for(engine.sync_engine, "connect")
+def enable_wal(dbapi_connection, _record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.close()
+```
+
+A key outside these eight and `sqlite_wal` is accepted and ignored. A store you
+bind yourself with `outbox.configure()` takes the eight settings as keyword
+arguments instead.
 
 ---
 

@@ -74,6 +74,19 @@ outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTB
   `dead_letter_after_attempts`, `retry_interval_seconds`,
   `retry_stale_seconds`, `max_retry_backoff_seconds` and `completion_mode`
   (`update`, `delete` or `archive`).
+- `sqlite_wal = true` in the same table switches a SQLite `outbox_url` to WAL
+  journal mode on every connection of that engine. It is off by default:
+  modupy never changes a database file's journal mode unless asked. In the
+  default rollback-journal mode a reader blocks a `COMMIT`, so an after-commit
+  claim can wait out SQLite's 5 s busy timeout; WAL lets readers and the writer
+  run together. WAL is persistent: once set it stays in the database file, and
+  removing the key or setting `false` does not switch it back. It adds `-wal`
+  and `-shm` files beside the database and cannot be used on network
+  filesystems. The key is a configuration error with a non-SQLite `outbox_url`.
+  An application that builds its own engine for `outbox.configure()` gets the
+  same effect with a `connect` listener running `PRAGMA journal_mode=WAL`
+  (see the Cookbook), or by setting WAL once on the file with
+  `sqlite3 app.db 'PRAGMA journal_mode=WAL'`.
 - The deserialization allowlist is the event types of the process's own
   listeners.
 - The binding needs module discovery (`auto_discover`, the default) outside a

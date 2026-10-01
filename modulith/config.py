@@ -731,10 +731,12 @@ _POSITIVE_SECONDS_KEYS = (
 _POSITIVE_INTEGER_KEYS = ("claim_batch_size", "dead_letter_after_attempts")
 
 
-def _validate_outbox_options(options: dict[str, Any]) -> None:
+def _validate_outbox_options(options: dict[str, Any], outbox_url: str | None = None) -> None:
     """Validate the keys of [tool.modulith.outbox_options] that
     ``Runtime.bind_configured_outbox`` forwards to ``outbox.configure()``
-    (claim, retry, dead-letter and completion settings) when present. Other
+    (claim, retry, dead-letter and completion settings), plus the
+    ``sqlite_wal`` flag it applies to the engine it builds, when present.
+    ``sqlite_wal`` needs ``outbox_url`` to name SQLite when one is set. Other
     keys in that table are intentionally NOT validated here — outbox_options
     is a forward-compatible passthrough (see _read_pyproject).
     """
@@ -766,6 +768,18 @@ def _validate_outbox_options(options: dict[str, Any]) -> None:
                 raise ConfigurationError(
                     f"outbox_options.{key} must be a positive integer, got {value!r}"
                 )
+    if "sqlite_wal" in options:
+        if type(options["sqlite_wal"]) is not bool:
+            raise ConfigurationError(
+                f"outbox_options.sqlite_wal must be true or false, got {options['sqlite_wal']!r}"
+            )
+        # Name the dialect only: a full URL would put its password in the message.
+        dialect = outbox_url.partition(":")[0].partition("+")[0] if outbox_url else "sqlite"
+        if dialect != "sqlite":
+            raise ConfigurationError(
+                "outbox_options.sqlite_wal applies to SQLite only: set outbox_url to a "
+                f"sqlite+aiosqlite:///<path> URL or remove the key (outbox_url uses {dialect!r})"
+            )
 
 
 def _validate_redis_broker_options(options: dict[str, Any]) -> None:
@@ -933,7 +947,7 @@ def _validate(data: dict[str, Any]) -> None:
 
     outbox_options = data.get("outbox_options")
     if outbox_options is not None:
-        _validate_outbox_options(outbox_options)
+        _validate_outbox_options(outbox_options, data.get("outbox_url"))
 
     broker_options = data.get("broker_options")
     if data.get("broker", "memory") == "redis-streams" and broker_options is not None:

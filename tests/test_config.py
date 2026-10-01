@@ -1360,6 +1360,64 @@ def test_outbox_options_keep_unknown_keys_next_to_validated_ones() -> None:
     assert load_configuration(outbox_options=options).outbox_options == options
 
 
+# ----- outbox_options sqlite_wal validation -----------------------------------
+
+_SQLITE_OUTBOX_URL = "sqlite+aiosqlite:///outbox.db"
+_POSTGRES_OUTBOX_URL = "postgresql+asyncpg://app:s3cret@db.internal/app"
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_outbox_options_accept_sqlite_wal_booleans_on_a_sqlite_url(value: bool) -> None:
+    cfg = load_configuration(outbox_url=_SQLITE_OUTBOX_URL, outbox_options={"sqlite_wal": value})
+    assert cfg.outbox_options == {"sqlite_wal": value}
+
+
+@pytest.mark.parametrize("value", ["wal", "true", "WAL", 1, 0, None, ["wal"]])
+def test_outbox_options_reject_a_non_boolean_sqlite_wal(value: object) -> None:
+    with pytest.raises(
+        ConfigurationError, match=r"outbox_options\.sqlite_wal must be true or false"
+    ):
+        load_configuration(outbox_url=_SQLITE_OUTBOX_URL, outbox_options={"sqlite_wal": value})
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_outbox_options_reject_sqlite_wal_on_a_non_sqlite_url_without_leaking_it(
+    value: bool,
+) -> None:
+    with pytest.raises(ConfigurationError) as excinfo:
+        load_configuration(outbox_url=_POSTGRES_OUTBOX_URL, outbox_options={"sqlite_wal": value})
+
+    message = str(excinfo.value)
+    assert (
+        "outbox_options.sqlite_wal" in message,
+        "sqlite+aiosqlite:///" in message,
+        "postgresql" in message,
+        "s3cret" in message,
+    ) == (True, True, True, False)
+
+
+def test_outbox_options_accept_sqlite_wal_without_an_outbox_url() -> None:
+    cfg = load_configuration(outbox_options={"sqlite_wal": True})
+    assert cfg.outbox_options == {"sqlite_wal": True}
+
+
+def test_sqlite_wal_in_pyproject_is_refused_when_the_env_url_is_not_sqlite(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.modulith]\n"
+        'outbox_url = "sqlite+aiosqlite:///outbox.db"\n'
+        "[tool.modulith.outbox_options]\n"
+        "sqlite_wal = true\n"
+    )
+    from_pyproject = load_configuration().outbox_options
+    monkeypatch.setenv("MODULITH_OUTBOX_URL", _POSTGRES_OUTBOX_URL)
+
+    assert from_pyproject == {"sqlite_wal": True}
+    with pytest.raises(ConfigurationError, match=r"outbox_options\.sqlite_wal"):
+        load_configuration()
+
+
 # ----- strict_boundaries (boundary enforcement mode) --------------------------
 
 

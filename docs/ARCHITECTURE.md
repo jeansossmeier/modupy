@@ -148,6 +148,13 @@ check:
 | `max_retry_backoff_seconds` | `300` | finite number > 0 |
 | `completion_mode` | `"update"` | `"update"`, `"delete"`, `"archive"` (§7.3) |
 
+A ninth key, `sqlite_wal`, is validated too but is not a `configure()`
+setting: `bind_configured_outbox` applies it to the engine it builds, running
+`PRAGMA journal_mode=WAL` on every new connection. It accepts `true` or `false`
+(off by default, so a database file's journal mode is never changed unless
+asked), and with it set `outbox_url` must name SQLite or config load raises.
+DEPLOYMENT.md covers what WAL changes on disk.
+
 Any other key in the table is accepted and ignored, so a `pyproject.toml`
 written for a newer release still loads. An application that calls
 `outbox.configure()` before bootstrap keeps its own store and settings:

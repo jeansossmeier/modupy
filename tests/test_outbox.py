@@ -2722,6 +2722,88 @@ def test_bootstrap_binds_store_from_outbox_url_and_delivers_after_commit(
     assert postgres_outbox._active_store is None
 
 
+def _journal_mode_of_file(db: Path) -> str:
+    connection = sqlite3.connect(db)
+    try:
+        return str(connection.execute("PRAGMA journal_mode").fetchone()[0])
+    finally:
+        connection.close()
+
+
+def _seed_sqlite_file(db: Path, journal_mode: str) -> None:
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute(f"PRAGMA journal_mode={journal_mode}")
+        connection.execute("CREATE TABLE seed (id INTEGER)")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _journal_modes_after_binding_outbox_url(
+    make_fake_app: Any, db: Path, options: dict[str, Any]
+) -> tuple[str, str]:
+    """Bootstrap ``fakeapp`` on a SQLite ``outbox_url`` with ``options``, create
+    the outbox table through the bound store's engine, and return the
+    ``journal_mode`` that engine reports and the one the file keeps after
+    shutdown."""
+    make_fake_app(_ORDERS_APP)
+    _runtime.configure(
+        package="fakeapp",
+        outbox="postgres",
+        outbox_url=f"sqlite+aiosqlite:///{db}",
+        outbox_options=options,
+    )
+    _runtime.ensure_bootstrapped()
+    assert _runtime._owned_outbox is not None
+    _, engine = _runtime._owned_outbox
+
+    async def scenario() -> str:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with engine.connect() as conn:
+            mode = (await conn.exec_driver_sql("PRAGMA journal_mode")).scalar_one()
+        await _runtime.shutdown()
+        return str(mode)
+
+    return asyncio.run(scenario()), _journal_mode_of_file(db)
+
+
+@pytest.mark.parametrize("existing_mode", [None, "delete"], ids=["fresh-file", "rollback-file"])
+def test_outbox_url_sqlite_wal_puts_the_bound_engine_and_the_file_in_wal(
+    make_fake_app: Any, tmp_path: Path, existing_mode: str | None
+) -> None:
+    db = tmp_path / "app.db"
+    if existing_mode is not None:
+        _seed_sqlite_file(db, existing_mode)
+
+    modes = _journal_modes_after_binding_outbox_url(make_fake_app, db, {"sqlite_wal": True})
+
+    assert modes == ("wal", "wal")
+
+
+@pytest.mark.parametrize("options", [{}, {"sqlite_wal": False}], ids=["unset", "false"])
+@pytest.mark.parametrize(
+    ("existing_mode", "expected"),
+    [(None, "delete"), ("wal", "wal")],
+    ids=["fresh-file", "wal-file"],
+)
+def test_outbox_url_leaves_the_journal_mode_alone_unless_sqlite_wal_is_true(
+    make_fake_app: Any,
+    tmp_path: Path,
+    options: dict[str, Any],
+    existing_mode: str | None,
+    expected: str,
+) -> None:
+    db = tmp_path / "app.db"
+    if existing_mode is not None:
+        _seed_sqlite_file(db, existing_mode)
+
+    modes = _journal_modes_after_binding_outbox_url(make_fake_app, db, options)
+
+    assert modes == (expected, expected)
+
+
 _FAILING_LISTENER_APP = {
     "orders": """
         from dataclasses import dataclass
