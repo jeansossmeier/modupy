@@ -346,6 +346,29 @@ def test_extract_boundary_violation_blocks_and_force_overrides(
     assert "Extraction notes" in readme
 
 
+def test_extract_force_under_strict_boundaries_extracts_with_notes(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_STRICT_BOUNDARIES", "1")
+    make_fake_app(
+        {
+            "orders": "def use():\n    from fakeapp.inventory._internal import secret\n    return secret\n",
+            "inventory": "",
+        },
+        extra_files={
+            "inventory/_internal.py": "secret = 1\n",
+            "contracts/__init__.py": "",
+        },
+    )
+    out_dir = tmp_path / "orders-service"
+
+    forced = runner.invoke(app, ["extract", "orders", "--output", str(out_dir), "--force"])
+
+    assert forced.exit_code == 0, forced.output
+    assert "Extraction notes" in (out_dir / "README.md").read_text()
+
+
 def test_extract_shared_table_blocks(make_fake_app, monkeypatch, tmp_path):
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app(

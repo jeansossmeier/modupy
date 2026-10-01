@@ -57,7 +57,7 @@ from .builtin import outbox, verifier
 from .config import ConfigurationError, _find_pyproject, load_configuration
 from .discovery import _detect_from_pyproject_name
 from .manifest import get_manifest
-from .runtime import Runtime, _runtime
+from .runtime import Runtime, _inspection_bootstrap, _runtime
 from .types import Violation, ViolationSeverity
 
 app = typer.Typer(
@@ -122,8 +122,13 @@ def _add_project_root_to_syspath() -> None:
         sys.path.insert(0, root)
 
 
-def _bootstrap_or_exit() -> Runtime:
+def _bootstrap_or_exit(*, inspection: bool = False) -> Runtime:
     """Bootstrap the runtime, converting config errors into a clean exit.
+
+    ``inspection=True`` is for the commands that report boundary findings
+    themselves (``verify``, ``docs``, ``doctor``, ``extract``): under
+    ``strict_boundaries`` the bootstrap then completes instead of aborting on
+    violations, which the command reads and judges under its own exit codes.
 
     Bootstrap imports the application's modules and wires the plugin
     manager — everything ``info``/``verify``/``docs`` need. A
@@ -156,7 +161,11 @@ def _bootstrap_or_exit() -> Runtime:
                 )
                 raise typer.Exit(code=1)
             _runtime.configure(package=pkg)
-    return _ensure_bootstrapped_or_exit()
+    token = _inspection_bootstrap.set(inspection)
+    try:
+        return _ensure_bootstrapped_or_exit()
+    finally:
+        _inspection_bootstrap.reset(token)
 
 
 def _ensure_bootstrapped_or_exit() -> Runtime:
@@ -969,7 +978,7 @@ def verify(
         typer.echo(f"invalid --mode {mode!r}: expected 'strict' or 'ratchet'", err=True)
         raise typer.Exit(code=1)
 
-    rt = _bootstrap_or_exit()
+    rt = _bootstrap_or_exit(inspection=True)
     violations = _collect_violations(rt)
 
     if update_baseline:
@@ -1013,7 +1022,7 @@ def docs(
     hook produced duplicate or unsafe module names — see the built-in docs
     generator's validation), 2 on unexpected internal errors.
     """
-    rt = _bootstrap_or_exit()
+    rt = _bootstrap_or_exit(inspection=True)
     modules = rt.modules
     pm = rt.plugin_manager
 
@@ -1088,7 +1097,7 @@ def extract(
     """
     from .extract import extraction_blockers, import_closure, write_extraction
 
-    rt = _bootstrap_or_exit()
+    rt = _bootstrap_or_exit(inspection=True)
     known = {m.name for m in rt.modules}
     if module not in known:
         available = ", ".join(sorted(known)) if known else "(none discovered)"
@@ -1299,7 +1308,7 @@ def doctor() -> None:
     """
     from .doctor import render_report, run_doctor
 
-    _bootstrap_or_exit()
+    _bootstrap_or_exit(inspection=True)
     report = run_doctor()
     typer.echo(render_report(report))
     if report.overall_status == "error":

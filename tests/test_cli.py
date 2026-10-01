@@ -840,6 +840,26 @@ def test_verify_dirty_exits_one_and_reports_violation(make_fake_app, monkeypatch
     assert "orders" in result.output
 
 
+def test_verify_under_strict_boundaries_reports_violations_and_exits_one(
+    make_fake_app, monkeypatch
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_STRICT_BOUNDARIES", "1")
+    make_fake_app(
+        {
+            "orders": "from fakeapp.inventory._internal import secret\n",
+            "inventory": "",
+        },
+        extra_files={"inventory/_internal.py": "secret = 1\n"},
+    )
+
+    result = runner.invoke(app, ["verify"])
+
+    assert result.exit_code == 1, result.output
+    assert "no-internal-imports" in result.output
+    assert "boundary violations detected with strict_boundaries" not in result.output
+
+
 def test_verify_unimportable_package_exits_one(make_fake_app, monkeypatch):
     """An application package whose own __init__ raises must fail `modulith
     verify` (exit 1 with the cause) — not report '✓ no boundary violations'
@@ -921,6 +941,24 @@ def test_verify_ratchet_grandfathers_baselined_violation(make_fake_app, monkeypa
 def test_docs_command_produces_files(make_fake_app, monkeypatch, tmp_path):
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app({"orders": "", "inventory": ""})
+    out_dir = tmp_path / "generated-docs"
+
+    result = runner.invoke(app, ["docs", "--output-dir", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "architecture.mmd").exists()
+
+
+def test_docs_under_strict_boundaries_still_generates_files(make_fake_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_STRICT_BOUNDARIES", "1")
+    make_fake_app(
+        {
+            "orders": "from fakeapp.inventory._internal import secret\n",
+            "inventory": "",
+        },
+        extra_files={"inventory/_internal.py": "secret = 1\n"},
+    )
     out_dir = tmp_path / "generated-docs"
 
     result = runner.invoke(app, ["docs", "--output-dir", str(out_dir)])
@@ -1636,6 +1674,30 @@ def test_dev_processes_topology_strict_boundaries_still_raises(make_fake_app, mo
     assert result.exit_code == 1
     assert "boundary violations detected" in result.stderr
     assert "MODULITH_DEV_WARN_ONLY" not in os.environ
+
+
+def test_app_bootstrap_still_raises_under_strict_boundaries_after_a_tool_command(
+    make_fake_app, monkeypatch
+) -> None:
+    """The tolerance is private to the inspection commands: once `verify`
+    has run in this process, bootstrapping the application itself must
+    still refuse to start on a boundary violation."""
+    import modulith
+    from modulith.config import ConfigurationError
+    from modulith.runtime import _runtime
+
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_STRICT_BOUNDARIES", "1")
+    make_fake_app(
+        {"orders": "from fakeapp.inventory._internal import secret\n", "inventory": ""},
+        extra_files={"inventory/_internal.py": "secret = 1\n"},
+    )
+
+    assert runner.invoke(app, ["verify"]).exit_code == 1
+    _runtime._reset_for_testing()
+
+    with pytest.raises(ConfigurationError, match="boundary violations detected"):
+        modulith.bootstrap()
 
 
 def test_verify_warning_only_violations_pass_unless_fail_on_warnings(

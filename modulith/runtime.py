@@ -18,6 +18,7 @@ import pkgutil
 import sys
 import threading
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
@@ -33,6 +34,11 @@ from .manager import create_plugin_manager
 from .types import EventPublication, EventPublishReceipt, ModuleInfo
 
 logger = logging.getLogger("modulith")
+
+# Set only by the CLI inspection commands (see ``cli._bootstrap_or_exit``).
+# While true, a bootstrap under ``strict_boundaries`` does not abort on
+# boundary violations, because the command reports them under its own contract.
+_inspection_bootstrap: ContextVar[bool] = ContextVar("modulith_inspection_bootstrap", default=False)
 
 # Strong references for fire-and-forget background tasks (currently just the
 # best-effort provisional-broker close below). asyncio only holds a weak
@@ -1001,6 +1007,8 @@ class Runtime:
             #
             # Single-process `modulith dev` uses this marker so it survives
             # uvicorn's reload child. It must not weaken process topology.
+            # The inspection commands (`verify`, `docs`, `doctor`, `extract`)
+            # skip the abort entirely: they report findings themselves.
             if config.strict_boundaries:
                 from .builtin import verifier
                 from .config import ConfigurationError
@@ -1012,7 +1020,7 @@ class Runtime:
                     ):
                         violations.extend(result)
                 violations.extend(verifier.detect_cycles(modules))
-                if violations:
+                if violations and not _inspection_bootstrap.get():
                     details = "\n  - ".join(
                         f"[{v.severity.value.upper()}] {v.module}: {v.rule}: {v.message}"
                         + (f" ({v.location})" if v.location else "")

@@ -657,6 +657,24 @@ def test_doctor_cli_exits_nonzero_on_error(make_fake_app, monkeypatch) -> None:
     assert "boundary health" in result.output
 
 
+def test_doctor_cli_under_strict_boundaries_reports_its_own_verdict(
+    make_fake_app, monkeypatch
+) -> None:
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_STRICT_BOUNDARIES", "1")
+    make_fake_app(
+        {"orders": "from fakeapp.inventory._internal import secret\n", "inventory": ""},
+        extra_files={"inventory/_internal.py": "secret = 1\n"},
+    )
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 1
+    assert "modulith doctor" in result.output
+    assert "boundary health" in result.output
+    assert "boundary violations detected with strict_boundaries" not in result.output
+
+
 # ---------------------------------------------------------------------------
 # regression: audit findings
 # ---------------------------------------------------------------------------
