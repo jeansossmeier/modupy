@@ -82,6 +82,23 @@ def _fresh_broker_announcements() -> Iterator[None]:
     _announced_broker_defaults.clear()
 
 
+@pytest.fixture(autouse=True)
+def _private_state_home(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep the broker state a test or its workers create out of the real home.
+
+    The default state directory is named after the package's path, so every
+    test's fresh ``tmp_path`` app would otherwise leave a new directory under
+    ``~/.local/state/modulith`` for good. macOS resolves the state home from
+    HOME alone (``modulith.adapters._state_path._default_state_home``), which
+    cannot be redirected here without breaking git in tests.
+    """
+    state_home = str(tmp_path_factory.mktemp("state-home"))
+    monkeypatch.setenv("XDG_STATE_HOME", state_home)
+    monkeypatch.setenv("LOCALAPPDATA", state_home)
+
+
 def _free_port() -> int:
     """Find a free TCP port by binding to port 0, then releasing it.
 
