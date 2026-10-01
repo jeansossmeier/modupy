@@ -550,10 +550,11 @@ is `"lease"`:
 | `"advisory_lock"` | a per-publication `pg_try_advisory_lock` held for the duration of the dispatch. Postgres-only — a non-Postgres store rejects it at `configure()` | no extra write, but a held AUTOCOMMIT connection (no open transaction) per in-flight row. Lock connections come from a separate pool sized like the engine's, so held locks never starve the listener or the store's own reads of the engine pool. With a `QueuePool` (the async engine default) a process can therefore hold up to 2×(`pool_size` + `max_overflow`) Postgres connections during a burst, and keeps up to `pool_size` idle lock connections open after it. `NullPool` and `max_overflow=-1` bound neither pool, so a burst opens one lock connection per in-flight row. The lock pool also caps how many rows the after-commit path delivers at once: an after-commit dispatch that waits past `pool_timeout` for a lock connection logs a WARNING and leaves its row, untouched and uncharged, to the sweep, which delivers one row at a time. A sweep that itself waits past `pool_timeout` logs a WARNING and leaves the rest of its batch to the next sweep. A lock connection returns to its pool when the lock attempt found the row taken or the unlock confirmed the release; after a failed lock query or unlock it is invalidated, so a lock never outlives its dispatch |
 | `"none"` | no coordination; two sweepers CAN dispatch the same row. Logged as a warning at `configure()` so the tradeoff is visible | none |
 
-Tuning knobs: `claim_lease_seconds` (default 60 — must exceed your slowest
-listener, or the lease expires mid-dispatch and a peer legitimately reclaims
-the row; it also bounds how long a crashed process's in-flight rows wait for
-recovery, see §7.2) and `claim_batch_size` (default 100 rows per claim). A
+Tuning knobs: `claim_lease_seconds` (default 60 — the lease renews every
+third of it while a listener runs, so it must exceed the longest event-loop
+stall, not your slowest listener; a lease that lapses lets a peer legitimately
+reclaim the row; it also bounds how long a crashed process's in-flight rows
+wait for recovery, see §7.2) and `claim_batch_size` (default 100 rows per claim). A
 renewal that raises (a database blip) is logged and retried until the lease
 expires; it never fails the delivery.
 
