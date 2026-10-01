@@ -126,6 +126,28 @@ row by primary key first, so a redelivered event changes nothing.
 Now the order row and its events commit together. The outbox lives in the same
 `shop.db` as the business tables; `modulith migrate` adds the outbox tables.
 
+Compare the sequence in which the three modules commit their rows:
+
+```mermaid
+sequenceDiagram
+    participant orders
+    participant inventory
+    participant notifications
+    alt stage 1: memory outbox
+        orders->>inventory: OrderPlaced
+        inventory->>notifications: StockReserved
+        Note over notifications: notice committed
+        Note over inventory: reservation committed
+        Note over orders: order committed
+    else stages 2 to 4: durable outbox
+        Note over orders: order and event<br>commit together
+        orders->>inventory: OrderPlaced
+        Note over inventory: reservation and event<br>commit together
+        inventory->>notifications: StockReserved
+        Note over notifications: notice committed
+    end
+```
+
 ```bash
 export MODULITH_OUTBOX=postgres MODULITH_OUTBOX_URL=sqlite+aiosqlite:///shop.db
 ```

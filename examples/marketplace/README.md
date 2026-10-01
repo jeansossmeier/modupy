@@ -13,6 +13,27 @@ through a fake gateway. `shipping` books a carrier. `notifications` tells the
 customer, and `reporting` keeps the read models. `catalog` prices what can be
 ordered.
 
+Solid arrows are events from `contracts`; the dashed arrow is a direct call.
+
+```mermaid
+flowchart LR
+    orders -->|PaymentRequested| payments
+    payments -->|PaymentCaptured| orders
+    payments -->|PaymentDeclined| inventory
+    catalog -->|ProductListed| inventory
+    orders -->|OrderPlaced| inventory
+    inventory -->|"StockReserved<br>StockRejected<br>StockReleased"| orders
+    orders -->|OrderConfirmed| shipping
+    orders -.->|"calls price_of"| catalog
+    subgraph readers["listen only"]
+        notifications
+        reporting
+    end
+    orders -->|OrderPlaced| notifications
+    orders -->|"OrderConfirmed<br>OrderCancelled"| readers
+    shipping -->|ShipmentBooked| readers
+```
+
 - [`marketplace/contracts/`](marketplace/contracts): the eleven events the modules share
 - [`marketplace/catalog/`](marketplace/catalog): `price_of(sku)`, and a command that lists a product
 - [`marketplace/inventory/`](marketplace/inventory): reserves stock, and releases it as compensation
@@ -190,6 +211,41 @@ re-run by CI until they match, and you re-run them by hand the same way. The
 first read of each story asks for its last effect, so the reads after it can
 rely on everything before.
 
+An order can end in four ways; `notifications` and `reporting` only listen, so
+the diagram leaves them out:
+
+```mermaid
+sequenceDiagram
+    participant orders
+    participant inventory
+    participant payments
+    participant shipping
+    orders->>inventory: OrderPlaced
+    alt stock reserved
+        inventory->>orders: StockReserved
+        orders->>payments: PaymentRequested
+        alt payment captured
+            payments->>orders: PaymentCaptured
+            orders->>shipping: OrderConfirmed
+            shipping->>shipping: ShipmentRequested
+            alt carrier booked
+                Note over shipping: publishes ShipmentBooked
+            else no shipping zone
+                Note left of shipping: dead-lettered after 3 attempts
+                Note over orders: order stays confirmed
+            end
+        else payment declined
+            payments->>inventory: PaymentDeclined
+            Note over inventory: puts the stock back
+            inventory->>orders: StockReleased
+            Note over orders: publishes OrderCancelled
+        end
+    else out of stock
+        inventory->>orders: StockRejected
+        Note over orders: publishes OrderCancelled
+    end
+```
+
 **A paid order.** `orders` publishes `OrderPlaced`. `inventory` reserves the
 stock, `orders` asks for payment, `payments` captures it, and `orders` confirms.
 `shipping` books a carrier and `notifications` writes the shipped notice.
@@ -329,6 +385,25 @@ monolith, isolated from every other module. It takes over port 8000:
 $ modulith dev marketplace.main:app --isolate orders
 modulith: --isolate='orders' restricts this deployment to that module only — every other discovered module is not started and its routes 404
 modulith → process-per-module: 1 worker(s) [orders:9001], reverse proxy on http://127.0.0.1:8000
+```
+
+This is what runs now, and the path the event takes:
+
+```mermaid
+flowchart LR
+    client["curl"]
+    subgraph platform["port 8000: orders alone"]
+        orders
+    end
+    broker[("database broker<br>in Postgres")]
+    subgraph service["port 8100: extracted service"]
+        notifications
+    end
+    client -->|"POST /orders"| orders
+    client -.->|"GET /notifications: 404"| platform
+    orders -->|OrderPlaced| broker
+    broker -->|OrderPlaced| notifications
+    client -->|"GET /notifications"| notifications
 ```
 
 An order placed there publishes `OrderPlaced` to the broker. Port 8000 no longer
