@@ -347,13 +347,14 @@ class Runtime:
             return handlers
         return [h for h in handlers if self._listener_owners.get(h, hosted) == hosted]
 
-    def bind_configured_outbox(self) -> None:
+    def bind_configured_outbox(self, bus: Any = None) -> None:
         """Bind a ``PostgresPublicationStore`` on ``outbox_url`` when none is bound.
 
         No-op for the memory outbox, without a URL, or when the application
         already called ``outbox.configure()``: an explicit store wins. The
         serializer admits only the event types of this process's local
-        listeners, the only rows it may deserialize. The claim, retry,
+        listeners on ``bus`` (default: the installed bus), the only rows it
+        may deserialize. The claim, retry,
         dead-letter and completion settings of ``outbox_options`` are applied
         by the same ``configure()`` call that
         binds the store, so no after-commit dispatch runs without them. That
@@ -388,11 +389,13 @@ class Runtime:
             )
             if key in cfg.outbox_options
         }
+        if bus is None:
+            bus = self._event_bus
         engine = create_async_engine(cfg.outbox_url)
         store = PostgresPublicationStore(engine)
-        self._owned_outbox = (store, engine)
-        event_types = self.local_event_types(self._event_bus) if self._event_bus else []
+        event_types = self.local_event_types(bus) if bus is not None else []
         outbox.configure(store, JsonEventSerializer(allowed_event_types=event_types), **tuning)
+        self._owned_outbox = (store, engine)
 
     def local_event_types(self, bus: Any) -> list[type]:
         """Registered event types with at least one listener this process owns."""
@@ -1039,6 +1042,26 @@ class Runtime:
             # module-scoped resources, doc canvases) silently never ran.
             for module in modules:
                 plugin_manager.hook.modulith_after_module_load(module=module)
+
+            # 6.7. Drain whatever queued AFTER the step-6 flush. A hookimpl for
+            # modulith_verify_module (6.55) or modulith_after_module_load (6.6)
+            # runs on this very thread, and the lock is reentrant, so a plugin
+            # registering a listener from one of them takes register_listener's
+            # pending branch (self._event_bus is still None up here) and the
+            # clear() at the commit point would destroy it with no error, no
+            # warning, no log. Only the tail is drained: the bus appends without
+            # dedupe, so re-flushing the whole list would double-register step
+            # 6's listeners.
+            for event_type, handler in self._pending_listeners[flushed:]:
+                event_bus.register(event_type, handler)
+
+            # 6.8. Bind the configured outbox store, the last step that can
+            # fail (a missing driver, an invalid outbox_options setting), so a
+            # failure still rolls back. Without discovery the bus lacks the
+            # modules' event types, so the store's deserialization allowlist
+            # would be empty; a worker binds after importing its module instead.
+            if config.auto_discover:
+                self.bind_configured_outbox(event_bus)
         except BaseException:
             # Roll back the early config install (see step 4.5) — a failed
             # bootstrap must leave the runtime exactly as it was. The local
@@ -1052,7 +1075,7 @@ class Runtime:
             raise
 
         # 7. Commit point — install all state on self. Nothing above mutated
-        # the runtime, so an exception in steps 1-6.6 left it pristine.
+        # the runtime, so an exception in steps 1-6.8 left it pristine.
         self._config = config
         for handler, importing in self._unresolved_listener_modules.items():
             owner = self._owning_module_package(importing)
@@ -1064,23 +1087,7 @@ class Runtime:
         self._broker_registry = broker_registry
         self._consumer_registry = consumer_registry
         self._modules = modules
-        # Drain whatever queued AFTER the step-6 flush. A hookimpl for
-        # modulith_verify_module (6.55) or modulith_after_module_load (6.6)
-        # runs on this very thread, and the lock is reentrant, so a plugin
-        # registering a listener from one of them takes register_listener's
-        # pending branch (self._event_bus is still None up here) and the
-        # clear() below would destroy it with no error, no warning, no log.
-        # Only the tail is drained: the bus appends without dedupe, so
-        # re-flushing the whole list would double-register step 6's listeners.
-        for event_type, handler in self._pending_listeners[flushed:]:
-            event_bus.register(event_type, handler)
         self._pending_listeners.clear()
-
-        # 7.4. Without discovery the bus lacks the modules' event types, so the
-        # store's deserialization allowlist would be empty; a worker binds
-        # after importing its module instead.
-        if config.auto_discover:
-            self.bind_configured_outbox()
 
         # 7.5. Friendly startup banner so users see what's active.
         self._log_banner()

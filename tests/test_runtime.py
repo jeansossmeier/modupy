@@ -193,6 +193,38 @@ def test_failed_bootstrap_rolls_back_early_config_install() -> None:
     assert _runtime.config is None  # documented: "None before bootstrap"
 
 
+def test_failed_outbox_bind_rolls_back_and_the_retry_keeps_listeners(
+    make_fake_app, tmp_path
+) -> None:
+    """Binding the configured outbox store can fail, so it must roll back like
+    every other bootstrap step: the failed attempt leaves no configuration
+    behind, and the retry still delivers to the modules the first attempt
+    imported. Bound after the commit point, it ran once the listener queue
+    had been cleared, so the retry came up with no listeners."""
+    make_fake_app({"orders": _LISTENER_MODULE})
+    configure(
+        package="fakeapp",
+        outbox="postgres",
+        outbox_url=f"sqlite+aiosqlite:///{tmp_path / 'outbox.db'}",
+        outbox_options={"claim_strategy": "advisory_lock"},
+    )
+
+    with pytest.raises(ConfigurationError, match="advisory_lock"):
+        _runtime.ensure_bootstrapped()
+    assert _runtime._bootstrapped is False
+    assert _runtime.config is None
+
+    configure(outbox_options={})
+    _runtime.ensure_bootstrapped()
+
+    import fakeapp.orders as orders
+
+    from modulith import publish_sync
+
+    publish_sync(orders.OrderCreated(order_id="o-bind"))
+    assert [e.order_id for e in orders.received] == ["o-bind"]
+
+
 # ---------------------------------------------------------------------------
 # Reentrant runtime use during bootstrap must not deadlock
 # ---------------------------------------------------------------------------
