@@ -251,6 +251,62 @@ def test_database_broker_postgres_migration_has_sync_driver_and_packaged_config(
     assert "PostgreSQL requires `psycopg[binary]`" in readme
 
 
+def test_render_pyproject_preserves_modupy_extras_from_source():
+    """Extras from source project's modupy are merged and sorted in extracted pyproject."""
+    cfg = Configuration(
+        package="fakeapp",
+        broker="redis-streams",
+    )
+    source_deps = ["modupy[postgres,otel]>=0.10"]
+
+    rendered = _render_pyproject(cfg=cfg, module="orders", source_deps=source_deps)
+    parsed = tomllib.loads(rendered)
+
+    deps = parsed["project"]["dependencies"]
+    modupy_dep = next(d for d in deps if d.startswith("modupy["))
+
+    expected = f"modupy[cli,fastapi,otel,postgres,redis]=={__version__}"
+    assert modupy_dep == expected
+
+
+def test_render_pyproject_handles_source_without_modupy_extras():
+    """Source projects without modupy extras produce unchanged behavior."""
+    cfg = Configuration(
+        package="fakeapp",
+        broker="redis-streams",
+    )
+    source_deps = ["modupy>=0.10"]
+
+    rendered = _render_pyproject(cfg=cfg, module="orders", source_deps=source_deps)
+    parsed = tomllib.loads(rendered)
+
+    deps = parsed["project"]["dependencies"]
+    modupy_dep = next(d for d in deps if d.startswith("modupy["))
+
+    expected = f"modupy[cli,fastapi,redis]=={__version__}"
+    assert modupy_dep == expected
+
+
+def test_render_pyproject_no_source_modupy_dependency():
+    """When source has no modupy dependency, output is unchanged."""
+    cfg = Configuration(
+        package="fakeapp",
+        broker="redis-streams",
+    )
+    source_deps = ["requests", "click"]
+
+    rendered = _render_pyproject(cfg=cfg, module="orders", source_deps=source_deps)
+    parsed = tomllib.loads(rendered)
+
+    deps = parsed["project"]["dependencies"]
+    modupy_dep = next(d for d in deps if d.startswith("modupy["))
+
+    expected = f"modupy[cli,fastapi,redis]=={__version__}"
+    assert modupy_dep == expected
+    assert "requests" in deps
+    assert "click" in deps
+
+
 def test_extract_unknown_module_exits_one_and_lists_modules(make_fake_app, monkeypatch, tmp_path):
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app({"orders": "", "inventory": ""})

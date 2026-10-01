@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import json
 import keyword
+import re
 import shutil
 import subprocess
 import sys
@@ -295,6 +296,17 @@ def _toml_scalar(value: Any) -> str:
     return json.dumps(value)
 
 
+_REQUIREMENT_HEAD = re.compile(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[([^\]]*)\])?")
+
+
+def _extract_modupy_extras(source_deps: list[str]) -> set[str]:
+    for dep in source_deps:
+        match = _REQUIREMENT_HEAD.match(dep)
+        if match and re.sub(r"[-_.]+", "-", match.group(1)).lower() == "modupy":
+            return {extra.strip() for extra in (match.group(2) or "").split(",") if extra.strip()}
+    return set()
+
+
 def _render_pyproject(*, cfg: Configuration, module: str, source_deps: list[str]) -> str:
     extras = ["fastapi", "cli"]
     if cfg.broker == "redis-streams":
@@ -306,9 +318,12 @@ def _render_pyproject(*, cfg: Configuration, module: str, source_deps: list[str]
     if cfg.outbox == "postgres":
         extras.append("postgres")
 
+    source_extras = _extract_modupy_extras(source_deps)
+    merged_extras = sorted(set(extras) | source_extras)
+
     from . import __version__
 
-    dependencies = [f"modupy[{','.join(extras)}]=={__version__}"]
+    dependencies = [f"modupy[{','.join(merged_extras)}]=={__version__}"]
     dependencies.extend(dep for dep in source_deps if not dep.startswith("modupy"))
     broker_url = _configured_broker_url(cfg.broker_options)
     if (
