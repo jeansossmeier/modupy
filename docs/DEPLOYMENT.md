@@ -25,6 +25,8 @@ MODULITH_BROKER=memory uvicorn myapp.main:app --workers 1
 
 ## Durable Single-Process (Outbox Pattern)
 
+![One commit saves the order and one event_publications row per listener; after the commit each listener runs in the background, and a failing one is retried, then dead-lettered](images/outbox.svg)
+
 Add persistence without splitting processes: publish events atomically with your domain transaction.
 
 Three steps make it durable. Set `outbox_url` so modulith binds the store in
@@ -301,6 +303,8 @@ existing Modulith tables or Alembic history in `public`; see
 ---
 
 ## Process-Per-Module Topology
+
+![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](images/processes.svg)
 
 Split modules across separate worker processes for independent scaling, deployment, and lifecycle. Events flow through a broker (database, Redis, or other transports).
 
@@ -607,7 +611,7 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY myapp/ ./myapp/
 RUN pip install --no-cache-dir .
-EXPOSE 8000-8100
+EXPOSE 8000
 ENV MODULITH_BROKER=database
 ENV MODULITH_BROKER_URL=postgresql+asyncpg://...
 # The supervisor binds 0.0.0.0, where actuator_mode="auto" only mounts
@@ -625,7 +629,7 @@ services:
   app:
     build: .
     ports:
-      - "8000-8100:8000-8100"
+      - "8000:8000"
     environment:
       MODULITH_BROKER: database
       MODULITH_BROKER_URL: postgresql+asyncpg://user:pass@postgres/mydb
@@ -692,6 +696,24 @@ spec:
 
 ```bash
 modulith k8s-manifest --output k8s/modulith.yaml --image myapp:1.0.0 --namespace prod
+```
+
+Each pod runs one worker, so the Ingress and the Services do the routing that the proxy does under `modulith run`.
+
+```mermaid
+flowchart TD
+    client["Client"] --> ing["Ingress<br>myapp-ingress"]
+    ing -->|"/orders"| so["Service<br>myapp-orders"]
+    ing -->|"/inventory"| si["Service<br>myapp-inventory"]
+    subgraph deps["Deployment per module"]
+        dor["myapp-orders"]
+        din["myapp-inventory"]
+    end
+    so --> dor
+    si --> din
+    sb["Secret myapp-broker<br>created by you"] -.->|"MODULITH_BROKER_URL"| deps
+    se["Secret myapp-env<br>created by you"] -.->|"envFrom, optional"| deps
+    deps --> broker[("Shared broker")]
 ```
 
 Options: `--output` (default `modulith-k8s.yaml`, `-` for stdout), `--image`
@@ -770,6 +792,22 @@ Or in `pyproject.toml`:
 ```toml
 [tool.modulith.workers]
 inventory = 4  # more workers for high-traffic module
+```
+
+The workers of one module share a consumer group (`modulith-<module>`), so each event reaches one of them, and every other module that consumes it gets its own copy. Here `notifications` also listens to `OrderPlaced`:
+
+```mermaid
+flowchart LR
+    pub["orders publishes<br>OrderPlaced"] --> broker[("Broker")]
+    broker -->|"one worker takes it"| inv
+    broker -->|"its own copy"| ntf
+    subgraph inv["modulith-inventory"]
+        i1["inventory worker"]
+        i2["inventory worker"]
+    end
+    subgraph ntf["modulith-notifications"]
+        n1["notifications worker"]
+    end
 ```
 
 ### Vertical Scaling (Increase Worker Resources)
@@ -901,6 +939,31 @@ Single-process topology is unaffected — modulith adds no HTTP routes there, so
 
 Both probes are served by the reverse proxy on the port `modulith run` binds (8000 by default), and both need the actuator mounted — set `MODULITH_ACTUATOR_TOKEN` (see [Actuator Access](#actuator-access-_modulith)). Plain `/health` belongs to each worker's own internal port (9001+ by default, set by `--worker-port-base` / `worker_port_base` / `MODULITH_WORKER_PORT_BASE`). The proxy answers it with 404, except when a module is named `health`: the proxy then forwards it to that module's worker, and the worker's own `/health` answers. There is no `/ready` route. Each `modulith run` hands its workers a random deployment token that their `/health` echoes as `"deployment"`.
 
+Liveness answers from the proxy alone, while readiness asks every replica of every module.
+
+```mermaid
+sequenceDiagram
+    participant K as Probe
+    participant P as Proxy :8000
+    participant I as inventory :9001
+    participant A as orders :9002
+    participant B as orders :9003
+    K->>P: GET /_modulith/live
+    P-->>K: 200, no worker called
+    K->>P: GET /_modulith/health
+    par
+        P->>I: GET /health
+    and
+        P->>A: GET /health
+    and
+        P->>B: GET /health
+    end
+    I-->>P: 503
+    A--xP: no answer within 2 s
+    B-->>P: 200
+    P-->>K: 503, inventory unhealthy, orders ok
+```
+
 ### Liveness Probe (Is the Proxy Running?)
 
 ```bash
@@ -922,7 +985,7 @@ answered without this deployment's token: another deployment's worker, or an
 unrelated process, holds it), `unreachable` (a replica is
 mid-restart-backoff, or waiting, for up to 60 s, until a process the dead
 worker started releases the worker's port), or `failed (given up)` (the crash-loop breaker has
-given up on every replica). `failed (given up)` is only reported once every
+given up on at least one replica). `failed (given up)` is only reported once every
 replica of that module is unreachable — a module with even one healthy
 replica reports `ok`.
 
@@ -1004,6 +1067,25 @@ Export spans to Prometheus, Jaeger, or your observability stack.
    forgotten group likewise appears only when `modulith run` restarts at
    least 24 hours after the group's last consumer activity; the restart in
    step 5 does not report it.
+
+On the SHM and database brokers, the retired group moves through these states.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Served
+    Served --> RecentlyServed: module deleted, workers restarted
+    RecentlyServed --> Idle: 24 h without consumer activity
+    RecentlyServed --> Dropped: drop-group with --force
+    Idle --> Dropped: drop-group
+    Dropped --> [*]
+    RecentlyServed : Recently served
+    note right of RecentlyServed
+        drop-group refuses without --force
+    end note
+    note right of Idle
+        modulith run warns at startup
+    end note
+```
 
 Step 6 depends on the broker:
 
@@ -1098,13 +1180,16 @@ group.
 
 ### Recovering from Broker Failure
 
-**Database broker:**
-- If the database is down, workers buffer events in memory and retry on reconnect
-- Outbox events persist to the database; the background loop retries
+**Publishing (every broker):**
+- A direct `publish()` raises the broker's error to its caller. Modulith keeps no in-memory buffer of events it could not send
+- Inside a bound outbox session, the broker send is saved as an outbox row in your transaction and made after the commit. While the broker is down the row stays in the outbox and the retry loop sends it again, until `dead_letter_after_attempts` (10 by default) failed attempts dead-letter it. `modulith outbox dead-letter --retry-all` resubmits dead-lettered rows once the broker is back
+
+**Consuming (every broker):**
+- A failed broker call is logged and retried under capped exponential backoff, 0.05 s doubling up to 5 s. `/health` reports `degraded` until that call succeeds again
+- A message that a stopped or crashed consumer left claimed or pending is delivered again once it has sat idle for `reclaim_stale_seconds` (database and SHM) or `reclaim_min_idle_ms` (Redis). Consumers reclaim it themselves: the supervisor takes no part, and nothing rebalances
 
 **Redis broker:**
-- Consumer groups are created by the first consumer; if all are down, events accumulate in Redis
-- On restart, the supervisor reads pending entries and rebalances
+- A consumer creates its group when it starts, from the beginning of the stream, and creates it again if Redis reports `NOGROUP`. Entries published while every consumer is down wait in the stream, until the `MODULITH_STREAM_MAXLEN` cap (10000 by default) trims the oldest, unacknowledged ones included (see the Redis durability caveat above)
 
 ### Graceful Shutdown
 
@@ -1120,10 +1205,34 @@ lifecycle:
 Consumer shutdown is bounded: a poll task whose cancellation is absorbed (a
 driver that never finishes closing a cancelled connection) is cancelled again
 after 10 s and, if it still ignores that, abandoned with an error log after
-another 10 s, so `stop()` returns within 20 s in the worst case.
+another 10 s, so a Redis consumer's `stop()` returns within 20 s in the worst
+case. The database and SHM consumers stop a poll task and then a prune task,
+each under that bound, so theirs can take up to 40 s.
 
-Modulith's supervisor handles SIGTERM and drains listeners before exit — on
-POSIX. Windows has no signal delivery on `subprocess.Popen` (`terminate()`
+On POSIX, `modulith run` shuts down in this order:
+
+```mermaid
+sequenceDiagram
+    participant O as Orchestrator
+    participant S as Supervisor and proxy
+    participant W as Worker
+    O->>S: SIGTERM
+    Note over S: proxy stops accepting,<br>in-flight requests finish
+    S->>W: SIGTERM to every worker
+    Note over W: in-flight requests finish, then<br>1 broker consumer stops<br>2 outbox retry loop stops<br>3 outbox deliveries finish<br>4 store and engine disposed<br>5 brokers closed
+    alt worker exits within 30 s
+        W-->>S: exit
+    else still alive after 30 s
+        S->>W: SIGKILL
+    end
+    S-->>O: exit
+```
+
+The supervisor sends SIGTERM to every worker at once, and SIGKILL to any still running 30 s later.
+Within that window, in-flight requests and after-commit outbox deliveries run to completion, but a listener that a broker consumer is running when its worker stops is cancelled, and its message is delivered again later.
+A pod from the generated Kubernetes manifests runs a worker alone, so it gets SIGTERM directly and skips the supervisor's steps.
+
+Windows has no signal delivery on `subprocess.Popen` (`terminate()`
 is an immediate `TerminateProcess`, with no softer step for a worker's
 lifespan to trap), and the `PDEATHSIG` orphan protection that stops a
 hard-killed supervisor from leaving workers behind is Linux-only.
@@ -1131,6 +1240,8 @@ hard-killed supervisor from leaving workers behind is Linux-only.
 ---
 
 ## Migration Path: Monolith → Processes → Microservices
+
+![The same three modules in three shapes: one process on day one, one process per module when a feature gets busy, and payments split off into its own service](images/growth.svg)
 
 1. **Start monolithic** — `MODULITH_BROKER=memory` (default)
    - Fast to iterate
@@ -1170,6 +1281,31 @@ This path is why modulith exists: **every module is a potential microservice, bu
    - Redis: `xinfo groups myapp-events`
 
 ### Worker Crash Loop
+
+The supervisor respawns a crashed worker after a doubling delay, and stops respawning it after more than five crashes in a row.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Running: spawn
+    Running --> Waiting: crash 1 to 5
+    Waiting --> Running: respawn
+    Running --> GivenUp: crash 6 in a row
+    Waiting : Waiting to respawn
+    GivenUp : Given up
+    note right of Waiting
+        waits 1, 2, 4, 8, 16 s;
+        then up to 60 s while
+        the port is still held
+    end note
+    note left of Running
+        a run of 60 s or more resets
+        the delay and the count
+    end note
+    note right of GivenUp
+        no respawn until the
+        supervisor restarts
+    end note
+```
 
 1. Check logs: `modulith run --topology processes 2>&1 | grep ERROR`
 2. Verify broker connectivity: `modulith doctor`
