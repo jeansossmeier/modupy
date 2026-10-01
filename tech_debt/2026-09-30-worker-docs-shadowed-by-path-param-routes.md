@@ -1,8 +1,8 @@
 ---
 type: tech-debt
-debt_status: open
+debt_status: resolved
 created: 2026-09-30
-updated: 2026-09-30
+updated: 2026-10-01
 category: Architecture
 impact: Low - A worker's docs are unreachable when its module has a top-level GET /{param} route
 effort: Low - Register the doc paths first unless the module defines the same exact path
@@ -29,3 +29,11 @@ Found while writing the `examples/demo_app` flow tests. The orders worker answer
 The registration order is read from `create_app`. [Tool-Verified]
 
 The observed 404 comes from the test author's report. [Assertion-Only] Highly Probable, since Starlette matches routes in registration order.
+
+## Resolution (2026-10-01)
+`create_app` now registers the doc routes before the module router. It drops any doc path the module router defines exactly, so a module's own `/docs`, `/redoc` or `/openapi.json` route still wins, and a path parameter no longer captures the docs. Before the change, the first test below got the module's 404 for `/orders/openapi.json`, which confirms the cause.
+
+Regression tests are in `tests/test_worker.py`:
+- `test_path_parameter_route_does_not_capture_doc_paths` fails without the fix.
+- `test_exact_module_route_wins_over_doc_route_beside_path_parameter` covers each exact collision next to a `GET /{item_id}` route.
+- `test_module_route_wins_over_generated_doc_route` still covers a module named `docs`.

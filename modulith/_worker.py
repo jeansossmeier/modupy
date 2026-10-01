@@ -166,8 +166,8 @@ def create_app() -> FastAPI:
             if consumer_error is not None:
                 raise consumer_error
 
-    # Docs are registered further down, after the module's own router, and
-    # under the module prefix — see the comment on that block.
+    # Docs are registered below, before the module's router, and under the
+    # module prefix — see the comment on that block.
     app = FastAPI(
         title=f"modulith-{module_name}",
         lifespan=lifespan,
@@ -209,7 +209,41 @@ def create_app() -> FastAPI:
             return response
         return JSONResponse(status_code=503, content=response)
 
+    # Docs live UNDER the module prefix. The supervisor's reverse proxy
+    # forwards /<module>/* to this worker verbatim and nothing else, so
+    # FastAPI's defaults (/docs, /openapi.json, /redoc) are unreachable from
+    # the public port. swagger_ui_oauth2_redirect_url has to be set too: it
+    # defaults to the literal "/docs/oauth2-redirect" and does not follow
+    # docs_url, so leaving it alone would hand the Swagger UI an OAuth2
+    # redirect URI outside this worker's prefix.
+    #
+    # Registered BEFORE include_router: Starlette matches routes in
+    # registration order, so a top-level path-parameter route such as
+    # GET /{item_id} would otherwise capture /<module>/openapi.json and answer
+    # 404 for it. A path the module defines EXACTLY is dropped again below, so
+    # a module named "docs" (prefix /docs, doc UI at /docs/docs) or one exposing
+    # its own /docs, /redoc or /openapi.json route keeps that route. FastAPI
+    # registers its doc routes from setup(), which __init__ already called
+    # while all three URLs were None — a no-op then, so this call registers
+    # each of them exactly once.
     router = getattr(module, "router", None)
+    app.openapi_url = f"/{module_name}/openapi.json"
+    app.docs_url = f"/{module_name}/docs"
+    app.redoc_url = f"/{module_name}/redoc"
+    app.swagger_ui_oauth2_redirect_url = f"/{module_name}/docs/oauth2-redirect"
+    app.setup()
+    module_owned = {f"/{module_name}{route.path}" for route in getattr(router, "routes", ())}
+    doc_paths = {
+        app.openapi_url,
+        app.docs_url,
+        app.redoc_url,
+        app.swagger_ui_oauth2_redirect_url,
+    }
+    superseded = module_owned & doc_paths
+    app.router.routes[:] = [
+        route for route in app.router.routes if getattr(route, "path", None) not in superseded
+    ]
+
     if router is not None:
         app.include_router(router, prefix=f"/{module_name}")
         logger.info("mounted router for module %r under /%s", module_name, module_name)
@@ -256,27 +290,6 @@ def create_app() -> FastAPI:
             module_name,
             module_package,
         )
-
-    # Docs live UNDER the module prefix. The supervisor's reverse proxy
-    # forwards /<module>/* to this worker verbatim and nothing else, so
-    # FastAPI's defaults (/docs, /openapi.json, /redoc) are unreachable from
-    # the public port. swagger_ui_oauth2_redirect_url has to be set too: it
-    # defaults to the literal "/docs/oauth2-redirect" and does not follow
-    # docs_url, so leaving it alone would hand the Swagger UI an OAuth2
-    # redirect URI outside this worker's prefix.
-    #
-    # Registered here, AFTER include_router, so the module's own routes win any
-    # collision: Starlette matches routes in registration order, so a module
-    # named "docs" (prefix /docs, doc UI at /docs/docs) or one exposing its own
-    # /docs, /redoc or /openapi.json route would otherwise have that route
-    # silently shadowed by the doc UI. FastAPI registers its doc routes from
-    # setup(), which __init__ already called while all three URLs were None —
-    # a no-op then, so this call registers each of them exactly once.
-    app.openapi_url = f"/{module_name}/openapi.json"
-    app.docs_url = f"/{module_name}/docs"
-    app.redoc_url = f"/{module_name}/redoc"
-    app.swagger_ui_oauth2_redirect_url = f"/{module_name}/docs/oauth2-redirect"
-    app.setup()
 
     logger.info("worker app built for module %r (package %r)", module_name, app_package)
     return app

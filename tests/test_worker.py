@@ -863,6 +863,87 @@ def test_module_route_wins_over_generated_doc_route(
     assert response.json() == {"served_by": "module"}
 
 
+def test_path_parameter_route_does_not_capture_doc_paths(make_fake_app, monkeypatch) -> None:
+    """GET /{item_id} matches /orders/openapi.json with item_id="openapi.json",
+    so a doc route registered after the module's router never gets a request:
+    the module's handler answers 404 instead. Most CRUD modules have such a
+    route, which made their worker docs unreachable through the proxy."""
+    make_fake_app(
+        {
+            "orders": """
+                from fastapi import APIRouter, HTTPException
+
+                router = APIRouter()
+
+                @router.get("/{item_id}")
+                async def get_item(item_id: str) -> dict[str, str]:
+                    raise HTTPException(status_code=404, detail="no such item")
+            """
+        }
+    )
+    _set_worker_env(monkeypatch, "orders")
+
+    app = create_app()
+    with TestClient(app) as client:
+        schema = client.get("/orders/openapi.json")
+        swagger = client.get("/orders/docs")
+        redoc = client.get("/orders/redoc")
+        item = client.get("/orders/42")
+
+    assert schema.status_code == 200
+    assert "/orders/{item_id}" in schema.json()["paths"]
+    assert swagger.status_code == 200
+    assert "swagger-ui" in swagger.text
+    assert redoc.status_code == 200
+    assert "redoc" in redoc.text
+    assert item.status_code == 404
+    assert item.json() == {"detail": "no such item"}
+
+
+@pytest.mark.parametrize("doc_path", ["openapi.json", "docs", "redoc"])
+def test_exact_module_route_wins_over_doc_route_beside_path_parameter(
+    make_fake_app, monkeypatch, doc_path: str
+) -> None:
+    """Registering the doc routes first must not hand them a path the module
+    defines exactly: its own /<doc path> route still answers, while the other
+    doc paths keep working next to the module's GET /{item_id}."""
+    make_fake_app(
+        {
+            "orders": f"""
+                from fastapi import APIRouter
+
+                router = APIRouter()
+
+                @router.get("/{doc_path}")
+                async def module_doc() -> dict[str, str]:
+                    return {{"served_by": "module"}}
+
+                @router.get("/{{item_id}}")
+                async def get_item(item_id: str) -> dict[str, str]:
+                    return {{"item": item_id}}
+            """
+        }
+    )
+    _set_worker_env(monkeypatch, "orders")
+
+    app = create_app()
+    with TestClient(app) as client:
+        own = client.get(f"/orders/{doc_path}")
+        others = {
+            other: client.get(f"/orders/{other}")
+            for other in ("openapi.json", "docs", "redoc")
+            if other != doc_path
+        }
+
+    assert own.json() == {"served_by": "module"}
+    assert {name: response.status_code for name, response in others.items()} == {
+        name: 200 for name in others
+    }
+    assert not any(
+        "served_by" in response.text or '"item"' in response.text for response in others.values()
+    )
+
+
 # ---------------------------------------------------------------------------
 # contracts module import
 # ---------------------------------------------------------------------------
