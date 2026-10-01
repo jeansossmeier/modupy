@@ -289,6 +289,14 @@ MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
 fails with "No 'script_location' key found" because there is no
 alembic.ini in your project root.)
 
+The chain records its revision in its own `modulith_alembic_version` table, so
+it can share a database with your application's Alembic history in
+`alembic_version`. A database migrated by an earlier release tracked modupy in
+`alembic_version`. The next `modulith migrate` or raw `alembic upgrade` moves
+that revision into the new table before upgrading. It touches only modupy's
+own revisions, runs no migration again, and drops `alembic_version` only if the
+table is then empty.
+
 To put the outbox tables in a Postgres schema named after a module instead of
 `public`, pass `modulith migrate --schema <name>`, or add `-x schema=<name>`
 (or set `MODULITH_DB_SCHEMA`) to the raw command — Postgres only;
