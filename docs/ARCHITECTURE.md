@@ -32,6 +32,8 @@ The whole architecture exists to make that promise true: the same `publish()`
 call dispatches in-memory, or writes to a durable outbox, or fans out across
 processes through a broker — decided entirely by configuration at bootstrap.
 
+![The same three modules in three shapes: one process on day one, one process per module when a feature gets busy, and payments split off into its own service](images/growth.svg)
+
 ---
 
 ## 2. The runtime singleton and lazy bootstrap
@@ -46,6 +48,20 @@ The runtime **bootstraps lazily** — it initializes on first use (the first
 a uvicorn app appears after uvicorn's own lines, on the first request that
 publishes an event, rather than at process launch (README "30-second pitch").
 
+Bootstrap builds everything in local variables first, so a failure while building leaves the runtime untouched and the next call tries again:
+
+```mermaid
+flowchart TD
+    A["any publish() or bootstrap()"] --> B{"already bootstrapped?"}
+    B -->|yes| R["return at once"]
+    B -->|no| C{"called from inside<br>bootstrap itself?"}
+    C -->|yes| E["ConfigurationError"]
+    C -->|no| S["build config, plugins, bus<br>in local variables"]
+    S --> F{"did the build raise?"}
+    F -->|yes| U["roll back, re-raise,<br>next call retries"]
+    F -->|no| I["install state,<br>mark bootstrapped"]
+```
+
 Bootstrap assembles the whole system in one shot (graph hyperedge *Runtime
 bootstrap assembly*):
 
@@ -55,7 +71,7 @@ bootstrap assembly*):
    plugins (§5).
 4. The `modulith_discover_modules` hook walks the package for modules; each
    module package (and its `_manifest.py`) is imported.
-5. `InMemoryEventBus` is created and queued listeners are flushed onto it.
+5. Queued listeners are flushed onto the new `InMemoryEventBus`.
 6. If `verify_manifests` is on, `verify_manifest()` checks each declared
    manifest against reality (§9).
 
@@ -261,6 +277,25 @@ delivery for every pending publication in the table, not just the one it hit.
 listeners by `type(event)` and dispatches to **all** listeners for that type
 **concurrently**. One listener raising does not block the others.
 
+Every entry point ends in `Runtime.publish()`, which picks the durable path only inside a bound session:
+
+```mermaid
+flowchart TD
+    A["await publish(event)"] --> R["Runtime.publish()"]
+    S["publish_sync(event)"] --> Q{"loop running<br>on this thread?"}
+    Q -->|yes| E["RuntimeError:<br>use await publish()"]
+    Q -->|no| N{"called from a<br>sync listener?"}
+    N -->|no| D["block on the persistent<br>daemon-thread loop"]
+    N -->|yes| F["block on a fresh<br>short-lived loop"]
+    D --> R
+    F --> R
+    R --> O{"outbox store set<br>and session bound?"}
+    O -->|yes| P["save rows now,<br>listeners after commit"]
+    O -->|no| M["listeners run now,<br>concurrently"]
+    P --> X["sync listeners run on<br>executor threads"]
+    M --> X
+```
+
 `Runtime.publish()` is the single funnel. Its sequence (graph community
 *Publish sequence*):
 
@@ -279,7 +314,12 @@ listeners by `type(event)` and dispatches to **all** listeners for that type
    hook is scoped to a successful publish, so the error hook is where a plugin
    closes the span it opened in step 1.
 4. Wrap each listener invocation in the lifecycle hooks
-   (`on_listener_dispatch` → listener → `on_listener_complete`/`_error`).
+   (`on_listener_dispatch` → listener → `on_listener_error` if it raised →
+   `on_listener_complete` either way).
+   On the in-memory path the listeners run inside step 2, so these hooks fire
+   before the after hook, which fires even when a listener raised;
+   `publish()` then re-raises the first listener error.
+   On the durable path they fire after commit (§7.1).
 
 ### The four contexts, one API
 
@@ -325,6 +365,37 @@ only if** that transaction commits.
 
 ### 7.1 Save, then dispatch after commit
 
+The calls for one publish inside a bound session, under the default `"lease"` claim strategy:
+
+```mermaid
+sequenceDiagram
+    participant App as Request handler
+    participant RT as Runtime
+    participant OB as outbox plugin
+    participant ST as PostgresPublicationStore
+    participant DB as SQLAlchemy session
+    participant L as Listener
+    App->>OB: bind_session(session)
+    App->>RT: await publish(event)
+    RT->>RT: modulith_before_event_published
+    RT->>OB: persist(event)
+    OB->>ST: save(pub), once per listener
+    ST->>DB: add row, queue id in session.info
+    RT->>RT: modulith_after_event_published
+    App->>DB: await session.commit()
+    alt transaction committed
+        DB->>ST: after_commit event
+        ST-)ST: create task _dispatch_after_commit
+        ST->>ST: _claim_publication takes a lease
+        ST->>OB: _dispatch_with_lease_renewal
+        OB->>L: await listener(event)
+        OB->>ST: complete_claim, or fail_claim
+    else rolled back or closed
+        DB->>ST: after_transaction_end event
+        ST->>ST: drop queued ids, log WARNING
+    end
+```
+
 - `PublicationStore.save()` is called *inside* the business transaction, using
   the **same** session/connection. So the publication row commits atomically
   with the data that produced it — a rollback discards the event too (no ghost
@@ -338,12 +409,37 @@ only if** that transaction commits.
 
 ### 7.2 Retry loop, backoff, dead-lettering
 
-**SPEC §7.4.** A background retry loop drives redelivery:
+**SPEC §7.4.** A publication row moves through these states under the default `"lease"` strategy.
+The numbers are the defaults of `dead_letter_after_attempts` (10) and `max_retry_backoff_seconds` (300):
 
-- `find_incomplete(older_than)` finds pending publications past a staleness
-  threshold. On startup the sweep uses `older_than=0` (recover everything a
-  crash left behind); steady-state it polls on a ~30s cadence so it doesn't
-  thrash on freshly-published events.
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "dead-lettered" as Dead
+    [*] --> Pending: business transaction commits
+    Pending --> Delivering: after-commit task or sweep
+    Delivering --> Completed: delivered
+    Delivering --> Waiting: failed, attempt_count below 10
+    Waiting --> Delivering: sweep after backoff
+    Delivering --> Dead: failed, attempt_count reaches 10
+    Dead --> Delivering: --retry-all, attempt_count reset
+    Delivering --> Pending: lease expired, no attempt charged
+    Completed --> [*]
+    note right of Waiting
+        backoff after the n-th failure
+        min(2^(n-1), 300) seconds
+    end note
+```
+
+A background retry loop drives redelivery:
+
+- Each sweep takes pending publications published at least `older_than` ago:
+  through `claim_batch` under the default `"lease"` strategy, and through
+  `find_incomplete` otherwise. On startup the sweep uses `older_than=0`
+  (recover everything a crash left behind); steady-state it runs every
+  `retry_interval_seconds` (30) and takes only rows at least
+  `retry_stale_seconds` (30) old, so it doesn't thrash on freshly-published
+  events.
 - A row the crashed process was delivering under a lease (`claim_strategy=
   "lease"`, the default, which after-commit dispatch also takes) stays claimed
   until that lease expires: the startup sweep skips it, and the first sweep
@@ -493,12 +589,29 @@ events have to leave the process. The mechanism:
 
 Mark an event `@externalized` so it is routed to the configured broker **in
 addition to** any local listeners (fan-out across processes). In single-process
-topology it's an inert marker. The runtime resolves an event's broker target in
+topology it's an inert marker.
+In process topology an event with no local listener is routed too, without `@externalized`, because its listeners live in other workers.
+The runtime resolves an event's broker target in
 priority order:
 
 1. the `modulith_resolve_event_target` hook (dynamic / tenant-aware routing),
 2. the `@externalized(target="scheme:destination")` static override,
 3. the default scheme `{broker}:{fully-qualified-event-name}`.
+
+In process topology the whole decision runs on every publish, and a bound session defers the send until commit:
+
+```mermaid
+flowchart TD
+    P["publish(event)"] --> H{"hook or explicit<br>target found?"}
+    H -->|no| X{"bare externalized, or<br>no local listener?"}
+    X -->|no| N["no broker send"]
+    X -->|yes| D["default target<br>{broker}:<br>{module}.{qualname}"]
+    H -->|yes| G["broker target"]
+    D --> G
+    G --> B{"outbox store set<br>and session bound?"}
+    B -->|yes| O["outbox row,<br>sent after commit"]
+    B -->|no| I["sent now, a failure<br>reaches the caller"]
+```
 
 `@externalized` strips whitespace around the target's scheme and destination
 and raises `ConfigurationError` at decoration time when either is empty.
@@ -545,6 +658,23 @@ is itself dialect-aware. Distributed via `modupy[database]` (async SQLAlchemy +
 `asyncpg`/`aiomysql`/`aiosqlite`); SQLAlchemy is lazy-imported so an app that
 never selects it pays nothing. SQLite doubles as a zero-infrastructure bootstrap
 broker — an embedded file (or `:memory:`) that needs no server at all.
+
+One publish of an event that `payments` and `inventory` both consume, with `payments` running two workers:
+
+```mermaid
+flowchart LR
+    P["DatabaseBroker.publish()"] -->|"one row per<br>subscribed group"| A["row for<br>modulith-payments"]
+    P --> B["row for<br>modulith-inventory"]
+    subgraph G1 ["group modulith-payments"]
+        W1["worker 1"]
+        W2["worker 2"]
+    end
+    subgraph G2 ["group modulith-inventory"]
+        W3["worker 1"]
+    end
+    A -->|"SKIP LOCKED,<br>one worker claims it"| G1
+    B --> G2
+```
 
 *Fan-out on write.* Each `DatabaseConsumer` self-registers its `(target, group)`
 subscriptions in a
@@ -770,6 +900,8 @@ split-readiness) with 80%/95% thresholds.
 ---
 
 ## 10. Process-per-module topology
+
+![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](images/processes.svg)
 
 **SPEC Part IX.** The three moving parts (graph hyperedge *Process-Per-Module
 Runtime*):
