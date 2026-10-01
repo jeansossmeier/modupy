@@ -25,3 +25,5 @@ Records of known technical debt, architectural issues, and improvements for futu
 | [2026-09-29-fastapi-testclient-starlette-deprecation.md](2026-09-29-fastapi-testclient-starlette-deprecation.md) | Testing | Low | open |
 | [2026-09-30-test-suite-leaks-state-dirs.md](2026-09-30-test-suite-leaks-state-dirs.md) | Testing | Low | open |
 | [2026-09-30-worker-docs-shadowed-by-path-param-routes.md](2026-09-30-worker-docs-shadowed-by-path-param-routes.md) | Architecture | Low | open |
+| [2026-10-01-marketplace-suite-teardown-hang.md](2026-10-01-marketplace-suite-teardown-hang.md) | Testing | Medium | resolved |
+| [2026-10-01-sqlite-dispatch-lock-waits.md](2026-10-01-sqlite-dispatch-lock-waits.md) | Architecture | Low | open |
