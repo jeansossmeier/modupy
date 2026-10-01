@@ -2169,6 +2169,154 @@ async def test_shutdown_preserves_concurrently_installed_retry_task() -> None:
     await outbox.shutdown()
 
 
+class HeldFindStore(ClaimingStubStore):
+    """The first ``find_incomplete`` call waits for ``gate`` and records how it ended."""
+
+    def __init__(self, gate: asyncio.Event | None = None) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.gate = gate or asyncio.Event()
+        self.outcome: str | None = None
+
+    async def find_incomplete(self, older_than: timedelta) -> list[EventPublication]:
+        if self.outcome is None:
+            self.outcome = "running"
+            self.entered.set()
+            try:
+                await self.gate.wait()
+            except asyncio.CancelledError:
+                self.outcome = "cancelled"
+                raise
+            self.outcome = "completed"
+        return await super().find_incomplete(older_than)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claim_strategy", ["none", "advisory_lock"])
+async def test_shutdown_lets_an_in_flight_store_call_finish_then_dispatches_nothing(
+    claim_strategy: str,
+) -> None:
+    store = HeldFindStore()
+    outbox.configure(
+        store, JsonEventSerializer(), claim_strategy=claim_strategy, retry_interval_seconds=60
+    )
+    _bootstrap_with_listener(record)
+    pub = _make_pub(record, value=5)
+    await store.save(pub)
+    task = outbox._retry_task
+    assert task is not None
+    await asyncio.wait_for(store.entered.wait(), timeout=1)
+
+    stopping = asyncio.create_task(outbox.shutdown())
+    await asyncio.sleep(0.05)
+    assert not stopping.done()
+    store.gate.set()
+    await asyncio.wait_for(stopping, timeout=1)
+
+    assert store.outcome == "completed"
+    assert task.done() and not task.cancelled()
+    assert outbox._retry_task is None
+    assert received == []
+    assert store.rows[pub.id].attempt_count == 0
+    assert store.lock_calls == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_between_lease_rows_releases_the_rest_uncharged(tmp_path: Path) -> None:
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def held(event: OutboxEvent) -> None:
+        entered.set()
+        await gate.wait()
+        received.append(event.value)
+
+    _bootstrap_with_listener(held)
+    engine, store = await _sqlite_outbox(tmp_path)
+    try:
+        start = datetime.now(UTC) - timedelta(seconds=10)
+        pubs = [
+            _make_pub(held, value=v, published_at=start + timedelta(seconds=v)) for v in (1, 2, 3)
+        ]
+        for pub in pubs:
+            await store.save(pub)
+        outbox.configure(
+            store,
+            JsonEventSerializer(),
+            claim_strategy="lease",
+            claim_lease_seconds=60.0,
+            retry_interval_seconds=60,
+        )
+        task = outbox._retry_task
+        assert task is not None
+        await asyncio.wait_for(entered.wait(), timeout=5)
+
+        stopping = asyncio.create_task(outbox.shutdown())
+        await asyncio.sleep(0.05)
+        assert not stopping.done()
+        gate.set()
+        await asyncio.wait_for(stopping, timeout=5)
+
+        assert task.done() and not task.cancelled()
+        assert received == [1]
+        async with async_sessionmaker(engine)() as session:
+            rows = {
+                row.id: row
+                for row in (await session.execute(select(EventPublicationRow))).scalars()
+            }
+        first, *rest = pubs
+        assert rows[first.id].completed_at is not None
+        assert [
+            (rows[p.id].attempt_count, rows[p.id].claim_token, rows[p.id].completed_at)
+            for p in rest
+        ] == [(0, None, None), (0, None, None)]
+    finally:
+        await store.dispose()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_a_store_call_that_outlasts_the_grace_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(outbox, "_shutdown_grace_seconds", 0.2)
+    store = HeldFindStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="none", retry_interval_seconds=60)
+    task = outbox._retry_task
+    assert task is not None
+    await asyncio.wait_for(store.entered.wait(), timeout=1)
+
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+    await asyncio.wait_for(outbox.shutdown(), timeout=2)
+    waited = loop.time() - began
+
+    assert waited >= 0.2
+    assert store.outcome == "cancelled"
+    assert task.cancelled()
+    assert outbox._retry_task is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_a_sleeping_retry_loop_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(outbox, "_shutdown_grace_seconds", 30.0)
+    store = HeldFindStore()
+    store.gate.set()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="none", retry_interval_seconds=60)
+    task = outbox._retry_task
+    assert task is not None
+    await asyncio.wait_for(store.entered.wait(), timeout=1)
+    await asyncio.sleep(0.05)
+    assert store.outcome == "completed"
+
+    await asyncio.wait_for(outbox.shutdown(), timeout=1)
+
+    assert task.cancelled()
+    assert outbox._retry_task is None
+
+
 @pytest.mark.asyncio
 async def test_core_store_maintenance_fallbacks_report_public_state() -> None:
     store = CoreOnlyStore()

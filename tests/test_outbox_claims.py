@@ -210,6 +210,79 @@ async def test_shutdown_stops_retry_task_running_on_a_foreign_loop() -> None:
         foreign_loop.close()
 
 
+class HeldFindStore(StubStore):
+    """``find_incomplete`` waits for ``gate`` and records how it ended."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.gate: asyncio.Event | None = None
+        self.outcome: str | None = None
+
+    async def find_incomplete(self, older_than: timedelta) -> list[EventPublication]:
+        self.gate = asyncio.Event()
+        self.entered.set()
+        try:
+            await self.gate.wait()
+        except asyncio.CancelledError:
+            self.outcome = "cancelled"
+            raise
+        self.outcome = "completed"
+        return []
+
+
+async def test_shutdown_from_another_loop_lets_the_in_flight_store_call_finish() -> None:
+    store = HeldFindStore()
+    foreign_loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=foreign_loop.run_forever, daemon=True)
+    thread.start()
+    try:
+
+        async def _configure_on_foreign_loop() -> None:
+            outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
+
+        asyncio.run_coroutine_threadsafe(_configure_on_foreign_loop(), foreign_loop).result(
+            timeout=5
+        )
+        task = outbox._retry_task
+        assert task is not None
+        assert await asyncio.to_thread(store.entered.wait, 5)
+
+        stopping = asyncio.create_task(outbox.shutdown())
+        await asyncio.sleep(0.05)
+        assert not stopping.done()
+        assert store.gate is not None
+        foreign_loop.call_soon_threadsafe(store.gate.set)
+        await asyncio.wait_for(stopping, timeout=5)
+
+        assert store.outcome == "completed"
+        assert task.done() and not task.cancelled()
+        assert outbox._retry_task is None
+    finally:
+        foreign_loop.call_soon_threadsafe(foreign_loop.stop)
+        thread.join(timeout=2)
+        foreign_loop.close()
+
+
+async def test_a_retry_loop_started_after_shutdown_dispatches_again() -> None:
+    store = StubStore()
+    _bootstrap_with_listener(record)
+    outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
+    await outbox.shutdown()
+    pub = _make_pub(record, value=51)
+    await store.save(pub)
+
+    outbox.start()
+    task = outbox._retry_task
+    assert task is not None
+    while not store.find_incomplete_calls:
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.01)
+
+    assert received == [51]
+    assert not task.done()
+
+
 # ---------------------------------------------------------------------------
 # Observe-only hookimpls must never gate outbox dispatch
 # (fixed at the plugin-manager level by the observe-shield; these lock the

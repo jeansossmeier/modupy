@@ -72,6 +72,8 @@ import inspect
 import logging
 import math
 import threading
+import time
+from collections.abc import Callable
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -213,6 +215,23 @@ _claim_owner: str = ""
 # threads, and without a threading-level lock each would spawn its own
 # retry-loop task, orphaning one with no cancellation path.
 _retry_task_lock = threading.Lock()
+
+# shutdown() asks the retry loop to stop between rows instead of cancelling it
+# inside a store statement: on rollback-journal SQLite, an aiosqlite statement
+# cancelled mid-read leaves a closed connection that still holds its read lock
+# until GC, and every later COMMIT waits out the busy timeout. A
+# threading.Event, because shutdown() may run on another thread's loop.
+_stop_requested = threading.Event()
+
+# Retry-loop tasks currently inside a sweep. Read and written only on each
+# task's own loop, so shutdown() decides "cancel at once" from there.
+_sweeping: set[asyncio.Task[Any]] = set()
+
+# How long shutdown() waits for a sweep to reach a row boundary before it
+# cancels the loop anyway. Container platforms commonly allow ~30 s for a
+# whole shutdown (Kubernetes terminationGracePeriodSeconds, ECS stopTimeout),
+# so this leaves most of that budget to the rest of the teardown.
+_shutdown_grace_seconds: float = 10.0
 
 # Publication ids currently being dispatched in THIS process. The after-commit
 # dispatch task and the crash-recovery sweep can both pick up the same freshly
@@ -494,6 +513,8 @@ def _ensure_retry_loop() -> None:
     treated as absent rather than merely "not done" — it will never run
     another step, so the ``not _retry_task.done()`` guard alone would block
     every future retry loop for the rest of the process.
+
+    A new loop starts with any earlier ``shutdown()`` stop request cleared.
     """
     global _retry_task
     try:
@@ -507,7 +528,38 @@ def _ensure_retry_loop() -> None:
             and not _retry_task.get_loop().is_closed()
         ):
             return
+        _stop_requested.clear()
         _retry_task = loop.create_task(_retry_loop())
+
+
+def _on_task_loop(task: asyncio.Task[Any], callback: Callable[[], object]) -> bool:
+    """Run ``callback`` on ``task``'s loop: directly when that loop is the
+    running one, otherwise thread-safely on its next iteration. Returns False
+    when the task's loop has already closed, so ``callback`` never runs."""
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if task.get_loop() is running:
+        callback()
+        return True
+    try:
+        task.get_loop().call_soon_threadsafe(callback)
+    except RuntimeError:
+        return False
+    return True
+
+
+def _request_stop(task: asyncio.Task[Any]) -> None:
+    """Ask the retry loop to stop; cancel it at once unless it is mid-sweep.
+
+    Runs on the task's own loop, where membership in ``_sweeping`` cannot
+    change underneath it. A loop sleeping between sweeps, or not yet started,
+    holds no store connection, so cancelling it is safe.
+    """
+    _stop_requested.set()
+    if task not in _sweeping:
+        task.cancel()
 
 
 def _cancel_retry_task() -> None:
@@ -525,17 +577,7 @@ def _cancel_retry_task() -> None:
         _retry_task = None
     if task is None or task.done():
         return
-    try:
-        running = asyncio.get_running_loop()
-    except RuntimeError:
-        running = None
-    if task.get_loop() is running:
-        task.cancel()
-    else:
-        try:
-            task.get_loop().call_soon_threadsafe(task.cancel)
-        except RuntimeError:
-            pass  # the task's loop is already closed
+    _on_task_loop(task, task.cancel)
 
 
 # ---------------------------------------------------------------------------
@@ -1004,6 +1046,8 @@ async def _sweep_unclaimed(older_than: timedelta, *, runtime_ready: bool) -> Non
         )
         return
     for pub in pending:
+        if _stop_requested.is_set():
+            return
         if pub.attempt_count >= _dead_letter_after_attempts:
             continue  # dead-lettered — no further retries
         if not _backoff_elapsed(pub) or _foreign_to_this_worker(pub):
@@ -1011,9 +1055,18 @@ async def _sweep_unclaimed(older_than: timedelta, *, runtime_ready: bool) -> Non
         await _dispatch_publication(pub)
 
 
+async def _release_claims(publications: list[EventPublication]) -> None:
+    """Hand claimed rows back at once, uncharged (``renew_claim`` with 0 s)."""
+    assert _store is not None
+    for pub in publications:
+        if pub.claim_token:
+            await _store.renew_claim(pub.id, pub.claim_token, 0.0)  # type: ignore[attr-defined]
+
+
 async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
     """Lease mode: claim a batch, re-arm each row's lease before its turn,
-    renew during dispatch, fence complete/fail."""
+    renew during dispatch, fence complete/fail. A stop request releases the
+    rows not yet dispatched."""
     assert _store is not None
     claimed = await _store.claim_batch(  # type: ignore[attr-defined]
         owner=_claim_owner,
@@ -1028,11 +1081,12 @@ async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
             len(claimed),
         )
         # Release immediately so another process can reclaim once ready.
-        for pub in claimed:
-            if pub.claim_token:
-                await _store.renew_claim(pub.id, pub.claim_token, 0.0)  # type: ignore[attr-defined]
+        await _release_claims(claimed)
         return
-    for pub in claimed:
+    for index, pub in enumerate(claimed):
+        if _stop_requested.is_set():
+            await _release_claims(claimed[index:])
+            return
         if pub.attempt_count >= _dead_letter_after_attempts:
             if pub.claim_token:
                 await _store.renew_claim(pub.id, pub.claim_token, 0.0)  # type: ignore[attr-defined]
@@ -1092,6 +1146,8 @@ async def _sweep_advisory(older_than: timedelta, *, runtime_ready: bool) -> None
         )
         return
     for pub in pending:
+        if _stop_requested.is_set():
+            return
         if pub.attempt_count >= _dead_letter_after_attempts:
             continue
         if not _backoff_elapsed(pub) or _foreign_to_this_worker(pub):
@@ -1252,7 +1308,9 @@ async def _retry_loop() -> None:
     On entry, runs a crash-recovery sweep (``older_than=0``) to catch records
     left in flight by a previous process. Then polls on the configured
     interval with a staleness threshold so freshly-published-but-not-yet-
-    committed-dispatched events aren't thrashed. Cancels cleanly on shutdown.
+    committed-dispatched events aren't thrashed. Returns after the sweep in
+    progress once ``shutdown()`` requests a stop; ``shutdown()`` cancels it
+    while it sleeps between sweeps.
     """
     # The task copied the *creating* call site's contextvars (PEP 567). On the
     # lazy-start path that call site is a live request with a bound session —
@@ -1261,18 +1319,35 @@ async def _retry_loop() -> None:
     # session and never be committed. Every dispatch this loop drives must run
     # session-less (a listener's own transactional work rebinds explicitly).
     _current_session.set(None)
+    task = asyncio.current_task()
+    assert task is not None
+    older_than = timedelta(0)  # crash recovery
     try:
-        await _guarded_sweep(timedelta(0))  # crash recovery
         while True:
+            _sweeping.add(task)
+            try:
+                await _guarded_sweep(older_than)
+            finally:
+                _sweeping.discard(task)
+            if _stop_requested.is_set():
+                return
+            older_than = timedelta(seconds=_retry_stale_seconds)
             await asyncio.sleep(_retry_interval_seconds)
-            await _guarded_sweep(timedelta(seconds=_retry_stale_seconds))
     except asyncio.CancelledError:
         logger.debug("outbox retry loop stopping")
         raise
 
 
 async def shutdown() -> None:
-    """Cancel the retry loop and wait for it to stop. Idempotent.
+    """Stop the retry loop and wait for it to finish. Idempotent.
+
+    A loop sleeping between sweeps is cancelled at once. A loop inside a
+    sweep is asked to stop instead: the store call or listener delivery in
+    flight completes, the lease sweep releases its undispatched rows
+    uncharged, and the loop returns. Cancelling a store call mid-statement
+    can leave a SQLite read lock behind (see ``_stop_requested``). If the
+    sweep has not returned within ``_shutdown_grace_seconds``, the loop is
+    cancelled anyway, which re-delivers its in-flight row later.
 
     The module slot keeps pointing at the task until cancellation has
     actually completed: nulling it up front opened a window (cancel() only
@@ -1283,11 +1358,11 @@ async def shutdown() -> None:
     Cross-loop safe: the retry task may live on a DIFFERENT event loop than
     the one ``shutdown()`` is awaited from — sync.py's persistent
     daemon-thread loop runs the retry task while the application's main loop
-    awaits ``shutdown()`` during teardown. Cancelling directly (``task.
-    cancel()``) is only safe from the task's own loop; from any other loop it
-    must go through ``call_soon_threadsafe``. Likewise ``await task`` on a
-    foreign-loop task raises ("Task got Future attached to a different
-    loop"), so completion is observed by polling ``task.done()`` instead.
+    awaits ``shutdown()`` during teardown. The stop request and any cancel
+    therefore run on the task's own loop (``_on_task_loop``). Likewise
+    ``await task`` on a foreign-loop task raises ("Task got Future attached
+    to a different loop"), so completion is observed by polling
+    ``task.done()`` instead.
     """
     global _retry_task
     task = _retry_task
@@ -1301,23 +1376,18 @@ async def shutdown() -> None:
                 "outbox retry task was stranded on a closed event loop; "
                 "clearing it without waiting for it to finish"
             )
-        else:
-            stranded = False
-            try:
-                running = asyncio.get_running_loop()
-            except RuntimeError:
-                running = None
-            if task.get_loop() is running:
-                task.cancel()
-            else:
-                try:
-                    task.get_loop().call_soon_threadsafe(task.cancel)
-                except RuntimeError:
-                    # The loop closed between the check above and this call.
-                    stranded = True
-            if not stranded:
-                while not task.done():
-                    await asyncio.sleep(0.01)
+        elif _on_task_loop(task, lambda: _request_stop(task)):
+            deadline = time.monotonic() + _shutdown_grace_seconds
+            cancelled = False
+            while not task.done() and not task.get_loop().is_closed():
+                if not cancelled and time.monotonic() >= deadline:
+                    cancelled = True
+                    logger.warning(
+                        "outbox retry loop did not stop within %.1f s; cancelling it",
+                        _shutdown_grace_seconds,
+                    )
+                    _on_task_loop(task, task.cancel)
+                await asyncio.sleep(0.01)
     with _retry_task_lock:
         # Clear the slot only if no concurrent configure()/_ensure_retry_loop()
         # installed a fresh task while we awaited the cancellation.
@@ -1486,6 +1556,7 @@ def _reset_for_testing() -> None:
     global _max_retry_backoff_seconds, _retry_stale_seconds, _retry_loop_enabled
     global _claim_strategy, _claim_lease_seconds, _claim_batch_size, _claim_owner
     _cancel_retry_task()
+    _stop_requested.clear()
     _store = None
     _serializer = None
     _completion_mode = "update"
