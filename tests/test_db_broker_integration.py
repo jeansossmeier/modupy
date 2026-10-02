@@ -555,6 +555,29 @@ async def test_reclaim_after_visibility_timeout(broker_engine: Any) -> None:
     assert reclaimed[0]["id"] == first[0]["id"]
 
 
+async def test_release_claims_hands_back_only_unstarted_claims_on_the_real_dialect(
+    broker_engine: Any,
+) -> None:
+    broker = DatabaseBroker(engine=broker_engine)
+    await broker.subscribe([_TARGET], "g")
+    serializer = JsonEventSerializer()
+    for name in ("w1", "w2"):
+        await broker.publish(
+            _TARGET, serializer.serialize(WidgetCreated(name=name)), {"event_type": _TARGET}
+        )
+    [started, unstarted] = [
+        row["id"] for row in await broker.claim_batch("g", batch_size=10, consumer_name="c1")
+    ]
+    await broker.renew_claims([started], consumer_name="c1", start_dispatch=True)
+
+    assert await broker.release_claims([started, unstarted], consumer_name="c1") == 1
+
+    peer = await broker.claim_batch(
+        "g", batch_size=10, consumer_name="c2", reclaim_stale_seconds=3600.0
+    )
+    assert [(row["id"], row["attempts"]) for row in peer] == [(unstarted, 0)]
+
+
 # ---------------------------------------------------------------------------
 # HIGH-8: the subscription upsert's DO UPDATE refreshes updated_at (real DDL)
 # ---------------------------------------------------------------------------
