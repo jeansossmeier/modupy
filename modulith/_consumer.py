@@ -80,6 +80,10 @@ def _as_str(value: Any) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
+def _optional_str(value: Any) -> str | None:
+    return None if value is None else _as_str(value)
+
+
 class BrokerConsumer:
     """Drives one worker's subscribed broker streams into its local bus."""
 
@@ -458,7 +462,12 @@ class BrokerConsumer:
             return
 
         try:
-            await _runtime.dispatch_local(event, self._bus)
+            await _runtime.dispatch_local(
+                event,
+                self._bus,
+                traceparent=_optional_str(fields.get(b"h:traceparent")),
+                tracestate=_optional_str(fields.get(b"h:tracestate")),
+            )
         except Exception:
             attempts = await self._failed_delivery_attempts(target, mid, key)
             if attempts is None:

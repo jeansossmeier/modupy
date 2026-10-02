@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import Any, cast
@@ -26,6 +27,19 @@ def _describe_rows(rows: dict[str, dict[str, Any]], in_flight: set[str]) -> str:
     )
     extra = len(stuck) - _MAX_STUCK_ROWS_NAMED
     return f"{named} and {extra} more" if extra > 0 else named
+
+
+def _row_headers(row: dict[str, Any]) -> dict[str, str]:
+    """The claimed row's string headers; the database broker stores them as a JSON text blob."""
+    headers = row.get("headers")
+    if isinstance(headers, str):
+        try:
+            headers = json.loads(headers)
+        except ValueError:
+            return {}
+    if not isinstance(headers, dict):
+        return {}
+    return {k: v for k, v in headers.items() if isinstance(k, str) and isinstance(v, str)}
 
 
 class DeliveryDispatch:
@@ -219,7 +233,13 @@ class DeliveryDispatch:
             # deliberately skips the *publish* hooks and broker routing: this
             # process did not publish the event, and re-routing it to the
             # target it was just consumed from is an infinite redelivery loop.
-            await _runtime.dispatch_local(event, self._bus)
+            headers = _row_headers(row)
+            await _runtime.dispatch_local(
+                event,
+                self._bus,
+                traceparent=headers.get("traceparent"),
+                tracestate=headers.get("tracestate"),
+            )
         except asyncio.CancelledError:
             task = asyncio.current_task()
             if self._should_stop() or (task is not None and task.cancelling() > 0):

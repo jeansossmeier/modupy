@@ -936,6 +936,7 @@ async def _dispatch_broker_route(publication: EventPublication) -> None:
     sweep instead of losing the event for every remote consumer.
     """
     from .. import runtime as _rt
+    from .observability import trace_headers
 
     assert publication.listener is not None  # caller matched the prefix
     target = publication.listener[len(_BROKER_ROUTE_LISTENER_PREFIX) :]
@@ -955,6 +956,7 @@ async def _dispatch_broker_route(publication: EventPublication) -> None:
             {
                 "event_type": publication.event_type or "",
                 "publication_id": str(publication.id),
+                **trace_headers(publication.trace_context),
             },
         )
     except Exception as exc:

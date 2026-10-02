@@ -666,8 +666,19 @@ class Runtime:
         if first_error is not None:
             raise first_error
 
-    async def dispatch_local(self, event: Any, bus: Any) -> None:
+    async def dispatch_local(
+        self,
+        event: Any,
+        bus: Any,
+        *,
+        traceparent: str | None = None,
+        tracestate: str | None = None,
+    ) -> None:
         """Deliver an event received from another process to local listeners.
+
+        ``traceparent`` / ``tracestate`` are the W3C headers the producer sent
+        with the message; the dispatch hooks receive them as the publication's
+        ``trace_context``, so a dispatch span joins the producer's trace.
 
         The cross-process consumers call this instead of ``bus.publish`` so a
         remotely-delivered event fires the same per-listener lifecycle hooks
@@ -691,11 +702,15 @@ class Runtime:
         handlers = self.local_listeners(bus.listeners_for(type(event)))
         if not handlers:
             return
+        trace_context = {"traceparent": traceparent} if traceparent else None
+        if trace_context is not None and tracestate:
+            trace_context["tracestate"] = tracestate
         first_error = await self._run_listeners(
             event,
             handlers,
             payload=self._serialized_payload(event),
             event_type=f"{type(event).__module__}.{type(event).__qualname__}",
+            trace_context=trace_context,
         )
         if first_error is not None:
             raise first_error
@@ -707,6 +722,7 @@ class Runtime:
         *,
         payload: bytes,
         event_type: str,
+        trace_context: dict[str, str] | None = None,
     ) -> BaseException | None:
         """Run every listener concurrently, wrapped in the per-listener hooks.
 
@@ -730,6 +746,7 @@ class Runtime:
                 event_type=event_type,
                 listener=name,
                 published_at=datetime.now(UTC),
+                trace_context=trace_context,
             )
             pm.hook.modulith_on_listener_dispatch(event=event, listener_name=name, publication=pub)
             try:
@@ -866,11 +883,14 @@ class Runtime:
         registry = self._broker_registry
         assert registry is not None  # _broker_route_target resolved a target
 
+        from .builtin.observability import _publish_trace_context, trace_headers
         from .serializers import JsonEventSerializer
 
         event_type = f"{type(event).__module__}.{type(event).__qualname__}"
         payload = JsonEventSerializer().serialize(event)
-        await registry.publish(target, payload, {"event_type": event_type})
+        await registry.publish(
+            target, payload, {"event_type": event_type, **trace_headers(_publish_trace_context())}
+        )
         logger.debug("routed %s to broker target %s", event_type, target)
 
     def ensure_bootstrapped(self) -> None:

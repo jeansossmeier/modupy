@@ -250,6 +250,22 @@ def _publish_trace_context() -> dict[str, str] | None:
     return carrier or None
 
 
+def trace_headers(carrier: Any) -> dict[str, str]:
+    """Broker message headers that carry a W3C trace context; empty without one.
+
+    ``tracestate`` is sent only when non-empty. Anything but a mapping of
+    strings (a forged outbox row's stored carrier) yields no headers rather
+    than failing the send.
+    """
+    if not isinstance(carrier, dict):
+        return {}
+    return {
+        name: value
+        for name in ("traceparent", "tracestate")
+        if isinstance(value := carrier.get(name), str) and value
+    }
+
+
 def _extract_context(carrier: Any) -> Any:
     """The OTel context a stored carrier names; None when it names nothing usable."""
     try:

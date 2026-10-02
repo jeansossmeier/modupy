@@ -1108,8 +1108,15 @@ the outbox row. Each outbox row stores that span's W3C trace context, so the
 dispatch span of an outbox-delivered event, whether delivered after commit or on
 a retry, is a child of the publish span that created it, in the same trace. A
 row with no stored trace context (tracing was off when it was written) gets a
-dispatch span with no parent. Events routed to a broker are not yet joined
-across the broker hop.
+dispatch span with no parent.
+
+Broker messages carry the same context in `traceparent` and `tracestate` headers
+(`tracestate` only when non-empty), on the outbox route and on the inline route
+alike. A `BrokerConsumer` or shm/database consumer hands them to its dispatch
+hooks, so a consumer's dispatch spans join the publisher's trace as children of
+the publish span. A third-party broker adapter that drops message headers loses
+that link: its consumers' dispatch spans have no parent. A message without the
+headers behaves the same way.
 
 Export spans to Prometheus, Jaeger, or your observability stack.
 
