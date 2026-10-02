@@ -947,7 +947,7 @@ class PostgresPublicationStore:
         _log_interrupted_deliveries(charged)
         return [claimed[row.id] for row in rows if row.id in claimed]
 
-    async def _claim_publication(
+    async def claim_publication(
         self, publication_id: UUID, *, owner: str, lease_seconds: float
     ) -> EventPublication | None:
         """Claim one row with the same lease-conditional UPDATE as
@@ -1245,7 +1245,7 @@ class PostgresPublicationStore:
             if pub is not None and pub.completed_at is not None:
                 logger.debug("after-commit dispatch: publication %s already completed", pub.id)
             elif pub is not None and outbox._claim_strategy == "lease":
-                claimed = await self._claim_publication(
+                claimed = await self.claim_publication(
                     pub.id,
                     owner=outbox._claim_owner,
                     lease_seconds=outbox._claim_lease_seconds,

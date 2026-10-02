@@ -1100,6 +1100,161 @@ async def _assert_sweep_cannot_claim_a_row_after_commit_is_delivering(engine: An
     assert await _completed_rows(engine) == 1
 
 
+async def test_retry_all_holds_a_claim_on_a_resubmitted_row_while_it_delivers(engine: Any) -> None:
+    """``retry_all_dead_lettered`` reopens a dead row and delivers it under the
+    claim a sweep would take, so a peer's ``claim_batch`` cannot take the row
+    while the listener runs, even past one lease length."""
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=2)
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        dead_letter_after_attempts=2,
+        claim_lease_seconds=0.3,
+        start_loop=False,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow(event: G04Event) -> None:
+        received.append(event.value)
+        entered.set()
+        await release.wait()
+
+    _bootstrap_with_listener(slow)
+    pub = _pub(1, slow, attempt_count=2, last_error="boom")
+    await store.save(pub)
+
+    task = asyncio.create_task(outbox.retry_all_dead_lettered())
+    await entered.wait()
+    peer_claims: list[EventPublication] = []
+    for _ in range(4):
+        peer_claims += await store.claim_batch(
+            owner="peer", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+        )
+        await asyncio.sleep(0.15)
+    release.set()
+    resubmitted = await task
+
+    assert peer_claims == []
+    assert resubmitted == 1
+    assert received == [1]
+    assert await _completed_rows(engine) == 1
+
+
+async def test_retry_all_leaves_a_row_a_peer_claimed_to_that_peer(engine: Any) -> None:
+    """A row a peer's sweep claims between the reset and the delivery is the
+    peer's to deliver; retry-all must not deliver it a second time."""
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=2)
+    outbox.configure(store, JsonEventSerializer(), dead_letter_after_attempts=2, start_loop=False)
+    _bootstrap_with_listener(record)
+    await store.save(_pub(1, attempt_count=2, last_error="boom"))
+    real_save = store.save
+
+    async def save_then_peer_claims(publication: EventPublication) -> None:
+        await real_save(publication)
+        await store.claim_batch(
+            owner="peer", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+        )
+
+    store.save = save_then_peer_claims  # type: ignore[method-assign]
+
+    resubmitted = await outbox.retry_all_dead_lettered()
+
+    assert resubmitted == 1
+    assert received == []
+    assert await _completed_rows(engine) == 0
+
+
+async def test_retry_all_under_advisory_lock_delivers_while_holding_the_row_lock(
+    tmp_path: Path,
+) -> None:
+    """Under ``advisory_lock`` a resubmitted row is delivered through the
+    advisory sweep's lock/re-read/unlock path, so the row's lock is held from
+    before the listener runs until after it returns."""
+    eng, store = await _advisory_store_with_one_lock_connection(tmp_path)
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        dead_letter_after_attempts=2,
+        claim_strategy="advisory_lock",
+        start_loop=False,
+    )
+    steps: list[str] = []
+
+    async def traced(event: G04Event) -> None:
+        steps.append("deliver")
+
+    _bootstrap_with_listener(traced)
+    pub = _pub(1, traced, attempt_count=2, last_error="boom")
+    store.dead_letter_after_attempts = 2
+    await store.save(pub)
+    real_lock, real_unlock = store.try_lock_publication, store.unlock_publication
+
+    async def lock(publication_id: Any) -> object | None:
+        steps.append("lock")
+        return await real_lock(publication_id)
+
+    async def unlock(handle: Any, publication_id: Any) -> None:
+        steps.append("unlock")
+        await real_unlock(handle, publication_id)
+
+    store.try_lock_publication = lock  # type: ignore[method-assign]
+    store.unlock_publication = unlock  # type: ignore[method-assign]
+    try:
+        resubmitted = await outbox.retry_all_dead_lettered()
+        completed = await _completed_rows(eng)
+    finally:
+        await store.dispose()
+        await eng.dispose()
+
+    assert resubmitted == 1
+    assert steps == ["lock", "deliver", "unlock"]
+    assert completed == 1
+
+
+async def test_retry_all_under_advisory_lock_without_a_lock_connection_leaves_the_row_to_the_sweep(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When the lock pool has no free connection, retry-all logs one WARNING
+    naming the row and carries on. The row stays reopened and undelivered for
+    the sweep."""
+    eng, store = await _advisory_store_with_one_lock_connection(tmp_path)
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        dead_letter_after_attempts=2,
+        claim_strategy="advisory_lock",
+        start_loop=False,
+    )
+    store.dead_letter_after_attempts = 2
+    _bootstrap_with_listener(record)
+    pub = _pub(1, attempt_count=2, last_error="boom")
+    await store.save(pub)
+    holder_id = uuid4()
+    holder = await store.try_lock_publication(holder_id)
+    assert holder is not None
+    try:
+        with caplog.at_level(logging.WARNING):
+            resubmitted = await outbox.retry_all_dead_lettered()
+        delivered_during_wait = list(received)
+        left = await store.find_incomplete(timedelta(0))
+        await store.unlock_publication(holder, holder_id)
+        await outbox._sweep(timedelta(0))
+        completed = await _completed_rows(eng)
+    finally:
+        await store.dispose()
+        await eng.dispose()
+
+    logged = _logged_at_warning_or_above(caplog)
+    assert [(level, has_traceback) for level, _, has_traceback in logged] == [("WARNING", False)]
+    assert str(pub.id) in logged[0][1]
+    assert resubmitted == 1
+    assert delivered_during_wait == []
+    assert [(p.id, p.attempt_count) for p in left] == [(pub.id, 0)]
+    assert received == [1]
+    assert completed == 1
+
+
 @pytest.mark.integration
 async def test_advisory_after_commit_holds_the_lock_for_its_delivery(pg_engine: Any) -> None:
     """Under ``advisory_lock`` the after-commit path delivers under the row's

@@ -1530,6 +1530,11 @@ async def retry_all_dead_lettered() -> int:
     dispatch, so a transient failure that exhausted the budget gets a clean
     start rather than immediately re-dead-lettering. Returns the number of
     publications resubmitted.
+
+    Each reopened row is delivered under the fence the configured claim
+    strategy gives a sweep (``_dispatch_resubmitted``), so a sweep in another
+    process cannot deliver it at the same time. A row a peer already holds is
+    the peer's to deliver; it still counts as resubmitted.
     """
     assert _store is not None
     dead = await list_dead_lettered()
@@ -1537,8 +1542,33 @@ async def retry_all_dead_lettered() -> int:
         pub.attempt_count = 0
         pub.last_error = None
         await _store.save(pub)
-        await _dispatch_publication(pub)
+        await _dispatch_resubmitted(pub)
     return len(dead)
+
+
+async def _dispatch_resubmitted(publication: EventPublication) -> None:
+    """Deliver a reopened row the way the configured claim strategy delivers a
+    swept one: under a lease, under its advisory lock, or unfenced."""
+    assert _store is not None
+    store_any: Any = _store
+    if _claim_strategy == "lease" and hasattr(_store, "claim_publication"):
+        claimed = await store_any.claim_publication(
+            publication.id, owner=_claim_owner, lease_seconds=_claim_lease_seconds
+        )
+        if claimed is not None:
+            await _dispatch_with_lease_renewal(claimed)
+        return
+    if _claim_strategy == "advisory_lock" and hasattr(_store, "try_lock_publication"):
+        try:
+            await _dispatch_under_advisory_lock(publication)
+        except _LockConnectionTimeout:
+            logger.warning(
+                "retry-all: no advisory-lock connection for publication %s within "
+                "the pool timeout; it stays reopened for the next sweep",
+                publication.id,
+            )
+        return
+    await _dispatch_publication(publication)
 
 
 # ---------------------------------------------------------------------------

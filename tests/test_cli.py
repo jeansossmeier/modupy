@@ -1315,6 +1315,117 @@ def test_outbox_dead_letter_retry_all_redispatches(make_fake_app, monkeypatch):
     assert store.pubs[dead.id].completed_at is not None
 
 
+def test_outbox_dead_letter_retry_all_delivers_the_events_its_listeners_publish(
+    make_fake_app, monkeypatch, tmp_path
+):
+    """A listener that publishes inside a bound session schedules after-commit
+    dispatches on the command's event loop. The command waits for them, so the
+    cascaded event is delivered and no row is left for a lease to expire on."""
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from modulith.adapters import postgres_outbox
+    from modulith.adapters.postgres_outbox import (
+        Base,
+        EventPublicationRow,
+        PostgresPublicationStore,
+    )
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'app.db'}"
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_OUTBOX", "postgres")
+    monkeypatch.setenv("MODULITH_OUTBOX_URL", url)
+    make_fake_app(
+        {
+            "orders": """
+                import asyncio
+                import os
+                from dataclasses import dataclass
+
+                from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+                from modulith import event, listener, publish
+                from modulith.adapters.postgres_outbox import bind_session, unbind_session
+
+                @event
+                @dataclass(frozen=True)
+                class Ping:
+                    value: str
+
+                @event
+                @dataclass(frozen=True)
+                class Pong:
+                    value: str
+
+                seen_pong = []
+
+                @listener
+                async def on_ping(evt: Ping) -> None:
+                    engine = create_async_engine(os.environ["MODULITH_OUTBOX_URL"])
+                    async with async_sessionmaker(engine)() as session:
+                        token = bind_session(session)
+                        try:
+                            await publish(Pong(value=evt.value))
+                            await session.commit()
+                        finally:
+                            unbind_session(token)
+                    await engine.dispose()
+
+                @listener
+                async def on_pong(evt: Pong) -> None:
+                    await asyncio.sleep(0.2)
+                    seen_pong.append(evt.value)
+            """
+        }
+    )
+
+    async def seed_and_read(seed: bool) -> list[bool]:
+        engine = create_async_engine(url)
+        try:
+            if seed:
+                async with engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.create_all)
+                import fakeapp.orders as orders
+
+                seeder = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=1)
+                await seeder.save(
+                    EventPublication(
+                        id=uuid4(),
+                        payload=JsonEventSerializer().serialize(orders.Ping(value="z")),
+                        event_type="fakeapp.orders.Ping",
+                        listener=outbox._listener_id(orders.on_ping),
+                        published_at=datetime.now(UTC),
+                        attempt_count=1,
+                        last_error="boom",
+                    )
+                )
+                await seeder.dispose()
+                return []
+            async with engine.connect() as conn:
+                rows = (await conn.execute(select(EventPublicationRow))).all()
+            return [row.completed_at is not None for row in rows]
+        finally:
+            await engine.dispose()
+
+    from modulith.runtime import _runtime
+
+    try:
+        _runtime.ensure_bootstrapped()
+        import fakeapp.orders as orders
+
+        asyncio.run(seed_and_read(seed=True))
+
+        result = runner.invoke(app, ["outbox", "dead-letter", "--retry-all"])
+
+        rows = asyncio.run(seed_and_read(seed=False))
+    finally:
+        postgres_outbox._reset_for_testing()
+
+    assert result.exit_code == 0, result.output
+    assert orders.seen_pong == ["z"]
+    assert rows == [True, True]
+
+
 # ---------------------------------------------------------------------------
 # Duration parsing helper
 # ---------------------------------------------------------------------------

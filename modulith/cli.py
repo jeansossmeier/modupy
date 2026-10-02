@@ -1784,6 +1784,16 @@ def outbox_purge(
     typer.echo(f"purged {deleted} completed publication(s) older than {older_than}")
 
 
+async def _retry_all_and_drain() -> int:
+    """Resubmit every dead letter, then wait for the after-commit dispatches
+    its listeners scheduled: they run on this loop, which ends with the command."""
+    count = await outbox.retry_all_dead_lettered()
+    waiter = getattr(outbox._store, "wait_for_dispatch", None)
+    if waiter is not None:
+        await waiter()
+    return count
+
+
 @outbox_app.command("dead-letter")
 def outbox_dead_letter(
     retry_all: bool = typer.Option(
@@ -1809,7 +1819,7 @@ def outbox_dead_letter(
     _require_outbox_store()
 
     if retry_all:
-        count = asyncio.run(outbox.retry_all_dead_lettered())
+        count = asyncio.run(_retry_all_and_drain())
         typer.echo(f"resubmitted {count} dead-lettered publication(s)")
         return
 

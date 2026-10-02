@@ -414,7 +414,7 @@ sequenceDiagram
     alt transaction committed
         DB->>ST: after_commit event
         ST-)ST: create task _dispatch_after_commit
-        ST->>ST: _claim_publication takes a lease
+        ST->>ST: claim_publication takes a lease
         ST->>OB: _dispatch_with_lease_renewal
         OB->>L: await listener(event)
         OB->>ST: complete_claim, or fail_claim
