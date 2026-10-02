@@ -5,10 +5,12 @@ from __future__ import annotations
 import sqlite3
 import time
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any, TypeVar
 
 from ..config import DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_SHM_MAX_STORE_BYTES
 from . import _shm_claims, _shm_completion, _shm_publications
+from ._dead_letter import DeadLetter
 from ._shm_schema import immediate_transaction, open_database
 from ._shm_types import ClaimToken, PublishResult
 
@@ -254,6 +256,12 @@ class SqliteQueueStore:
                 consumer_name,
             )
         )
+
+    def list_dead_letters(self, after: tuple[datetime, str] | None, limit: int) -> list[DeadLetter]:
+        return _shm_completion.list_dead_letters(self._conn, after, limit)
+
+    def retry_dead_letters(self) -> int:
+        return self._consumer_write(lambda: _shm_completion.retry_dead_letters(self._conn))
 
     def prune(self, retention_age_seconds: float, limit: int) -> int:
         return self._consumer_write(

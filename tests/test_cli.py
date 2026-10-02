@@ -2867,6 +2867,106 @@ def test_broker_dead_letter_retry_all_reaches_only_the_group_whose_delivery_died
     assert [row["id"] for row in _claim_for(url, "modulith-orders")] == [row_id]
 
 
+def _seed_shm_dead_delivery(tmp_path: Path, monkeypatch) -> Path:
+    """One message fanned out to two groups: orders dead-letters it, billing completes it."""
+    from modulith.adapters.shm_broker import ShmBroker, _resolve_shm_paths
+
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    _, db_path, hint_path = _resolve_shm_paths("fakeapp", {})
+
+    async def seed() -> None:
+        broker = ShmBroker(shm_name=str(hint_path), db_path=str(db_path), completion_mode="mark")
+        try:
+            await broker.subscribe(["t.Order"], "modulith-orders")
+            await broker.subscribe(["t.Order"], "modulith-billing")
+            await broker.publish("t.Order", b"{}", {"event_type": "t.Order"})
+            (orders,) = await broker.claim_batch(
+                "modulith-orders", batch_size=5, consumer_name="o1"
+            )
+            (billing,) = await broker.claim_batch(
+                "modulith-billing", batch_size=5, consumer_name="b1"
+            )
+            await broker.fail(
+                orders["id"], "boom: listener raised", consumer_name="o1", max_attempts=1
+            )
+            await broker.ack(billing["id"], consumer_name="b1")
+        finally:
+            await broker.close()
+
+    asyncio.run(seed())
+    return db_path
+
+
+def _claim_from_shm(db_path: Path, group: str) -> list[dict]:
+    from modulith.adapters.shm_broker import ShmBroker, _resolve_shm_paths
+
+    _, _, hint_path = _resolve_shm_paths("fakeapp", {})
+
+    async def claim() -> list[dict]:
+        broker = ShmBroker(shm_name=str(hint_path), db_path=str(db_path))
+        try:
+            return await broker.claim_batch(group, batch_size=5, consumer_name="again")
+        finally:
+            await broker.close()
+
+    return asyncio.run(claim())
+
+
+def test_shm_broker_dead_letter_lists_an_exhausted_delivery_with_its_error(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    import sqlite3
+
+    db_path = _seed_shm_dead_delivery(tmp_path, monkeypatch)
+    conn = sqlite3.connect(db_path)
+    try:
+        (row_id,) = conn.execute("SELECT id FROM shm_delivery WHERE status='dead'").fetchone()
+    finally:
+        conn.close()
+
+    result = runner.invoke(app, ["broker", "dead-letter"])
+
+    assert result.exit_code == 0, result.output
+    assert "1 dead-lettered message(s):" in result.output
+    assert (
+        f"  {row_id}  t.Order  target=t.Order  group=modulith-orders  attempts=1  "
+        "last_error=boom: listener raised"
+    ) in result.output
+
+
+def test_shm_broker_dead_letter_retry_all_reaches_only_the_group_whose_delivery_died(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    db_path = _seed_shm_dead_delivery(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["broker", "dead-letter", "--retry-all"])
+
+    assert result.exit_code == 0, result.output
+    assert "resubmitted 1 dead-lettered message(s)" in result.output
+    assert _claim_from_shm(db_path, "modulith-billing") == []
+    assert [row["consumer_group"] for row in _claim_from_shm(db_path, "modulith-orders")] == [
+        "modulith-orders"
+    ]
+
+
+def test_shm_broker_dead_letter_does_not_create_a_missing_store(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    state_home = tmp_path / "empty-state-home"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+
+    result = runner.invoke(app, ["broker", "dead-letter", "--retry-all"])
+
+    assert result.exit_code == 1, result.output
+    assert "no shm broker store" in result.output
+    assert not state_home.exists()
+
+
 def test_broker_dead_letter_with_nothing_dead_says_so(make_fake_app, monkeypatch, tmp_path):
     from modulith.adapters.db_broker import DatabaseBroker
 

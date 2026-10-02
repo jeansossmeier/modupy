@@ -1437,3 +1437,133 @@ async def test_registration_logs_absolute_sqlite_path_as_the_explicit_store(
     finally:
         await instance.close()
         instance._ring.unlink()
+
+
+async def _exhaust_one_delivery(broker: ShmBroker, group: str, error: str) -> str:
+    """Fail the group's next delivery past its cap; return the delivery's row id."""
+    (row,) = await broker.claim_batch(group, batch_size=1, consumer_name=f"{group}-1")
+    await broker.fail(row["id"], error, consumer_name=f"{group}-1", max_attempts=1)
+    return str(row["claim_token"].delivery_id)
+
+
+async def test_list_dead_letters_reports_an_exhausted_delivery_with_its_group_and_error(
+    broker: ShmBroker,
+) -> None:
+    await broker.subscribe(["t.A"], "orders")
+    await broker.publish("t.A", b"x", {"event_type": "t.A.Created"})
+    delivery_id = await _exhaust_one_delivery(broker, "orders", "boom")
+
+    (dead,) = await broker.list_dead_letters()
+
+    assert (
+        dead.id,
+        dead.target,
+        dead.consumer_group,
+        dead.event_type,
+        dead.attempts,
+        dead.last_error,
+    ) == (delivery_id, "t.A", "orders", "t.A.Created", 1, "boom")
+    assert dead.created_at.tzinfo is not None
+    assert dead.cursor == (dead.created_at, delivery_id)
+
+
+async def test_list_dead_letters_skips_deliveries_that_are_not_dead(broker: ShmBroker) -> None:
+    await broker.subscribe(["t.A"], "orders")
+    await broker.publish("t.A", b"x", {"event_type": "t.A"})
+    await broker.publish("t.A", b"y", {"event_type": "t.A"})
+    await broker.claim_batch("orders", batch_size=1, consumer_name="c1")
+
+    assert await broker.list_dead_letters() == []
+
+
+async def test_list_dead_letters_pages_by_cursor_without_gaps_or_repeats(
+    broker: ShmBroker, tmp_path: Path
+) -> None:
+    await broker.subscribe(["t.A"], "orders")
+    for _ in range(5):
+        await broker.publish("t.A", b"x", {"event_type": "t.A"})
+    ids = [await _exhaust_one_delivery(broker, "orders", f"e{index}") for index in range(5)]
+    connection = sqlite3.connect(tmp_path / "broker.db")
+    try:
+        # One shared stamp finer than a microsecond: only the id tie-break orders
+        # the rows, and the cursor's datetime must still land on the stored value.
+        connection.execute("UPDATE shm_delivery SET created_at=1700000000.1234567")
+        connection.commit()
+    finally:
+        connection.close()
+
+    seen: list[str] = []
+    after = None
+    while page := await broker.list_dead_letters(after=after, limit=2):
+        assert len(page) <= 2
+        seen.extend(entry.id for entry in page)
+        after = page[-1].cursor
+
+    assert seen == ids
+
+
+async def test_retry_dead_letters_resubmits_only_the_group_whose_delivery_died(
+    tmp_path: Path,
+) -> None:
+    instance = ShmBroker(
+        shm_name="retry-hints",
+        capacity=16,
+        db_path=str(tmp_path / "retry.db"),
+        completion_mode="mark",
+    )
+    try:
+        await instance.subscribe(["t.A"], "orders")
+        await instance.subscribe(["t.A"], "billing")
+        await instance.publish("t.A", b"x", {"event_type": "t.A"})
+        orders_id = await _exhaust_one_delivery(instance, "orders", "boom")
+        (billing,) = await instance.claim_batch("billing", batch_size=1, consumer_name="b1")
+        await instance.ack(billing["id"], consumer_name="b1")
+
+        assert await instance.retry_dead_letters() == 1
+
+        assert await instance.list_dead_letters() == []
+        assert await instance.claim_batch("billing", batch_size=5, consumer_name="b2") == []
+        (again,) = await instance.claim_batch("orders", batch_size=5, consumer_name="o2")
+        assert (str(again["claim_token"].delivery_id), again["attempts"], again["last_error"]) == (
+            orders_id,
+            0,
+            None,
+        )
+        assert again["payload"] == b"x"
+    finally:
+        await instance.close()
+        instance._ring.unlink()
+
+
+async def test_retry_dead_letters_clears_claim_state_and_makes_the_delivery_due_now(
+    broker: ShmBroker, tmp_path: Path
+) -> None:
+    await broker.subscribe(["t.A"], "orders")
+    await broker.publish("t.A", b"x", {"event_type": "t.A"})
+    (row,) = await broker.claim_batch("orders", batch_size=1, consumer_name="c1")
+    await broker.renew_claims([row["id"]], consumer_name="c1", start_dispatch=True)
+    await broker.dead_letter(row["id"], "poison", consumer_name="c1")
+    connection = sqlite3.connect(tmp_path / "broker.db")
+    try:
+        connection.execute("UPDATE shm_delivery SET attempts=7, available_at=available_at+3600")
+        connection.commit()
+
+        await broker.retry_dead_letters()
+
+        stored = connection.execute(
+            "SELECT status, attempts, last_error, claimed_at, claimed_by, dispatch_started, "
+            "completed_at, available_at<=? FROM shm_delivery",
+            (time.time(),),
+        ).fetchall()
+    finally:
+        connection.close()
+    assert stored == [("pending", 0, None, None, None, 0, None, 1)]
+    assert len(await broker.claim_batch("orders", batch_size=5, consumer_name="c2")) == 1
+
+
+async def test_retry_dead_letters_with_nothing_dead_returns_zero(broker: ShmBroker) -> None:
+    await broker.subscribe(["t.A"], "orders")
+    await broker.publish("t.A", b"x", {"event_type": "t.A"})
+
+    assert await broker.retry_dead_letters() == 0
+    assert len(await broker.claim_batch("orders", batch_size=5, consumer_name="c1")) == 1

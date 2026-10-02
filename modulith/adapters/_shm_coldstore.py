@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime
 from functools import partial
 from typing import Any, cast
 
@@ -12,6 +13,7 @@ from ..config import (
     DEFAULT_SHM_ORPHAN_RETENTION_SECONDS,
     _validate_shm_broker_options,
 )
+from ._dead_letter import DeadLetter
 from ._shm_executor import SerialStoreExecutor
 from ._shm_store import ClaimToken, PublishResult, SqliteQueueStore
 from ._shm_types import require_consumer_name
@@ -213,6 +215,19 @@ class ShmColdStore(SerialStoreExecutor):
             bool,
             await self._call("dead_letter", value, error, consumer_name),
         )
+
+    async def list_dead_letters(
+        self, *, after: tuple[datetime, str] | None = None, limit: int = 100
+    ) -> list[DeadLetter]:
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be an integer >= 1")
+        return cast(
+            list[DeadLetter],
+            await self._call("list_dead_letters", after, limit),
+        )
+
+    async def retry_dead_letters(self) -> int:
+        return cast(int, await self._call("retry_dead_letters"))
 
     async def prune(
         self,

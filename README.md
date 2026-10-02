@@ -617,7 +617,7 @@ Every setting directly under `[tool.modulith]` can also come from an environment
 | `modulith outbox status` | counts incomplete, completed and dead-lettered events | operations |
 | `modulith outbox failing` | lists events that are failing but not yet dead-lettered, with their last error and next retry time | incidents |
 | `modulith outbox dead-letter` | lists dead-lettered events, or replays them with `--retry-all` | incidents |
-| `modulith broker dead-letter` | lists dead-lettered broker deliveries, or resubmits them with `--retry-all` (database broker only) | incidents |
+| `modulith broker dead-letter` | lists dead-lettered broker deliveries, or resubmits them with `--retry-all` (database and shm brokers) | incidents |
 | `modulith broker drop-group <group>` | removes a retired module's consumer group | operations |
 | `modulith extract <module>` | turns one module into a standalone service | splitting a service off |
 | `modulith k8s-manifest` | writes Kubernetes manifests, one Deployment per module | deploying |

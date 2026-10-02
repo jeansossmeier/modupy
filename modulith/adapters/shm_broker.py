@@ -25,6 +25,7 @@ import logging
 import math
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -50,6 +51,7 @@ from ..config import (
     MAX_PAYLOAD_BYTES,
     _validate_shm_broker_options,
 )
+from ._dead_letter import DeadLetter
 from ._polling_consumer import PollingConsumer
 from ._shm_coldstore import ShmColdStore
 from ._shm_ring import _HEADER_SIZE, _SLOT_SIZE, ShmRing
@@ -470,6 +472,28 @@ class ShmBroker:
             error,
             consumer_name=consumer_name,
         )
+
+    async def list_dead_letters(
+        self, *, after: tuple[datetime, str] | None = None, limit: int = 100
+    ) -> list[DeadLetter]:
+        """One page of dead-lettered deliveries, oldest first by ``(created_at, id)``.
+
+        ``after`` is the ``cursor`` of the last entry of the previous page.
+        Every entry is one group's delivery of a publication, so a publication
+        that died for two groups is listed twice.
+        """
+        return await self._cold.list_dead_letters(after=after, limit=limit)
+
+    async def retry_dead_letters(self) -> int:
+        """Make every dead-lettered delivery claimable again; return how many.
+
+        Each delivery belongs to one consumer group, so only that group's
+        consumer receives it again; deliveries other groups completed are not
+        touched. Attempts and the recorded error are cleared. A running
+        consumer picks the delivery up on its next poll: SQLite is where it
+        claims from, and the hint ring only announces new publications.
+        """
+        return await self._cold.retry_dead_letters()
 
     async def prune(
         self,

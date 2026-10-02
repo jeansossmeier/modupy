@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from datetime import UTC, datetime, timedelta
 
+from ._dead_letter import DeadLetter
 from ._shm_claims import owned_claim, owned_predicate
 from ._shm_schema import immediate_transaction
 from ._shm_types import ClaimToken
@@ -140,6 +142,68 @@ def dead_letter(
             (error, now, token.delivery_id, owner, token.generation),
         )
         return cursor.rowcount == 1
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_MICROSECOND = timedelta(microseconds=1)
+_CREATED_MICROS = "CAST(ROUND(d.created_at * 1000000) AS INTEGER)"
+
+
+def list_dead_letters(
+    conn: sqlite3.Connection,
+    after: tuple[datetime, str] | None,
+    limit: int,
+) -> list[DeadLetter]:
+    """One page of dead deliveries ordered by creation time, then delivery id.
+
+    Creation time is compared in whole microseconds, the precision a
+    ``DeadLetter.created_at`` can carry, so a cursor built from a listed entry
+    resumes exactly past it.
+    """
+    keyset = ""
+    params: tuple[int, ...] = ()
+    if after is not None:
+        created_at, delivery_id = after
+        micros = (created_at - _EPOCH) // _MICROSECOND
+        keyset = f"AND ({_CREATED_MICROS} > ? OR ({_CREATED_MICROS} = ? AND d.id > ?))"
+        params = (micros, micros, int(delivery_id))
+    rows = conn.execute(
+        f"""
+        SELECT d.id, p.target, d.consumer_group, p.event_type, d.attempts,
+               d.last_error, {_CREATED_MICROS} AS created_micros
+        FROM shm_delivery AS d JOIN shm_publication AS p ON p.id=d.publication_id
+        WHERE d.status='dead' {keyset}
+        ORDER BY created_micros, d.id LIMIT ?
+        """,
+        (*params, limit),
+    )
+    return [
+        DeadLetter(
+            id=str(row["id"]),
+            target=str(row["target"]),
+            consumer_group=str(row["consumer_group"]),
+            event_type=str(row["event_type"]),
+            attempts=int(row["attempts"]),
+            last_error=row["last_error"],
+            created_at=_EPOCH + int(row["created_micros"]) * _MICROSECOND,
+        )
+        for row in rows
+    ]
+
+
+def retry_dead_letters(conn: sqlite3.Connection) -> int:
+    """Make every dead delivery claimable again by its own group; return how many."""
+    with immediate_transaction(conn):
+        return conn.execute(
+            """
+            UPDATE shm_delivery
+            SET status='pending', attempts=0, last_error=NULL, available_at=?,
+                claimed_at=NULL, claimed_by=NULL, dispatch_started=0,
+                completed_at=NULL
+            WHERE status='dead'
+            """,
+            (time.time(),),
+        ).rowcount
 
 
 def prune(

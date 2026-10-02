@@ -1255,7 +1255,7 @@ group.
 - A direct `publish()` raises the broker's error to its caller. modupy keeps no in-memory buffer of events it could not send
 - Inside a bound outbox session, the broker send is saved as an outbox row in your transaction and made after the commit. While the broker is down the row stays in the outbox and the retry loop sends it again, until `dead_letter_after_attempts` (10 by default) failed attempts dead-letter it. `modulith outbox dead-letter --retry-all` resubmits dead-lettered rows once the broker is back
 
-**Dead-lettered deliveries (database broker only):**
+**Dead-lettered deliveries (database and shm brokers):**
 
 ```bash
 modulith broker dead-letter               # list them, with attempts and last error (--list is the default)
@@ -1267,8 +1267,10 @@ reclaims, or at once when its payload cannot be read. Each belongs to one
 consumer group, so `--retry-all` hands it back only to that group; a group that
 already completed the same message does not receive it again. `--list` and
 `--retry-all` are mutually exclusive. The command runs against the broker store
-the service is configured with, and exits 1 with `no database broker tables` if
-that store has none. The shm and Redis brokers do not support it yet, and exit 1
+the service is configured with, and exits 1 with `no database broker tables` (or
+`no shm broker store`) if that store has none. On the shm broker the resubmitted
+delivery is claimed from the SQLite store, so a running consumer receives it on
+its next poll. The Redis broker does not support the command yet, and exits 1
 saying so. For the outbox, use `modulith outbox dead-letter`.
 
 **Consuming (every broker):**
