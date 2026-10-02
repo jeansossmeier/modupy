@@ -476,10 +476,11 @@ def _make_polling_consumer(
     poll_interval_s: float,
     max_attempts: int,
     idle_wait: Any,
+    bus: InMemoryEventBus | None = None,
 ) -> PollingConsumer:
     return PollingConsumer(
         broker=broker,
-        bus=InMemoryEventBus(),
+        bus=bus or InMemoryEventBus(),
         serializer=JsonEventSerializer(),
         consumer_name="worker-1",
         group="workers",
@@ -605,10 +606,16 @@ async def test_stop_lets_an_in_flight_claim_finish_instead_of_cancelling_it() ->
     consumer = _make_polling_consumer(broker, poll_interval_s=30.0, max_attempts=3, idle_wait=None)
     await consumer.start()
     await asyncio.wait_for(broker.entered.wait(), timeout=2.0)
+    poll_task = consumer._task
+    assert poll_task is not None
+    loop = asyncio.get_running_loop()
 
+    started = loop.time()
     await asyncio.wait_for(consumer.stop(), timeout=5.0)
 
     assert (broker.finished, broker.cancelled) == (1, 0)
+    assert not poll_task.cancelled()
+    assert loop.time() - started < consumer._stop_drain_grace_s
     assert consumer.health().status == "stopped"
 
 
@@ -627,6 +634,29 @@ async def test_stop_cancelled_while_draining_still_cancels_the_poll() -> None:
     with pytest.raises(asyncio.CancelledError):
         await stop_task
     assert (poll_task.done(), broker.cancelled, consumer._task) == (True, 1, None)
+    assert consumer.health().status == "stopped"
+
+
+async def test_stop_cancelled_while_draining_re_cancels_a_claim_that_absorbed_the_first_cancel() -> (
+    None
+):
+    """SQLAlchemy shields the close of a connection whose operation was
+    cancelled, so only a second cancel ends such a claim promptly."""
+    broker = _WedgedClaimBroker(absorb=1)
+    consumer = _make_polling_consumer(broker, poll_interval_s=30.0, max_attempts=3, idle_wait=None)
+    consumer._stop_timeout_s = 30.0
+    await consumer.start()
+    await asyncio.wait_for(broker.entered.wait(), timeout=2.0)
+    poll_task = consumer._task
+    assert poll_task is not None
+
+    stop_task = asyncio.create_task(consumer.stop())
+    await _until(lambda: consumer._stopping)
+    stop_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(stop_task, timeout=5.0)
+    assert (poll_task.done(), broker.cancels) == (True, 2)
 
 
 async def test_stop_cancels_a_poll_sleeping_between_claims_at_once() -> None:
@@ -641,6 +671,155 @@ async def test_stop_cancels_a_poll_sleeping_between_claims_at_once() -> None:
 
     assert loop.time() - started < consumer._stop_drain_grace_s / 2
     assert consumer.health().status == "stopped"
+
+
+async def test_stop_cancels_a_poll_waiting_for_a_latency_hint_at_once() -> None:
+    waiting = asyncio.Event()
+
+    async def idle_wait(delay: float) -> None:
+        waiting.set()
+        await asyncio.sleep(3600)
+
+    consumer = _make_polling_consumer(
+        FakePollingBroker(), poll_interval_s=30.0, max_attempts=3, idle_wait=idle_wait
+    )
+    await consumer.start()
+    await asyncio.wait_for(waiting.wait(), timeout=2.0)
+    loop = asyncio.get_running_loop()
+
+    started = loop.time()
+    await asyncio.wait_for(consumer.stop(), timeout=5.0)
+
+    assert loop.time() - started < consumer._stop_drain_grace_s / 2
+
+
+class _FailingClaimBroker(FakePollingBroker):
+    """``claim_batch`` waits until ``release`` is set, then fails."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def claim_batch(self, group: str, **kwargs: Any) -> list[dict[str, Any]]:
+        self.entered.set()
+        await self.release.wait()
+        raise ConnectionError("database went away")
+
+
+async def test_stop_cancels_a_poll_backing_off_after_a_failed_claim_at_once() -> None:
+    broker = _FailingClaimBroker()
+    broker.release.set()
+    consumer = _make_polling_consumer(broker, poll_interval_s=30.0, max_attempts=3, idle_wait=None)
+    consumer._consecutive_failures = 10
+    await consumer.start()
+    await _until(lambda: consumer._sleeping)
+    loop = asyncio.get_running_loop()
+
+    started = loop.time()
+    await asyncio.wait_for(consumer.stop(), timeout=5.0)
+
+    assert loop.time() - started < consumer._stop_drain_grace_s / 2
+
+
+async def test_stop_does_not_back_off_after_a_claim_that_failed_while_stopping() -> None:
+    broker = _FailingClaimBroker()
+    consumer = _make_polling_consumer(broker, poll_interval_s=30.0, max_attempts=3, idle_wait=None)
+    consumer._consecutive_failures = 10
+    await consumer.start()
+    await asyncio.wait_for(broker.entered.wait(), timeout=2.0)
+    loop = asyncio.get_running_loop()
+
+    started = loop.time()
+    stop_task = asyncio.create_task(consumer.stop())
+    await _until(lambda: consumer._stopping)
+    broker.release.set()
+    await asyncio.wait_for(stop_task, timeout=5.0)
+
+    assert loop.time() - started < consumer._stop_drain_grace_s / 2
+
+
+class _SlowTouchBroker(FakePollingBroker):
+    """``touch_subscriptions`` waits until ``release`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.touching = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def touch_subscriptions(self, targets: list[str], group: str) -> None:
+        self.touching.set()
+        await self.release.wait()
+
+
+async def test_stop_during_a_subscription_refresh_claims_nothing() -> None:
+    broker = _SlowTouchBroker()
+    consumer = _make_polling_consumer(broker, poll_interval_s=30.0, max_attempts=3, idle_wait=None)
+    await consumer.start()
+    await asyncio.wait_for(broker.touching.wait(), timeout=2.0)
+
+    stop_task = asyncio.create_task(consumer.stop())
+    await _until(lambda: consumer._stopping)
+    broker.release.set()
+    await asyncio.wait_for(stop_task, timeout=5.0)
+
+    assert broker.claim_batch_calls == []
+
+
+class _OneRowBroker(FakePollingBroker):
+    """Hands out one ``ConsumerEvent(value=1)`` row and records its ack."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[dict[str, Any]] = [
+            {
+                "id": "row-1",
+                "target": "t",
+                "event_type": _FQN,
+                "payload": JsonEventSerializer().serialize(ConsumerEvent(value=1)),
+                "attempts": 0,
+            }
+        ]
+        self.acked: list[str] = []
+
+    async def claim_batch(self, group: str, **kwargs: Any) -> list[dict[str, Any]]:
+        rows, self.rows = self.rows, []
+        return rows
+
+    async def renew_claims(
+        self, row_ids: list[str], *, consumer_name: str, start_dispatch: bool = False
+    ) -> int:
+        return len(row_ids)
+
+    async def ack(self, row_id: str, *, consumer_name: str) -> None:
+        self.acked.append(row_id)
+
+
+async def test_stop_lets_a_running_listener_finish_and_acks_its_row() -> None:
+    running, finish = asyncio.Event(), asyncio.Event()
+
+    async def listener(evt: ConsumerEvent) -> None:
+        running.set()
+        await finish.wait()
+
+    bus = InMemoryEventBus()
+    bus.register(ConsumerEvent, listener)
+    broker = _OneRowBroker()
+    consumer = _make_polling_consumer(
+        broker, poll_interval_s=30.0, max_attempts=3, idle_wait=None, bus=bus
+    )
+    await consumer.start()
+    await asyncio.wait_for(running.wait(), timeout=2.0)
+    poll_task = consumer._task
+    assert poll_task is not None
+
+    stop_task = asyncio.create_task(consumer.stop())
+    await _until(lambda: consumer._stopping)
+    finish.set()
+    await asyncio.wait_for(stop_task, timeout=5.0)
+
+    assert broker.acked == ["row-1"]
+    assert not poll_task.cancelled()
 
 
 async def test_stop_re_cancels_a_poll_task_that_absorbed_the_first_cancel() -> None:

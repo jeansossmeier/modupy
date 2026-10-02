@@ -228,7 +228,16 @@ class PollingConsumer(DeliveryDispatch):
         """
         if task is None or task.done() or self._sleeping:
             return
-        await asyncio.wait({task}, timeout=self._stop_drain_grace_s)
+        try:
+            await asyncio.wait({task}, timeout=self._stop_drain_grace_s)
+        except asyncio.CancelledError:
+            # stop() itself is being cancelled. Cancel the poll now and give it a
+            # loop turn to take that cancel, so the cancel from cancel_and_wait
+            # (modulith/_shutdown.py) that follows is a second one, which breaks
+            # SQLAlchemy's shield around closing a cancelled connection.
+            task.cancel()
+            await asyncio.sleep(0)
+            raise
 
     async def _sleep_between_claims(self, wait: Awaitable[None]) -> None:
         self._sleeping = True
@@ -269,6 +278,8 @@ class PollingConsumer(DeliveryDispatch):
         touched_at = -math.inf
         while not self._stopping:
             touched_at = await self._touch_subscriptions_if_due(loop.time(), touched_at)
+            if self._should_stop():
+                return
             try:
                 rows = await self._broker.claim_batch(
                     self._group,
@@ -283,6 +294,8 @@ class PollingConsumer(DeliveryDispatch):
             except Exception as exc:
                 self._mark_broker_failure("claim", self._group, exc)
                 self._logger.exception("claim failed for group %s", self._group)
+                if self._should_stop():
+                    return
                 await self._backoff_after_failure()
                 continue
             self._consecutive_failures = 0
