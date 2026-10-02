@@ -3132,6 +3132,48 @@ def test_outbox_shutdown_leaves_the_engine_open_with_a_warning_when_the_retry_lo
     )
 
 
+def test_outbox_shutdown_leaves_the_engine_open_with_a_warning_when_the_retry_loop_stalled(
+    make_fake_app: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    engine, disposals = _bind_outbox_url_engine(make_fake_app, tmp_path / "app.db")
+    stalled_loop = asyncio.new_event_loop()
+
+    class FinishedTaskOnStoppedLoop:
+        def done(self) -> bool:
+            return True
+
+        def get_loop(self) -> asyncio.AbstractEventLoop:
+            return stalled_loop
+
+    monkeypatch.setattr(outbox, "_retry_task", FinishedTaskOnStoppedLoop())
+    monkeypatch.setattr(outbox, "_shutdown_grace_seconds", 0.05)
+
+    async def scenario() -> int:
+        with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
+            await asyncio.wait_for(outbox.shutdown(), timeout=15)
+        disposed = len(disposals)
+        await engine.dispose()
+        return disposed
+
+    try:
+        assert asyncio.run(scenario()) == 0
+    finally:
+        # Let the stopped loop discard the disposal it never ran.
+        stalled_loop.run_until_complete(asyncio.sleep(0))
+        leftover = asyncio.all_tasks(stalled_loop)
+        if leftover:
+            stalled_loop.run_until_complete(asyncio.gather(*leftover, return_exceptions=True))
+        stalled_loop.close()
+    assert any(
+        "leaving the engine built from outbox_url open" in r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+    )
+
+
 _FAILING_LISTENER_APP = {
     "orders": """
         from dataclasses import dataclass
