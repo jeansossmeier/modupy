@@ -238,7 +238,9 @@ def _publish_trace_context() -> dict[str, str] | None:
     """W3C trace context of the active publish span, for an outbox row to store.
 
     None when OTel is missing, no publish span is active (the observability
-    plugin disabled never starts one) or the span is not recording.
+    plugin disabled never starts one) or the span has no valid span context,
+    as when no SDK tracer provider is installed. A sampled-out span still
+    yields a carrier, so its sampling decision travels with the row.
     """
     span = _publish_span.get()
     if not _OTEL_AVAILABLE or span is None:
