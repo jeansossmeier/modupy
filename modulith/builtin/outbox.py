@@ -606,6 +606,17 @@ def modulith_after_event_published(event: Any, publication: EventPublication) ->
     """Observability hook — the outbox itself does nothing here."""
 
 
+def _publish_trace_context() -> dict[str, str] | None:
+    """The carrier a row stores so its dispatch span can join the publish span's trace.
+
+    Imported lazily: this module never depends on OpenTelemetry; the
+    observability plugin owns that and returns None when tracing is off.
+    """
+    from .observability import _publish_trace_context as carrier
+
+    return carrier()
+
+
 async def persist(event: Any) -> list[EventPublication]:
     """Persist one publication per registered listener, inside the txn.
 
@@ -635,6 +646,7 @@ async def persist(event: Any) -> list[EventPublication]:
     fqcn = f"{type(event).__module__}.{type(event).__qualname__}"
     payload = _serializer.serialize(event)
     now = datetime.now(UTC)
+    trace_context = _publish_trace_context()
     saved: list[EventPublication] = []
     for handler in handlers:
         pub = EventPublication(
@@ -643,6 +655,7 @@ async def persist(event: Any) -> list[EventPublication]:
             event_type=fqcn,
             listener=_listener_id(handler),
             published_at=now,
+            trace_context=trace_context,
         )
         await _store.save(pub)
         saved.append(pub)
@@ -679,6 +692,7 @@ async def persist_broker_route(event: Any, target: str) -> EventPublication:
         event_type=fqcn,
         listener=_BROKER_ROUTE_LISTENER_PREFIX + target,
         published_at=datetime.now(UTC),
+        trace_context=_publish_trace_context(),
     )
     await _store.save(pub)
     return pub

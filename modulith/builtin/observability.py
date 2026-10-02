@@ -29,7 +29,8 @@ Spans emitted:
       listener.name        — the outbox's stored listener id (module.qualname,
                              ``owner:`` prefix for bound methods/instances)
       publication.id
-    parent: the modulith.event.publish span
+    parent: the modulith.event.publish span (for outbox deliveries, the one
+            named by the row's stored trace context)
     duration: just the listener invocation (dispatch → complete)
     status: ERROR (with recorded exception) when the listener raises
 
@@ -45,8 +46,10 @@ in-memory dispatch. ``modulith_after_event_published`` fires on this path too �
 right after the event is persisted, which is the hookspec's documented trigger
 — so the publish span is started unconditionally and, on the durable path,
 brackets the persistence step. Listener dispatch happens after the business
-transaction commits, in a different context, so those later dispatch spans are
-not parented to the publish span.
+transaction commits, in a different context, and a retry runs in the outbox's
+own task. Each outbox row therefore stores the W3C trace context of the publish
+span that created it (``EventPublication.trace_context``), and the dispatch span
+of every delivery, after commit or on retry, is parented to that span.
 """
 
 from __future__ import annotations
@@ -69,8 +72,10 @@ logger = logging.getLogger("modulith.observability")
 try:
     from opentelemetry import trace
     from opentelemetry.trace import Status, StatusCode
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
     _OTEL_AVAILABLE = True
+    _propagator: Any = TraceContextTextMapPropagator()
     # The instrumenting-library version is the package's own version — read it
     # from ``modulith.__version__`` rather than restating the literal here, so
     # a release bump cannot leave the tracer metadata behind. Passed
@@ -79,6 +84,7 @@ try:
 except ImportError:
     _OTEL_AVAILABLE = False
     _tracer = None
+    _propagator = None
 
 
 # ---------------------------------------------------------------------------
@@ -178,11 +184,19 @@ def modulith_on_listener_dispatch(
     listener_name: str,
     publication: EventPublication,
 ) -> None:
-    """Start a span for one listener invocation, parented to the publish span."""
+    """Start a span for one listener invocation, parented to the publish span.
+
+    An outbox row's stored ``trace_context`` names the publish span that created
+    it, which is the only link left after commit or on a retry; without one, the
+    live publish span of this context is the parent.
+    """
     if not _OTEL_AVAILABLE:
         return
-    parent = _publish_span.get()
-    context = trace.set_span_in_context(parent) if parent is not None else None
+    if publication.trace_context is not None:
+        context = _extract_context(publication.trace_context)
+    else:
+        parent = _publish_span.get()
+        context = trace.set_span_in_context(parent) if parent is not None else None
     span = _tracer.start_span(
         "modulith.event.dispatch",
         context=context,
@@ -218,6 +232,29 @@ def modulith_on_listener_complete(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _publish_trace_context() -> dict[str, str] | None:
+    """W3C trace context of the active publish span, for an outbox row to store.
+
+    None when OTel is missing, no publish span is active (the observability
+    plugin disabled never starts one) or the span is not recording.
+    """
+    span = _publish_span.get()
+    if not _OTEL_AVAILABLE or span is None:
+        return None
+    carrier: dict[str, str] = {}
+    _propagator.inject(carrier, trace.set_span_in_context(span))
+    return carrier or None
+
+
+def _extract_context(carrier: Any) -> Any:
+    """The OTel context a stored carrier names; None when it names nothing usable."""
+    try:
+        return _propagator.extract(carrier)
+    except Exception:
+        logger.debug("unusable stored trace context", exc_info=True)
+        return None
 
 
 def _event_type(event: Any) -> str:

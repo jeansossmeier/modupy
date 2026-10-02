@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -24,11 +25,22 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from modulith import ConfigurationError, EventPublication, configure, event
+from modulith.adapters.postgres_outbox import (
+    Base,
+    EventPublicationRow,
+    PostgresPublicationStore,
+    bind_session,
+    unbind_session,
+)
 from modulith.builtin import observability, outbox
 from modulith.runtime import _runtime
 from modulith.serializers import JsonEventSerializer
+from modulith.types import EventPublishReceipt
 
 
 @dataclass(frozen=True)
@@ -195,3 +207,245 @@ async def test_retry_loop_dispatch_span_has_no_parent_from_the_creating_publish(
     (dispatch_span,) = await asyncio.wait_for(dispatched(), timeout=5)
     assert dispatch_span.parent is None
     assert dispatch_span.context.trace_id != stale_publish_span.context.trace_id
+
+
+# ---------------------------------------------------------------------------
+# Outbox rows carry the publish span's trace context, so dispatch spans of
+# durably delivered events are children of the publish span that created them.
+# ---------------------------------------------------------------------------
+
+
+@event
+@dataclass(frozen=True)
+class TracedEvt:
+    x: int
+
+
+class _FlakyListener:
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.calls = 0
+
+    async def __call__(self, evt: TracedEvt) -> None:
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise RuntimeError("listener down")
+
+
+class _CapturingStore(FailingStore):
+    def __init__(self) -> None:
+        self.saved: list[EventPublication] = []
+
+    async def save(self, publication: Any) -> None:
+        self.saved.append(publication)
+
+
+async def _sqlite_store(
+    tmp_path: Path, **outbox_options: Any
+) -> tuple[Any, PostgresPublicationStore]:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'outbox.db'}", poolclass=NullPool
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False, **outbox_options)
+    return engine, store
+
+
+async def _publish_committed(engine: Any, x: int = 1) -> None:
+    async with async_sessionmaker(engine)() as session:
+        token = bind_session(session)
+        try:
+            await _runtime.publish(TracedEvt(x=x))
+            await session.commit()
+        finally:
+            unbind_session(token)
+
+
+async def _stored_trace_contexts(engine: Any) -> list[str | None]:
+    async with async_sessionmaker(engine)() as session:
+        rows = await session.execute(select(EventPublicationRow.trace_context))
+        return [row.trace_context for row in rows]
+
+
+def _register(listener: Any, **config: Any) -> None:
+    configure(package="modulith_w4trace_metatest", auto_discover=False, **config)
+    _runtime.ensure_bootstrapped()
+    assert _runtime.event_bus is not None
+    _runtime.event_bus.register(TracedEvt, listener)
+
+
+def _traceparent(context: Any) -> dict[str, str]:
+    flags = int(context.trace_flags)
+    return {"traceparent": f"00-{context.trace_id:032x}-{context.span_id:016x}-{flags:02x}"}
+
+
+async def _wait_for_dispatch_spans(exporter: InMemorySpanExporter, count: int) -> list[Any]:
+    async def reached() -> list[Any]:
+        while len(spans := _dispatch_spans(exporter)) < count:
+            await asyncio.sleep(0.005)
+        return spans
+
+    return await asyncio.wait_for(reached(), timeout=5)
+
+
+async def test_after_commit_dispatch_span_is_a_child_of_the_publish_span(
+    span_exporter: InMemorySpanExporter, tmp_path: Path
+) -> None:
+    flaky = _FlakyListener(failures=0)
+    _register(flaky)
+    engine, store = await _sqlite_store(tmp_path)
+    try:
+        await _publish_committed(engine)
+        await store.wait_for_dispatch()
+
+        (publish_span,) = _publish_spans(span_exporter)
+        (dispatch_span,) = _dispatch_spans(span_exporter)
+        assert dispatch_span.context.trace_id == publish_span.context.trace_id
+        assert dispatch_span.parent is not None
+        assert dispatch_span.parent.span_id == publish_span.context.span_id
+        assert flaky.calls == 1
+    finally:
+        await store.dispose()
+        await engine.dispose()
+
+
+async def test_retry_dispatch_span_is_a_child_of_the_publish_span(
+    span_exporter: InMemorySpanExporter, tmp_path: Path
+) -> None:
+    flaky = _FlakyListener(failures=1)
+    _register(flaky)
+    engine, store = await _sqlite_store(
+        tmp_path,
+        retry_interval_seconds=0.02,
+        retry_stale_seconds=0,
+        max_retry_backoff_seconds=0.01,
+    )
+    try:
+        await _publish_committed(engine)
+        await store.wait_for_dispatch()
+        assert flaky.calls == 1
+
+        outbox._ensure_retry_loop()
+        await _wait_for_dispatch_spans(span_exporter, 2)
+
+        (publish_span,) = _publish_spans(span_exporter)
+        failed, retried = sorted(_dispatch_spans(span_exporter), key=lambda s: s.start_time)
+        assert failed.status.status_code is StatusCode.ERROR
+        assert retried.status.status_code is not StatusCode.ERROR
+        assert retried.context.trace_id == publish_span.context.trace_id
+        assert retried.parent is not None
+        assert retried.parent.span_id == publish_span.context.span_id
+    finally:
+        await outbox.shutdown()
+        await store.dispose()
+        await engine.dispose()
+
+
+async def test_every_row_of_one_publish_stores_the_same_carrier(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    store = _CapturingStore()
+    first, second = _FlakyListener(0), _FlakyListener(0)
+    configure(package="modulith_w4trace_metatest", auto_discover=False)
+    _runtime.ensure_bootstrapped()
+    assert _runtime.event_bus is not None
+    _runtime.event_bus.register(TracedEvt, first)
+    _runtime.event_bus.register(TracedEvt, second)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+
+    token = outbox._current_session.set(object())
+    try:
+        await _runtime.publish(TracedEvt(x=1))
+    finally:
+        outbox._current_session.reset(token)
+
+    (publish_span,) = _publish_spans(span_exporter)
+    assert len(store.saved) == 2
+    assert [pub.trace_context for pub in store.saved] == [_traceparent(publish_span.context)] * 2
+
+
+async def test_broker_route_row_carries_the_publish_span_carrier(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    store = _CapturingStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+
+    observability.modulith_before_event_published(event=TracedEvt(x=1))
+    publish_span = observability._publish_span.get()
+    assert publish_span is not None
+    try:
+        await outbox.persist_broker_route(TracedEvt(x=1), "redis://queue")
+    finally:
+        observability.modulith_after_event_published(
+            event=TracedEvt(x=1), publication=EventPublishReceipt(records=())
+        )
+
+    (pub,) = store.saved
+    assert pub.trace_context == _traceparent(publish_span.get_span_context())
+
+
+@pytest.mark.parametrize("mode", ["observability-off", "otel-unavailable"])
+async def test_rows_carry_no_trace_context_when_tracing_is_off(
+    mode: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    flaky = _FlakyListener(failures=0)
+    if mode == "observability-off":
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(InMemorySpanExporter()))
+        monkeypatch.setattr(observability, "_tracer", provider.get_tracer("test"))
+        monkeypatch.setattr(observability, "_OTEL_AVAILABLE", True)
+        _register(flaky, observability=False)
+    else:
+        monkeypatch.setattr(observability, "_OTEL_AVAILABLE", False)
+        monkeypatch.setattr(observability, "_tracer", None)
+        _register(flaky)
+    engine, store = await _sqlite_store(tmp_path)
+    try:
+        await _publish_committed(engine)
+        await store.wait_for_dispatch()
+
+        assert await _stored_trace_contexts(engine) == [None]
+        assert flaky.calls == 1
+    finally:
+        await store.dispose()
+        await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "carrier",
+    [{"traceparent": "garbage"}, {}, ["not", "a", "carrier"], {"traceparent": 7}],
+    ids=["malformed", "empty", "not-a-mapping", "non-string-value"],
+)
+async def test_garbage_trace_context_dispatches_with_a_parentless_span(
+    carrier: Any, span_exporter: InMemorySpanExporter, tmp_path: Path
+) -> None:
+    flaky = _FlakyListener(failures=0)
+    _register(flaky)
+    engine, store = await _sqlite_store(tmp_path)
+    try:
+        pub = EventPublication(
+            id=uuid4(),
+            payload=JsonEventSerializer().serialize(TracedEvt(x=1)),
+            event_type=f"{TracedEvt.__module__}.{TracedEvt.__qualname__}",
+            listener=outbox._listener_id(flaky),
+            published_at=datetime.now(UTC),
+            trace_context=carrier,
+        )
+        async with async_sessionmaker(engine)() as session:
+            token = bind_session(session)
+            try:
+                await store.save(pub)
+                await session.commit()
+            finally:
+                unbind_session(token)
+
+        await outbox.force_retry(pub.id)
+
+        (dispatch_span,) = _dispatch_spans(span_exporter)
+        assert dispatch_span.parent is None
+        assert flaky.calls == 1
+    finally:
+        await store.dispose()
+        await engine.dispose()

@@ -1104,8 +1104,12 @@ a silent no-op otherwise. `false` creates no spans. `true` makes bootstrap raise
 on traces fails at startup; install it with `pip install 'modupy[otel]'`.
 
 There is no outbox span. On the durable path the publish span brackets writing
-the outbox row, and the dispatch spans that run after commit are not parented
-to it.
+the outbox row. Each outbox row stores that span's W3C trace context, so the
+dispatch span of an outbox-delivered event, whether delivered after commit or on
+a retry, is a child of the publish span that created it, in the same trace. A
+row with no stored trace context (tracing was off when it was written) gets a
+dispatch span with no parent. Events routed to a broker are not yet joined
+across the broker hop.
 
 Export spans to Prometheus, Jaeger, or your observability stack.
 
