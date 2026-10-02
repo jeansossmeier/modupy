@@ -23,7 +23,7 @@ Records of known technical debt, architectural issues, and improvements for futu
 | [2026-09-29-sqlalchemy-2-1-version-gate-tests-fail.md](2026-09-29-sqlalchemy-2-1-version-gate-tests-fail.md) | Testing | High | resolved |
 | [2026-09-29-password-masking-in-migrate-command.md](2026-09-29-password-masking-in-migrate-command.md) | Security | Low | resolved |
 | [2026-09-29-fastapi-testclient-starlette-deprecation.md](2026-09-29-fastapi-testclient-starlette-deprecation.md) | Testing | Low | resolved |
-| [2026-09-30-test-suite-leaks-state-dirs.md](2026-09-30-test-suite-leaks-state-dirs.md) | Testing | Low | open |
+| [2026-09-30-test-suite-leaks-state-dirs.md](2026-09-30-test-suite-leaks-state-dirs.md) | Testing | Low | resolved |
 | [2026-09-30-worker-docs-shadowed-by-path-param-routes.md](2026-09-30-worker-docs-shadowed-by-path-param-routes.md) | Architecture | Low | resolved |
 | [2026-10-01-marketplace-suite-teardown-hang.md](2026-10-01-marketplace-suite-teardown-hang.md) | Testing | Medium | resolved |
 | [2026-10-01-sqlite-dispatch-lock-waits.md](2026-10-01-sqlite-dispatch-lock-waits.md) | Architecture | Low | resolved |
