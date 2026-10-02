@@ -27,7 +27,7 @@ Multiple operator-facing gaps:
 Add: 1) broker dead-letter CLI command, 2) outbox filtering by status, 3) full topology in actuator endpoint, 4) `--worker-port-base` for `modulith dev`, 5) `disabled_rules` config key and enforcement.
 
 ## Progress (2026-10-01)
-Items 3 and 4 are done. `/_modulith/topology` gives each module a `replicas` list (`tests/test_proxy.py::test_topology_lists_all_replicas_for_scaled_module`), and `modulith dev` takes `--worker-port-base` (`tests/test_cli.py::test_dev_processes_topology_accepts_worker_port_base`). Items 1, 2 and 5 remain open.
+Items 3, 4 and 5 are done. `/_modulith/topology` gives each module a `replicas` list (`tests/test_proxy.py::test_topology_lists_all_replicas_for_scaled_module`), `modulith dev` takes `--worker-port-base` (`tests/test_cli.py::test_dev_processes_topology_accepts_worker_port_base`), and `disabled_rules` turns off plugin rules by name in `verify`, `doctor` and the strict bootstrap (`modulith/builtin/verifier.py::collect_violations`). Items 1 and 2 remain open.
 
 ## Context
 These are nice-to-have features for large deployments. Single-module or small-team projects are unaffected. [Assertion-Only]
