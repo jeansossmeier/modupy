@@ -438,8 +438,9 @@ until the runtime is bootstrapped. Call `modulith.bootstrap()` and then
 `outbox.start()` in your ASGI lifespan's startup half, so rows a crashed
 process left undelivered are swept at startup instead of waiting for the first
 transactional publish. In a single-process app, call `outbox.shutdown()` in the
-lifespan's teardown to stop the retry loop; the store bound from `outbox_url`
-is disposed only by process-topology workers. The outbox table must live in the
+lifespan's teardown: it stops the retry loop and closes the engine modulith
+created from `outbox_url`, but never a store or engine you configured
+yourself. The outbox table must live in the
 database that holds your business data, or the row and your data cannot commit
 in one transaction. Under `--topology processes`, `main.py` (its lifespan and
 middleware) does not run in workers; with `outbox_url` set, each worker binds

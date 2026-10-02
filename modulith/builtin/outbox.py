@@ -201,6 +201,11 @@ _retry_stale_seconds: float = 30.0
 _retry_loop_enabled: bool = True
 _retry_task: asyncio.Task[None] | None = None
 
+# The (store, engine) pair Runtime.bind_configured_outbox built from
+# ``outbox_url``. shutdown() disposes it; a store the application passed to
+# configure() is never recorded here, so it is never disposed.
+_owned_resources: tuple[Any, Any] | None = None
+
 # Claim coordination (see modulith._claims). Bound in configure().
 # Default ``"lease"``; third-party stores without ClaimingStore fall back to
 # the original find_incomplete path at sweep time (capability duck-typing).
@@ -1362,7 +1367,47 @@ async def _retry_loop() -> None:
 
 
 async def shutdown() -> None:
+    """Stop the retry loop, then close what modulith built from ``outbox_url``.
+
+    Idempotent. Once the loop has stopped, a store and engine that
+    ``Runtime.bind_configured_outbox`` created from ``outbox_url`` are
+    disposed, closing the engine's pooled connections. A store the
+    application passed to ``configure()`` is never disposed: its engine
+    belongs to the application. When the retry loop ran on another event loop
+    than the one awaiting ``shutdown()``, the engine is left open: its pooled
+    connections may be bound to that other loop, and a driver such as asyncpg
+    fails when closing them from a different one.
+
+    See ``_stop_retry_loop`` for how the loop is stopped.
+    """
+    task_loop = await _stop_retry_loop()
+    await _dispose_owned_resources(task_loop)
+
+
+async def _dispose_owned_resources(task_loop: asyncio.AbstractEventLoop | None) -> None:
+    """Dispose and forget the store and engine built from ``outbox_url``.
+
+    ``task_loop`` is the loop the retry task ran on, if there was one.
+    """
+    global _owned_resources
+    owned, _owned_resources = _owned_resources, None
+    if owned is None:
+        return
+    if task_loop is not None and task_loop is not asyncio.get_running_loop():
+        logger.debug(
+            "outbox shutdown ran on another event loop than the retry loop; "
+            "leaving the engine built from outbox_url open"
+        )
+        return
+    store, engine = owned
+    await store.dispose()
+    await engine.dispose()
+
+
+async def _stop_retry_loop() -> asyncio.AbstractEventLoop | None:
     """Stop the retry loop and wait for it to finish. Idempotent.
+
+    Returns the loop the retry task ran on, or None when there was no task.
 
     A loop sleeping between sweeps is cancelled at once. A loop inside a
     sweep is asked to stop instead: the store call or listener delivery in
@@ -1390,7 +1435,7 @@ async def shutdown() -> None:
     global _retry_task
     task = _retry_task
     if task is None:
-        return
+        return None
     if not task.done():
         if task.get_loop().is_closed():
             # Stranded on a closed foreign loop — it will never take another
@@ -1416,6 +1461,7 @@ async def shutdown() -> None:
         # installed a fresh task while we awaited the cancellation.
         if _retry_task is task:
             _retry_task = None
+    return task.get_loop()
 
 
 # ---------------------------------------------------------------------------
@@ -1632,8 +1678,10 @@ def _reset_for_testing() -> None:
     global _dead_letter_after_attempts, _retry_interval_seconds
     global _max_retry_backoff_seconds, _retry_stale_seconds, _retry_loop_enabled
     global _claim_strategy, _claim_lease_seconds, _claim_batch_size, _claim_owner
+    global _owned_resources
     _cancel_retry_task()
     _stop_requested.clear()
+    _owned_resources = None
     _store = None
     _serializer = None
     _completion_mode = "update"

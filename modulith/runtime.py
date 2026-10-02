@@ -386,9 +386,9 @@ class Runtime:
         here. Any other database ignores it, so one pyproject can serve a
         SQLite development setup and a Postgres deployment; unset, the
         database's journal mode is never touched.
-        ``shutdown()`` disposes the store and its engine, but only
-        process-topology workers call it; a single-process app stops the retry
-        loop with ``outbox.shutdown()``.
+        ``outbox.shutdown()`` disposes the store and its engine: process-topology
+        workers reach it through ``Runtime.shutdown``, a single-process app
+        calls it directly.
         """
         from .builtin import outbox
 
@@ -423,7 +423,7 @@ class Runtime:
         store = PostgresPublicationStore(engine)
         event_types = self.local_event_types(bus) if bus is not None else []
         outbox.configure(store, JsonEventSerializer(allowed_event_types=event_types), **tuning)
-        self._owned_outbox = (store, engine)
+        self._owned_outbox = outbox._owned_resources = (store, engine)
 
     def local_event_types(self, bus: Any) -> list[type]:
         """Registered event types with at least one listener this process owns."""
@@ -1235,11 +1235,7 @@ class Runtime:
             waiter = getattr(store, "wait_for_dispatch", None) if store is not None else None
             if waiter is not None:
                 await waiter()
-            owned, self._owned_outbox = self._owned_outbox, None
-            if owned is not None:
-                owned_store, owned_engine = owned
-                await owned_store.dispose()
-                await owned_engine.dispose()
+            self._owned_outbox = None
         except BaseException as exc:
             local_error = exc
 

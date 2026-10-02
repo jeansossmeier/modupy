@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+import threading
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -2923,6 +2924,173 @@ def test_outbox_url_sqlite_wal_listener_is_installed_only_on_a_sqlite_engine(
     asyncio.run(_runtime.shutdown())
 
     assert bound == ("PostgresPublicationStore", installed)
+
+
+async def _create_tables_and_pool_a_connection(engine: Any) -> int:
+    """Create the outbox table through ``engine`` and return how many idle
+    connections its pool then holds."""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    return int(engine.pool.checkedin())
+
+
+def _count_engine_disposals(engine: Any) -> list[object]:
+    disposals: list[object] = []
+    sqlalchemy_event.listen(engine.sync_engine, "engine_disposed", disposals.append)
+    return disposals
+
+
+def _bind_outbox_url_engine(make_fake_app: Any, db: Path) -> tuple[Any, list[object]]:
+    make_fake_app(_ORDERS_APP)
+    _runtime.configure(package="fakeapp", outbox="postgres", outbox_url=f"sqlite+aiosqlite:///{db}")
+    _runtime.ensure_bootstrapped()
+    assert _runtime._owned_outbox is not None
+    _, engine = _runtime._owned_outbox
+    return engine, _count_engine_disposals(engine)
+
+
+def test_outbox_shutdown_closes_the_pool_of_the_engine_built_from_outbox_url(
+    make_fake_app: Any, tmp_path: Path
+) -> None:
+    from modulith.adapters import postgres_outbox
+
+    engine, _ = _bind_outbox_url_engine(make_fake_app, tmp_path / "app.db")
+
+    async def scenario() -> tuple[int, int]:
+        pooled = await _create_tables_and_pool_a_connection(engine)
+        await outbox.shutdown()
+        return pooled, int(engine.pool.checkedin())
+
+    assert asyncio.run(scenario()) == (1, 0)
+    assert postgres_outbox._active_store is None
+
+
+def test_outbox_shutdown_leaves_an_application_configured_engine_alone(tmp_path: Path) -> None:
+    from modulith.adapters import postgres_outbox
+
+    async def scenario() -> tuple[int, int, int, bool]:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
+        disposals = _count_engine_disposals(engine)
+        store = PostgresPublicationStore(engine)
+        outbox.configure(store, JsonEventSerializer(), start_loop=False)
+        pooled = await _create_tables_and_pool_a_connection(engine)
+        await outbox.shutdown()
+        result = (
+            pooled,
+            int(engine.pool.checkedin()),
+            len(disposals),
+            postgres_outbox._active_store is store,
+        )
+        await store.dispose()
+        await engine.dispose()
+        return result
+
+    assert asyncio.run(scenario()) == (1, 1, 0, True)
+
+
+def test_outbox_shutdown_ignores_the_outbox_url_when_the_application_configured_its_store(
+    make_fake_app: Any, tmp_path: Path
+) -> None:
+    make_fake_app(_ORDERS_APP)
+
+    async def scenario() -> tuple[int, int, int]:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
+        disposals = _count_engine_disposals(engine)
+        store = PostgresPublicationStore(engine)
+        outbox.configure(store, JsonEventSerializer(), start_loop=False)
+        _runtime.configure(
+            package="fakeapp",
+            outbox="postgres",
+            outbox_url=f"sqlite+aiosqlite:///{tmp_path / 'other.db'}",
+        )
+        _runtime.ensure_bootstrapped()
+        assert _runtime._owned_outbox is None
+        pooled = await _create_tables_and_pool_a_connection(engine)
+        await outbox.shutdown()
+        result = (pooled, int(engine.pool.checkedin()), len(disposals))
+        await store.dispose()
+        await engine.dispose()
+        return result
+
+    assert asyncio.run(scenario()) == (1, 1, 0)
+
+
+def test_outbox_shutdown_twice_disposes_the_outbox_url_engine_once(
+    make_fake_app: Any, tmp_path: Path
+) -> None:
+    _, disposals = _bind_outbox_url_engine(make_fake_app, tmp_path / "app.db")
+
+    async def scenario() -> None:
+        await outbox.shutdown()
+        await outbox.shutdown()
+
+    asyncio.run(scenario())
+
+    assert len(disposals) == 1
+
+
+def test_runtime_shutdown_after_outbox_shutdown_disposes_the_outbox_url_engine_once(
+    make_fake_app: Any, tmp_path: Path
+) -> None:
+    engine, disposals = _bind_outbox_url_engine(make_fake_app, tmp_path / "app.db")
+
+    async def scenario() -> None:
+        await _create_tables_and_pool_a_connection(engine)
+        await outbox.shutdown()
+        await _runtime.shutdown()
+        await _runtime.shutdown()
+
+    asyncio.run(scenario())
+
+    assert (len(disposals), _runtime._owned_outbox) == (1, None)
+
+
+def test_runtime_shutdown_disposes_the_outbox_url_engine_once(
+    make_fake_app: Any, tmp_path: Path
+) -> None:
+    engine, disposals = _bind_outbox_url_engine(make_fake_app, tmp_path / "app.db")
+
+    async def scenario() -> int:
+        pooled = await _create_tables_and_pool_a_connection(engine)
+        await _runtime.shutdown()
+        return pooled
+
+    assert (asyncio.run(scenario()), len(disposals), engine.pool.checkedin()) == (1, 1, 0)
+
+
+def test_outbox_shutdown_on_another_loop_than_the_retry_loop_leaves_the_engine_open(
+    make_fake_app: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    engine, disposals = _bind_outbox_url_engine(make_fake_app, tmp_path / "app.db")
+    retry_loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=retry_loop.run_forever, daemon=True)
+    thread.start()
+
+    async def start_retry_loop_on_the_other_loop() -> None:
+        outbox._ensure_retry_loop()
+
+    async def scenario() -> tuple[int, int, int]:
+        pooled = await _create_tables_and_pool_a_connection(engine)
+        asyncio.run_coroutine_threadsafe(start_retry_loop_on_the_other_loop(), retry_loop).result(5)
+        assert outbox._retry_task is not None
+        assert outbox._retry_task.get_loop() is retry_loop
+        with caplog.at_level(logging.DEBUG, logger="modulith.outbox"):
+            await asyncio.wait_for(outbox.shutdown(), timeout=15)
+        result = (pooled, int(engine.pool.checkedin()), len(disposals))
+        await engine.dispose()
+        return result
+
+    try:
+        assert asyncio.run(scenario()) == (1, 1, 0)
+    finally:
+        retry_loop.call_soon_threadsafe(retry_loop.stop)
+        thread.join(5)
+        retry_loop.close()
+
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG][-1:] == [
+        "outbox shutdown ran on another event loop than the retry loop; "
+        "leaving the engine built from outbox_url open"
+    ]
 
 
 _FAILING_LISTENER_APP = {

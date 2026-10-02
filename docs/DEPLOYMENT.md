@@ -134,18 +134,17 @@ outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTB
   `publish()`. `outbox.start()` is a no-op while no store is bound, so a
   lifespan that calls only `start()` runs no crash sweep and no retry loop
   until something publishes.
-- The runtime's own shutdown drains in-flight after-commit deliveries and
-  disposes the store and its engine, but it runs only in process-topology
-  workers. In a single-process app nothing public drains or disposes the
-  store bound from `outbox_url`; call `outbox.shutdown()` in the lifespan's
-  teardown to stop the retry loop. An after-commit delivery still running when
-  the process exits is cancelled and delivered again later: under `"lease"`
-  once its lease expires, under `"advisory_lock"` by a later sweep once its
-  lock is released, at the latest when the dead process's lock connection
-  closes, and under `"none"` by the next sweep. The connection pools close
-  with the process. An app that needs a graceful drain binds its own store
-  with `outbox.configure()` and follows the teardown order of the lifespan
-  below.
+- In a single-process app, call `outbox.shutdown()` in the lifespan's
+  teardown. It stops the retry loop, then drains in-flight after-commit
+  deliveries and closes the connection pool of the engine modulith created
+  from `outbox_url`. The runtime's own shutdown does the same in
+  process-topology workers. `outbox.shutdown()` never disposes a store you
+  bound with `outbox.configure()`, or its engine: dispose those yourself, in
+  the teardown order of the lifespan below. An after-commit delivery still
+  running when the process exits without it is cancelled and delivered again
+  later: under `"lease"` once its lease expires, under `"advisory_lock"` by a
+  later sweep once its lock is released, at the latest when the dead
+  process's lock connection closes, and under `"none"` by the next sweep.
 
 **Upgrading to the release that adds migration 0008.** Migration
 `0008_outbox_trace_context` adds a nullable `trace_context` column to
