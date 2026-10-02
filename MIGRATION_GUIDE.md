@@ -256,8 +256,11 @@ forwards eight keys to `outbox.configure()` when it binds the store from
 `outbox_url`: `claim_strategy`, `claim_lease_seconds`, `claim_batch_size`,
 `dead_letter_after_attempts`, `retry_interval_seconds`, `retry_stale_seconds`,
 `max_retry_backoff_seconds` and `completion_mode` (`"update"` keeps history
-visible; `"delete"` and `"archive"` are the alternatives). Any other key in
-the table is accepted and ignored. An application that binds its own store, as
+visible; `"delete"` and `"archive"` are the alternatives). `sqlite_wal = true`
+switches a SQLite `outbox_url` database to WAL journal mode, so readers no
+longer block a commit. It is off by default, is ignored for other databases,
+persists in the database file, and cannot be used on network filesystems. Any
+other key in the table is accepted and ignored. An application that binds its own store, as
 the manual wiring below does, passes these settings to `outbox.configure()` as
 keyword arguments.
 

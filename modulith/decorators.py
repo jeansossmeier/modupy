@@ -346,13 +346,16 @@ def configure(**overrides: Any) -> None:
             production=os.environ.get("ENV") == "prod",
         )
 
-    Dict-valued fields like ``outbox_options`` are accepted. Only the
-    ``claim_strategy``, ``claim_lease_seconds`` and ``claim_batch_size``
-    keys of ``outbox_options`` are validated, and the runtime applies
-    them only when it binds the outbox store from ``outbox_url``. Any
-    other key in ``outbox_options`` is accepted and ignored. An
-    application's own ``modulith.builtin.outbox.configure()`` call takes
-    those settings, and other outbox tuning such as ``completion_mode``,
-    as keyword arguments.
+    Dict-valued fields like ``outbox_options`` are accepted. Its claim,
+    retry, dead-letter and completion keys (``claim_strategy``,
+    ``claim_lease_seconds``, ``claim_batch_size``,
+    ``dead_letter_after_attempts``, ``retry_interval_seconds``,
+    ``retry_stale_seconds``, ``max_retry_backoff_seconds`` and
+    ``completion_mode``) and ``sqlite_wal`` are validated, and the runtime
+    applies them only when it binds the outbox store from ``outbox_url``.
+    Any other key in ``outbox_options`` is accepted and ignored. An
+    application that binds its own store passes the outbox settings to
+    ``modulith.builtin.outbox.configure()`` as keyword arguments, and sets
+    the journal mode on its own engine.
     """
     _runtime.configure(**overrides)
