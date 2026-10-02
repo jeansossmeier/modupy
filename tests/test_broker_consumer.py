@@ -766,36 +766,50 @@ async def test_stop_during_a_subscription_refresh_claims_nothing() -> None:
     assert broker.claim_batch_calls == []
 
 
-class _OneRowBroker(FakePollingBroker):
-    """Hands out one ``ConsumerEvent(value=1)`` row and records its ack."""
+class _ReleasingBroker(FakePollingBroker):
+    """Hands out three ``ConsumerEvent`` rows once ``claim_gate`` is set, then none,
+    and records which rows were started, acked and released."""
 
     def __init__(self) -> None:
         super().__init__()
+        self.claiming = asyncio.Event()
+        self.claim_gate = asyncio.Event()
         self.rows: list[dict[str, Any]] = [
             {
-                "id": "row-1",
+                "id": f"row-{n}",
                 "target": "t",
                 "event_type": _FQN,
-                "payload": JsonEventSerializer().serialize(ConsumerEvent(value=1)),
+                "payload": JsonEventSerializer().serialize(ConsumerEvent(value=n)),
                 "attempts": 0,
             }
+            for n in range(3)
         ]
+        self.started: list[str] = []
         self.acked: list[str] = []
+        self.released: list[str] = []
 
     async def claim_batch(self, group: str, **kwargs: Any) -> list[dict[str, Any]]:
+        self.claiming.set()
+        await self.claim_gate.wait()
         rows, self.rows = self.rows, []
         return rows
 
     async def renew_claims(
         self, row_ids: list[str], *, consumer_name: str, start_dispatch: bool = False
     ) -> int:
+        if start_dispatch:
+            self.started.extend(row_ids)
         return len(row_ids)
 
     async def ack(self, row_id: str, *, consumer_name: str) -> None:
         self.acked.append(row_id)
 
+    async def release_claims(self, row_ids: list[str], *, consumer_name: str) -> int:
+        self.released.extend(row_ids)
+        return len(row_ids)
 
-async def test_stop_lets_a_running_listener_finish_and_acks_its_row() -> None:
+
+async def test_stop_lets_a_running_listener_finish_and_releases_the_rows_queued_behind_it() -> None:
     running, finish = asyncio.Event(), asyncio.Event()
 
     async def listener(evt: ConsumerEvent) -> None:
@@ -804,7 +818,8 @@ async def test_stop_lets_a_running_listener_finish_and_acks_its_row() -> None:
 
     bus = InMemoryEventBus()
     bus.register(ConsumerEvent, listener)
-    broker = _OneRowBroker()
+    broker = _ReleasingBroker()
+    broker.claim_gate.set()
     consumer = _make_polling_consumer(
         broker, poll_interval_s=30.0, max_attempts=3, idle_wait=None, bus=bus
     )
@@ -818,8 +833,46 @@ async def test_stop_lets_a_running_listener_finish_and_acks_its_row() -> None:
     finish.set()
     await asyncio.wait_for(stop_task, timeout=5.0)
 
-    assert broker.acked == ["row-1"]
+    assert (broker.started, broker.acked) == (["row-0"], ["row-0"])
+    assert sorted(broker.released) == ["row-1", "row-2"]
     assert not poll_task.cancelled()
+
+
+async def test_stop_releases_every_row_a_claim_returned_while_stopping() -> None:
+    broker = _ReleasingBroker()
+    consumer = _make_polling_consumer(broker, poll_interval_s=30.0, max_attempts=3, idle_wait=None)
+    await consumer.start()
+    await asyncio.wait_for(broker.claiming.wait(), timeout=2.0)
+
+    stop_task = asyncio.create_task(consumer.stop())
+    await _until(lambda: consumer._stopping)
+    broker.claim_gate.set()
+    await asyncio.wait_for(stop_task, timeout=5.0)
+
+    assert broker.started == []
+    assert sorted(broker.released) == ["row-0", "row-1", "row-2"]
+
+
+class _ReleaseFailingBroker(_ReleasingBroker):
+    async def release_claims(self, row_ids: list[str], *, consumer_name: str) -> int:
+        raise ConnectionError("database went away")
+
+
+async def test_stop_completes_when_releasing_unstarted_rows_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    broker = _ReleaseFailingBroker()
+    consumer = _make_polling_consumer(broker, poll_interval_s=30.0, max_attempts=3, idle_wait=None)
+    await consumer.start()
+    await asyncio.wait_for(broker.claiming.wait(), timeout=2.0)
+
+    stop_task = asyncio.create_task(consumer.stop())
+    await _until(lambda: consumer._stopping)
+    broker.claim_gate.set()
+    await asyncio.wait_for(stop_task, timeout=5.0)
+
+    assert consumer.health().status == "stopped"
+    assert "could not release 3 claimed rows" in caplog.text
 
 
 async def test_stop_re_cancels_a_poll_task_that_absorbed_the_first_cancel() -> None:

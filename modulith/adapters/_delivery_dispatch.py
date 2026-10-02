@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, cast
+from typing import Any, Protocol, cast, runtime_checkable
 
 from ..runtime import _runtime
 from ._consumer_protocol import PollingBroker
@@ -27,6 +27,11 @@ def _describe_rows(rows: dict[str, dict[str, Any]], in_flight: set[str]) -> str:
     )
     extra = len(stuck) - _MAX_STUCK_ROWS_NAMED
     return f"{named} and {extra} more" if extra > 0 else named
+
+
+@runtime_checkable
+class _ClaimReleaser(Protocol):
+    async def release_claims(self, row_ids: list[str], *, consumer_name: str) -> int: ...
 
 
 def _row_headers(row: dict[str, Any]) -> dict[str, str]:
@@ -113,25 +118,55 @@ class DeliveryDispatch:
         semaphore = asyncio.Semaphore(self._dispatch_concurrency)
         try:
             async with asyncio.TaskGroup() as tasks:
-                for row in valid_rows:
+                dispatches = [
                     tasks.create_task(self._dispatch_guarded(row, semaphore, in_flight))
+                    for row in valid_rows
+                ]
         finally:
             self._batch_in_flight = None
             await self._cancel(renewer, "claim-renewal")
+        unstarted = [
+            cast(str, row["id"])
+            for row, dispatch in zip(valid_rows, dispatches, strict=True)
+            if dispatch.result()
+        ]
+        if unstarted:
+            await self._release_unstarted(unstarted)
+
+    async def _release_unstarted(self, row_ids: list[str]) -> None:
+        """Hand rows a stop kept from their listeners back to the group at once,
+        instead of leaving them to a stale reclaim ``_reclaim_stale_seconds`` later."""
+        if not isinstance(self._broker, _ClaimReleaser):
+            return
+        try:
+            await self._broker.release_claims(row_ids, consumer_name=self._consumer_name)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._logger.warning(
+                "could not release %d claimed rows the stop kept from their listeners; "
+                "another consumer claims them after %gs",
+                len(row_ids),
+                self._reclaim_stale_seconds,
+                exc_info=True,
+            )
 
     async def _dispatch_guarded(
         self,
         row: dict[str, Any],
         semaphore: asyncio.Semaphore,
         in_flight: set[str],
-    ) -> None:
-        """Dispatch one row only while its opaque fencing ID remains owned."""
+    ) -> bool:
+        """Dispatch one row only while its opaque fencing ID remains owned.
+
+        Returns whether a stop kept the row from its listener.
+        """
         row_id = cast(str, row["id"])
         target = str(row.get("target") or "<unknown>")
         try:
             async with semaphore:
                 if self._should_stop():
-                    return
+                    return True
                 try:
                     renewed = await self._broker.renew_claims(
                         [row_id],
@@ -150,7 +185,7 @@ class DeliveryDispatch:
                         row_id,
                         self._consumer_name,
                     )
-                    return
+                    return False
                 await self._dispatch_one(row)
         except asyncio.CancelledError:
             raise
@@ -160,6 +195,7 @@ class DeliveryDispatch:
             self._logger.exception("dispatch crashed for row %s -- loop continues", row_id)
         finally:
             in_flight.discard(row_id)
+        return False
 
     async def _renew_loop(self, in_flight: set[str]) -> None:
         """Renew claims for a bounded period so wedged listeners can be reclaimed."""

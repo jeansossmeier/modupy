@@ -2030,6 +2030,40 @@ class DatabaseBroker:
         return count
 
     @_on_owning_loop
+    async def release_claims(self, row_ids: list[str], *, consumer_name: str) -> int:
+        """Hand rows THIS consumer claimed but never dispatched back to ``pending``.
+
+        A stopping consumer calls it for the rows its stop kept from their
+        listeners, so any consumer of the group can claim them at once instead
+        of after ``reclaim_stale_seconds``. Nothing is charged: ``attempts`` and
+        ``available_at`` stay as they were. Owner-guarded like
+        ``renew_claims``, and a row whose dispatch started keeps its claim, so
+        its stale reclaim still charges the attempt. Returns how many rows
+        were released.
+        """
+        if not row_ids:
+            return 0
+        from sqlalchemy import update
+
+        _, _, message = broker_schema()
+
+        async def op(conn: Any) -> int:
+            result = await conn.execute(
+                update(message)
+                .where(
+                    message.c.id.in_(row_ids),
+                    message.c.status == "claimed",
+                    message.c.claimed_by == consumer_name,
+                    message.c.dispatch_started.is_(False),
+                )
+                .values(status="pending", claimed_at=None, claimed_by=None)
+            )
+            return int(result.rowcount or 0)
+
+        count: int = await self._write(op)
+        return count
+
+    @_on_owning_loop
     async def ack(self, row_id: str, *, consumer_name: str) -> None:
         """Complete a row THIS consumer still owns: delete it (default) or mark
         it 'done' (mark mode, which keeps the row for the prune job — see

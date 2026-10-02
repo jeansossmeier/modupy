@@ -1013,6 +1013,38 @@ async def test_renew_claims_is_owner_guarded(engine: Any) -> None:
     assert await broker.renew_claims([], consumer_name="c1") == 0  # empty = no-op
 
 
+async def test_release_claims_hands_an_unstarted_claim_to_a_peer_at_once(engine: Any) -> None:
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="r1", status="pending")
+    await broker.claim_batch("g", batch_size=10, consumer_name="c0")
+
+    assert await broker.release_claims(["r1"], consumer_name="c0") == 1
+    peer = await broker.claim_batch(
+        "g", batch_size=10, consumer_name="c1", reclaim_stale_seconds=3600.0
+    )
+
+    assert [(row["id"], row["attempts"]) for row in peer] == [("r1", 0)]
+
+
+async def test_release_claims_leaves_started_and_foreign_claims_alone(engine: Any) -> None:
+    """A row whose listener started keeps its claim, so its stale reclaim still
+    charges the attempt; a consumer cannot release a peer's claim."""
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="started", status="pending")
+    await _insert_ex(engine, id="unstarted", status="pending")
+    await broker.claim_batch("g", batch_size=10, consumer_name="c0")
+    await broker.renew_claims(["started"], consumer_name="c0", start_dispatch=True)
+
+    assert await broker.release_claims(["unstarted"], consumer_name="c1") == 0
+    assert await broker.release_claims(["started", "unstarted"], consumer_name="c0") == 1
+    assert await broker.release_claims([], consumer_name="c0") == 0
+
+    assert await _fetch_row(engine, "started") == ("claimed", 0, "c0")
+    assert await _fetch_row(engine, "unstarted") == ("pending", 0, None)
+
+
 async def test_renewed_claim_is_not_reclaimed_by_peer(engine: Any) -> None:
     """A renewal re-stamps claimed_at to server-now, so a peer claiming with a
     stale window that WOULD have reclaimed the original claim gets nothing."""
@@ -1216,6 +1248,67 @@ async def test_dispatch_concurrency_fans_out_within_batch(engine: Any) -> None:
     finally:
         gate.set()
         await consumer.stop()
+
+
+async def test_stop_mid_batch_hands_the_rows_it_never_started_to_a_peer_at_once(
+    engine: Any,
+) -> None:
+    """Rows a stop keeps from their listeners are released uncharged, so a peer
+    claims them now instead of after ``reclaim_stale_seconds``."""
+    running, finish = asyncio.Event(), asyncio.Event()
+    delivered: list[str] = []
+
+    async def handler(evt: WidgetCreated) -> None:
+        running.set()
+        await finish.wait()
+        delivered.append(evt.name)
+
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+    broker = DatabaseBroker(engine=engine)
+    target = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=[target],
+        poll_interval_s=0.01,
+        batch_size=10,
+        dispatch_concurrency=1,
+    )
+    await broker.subscribe([target], "modulith-inventory")
+    for i in range(3):
+        payload = serializer.serialize(WidgetCreated(name=f"w{i}"))
+        await broker.publish(target, payload, {"event_type": target})
+
+    await consumer.start()
+    try:
+        await asyncio.wait_for(running.wait(), timeout=5.0)
+        stop_task = asyncio.create_task(consumer.stop())
+
+        async def _stopping() -> bool:
+            return consumer._stopping
+
+        await _until_async(_stopping)
+        finish.set()
+        await asyncio.wait_for(stop_task, timeout=5.0)
+    finally:
+        finish.set()
+        await consumer.stop()
+
+    peer = await broker.claim_batch(
+        "modulith-inventory",
+        batch_size=10,
+        consumer_name="inventory:2",
+        reclaim_stale_seconds=3600.0,
+    )
+    released = [serializer.deserialize(row["payload"], row["event_type"]).name for row in peer]
+    assert len(delivered) == 1
+    assert sorted(delivered + released) == ["w0", "w1", "w2"]
+    assert [row["attempts"] for row in peer] == [0, 0]
 
 
 async def test_orphaned_claim_is_reclaimed_after_visibility_timeout(engine: Any) -> None:
