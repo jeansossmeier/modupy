@@ -89,8 +89,8 @@ async def test_publish_fires_lifecycle_hooks_in_order(fake_app, monkeypatch) -> 
     assert names.index("before") < names.index("dispatch")
     assert names.index("dispatch") < names.index("complete")
     assert names.index("complete") < names.index("after")
-    assert ("dispatch", "reserve_stock") in recorder.calls
-    assert ("complete", "reserve_stock", False) in recorder.calls
+    assert ("dispatch", "fakeapp.inventory.reserve_stock") in recorder.calls
+    assert ("complete", "fakeapp.inventory.reserve_stock", False) in recorder.calls
 
     # And the listener actually ran (in-memory dispatch still happened).
     from fakeapp.inventory import received  # type: ignore[import-not-found]
@@ -131,9 +131,9 @@ async def test_listener_error_fires_error_and_complete_then_reraises(
     with pytest.raises(ValueError, match="kaboom"):
         await _runtime.publish(Boom(x=1))
 
-    assert ("error", "explode", "ValueError") in recorder.calls
+    assert ("error", "fakeapp.handlers.explode", "ValueError") in recorder.calls
     # complete still fires on error, carrying the exception flag.
-    assert ("complete", "explode", True) in recorder.calls
+    assert ("complete", "fakeapp.handlers.explode", True) in recorder.calls
 
 
 @pytest.mark.asyncio

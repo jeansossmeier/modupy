@@ -115,7 +115,7 @@ The defaults stack:
 - **Topology**: single-process; flip to processes with one flag
 - **Broker**: in-memory for `single`; durable local `shm` for `processes` unless
   a configured URL/DSN selects `database`
-- **Observability**: auto-enabled if OpenTelemetry is installed, silent no-op if not
+- **Observability**: auto-enabled if OpenTelemetry is installed, silent no-op if not; `observability = false` turns it off, `true` requires OpenTelemetry
 - **Verification**: warnings in dev, hard checks via `modulith verify` in CI
 - **Logging**: standard library `logging`, inherits app's config
 
@@ -963,10 +963,10 @@ are fixed-size sequence records.
 
 ### 10.4 OpenTelemetry Observability
 
-Extra: `modupy[otel]` (built-in plugin `modulith/builtin/observability.py`; a silent no-op when OTel isn't installed, or installed without a configured tracer provider). Auto-instrumentation emits two span types via the paired event-lifecycle hooks:
+Extra: `modupy[otel]` (built-in plugin `modulith/builtin/observability.py`; a silent no-op when OTel isn't installed, or installed without a configured tracer provider). `Configuration.observability` switches it: `None` (default) auto-detects as above; `False` skips loading the plugin, so no spans are created; `True` makes bootstrap raise `ConfigurationError` (naming `pip install 'modupy[otel]'`) when OTel is not importable. Auto-instrumentation emits two span types via the paired event-lifecycle hooks:
 
 - `modulith.event.publish` — one per publication, attributes `event.type`, `event.module`, `modulith.duration_ms`. On the durable (outbox) path the span brackets the persistence step; a persist/serialize/broker-route failure still ends the span, with the exception recorded and status ERROR (the span never leaks).
-- `modulith.event.dispatch` — one per listener invocation, attributes `event.type`, `listener.name`, `publication.id`; status ERROR (with recorded exception) when the listener raises. Parenting depends on the path: on the **in-memory path** the dispatch span is a child of the publish span; on the **durable (outbox) path** listener dispatch runs after the business transaction commits, in a different context, so those dispatch spans are **not** parented to the publish span — correlate them via `publication.id` instead.
+- `modulith.event.dispatch` — one per listener invocation, attributes `event.type`, `listener.name`, `publication.id`. `listener.name` is the outbox's stored listener id on every delivery path (in-memory, outbox, broker): `module.qualname`, with an `owner:` prefix for a bound method or callable instance. Status ERROR (with recorded exception) when the listener raises. Parenting depends on the path: on the **in-memory path** the dispatch span is a child of the publish span; on the **durable (outbox) path** listener dispatch runs after the business transaction commits, in a different context, so those dispatch spans are **not** parented to the publish span — correlate them via `publication.id` instead.
 
 ### 10.5 Documentation Generator
 

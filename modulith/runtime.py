@@ -717,11 +717,13 @@ class Runtime:
         — a broker route failing during an outage — can never swallow the
         listener diagnostics along with it.
         """
+        from .builtin.outbox import _listener_id
+
         assert self._plugin_manager is not None
         pm = self._plugin_manager
 
         async def _run_one(handler: Callable[..., Any]) -> None:
-            name = getattr(handler, "__qualname__", repr(handler))
+            name = _listener_id(handler)
             pub = EventPublication(
                 id=uuid4(),
                 payload=payload,
@@ -943,9 +945,23 @@ class Runtime:
         # any programmatically-injected extras such as the test spy), skipping
         # anything named in configure(disable_plugins=[...]) — the documented
         # escape hatch for e.g. the observe-shield or replacing a built-in.
+        # ``observability`` False also skips the tracing plugin; True demands
+        # OpenTelemetry be importable, None auto-detects (a silent no-op when
+        # it is absent).
+        disabled_plugins = list(self._disabled_plugins)
+        if config.observability is False:
+            disabled_plugins.append("modulith.builtin.observability")
+        elif config.observability is True:
+            from .builtin import observability
+
+            if not observability._OTEL_AVAILABLE:
+                raise ConfigurationError(
+                    "observability = true needs OpenTelemetry, which is not installed. "
+                    "Install it with: pip install 'modupy[otel]'"
+                )
         plugin_manager = create_plugin_manager(
             extra_plugins=self._extra_plugins,
-            disable=self._disabled_plugins,
+            disable=disabled_plugins,
         )
 
         # 4. Build the event bus — kept LOCAL until bootstrap succeeds, so
@@ -1001,7 +1017,6 @@ class Runtime:
             # mutate the handler dict mid-iteration.
             if config.verify_manifests:
                 from . import manifest as _manifest_module
-                from .config import ConfigurationError
 
                 manifests = _manifest_module.all_manifests()
                 if manifests:
@@ -1033,7 +1048,6 @@ class Runtime:
             # skip the abort entirely: they report findings themselves.
             if config.strict_boundaries:
                 from .builtin import verifier
-                from .config import ConfigurationError
 
                 violations = verifier.collect_violations(modules, plugin_manager)
                 if violations and not _inspection_bootstrap.get():

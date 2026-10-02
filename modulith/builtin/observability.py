@@ -26,7 +26,8 @@ Spans emitted:
   modulith.event.dispatch
     attributes:
       event.type
-      listener.name
+      listener.name        — the outbox's stored listener id (module.qualname,
+                             ``owner:`` prefix for bound methods/instances)
       publication.id
     parent: the modulith.event.publish span
     duration: just the listener invocation (dispatch → complete)

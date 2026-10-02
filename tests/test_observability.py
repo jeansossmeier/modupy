@@ -103,7 +103,7 @@ async def test_publish_emits_publish_and_dispatch_spans(make_fake_app, span_expo
     dispatch_span = dispatch_spans[0]
     assert publish_span.attributes["event.type"].endswith("OrderPlaced")
     assert dispatch_span.attributes["event.type"].endswith("OrderPlaced")
-    assert dispatch_span.attributes["listener.name"] == "reserve"
+    assert dispatch_span.attributes["listener.name"] == "fakeapp.inventory.reserve"
 
     # dispatch span is a child of the publish span (same trace, parent linkage)
     assert dispatch_span.parent is not None
@@ -355,3 +355,153 @@ def test_tracer_version_is_not_a_hardcoded_copy() -> None:
         "use modulith.__version__ so the tracer metadata cannot drift"
     )
     assert obs._tracer._instrumenting_library_version == modulith.__version__
+
+
+# ---------------------------------------------------------------------------
+# listener.name: one name per listener, whichever way the event arrived
+# ---------------------------------------------------------------------------
+
+
+class _Reserver:
+    async def reserve(self, evt: object) -> None:
+        return None
+
+
+_ORDERS_APP = {
+    "orders": """
+        from dataclasses import dataclass
+        from modulith import event, publish
+
+        @event
+        @dataclass(frozen=True)
+        class OrderPlaced:
+            order_id: str
+
+        async def place(order_id: str) -> None:
+            await publish(OrderPlaced(order_id=order_id))
+    """,
+    "inventory": """
+        from modulith import listener
+        from fakeapp.orders import OrderPlaced
+
+        @listener
+        async def reserve(evt: OrderPlaced) -> None:
+            pass
+    """,
+}
+
+
+async def test_dispatch_listener_name_is_the_outbox_listener_id_in_memory(
+    make_fake_app, span_exporter
+) -> None:
+    """In-memory dispatch names the listener by the outbox's stored id, so a
+    trace query for one listener finds it on every delivery path."""
+    from modulith.runtime import _runtime
+
+    make_fake_app(_ORDERS_APP)
+    configure(package="fakeapp")
+    import fakeapp.orders as orders
+
+    await orders.place("o-1")
+
+    (span,) = _spans_by_name(span_exporter, "modulith.event.dispatch")
+    (handler,) = _runtime.event_bus.listeners_for(orders.OrderPlaced)
+    assert span.attributes["listener.name"] == "fakeapp.inventory.reserve"
+    assert span.attributes["listener.name"] == outbox._listener_id(handler)
+
+
+async def test_dispatch_listener_name_matches_for_broker_delivered_events(
+    make_fake_app, span_exporter
+) -> None:
+    """A broker consumer hands events to ``dispatch_local``; its dispatch span
+    carries the same listener name as the in-memory path."""
+    from modulith.runtime import _runtime
+
+    make_fake_app(_ORDERS_APP)
+    configure(package="fakeapp")
+    import fakeapp.orders as orders
+
+    _runtime.ensure_bootstrapped()
+    await _runtime.dispatch_local(orders.OrderPlaced(order_id="o-2"), _runtime.event_bus)
+
+    (span,) = _spans_by_name(span_exporter, "modulith.event.dispatch")
+    assert span.attributes["listener.name"] == "fakeapp.inventory.reserve"
+
+
+async def test_dispatch_listener_name_carries_owner_prefix_for_bound_methods(
+    make_fake_app, span_exporter
+) -> None:
+    """A bound method is named ``owner:module.Class.method``, exactly as the
+    outbox stores it."""
+    from modulith.runtime import _runtime
+
+    make_fake_app(_ORDERS_APP)
+    configure(package="fakeapp")
+    import fakeapp.orders as orders
+
+    _runtime.ensure_bootstrapped()
+    handler = _Reserver().reserve
+    _runtime.event_bus.register(orders.OrderPlaced, handler)
+    _runtime._listener_owners[handler] = "inventory"
+
+    await _runtime.dispatch_local(orders.OrderPlaced(order_id="o-3"), _runtime.event_bus)
+
+    spans = _spans_by_name(span_exporter, "modulith.event.dispatch")
+    names = {s.attributes["listener.name"] for s in spans}
+    assert f"inventory:{_Reserver.__module__}._Reserver.reserve" in names
+    assert outbox._listener_id(handler) in names
+
+
+# ---------------------------------------------------------------------------
+# Configuration.observability
+# ---------------------------------------------------------------------------
+
+
+async def test_observability_false_creates_no_spans(make_fake_app, span_exporter) -> None:
+    from modulith.runtime import _runtime
+
+    make_fake_app(_ORDERS_APP)
+    configure(package="fakeapp", observability=False)
+    import fakeapp.orders as orders
+
+    await orders.place("o-4")
+
+    assert span_exporter.get_finished_spans() == ()
+    assert _runtime.plugin_manager.get_plugin("modulith.builtin.observability") is None
+
+
+async def test_observability_true_creates_spans_when_otel_is_installed(
+    make_fake_app, span_exporter
+) -> None:
+    make_fake_app(_ORDERS_APP)
+    configure(package="fakeapp", observability=True)
+    import fakeapp.orders as orders
+
+    await orders.place("o-5")
+
+    assert len(_spans_by_name(span_exporter, "modulith.event.dispatch")) == 1
+
+
+def test_observability_true_without_otel_fails_bootstrap(make_fake_app, monkeypatch) -> None:
+    from modulith import ConfigurationError
+    from modulith.runtime import _runtime
+
+    monkeypatch.setattr(observability, "_OTEL_AVAILABLE", False)
+    make_fake_app(_ORDERS_APP)
+    configure(package="fakeapp", observability=True)
+
+    with pytest.raises(ConfigurationError, match=r"pip install 'modupy\[otel\]'"):
+        _runtime.ensure_bootstrapped()
+    assert _runtime.plugin_manager is None
+
+
+async def test_observability_unset_without_otel_stays_a_silent_no_op(
+    make_fake_app, monkeypatch
+) -> None:
+    monkeypatch.setattr(observability, "_OTEL_AVAILABLE", False)
+    monkeypatch.setattr(observability, "_tracer", None)
+    make_fake_app(_ORDERS_APP)
+    configure(package="fakeapp")
+    import fakeapp.orders as orders
+
+    await orders.place("o-6")

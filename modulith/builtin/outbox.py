@@ -74,7 +74,7 @@ import math
 import threading
 import time
 from collections.abc import Callable
-from contextvars import ContextVar
+from contextvars import Context, ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -534,7 +534,9 @@ def _ensure_retry_loop() -> None:
         ):
             return
         _stop_requested.clear()
-        _retry_task = loop.create_task(_retry_loop())
+        # Empty context: a task copies its creator's ContextVars, and this
+        # call site is inside a publish (its bound session, its publish span).
+        _retry_task = loop.create_task(_retry_loop(), context=Context())
 
 
 def _on_task_loop(task: asyncio.Task[Any], callback: Callable[[], object]) -> bool:
@@ -1340,13 +1342,12 @@ async def _retry_loop() -> None:
     progress once ``shutdown()`` requests a stop; ``shutdown()`` cancels it
     while it sleeps between sweeps.
     """
-    # The task copied the *creating* call site's contextvars (PEP 567). On the
-    # lazy-start path that call site is a live request with a bound session —
-    # frozen into this task forever, so a cascading publish() from a
+    # ``_ensure_retry_loop`` starts this task in an empty context. A copy of
+    # the creating call site's — a live request's bound session, its publish
+    # span — would be frozen in here forever: a cascading publish() from a
     # retry-dispatched listener would enlist in that stale, already-closed
-    # session and never be committed. Every dispatch this loop drives must run
+    # session and never be committed. Every dispatch this loop drives runs
     # session-less (a listener's own transactional work rebinds explicitly).
-    _current_session.set(None)
     task = asyncio.current_task()
     assert task is not None
     older_than = timedelta(0)  # crash recovery

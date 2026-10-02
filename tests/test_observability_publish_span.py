@@ -13,10 +13,11 @@ the ContextVar on the failure path.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from opentelemetry.sdk.trace import TracerProvider
@@ -24,7 +25,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
 
-from modulith import ConfigurationError, configure
+from modulith import ConfigurationError, EventPublication, configure, event
 from modulith.builtin import observability, outbox
 from modulith.runtime import _runtime
 from modulith.serializers import JsonEventSerializer
@@ -82,6 +83,10 @@ def _publish_spans(exporter: InMemorySpanExporter) -> list[Any]:
     return [s for s in exporter.get_finished_spans() if s.name == "modulith.event.publish"]
 
 
+def _dispatch_spans(exporter: InMemorySpanExporter) -> list[Any]:
+    return [s for s in exporter.get_finished_spans() if s.name == "modulith.event.dispatch"]
+
+
 async def test_durable_persist_failure_ends_publish_span_with_error(
     span_exporter: InMemorySpanExporter,
 ) -> None:
@@ -132,3 +137,61 @@ async def test_direct_broker_route_failure_ends_publish_span_with_error(
     assert len(spans) == 1, "publish span was never ended (leaked, not exported)"
     assert spans[0].status.status_code is StatusCode.ERROR
     assert observability._publish_span.get() is None
+
+
+@event
+@dataclass(frozen=True)
+class RetriedEvt:
+    x: int
+
+
+class PendingStore(FailingStore):
+    """Store holding one undelivered publication for the crash sweep."""
+
+    def __init__(self, pending: EventPublication) -> None:
+        self.pending = pending
+
+    async def save(self, publication: Any) -> None: ...
+
+    async def find_incomplete(self, older_than: timedelta) -> list[Any]:
+        return [self.pending] if self.pending.completed_at is None else []
+
+    async def mark_complete(self, publication_id: UUID) -> None:
+        self.pending.completed_at = datetime.now(UTC)
+
+
+async def test_retry_loop_dispatch_span_has_no_parent_from_the_creating_publish(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    """The retry task is created inside a publish span's context. It must not
+    copy that span: its dispatch spans would be parented to a publish span that
+    ended long ago."""
+
+    async def listener(evt: RetriedEvt) -> None: ...
+
+    configure(package="modulith_w3r4obs_metatest", auto_discover=False)
+    _runtime.ensure_bootstrapped()
+    assert _runtime.event_bus is not None
+    _runtime.event_bus.register(RetriedEvt, listener)
+    pending = EventPublication(
+        id=uuid4(),
+        payload=JsonEventSerializer().serialize(RetriedEvt(x=3)),
+        event_type=f"{RetriedEvt.__module__}.{RetriedEvt.__qualname__}",
+        listener=outbox._listener_id(listener),
+        published_at=datetime.now(UTC),
+    )
+
+    observability.modulith_before_event_published(event=RetriedEvt(x=3))
+    stale_publish_span = observability._publish_span.get()
+    assert stale_publish_span is not None
+    outbox.configure(PendingStore(pending), JsonEventSerializer(), retry_interval_seconds=60)
+    observability.modulith_after_event_published(event=RetriedEvt(x=3), publication=pending)
+
+    async def dispatched() -> list[Any]:
+        while not (spans := _dispatch_spans(span_exporter)):
+            await asyncio.sleep(0.005)
+        return spans
+
+    (dispatch_span,) = await asyncio.wait_for(dispatched(), timeout=5)
+    assert dispatch_span.parent is None
+    assert dispatch_span.context.trace_id != stale_publish_span.context.trace_id

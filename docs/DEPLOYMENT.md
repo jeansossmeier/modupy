@@ -1089,6 +1089,20 @@ If OpenTelemetry is enabled (`modupy[otel]`), spans are emitted for:
 - `modulith.event.publish` — an event was published
 - `modulith.event.dispatch` — an event was dispatched to a listener
 
+The `listener.name` attribute of a dispatch span is the same for a listener
+whether the event arrived in memory, through the outbox or through a broker:
+`module.qualname` (for example `myapp.inventory.reserve_stock`). A bound method
+or callable instance gets an `owner:` prefix naming the application module that
+registered it (`inventory:myapp.inventory.Reserver.reserve`). It is the id the
+outbox stores for the listener.
+
+The `observability` setting (`[tool.modulith] observability`, the
+`MODULITH_OBSERVABILITY` environment variable, or `configure(observability=...)`)
+controls tracing. Unset, tracing turns on when OpenTelemetry is installed and is
+a silent no-op otherwise. `false` creates no spans. `true` makes bootstrap raise
+`ConfigurationError` when OpenTelemetry is missing, so a deployment that relies
+on traces fails at startup; install it with `pip install 'modupy[otel]'`.
+
 There is no outbox span. On the durable path the publish span brackets writing
 the outbox row, and the dispatch spans that run after commit are not parented
 to it.
