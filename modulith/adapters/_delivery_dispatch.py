@@ -128,7 +128,7 @@ class DeliveryDispatch:
         unstarted = [
             cast(str, row["id"])
             for row, dispatch in zip(valid_rows, dispatches, strict=True)
-            if dispatch.result()
+            if not dispatch.cancelled() and dispatch.result()
         ]
         if unstarted:
             await self._release_unstarted(unstarted)

@@ -853,6 +853,37 @@ async def test_stop_releases_every_row_a_claim_returned_while_stopping() -> None
     assert sorted(broker.released) == ["row-0", "row-1", "row-2"]
 
 
+async def test_stop_releases_queued_rows_after_a_listener_raises_cancelled_error() -> None:
+    """While stopping, a listener's own CancelledError ends its dispatch as
+    cancelled; the rows queued behind it are still handed back."""
+    running, finish = asyncio.Event(), asyncio.Event()
+
+    async def listener(evt: ConsumerEvent) -> None:
+        running.set()
+        await finish.wait()
+        raise asyncio.CancelledError
+
+    bus = InMemoryEventBus()
+    bus.register(ConsumerEvent, listener)
+    broker = _ReleasingBroker()
+    broker.claim_gate.set()
+    consumer = _make_polling_consumer(
+        broker, poll_interval_s=30.0, max_attempts=3, idle_wait=None, bus=bus
+    )
+    await consumer.start()
+    await asyncio.wait_for(running.wait(), timeout=2.0)
+    poll_task = consumer._task
+    assert poll_task is not None
+
+    stop_task = asyncio.create_task(consumer.stop())
+    await _until(lambda: consumer._stopping)
+    finish.set()
+    await asyncio.wait_for(stop_task, timeout=5.0)
+
+    assert sorted(broker.released) == ["row-1", "row-2"]
+    assert not poll_task.cancelled()
+
+
 class _ReleaseFailingBroker(_ReleasingBroker):
     async def release_claims(self, row_ids: list[str], *, consumer_name: str) -> int:
         raise ConnectionError("database went away")
