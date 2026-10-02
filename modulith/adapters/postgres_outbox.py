@@ -41,6 +41,7 @@ the ``PublicationStore`` Protocol (the authoritative contract):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import weakref
 from collections.abc import Sequence
@@ -151,6 +152,9 @@ class EventPublicationRow(Base):
     dispatch_started: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
+    # JSON text of EventPublication.trace_context. Keep in lockstep with
+    # migrations/versions/0008_outbox_trace_context.py.
+    trace_context: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         # Partial index keeps the pending-rows scan small even with millions
@@ -183,6 +187,7 @@ class EventPublicationArchiveRow(Base):
     )
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    trace_context: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         # Nothing deletes from this table except ``purge_completed``, which
@@ -341,6 +346,9 @@ def _pub_to_row(publication: EventPublication, *, dead: bool) -> EventPublicatio
         last_error=publication.last_error,
         last_attempt_at=_to_utc(publication.last_attempt_at),
         is_dead_lettered=dead,
+        trace_context=(
+            None if publication.trace_context is None else json.dumps(publication.trace_context)
+        ),
     )
 
 
@@ -355,6 +363,7 @@ def _row_to_pub(row: EventPublicationRow) -> EventPublication:
         attempt_count=row.attempt_count,
         last_error=row.last_error,
         last_attempt_at=_aware(row.last_attempt_at),
+        trace_context=None if row.trace_context is None else json.loads(row.trace_context),
     )
 
 
@@ -661,6 +670,7 @@ class PostgresPublicationStore:
                     attempt_count=row.attempt_count,
                     last_error=row.last_error,
                     last_attempt_at=row.last_attempt_at,
+                    trace_context=row.trace_context,
                 )
             )
             await s.delete(row)
@@ -1049,6 +1059,7 @@ class PostgresPublicationStore:
                         attempt_count=row.attempt_count,
                         last_error=row.last_error,
                         last_attempt_at=row.last_attempt_at,
+                        trace_context=row.trace_context,
                     )
                 )
                 await s.delete(row)

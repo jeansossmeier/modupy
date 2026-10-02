@@ -821,7 +821,8 @@ CREATE TABLE event_publications (
     attempt_count INT NOT NULL DEFAULT 0,
     last_error TEXT,
     last_attempt_at TIMESTAMPTZ,  -- when the most recent retry ran; drives backoff
-    is_dead_lettered BOOLEAN NOT NULL DEFAULT FALSE
+    is_dead_lettered BOOLEAN NOT NULL DEFAULT FALSE,
+    trace_context TEXT            -- JSON of the publisher's W3C trace context; NULL if none
 );
 CREATE INDEX idx_pending ON event_publications (published_at)
     WHERE completed_at IS NULL;
@@ -836,7 +837,8 @@ CREATE TABLE event_publications_archive (
     completed_at TIMESTAMPTZ,
     attempt_count INT NOT NULL DEFAULT 0,
     last_error TEXT,
-    last_attempt_at TIMESTAMPTZ
+    last_attempt_at TIMESTAMPTZ,
+    trace_context TEXT
 );
 ```
 

@@ -147,6 +147,14 @@ outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTB
   with `outbox.configure()` and follows the teardown order of the lifespan
   below.
 
+**Upgrading to the release that adds migration 0008.** Migration
+`0008_outbox_trace_context` adds a nullable `trace_context` column to
+`event_publications` and `event_publications_archive`. Run `modulith migrate`
+before the new version starts: the new code maps the column on every save, so
+against an unmigrated schema each publish fails, and with a bound session that
+takes the business transaction down with it. Rows written by the old version
+stay valid; their `trace_context` reads back as `None`.
+
 **Stored listener ids.** Each outbox row names its listener. A plain function
 is stored as `module.function`. A callable instance or bound method
 registered from an application module is stored as

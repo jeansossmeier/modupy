@@ -561,8 +561,9 @@ packaged `alembic.ini` — see [MIGRATION_GUIDE.md](../MIGRATION_GUIDE.md), the
 outbox migration step): `0001_initial` alone is **not** enough for the shipped
 default, because the lease columns (`claim_owner`, `claim_token`,
 `claim_until`) arrive in `0003_outbox_claim_leases`, the claim/scan indexes
-in `0005_outbox_scan_indexes`, and `dispatch_started` in
-`0007_outbox_dispatch_started`. Against a schema missing any of those columns
+in `0005_outbox_scan_indexes`, `dispatch_started` in
+`0007_outbox_dispatch_started`, and `trace_context` in
+`0008_outbox_trace_context`. Against a schema missing any of those columns
 the blast radius is not confined to delivery: `EventPublicationRow` maps
 every one of them unconditionally, so `save()`'s
 bound-session path enlists a row naming those columns in the caller's own

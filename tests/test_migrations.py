@@ -108,7 +108,7 @@ async def test_alembic_upgrade_head_after_broker_self_bootstrap(tmp_path: Path) 
         versions = {r[0] for r in conn.execute("SELECT version_num FROM modulith_alembic_version")}
     finally:
         conn.close()
-    assert versions == {"0007_outbox_dispatch_started"}
+    assert versions == {"0008_outbox_trace_context"}
 
     tables = _objects(db, "table")
     assert "event_publications" in tables
@@ -127,6 +127,45 @@ def test_outbox_claim_lease_columns_exist_in_migration_and_model(tmp_path: Path)
     expected = {"claim_owner", "claim_token", "claim_until"}
     assert expected <= _columns(db, "event_publications")
     assert expected <= {column.name for column in EventPublicationRow.__table__.columns}
+
+
+def test_trace_context_columns_are_added_and_dropped_by_their_migration(tmp_path: Path) -> None:
+    db = tmp_path / "trace-context.db"
+    cfg = _cfg(db)
+    command.upgrade(cfg, "head")
+    assert "trace_context" in _columns(db, "event_publications")
+    assert "trace_context" in _columns(db, "event_publications_archive")
+
+    command.downgrade(cfg, "0007_outbox_dispatch_started")
+    assert "trace_context" not in _columns(db, "event_publications")
+    assert "trace_context" not in _columns(db, "event_publications_archive")
+
+    command.upgrade(cfg, "head")
+    assert "trace_context" in _columns(db, "event_publications")
+
+
+def test_trace_context_migration_keeps_rows_written_before_it(tmp_path: Path) -> None:
+    db = tmp_path / "trace-context-old-rows.db"
+    cfg = _cfg(db)
+    command.upgrade(cfg, "0007_outbox_dispatch_started")
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO event_publications (id, event_type, payload, listener, published_at) "
+            "VALUES ('00000000000000000000000000000001', 'e', x'01', 'l', '2026-01-01 00:00:00')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    command.upgrade(cfg, "head")
+
+    conn = sqlite3.connect(db)
+    try:
+        rows = conn.execute("SELECT event_type, trace_context FROM event_publications").fetchall()
+    finally:
+        conn.close()
+    assert rows == [("e", None)]
 
 
 def test_migration_columns_match_orm(tmp_path: Path) -> None:
@@ -431,7 +470,7 @@ def test_alembic_rejects_invalid_schema_before_opening_a_connection(
     assert not db.exists()
 
 
-HEAD = "0007_outbox_dispatch_started"
+HEAD = "0008_outbox_trace_context"
 BUSINESS_REVISION = "business_rev_1"
 
 
@@ -534,6 +573,7 @@ def test_upgrade_moves_a_legacy_mid_chain_revision_then_continues_from_it(
     assert _upgrade_steps(caplog) == [
         "0005_outbox_scan_indexes -> 0006_broker_dispatch_started",
         "0006_broker_dispatch_started -> 0007_outbox_dispatch_started",
+        "0007_outbox_dispatch_started -> 0008_outbox_trace_context",
     ]
     assert "alembic_version" not in _objects(db, "table")
     assert _versions(db, "modulith_alembic_version") == {HEAD}

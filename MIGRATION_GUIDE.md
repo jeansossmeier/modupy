@@ -300,6 +300,13 @@ that revision into the new table before upgrading. It touches only modupy's
 own revisions, runs no migration again, and drops `alembic_version` only if the
 table is then empty.
 
+**Upgrading across migration 0008.** This release adds
+`0008_outbox_trace_context`, a nullable `trace_context` column on
+`event_publications` and `event_publications_archive`. Run `modulith migrate`
+before the new version starts: the new code maps the column on every save, so
+an unmigrated schema fails each publish. Rows written by the old version keep
+working and read back with no trace context.
+
 To put the outbox tables in a Postgres schema named after a module instead of
 `public`, pass `modulith migrate --schema <name>`, or add `-x schema=<name>`
 (or set `MODULITH_DB_SCHEMA`) to the raw command — Postgres only;

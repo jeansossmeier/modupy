@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import threading
 from dataclasses import dataclass
@@ -632,6 +633,90 @@ async def test_status_counts_archived_publications_as_completed(engine: Any) -> 
 
     assert status["completed"] == 3
     assert status["incomplete"] == 0
+
+
+# ---------------------------------------------------------------------------
+# trace_context is stored with the publication and survives every read path
+# ---------------------------------------------------------------------------
+
+_TRACEPARENT = {"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}
+
+
+async def _archived(engine: Any, publication_id: Any) -> Any:
+    from modulith.adapters.postgres_outbox import EventPublicationArchiveRow
+
+    async with async_sessionmaker(engine)() as s:
+        return await s.get(EventPublicationArchiveRow, publication_id)
+
+
+async def test_publication_without_trace_context_reads_back_none(engine: Any) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1)
+    await store.save(pub)
+
+    found = await store.find_by_id(pub.id)
+    assert found is not None
+    assert found.trace_context is None
+
+
+async def test_trace_context_survives_save_and_claim_batch(engine: Any) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1, trace_context=_TRACEPARENT)
+    await store.save(pub)
+
+    [claimed] = await store.claim_batch(
+        owner="sweeper", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+    assert claimed.trace_context == _TRACEPARENT
+
+
+async def test_trace_context_survives_find_dead_lettered(engine: Any) -> None:
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=3)
+    pub = _pub(1, trace_context=_TRACEPARENT, attempt_count=3)
+    await store.save(pub)
+
+    [dead] = await store.find_dead_lettered()
+    assert dead.trace_context == _TRACEPARENT
+
+
+async def test_trace_context_survives_archive(engine: Any) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1, trace_context=_TRACEPARENT)
+    await store.save(pub)
+
+    await store.archive(pub.id)
+
+    archived = await _archived(engine, pub.id)
+    assert archived is not None
+    assert json.loads(archived.trace_context) == _TRACEPARENT
+
+
+async def test_trace_context_survives_a_fenced_archive_completion(engine: Any) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1, trace_context=_TRACEPARENT)
+    await store.save(pub)
+    [claimed] = await store.claim_batch(
+        owner="sweeper", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+    assert claimed.claim_token is not None
+
+    assert await store.complete_claim(pub.id, claimed.claim_token, "archive") is True
+
+    archived = await _archived(engine, pub.id)
+    assert archived is not None
+    assert json.loads(archived.trace_context) == _TRACEPARENT
+
+
+async def test_archiving_a_publication_without_trace_context_keeps_it_null(engine: Any) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1)
+    await store.save(pub)
+
+    await store.archive(pub.id)
+
+    archived = await _archived(engine, pub.id)
+    assert archived is not None
+    assert archived.trace_context is None
 
 
 # ---------------------------------------------------------------------------

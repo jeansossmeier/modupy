@@ -338,9 +338,7 @@ def test_upgrade_moves_a_legacy_revision_inside_the_named_schema(
             )
         )
         conn.execute(
-            text(
-                f"INSERT INTO \"{schema}\".alembic_version VALUES ('0007_outbox_dispatch_started')"
-            )
+            text(f"INSERT INTO \"{schema}\".alembic_version VALUES ('0008_outbox_trace_context')")
         )
 
     command.upgrade(cfg, "head")
@@ -350,7 +348,7 @@ def test_upgrade_moves_a_legacy_revision_inside_the_named_schema(
     with engine.connect() as conn:
         assert conn.execute(
             text(f'SELECT version_num FROM "{schema}".modulith_alembic_version')
-        ).scalar_one() == ("0007_outbox_dispatch_started")
+        ).scalar_one() == ("0008_outbox_trace_context")
     assert "modulith_alembic_version" not in inspect(engine).get_table_names(schema="public")
 
 

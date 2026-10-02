@@ -417,6 +417,7 @@ transformations) don't need to know them upfront.
 - `last_error: str | None` = `None`
 - `last_attempt_at: datetime | None` = `None`
 - `claim_token: str | None` = `None`
+- `trace_context: dict[str, str] | None` = `None`
 
 ### `ModuleInfo`
 

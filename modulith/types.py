@@ -108,6 +108,12 @@ class EventPublication:
     # save()/mark_complete()/delete()/archive() calls unchanged.
     claim_token: str | None = None
 
+    # W3C trace context (``traceparent`` and, when present, ``tracestate``) of
+    # the publish that created this record. Stored with the row so a later
+    # dispatch can join the publisher's trace. None when none was captured,
+    # including every row written before the column existed.
+    trace_context: dict[str, str] | None = None
+
 
 @dataclass(frozen=True)
 class EventPublishReceipt:
