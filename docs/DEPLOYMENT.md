@@ -1299,6 +1299,7 @@ other targets, then names the target and its groups in an error and exits 1.
 **Consuming (every broker):**
 - A failed broker call is logged and retried under capped exponential backoff, 0.05 s doubling up to 5 s. `/health` reports `degraded` until that call succeeds again
 - A message that a stopped or crashed consumer left claimed or pending is delivered again once it has sat idle for `reclaim_stale_seconds` (database and SHM) or `reclaim_min_idle_ms` (Redis). Consumers reclaim it themselves: the supervisor takes no part, and nothing rebalances
+- A database or SHM consumer that stops gracefully hands back the messages it claimed but never started delivering, uncharged, so a peer takes them on its next poll. If a listener is still running when the stop's 1 s grace ends, the stop cancels it, and the messages of that batch wait for the reclaim above
 
 **Redis broker:**
 - A consumer creates its group when it starts, from the beginning of the stream, and creates it again if Redis reports `NOGROUP`. Entries published while every consumer is down wait in the stream, until the `MODULITH_STREAM_MAXLEN` cap (10000 by default) trims the oldest, unacknowledged ones included (see the Redis durability caveat above)
@@ -1318,8 +1319,10 @@ Consumer shutdown is bounded: a poll task whose cancellation is absorbed (a
 driver that never finishes closing a cancelled connection) is cancelled again
 after 10 s and, if it still ignores that, abandoned with an error log after
 another 10 s, so a Redis consumer's `stop()` returns within 20 s in the worst
-case. The database and SHM consumers stop a poll task and then a prune task,
-each under that bound, so theirs can take up to 40 s.
+case. The database and SHM consumers first give a claim or dispatch already
+under way up to 1 s to finish, then stop the poll task and then a prune task,
+each under that bound, so theirs can take up to 41 s. A consumer sleeping
+between polls skips that second.
 
 On POSIX, `modulith run` shuts down in this order:
 

@@ -87,7 +87,7 @@ Further instrumentation on `sqlalchemy.pool.base._ConnectionRecord.__connect` an
 
 The key insight: **aiosqlite's guard worked perfectly; SQLAlchemy's unguarded on_connect handler was the culprit.** The cancel was coming from `PollingConsumer.stop()`, which called `cancel_and_wait` without draining. The fix is to drain in-flight work before the cancel lands.
 
-The upstream complete fix (guarding the else-branch in SQLAlchemy's `_ConnectionRecord.__connect`) exists but is out-of-scope. This fix narrows the race window to the ~1 s grace period; any listener slower than that can still trigger the leak under load, but the probability drops dramatically in typical workloads.
+A complete fix belongs upstream: guarding the else-branch of SQLAlchemy's `_ConnectionRecord.__connect`, which SQLAlchemy 2.0.51 still leaves unguarded. That is out of scope here. This fix narrows the race to work that outlives the 1 s grace: a claim or dispatch still running when the grace ends can still be cancelled inside on-connect, but in typical workloads that is rare.
 
 ## Generalizable Pattern
 
@@ -107,4 +107,4 @@ Asyncio cancellation is a sharp tool. When a task is cancelled at an arbitrary p
 
 ## Summary
 
-Consumer shutdown cancelled the polling task without draining in-flight work. A TaskGroup cancellation landed inside SQLAlchemy's NullPool on_connect handler while it was registering UDFs, leaving an aiosqlite Connection unclosed. The unguarded else-branch of `_ConnectionRecord.__connect` had no BaseException handler, unlike the creator block. The fix drains in-flight work up to a grace period before falling back to cancellation, reducing the leak window from always-possible to ~1 s under idle load. The upstream complete fix guards SQLAlchemy's entire `__connect` sequence.
+Consumer shutdown cancelled the polling task without draining in-flight work. A TaskGroup cancellation landed inside SQLAlchemy's NullPool on_connect handler while it was registering UDFs, leaving an aiosqlite Connection unclosed. The unguarded else-branch of `_ConnectionRecord.__connect` had no BaseException handler, unlike the creator block. The fix drains in-flight work up to a grace period before falling back to cancellation, so only a claim or dispatch that outlives that 1 s grace can still leak; a consumer sleeping between polls holds no connection and is cancelled at once. A complete fix would guard SQLAlchemy's entire `__connect` sequence upstream.
