@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from modulith import EventPublication, event
@@ -516,6 +516,187 @@ async def test_retry_all_dead_lettered_resets_and_redelivers(pg_engine) -> None:
     assert resubmitted == 2
     assert sorted(delivered) == [10, 20]
     assert await store.find_dead_lettered() == []
+    await store.dispose()
+
+
+# ---------------------------------------------------------------------------
+# retry-all under claim_strategy="advisory_lock": real pg_try_advisory_lock
+# ---------------------------------------------------------------------------
+
+
+def _advisory_key(publication: EventPublication) -> int:
+    """The key ``PostgresPublicationStore.try_lock_publication`` locks for a row."""
+    return publication.id.int & 0x7FFFFFFFFFFFFFFF
+
+
+async def _advisory_locks(engine, *, granted: bool) -> list[int]:
+    """Sorted advisory-lock keys of this database that are held (``granted``) or awaited."""
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT classid::bigint, objid::bigint FROM pg_locks "
+                "WHERE locktype = 'advisory' AND granted = :granted "
+                "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+            ),
+            {"granted": granted},
+        )
+        return sorted((classid << 32) | objid for classid, objid in result)
+
+
+async def _dead_lettered_store(pg_engine, values, handler, fail) -> list[EventPublication]:
+    """Configure an advisory-lock outbox and dead-letter one row per value."""
+    bus = _bootstrap()
+    bus.register(OutboxEvent, handler)
+    store = PostgresPublicationStore(engine=pg_engine, dead_letter_after_attempts=1)
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        dead_letter_after_attempts=1,
+        start_loop=False,
+        claim_strategy="advisory_lock",
+    )
+    fail["on"] = True
+    pubs = [_pub(value, handler) for value in values]
+    for pub in pubs:
+        await store.save(pub)
+        await outbox._dispatch_publication(pub)
+    assert len(await store.find_dead_lettered()) == len(pubs)
+    fail["on"] = False
+    return pubs
+
+
+async def test_retry_all_holds_the_rows_advisory_lock_while_it_delivers(pg_engine) -> None:
+    fail = {"on": True}
+    inside, release = asyncio.Event(), asyncio.Event()
+    delivered: list[int] = []
+
+    async def handler(evt: OutboxEvent) -> None:
+        if fail["on"]:
+            raise RuntimeError("listener broken")
+        inside.set()
+        await release.wait()
+        delivered.append(evt.value)
+
+    (pub,) = await _dead_lettered_store(pg_engine, [7], handler, fail)
+    store = outbox._store
+    assert await _advisory_locks(pg_engine, granted=True) == []
+
+    retry = asyncio.create_task(outbox.retry_all_dead_lettered())
+    await asyncio.wait_for(inside.wait(), timeout=10)
+
+    assert await _advisory_locks(pg_engine, granted=True) == [_advisory_key(pub)]
+    assert delivered == []
+
+    release.set()
+    assert await asyncio.wait_for(retry, timeout=10) == 1
+
+    assert delivered == [7]
+    assert await _advisory_locks(pg_engine, granted=True) == []
+    await store.dispose()
+
+
+async def test_retry_all_leaves_a_row_locked_by_another_session_to_the_sweep(pg_engine) -> None:
+    fail = {"on": True}
+    delivered: list[int] = []
+
+    async def handler(evt: OutboxEvent) -> None:
+        if fail["on"]:
+            raise RuntimeError("listener broken")
+        delivered.append(evt.value)
+
+    held, _ = await _dead_lettered_store(pg_engine, [1, 2], handler, fail)
+    store = outbox._store
+
+    async with pg_engine.connect() as raw:
+        holder = await raw.execution_options(isolation_level="AUTOCOMMIT")
+        await holder.execute(text("SELECT pg_advisory_lock(:k)"), {"k": _advisory_key(held)})
+        try:
+            resubmitted = await outbox.retry_all_dead_lettered()
+
+            assert resubmitted == 2  # the held row still counts as resubmitted
+            assert delivered == [2]  # but only the unlocked row was delivered
+            reopened = await store.find_by_id(held.id)
+            assert reopened is not None
+            assert reopened.completed_at is None and reopened.attempt_count == 0
+            assert await store.find_dead_lettered() == []
+        finally:
+            await holder.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _advisory_key(held)})
+
+    await outbox._sweep(timedelta(0))
+
+    assert sorted(delivered) == [1, 2]
+    await store.dispose()
+
+
+async def test_concurrent_retry_all_and_sweep_deliver_every_dead_row_exactly_once(
+    pg_engine,
+) -> None:
+    fail = {"on": True}
+    delivered: list[int] = []
+
+    async def handler(evt: OutboxEvent) -> None:
+        if fail["on"]:
+            raise RuntimeError("listener broken")
+        await asyncio.sleep(0.02)
+        delivered.append(evt.value)
+
+    values = list(range(12))
+    pubs = await _dead_lettered_store(pg_engine, values, handler, fail)
+    value_of = {pub.id: value for pub, value in zip(pubs, values, strict=True)}
+    store = outbox._store
+    retries_done = asyncio.Event()
+
+    async def sweeper() -> None:
+        while not retries_done.is_set():
+            await outbox._sweep(timedelta(0))
+            await asyncio.sleep(0.005)
+
+    peer_delivered: list[int] = []
+
+    async def peer_dispatcher() -> None:
+        """A dispatcher in another process: its own session, the same lock protocol."""
+        async with pg_engine.connect() as raw:
+            conn = await raw.execution_options(isolation_level="AUTOCOMMIT")
+            while not retries_done.is_set():
+                for pub_id, value in value_of.items():
+                    key = pub_id.int & 0x7FFFFFFFFFFFFFFF
+                    got = await conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": key})
+                    if not got.scalar():
+                        continue
+                    try:
+                        open_row = await conn.execute(
+                            select(EventPublicationRow.id).where(
+                                EventPublicationRow.id == pub_id,
+                                EventPublicationRow.completed_at.is_(None),
+                                EventPublicationRow.is_dead_lettered.is_(False),
+                            )
+                        )
+                        if open_row.first() is not None:
+                            peer_delivered.append(value)
+                            await asyncio.sleep(0.05)
+                            await conn.execute(
+                                update(EventPublicationRow)
+                                .where(EventPublicationRow.id == pub_id)
+                                .values(completed_at=datetime.now(UTC))
+                            )
+                    finally:
+                        await conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
+                await asyncio.sleep(0.005)
+
+    sweep_task = asyncio.create_task(sweeper())
+    peer_task = asyncio.create_task(peer_dispatcher())
+    counts = await asyncio.wait_for(
+        asyncio.gather(*(outbox.retry_all_dead_lettered() for _ in range(3))), timeout=60
+    )
+    retries_done.set()
+    await asyncio.wait_for(asyncio.gather(sweep_task, peer_task), timeout=60)
+    await outbox._sweep(timedelta(0))
+
+    assert all(count <= len(values) for count in counts)
+    assert sorted(delivered + peer_delivered) == values  # each dead row delivered exactly once
+    assert await store.find_dead_lettered() == []
+    assert await store.count_open() == 0
+    assert await _advisory_locks(pg_engine, granted=True) == []
     await store.dispose()
 
 
