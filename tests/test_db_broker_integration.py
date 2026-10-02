@@ -29,7 +29,12 @@ from uuid import uuid4
 import pytest
 
 from modulith import event
-from modulith.adapters.db_broker import DatabaseBroker, DatabaseConsumer, broker_schema
+from modulith.adapters.db_broker import (
+    DatabaseBroker,
+    DatabaseConsumer,
+    _postgres_target_lock_key,
+    broker_schema,
+)
 from modulith.event_bus import InMemoryEventBus
 from modulith.serializers import JsonEventSerializer
 
@@ -831,3 +836,216 @@ async def test_has_schema_reports_whether_the_broker_tables_exist(broker_engine:
         await conn.run_sync(metadata.drop_all)
 
     assert await DatabaseBroker(engine=broker_engine).has_schema() is False
+
+
+# ---------------------------------------------------------------------------
+# Per-target write lock — serialization on real Postgres (pg_advisory_xact_lock)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def pg_broker(postgres_url: str) -> Any:
+    """A ``store``-policy broker on its own Postgres schema, dropped on teardown."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.schema import DropSchema
+
+    schema = f"modupy_lock_{uuid4().hex}"
+    broker = DatabaseBroker(
+        url=postgres_url,
+        engine_options={"schema": schema},
+        no_subscriber_policy="store",
+    )
+    await broker._ensure_schema()
+    admin_engine = create_async_engine(postgres_url)
+    try:
+        yield broker
+    finally:
+        await broker.close()
+        async with admin_engine.begin() as conn:
+            await conn.execute(DropSchema(schema, if_exists=True, cascade=True))
+        await admin_engine.dispose()
+
+
+async def _advisory_waiters(broker: DatabaseBroker) -> list[int]:
+    """Signed advisory-lock keys that some backend of this database is waiting on."""
+    from sqlalchemy import text
+
+    async with broker._engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT classid::bigint, objid::bigint FROM pg_locks "
+                "WHERE locktype = 'advisory' AND NOT granted "
+                "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+            )
+        )
+        keys = []
+        for classid, objid in result:
+            unsigned = (classid << 32) | objid
+            keys.append(unsigned - (1 << 64) if unsigned >= 1 << 63 else unsigned)
+        return sorted(keys)
+
+
+async def test_target_lock_blocks_same_target_callers_but_not_other_targets(
+    pg_broker: DatabaseBroker,
+) -> None:
+    target, other = f"{_TARGET}.lock-held", f"{_TARGET}.lock-free"
+    holding, release = asyncio.Event(), asyncio.Event()
+    events: list[str] = []
+    active = 0
+    max_active = 0
+
+    async def hold(conn: Any) -> None:
+        holding.set()
+        await release.wait()
+        events.append("holder-done")
+
+    def contender(name: str) -> Any:
+        async def op(conn: Any) -> None:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            events.append(f"{name}-entered")
+            await asyncio.sleep(0.05)
+            active -= 1
+
+        return op
+
+    holder = asyncio.create_task(pg_broker._write_target_locked([target], hold))
+    await asyncio.wait_for(holding.wait(), timeout=10)
+    waiters = [
+        asyncio.create_task(pg_broker._write_target_locked([target], contender(f"w{index}")))
+        for index in range(3)
+    ]
+    key = _postgres_target_lock_key(target)
+
+    async def three_blocked() -> bool:
+        return await _advisory_waiters(pg_broker) == [key] * 3
+
+    await _until(three_blocked)
+    await asyncio.wait_for(pg_broker._write_target_locked([other], contender("other")), timeout=10)
+
+    assert events == ["other-entered"]  # same-target callers still parked on the lock
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(holder, *waiters), timeout=20)
+
+    assert events[:2] == ["other-entered", "holder-done"]
+    assert sorted(events[2:]) == ["w0-entered", "w1-entered", "w2-entered"]
+    assert max_active == 1
+    assert await _advisory_waiters(pg_broker) == []
+
+
+async def test_target_lock_overlapping_target_sets_serialize_without_deadlock(
+    pg_broker: DatabaseBroker,
+) -> None:
+    a, b, c = (f"{_TARGET}.multi-{name}" for name in "abc")
+    active: dict[str, int] = dict.fromkeys((a, b, c), 0)
+    overlaps: list[str] = []
+    # Opposite orderings of the same pair would deadlock without sorted acquisition.
+    name_targets = {"ab": [a, b], "ba": [b, a], "bca": [b, c, a], "c": [c]}
+
+    def op_over(name: str) -> Any:
+        async def op(conn: Any) -> str:
+            targets = name_targets[name]
+            for t in targets:
+                active[t] += 1
+                if active[t] > 1:
+                    overlaps.append(t)
+            await asyncio.sleep(0.02)
+            for t in targets:
+                active[t] -= 1
+            return name
+
+        return op
+
+    for _ in range(5):
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    pg_broker._write_target_locked(targets, op_over(name))
+                    for name, targets in name_targets.items()
+                )
+            ),
+            timeout=20,
+        )
+        assert sorted(results) == sorted(name_targets)
+
+    assert overlaps == []
+
+
+async def _delivered_payloads(broker: DatabaseBroker) -> dict[str, list[bytes]]:
+    from sqlalchemy import select
+
+    _, _, message = broker_schema()
+    async with broker._engine.connect() as conn:
+        result = await conn.execute(select(message.c.consumer_group, message.c.payload))
+        grouped: dict[str, list[bytes]] = {}
+        for group, payload in result:
+            grouped.setdefault(group, []).append(bytes(payload))
+        return {group: sorted(payloads) for group, payloads in grouped.items()}
+
+
+async def test_concurrent_publishers_and_subscribers_deliver_each_message_once_per_group(
+    pg_broker: DatabaseBroker,
+) -> None:
+    publishers, groups = 4, [f"g-{index}" for index in range(4)]
+    for round_index in range(60):
+        target = f"{_TARGET}.fanout-{round_index}"
+        payloads = [f"{round_index}:{index}".encode() for index in range(publishers)]
+
+        await asyncio.wait_for(
+            asyncio.gather(
+                *(pg_broker.publish(target, p, {"event_type": _EVENT_TYPE}) for p in payloads),
+                *(pg_broker.subscribe([target], group) for group in groups),
+                *(pg_broker.subscribe([target], group) for group in groups),
+            ),
+            timeout=30,
+        )
+
+        delivered = await _delivered_payloads(pg_broker)
+        for group in groups:
+            mine = [p for p in delivered.get(group, []) if p.startswith(f"{round_index}:".encode())]
+            assert mine == sorted(payloads), f"{group} round {round_index}"
+
+
+async def test_concurrent_retry_dead_letters_redelivers_each_dead_row_once(
+    pg_broker: DatabaseBroker,
+) -> None:
+    dead_ids = {f"dead-{index}" for index in range(6)}
+    for index, row_id in enumerate(sorted(dead_ids)):
+        await _insert(
+            pg_broker._engine,
+            id=row_id,
+            target=_TARGET,
+            group=f"g-{index % 2}",
+            status="dead",
+            age_seconds=60,
+        )
+    await _insert(
+        pg_broker._engine, id="done-0", target=_TARGET, group="g-0", status="done", age_seconds=60
+    )
+    claimed: list[str] = []
+
+    async def claimer(group: str, name: str) -> None:
+        for _ in range(10):
+            rows = await pg_broker.claim_batch(group, batch_size=10, consumer_name=name)
+            claimed.extend(cast(str, row["id"]) for row in rows)
+            await asyncio.sleep(0.01)
+
+    retried, *_ = await asyncio.wait_for(
+        asyncio.gather(
+            asyncio.gather(*(pg_broker.retry_dead_letters() for _ in range(4))),
+            claimer("g-0", "c0"),
+            claimer("g-1", "c1"),
+            claimer("g-0", "c2"),
+        ),
+        timeout=30,
+    )
+    for group, name in (("g-0", "c0"), ("g-1", "c1")):
+        rows = await pg_broker.claim_batch(group, batch_size=10, consumer_name=name)
+        claimed.extend(cast(str, row["id"]) for row in rows)
+
+    assert sum(retried) == len(dead_ids)  # no row counted by two retry calls
+    assert sorted(claimed) == sorted(dead_ids)  # each re-delivered exactly once
+    done = await _message_row(pg_broker._engine, "done-0")
+    assert done is not None and done.status == "done"
