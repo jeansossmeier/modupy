@@ -3098,6 +3098,47 @@ def test_outbox_shutdown_disposes_the_engine_on_the_retry_loops_own_event_loop(
     assert disposing_loops == [retry_loop]
 
 
+def test_outbox_shutdown_does_not_wait_for_a_retry_task_whose_event_loop_stopped(
+    make_fake_app: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    engine, disposals = _bind_outbox_url_engine(make_fake_app, tmp_path / "app.db")
+    retry_loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=retry_loop.run_forever, daemon=True)
+    thread.start()
+
+    async def pool_a_connection_and_start_the_retry_loop() -> None:
+        await _create_tables_and_pool_a_connection(engine)
+        outbox._ensure_retry_loop()
+
+    asyncio.run_coroutine_threadsafe(
+        pool_a_connection_and_start_the_retry_loop(), retry_loop
+    ).result(5)
+    # What publish_sync()'s exit handler does to its daemon loop: stop it, never close it.
+    retry_loop.call_soon_threadsafe(retry_loop.stop)
+    thread.join(5)
+
+    async def scenario() -> int:
+        with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
+            await asyncio.wait_for(outbox.shutdown(), timeout=5)
+        return len(disposals)
+
+    async def finish_on_the_retry_loop() -> None:
+        stranded = asyncio.all_tasks() - {asyncio.current_task()}
+        for task in stranded:
+            task.cancel()
+        await asyncio.gather(*stranded, return_exceptions=True)
+        await engine.dispose()
+
+    try:
+        assert asyncio.run(scenario()) == 0
+        assert outbox._retry_task is None
+    finally:
+        retry_loop.run_until_complete(finish_on_the_retry_loop())
+        retry_loop.close()
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("leaving the engine built from outbox_url open" in m for m in warnings)
+
+
 def test_outbox_shutdown_leaves_the_engine_open_with_a_warning_when_the_retry_loop_closed(
     make_fake_app: Any,
     tmp_path: Path,
@@ -3132,41 +3173,52 @@ def test_outbox_shutdown_leaves_the_engine_open_with_a_warning_when_the_retry_lo
     )
 
 
-def test_outbox_shutdown_leaves_the_engine_open_with_a_warning_when_the_retry_loop_stalled(
+def test_outbox_shutdown_leaves_the_engine_open_with_a_warning_when_the_retry_loop_is_busy(
     make_fake_app: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     engine, disposals = _bind_outbox_url_engine(make_fake_app, tmp_path / "app.db")
-    stalled_loop = asyncio.new_event_loop()
+    busy_loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=busy_loop.run_forever, daemon=True)
+    thread.start()
+    entered, release = threading.Event(), threading.Event()
 
-    class FinishedTaskOnStoppedLoop:
+    def hold_the_loop() -> None:
+        entered.set()
+        release.wait(5)
+
+    class FinishedTaskOnBusyLoop:
         def done(self) -> bool:
             return True
 
         def get_loop(self) -> asyncio.AbstractEventLoop:
-            return stalled_loop
+            return busy_loop
 
-    monkeypatch.setattr(outbox, "_retry_task", FinishedTaskOnStoppedLoop())
+    monkeypatch.setattr(outbox, "_retry_task", FinishedTaskOnBusyLoop())
     monkeypatch.setattr(outbox, "_shutdown_grace_seconds", 0.05)
+    busy_loop.call_soon_threadsafe(hold_the_loop)
+    assert entered.wait(5)
 
     async def scenario() -> int:
         with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
             await asyncio.wait_for(outbox.shutdown(), timeout=15)
-        disposed = len(disposals)
-        await engine.dispose()
-        return disposed
+        return len(disposals)
+
+    async def settle() -> None:
+        others = asyncio.all_tasks() - {asyncio.current_task()}
+        await asyncio.gather(*others, return_exceptions=True)
 
     try:
         assert asyncio.run(scenario()) == 0
     finally:
-        # Let the stopped loop discard the disposal it never ran.
-        stalled_loop.run_until_complete(asyncio.sleep(0))
-        leftover = asyncio.all_tasks(stalled_loop)
-        if leftover:
-            stalled_loop.run_until_complete(asyncio.gather(*leftover, return_exceptions=True))
-        stalled_loop.close()
+        release.set()
+        asyncio.run_coroutine_threadsafe(settle(), busy_loop).result(5)
+        busy_loop.call_soon_threadsafe(busy_loop.stop)
+        thread.join(5)
+        busy_loop.close()
+    asyncio.run(engine.dispose())
     assert any(
         "leaving the engine built from outbox_url open" in r.getMessage()
         for r in caplog.records

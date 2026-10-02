@@ -28,7 +28,7 @@ This is only a concern for long-running single-process apps or REPL environments
 
 When the retry loop ran on another event loop than the one awaiting `shutdown()`, such as `publish_sync()`'s daemon-thread loop, the disposal runs on that loop, because a driver such as asyncpg closes a connection only on the loop that opened it.
 
-Residual, accepted: if that loop has closed, or does not run the disposal within `_shutdown_grace_seconds`, the engine is left open and a warning says so. A pool holding connections opened on both loops still has the ones from the awaiting loop closed from the retry loop, which asyncpg rejects; SQLAlchemy logs each such failure and drops the connection.
+Residual, accepted: if that loop has closed or stopped, or does not finish the disposal within `_shutdown_grace_seconds`, the engine is left open and a warning says so. `publish_sync()`'s exit handler stops its loop without closing it, so a shutdown that runs after that handler takes this path. A pool holding connections opened on both loops still has the ones from the awaiting loop closed from the retry loop, which asyncpg rejects; SQLAlchemy logs each such failure and drops the connection.
 
 Tests:
 - `tests/test_outbox.py::test_outbox_shutdown_closes_the_pool_of_the_engine_built_from_outbox_url`
@@ -36,4 +36,6 @@ Tests:
 - `tests/test_outbox.py::test_outbox_shutdown_ignores_the_outbox_url_when_the_application_configured_its_store`
 - `tests/test_outbox.py::test_outbox_shutdown_twice_disposes_the_outbox_url_engine_once`
 - `tests/test_outbox.py::test_outbox_shutdown_disposes_the_engine_on_the_retry_loops_own_event_loop`
+- `tests/test_outbox.py::test_outbox_shutdown_does_not_wait_for_a_retry_task_whose_event_loop_stopped`
 - `tests/test_outbox.py::test_outbox_shutdown_leaves_the_engine_open_with_a_warning_when_the_retry_loop_closed`
+- `tests/test_outbox.py::test_outbox_shutdown_leaves_the_engine_open_with_a_warning_when_the_retry_loop_is_busy`

@@ -1393,9 +1393,9 @@ async def shutdown() -> None:
     belongs to the application. When the retry loop ran on another event loop
     than the one awaiting ``shutdown()``, such as ``publish_sync()``'s
     daemon-thread loop, the disposal runs on that loop, where its pooled
-    connections were opened. If that loop is closed or does not run the
-    disposal within ``_shutdown_grace_seconds``, the engine is left open and
-    a warning says so.
+    connections were opened. If that loop is closed or stopped, or does not
+    finish the disposal within ``_shutdown_grace_seconds``, the engine is left
+    open and a warning says so.
 
     See ``_stop_retry_loop`` for how the loop is stopped.
     """
@@ -1423,7 +1423,7 @@ async def _dispose_owned_resources(task_loop: asyncio.AbstractEventLoop | None) 
         return
     # The retry sweeps pooled their connections on task_loop, and a driver
     # such as asyncpg closes a connection only on the loop that opened it.
-    if not task_loop.is_closed():
+    if task_loop.is_running():
         future = asyncio.run_coroutine_threadsafe(dispose(), task_loop)
         try:
             await asyncio.wait_for(asyncio.wrap_future(future), _shutdown_grace_seconds)
@@ -1431,8 +1431,10 @@ async def _dispose_owned_resources(task_loop: asyncio.AbstractEventLoop | None) 
         except TimeoutError:
             pass
     logger.warning(
-        "outbox shutdown could not run on the retry loop's event loop, which is "
-        "closed or not running; leaving the engine built from outbox_url open"
+        "outbox shutdown could not run on the retry loop's event loop, which is closed, "
+        "stopped, or did not finish the disposal within %.1f s; leaving the engine built "
+        "from outbox_url open",
+        _shutdown_grace_seconds,
     )
 
 
@@ -1462,7 +1464,10 @@ async def _stop_retry_loop() -> asyncio.AbstractEventLoop | None:
     therefore run on the task's own loop (``_on_task_loop``). Likewise
     ``await task`` on a foreign-loop task raises ("Task got Future attached
     to a different loop"), so completion is observed by polling
-    ``task.done()`` instead.
+    ``task.done()`` instead, and only while that loop runs: the exit handler
+    of ``publish_sync()`` stops its loop without closing it, and a task on a
+    stopped loop never finishes. Such a task is cleared without waiting; the
+    stop request stays queued on its loop in case that loop runs again.
     """
     global _retry_task
     task = _retry_task
@@ -1479,7 +1484,7 @@ async def _stop_retry_loop() -> asyncio.AbstractEventLoop | None:
         elif _on_task_loop(task, lambda: _request_stop(task)):
             deadline = time.monotonic() + _shutdown_grace_seconds
             cancelled = False
-            while not task.done() and not task.get_loop().is_closed():
+            while not task.done() and task.get_loop().is_running():
                 if not cancelled and time.monotonic() >= deadline:
                     cancelled = True
                     logger.warning(
@@ -1488,6 +1493,11 @@ async def _stop_retry_loop() -> asyncio.AbstractEventLoop | None:
                     )
                     _on_task_loop(task, task.cancel)
                 await asyncio.sleep(0.01)
+            if not task.done():
+                logger.warning(
+                    "outbox retry task's event loop stopped running; clearing the task "
+                    "without waiting for it, and it stops if that loop runs again"
+                )
     with _retry_task_lock:
         # Clear the slot only if no concurrent configure()/_ensure_retry_loop()
         # installed a fresh task while we awaited the cancellation.
