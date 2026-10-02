@@ -36,6 +36,8 @@ from modulith.builtin import outbox
 from modulith.cli import _parse_duration, app
 from modulith.serializers import JsonEventSerializer
 
+from conftest import replace_current_event_loop
+
 runner = CliRunner()
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -127,7 +129,7 @@ def _reset_outbox_state():
     yield
     outbox._reset_for_testing()
     _runtime._reset_for_testing()
-    asyncio.set_event_loop(asyncio.new_event_loop())
+    replace_current_event_loop()
     # dev() sets this directly on os.environ (not via monkeypatch — it must
     # survive an os.execvp that replaces the process), so it needs its own
     # explicit cleanup or it leaks into every later test in this process.
@@ -1849,6 +1851,36 @@ def test_outbox_status_uses_store_built_from_outbox_url(make_fake_app, monkeypat
     result = runner.invoke(app, ["outbox", "status"])
 
     assert (result.exit_code, result.output.splitlines()[:1]) == (0, ["incomplete:    0"])
+
+
+def test_outbox_command_closes_the_engine_built_from_outbox_url(
+    make_fake_app, monkeypatch, tmp_path
+):
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from modulith.adapters.postgres_outbox import Base
+    from modulith.runtime import _runtime
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'app.db'}"
+
+    async def create_schema() -> None:
+        engine = create_async_engine(url)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        await engine.dispose()
+
+    asyncio.run(create_schema())
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_OUTBOX", "postgres")
+    monkeypatch.setenv("MODULITH_OUTBOX_URL", url)
+    make_fake_app({"orders": ""})
+
+    result = runner.invoke(app, ["outbox", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert _runtime._owned_outbox is not None
+    _, engine = _runtime._owned_outbox
+    assert (outbox._owned_resources, engine.pool.checkedin()) == (None, 0)
 
 
 def test_outbox_store_error_on_memory_outbox_names_the_config_key(

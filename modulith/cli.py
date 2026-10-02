@@ -38,9 +38,10 @@ import sys
 import tomllib
 import traceback
 from collections import defaultdict
+from collections.abc import Coroutine
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from uuid import UUID
 
 # typer is an optional dependency — only loaded when the CLI is invoked.
@@ -273,6 +274,8 @@ def _exec_uvicorn(argv: list[str]) -> None:
 
 
 _TOPOLOGIES = ("single", "processes")
+
+_T = TypeVar("_T")
 
 
 def _validate_topology(topology: str) -> None:
@@ -516,6 +519,19 @@ def _require_outbox_store() -> None:
         )
     typer.echo(f"no outbox store: {cause}. {remedy}", err=True)
     raise typer.Exit(code=1)
+
+
+def _run_outbox_command(coro: Coroutine[Any, Any, _T]) -> _T:
+    """``asyncio.run`` for an outbox command, closing the engine built from
+    ``outbox_url`` on the same loop, where its pooled connections were opened."""
+
+    async def run() -> _T:
+        try:
+            return await coro
+        finally:
+            await outbox.shutdown()
+
+    return asyncio.run(run())
 
 
 def _parse_workers_json(workers_json: str) -> dict[str, Any]:
@@ -1716,7 +1732,7 @@ def outbox_status() -> None:
     """Show outbox counts: incomplete, completed, dead-lettered."""
     _bootstrap_or_exit()
     _require_outbox_store()
-    counts = asyncio.run(outbox.status())
+    counts = _run_outbox_command(outbox.status())
     typer.echo(f"incomplete:    {counts['incomplete']}")
     typer.echo(f"completed:     {counts['completed']}")
     typer.echo(f"dead-lettered: {counts['dead_lettered']}")
@@ -1767,7 +1783,7 @@ def outbox_retry(publication_id: str) -> None:
         raise typer.Exit(code=1) from None
     _bootstrap_or_exit()
     _require_outbox_store()
-    if not asyncio.run(_force_retry_known(pub_id)):
+    if not _run_outbox_command(_force_retry_known(pub_id)):
         typer.echo(
             f"publication {pub_id} not found (or already complete) — nothing was retried",
             err=True,
@@ -1788,7 +1804,7 @@ def outbox_purge(
     except ValueError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from None
-    deleted = asyncio.run(outbox.purge_completed(threshold))
+    deleted = _run_outbox_command(outbox.purge_completed(threshold))
     typer.echo(f"purged {deleted} completed publication(s) older than {older_than}")
 
 
@@ -1827,11 +1843,11 @@ def outbox_dead_letter(
     _require_outbox_store()
 
     if retry_all:
-        count = asyncio.run(_retry_all_and_drain())
+        count = _run_outbox_command(_retry_all_and_drain())
         typer.echo(f"resubmitted {count} dead-lettered publication(s)")
         return
 
-    dead = asyncio.run(outbox.list_dead_lettered())
+    dead = _run_outbox_command(outbox.list_dead_lettered())
     if not dead:
         typer.echo("no dead-lettered publications")
         return
@@ -1855,7 +1871,7 @@ def outbox_failing() -> None:
     _require_outbox_store()
 
     try:
-        failing = asyncio.run(outbox.list_failing())
+        failing = _run_outbox_command(outbox.list_failing())
     except NotImplementedError as exc:
         typer.echo(f"{exc}: it cannot list failing publications", err=True)
         raise typer.Exit(code=1) from None
