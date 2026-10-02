@@ -35,6 +35,7 @@ class PollingConsumer(DeliveryDispatch):
     """Store-neutral poll, health, backoff, pruning, and shutdown lifecycle."""
 
     _stop_timeout_s: float = DEFAULT_STOP_TIMEOUT_S
+    _stop_drain_grace_s: float = 1.0
     _subscription_refresh_s: float = SUBSCRIPTION_REFRESH_S
 
     def __init__(
@@ -82,6 +83,7 @@ class PollingConsumer(DeliveryDispatch):
         self._task: asyncio.Task[None] | None = None
         self._prune_task: asyncio.Task[None] | None = None
         self._stopping = False
+        self._sleeping = False
         self._health = ConsumerHealth(ready=False, status="stopped")
         self._health_failures = HealthFailures(completion_expiry_s=reclaim_stale_seconds)
         self._consecutive_failures = 0
@@ -167,7 +169,10 @@ class PollingConsumer(DeliveryDispatch):
         """Cancel all background work; safe before start and on repeated calls."""
         self._stopping = True
         try:
-            await self._cancel(self._task, "poll")
+            try:
+                await self._let_in_flight_work_finish(self._task)
+            finally:
+                await self._cancel(self._task, "poll")
         finally:
             self._task = None
             try:
@@ -211,6 +216,26 @@ class PollingConsumer(DeliveryDispatch):
 
     def _mark_broker_recovered(self, operation: str, target: str) -> None:
         self._health_failures.recover(operation, target)
+
+    async def _let_in_flight_work_finish(self, task: asyncio.Task[None] | None) -> None:
+        """Give a poll that is mid-claim or mid-dispatch ``_stop_drain_grace_s`` to
+        see ``_stopping`` and return before it is cancelled.
+
+        A cancel that lands while SQLAlchemy runs a new connection's on-connect
+        setup (``sqlalchemy.pool.base._ConnectionRecord.__connect``, outside its
+        own cancellation guard) abandons the driver connection it just opened.
+        A poll sleeping between claims holds no connection and is cancelled at once.
+        """
+        if task is None or task.done() or self._sleeping:
+            return
+        await asyncio.wait({task}, timeout=self._stop_drain_grace_s)
+
+    async def _sleep_between_claims(self, wait: Awaitable[None]) -> None:
+        self._sleeping = True
+        try:
+            await wait
+        finally:
+            self._sleeping = False
 
     async def _cancel(self, task: asyncio.Task[None] | None, label: str) -> None:
         if task is None:
@@ -274,20 +299,22 @@ class PollingConsumer(DeliveryDispatch):
                     max(self._poll_interval_s, _IDLE_BACKOFF_CAP_S),
                 )
                 delay += random.uniform(0.0, min(0.05, delay * 0.25))
+            if self._should_stop():
+                return
             await self._wait_when_idle(delay)
 
     async def _wait_when_idle(self, safety_timeout: float) -> None:
         """Wait for an optional latency hint without extending the safety poll."""
         if self._idle_wait is None:
-            await asyncio.sleep(safety_timeout)
+            await self._sleep_between_claims(asyncio.sleep(safety_timeout))
             return
-        await self._idle_wait(safety_timeout)
+        await self._sleep_between_claims(self._idle_wait(safety_timeout))
 
     async def _backoff_after_failure(self) -> None:
         self._consecutive_failures += 1
         exponent = min(self._consecutive_failures - 1, _BACKOFF_MAX_EXPONENT)
         delay = min(_BACKOFF_BASE_S * (2.0**exponent), _BACKOFF_CAP_S)
-        await asyncio.sleep(delay)
+        await self._sleep_between_claims(asyncio.sleep(delay))
 
     async def _prune_loop(self) -> None:
         interval = self._prune_interval_s or _DEFAULT_PRUNE_INTERVAL_S

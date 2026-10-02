@@ -1931,6 +1931,7 @@ async def test_stop_propagates_cancellation_of_the_stopping_task(engine: Any) ->
         group="modulith-inventory",
         targets=["fakeapp.orders.WidgetCreated"],
     )
+    consumer._stop_drain_grace_s = 0.0
     child_task = asyncio.create_task(child())
     prune_task = asyncio.create_task(prune())
     consumer._task = child_task

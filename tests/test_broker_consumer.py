@@ -15,6 +15,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from modulith import event, externalized
 from modulith._consumer import BrokerConsumer, consumer_targets
 from modulith.adapters._polling_consumer import PollingConsumer
@@ -573,6 +575,72 @@ class _WedgedClaimBroker(FakePollingBroker):
                 self.cancels += 1
                 if self.cancels > self.absorb:
                     raise
+
+
+class _SlowClaimBroker(FakePollingBroker):
+    """``claim_batch`` takes ``seconds`` and records whether it was cancelled."""
+
+    def __init__(self, seconds: float) -> None:
+        super().__init__()
+        self.seconds = seconds
+        self.entered = asyncio.Event()
+        self.finished = 0
+        self.cancelled = 0
+
+    async def claim_batch(self, group: str, **kwargs: Any) -> list[dict[str, Any]]:
+        self.entered.set()
+        try:
+            await asyncio.sleep(self.seconds)
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        self.finished += 1
+        return []
+
+
+async def test_stop_lets_an_in_flight_claim_finish_instead_of_cancelling_it() -> None:
+    """A cancel landing in SQLAlchemy's on-connect setup abandons the driver
+    connection it just opened, so stop() lets a claim already under way end."""
+    broker = _SlowClaimBroker(seconds=0.1)
+    consumer = _make_polling_consumer(broker, poll_interval_s=30.0, max_attempts=3, idle_wait=None)
+    await consumer.start()
+    await asyncio.wait_for(broker.entered.wait(), timeout=2.0)
+
+    await asyncio.wait_for(consumer.stop(), timeout=5.0)
+
+    assert (broker.finished, broker.cancelled) == (1, 0)
+    assert consumer.health().status == "stopped"
+
+
+async def test_stop_cancelled_while_draining_still_cancels_the_poll() -> None:
+    broker = _SlowClaimBroker(seconds=3600.0)
+    consumer = _make_polling_consumer(broker, poll_interval_s=30.0, max_attempts=3, idle_wait=None)
+    await consumer.start()
+    await asyncio.wait_for(broker.entered.wait(), timeout=2.0)
+    poll_task = consumer._task
+    assert poll_task is not None
+
+    stop_task = asyncio.create_task(consumer.stop())
+    await _until(lambda: consumer._stopping)
+    stop_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await stop_task
+    assert (poll_task.done(), broker.cancelled, consumer._task) == (True, 1, None)
+
+
+async def test_stop_cancels_a_poll_sleeping_between_claims_at_once() -> None:
+    broker = _SlowClaimBroker(seconds=0.0)
+    consumer = _make_polling_consumer(broker, poll_interval_s=30.0, max_attempts=3, idle_wait=None)
+    await consumer.start()
+    await _until(lambda: consumer._sleeping)
+    loop = asyncio.get_running_loop()
+
+    started = loop.time()
+    await asyncio.wait_for(consumer.stop(), timeout=5.0)
+
+    assert loop.time() - started < consumer._stop_drain_grace_s / 2
+    assert consumer.health().status == "stopped"
 
 
 async def test_stop_re_cancels_a_poll_task_that_absorbed_the_first_cancel() -> None:
