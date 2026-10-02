@@ -1270,6 +1270,114 @@ def test_outbox_dead_letter_lists_dead_publications(make_fake_app, monkeypatch):
     assert "kaboom" in result.output
 
 
+class FailingStore(StubStore):
+    """StubStore plus the optional keyset-paged ``find_failing`` capability."""
+
+    async def find_failing(
+        self, *, after: tuple[datetime, UUID] | None = None, limit: int = 100
+    ) -> list[EventPublication]:
+        rows = sorted(
+            (p for p in self.pubs.values() if p.completed_at is None and 0 < p.attempt_count < 10),
+            key=lambda p: (p.published_at, p.id),
+        )
+        if after is not None:
+            rows = [p for p in rows if (p.published_at, p.id) > after]
+        return rows[:limit]
+
+
+def _failing_pub(**overrides) -> EventPublication:
+    fields = dict(
+        id=uuid4(),
+        payload=b"{}",
+        event_type="fakeapp.orders.Boom",
+        listener="handler",
+        published_at=datetime(2026, 1, 1, 11, 0, tzinfo=UTC),
+        attempt_count=3,
+        last_error="kaboom",
+        last_attempt_at=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+    )
+    fields.update(overrides)
+    return EventPublication(**fields)
+
+
+def test_outbox_failing_lists_failing_publications_with_next_retry(make_fake_app, monkeypatch):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    store = FailingStore()
+    failing = _failing_pub()  # attempt 3 → 2 ** 2 = 4s after the last attempt
+    never_attempted = _failing_pub(attempt_count=0, last_error=None, last_attempt_at=None)
+    dead = _failing_pub(attempt_count=10)
+    done = _failing_pub(completed_at=datetime(2026, 1, 1, 12, 5, tzinfo=UTC))
+    for pub in (failing, never_attempted, dead, done):
+        store.pubs[pub.id] = pub
+    outbox.configure(store=store, serializer=JsonEventSerializer(), start_loop=False)
+
+    result = runner.invoke(app, ["outbox", "failing"])
+
+    assert result.exit_code == 0, result.output
+    lines = [line for line in result.output.splitlines() if str(failing.id) in line]
+    assert len(lines) == 1
+    for expected in (
+        "fakeapp.orders.Boom",
+        "listener=handler",
+        "attempts=3",
+        "last_error=kaboom",
+        "next_retry_at=2026-01-01T12:00:04+00:00",
+    ):
+        assert expected in lines[0]
+    for other in (never_attempted, dead, done):
+        assert str(other.id) not in result.output
+
+
+def test_outbox_failing_pages_past_one_page(make_fake_app, monkeypatch):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    store = FailingStore()
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    for i in range(101):
+        pub = _failing_pub(published_at=base + timedelta(seconds=i))
+        store.pubs[pub.id] = pub
+    outbox.configure(store=store, serializer=JsonEventSerializer(), start_loop=False)
+
+    result = runner.invoke(app, ["outbox", "failing"])
+
+    assert result.exit_code == 0, result.output
+    assert "101 failing publication(s):" in result.output
+    assert all(str(pub_id) in result.output for pub_id in store.pubs)
+
+
+def test_outbox_failing_with_nothing_failing_says_so(make_fake_app, monkeypatch):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    outbox.configure(store=FailingStore(), serializer=JsonEventSerializer(), start_loop=False)
+
+    result = runner.invoke(app, ["outbox", "failing"])
+
+    assert result.exit_code == 0, result.output
+    assert "no failing publications" in result.output
+
+
+def test_outbox_failing_exits_1_for_a_store_without_find_failing(make_fake_app, monkeypatch):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    outbox.configure(store=StubStore(), serializer=JsonEventSerializer(), start_loop=False)
+
+    result = runner.invoke(app, ["outbox", "failing"])
+
+    assert result.exit_code == 1
+    assert "find_failing" in result.output
+
+
+def test_outbox_failing_without_store_errors(make_fake_app, monkeypatch):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+
+    result = runner.invoke(app, ["outbox", "failing"])
+
+    assert result.exit_code == 1
+    assert "no outbox store" in result.output
+
+
 def test_outbox_dead_letter_retry_all_redispatches(make_fake_app, monkeypatch):
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app(

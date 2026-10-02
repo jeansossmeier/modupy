@@ -2496,6 +2496,96 @@ async def test_list_dead_lettered_pages_across_a_full_page() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_failing_pages_across_a_full_page() -> None:
+    class PagedStore(StubStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failing: list[EventPublication] = []
+            self.calls: list[tuple[datetime, UUID] | None] = []
+
+        async def find_failing(
+            self, *, after: tuple[datetime, UUID] | None, limit: int
+        ) -> list[EventPublication]:
+            self.calls.append(after)
+            ordered = sorted(self.failing, key=lambda p: (p.published_at, p.id))
+            if after is not None:
+                ordered = [p for p in ordered if (p.published_at, p.id) > after]
+            return ordered[:limit]
+
+    store = PagedStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    base = datetime.now(UTC) - timedelta(hours=1)
+    store.failing = [
+        _make_pub(record, value=i, attempt_count=1, published_at=base + timedelta(seconds=i))
+        for i in range(101)
+    ]
+
+    result = await outbox.list_failing()
+
+    assert [p.id for p in result] == [
+        p.id for p in sorted(store.failing, key=lambda p: (p.published_at, p.id))
+    ]
+    assert len(store.calls) == 2
+    assert store.calls[1] == (result[99].published_at, result[99].id)
+
+
+@pytest.mark.asyncio
+async def test_list_failing_accepts_empty_result() -> None:
+    class EmptyStore(StubStore):
+        async def find_failing(
+            self, *, after: tuple[datetime, UUID] | None, limit: int
+        ) -> list[EventPublication]:
+            return []
+
+    outbox.configure(EmptyStore(), JsonEventSerializer(), start_loop=False)
+
+    assert await outbox.list_failing() == []
+
+
+@pytest.mark.asyncio
+async def test_list_failing_rejects_a_store_without_find_failing() -> None:
+    outbox.configure(StubStore(), JsonEventSerializer(), start_loop=False)
+
+    with pytest.raises(NotImplementedError, match="find_failing"):
+        await outbox.list_failing()
+
+
+def test_next_retry_at_is_the_instant_backoff_elapsed_flips() -> None:
+    outbox.configure(
+        StubStore(), JsonEventSerializer(), max_retry_backoff_seconds=300.0, start_loop=False
+    )
+    attempted = datetime.now(UTC) - timedelta(seconds=1)
+    pub = _make_pub(record, attempt_count=3, last_attempt_at=attempted)  # 2 ** 2 = 4s
+
+    assert outbox.next_retry_at(pub) == attempted + timedelta(seconds=4)
+    assert outbox._backoff_elapsed(pub) is False
+
+    pub.last_attempt_at = datetime.now(UTC) - timedelta(seconds=5)
+    due = outbox.next_retry_at(pub)
+    assert due is not None
+    assert due <= datetime.now(UTC)
+    assert outbox._backoff_elapsed(pub) is True
+
+
+def test_next_retry_at_is_capped_and_treats_naive_timestamps_as_utc() -> None:
+    outbox.configure(
+        StubStore(), JsonEventSerializer(), max_retry_backoff_seconds=60.0, start_loop=False
+    )
+    naive = datetime(2026, 1, 1, 12, 0, 0)
+    pub = _make_pub(record, attempt_count=100_000, last_attempt_at=naive)
+
+    assert outbox.next_retry_at(pub) == datetime(2026, 1, 1, 12, 1, 0, tzinfo=UTC)
+
+
+def test_next_retry_at_is_none_when_a_publication_is_due_now() -> None:
+    outbox.configure(StubStore(), JsonEventSerializer(), start_loop=False)
+
+    assert outbox.next_retry_at(_make_pub(record, attempt_count=0)) is None
+    no_anchor = _make_pub(record, attempt_count=2, published_at=None, last_attempt_at=None)
+    assert outbox.next_retry_at(no_anchor) is None
+
+
+@pytest.mark.asyncio
 async def test_retry_all_dead_lettered_resubmits_with_reset_state() -> None:
     store = StubStore()
     outbox.configure(store, JsonEventSerializer(), dead_letter_after_attempts=2, start_loop=False)

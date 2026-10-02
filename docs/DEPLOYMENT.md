@@ -293,8 +293,15 @@ engine; see §A. This also applies to the store bound from `outbox_url`.
 modulith outbox status              # pending events
 modulith outbox retry <event-id>    # retry a failed event
 modulith outbox purge               # remove delivered events
+modulith outbox failing             # events still being retried: attempts, last error, next retry
 modulith outbox dead-letter         # inspect stuck events
 ```
+
+`failing` lists undelivered rows that have failed at least once and are not yet
+dead-lettered. Its next-retry time is the last attempt plus the retry backoff
+(doubling per attempt, capped by `max_retry_backoff_seconds`); a time in the
+past means the next sweep picks the row up. It prints `no failing publications`
+when there are none, and exits 1 for a custom store without `find_failing`.
 
 These run in the CLI's **own** process and operate on the store that process
 binds. They cannot reach into a separately-running server: the store binds in

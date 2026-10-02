@@ -425,7 +425,9 @@ session's open transaction, under the same rule: they are delivered only if a
 later commit covers them. Its publishes after then are not transactional. For
 a durable publish from such a task, open and bind a session in the task itself.
 Inspect the queue with `modulith outbox status`; a persistently-failing
-publication is dead-lettered after 10 attempts.
+publication is dead-lettered after 10 attempts. `modulith outbox failing` lists
+the ones still being retried, with their attempts, last error and next retry
+time (it needs a store with `find_failing`, which the built-in SQL store has).
 
 `bind_session` and `unbind_session` live in `modulith.builtin.outbox`. The
 older `modulith.adapters.postgres_outbox` import path still works, as aliases

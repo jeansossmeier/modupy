@@ -782,6 +782,41 @@ class PostgresPublicationStore:
             rows = (await s.execute(stmt)).scalars().all()
             return [_row_to_pub(r) for r in rows]
 
+    async def find_failing(
+        self, *, after: tuple[datetime, UUID] | None = None, limit: int = 100
+    ) -> list[EventPublication]:
+        """Return publications that have failed but are still being retried.
+
+        Failing means undelivered, attempted at least once and not
+        dead-lettered (the same ``is_dead_lettered`` flag ``find_incomplete``
+        filters on). Pages like ``find_dead_lettered``: ``after`` is the
+        ``(published_at, id)`` of the previous page's last row.
+        """
+        async with self._open_session() as s:
+            stmt = select(EventPublicationRow).where(
+                EventPublicationRow.completed_at.is_(None),
+                EventPublicationRow.attempt_count > 0,
+                EventPublicationRow.is_dead_lettered.is_(False),
+            )
+            if after is not None:
+                after_at, after_id = after
+                normalized = _to_utc(after_at)
+                assert normalized is not None
+                stmt = stmt.where(
+                    or_(
+                        EventPublicationRow.published_at > normalized,
+                        and_(
+                            EventPublicationRow.published_at == normalized,
+                            EventPublicationRow.id > after_id,
+                        ),
+                    )
+                )
+            stmt = stmt.order_by(EventPublicationRow.published_at, EventPublicationRow.id).limit(
+                limit
+            )
+            rows = (await s.execute(stmt)).scalars().all()
+            return [_row_to_pub(r) for r in rows]
+
     async def find_by_id(self, publication_id: UUID) -> EventPublication | None:
         """Direct point lookup by id, used by ``force_retry``.
 

@@ -615,6 +615,7 @@ Every setting directly under `[tool.modulith]` can also come from an environment
 | `modulith doctor` | reports architecture and operations health | reviews and incidents |
 | `modulith migrate` | creates the outbox and database-broker tables | deploying |
 | `modulith outbox status` | counts incomplete, completed and dead-lettered events | operations |
+| `modulith outbox failing` | lists events that are failing but not yet dead-lettered, with their last error and next retry time | incidents |
 | `modulith outbox dead-letter` | lists dead-lettered events, or replays them with `--retry-all` | incidents |
 | `modulith broker dead-letter` | lists dead-lettered broker deliveries, or resubmits them with `--retry-all` (database broker only) | incidents |
 | `modulith broker drop-group <group>` | removes a retired module's consumer group | operations |

@@ -594,6 +594,53 @@ async def test_find_dead_lettered_keyset_pagination_reaches_101_plus(engine) -> 
     assert len({p.id for p in all_dead}) == total  # no duplicates across pages
 
 
+async def test_find_failing_returns_only_attempted_undelivered_not_dead_rows(engine) -> None:
+    """Failing = attempt_count > 0, not completed, and below the dead-letter
+    threshold: never-attempted, delivered and dead-lettered rows are excluded."""
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=3)
+    fresh = _pub(0, attempt_count=0)
+    first_failure = _pub(1, attempt_count=1, last_error="boom")
+    last_chance = _pub(2, attempt_count=2, last_error="boom again")
+    dead = _pub(3, attempt_count=3, last_error="gave up")
+    done = _pub(4, attempt_count=1, completed_at=datetime.now(UTC))
+    for pub in (fresh, first_failure, last_chance, dead, done):
+        await store.save(pub)
+
+    failing = await store.find_failing()
+
+    assert {p.id for p in failing} == {first_failure.id, last_chance.id}
+    assert {p.last_error for p in failing} == {"boom", "boom again"}
+
+
+async def test_find_failing_keyset_pagination_reaches_101_plus(engine) -> None:
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=10)
+    total = 105
+    base = datetime.now(UTC) - timedelta(hours=1)
+    for i in range(total):
+        await store.save(_pub(i, attempt_count=1, published_at=base + timedelta(seconds=i)))
+
+    first_page = await store.find_failing()
+    assert len(first_page) == 100
+    last = first_page[-1]
+    assert last.published_at is not None
+    second_page = await store.find_failing(after=(last.published_at, last.id), limit=100)
+
+    assert len(second_page) == total - 100
+    assert len({p.id for p in first_page + second_page}) == total
+
+
+async def test_outbox_list_failing_pages_through_the_sqlite_store(engine) -> None:
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=10)
+    outbox.configure(store, JsonEventSerializer(), dead_letter_after_attempts=10, start_loop=False)
+    total = 103
+    for i in range(total):
+        await store.save(_pub(i, attempt_count=2))
+
+    failing = await outbox.list_failing()
+
+    assert len({p.id for p in failing}) == total
+
+
 async def test_last_attempt_at_persists_and_round_trips(engine) -> None:
     store = PostgresPublicationStore(engine=engine)
     ts = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)

@@ -1835,6 +1835,35 @@ def outbox_dead_letter(
         )
 
 
+@outbox_app.command("failing")
+def outbox_failing() -> None:
+    """List publications that are failing but not yet dead-lettered.
+
+    One line per row with its attempts, last error and when the retry loop
+    next considers it due. Needs a store with ``find_failing`` (the built-in
+    SQL store has it); exits 1 for one without.
+    """
+    _bootstrap_or_exit()
+    _require_outbox_store()
+
+    try:
+        failing = asyncio.run(outbox.list_failing())
+    except NotImplementedError as exc:
+        typer.echo(f"{exc}: it cannot list failing publications", err=True)
+        raise typer.Exit(code=1) from None
+    if not failing:
+        typer.echo("no failing publications")
+        return
+    typer.echo(f"{len(failing)} failing publication(s):")
+    for pub in failing:
+        due = outbox.next_retry_at(pub)
+        typer.echo(
+            f"  {pub.id}  {pub.event_type}  listener={pub.listener}  "
+            f"attempts={pub.attempt_count}  last_error={pub.last_error}  "
+            f"next_retry_at={due.isoformat(timespec='seconds') if due else 'now'}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # modulith info — show detected configuration
 # ---------------------------------------------------------------------------

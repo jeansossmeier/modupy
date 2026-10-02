@@ -967,8 +967,8 @@ async def _dispatch_broker_route(publication: EventPublication) -> None:
 _MAX_BACKOFF_EXPONENT = 1023
 
 
-def _backoff_elapsed(publication: EventPublication) -> bool:
-    """True when enough time has passed since publish to retry this record.
+def _retry_schedule(publication: EventPublication) -> tuple[datetime, float] | None:
+    """The ``(anchor, backoff seconds)`` a retry waits on; None when due at once.
 
     A never-attempted record (count 0) dispatches immediately — this is the
     crash-recovery case, where a committed-but-undelivered publication must go
@@ -979,10 +979,10 @@ def _backoff_elapsed(publication: EventPublication) -> bool:
     every sweep once it ages past the cap.
     """
     if publication.attempt_count == 0:
-        return True
+        return None
     anchor = publication.last_attempt_at or publication.published_at
     if anchor is None:
-        return True
+        return None
     if anchor.tzinfo is None:
         # The plugin always WRITES UTC-aware timestamps, but a custom store's
         # find_incomplete() may round-trip them naive (SQLite, for one, drops
@@ -998,9 +998,29 @@ def _backoff_elapsed(publication: EventPublication) -> bool:
     # the largest non-overflowing exponent and ``2.0 ** 1023`` already dwarfs
     # any finite backoff cap, so the min() below is unchanged.
     exponent = min(publication.attempt_count - 1, _MAX_BACKOFF_EXPONENT)
-    backoff = min(2.0**exponent, _max_retry_backoff_seconds)
-    age = (datetime.now(UTC) - anchor).total_seconds()
-    return age >= backoff
+    return anchor, min(2.0**exponent, _max_retry_backoff_seconds)
+
+
+def _backoff_elapsed(publication: EventPublication) -> bool:
+    """True when enough time has passed since the last attempt to retry this record."""
+    schedule = _retry_schedule(publication)
+    if schedule is None:
+        return True
+    anchor, backoff = schedule
+    return (datetime.now(UTC) - anchor).total_seconds() >= backoff
+
+
+def next_retry_at(publication: EventPublication) -> datetime | None:
+    """When the retry sweep next considers ``publication`` due; None when due now.
+
+    The same backoff ``_backoff_elapsed`` applies, as a timestamp instead of a
+    verdict.
+    """
+    schedule = _retry_schedule(publication)
+    if schedule is None:
+        return None
+    anchor, backoff = schedule
+    return anchor + timedelta(seconds=backoff)
 
 
 async def _sweep(older_than: timedelta) -> None:
@@ -1523,6 +1543,30 @@ async def list_dead_lettered() -> list[EventPublication]:
     return results
 
 
+async def list_failing() -> list[EventPublication]:
+    """Return ALL publications that have failed but are not yet dead-lettered.
+
+    Pages through the store's optional ``find_failing(after=..., limit=...)``
+    keyset capability, like ``list_dead_lettered``. There is no fallback: a
+    store without it raises ``NotImplementedError``.
+    """
+    assert _store is not None
+    finder = getattr(_store, "find_failing", None)
+    if finder is None:
+        raise NotImplementedError(f"{type(_store).__name__} does not implement find_failing")
+    results: list[EventPublication] = []
+    after: tuple[datetime, UUID] | None = None
+    page_size = 100
+    while True:
+        page = await finder(after=after, limit=page_size)
+        results.extend(page)
+        if len(page) < page_size:
+            return results
+        last = page[-1]
+        assert last.published_at is not None
+        after = (last.published_at, last.id)
+
+
 async def retry_all_dead_lettered() -> int:
     """Resubmit every dead-lettered publication with a fresh retry budget.
 
@@ -1611,8 +1655,10 @@ __all__ = [
     "configure",
     "force_retry",
     "list_dead_lettered",
+    "list_failing",
     "modulith_after_event_published",
     "modulith_before_event_published",
+    "next_retry_at",
     "persist",
     "persist_broker_route",
     "purge_completed",
