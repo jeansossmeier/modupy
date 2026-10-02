@@ -26,11 +26,14 @@ This is only a concern for long-running single-process apps or REPL environments
 ## Resolution (2026-10-02)
 `await outbox.shutdown()` disposes the store and engine that `Runtime.bind_configured_outbox` built from `outbox_url`, once the retry loop has stopped (`modulith/builtin/outbox.py::_dispose_owned_resources`, fed by `outbox._owned_resources`). No public API was added. A store the application passed to `outbox.configure()` is never disposed. Workers reach the same disposal through `Runtime.shutdown`, which calls `outbox.shutdown()`.
 
-Residual, accepted: when the retry loop ran on another event loop than the one awaiting `shutdown()`, such as `publish_sync()`'s daemon-thread loop, the engine is left open and a debug message says so. A driver such as asyncpg cannot close connections bound to another loop.
+When the retry loop ran on another event loop than the one awaiting `shutdown()`, such as `publish_sync()`'s daemon-thread loop, the disposal runs on that loop, because a driver such as asyncpg closes a connection only on the loop that opened it.
+
+Residual, accepted: if that loop has closed, or does not run the disposal within `_shutdown_grace_seconds`, the engine is left open and a warning says so. A pool holding connections opened on both loops still has the ones from the awaiting loop closed from the retry loop, which asyncpg rejects; SQLAlchemy logs each such failure and drops the connection.
 
 Tests:
 - `tests/test_outbox.py::test_outbox_shutdown_closes_the_pool_of_the_engine_built_from_outbox_url`
 - `tests/test_outbox.py::test_outbox_shutdown_leaves_an_application_configured_engine_alone`
 - `tests/test_outbox.py::test_outbox_shutdown_ignores_the_outbox_url_when_the_application_configured_its_store`
 - `tests/test_outbox.py::test_outbox_shutdown_twice_disposes_the_outbox_url_engine_once`
-- `tests/test_outbox.py::test_outbox_shutdown_on_another_loop_than_the_retry_loop_leaves_the_engine_open`
+- `tests/test_outbox.py::test_outbox_shutdown_disposes_the_engine_on_the_retry_loops_own_event_loop`
+- `tests/test_outbox.py::test_outbox_shutdown_leaves_the_engine_open_with_a_warning_when_the_retry_loop_closed`

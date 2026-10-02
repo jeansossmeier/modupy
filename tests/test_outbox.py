@@ -3058,39 +3058,78 @@ def test_runtime_shutdown_disposes_the_outbox_url_engine_once(
     assert (asyncio.run(scenario()), len(disposals), engine.pool.checkedin()) == (1, 1, 0)
 
 
-def test_outbox_shutdown_on_another_loop_than_the_retry_loop_leaves_the_engine_open(
-    make_fake_app: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
+def test_outbox_shutdown_disposes_the_engine_on_the_retry_loops_own_event_loop(
+    make_fake_app: Any, tmp_path: Path
 ) -> None:
     engine, disposals = _bind_outbox_url_engine(make_fake_app, tmp_path / "app.db")
     retry_loop = asyncio.new_event_loop()
     thread = threading.Thread(target=retry_loop.run_forever, daemon=True)
     thread.start()
+    disposing_loops: list[asyncio.AbstractEventLoop] = []
+    sqlalchemy_event.listen(
+        engine.sync_engine,
+        "engine_disposed",
+        lambda _: disposing_loops.append(asyncio.get_running_loop()),
+    )
 
     async def start_retry_loop_on_the_other_loop() -> None:
         outbox._ensure_retry_loop()
 
+    async def pool_a_connection_on_the_other_loop() -> int:
+        return await _create_tables_and_pool_a_connection(engine)
+
     async def scenario() -> tuple[int, int, int]:
-        pooled = await _create_tables_and_pool_a_connection(engine)
+        pooled = asyncio.run_coroutine_threadsafe(
+            pool_a_connection_on_the_other_loop(), retry_loop
+        ).result(5)
         asyncio.run_coroutine_threadsafe(start_retry_loop_on_the_other_loop(), retry_loop).result(5)
         assert outbox._retry_task is not None
         assert outbox._retry_task.get_loop() is retry_loop
-        with caplog.at_level(logging.DEBUG, logger="modulith.outbox"):
-            await asyncio.wait_for(outbox.shutdown(), timeout=15)
-        result = (pooled, int(engine.pool.checkedin()), len(disposals))
-        await engine.dispose()
-        return result
+        await asyncio.wait_for(outbox.shutdown(), timeout=15)
+        return pooled, int(engine.pool.checkedin()), len(disposals)
 
     try:
-        assert asyncio.run(scenario()) == (1, 1, 0)
+        assert asyncio.run(scenario()) == (1, 0, 1)
     finally:
         retry_loop.call_soon_threadsafe(retry_loop.stop)
         thread.join(5)
         retry_loop.close()
 
-    assert [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG][-1:] == [
-        "outbox shutdown ran on another event loop than the retry loop; "
-        "leaving the engine built from outbox_url open"
-    ]
+    assert disposing_loops == [retry_loop]
+
+
+def test_outbox_shutdown_leaves_the_engine_open_with_a_warning_when_the_retry_loop_closed(
+    make_fake_app: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    engine, disposals = _bind_outbox_url_engine(make_fake_app, tmp_path / "app.db")
+    closed_loop = asyncio.new_event_loop()
+    closed_loop.close()
+
+    class TaskOnClosedLoop:
+        def done(self) -> bool:
+            return False
+
+        def get_loop(self) -> asyncio.AbstractEventLoop:
+            return closed_loop
+
+    monkeypatch.setattr(outbox, "_retry_task", TaskOnClosedLoop())
+
+    async def scenario() -> int:
+        with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
+            await asyncio.wait_for(outbox.shutdown(), timeout=15)
+        disposed = len(disposals)
+        await engine.dispose()
+        return disposed
+
+    assert asyncio.run(scenario()) == 0
+    assert any(
+        "leaving the engine built from outbox_url open" in r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+    )
 
 
 _FAILING_LISTENER_APP = {

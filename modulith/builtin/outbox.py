@@ -1391,9 +1391,11 @@ async def shutdown() -> None:
     disposed, closing the engine's pooled connections. A store the
     application passed to ``configure()`` is never disposed: its engine
     belongs to the application. When the retry loop ran on another event loop
-    than the one awaiting ``shutdown()``, the engine is left open: its pooled
-    connections may be bound to that other loop, and a driver such as asyncpg
-    fails when closing them from a different one.
+    than the one awaiting ``shutdown()``, such as ``publish_sync()``'s
+    daemon-thread loop, the disposal runs on that loop, where its pooled
+    connections were opened. If that loop is closed or does not run the
+    disposal within ``_shutdown_grace_seconds``, the engine is left open and
+    a warning says so.
 
     See ``_stop_retry_loop`` for how the loop is stopped.
     """
@@ -1410,15 +1412,28 @@ async def _dispose_owned_resources(task_loop: asyncio.AbstractEventLoop | None) 
     owned, _owned_resources = _owned_resources, None
     if owned is None:
         return
-    if task_loop is not None and task_loop is not asyncio.get_running_loop():
-        logger.debug(
-            "outbox shutdown ran on another event loop than the retry loop; "
-            "leaving the engine built from outbox_url open"
-        )
-        return
     store, engine = owned
-    await store.dispose()
-    await engine.dispose()
+
+    async def dispose() -> None:
+        await store.dispose()
+        await engine.dispose()
+
+    if task_loop is None or task_loop is asyncio.get_running_loop():
+        await dispose()
+        return
+    # The retry sweeps pooled their connections on task_loop, and a driver
+    # such as asyncpg closes a connection only on the loop that opened it.
+    if not task_loop.is_closed():
+        future = asyncio.run_coroutine_threadsafe(dispose(), task_loop)
+        try:
+            await asyncio.wait_for(asyncio.wrap_future(future), _shutdown_grace_seconds)
+            return
+        except TimeoutError:
+            pass
+    logger.warning(
+        "outbox shutdown could not run on the retry loop's event loop, which is "
+        "closed or not running; leaving the engine built from outbox_url open"
+    )
 
 
 async def _stop_retry_loop() -> asyncio.AbstractEventLoop | None:
