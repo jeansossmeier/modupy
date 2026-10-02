@@ -165,7 +165,8 @@ $ python -m marketplace.catalog SKU-MUG "Stoneware mug" 1200 10
 $ modulith doctor
 modulith doctor
 ✓ boundary health — 0 violation(s)
-✓ process-split readiness — 100% of cross-module interactions via events — microservice-ready
+✓ process-split readiness — 93% of cross-module interactions via events — process-split ready
+    orders: 1 direct cross-module import(s)
 ✓ schema drift — recorded 12 event schema(s)
 ✓ outbox health — 0 incomplete, 1 completed, 0 dead-lettered
 ✓ listener registration — 17 declared listener(s), all registered
@@ -175,6 +176,10 @@ modulith doctor
 ✓ redis retention — broker is not redis-streams
 overall: ok
 ```
+
+`orders` imports `catalog` to call `price_of`, so `doctor` counts one direct
+cross-module import and rates the app process-split ready rather than
+microservice-ready.
 
 ### 2. Serve the platform
 
