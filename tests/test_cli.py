@@ -1329,6 +1329,22 @@ def test_outbox_failing_lists_failing_publications_with_next_retry(make_fake_app
         assert str(other.id) not in result.output
 
 
+def test_outbox_failing_shows_now_for_a_row_without_timestamps(make_fake_app, monkeypatch):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    store = FailingStore()
+    undated = _failing_pub(published_at=None, last_attempt_at=None)
+    store.pubs[undated.id] = undated
+    outbox.configure(store=store, serializer=JsonEventSerializer(), start_loop=False)
+
+    result = runner.invoke(app, ["outbox", "failing"])
+
+    assert result.exit_code == 0, result.output
+    lines = [line for line in result.output.splitlines() if str(undated.id) in line]
+    assert len(lines) == 1
+    assert lines[0].endswith("next_retry_at=now")
+
+
 def test_outbox_failing_pages_past_one_page(make_fake_app, monkeypatch):
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app({"orders": ""})
