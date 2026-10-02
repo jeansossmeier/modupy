@@ -52,6 +52,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import os
 from collections import Counter
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
@@ -113,6 +114,24 @@ def _disabled_rules_from_config() -> frozenset[str]:
     return frozenset(cfg.verify_disabled_rules)
 
 
+def _looks_like_rule_typo(name: str) -> bool:
+    """Whether ``name`` nearly matches a built-in rule or misspells its start.
+
+    A shortened name such as ``no-cycle`` scores only 0.5 against the whole
+    of ``no-cyclic-dependency``, so a name also counts as a typo when it
+    shares a rule's leading words and then diverges three or more letters
+    into the next word. A plugin rule that only shares whole words, such as
+    ``no-print`` or ``no-internal-calls``, does not.
+    """
+    if difflib.get_close_matches(name, RULE_NAMES, n=1, cutoff=0.8):
+        return True
+    for rule in RULE_NAMES:
+        _, sep, partial = os.path.commonprefix([name, rule]).rpartition("-")
+        if sep and len(partial) >= 3:
+            return True
+    return False
+
+
 def _configured_disabled_rules() -> frozenset[str]:
     """The rule names disabled via runtime config, or none.
 
@@ -122,11 +141,7 @@ def _configured_disabled_rules() -> frozenset[str]:
     name that nearly matches a built-in rule — a typo — draws a warning.
     """
     disabled = _disabled_rules_from_config()
-    typos = sorted(
-        name
-        for name in disabled - RULE_NAMES
-        if difflib.get_close_matches(name, RULE_NAMES, n=1, cutoff=0.8)
-    )
+    typos = sorted(name for name in disabled - RULE_NAMES if _looks_like_rule_typo(name))
     if typos:
         known_str = ", ".join(sorted(RULE_NAMES))
         logger.warning(

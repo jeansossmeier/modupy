@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from modulith import ModuleInfo, Violation, hookimpl
 from modulith.builtin import verifier
 from modulith.builtin.verifier import (
@@ -1080,6 +1082,26 @@ def test_disabled_rules_no_warning_for_known_rule(make_fake_app, monkeypatch, ca
     assert not any(
         "disabled_rules names no known rule" in record.message for record in caplog.records
     ), f"Unexpected warning for known rule, got: {[r.message for r in caplog.records]}"
+
+
+@pytest.mark.parametrize(
+    ("name", "is_typo"),
+    [
+        ("no-cycle", True),
+        ("no-cycles", True),
+        ("no-cyclic-deps", True),
+        ("no-internal-import", True),
+        ("use-contract", True),
+        ("use", False),
+        ("no-print", False),
+        ("no-internal-calls", False),
+        ("database", False),
+        ("max-module-size", False),
+    ],
+)
+def test_disabled_rules_typo_detection(name: str, is_typo: bool) -> None:
+    """Shortened built-in names warn; unrelated plugin rule names do not."""
+    assert verifier._looks_like_rule_typo(name) is is_typo
 
 
 # ---------------------------------------------------------------------------
