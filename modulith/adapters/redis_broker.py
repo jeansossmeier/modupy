@@ -386,6 +386,10 @@ class RedisStreamsBroker:
         # failed XADD leave a dedup key with nothing behind it: the retry
         # would then see "already deduped", skip the XADD, and fall through to
         # the unconditional XACK below, silently dropping the payload.
+        # The delivery count copied into h:attempts comes from XPENDING, read
+        # with redis.pcall(): XPENDING raises NOGROUP once the consumer group is
+        # gone, and redis.call() would abort the script before the dead letter
+        # was written. A missing group or entry counts as one delivery.
         dedup_key = f"{stream}.dead.dedup.{group_name}.{message_id}"
         arguments: list[str | bytes | int] = [
             group_name,
@@ -400,8 +404,8 @@ class RedisStreamsBroker:
             arguments.extend((key, value))
         await self._client.eval(
             f"""
-            local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[2], ARGV[2], 1)
-            local attempts = (pending[1] or {{0, 0, 0, 1}})[4]
+            local entry = redis.pcall('XPENDING', KEYS[1], ARGV[1], ARGV[2], ARGV[2], 1)[1]
+            local attempts = entry and entry[4] or 1
             local exists = redis.call('EXISTS', KEYS[3])
             if exists == 0 then
               local command = {{KEYS[2], 'MAXLEN', '~', ARGV[3], '*'}}

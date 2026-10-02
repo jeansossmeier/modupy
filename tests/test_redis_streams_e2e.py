@@ -405,6 +405,25 @@ async def test_list_dead_letters_reports_target_group_event_type_and_creation_ti
     assert listed == sorted(listed, key=lambda e: e.cursor)
 
 
+async def test_dead_letter_for_a_group_that_was_never_created_is_still_written(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    """XPENDING raises NOGROUP for a missing group; that must not stop the transfer."""
+    broker = _broker(redis_url, redis_key_prefix)
+    try:
+        await broker.publish(_TARGET, b"poison")
+        [(message_id, fields)] = await redis_client.xrange(_stream(redis_key_prefix))
+
+        await broker.dead_letter(_TARGET, message_id.decode(), fields, "never-created")
+
+        [dead] = await broker.list_dead_letters()
+    finally:
+        await broker.close()
+    assert dead.target == _TARGET
+    assert dead.consumer_group == "never-created"
+    assert dead.attempts == 1
+
+
 async def test_list_dead_letters_ignores_streams_of_another_prefix(
     redis_url, redis_client, redis_key_prefix
 ) -> None:

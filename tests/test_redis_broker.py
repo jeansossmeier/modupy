@@ -351,7 +351,7 @@ async def test_stream_caps_accept_numeric_strings() -> None:
     assert 7 in fake.eval_calls[0][2]
 
 
-_DEAD_LETTER_CALL_RE = re.compile(r"redis\.call\('(\w+)'[^)]*\)")
+_DEAD_LETTER_CALL_RE = re.compile(r"redis\.p?call\('(\w+)'[^)]*\)")
 
 
 def _run_dead_letter_script(
@@ -486,6 +486,21 @@ async def test_dead_letter_xadd_failure_leaves_no_dangling_dedup_key() -> None:
 
     assert fake.dlq_entries == ["1-0"]  # retry actually reaches the DLQ
     assert fake.acked_ids == ["1-0"]
+
+
+def test_dead_letter_of_reports_the_delivery_count_the_dead_letter_copied(broker) -> None:
+    dead = broker._dead_letter_of("orders", b"1-0", {b"data": b"{}", b"h:attempts": b"4"})
+
+    assert dead.attempts == 4
+
+
+def test_dead_letter_of_counts_one_attempt_for_a_dead_letter_written_by_an_earlier_version(
+    broker,
+) -> None:
+    """Dead letters written before ``h:attempts`` was copied carry no count."""
+    dead = broker._dead_letter_of("orders", b"1-0", {b"data": b"{}"})
+
+    assert dead.attempts == 1
 
 
 async def test_close_calls_aclose(broker, fake) -> None:
