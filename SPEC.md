@@ -1028,7 +1028,7 @@ class Scenario:
 
 Implementation strategy: subprocess-per-test for the strictest isolation mode. Fork overhead is fine for integration tests in CI; not for unit tests on save.
 
-For non-isolated tests, the fixtures handle state reset, but only for the tests that request them. `modulith_app` resets the runtime singleton before and after the test and, on teardown, drops every non-`modulith` module first imported during it. `modulith_module` removes the application package's modules from `sys.modules` for the duration of the `with` block, installs `MagicMock` stand-ins for `mock_modules`, and restores `sys.modules` and the manifest registry on exit. Names are dotted module paths: `"myapp.orders"`, not `"orders"`.
+For non-isolated tests, the fixtures handle state reset, but only for the tests that request them. `modulith_app` resets the runtime singleton before and after the test and, on teardown, drops every module of the application package first imported during it: the package the test configured or bootstrapped, or else the one `[tool.modulith] package`, `MODULITH_PACKAGE` or `[project] name` names. Third-party, stdlib and `modulith` modules stay loaded. `modulith_module` removes the application package's modules from `sys.modules` for the duration of the `with` block, installs `MagicMock` stand-ins for `mock_modules`, and restores `sys.modules` and the manifest registry on exit. Names are dotted module paths: `"myapp.orders"`, not `"orders"`.
 
 ### 11.4 Subprocess-Per-Test Mode
 

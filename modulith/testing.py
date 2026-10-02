@@ -105,6 +105,22 @@ class _SpyPlugin:
         self._app.listener_calls.append((listener_name, event))
 
 
+def _application_package() -> str | None:
+    """Resolved as ``Runtime._bootstrap`` resolves it, minus caller-stack detection."""
+    from .config import ConfigurationError, _read_env_vars, _read_pyproject
+    from .discovery import _detect_from_pyproject_name
+    from .runtime import _runtime
+
+    if _runtime._config is not None:
+        return _runtime._config.package
+    try:
+        explicit = {**_read_pyproject(), **_read_env_vars(), **_runtime._config_overrides}
+    except ConfigurationError:
+        return None
+    package = explicit.get("package")
+    return str(package) if package else _detect_from_pyproject_name()
+
+
 @pytest.fixture
 def modulith_app() -> Iterator[ModulithTestApp]:
     """Provide a fresh modulith runtime for each test.
@@ -115,8 +131,10 @@ def modulith_app() -> Iterator[ModulithTestApp]:
     application package first imported during the test is dropped from
     ``sys.modules`` so import-time state can't leak into the next test. The
     package is the one the test configured or bootstrapped (``configure(package=...)``
-    or the resolved ``Configuration.package``); a test that did neither
-    purges nothing. Third-party, stdlib and ``modulith``'s own modules are
+    or the resolved ``Configuration.package``). For a test that did neither,
+    it is the package bootstrap would resolve from ``[tool.modulith] package``,
+    ``MODULITH_PACKAGE`` or ``[project] name``; with none of those set, nothing
+    is purged. Third-party, stdlib and ``modulith``'s own modules are
     never dropped: libraries such as SQLAlchemy cannot be re-imported, and
     ``modulith``'s identity backs the runtime singleton and other global state.
 
@@ -140,10 +158,7 @@ def modulith_app() -> Iterator[ModulithTestApp]:
     try:
         yield test_app
     finally:
-        config = _runtime._config
-        package = (
-            config.package if config is not None else _runtime._config_overrides.get("package")
-        )
+        package = _application_package()
         _runtime._reset_for_testing()
         if package:
             for name in set(sys.modules) - snapshot:

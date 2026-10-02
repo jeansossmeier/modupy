@@ -987,8 +987,9 @@ identical to single-process mode — that's the point.
   shielded — a failing exporter can't affect delivery.
 - **Testing** (`modulith/testing.py`, SPEC Part XI): a pytest plugin whose
   fixtures are opt-in, so a test gets one only by naming it as an argument.
-  `modulith_app` resets the runtime singleton around the test, drops modules
-  first imported during it, and hands back a capture handle for asserting
+  `modulith_app` resets the runtime singleton around the test, drops the
+  application package's modules first imported during it, and hands back a
+  capture handle for asserting
   published events. `modulith_module("myapp.orders", mock_modules=[...])`
   isolates one module from its siblings, with dotted module names. A
   `modulith_isolated` marker runs a test in its own subprocess, and a fluent

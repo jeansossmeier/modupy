@@ -111,6 +111,42 @@ def test_modulith_app_purges_only_the_applications_modules(pytester, bootstrap: 
     result.assert_outcomes(passed=2)
 
 
+_UNBOOTSTRAPPED_PURGE_TESTS = """
+import importlib
+import sys
+
+
+def test_first_imports_an_app_module_without_bootstrapping(modulith_app):
+    importlib.import_module("purgeapp.orders")
+
+
+def test_second_sees_the_app_module_purged():
+    assert "purgeapp.orders" not in sys.modules
+"""
+
+
+@pytest.mark.parametrize(
+    "pyproject",
+    ['[tool.modulith]\npackage = "purgeapp"\n', '[project]\nname = "purgeapp"\nversion = "0"\n'],
+    ids=["tool-modulith-package", "project-name"],
+)
+def test_modulith_app_purges_the_project_package_when_the_test_never_bootstrapped(
+    pytester, pyproject: str
+) -> None:
+    """Application modules a test imported without bootstrapping would otherwise
+    enter every later test's snapshot and survive its purge, while the modules
+    importing them are dropped and re-imported: tables defined again on a
+    surviving SQLAlchemy ``MetaData`` then fail with "already defined"."""
+    pytester.makepyprojecttoml(pyproject)
+    pytester.mkpydir("purgeapp")
+    pytester.mkpydir("purgeapp/orders")
+    pytester.makepyfile(test_purge=_UNBOOTSTRAPPED_PURGE_TESTS)
+
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider")
+
+    result.assert_outcomes(passed=2)
+
+
 # ---------------------------------------------------------------------------
 # scenario — fluent event-flow assertions
 # ---------------------------------------------------------------------------
