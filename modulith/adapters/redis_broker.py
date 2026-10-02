@@ -96,7 +96,7 @@ _DEFAULT_GROUP = "modulith"
 _DEFAULT_MAXLEN = 10000
 _DLQ_DEDUP_TTL_SECONDS = 7 * 24 * 60 * 60
 _DEAD_SUFFIX = ".dead"
-_DEAD_ONLY_FIELDS = frozenset({b"h:source_message_id", b"h:source_group"})
+_DEAD_ONLY_FIELDS = frozenset({b"h:source_message_id", b"h:source_group", b"h:attempts"})
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _SOCKET_TIMEOUT_MARGIN_S = 5.0
 
@@ -400,10 +400,14 @@ class RedisStreamsBroker:
             arguments.extend((key, value))
         await self._client.eval(
             f"""
+            local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[2], ARGV[2], 1)
+            local attempts = (pending[1] or {{0, 0, 0, 1}})[4]
             local exists = redis.call('EXISTS', KEYS[3])
             if exists == 0 then
               local command = {{KEYS[2], 'MAXLEN', '~', ARGV[3], '*'}}
               for index = 4, #ARGV do table.insert(command, ARGV[index]) end
+              table.insert(command, 'h:attempts')
+              table.insert(command, attempts)
               redis.call('XADD', unpack(command))
               redis.call('SET', KEYS[3], ARGV[2], 'EX', {_DLQ_DEDUP_TTL_SECONDS})
             end
@@ -436,6 +440,7 @@ class RedisStreamsBroker:
         ms, seq = _cursor_str(entry_id).split("-")
         event_type = fields.get(b"h:event_type")
         group = fields.get(b"h:source_group")
+        attempts = fields.get(b"h:attempts")
         return DeadLetter(
             # Zero-padded so that sorting ids as strings follows stream order, and
             # suffixed with the target because entry ids repeat across streams.
@@ -443,11 +448,9 @@ class RedisStreamsBroker:
             target=target,
             consumer_group=group.decode() if group is not None else self._consumer_group,
             event_type=event_type.decode() if event_type is not None else None,
-            # Redis keeps no delivery count for a dead letter. Every one was
-            # delivered at least once, so 1 is the one value that is never wrong;
-            # a message that failed repeatedly was delivered up to
-            # max_delivery_attempts times, an undecodable one exactly once.
-            attempts=1,
+            # dead_letter copies the PEL delivery count into h:attempts. A dead
+            # letter written before it did has none; 1 is a lower bound for it.
+            attempts=int(attempts) if attempts is not None else 1,
             last_error=None,
             created_at=_EPOCH + timedelta(milliseconds=int(ms)),
         )
@@ -461,7 +464,8 @@ class RedisStreamsBroker:
         ``created_at`` is the millisecond timestamp of the entry's id in the
         dead stream, i.e. when it was dead-lettered; ``last_error`` is always
         ``None`` because the dead stream stores no error text. ``attempts`` is
-        always 1, a lower bound: see ``_dead_letter_of``.
+        how many times the consumer group delivered the message: see
+        ``_dead_letter_of``.
         """
         after_ms = None if after is None else (after[0] - _EPOCH) // timedelta(milliseconds=1)
         found: list[DeadLetter] = []

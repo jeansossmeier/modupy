@@ -384,6 +384,8 @@ def _run_dead_letter_script(
     dedup_key = keys[2]
 
     def _exec(name: str) -> Any:
+        if name == "XPENDING":
+            return []
         if name == "EXISTS":
             return 1 if dedup_key in dedup_store else 0
         if name == "SET":

@@ -20,7 +20,7 @@ from dataclasses import dataclass
 import pytest
 
 from modulith import event
-from modulith._consumer import BrokerConsumer
+from modulith._consumer import _MAX_DELIVERY_ATTEMPTS, BrokerConsumer
 from modulith.adapters._dead_letter import DeadLetterRetryRefused
 from modulith.adapters.redis_broker import RedisStreamsBroker
 from modulith.event_bus import InMemoryEventBus
@@ -266,6 +266,8 @@ async def test_repeated_dispatch_failures_dead_letter_on_real_redis(
         await consumer.start()
         await _until_async(dlq_ready)
         assert await redis_client.xlen(dlq) == 1
+        [dead] = await broker.list_dead_letters()
+        assert dead.attempts == _MAX_DELIVERY_ATTEMPTS
     finally:
         await consumer.stop()
         await broker.close()

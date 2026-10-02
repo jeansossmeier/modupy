@@ -1285,9 +1285,11 @@ its next poll. A broker without dead-letter support, such as a custom one, exits
 1 saying so. For the outbox, use `modulith outbox dead-letter`.
 
 On the Redis broker the command reads the `<stream_prefix>.<target>.dead`
-streams. Redis stores no error text or attempt count for a dead letter, so
-`last_error` is `None` and `attempts` is always `1` (a lower bound), and the
-creation time is the entry id's timestamp. `--retry-all` re-adds each entry to
+streams. Redis stores no error text for a dead letter, so `last_error` is
+`None`. `attempts` is how many times the consumer group delivered the message
+before it was dead-lettered; a dead letter written by an earlier modupy version
+has no count and shows `1`, a lower bound. The creation time is the entry id's
+timestamp. `--retry-all` re-adds each entry to
 its target's stream and deletes it from the dead stream. Redis cannot address
 one consumer group, so a re-added message reaches every group on that stream:
 a target is resubmitted only when its stream has **one** consumer group. For a
