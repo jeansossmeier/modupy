@@ -362,7 +362,8 @@ def test_save_with_bound_sync_session_persists_and_defers_to_sweep(tmp_path) -> 
     db = tmp_path / "syncsave.db"
     sync_engine = create_engine(f"sqlite:///{db}")
     Base.metadata.create_all(sync_engine)
-    store = PostgresPublicationStore(engine=create_async_engine(f"sqlite+aiosqlite:///{db}"))
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db}")
+    store = PostgresPublicationStore(engine=engine)
     pub = _pub(21)
 
     with SyncSession(sync_engine) as session:
@@ -380,6 +381,7 @@ def test_save_with_bound_sync_session_persists_and_defers_to_sweep(tmp_path) -> 
     found = asyncio.run(store.find_incomplete(timedelta(0)))
     assert [p.id for p in found] == [pub.id]
     asyncio.run(store.dispose())
+    asyncio.run(engine.dispose())
     sync_engine.dispose()
 
 

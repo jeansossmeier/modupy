@@ -38,6 +38,29 @@ from modulith.config import _announced_broker_defaults
 
 FENCE = re.compile(r"^```(\S*)\s*$")
 
+_installed_loop: asyncio.AbstractEventLoop | None = None
+
+
+def replace_current_event_loop() -> None:
+    """Install a fresh current event loop, closing the one installed here last.
+
+    A test whose code calls ``asyncio.run()`` leaves the thread with no current
+    loop, and later sync tests call ``asyncio.get_event_loop()``. A loop that is
+    installed and then replaced without ``close()`` is finalised by the garbage
+    collector, raising an "unclosed event loop" ResourceWarning in whichever
+    test happens to be running then.
+    """
+    global _installed_loop
+    if _installed_loop is not None and not _installed_loop.is_running():
+        _installed_loop.close()
+    _installed_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_installed_loop)
+
+
+def pytest_sessionfinish() -> None:
+    if _installed_loop is not None and not _installed_loop.is_running():
+        _installed_loop.close()
+
 
 class Block(NamedTuple):
     """One fenced code block: its info string, first content line, and body."""

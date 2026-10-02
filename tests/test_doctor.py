@@ -36,6 +36,8 @@ from modulith.doctor import (
 from modulith.runtime import _runtime
 from modulith.serializers import JsonEventSerializer
 
+from conftest import replace_current_event_loop
+
 runner = CliRunner()
 
 
@@ -62,7 +64,7 @@ def _reset_state():
     yield
     manifest_module._reset_for_testing()
     outbox._reset_for_testing()
-    asyncio.set_event_loop(asyncio.new_event_loop())
+    replace_current_event_loop()
 
 
 def _check(report: HealthReport, name: str) -> HealthCheck:

@@ -15,7 +15,6 @@ warning). The OTel-absent path is verified by flipping ``_OTEL_AVAILABLE``.
 
 from __future__ import annotations
 
-import asyncio
 import importlib
 
 import pytest
@@ -28,13 +27,15 @@ from modulith import configure
 from modulith.builtin import observability, outbox
 from modulith.serializers import JsonEventSerializer
 
+from conftest import replace_current_event_loop
+
 
 @pytest.fixture(autouse=True)
 def _reset_state():
     outbox._reset_for_testing()
     yield
     outbox._reset_for_testing()
-    asyncio.set_event_loop(asyncio.new_event_loop())
+    replace_current_event_loop()
 
 
 @pytest.fixture

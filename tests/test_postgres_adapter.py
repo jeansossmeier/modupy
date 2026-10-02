@@ -320,7 +320,8 @@ def test_after_commit_without_running_loop_defers_to_retry_sweep(tmp_path, caplo
 
     # Constructing the store is synchronous: it registers the global after_commit
     # hook and becomes the _active_store the hook routes to.
-    store = PostgresPublicationStore(engine=create_async_engine(f"sqlite+aiosqlite:///{db}"))
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db}")
+    store = PostgresPublicationStore(engine=engine)
     pub = _pub(11)
 
     with caplog.at_level(logging.WARNING, logger="modulith.adapters.postgres"):
@@ -352,6 +353,7 @@ def test_after_commit_without_running_loop_defers_to_retry_sweep(tmp_path, caplo
     assert [p.id for p in found] == [pub.id]
 
     asyncio.run(store.dispose())
+    asyncio.run(engine.dispose())
     sync_engine.dispose()
 
 
