@@ -21,6 +21,7 @@ import pytest
 
 from modulith import event
 from modulith._consumer import BrokerConsumer
+from modulith.adapters._dead_letter import DeadLetterRetryRefused
 from modulith.adapters.redis_broker import RedisStreamsBroker
 from modulith.event_bus import InMemoryEventBus
 from modulith.serializers import JsonEventSerializer
@@ -347,5 +348,194 @@ async def test_stream_is_trimmed_to_maxlen(redis_url, redis_client, redis_key_pr
             await _publish(broker, v)
         length = await redis_client.xlen(_stream(redis_key_prefix))
         assert 0 < length < total  # MAXLEN ~ enforced (approximate trimming)
+    finally:
+        await broker.close()
+
+
+# ---------------------------------------------------------------------------
+# Dead-letter inspection and retry (``modulith broker dead-letter``)
+# ---------------------------------------------------------------------------
+
+
+async def _dead_letter_one(
+    broker: RedisStreamsBroker,
+    target: str,
+    group: str,
+    payload: bytes,
+    headers: dict[str, str] | None = None,
+) -> str:
+    """Publish one message, deliver it to ``group`` and dead-letter it; return its id."""
+    await broker.ensure_group(target, group)
+    await broker.publish(target, payload, headers)
+    [(_stream_key, [(message_id, fields)])] = await broker.read(
+        target, consumer="c:1", group=group, block_ms=50
+    )
+    message_id = message_id.decode() if isinstance(message_id, bytes) else message_id
+    await broker.dead_letter(target, message_id, fields, group)
+    return str(message_id)
+
+
+async def test_list_dead_letters_reports_target_group_event_type_and_creation_time(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    broker = _broker(redis_url, redis_key_prefix)
+    try:
+        await _dead_letter_one(
+            broker, _TARGET, "modulith-mod", b"not json", {"event_type": _TARGET}
+        )
+        await _dead_letter_one(broker, "other.Event", "modulith-other", b"x")
+        [(dead_id, _fields)] = await redis_client.xrange(_dlq(redis_key_prefix))
+
+        listed = await broker.list_dead_letters()
+    finally:
+        await broker.close()
+
+    by_target = {entry.target: entry for entry in listed}
+    assert set(by_target) == {_TARGET, "other.Event"}
+    entry = by_target[_TARGET]
+    assert entry.consumer_group == "modulith-mod"
+    assert entry.event_type == _TARGET
+    assert entry.attempts == 1
+    assert entry.last_error is None
+    ms = int(dead_id.decode().split("-")[0])
+    assert round(entry.created_at.timestamp() * 1000) == ms
+    assert by_target["other.Event"].event_type is None
+    assert listed == sorted(listed, key=lambda e: e.cursor)
+
+
+async def test_list_dead_letters_ignores_streams_of_another_prefix(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    ours = _broker(redis_url, redis_key_prefix)
+    theirs = _broker(redis_url, f"{redis_key_prefix}x")
+    try:
+        await _dead_letter_one(theirs, _TARGET, "g", b"x")
+        assert await ours.list_dead_letters() == []
+    finally:
+        await ours.close()
+        await theirs.close()
+
+
+async def test_list_dead_letters_pages_by_cursor_without_gaps_or_repeats(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    broker = _broker(redis_url, redis_key_prefix)
+    try:
+        for index in range(7):
+            await _dead_letter_one(broker, f"t{index % 3}.Event", "g", f"{index}".encode())
+        everything = await broker.list_dead_letters(limit=100)
+
+        paged = []
+        after = None
+        while page := await broker.list_dead_letters(after=after, limit=2):
+            assert len(page) <= 2
+            paged.extend(page)
+            after = page[-1].cursor
+    finally:
+        await broker.close()
+
+    assert len(everything) == 7
+    assert paged == everything
+    assert len({entry.id for entry in paged}) == 7
+
+
+async def test_retry_with_one_group_redelivers_to_the_consumer_and_empties_the_dead_stream(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    broker = _broker(redis_url, redis_key_prefix)
+    received: list[int] = []
+    consumer = _consumer(broker, group="modulith-mod", name="c:2", sink=received)
+    payload = JsonEventSerializer().serialize(StreamEvent(value=41))
+    try:
+        await _dead_letter_one(
+            broker, _TARGET, "modulith-mod", payload, {"event_type": _TARGET, "trace": "abc"}
+        )
+
+        assert await broker.retry_dead_letters() == 1
+
+        assert await redis_client.xlen(_dlq(redis_key_prefix)) == 0
+        assert await broker.list_dead_letters() == []
+        entries = await redis_client.xrange(_stream(redis_key_prefix))
+        assert entries[-1][1] == {
+            b"data": payload,
+            b"h:event_type": _TARGET.encode(),
+            b"h:trace": b"abc",
+        }
+        await consumer.start()
+        await _until(lambda: received == [41])
+    finally:
+        await consumer.stop()
+        await broker.close()
+
+
+async def test_retry_does_not_let_the_dedup_key_swallow_a_second_dead_letter(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    broker = _broker(redis_url, redis_key_prefix)
+    try:
+        await _dead_letter_one(broker, _TARGET, "modulith-mod", b"poison")
+        assert await broker.retry_dead_letters() == 1
+
+        [(_stream_key, [(message_id, fields)])] = await broker.read(
+            _TARGET, consumer="c:1", group="modulith-mod", block_ms=50
+        )
+        await broker.dead_letter(_TARGET, message_id.decode(), fields, "modulith-mod")
+
+        [dead] = await broker.list_dead_letters()
+    finally:
+        await broker.close()
+    assert dead.target == _TARGET
+
+
+async def test_retry_with_two_groups_refuses_naming_target_and_groups_and_changes_nothing(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    broker = _broker(redis_url, redis_key_prefix)
+    try:
+        await broker.ensure_group(_TARGET, "modulith-billing")
+        await _dead_letter_one(broker, _TARGET, "modulith-orders", b"poison")
+        dead_before = await redis_client.xrange(_dlq(redis_key_prefix))
+        main_before = await redis_client.xlen(_stream(redis_key_prefix))
+
+        with pytest.raises(DeadLetterRetryRefused) as refused:
+            await broker.retry_dead_letters()
+
+        assert await redis_client.xrange(_dlq(redis_key_prefix)) == dead_before
+        assert await redis_client.xlen(_stream(redis_key_prefix)) == main_before
+    finally:
+        await broker.close()
+    message = str(refused.value)
+    assert _TARGET in message
+    assert "modulith-orders" in message
+    assert "modulith-billing" in message
+
+
+async def test_retry_resubmits_resolvable_targets_before_refusing_the_ambiguous_one(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    broker = _broker(redis_url, redis_key_prefix)
+    try:
+        await _dead_letter_one(broker, "solo.Event", "g1", b"a")
+        await _dead_letter_one(broker, "shared.Event", "g1", b"b")
+        await broker.ensure_group("shared.Event", "g2")
+
+        with pytest.raises(DeadLetterRetryRefused) as refused:
+            await broker.retry_dead_letters()
+
+        remaining = await broker.list_dead_letters()
+    finally:
+        await broker.close()
+    assert [entry.target for entry in remaining] == ["shared.Event"]
+    assert "shared.Event" in str(refused.value)
+    assert "solo.Event" not in str(refused.value)
+    assert "1 dead-lettered message(s) were resubmitted" in str(refused.value)
+
+
+async def test_retry_with_nothing_dead_returns_zero(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    broker = _broker(redis_url, redis_key_prefix)
+    try:
+        assert await broker.retry_dead_letters() == 0
     finally:
         await broker.close()

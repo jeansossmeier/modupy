@@ -17,6 +17,10 @@ from dataclasses import dataclass
 from datetime import datetime
 
 
+class DeadLetterRetryRefused(Exception):
+    """A broker declined to resubmit some dead letters, and says why in its message."""
+
+
 @dataclass(frozen=True, slots=True)
 class DeadLetter:
     """One delivery that exhausted its attempts, addressed to one consumer group."""

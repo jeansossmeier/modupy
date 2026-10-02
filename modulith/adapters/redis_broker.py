@@ -71,6 +71,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from modulith import (
@@ -83,6 +85,7 @@ from modulith import (
 )
 
 from ..config import DEFAULT_MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES
+from ._dead_letter import DeadLetter, DeadLetterRetryRefused
 
 logger = logging.getLogger("modulith.adapters.redis")
 
@@ -92,6 +95,9 @@ _DEFAULT_PREFIX = "modulith.events"
 _DEFAULT_GROUP = "modulith"
 _DEFAULT_MAXLEN = 10000
 _DLQ_DEDUP_TTL_SECONDS = 7 * 24 * 60 * 60
+_DEAD_SUFFIX = ".dead"
+_DEAD_ONLY_FIELDS = frozenset({b"h:source_message_id", b"h:source_group"})
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _SOCKET_TIMEOUT_MARGIN_S = 5.0
 
 
@@ -115,6 +121,11 @@ def _positive_int(value: object, name: str) -> int:
 def _cursor_str(raw: Any) -> str:
     """Normalize an XAUTOCLAIM cursor (bytes from redis-py, str from fakes)."""
     return raw.decode() if isinstance(raw, bytes) else str(raw)
+
+
+def _glob_escape(text: str) -> str:
+    """Escape SCAN MATCH glob metacharacters so ``text`` matches literally."""
+    return re.sub(r"([\\*?\[\]])", r"\\\1", text)
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +416,127 @@ class RedisStreamsBroker:
             *arguments,
         )
         logger.warning("dead-lettered message %s from stream %s", message_id, stream)
+
+    # ----- dead-letter inspection and retry ---------------------------------
+
+    async def _dead_streams(self) -> list[str]:
+        """Every ``<prefix>.<target>.dead`` stream, found with SCAN (never KEYS)."""
+        pattern = f"{_glob_escape(self._stream_prefix)}.*{_DEAD_SUFFIX}"
+        return sorted(
+            [
+                _cursor_str(key)
+                async for key in self._client.scan_iter(match=pattern, _type="stream")
+            ]
+        )
+
+    def _dead_target(self, dead_stream: str) -> str:
+        return dead_stream.removeprefix(f"{self._stream_prefix}.").removesuffix(_DEAD_SUFFIX)
+
+    def _dead_letter_of(self, target: str, entry_id: Any, fields: dict[bytes, bytes]) -> DeadLetter:
+        ms, seq = _cursor_str(entry_id).split("-")
+        event_type = fields.get(b"h:event_type")
+        group = fields.get(b"h:source_group")
+        return DeadLetter(
+            # Zero-padded so that sorting ids as strings follows stream order, and
+            # suffixed with the target because entry ids repeat across streams.
+            id=f"{ms}-{int(seq):06d}@{target}",
+            target=target,
+            consumer_group=group.decode() if group is not None else self._consumer_group,
+            event_type=event_type.decode() if event_type is not None else None,
+            # Redis keeps no delivery count for a dead letter. Every one was
+            # delivered at least once, so 1 is the one value that is never wrong;
+            # a message that failed repeatedly was delivered up to
+            # max_delivery_attempts times, an undecodable one exactly once.
+            attempts=1,
+            last_error=None,
+            created_at=_EPOCH + timedelta(milliseconds=int(ms)),
+        )
+
+    async def list_dead_letters(
+        self, *, after: tuple[datetime, str] | None = None, limit: int = 100
+    ) -> list[DeadLetter]:
+        """One page of dead letters across every target, oldest first by ``(created_at, id)``.
+
+        ``after`` is the ``cursor`` of the last entry of the previous page.
+        ``created_at`` is the millisecond timestamp of the entry's id in the
+        dead stream, i.e. when it was dead-lettered; ``last_error`` is always
+        ``None`` because the dead stream stores no error text. ``attempts`` is
+        always 1, a lower bound: see ``_dead_letter_of``.
+        """
+        after_ms = None if after is None else (after[0] - _EPOCH) // timedelta(milliseconds=1)
+        found: list[DeadLetter] = []
+        for stream in await self._dead_streams():
+            target = self._dead_target(stream)
+            start = "-" if after_ms is None else str(after_ms)
+            taken = 0
+            while taken < limit:
+                entries = await self._client.xrange(stream, min=start, max="+", count=limit)
+                for entry_id, fields in entries:
+                    dead = self._dead_letter_of(target, entry_id, fields)
+                    if after is None or dead.cursor > after:
+                        found.append(dead)
+                        taken += 1
+                if len(entries) < limit:
+                    break
+                ms, seq = _cursor_str(entries[-1][0]).split("-")
+                start = f"{ms}-{int(seq) + 1}"
+        found.sort(key=lambda dead: dead.cursor)
+        return found[:limit]
+
+    async def _consumer_groups(self, stream: str) -> list[str]:
+        try:
+            groups = await self._client.xinfo_groups(stream)
+        except Exception as exc:  # redis.exceptions.ResponseError on a missing stream
+            if "no such key" not in str(exc).lower():
+                raise
+            return []
+        return sorted(_cursor_str(group["name"]) for group in groups)
+
+    async def _resubmit(self, dead_stream: str, stream: str) -> int:
+        """Move every entry present now from ``dead_stream`` back to ``stream``."""
+        newest = await self._client.xrevrange(dead_stream, count=1)
+        if not newest:
+            return 0
+        upper = newest[0][0]
+        moved = 0
+        while entries := await self._client.xrange(dead_stream, min="-", max=upper, count=100):
+            for entry_id, fields in entries:
+                original = {k: v for k, v in fields.items() if k not in _DEAD_ONLY_FIELDS}
+                await self._client.xadd(
+                    stream, original, maxlen=self._max_stream_len, approximate=True
+                )
+                await self._client.xdel(dead_stream, entry_id)
+                moved += 1
+        return moved
+
+    async def retry_dead_letters(self) -> int:
+        """Re-add every dead letter to its stream and remove it from the dead stream.
+
+        XADD to a stream reaches every consumer group on it and Redis cannot
+        address one, so a target is resubmitted only when its stream has at
+        most one consumer group. Targets with several groups are left
+        untouched; once every other target has been resubmitted, a
+        ``DeadLetterRetryRefused`` names them and their groups. The re-added
+        entry gets a new id, so a later dead-lettering of it is not suppressed
+        by the dedup key of the first one.
+        """
+        resubmitted = 0
+        refused: list[str] = []
+        for dead_stream in await self._dead_streams():
+            stream = dead_stream.removesuffix(_DEAD_SUFFIX)
+            groups = await self._consumer_groups(stream)
+            if len(groups) > 1:
+                refused.append(f"{self._dead_target(dead_stream)} (groups: {', '.join(groups)})")
+                continue
+            resubmitted += await self._resubmit(dead_stream, stream)
+        if refused:
+            raise DeadLetterRetryRefused(
+                f"{resubmitted} dead-lettered message(s) were resubmitted. Left in their dead "
+                f"streams: {'; '.join(refused)}. Redis cannot resubmit to one consumer group, "
+                "and re-adding to a stream with several groups would deliver the message to "
+                "all of them."
+            )
+        return resubmitted
 
     async def close(self) -> None:
         """Disconnect from Redis. Idempotent-friendly (close-after-close ok)."""

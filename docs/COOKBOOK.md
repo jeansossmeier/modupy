@@ -966,8 +966,10 @@ removes it. `modulith broker dead-letter` lists them with their last error;
 `modulith broker dead-letter --retry-all` makes every one claimable again with
 its attempts reset. Each dead letter belongs to one consumer group, so only
 that group's consumer receives it again and a group that already handled the
-message does not. The database and shm brokers support this command; the Redis
-broker does not yet.
+message does not. The database, shm and redis-streams brokers support this
+command. On redis-streams a dead letter has no recorded error and `--retry-all` resubmits
+a target only when its stream has exactly one consumer group, because a
+re-added message reaches every group on the stream.
 
 With `broker = "database"`, a bare `@externalized` event's default target is
 `database:{event-fqn}`; pin one explicitly with

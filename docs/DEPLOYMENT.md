@@ -1255,11 +1255,11 @@ group.
 - A direct `publish()` raises the broker's error to its caller. modupy keeps no in-memory buffer of events it could not send
 - Inside a bound outbox session, the broker send is saved as an outbox row in your transaction and made after the commit. While the broker is down the row stays in the outbox and the retry loop sends it again, until `dead_letter_after_attempts` (10 by default) failed attempts dead-letter it. `modulith outbox dead-letter --retry-all` resubmits dead-lettered rows once the broker is back
 
-**Dead-lettered deliveries (database and shm brokers):**
+**Dead-lettered deliveries (database, shm and redis-streams brokers):**
 
 ```bash
 modulith broker dead-letter               # list them, with attempts and last error (--list is the default)
-modulith broker dead-letter --retry-all   # make every one claimable again, attempts reset
+modulith broker dead-letter --retry-all   # resubmit every one, with attempts reset
 ```
 
 A delivery is dead-lettered after `max_delivery_attempts` failed dispatches or
@@ -1270,8 +1270,18 @@ already completed the same message does not receive it again. `--list` and
 the service is configured with, and exits 1 with `no database broker tables` (or
 `no shm broker store`) if that store has none. On the shm broker the resubmitted
 delivery is claimed from the SQLite store, so a running consumer receives it on
-its next poll. The Redis broker does not support the command yet, and exits 1
-saying so. For the outbox, use `modulith outbox dead-letter`.
+its next poll. A broker without dead-letter support, such as a custom one, exits
+1 saying so. For the outbox, use `modulith outbox dead-letter`.
+
+On the Redis broker the command reads the `<stream_prefix>.<target>.dead`
+streams. Redis stores no error text or attempt count for a dead letter, so
+`last_error` is `None` and `attempts` is always `1` (a lower bound), and the
+creation time is the entry id's timestamp. `--retry-all` re-adds each entry to
+its target's stream and deletes it from the dead stream. Redis cannot address
+one consumer group, so a re-added message reaches every group on that stream:
+a target is resubmitted only when its stream has **one** consumer group. For a
+target with several groups nothing is resubmitted; the command resubmits the
+other targets, then names the target and its groups in an error and exits 1.
 
 **Consuming (every broker):**
 - A failed broker call is logged and retried under capped exponential backoff, 0.05 s doubling up to 5 s. `/health` reports `degraded` until that call succeeds again

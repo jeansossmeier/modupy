@@ -3035,6 +3035,77 @@ def test_broker_dead_letter_does_not_create_a_missing_database_store(
     assert not db_file.exists()
 
 
+@pytest.fixture
+def redis_dead_letter_project(make_fake_app, monkeypatch, tmp_path, redis_url, redis_key_prefix):
+    """A Redis-configured app holding one dead letter for group ``modulith-orders``."""
+    from modulith.adapters.redis_broker import RedisStreamsBroker
+
+    make_fake_app({"orders": ""})
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith]\nbroker = "redis-streams"\n[tool.modulith.broker_options]\n'
+        f'url = "{redis_url}"\nstream_prefix = "{redis_key_prefix}"\n'
+    )
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("MODULITH_STREAM_PREFIX", raising=False)
+
+    async def seed() -> None:
+        broker = RedisStreamsBroker(url=redis_url, stream_prefix=redis_key_prefix)
+        try:
+            await broker.ensure_group("t.Order", "modulith-orders")
+            await broker.publish("t.Order", b"{}", {"event_type": "t.Order"})
+            [(_key, [(message_id, fields)])] = await broker.read(
+                "t.Order", consumer="o1", group="modulith-orders", block_ms=50
+            )
+            await broker.dead_letter("t.Order", message_id.decode(), fields, "modulith-orders")
+        finally:
+            await broker.close()
+
+    asyncio.run(seed())
+    yield redis_key_prefix
+
+    import redis
+
+    client = redis.Redis.from_url(redis_url)
+    try:
+        for key in client.scan_iter(match=f"{redis_key_prefix}*"):
+            client.delete(key)
+    finally:
+        client.close()
+
+
+@pytest.mark.integration
+def test_broker_dead_letter_lists_a_redis_dead_letter(redis_dead_letter_project):
+    result = runner.invoke(app, ["broker", "dead-letter"])
+
+    assert result.exit_code == 0, result.output
+    assert "1 dead-lettered message(s):" in result.output
+    assert "t.Order  target=t.Order  group=modulith-orders  attempts=1  last_error=None" in (
+        result.output
+    )
+
+
+@pytest.mark.integration
+def test_broker_dead_letter_retry_all_resubmits_a_redis_dead_letter(
+    redis_dead_letter_project, redis_url
+):
+    from modulith.adapters.redis_broker import RedisStreamsBroker
+
+    result = runner.invoke(app, ["broker", "dead-letter", "--retry-all"])
+
+    assert result.exit_code == 0, result.output
+    assert "resubmitted 1 dead-lettered message(s)" in result.output
+
+    async def remaining() -> int:
+        broker = RedisStreamsBroker(url=redis_url, stream_prefix=redis_dead_letter_project)
+        try:
+            return len(await broker.list_dead_letters())
+        finally:
+            await broker.close()
+
+    assert asyncio.run(remaining()) == 0
+
+
 # ---------------------------------------------------------------------------
 # modulith migrate
 # ---------------------------------------------------------------------------
