@@ -1,8 +1,8 @@
 ---
 type: tech-debt
-debt_status: open
+debt_status: resolved
 created: 2026-09-29
-updated: 2026-09-29
+updated: 2026-10-02
 category: Architecture
 impact: Low - Single-process apps have no public way to clean up database connections on shutdown
 effort: Low - Expose Runtime.shutdown or engine from configuration
@@ -22,3 +22,15 @@ Either: 1) expose `Runtime.shutdown()` as a public API for single-process apps, 
 
 ## Context
 This is only a concern for long-running single-process apps or REPL environments that create many connections. Short-lived CLI tools are unaffected. [Assertion-Only]
+
+## Resolution (2026-10-02)
+`await outbox.shutdown()` disposes the store and engine that `Runtime.bind_configured_outbox` built from `outbox_url`, once the retry loop has stopped (`modulith/builtin/outbox.py::_dispose_owned_resources`, fed by `outbox._owned_resources`). No public API was added. A store the application passed to `outbox.configure()` is never disposed. Workers reach the same disposal through `Runtime.shutdown`, which calls `outbox.shutdown()`.
+
+Residual, accepted: when the retry loop ran on another event loop than the one awaiting `shutdown()`, such as `publish_sync()`'s daemon-thread loop, the engine is left open and a debug message says so. A driver such as asyncpg cannot close connections bound to another loop.
+
+Tests:
+- `tests/test_outbox.py::test_outbox_shutdown_closes_the_pool_of_the_engine_built_from_outbox_url`
+- `tests/test_outbox.py::test_outbox_shutdown_leaves_an_application_configured_engine_alone`
+- `tests/test_outbox.py::test_outbox_shutdown_ignores_the_outbox_url_when_the_application_configured_its_store`
+- `tests/test_outbox.py::test_outbox_shutdown_twice_disposes_the_outbox_url_engine_once`
+- `tests/test_outbox.py::test_outbox_shutdown_on_another_loop_than_the_retry_loop_leaves_the_engine_open`

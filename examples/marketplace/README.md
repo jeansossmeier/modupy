@@ -316,9 +316,8 @@ $ curl -s localhost:8000/notifications/o-300
 ```
 
 The command runs the booking listener inside the CLI, so it books the shipment
-at once. The `ShipmentBooked` event it publishes waits for a running worker to
-sweep it: the CLI's claim on that event lasts `claim_lease_seconds`, and the
-notice appears only after it expires and a sweep runs, seconds later.
+at once, and it delivers the `ShipmentBooked` event that listener publishes
+before it exits.
 
 ### 4. Check the totals
 
