@@ -1092,15 +1092,30 @@ def test_disabled_rules_no_warning_for_known_rule(make_fake_app, monkeypatch, ca
         ("no-cyclic-deps", True),
         ("no-internal-import", True),
         ("use-contract", True),
+        ("no-cyclic", True),
+        ("no-cyclic-dep", True),
+        ("undeclared-deps", True),
+        ("parse-err", True),
+        ("no-cyc", True),
         ("use", False),
         ("no-print", False),
         ("no-internal-calls", False),
         ("database", False),
         ("max-module-size", False),
+        ("use-config-module", False),
+        ("use-context-vars", False),
+        ("use-contracts-strict", False),
+        ("no-internal-imports-strict", False),
+        ("data-ownership-v2", False),
+        ("no-integration-calls", False),
+        ("no-integer-ids", False),
+        ("data-owned-by-module", False),
+        ("parse-errors-as-warnings", False),
+        ("undeclared-deprecations", False),
     ],
 )
 def test_disabled_rules_typo_detection(name: str, is_typo: bool) -> None:
-    """Shortened built-in names warn; unrelated plugin rule names do not."""
+    """Shortened built-in names warn; plugin rule names, even ones sharing a prefix, do not."""
     assert verifier._looks_like_rule_typo(name) is is_typo
 
 
@@ -1212,6 +1227,32 @@ def test_unknown_disabled_rule_warns_only_for_a_near_miss_of_a_builtin_name(
     assert len(warnings) == 1
     assert "no-internal-import" in warnings[0]
     assert "team-rule" not in warnings[0]
+
+
+@pytest.mark.parametrize(
+    ("name", "warns"),
+    [
+        ("no-cycle", True),
+        ("use-config-module", False),
+        ("no-internal-imports-strict", False),
+    ],
+)
+def test_configured_disabled_rules_warns_only_for_a_typo(
+    monkeypatch, caplog, name: str, warns: bool
+) -> None:
+    """A typo of a built-in name draws the warning; a plugin rule name does not."""
+    import logging
+
+    _disable_rules(monkeypatch, name)
+
+    with caplog.at_level(logging.WARNING, logger="modulith.verifier"):
+        assert verifier._configured_disabled_rules() == {name}
+
+    warnings = [
+        r for r in caplog.records if r.levelno == logging.WARNING and "disabled_rules" in r.message
+    ]
+    assert bool(warnings) is warns
+    assert all(name in r.message for r in warnings)
 
 
 # Keep ImportRecord referenced for import-time coverage of the dataclass.

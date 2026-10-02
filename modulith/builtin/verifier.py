@@ -115,20 +115,36 @@ def _disabled_rules_from_config() -> frozenset[str]:
 
 
 def _looks_like_rule_typo(name: str) -> bool:
-    """Whether ``name`` nearly matches a built-in rule or misspells its start.
+    """Whether ``name`` looks like a misspelled built-in rule name.
 
-    A shortened name such as ``no-cycle`` scores only 0.5 against the whole
-    of ``no-cyclic-dependency``, so a name also counts as a typo when it
-    shares a rule's leading words and then diverges three or more letters
-    into the next word. A plugin rule that only shares whole words, such as
-    ``no-print`` or ``no-internal-calls``, does not.
+    Plugin rules are legitimate names this module cannot know, so only a
+    near miss of a built-in name counts as a typo. Three rules decide, in
+    this order:
+
+    1. A name that extends a built-in rule with more words, such as
+       ``no-internal-imports-strict``, is a plugin rule.
+    2. A name that nearly matches a whole built-in name, such as
+       ``no-internal-import``, is a typo.
+    3. A name that repeats a built-in rule's leading words and ends in that
+       rule's next word cut short is a typo, such as ``no-cycle`` or
+       ``no-cyclic-dep``. Cut short means at least three leading letters
+       of that word and at most two letters beyond them. Any other name,
+       such as ``no-internal-calls`` or ``use-config-module``, is a plugin
+       rule.
     """
+    if any(name.startswith(f"{rule}-") for rule in RULE_NAMES):
+        return False
     if difflib.get_close_matches(name, RULE_NAMES, n=1, cutoff=0.8):
         return True
+    *head, last = name.split("-")
+    if not head:
+        return False
     for rule in RULE_NAMES:
-        _, sep, partial = os.path.commonprefix([name, rule]).rpartition("-")
-        if sep and len(partial) >= 3:
-            return True
+        words = rule.split("-")
+        if len(words) > len(head) and words[: len(head)] == head:
+            shared = len(os.path.commonprefix([last, words[len(head)]]))
+            if shared >= 3 and len(last) - shared <= 2:
+                return True
     return False
 
 
