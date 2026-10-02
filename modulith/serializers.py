@@ -149,7 +149,7 @@ def _subclass_for_tag(base: type, tag: str) -> type | None:
     type is checked against ``allowed_event_types``. So the tag is matched
     against ``base``'s already-imported subclass tree and never imported.
     """
-    pending = list(base.__subclasses__())
+    pending: list[type] = list(base.__subclasses__())
     while pending:
         candidate = pending.pop()
         if _hint_tag(candidate) == tag:
