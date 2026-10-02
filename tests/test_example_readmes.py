@@ -1755,6 +1755,7 @@ SLOW_CHILD = (
     "import pathlib, signal, time, os; "
     "signal.signal(signal.SIGINT, lambda *_: (time.sleep(1), "
     "pathlib.Path('child.done').write_text('done'), os._exit(0))); "
+    "pathlib.Path('child.ready').touch(); "
     "[time.sleep(0.1) for _ in iter(int, 1)]"
 )
 
@@ -1791,6 +1792,8 @@ def serve(number, broken=False):
 
 if "--slow-child" in sys.argv:
     subprocess.Popen([sys.executable, "-c", SLOW_CHILD])
+    while not os.path.exists("child.ready"):
+        time.sleep(0.01)
 if "--topology=processes" in sys.argv or "--with-workers" in sys.argv:
     for offset in (0, 1, 2):
         serve(workers + offset, broken="--broken-worker" in sys.argv)
