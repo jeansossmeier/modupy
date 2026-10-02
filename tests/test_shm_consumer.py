@@ -605,10 +605,51 @@ async def test_stopping_consumer_skips_claim_without_completing_it(broker: ShmBr
     in_flight = {row["id"]}
     consumer._stopping = True
 
-    await consumer._dispatch_guarded(row, asyncio.Semaphore(1), in_flight)
+    assert await consumer._dispatch_guarded(row, asyncio.Semaphore(1), in_flight) is True
 
     assert in_flight == set()
     assert await broker.renew_claims([row["id"]], consumer_name="worker-1") == 1
+
+
+async def test_stop_mid_batch_hands_the_deliveries_it_never_started_to_a_peer_at_once(
+    broker: ShmBroker,
+) -> None:
+    running, finish = asyncio.Event(), asyncio.Event()
+    delivered: list[str] = []
+
+    async def handler(item: ConsumerEvent) -> None:
+        running.set()
+        await finish.wait()
+        delivered.append(item.name)
+
+    bus = InMemoryEventBus()
+    bus.register(ConsumerEvent, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[ConsumerEvent])
+    consumer = _consumer(broker, bus, serializer, dispatch_concurrency=1)
+    await broker.subscribe([TARGET], GROUP)
+    for name in ("a", "b", "c"):
+        await broker.publish(
+            TARGET, serializer.serialize(ConsumerEvent(name)), {"event_type": EVENT_TYPE}
+        )
+
+    await consumer.start()
+    try:
+        await asyncio.wait_for(running.wait(), timeout=5.0)
+        stop_task = asyncio.create_task(consumer.stop())
+        await _until(lambda: consumer._stopping)
+        finish.set()
+        await asyncio.wait_for(stop_task, timeout=5.0)
+    finally:
+        finish.set()
+        await consumer.stop()
+
+    peer = await broker.claim_batch(
+        GROUP, batch_size=10, consumer_name="worker-2", reclaim_stale_seconds=3600.0
+    )
+    released = [serializer.deserialize(row["payload"], row["event_type"]).name for row in peer]
+    assert len(delivered) == 1
+    assert sorted(delivered + released) == ["a", "b", "c"]
+    assert [row["attempts"] for row in peer] == [0, 0]
 
 
 async def test_cancelling_guarded_renewal_propagates_and_releases_in_flight(

@@ -208,6 +208,11 @@ class SqliteQueueStore:
             )
         )
 
+    def release_claims(self, values: list[ClaimToken | str], consumer_name: str) -> int:
+        return self._consumer_write(
+            lambda: _shm_claims.release_claims(self._conn, values, consumer_name)
+        )
+
     def ack(
         self,
         value: ClaimToken | str,

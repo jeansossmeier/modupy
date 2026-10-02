@@ -441,6 +441,16 @@ class ShmBroker:
         claim_tokens: list[ClaimToken | str] = list(row_ids)
         return await self._cold.renew_claims(claim_tokens, consumer_name, start_dispatch)
 
+    async def release_claims(self, row_ids: list[str], *, consumer_name: str) -> int:
+        """Return claims the caller took but never dispatched to pending.
+
+        Only claims whose owner and generation still match and whose dispatch
+        never started are released. A peer claims them at once instead of
+        after ``reclaim_stale_seconds``, and no attempt is charged.
+        """
+        claim_tokens: list[ClaimToken | str] = list(row_ids)
+        return await self._cold.release_claims(claim_tokens, consumer_name)
+
     async def ack(self, row_id: str, *, consumer_name: str) -> None:
         """Complete one currently owned claim using its fencing token."""
         await self._cold.ack(

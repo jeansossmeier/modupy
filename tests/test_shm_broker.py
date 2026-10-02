@@ -653,6 +653,25 @@ async def test_stale_generation_and_wrong_owner_mutations_are_noops(
     await broker.ack(current["id"], consumer_name="worker-2")
 
 
+async def test_release_claims_round_trip_returns_an_unstarted_claim_to_its_peers(
+    broker: ShmBroker, tmp_path: Path
+) -> None:
+    await broker.subscribe(["events"], "workers")
+    await broker.publish("events", b"payload")
+    held = (await broker.claim_batch("workers", batch_size=1, consumer_name="worker-1"))[0]
+    assert await broker.claim_batch("workers", batch_size=1, consumer_name="worker-2") == []
+
+    assert await broker.release_claims([held["id"]], consumer_name="worker-2") == 0
+    assert await broker.release_claims([held["id"]], consumer_name="worker-1") == 1
+
+    (peer,) = await broker.claim_batch("workers", batch_size=1, consumer_name="worker-2")
+    assert (peer["payload"], peer["attempts"], peer["claimed_by"]) == (b"payload", 0, "worker-2")
+    assert [dict(row) for row in _delivery_rows(tmp_path / "broker.db")] == [
+        {"status": "claimed", "attempts": 0, "claimed_by": "worker-2", "claim_generation": 2}
+    ]
+    await broker.ack(peer["id"], consumer_name="worker-2")
+
+
 @pytest.mark.parametrize(("mode", "expected"), [("delete", []), ("mark", ["done"])])
 async def test_completion_mode_is_honored(tmp_path: Path, mode: str, expected: list[str]) -> None:
     db_path = tmp_path / f"{mode}.db"

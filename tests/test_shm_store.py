@@ -1273,6 +1273,191 @@ def test_claim_token_decode_rejects_malformed_or_nonpositive_values(value: str) 
         ClaimToken.decode(value)
 
 
+def _delivery_state(path: Path, columns: str = "*") -> list[dict[str, Any]]:
+    return [dict(row) for row in _rows(path, f"SELECT {columns} FROM shm_delivery ORDER BY id")]
+
+
+async def test_release_claims_makes_an_unstarted_claim_claimable_at_once_without_a_charge(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "release.db"
+    store = await _published_store(
+        path,
+        retry_backoff_base_seconds=0.03,
+        retry_backoff_cap_seconds=0.03,
+    )
+    columns = (
+        "status, attempts, available_at, last_error, claimed_at, claimed_by, "
+        "dispatch_started, completed_at"
+    )
+    try:
+        first = (await store.claim("g1", consumer_name="worker-1"))[0]
+        assert await store.fail(first["claim_token"], "temporary", 3, consumer_name="worker-1")
+        await asyncio.sleep(0.04)
+        retried = (await store.claim("g1", consumer_name="worker-1"))[0]
+        assert retried["attempts"] == 1
+        assert await store.claim("g1", consumer_name="worker-2", reclaim_stale_seconds=3600) == []
+        claimed = _delivery_state(path, columns)
+
+        assert await store.release_claims([retried["claim_token"]], "worker-1") == 1
+
+        assert _delivery_state(path, columns) == [
+            {**claimed[0], "status": "pending", "claimed_at": None, "claimed_by": None}
+        ]
+        (peer,) = await store.claim("g1", consumer_name="worker-2", reclaim_stale_seconds=3600)
+        assert (peer["message_id"], peer["attempts"], peer["last_error"]) == (
+            "publication-1",
+            1,
+            "temporary",
+        )
+    finally:
+        await store.close()
+
+
+async def test_release_claims_leaves_a_claim_whose_dispatch_started(tmp_path: Path) -> None:
+    path = tmp_path / "release-started.db"
+    store = await _published_store(path)
+    try:
+        row = (await store.claim("g1", consumer_name="worker-1"))[0]
+        assert await store.renew_claims([row["claim_token"]], "worker-1", start_dispatch=True) == 1
+        before = _delivery_state(path)
+        assert (before[0]["status"], before[0]["claimed_by"], before[0]["dispatch_started"]) == (
+            "claimed",
+            "worker-1",
+            1,
+        )
+
+        assert await store.release_claims([row["claim_token"]], "worker-1") == 0
+
+        assert _delivery_state(path) == before
+    finally:
+        await store.close()
+
+
+async def test_release_claims_leaves_a_claim_another_consumer_owns(tmp_path: Path) -> None:
+    path = tmp_path / "release-owner.db"
+    store = await _published_store(path)
+    try:
+        row = (await store.claim("g1", consumer_name="worker-1"))[0]
+        before = _delivery_state(path)
+        assert (before[0]["status"], before[0]["claimed_by"]) == ("claimed", "worker-1")
+
+        assert await store.release_claims([row["claim_token"]], "worker-2") == 0
+
+        assert _delivery_state(path) == before
+    finally:
+        await store.close()
+
+
+async def test_release_claims_leaves_a_claim_a_stale_reclaim_replaced(tmp_path: Path) -> None:
+    path = tmp_path / "release-stale.db"
+    store = await _published_store(path)
+    try:
+        first = (await store.claim("g1", consumer_name="worker-1"))[0]
+        await asyncio.sleep(0.01)
+        second = (await store.claim("g1", consumer_name="worker-2", reclaim_stale_seconds=0))[0]
+        before = _delivery_state(path)
+        assert (before[0]["status"], before[0]["claimed_by"]) == ("claimed", "worker-2")
+
+        assert await store.release_claims([first["claim_token"]], "worker-1") == 0
+        # The current owner presenting the replaced token differs only by generation.
+        assert await store.release_claims([first["claim_token"]], "worker-2") == 0
+
+        assert _delivery_state(path) == before
+        assert await store.release_claims([second["claim_token"]], "worker-2") == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("peer", ["worker-2", "worker-1"], ids=["other-consumer", "same-consumer"])
+async def test_release_claims_fences_the_old_token_once_a_peer_claims(
+    tmp_path: Path,
+    peer: str,
+) -> None:
+    store = await _published_store(tmp_path / "release-fence.db")
+    try:
+        old = (await store.claim("g1", consumer_name="worker-1"))[0]["claim_token"]
+        assert await store.release_claims([old], "worker-1") == 1
+        claimed = await store.claim("g1", consumer_name=peer, reclaim_stale_seconds=3600)
+        new = claimed[0]["claim_token"]
+
+        assert (new.delivery_id, new.generation) == (old.delivery_id, old.generation + 1)
+        assert not await store.ack(old, consumer_name="worker-1")
+        assert not await store.fail(old, "late failure", 3, consumer_name="worker-1")
+        assert await store.renew_claims([old], "worker-1") == 0
+        assert await store.release_claims([old], "worker-1") == 0
+        assert await store.ack(new, consumer_name=peer)
+    finally:
+        await store.close()
+
+
+async def test_release_claims_counts_only_the_deliveries_it_released(tmp_path: Path) -> None:
+    store = ShmColdStore(str(tmp_path / "release-count.db"))
+    try:
+        await store.subscribe(["events.Created"], "g1")
+        for index in range(3):
+            await store.publish("events.Created", b"x", publication_id=f"publication-{index}")
+        tokens = [row["claim_token"] for row in await store.claim("g1", consumer_name="worker-1")]
+        assert await store.renew_claims([tokens[1]], "worker-1", start_dispatch=True) == 1
+
+        assert await store.release_claims(tokens, "worker-1") == 2
+
+        reclaimed = await store.claim("g1", consumer_name="worker-2", reclaim_stale_seconds=3600)
+        assert [row["message_id"] for row in reclaimed] == ["publication-0", "publication-2"]
+    finally:
+        await store.close()
+
+
+def test_release_claims_of_nothing_opens_no_write_transaction(tmp_path: Path) -> None:
+    store = SqliteQueueStore(
+        str(tmp_path / "release-empty.db"),
+        synchronous="NORMAL",
+        completion_mode="delete",
+        orphan_retention_seconds=86400.0,
+        retry_backoff_base_seconds=0.05,
+        retry_backoff_cap_seconds=5.0,
+    )
+    statements: list[str] = []
+    try:
+        store._conn.set_trace_callback(statements.append)
+        try:
+            assert store.release_claims([], "worker-1") == 0
+        finally:
+            store._conn.set_trace_callback(None)
+    finally:
+        store.close()
+
+    assert [statement for statement in statements if statement.startswith("BEGIN")] == []
+
+
+async def test_release_claims_requires_a_nonempty_string_owner(tmp_path: Path) -> None:
+    store = ShmColdStore(str(tmp_path / "release-owners.db"))
+    try:
+        with pytest.raises(TypeError, match="consumer_name"):
+            await store.release_claims([], 7)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="consumer_name"):
+            await store.release_claims([], "")
+    finally:
+        await store.close()
+
+
+def test_synchronous_release_claims_validates_owner_before_opening_transaction(
+    tmp_path: Path,
+) -> None:
+    store = SqliteQueueStore(
+        str(tmp_path / "sync-release-owner.db"),
+        synchronous="NORMAL",
+        completion_mode="delete",
+        orphan_retention_seconds=86400.0,
+        retry_backoff_base_seconds=0.05,
+        retry_backoff_cap_seconds=5.0,
+    )
+    store.close()
+
+    with pytest.raises(ValueError, match="consumer_name"):
+        store.release_claims([], "")
+
+
 async def test_failure_applies_backoff_then_dead_letters_at_attempt_cap(
     tmp_path: Path,
 ) -> None:

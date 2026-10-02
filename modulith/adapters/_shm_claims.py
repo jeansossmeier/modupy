@@ -251,6 +251,39 @@ def renew_claims(
     return renewed
 
 
+def release_claims(
+    conn: sqlite3.Connection,
+    values: list[ClaimToken | str],
+    consumer_name: str,
+) -> int:
+    """Return the caller's claims it never started dispatching to pending.
+
+    Only complete delivery-generation tokens the caller still owns, whose
+    ``dispatch_started`` is 0, are released: another consumer claims them at
+    once instead of after ``reclaim_stale_seconds``. Nothing is charged, so
+    attempts, ``available_at`` and ``last_error`` stay as they were.
+    ``claim_generation`` is left alone because ``claim`` bumps it on the next
+    claim, which fences every token from before the release.
+    """
+    consumer_name = require_consumer_name(consumer_name)
+    tokens = [ClaimToken.decode(value) for value in values]
+    if not tokens:
+        return 0
+    released = 0
+    with immediate_transaction(conn):
+        for token in tokens:
+            cursor = conn.execute(
+                f"""
+                UPDATE shm_delivery
+                SET status='pending', claimed_at=NULL, claimed_by=NULL
+                WHERE {owned_predicate()} AND dispatch_started=0
+                """,
+                (token.delivery_id, consumer_name, token.generation),
+            )
+            released += cursor.rowcount
+    return released
+
+
 def owned_claim(
     conn: sqlite3.Connection,
     value: ClaimToken | str,

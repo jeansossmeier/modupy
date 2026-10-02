@@ -172,6 +172,10 @@ class ShmColdStore(SerialStoreExecutor):
             await self._call("renew_claims", values, consumer_name, start_dispatch),
         )
 
+    async def release_claims(self, values: list[ClaimToken | str], consumer_name: str) -> int:
+        consumer_name = require_consumer_name(consumer_name)
+        return cast(int, await self._call("release_claims", values, consumer_name))
+
     async def ack(
         self,
         value: ClaimToken | str,
