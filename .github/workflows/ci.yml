@@ -93,7 +93,7 @@ jobs:
 
       - name: Run focused SHM and state tests serially
         run: >-
-          pytest -q
+          pytest -q --durations=15
           tests/test_shm_broker.py
           tests/test_shm_coldstore.py
           tests/test_shm_consumer.py
