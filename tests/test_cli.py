@@ -1853,13 +1853,12 @@ def test_outbox_status_uses_store_built_from_outbox_url(make_fake_app, monkeypat
     assert (result.exit_code, result.output.splitlines()[:1]) == (0, ["incomplete:    0"])
 
 
-def test_outbox_command_closes_the_engine_built_from_outbox_url(
-    make_fake_app, monkeypatch, tmp_path
-):
+@pytest.fixture
+def outbox_url_app(make_fake_app, monkeypatch, tmp_path) -> None:
+    """A fake app whose outbox store bootstrap builds from a SQLite ``outbox_url``."""
     from sqlalchemy.ext.asyncio import create_async_engine
 
     from modulith.adapters.postgres_outbox import Base
-    from modulith.runtime import _runtime
 
     url = f"sqlite+aiosqlite:///{tmp_path / 'app.db'}"
 
@@ -1875,12 +1874,52 @@ def test_outbox_command_closes_the_engine_built_from_outbox_url(
     monkeypatch.setenv("MODULITH_OUTBOX_URL", url)
     make_fake_app({"orders": ""})
 
-    result = runner.invoke(app, ["outbox", "status"])
 
-    assert result.exit_code == 0, result.output
+def _outbox_url_engine_state() -> tuple[object, int]:
+    """The ownership record bootstrap made for its ``outbox_url`` engine (None
+    once shutdown disposed it) and that engine's pool's idle connections."""
+    from modulith.runtime import _runtime
+
     assert _runtime._owned_outbox is not None
     _, engine = _runtime._owned_outbox
-    assert (outbox._owned_resources, engine.pool.checkedin()) == (None, 0)
+    return outbox._owned_resources, engine.pool.checkedin()
+
+
+@pytest.mark.parametrize(
+    ("argv", "exit_code"),
+    [
+        pytest.param(["status"], 0, id="status"),
+        # An id naming no publication still runs the coroutine, finds nothing, exits 1.
+        pytest.param(["retry", "00000000-0000-4000-8000-000000000000"], 1, id="retry"),
+        pytest.param(["purge", "--older-than", "7d"], 0, id="purge"),
+        pytest.param(["dead-letter"], 0, id="dead-letter"),
+        pytest.param(["dead-letter", "--retry-all"], 0, id="dead-letter-retry-all"),
+        pytest.param(["failing"], 0, id="failing"),
+    ],
+)
+def test_outbox_command_closes_the_engine_built_from_outbox_url(outbox_url_app, argv, exit_code):
+    result = runner.invoke(app, ["outbox", *argv])
+
+    assert result.exit_code == exit_code, result.output
+    assert _outbox_url_engine_state() == (None, 0)
+
+
+def test_outbox_command_closes_the_engine_when_its_coroutine_raises(outbox_url_app, monkeypatch):
+    from modulith.adapters.postgres_outbox import PostgresPublicationStore
+
+    find_failing = PostgresPublicationStore.find_failing
+
+    async def find_failing_then_raise(self, **kwargs):
+        await find_failing(self, **kwargs)  # leaves a pooled connection for shutdown to close
+        raise NotImplementedError("PostgresPublicationStore does not implement find_failing")
+
+    monkeypatch.setattr(PostgresPublicationStore, "find_failing", find_failing_then_raise)
+
+    result = runner.invoke(app, ["outbox", "failing"])
+
+    assert result.exit_code == 1, result.output
+    assert "cannot list failing publications" in result.stderr
+    assert _outbox_url_engine_state() == (None, 0)
 
 
 def test_outbox_store_error_on_memory_outbox_names_the_config_key(
