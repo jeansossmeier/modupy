@@ -1646,7 +1646,9 @@ def broker_dead_letter(
 
     Listing is the default; ``--list`` makes it explicit and is refused with
     ``--retry-all``. A resubmitted delivery reaches only the consumer group
-    whose delivery died. Supported by the database broker.
+    whose delivery died. Supported by the database, shm and redis-streams
+    brokers. On redis-streams, ``--retry-all`` resubmits a target only when
+    its stream has one consumer group, and exits 1 naming any target it left.
     """
     # The flag conflict is an argument error: report it before any environment check.
     if retry_all and list_dead:
@@ -1677,7 +1679,13 @@ def broker_dead_letter(
             )
             raise typer.Exit(code=1)
         if retry_all:
-            return int(await broker.retry_dead_letters())
+            from .adapters._dead_letter import DeadLetterRetryRefused
+
+            try:
+                return int(await broker.retry_dead_letters())
+            except DeadLetterRetryRefused as exc:
+                typer.echo(f"error: {exc}", err=True)
+                raise typer.Exit(code=1) from exc
         dead: list[Any] = []
         after = None
         while True:

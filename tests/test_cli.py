@@ -2988,6 +2988,35 @@ def test_broker_dead_letter_with_nothing_dead_says_so(make_fake_app, monkeypatch
     assert result.output.strip().endswith("no dead-lettered messages")
 
 
+def test_broker_dead_letter_retry_all_reports_a_refusal_and_exits_1(
+    make_fake_app, monkeypatch, tmp_path
+):
+    from modulith.adapters._dead_letter import DeadLetterRetryRefused
+    from modulith.adapters.db_broker import DatabaseBroker
+
+    make_fake_app({"orders": ""})
+    url = _database_project(tmp_path, monkeypatch, tmp_path / "broker.db")
+
+    async def seed() -> None:
+        broker = DatabaseBroker(url=url)
+        try:
+            await broker.subscribe(["t.Order"], "modulith-orders")
+        finally:
+            await broker.close()
+
+    asyncio.run(seed())
+
+    async def refuse(self: DatabaseBroker) -> int:
+        raise DeadLetterRetryRefused("t.Order has consumer groups modulith-a, modulith-b")
+
+    monkeypatch.setattr(DatabaseBroker, "retry_dead_letters", refuse)
+
+    result = runner.invoke(app, ["broker", "dead-letter", "--retry-all"])
+
+    assert result.exit_code == 1, result.output
+    assert "error: t.Order has consumer groups modulith-a, modulith-b" in result.stderr
+
+
 def test_broker_dead_letter_flag_conflict_is_reported_before_any_environment_check(
     make_fake_app, monkeypatch, tmp_path
 ):
