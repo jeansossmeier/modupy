@@ -302,7 +302,8 @@ def test_render_report_contains_key_sections(tmp_path: Path) -> None:
     result = audit_codebase(root)
     report = render_report(result)
 
-    assert "# Modulith Audit Report" in report
+    assert "# modupy Audit Report" in report
+    assert "ready for modupy adoption" in report
     assert "Readiness score" in report
     assert str(result.readiness_score) in report
     assert "orders" in report and "inventory" in report
@@ -323,7 +324,7 @@ def test_audit_cli_writes_report(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert out.exists()
-    assert "Modulith Audit Report" in out.read_text(encoding="utf-8")
+    assert "modupy Audit Report" in out.read_text(encoding="utf-8")
     assert "readiness score" in result.output.lower()
 
 

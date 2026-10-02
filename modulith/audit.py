@@ -538,7 +538,7 @@ def render_report(result: AuditResult) -> str:
             return path.relative_to(root).as_posix()
         return str(path)
 
-    lines: list[str] = ["# Modulith Audit Report", ""]
+    lines: list[str] = ["# modupy Audit Report", ""]
 
     # Summary
     score = f"{result.readiness_score}/100" if result.score_applicable else "not applicable"
@@ -559,7 +559,7 @@ def render_report(result: AuditResult) -> str:
     lines += [
         (
             f"Your codebase is approximately {result.readiness_score}% ready for "
-            "modulith adoption. Top blockers:"
+            "modupy adoption. Top blockers:"
             if result.score_applicable
             else "Top blockers:"
         ),
