@@ -6,10 +6,10 @@
 
 This guide assumes you have a FastAPI app of moderate size (50k-200k
 lines), structured as folders without enforced boundaries, with at
-least some database access via SQLAlchemy. If you have something quite
-different (Django, Flask without async, sync-only stack), the path
-still works but specific commands differ — see the SPEC.md notes on
-your stack.
+least some database access via SQLAlchemy. Django projects and sync-only
+codebases that won't go async are outside the audience modupy is built
+for (SPEC.md, "Who This Is Not For"); [When modupy is the wrong
+choice](#when-modupy-is-the-wrong-choice) lists the other reasons to skip it.
 
 The migration has seven steps. Steps 1-3 are mandatory for any
 modupy adoption. Steps 4-5 are optional but recommended — they are
@@ -18,7 +18,7 @@ are optional and gated on real need.
 
 ---
 
-## Step 1 — Install and audit (Friday afternoon, 2 hours)
+## Step 1 — Install and audit
 
 ```bash
 uv add 'modupy[cli]'         # or: pip install 'modupy[cli]'
@@ -63,7 +63,7 @@ hours. If you can't, the modulith pattern probably isn't the right
 abstraction for your codebase, or the team isn't aligned on the
 domain — neither of which modupy fixes.
 
-## Step 2 — Restructure files (the boring weekend)
+## Step 2 — Restructure files
 
 Move files into the proposed structure. **Don't change any logic yet.**
 
@@ -86,7 +86,8 @@ app/
 After:
 ```
 app/
-├── contracts/                  # new — for shared event types (created in step 3)
+├── contracts/                  # new — for shared event types (created in step 4)
+│   ├── __init__.py
 │   └── events.py
 ├── orders/
 │   ├── __init__.py
@@ -164,12 +165,21 @@ async def create_order(customer_id):
 After:
 ```python
 # app/contracts/events.py
+from dataclasses import dataclass
+
+from modulith import event
+
+
 @event
 @dataclass(frozen=True)
 class OrderCreated:
     order_id: str
     customer_id: str
 ```
+
+Keep an empty `app/contracts/__init__.py` beside it, as the Step 2 tree shows.
+A folder without an `__init__.py` is not a module, so `modulith verify` would
+silently skip the contracts rules.
 
 ```python
 # app/orders/_internal/service.py
@@ -185,6 +195,7 @@ async def create_order(customer_id):
 ```python
 # app/inventory/handlers.py
 from app.contracts.events import OrderCreated
+from app.inventory._internal.service import reserve_stock
 from modulith import listener
 
 @listener
@@ -233,11 +244,25 @@ table-only cross-module coupling produces a warning even when there are no
 import or event interactions, and any shared-table dependency still blocks
 safe extraction.
 
-## Step 5 — Enable the transactional outbox (production-grade delivery)
+## Step 5 — Enable the transactional outbox (durable, at-least-once delivery)
 
 ![One commit saves the order and one event_publications row per listener; after the commit each listener runs in the background, and a failing one is retried, then dead-lettered](docs/images/outbox.svg)
 
-When you have real users in production and event loss matters:
+When you have real users in production and event loss matters, five things
+turn the outbox on:
+
+1. Install the Postgres extra.
+2. Set `outbox = "postgres"` and `outbox_url` (or `MODULITH_OUTBOX_URL`) under
+   `[tool.modulith]`.
+3. Run `modulith migrate`.
+4. Publish inside a session bound with `bind_session`/`unbind_session` from
+   `modulith.builtin.outbox`.
+5. Call `outbox.start()` and `await outbox.shutdown()` in the app's lifespan,
+   after `modulith.bootstrap()`.
+
+The rest of this step shows each one in order. Tuning keys, the raw Alembic
+command, Postgres schemas and binding your own store follow under
+[More outbox options](#more-outbox-options).
 
 ```bash
 uv add 'modupy[postgres]'
@@ -246,23 +271,11 @@ uv add 'modupy[postgres]'
 ```toml
 [tool.modulith]
 outbox = "postgres"
-outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # your business database
+outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # your business database, or MODULITH_OUTBOX_URL
 ```
 
 `outbox_url` is the async SQLAlchemy URL of the database your business data
-lives in. With it set, modupy binds the outbox store for you. The tuning
-knobs live in `[tool.modulith.outbox_options]`, and the runtime validates and
-forwards eight keys to `outbox.configure()` when it binds the store from
-`outbox_url`: `claim_strategy`, `claim_lease_seconds`, `claim_batch_size`,
-`dead_letter_after_attempts`, `retry_interval_seconds`, `retry_stale_seconds`,
-`max_retry_backoff_seconds` and `completion_mode` (`"update"` keeps history
-visible; `"delete"` and `"archive"` are the alternatives). `sqlite_wal = true`
-switches a SQLite `outbox_url` database to WAL journal mode, so readers no
-longer block a commit. It is off by default, is ignored for other databases,
-persists in the database file, and cannot be used on network filesystems. Any
-other key in the table is accepted and ignored. An application that binds its own store, as
-the manual wiring below does, passes these settings to `outbox.configure()` as
-keyword arguments.
+lives in. With it set, modupy binds the outbox store for you.
 
 Run the packaged schema migration. `modulith migrate` applies it to
 `outbox_url`, swapping the async driver for the sync one Alembic runs on, and
@@ -274,61 +287,9 @@ modulith migrate
 
 Pass `--url <sqlalchemy url>` to migrate another database, and a revision
 (`modulith migrate <revision>`) to stop short of `head`. The chain creates the
-outbox tables and also the `broker_*` tables of the database broker.
-
-The raw Alembic command remains the alternative. modupy ships its alembic
-config *inside* the installed package (your project needs no alembic.ini), so
-point alembic's `-c` at it and supply the database URL via the
-`MODULITH_DB_URL` env var (alembic runs on a **sync** driver, e.g.
-`postgresql+psycopg://`, even if your app connects with asyncpg):
-
-```bash
-MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
-  alembic -c "$(python -c 'import modulith.adapters, pathlib; print(pathlib.Path(modulith.adapters.__file__).parent / "alembic.ini")')" \
-  upgrade head
-```
-
-(`-x url=...` works instead of the env var; a bare `alembic upgrade head`
-fails with "No 'script_location' key found" because there is no
-alembic.ini in your project root.)
-
-The chain records its revision in its own `modulith_alembic_version` table, so
-it can share a database with your application's Alembic history in
-`alembic_version`. A database migrated by an earlier release tracked modupy in
-`alembic_version`. The next `modulith migrate` or raw `alembic upgrade` moves
-that revision into the new table before upgrading. It touches only modupy's
-own revisions, runs no migration again, and drops `alembic_version` only if the
-table is then empty.
-
-**Upgrading across migration 0008.** This release adds
-`0008_outbox_trace_context`, a nullable `trace_context` column on
-`event_publications` and `event_publications_archive`. Run `modulith migrate`
-before the new version starts: the new code maps the column on every save, so
-an unmigrated schema fails each publish. Rows written by the old version keep
-working and read back with no trace context.
-
-To put the outbox tables in a Postgres schema named after a module instead of
-`public`, pass `modulith migrate --schema <name>`, or add `-x schema=<name>`
-(or set `MODULITH_DB_SCHEMA`) to the raw command — Postgres only;
-other dialects log a warning and ignore it. This is separate from, but usually
-paired with, the database broker's own `broker_options.schema` /
-`MODULITH_BROKER_SCHEMA` knob.
-
-With the raw command, Alembic's `-x` is a global option and must precede the
-command:
-
-```bash
-MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
-  alembic -c "$(python -c 'import modulith.adapters, pathlib; print(pathlib.Path(modulith.adapters.__file__).parent / "alembic.ini")')" \
-  -x schema=orders upgrade head
-```
-
-Schema names must be portable unquoted SQL identifiers. The same validation
-applies to configuration, environment variables, Alembic `-x`, and direct
-database-broker construction. Enabling a named schema does not move data: if
-`public` already contains modupy tables or Alembic history and the target has
-no history, migration stops until you back up, explicitly move and verify the
-tables, then rerun it.
+outbox tables and also the `broker_*` tables of the database broker. The chain
+records its revision in its own `modulith_alembic_version` table, so it can
+share a database with your application's Alembic history in `alembic_version`.
 
 Bind your SQLAlchemy session to modupy around each transaction. The service
 function binds, publishes, commits and unbinds before the route returns:
@@ -371,6 +332,68 @@ modupy binds the store in every process-topology worker and, while
 `modulith outbox` CLI; without discovery, call `outbox.configure()` yourself. A
 worker with a durable `outbox` and no store refuses to start.
 
+Now `publish()` calls inside a transaction are atomically persisted.
+A crash after the commit does not lose the event. Rolled-back transactions
+don't leak ghost events. Listeners are called at-least-once after commit.
+
+**This is the feature that justifies modupy over "FastAPI plus
+folders."** Without it, you have a structural pattern. With it, you
+have durable, at-least-once delivery.
+
+### More outbox options
+
+The tuning knobs live in `[tool.modulith.outbox_options]`, and the runtime
+validates and forwards eight keys to `outbox.configure()` when it binds the
+store from `outbox_url`: `claim_strategy`, `claim_lease_seconds`,
+`claim_batch_size`, `dead_letter_after_attempts`, `retry_interval_seconds`,
+`retry_stale_seconds`, `max_retry_backoff_seconds` and `completion_mode`
+(`"update"` keeps history visible; `"delete"` and `"archive"` are the
+alternatives). `sqlite_wal = true` switches a SQLite `outbox_url` database to
+WAL journal mode, so readers no longer block a commit. It is off by default, is
+ignored for other databases, persists in the database file, and cannot be used
+on network filesystems. Any other key in the table is accepted and ignored. An
+application that binds its own store, as the manual wiring below does, passes
+these settings to `outbox.configure()` as keyword arguments.
+
+The raw Alembic command remains the alternative to `modulith migrate`. modupy
+ships its alembic config *inside* the installed package (your project needs no
+alembic.ini), so point alembic's `-c` at it and supply the database URL via the
+`MODULITH_DB_URL` env var (alembic runs on a **sync** driver, e.g.
+`postgresql+psycopg://`, even if your app connects with asyncpg):
+
+```bash
+MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
+  alembic -c "$(python -c 'import modulith.adapters, pathlib; print(pathlib.Path(modulith.adapters.__file__).parent / "alembic.ini")')" \
+  upgrade head
+```
+
+(`-x url=...` works instead of the env var; a bare `alembic upgrade head`
+fails with "No 'script_location' key found" because there is no
+alembic.ini in your project root.)
+
+To put the outbox tables in a Postgres schema named after a module instead of
+`public`, pass `modulith migrate --schema <name>`, or add `-x schema=<name>`
+(or set `MODULITH_DB_SCHEMA`) to the raw command — Postgres only;
+other dialects log a warning and ignore it. This is separate from, but usually
+paired with, the database broker's own `broker_options.schema` /
+`MODULITH_BROKER_SCHEMA` knob.
+
+With the raw command, Alembic's `-x` is a global option and must precede the
+command:
+
+```bash
+MODULITH_DB_URL='postgresql+psycopg://user:pass@localhost/mydb' \
+  alembic -c "$(python -c 'import modulith.adapters, pathlib; print(pathlib.Path(modulith.adapters.__file__).parent / "alembic.ini")')" \
+  -x schema=orders upgrade head
+```
+
+Schema names must be portable unquoted SQL identifiers. The same validation
+applies to configuration, environment variables, Alembic `-x`, and direct
+database-broker construction. Enabling a named schema does not move data: if
+`public` already contains modupy tables or Alembic history and the target has
+no history, migration stops until you back up, explicitly move and verify the
+tables, then rerun it.
+
 To bind your own store or serializer instead of `outbox_url`, call
 `outbox.configure()` yourself, at startup:
 
@@ -396,20 +419,6 @@ outbox.configure(
 ```
 
 The session binding above is the same either way.
-
-Upgrading with rows still in the outbox: a callable-instance or bound-method
-listener registered from a module is now stored as
-`<module package>:<class module>.<ClassName>`, so rows written under the old
-bare class id no longer match it. Let `modulith outbox status` report no
-incomplete rows before you deploy the upgrade.
-
-Now `publish()` calls inside a transaction are atomically persisted.
-Process crashes don't lose events. Rolled-back transactions don't leak
-ghost events. Listeners are called at-least-once after commit.
-
-**This is the feature that justifies modupy over "FastAPI plus
-folders."** Without it, you have a structural pattern. With it, you
-have actual delivery guarantees.
 
 ---
 
@@ -440,12 +449,10 @@ in-memory broker is a loud `ConfigurationError`, and explicit SHM rejects
 SQLAlchemy/network URLs.
 
 The supervisor spawns workers. The reverse proxy routes requests by
-URL prefix. Cross-module events flow through the configured broker. **No code
-changes are needed if you've been following events for cross-module
-communication** — an event whose consumer lives
-in another worker routes to the broker automatically. The one exception
-is fan-out: an event consumed *both* by a local listener *and* by a
-remote worker must be marked `@externalized` (from `modulith`), or
+URL prefix. Cross-module events flow through the configured broker: an event
+whose consumer lives in another worker routes to the broker automatically. The
+one exception is fan-out: an event consumed *both* by a local listener *and* by
+a remote worker must be marked `@externalized` (from `modulith`), or
 `@externalized(target="scheme:destination")` to pin a destination:
 
 ```python
@@ -457,6 +464,18 @@ from modulith import event, externalized
 class OrderPlaced:
     order_id: str
 ```
+
+Your routes need a check too, because a worker serves one module package and
+never your `main.py`:
+
+- A module with routes re-exports its `router` from `__init__.py`, because a
+  module running in its own process serves exactly that `router` under
+  `/<module>`. A listener-only module needs none. Without the re-export the
+  worker still starts, answers 404 on every `/<module>/...` path, and logs a
+  warning.
+- Declare each route without the `/<module>` prefix: the worker adds it.
+- `main.py` does not run in a worker, so its middleware, its lifespan and
+  anything else it sets up are absent there.
 
 A worker runs only the listeners owned by its own module package. Two
 listener shapes behave differently:
@@ -501,7 +520,7 @@ publication, including one every group has acked, is retained for
 `orphan_retention_seconds` (default one hour) and replayed to groups that
 subscribe before expiry, while the store has room below its publish budget.
 
-Use canonical private paths rather than the legacy names:
+Set the paths and limits under `[tool.modulith.broker_options]`:
 
 ```toml
 [tool.modulith.broker_options]
@@ -526,18 +545,6 @@ budget, as any consumer write can (error text, dead letters, and mark-mode
 completions grow rows); publishes are then refused until prune frees pages or
 `max_store_bytes` is raised. Environment overrides are
 `MODULITH_BROKER_MAX_PAYLOAD_BYTES` and `MODULITH_BROKER_MAX_STORE_BYTES`.
-Remove legacy `shm_slot_size`; it is deprecated and ignored.
-
-### Migrating the old overflow-only SHM store
-
-Stop the entire process fleet before opening an old store with the new runtime.
-Back up the state directory, deploy one version everywhere, then restart. On
-first open, the v0 `shm_message` overflow schema migrates transactionally to the
-SQLite-authoritative schema; a failed migration rolls back.
-
-Only rows that reached the old SQLite overflow store can migrate. Messages that
-existed only in the old payload ring cannot be recovered. Do not run old and new
-workers against the same files during migration.
 
 For cross-host delivery, explicitly configure Redis Streams
 (`modupy[redis]`) or a networked `database` URL.
@@ -623,9 +630,11 @@ call raises `TimeoutError`; pass `timeout=None` to disable the bound.
 Sync `@listener` functions are also accepted — they run in the event
 loop's executor.
 
-**"Tests are flaky after adding modupy."** Add the pytest plugin:
-`pip install 'modupy[test]'`. The `modulith_app` fixture handles
-state reset between tests, which fixes 90% of test isolation issues.
+**"Tests are flaky after adding modupy."** Request the `modulith_app` fixture
+in the flaky tests: it gives each test a fresh modupy runtime and resets it
+afterwards. Any install of modupy registers the pytest plugin, but a fixture
+only applies to a test that asks for it. `pip install 'modupy[test]'` adds the
+libraries the fixtures use.
 
 **"The audit tool's proposed structure looks wrong."** It's a
 heuristic. Override it. The point is to start a conversation, not
@@ -641,7 +650,6 @@ Skip modupy if:
 - You're already on microservices — coming back to a monolith is rare
   and the migration cost would dwarf the benefit
 - Your team is fully sync — the outbox requires async DB integration
-  to be production-grade
 - You have no events anywhere yet and aren't willing to introduce them
   — modupy is fundamentally event-driven; without that, you're just
   using folders and getting almost no benefit
@@ -654,6 +662,6 @@ people give it credit for.
 
 ## Getting help
 
-- **SPEC.md** — every design decision documented
+- **SPEC.md** — the full design
 - **examples/** — reference implementations of plugins and adapters
 - **GitHub issues** — for bugs and adoption questions

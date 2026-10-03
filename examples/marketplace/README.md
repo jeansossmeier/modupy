@@ -47,9 +47,10 @@ flowchart LR
 - [`marketplace_platform/`](marketplace_platform): the team's own boundary rule and tracing, shipped as a plugin
 - [`tests/`](tests): the architecture checks and every saga path under `pytest`
 
-Every command below runs from this directory, exactly as written. CI executes
-them, so the output shown is the output you get. Log lines that carry paths,
-process ids or timestamps are left out.
+Every command below runs from this directory, `examples/marketplace` in a clone
+of the repository (the [examples index](../README.md) shows how), exactly as
+written. CI executes them and checks that every line of output shown appears,
+in order. Log lines that carry paths, process ids or timestamps are left out.
 
 ## Check the architecture
 
@@ -386,8 +387,8 @@ The extracted service joins the database broker's `modulith-notifications`
 group, the group the platform's own `notifications` worker is in. While both
 run, nothing is published, so no event is split between them.
 
-Now stop the platform with Ctrl-C and start `orders` alone as a single
-monolith, isolated from every other module. It takes over port 8000:
+Now stop the platform with Ctrl-C and start `orders` alone, in a process of its
+own, with every other module left out. It takes over port 8000:
 
 ```bash
 $ modulith dev marketplace.main:app --isolate orders

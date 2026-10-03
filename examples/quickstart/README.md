@@ -1,11 +1,11 @@
 # Quickstart
 
 The smallest complete modupy project: three modules and a contracts package,
-no database, no broker, nothing to start first. It is the code from the root
-[README](../../README.md#the-30-second-pitch), file for file. Orders publish
-`OrderCreated`; `payments` charges it and publishes `PaymentReceived`;
-`orders` marks the order fulfilled; `inventory` reserves stock. No module
-imports another module, only the shared events.
+no database to set up, no broker to install, nothing to start first. It is the
+code from the root [README](../../README.md#the-30-second-pitch), file for
+file. Orders publish `OrderCreated`; `payments` charges it and publishes
+`PaymentReceived`; `orders` marks the order fulfilled; `inventory` reserves
+stock. No module imports another module, only the shared events.
 
 ![orders publishes OrderCreated, which payments and inventory receive; payments publishes PaymentReceived, which orders receives; both events live in contracts](../../docs/images/event-flow.svg)
 
@@ -16,9 +16,11 @@ imports another module, only the shared events.
 - [`myapp/main.py`](myapp/main.py): the FastAPI app
 - [`tests/`](tests): the same flows under `pytest`
 
-Every command below runs from this directory, exactly as written. CI executes
-them, so the output shown is the output you get. The server logs also carry
-process ids and timestamps, which are left out.
+Every command below runs from this directory, `examples/quickstart` in a clone
+of the repository (the [examples index](../README.md) shows how), exactly as
+written. CI executes them and checks that every line of output shown appears,
+in order. Real output can carry more: the server logs also carry process ids
+and timestamps, which are left out.
 
 ## Install and look around
 
@@ -50,6 +52,9 @@ modulith
 $ modulith verify
 ✓ no boundary violations
 ```
+
+`modulith info` goes on to list the loaded plugins and brokers; those lines are
+left out.
 
 ## Run it in one process
 
@@ -128,7 +133,8 @@ $ curl -s localhost:8000/inventory/ord-1
 ## Run its tests
 
 The tests drive the same flows in one process with modupy's test fixtures,
-without starting a server:
+without starting a server. `httpx2` is the HTTP client that Starlette's
+`TestClient` imports first, not a typo for `httpx`:
 
 ```bash
 pip install pytest httpx2

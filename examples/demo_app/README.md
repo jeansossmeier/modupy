@@ -1,8 +1,9 @@
 # The shop
 
 The mid-size example: one shop, three modules, four ways to run it. The code
-never changes between stages; environment variables change where events live
-and how many processes serve them.
+never changes between stages; environment variables change where events live,
+and the `--topology` flag and `pyproject.toml` change how many processes serve
+them.
 
 `orders` accepts an order and publishes `OrderPlaced`. `inventory` reserves the
 stock and publishes `StockReserved`. `notifications` records the notice. No
@@ -16,11 +17,13 @@ module imports another module, only the shared events.
 - [`shop/main.py`](shop/main.py): the FastAPI app and its lifespan
 - [`tests/`](tests): the flows under `pytest`
 
-Every command below runs from this directory, exactly as written. CI executes
-them, so the output shown is the output you get. Server logs also carry
-process ids and access lines, which are left out. Every stage places an order
-with an id of its own (`o-1`, `o-2`, ...) because `shop.db` keeps the earlier
-stages' orders, and a repeated id is answered with 409.
+Every command below runs from this directory, `examples/demo_app` in a clone of
+the repository (the [examples index](../README.md) shows how), exactly as
+written. CI executes them and checks that every line of output shown appears,
+in order. Real output can carry more: server logs also carry process ids and
+access lines, which are left out. Every stage places an order with an id of its
+own (`o-1`, `o-2`, ...) because `shop.db` keeps the earlier stages' orders, and
+a repeated id is answered with 409.
 
 ## Look before you run
 
@@ -62,7 +65,13 @@ generated 6 file(s) in docs/modulith:
   events.mmd
 ```
 
+`modulith info` goes on to list the loaded plugins and brokers; those lines are
+left out.
+
 ## Run its tests
+
+The tests use Starlette's `TestClient`, which imports `httpx2` first (it is not
+a typo for `httpx`):
 
 ```bash
 pip install pytest pytest-asyncio httpx2
@@ -261,8 +270,11 @@ The counts include stage 2's two publications, because both stages share
 
 ## Stage 3 afterwards: the outbox after the drain
 
-Stop the supervisor with Ctrl-C. It signals every worker and waits for them to
-finish what they were delivering, so nothing is left half done:
+Stop the supervisor with Ctrl-C. It signals every worker and waits up to 30
+seconds for them to exit. A listener still running when its worker stops is
+cancelled and delivered again later, because delivery is at least once (see
+[Graceful Shutdown](../../docs/DEPLOYMENT.md#graceful-shutdown)). The shop's
+listeners are quick, so nothing is left incomplete:
 
 ```bash
 $ modulith outbox status
