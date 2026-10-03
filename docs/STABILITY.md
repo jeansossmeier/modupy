@@ -6,13 +6,13 @@ This guide explains API stability guarantees for modupy 0.x and what to expect a
 
 ## Pre-1.0 SemVer: 0.x releases
 
-modupy follows [Semantic Versioning](https://semver.org/). Until 1.0, **breaking changes may occur in minor releases** (0.9 → 0.10) and **are always documented in CHANGELOG.md**. Patch releases (0.9.0 → 0.9.1) never break the public API.
+modupy follows [Semantic Versioning](https://semver.org/). Until 1.0, **breaking changes may occur in minor releases** (0.11 → 0.12) and **are always documented in CHANGELOG.md**. On the stable surfaces below, a breaking change first goes through the [deprecation policy](#deprecation-policy): the old form keeps working, with a warning, for at least one minor release before a later minor removes it. Patch releases (0.11.0 → 0.11.1) never break the public API.
 
 | Release | Breaking changes allowed? | Documented in | Upgrade effort |
 |---------|--------------------------|---------------|----------------|
-| 0.9.0 → 0.10.0 | **Yes** | CHANGELOG.md | Check for migrations |
-| 0.9.0 → 0.9.1 | No | CHANGELOG.md (bugfixes) | Safe |
-| 0.9 → 1.0 | Final, then no | CHANGELOG.md + [MIGRATION_GUIDE.md](../MIGRATION_GUIDE.md) | Review migration guide |
+| 0.11.0 → 0.12.0 | **Yes**, after a deprecation period on the stable surfaces | CHANGELOG.md | Check for migrations |
+| 0.11.0 → 0.11.1 | No | CHANGELOG.md (bugfixes) | Safe |
+| 0.x → 1.0 | Final, then no | CHANGELOG.md | Read the upgrade notes |
 
 ---
 
@@ -40,7 +40,7 @@ The public API is defined by exports in `modulith/__init__.py`:
 **Contract types** (plugin/extension data):
 - `EventPublication`, `ModuleInfo`, `Violation`, `ViolationSeverity` — event and manifest types
 
-**Stability**: These exports are considered stable. **Signature changes or removals require a major version bump (0.x → 1.0+)**, though 0.x minors may add optional parameters or new overloads if backward-compatible. The list above is `modulith.__all__` minus `__version__`; anything reachable only by a deeper import path is covered by one of the weaker tiers below.
+**Stability**: These exports are considered stable. **Before 1.0, a signature change or removal goes through the [deprecation policy](#deprecation-policy); from 1.0 on, it requires a major version bump.** 0.x minors may add optional parameters or new overloads if backward-compatible. The list above is `modulith.__all__` minus `__version__`; anything reachable only by a deeper import path is covered by one of the weaker tiers below.
 
 ---
 
@@ -49,7 +49,8 @@ The public API is defined by exports in `modulith/__init__.py`:
 `modulith.hooks` declares the 13 hookspecs a plugin implements, and
 `modulith.protocols` declares the driver contracts. Both carry the same
 guarantee as the public API above: a hookspec's name or parameter list changes
-only on a major bump.
+only through the deprecation policy before 1.0, and only on a major bump after
+it.
 
 That guarantee extends to types a hookspec's signature names but
 `modulith/__init__.py` deliberately does **not** re-export — import them from
@@ -67,15 +68,15 @@ the module that defines them:
 
 `modulith.testing` is registered through the `pytest11` entry point, so its
 fixtures and markers load in any pytest run where modupy is installed — the
-`modupy[test]` extra only adds the libraries the fixtures need, it does not
-gate registration.
+`modupy[test]` extra adds pytest, pytest-asyncio and the other libraries
+modupy's own test suite uses, and does not gate registration.
 
 - Fixtures: `modulith_app`, `modulith_module`, `scenario`
 - Classes: `ModulithTestApp`, `Scenario` (what those fixtures hand you)
 - Markers: `modulith_isolated`, `modulith_no_outbox`
 - Ini option: `modulith_isolated_timeout` (seconds an isolated test's subprocess may run; default 300)
 
-**Stability**: same as the public API — a rename or signature change is a major-version event, because test suites depend on these by name in every test function's arguments. The plugin is expected to move into a standalone `pytest-modupy` distribution in a future release; that split will keep the fixture, marker, and ini-option names identical, and will be documented in CHANGELOG.md.
+**Stability**: same as the public API — a rename or signature change goes through the deprecation policy before 1.0 and needs a major bump after it, because test suites depend on these by name in every test function's arguments. The plugin is expected to move into a standalone `pytest-modupy` distribution in a future release; that split will keep the fixture, marker, and ini-option names identical, and will be documented in CHANGELOG.md.
 
 ---
 
@@ -116,16 +117,14 @@ Modules under `modulith/adapters/*` are **implementation details** and may chang
 1. Raise `DeprecationWarning` at runtime (where feasible)
 2. Be marked `@deprecated` in docstrings
 3. Appear in CHANGELOG.md under "Deprecated"
-4. Remain functional for **at least one minor release** (e.g., deprecated in 0.9, removed no earlier than 0.11)
+4. Remain functional for **at least one minor release** (e.g., deprecated in 0.12, removed no earlier than 0.14)
 
 Example timeline:
-- **0.9.0**: `publish_sync(timeout=...)` parameter works, `DeprecationWarning` issued, CHANGELOG notes deprecation
-- **0.9.1 – 0.10.x**: Parameter still works, warning continues
-- **0.11.0** (or later): Parameter removed, breaking change documented in [MIGRATION_GUIDE.md](../MIGRATION_GUIDE.md)
+- **0.12.0**: `publish_sync(timeout=...)` parameter works, `DeprecationWarning` issued, CHANGELOG notes deprecation
+- **0.12.1 – 0.13.x**: Parameter still works, warning continues
+- **0.14.0** (or later): Parameter removed, breaking change documented in CHANGELOG.md with an upgrade note
 
-(Illustration only — `publish_sync(timeout=...)` is not deprecated. Do not
-confuse `MIGRATION_GUIDE.md`, the upstream upgrade guide, with `MIGRATION.md`,
-the default output filename of your own `modulith audit` run.)
+(Illustration only — `publish_sync(timeout=...)` is not deprecated.)
 
 This gives users a clear upgrade path without surprise breakage in patch releases.
 
