@@ -68,8 +68,8 @@ the module that defines them:
 
 `modulith.testing` is registered through the `pytest11` entry point, so its
 fixtures and markers load in any pytest run where modupy is installed — the
-`modupy[test]` extra adds pytest, pytest-asyncio and the other libraries
-modupy's own test suite uses, and does not gate registration.
+`modupy[test]` extra adds pytest and pytest-asyncio, and does not gate
+registration.
 
 - Fixtures: `modulith_app`, `modulith_module`, `scenario`
 - Classes: `ModulithTestApp`, `Scenario` (what those fixtures hand you)

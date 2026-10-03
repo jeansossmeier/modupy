@@ -89,7 +89,7 @@ jobs:
           enable-cache: true
 
       - name: Install project
-        run: uv pip install --system -e ".[test]"
+        run: uv pip install --system -e ".[test-suite]"
 
       - name: Run focused SHM and state tests serially
         run: >-
@@ -126,7 +126,7 @@ jobs:
       - name: Install project with integration extras
         # `.[integration]` layers testcontainers + the REAL Postgres drivers
         # (asyncpg for the outbox, sync psycopg for Alembic) on top of the
-        # default test extra. GitHub-hosted ubuntu runners ship a working
+        # default test-suite extra. GitHub-hosted ubuntu runners ship a working
         # Docker daemon, which testcontainers uses to start disposable
         # postgres:16 / redis:7 containers.
         run: uv pip install --system -e ".[integration]"

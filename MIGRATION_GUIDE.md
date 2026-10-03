@@ -633,8 +633,8 @@ loop's executor.
 **"Tests are flaky after adding modupy."** Request the `modulith_app` fixture
 in the flaky tests: it gives each test a fresh modupy runtime and resets it
 afterwards. Any install of modupy registers the pytest plugin, but a fixture
-only applies to a test that asks for it. `pip install 'modupy[test]'` adds the
-libraries the fixtures use.
+only applies to a test that asks for it. `pip install 'modupy[test]'` adds
+pytest and pytest-asyncio.
 
 **"The audit tool's proposed structure looks wrong."** It's a
 heuristic. Override it. The point is to start a conversation, not

@@ -4,8 +4,8 @@
 #   - Package metadata (name, version, description, license, authors)
 #   - Runtime dependencies (just pluggy, intentionally minimal)
 #   - Optional extras (postgres, redis, database, otel, fastapi, cli, test,
-#     integration, all, dev — no kafka extra: the adapter is unshipped, see
-#     the NOTE below)
+#     test-suite, integration, all, dev — no kafka extra: the adapter is
+#     unshipped, see the NOTE below)
 #   - The `modulith` console script entry point
 #   - The `modulith` plugin entry point group for third-party plugins
 #   - Tool configurations (pytest, ruff, mypy)
@@ -151,16 +151,23 @@ cli = [
 # Test plugin (separate package conceptually, but shipped inside modupy as
 # this extra; a standalone pytest-modupy remains a possible future split).
 #
-# This extra must install everything the default (non-integration) test suite
-# imports at collection time, so `pip install modupy[test] && pytest` is
+# This is what users install for the plugin: modulith/testing.py imports only
+# pytest and the standard library, so the extra holds just pytest and
+# pytest-asyncio. Everything modupy's own suite needs lives in `test-suite`.
+test = [
+    "pytest>=7.4,<10.0",
+    "pytest-asyncio>=0.23,<2.0",
+]
+
+# Everything modupy's default (non-integration) test suite imports at
+# collection time, so `pip install modupy[test-suite] && pytest` is
 # reproducible. The suite runs the Postgres adapter against aiosqlite, so we
 # pull SQLAlchemy + alembic + aiosqlite directly (NOT asyncpg — the sqlite path
 # doesn't need it), plus the feature extras whose libraries the tests import
 # (fastapi/httpx for proxy+worker, typer for CLI, otel for observability, redis
 # for the broker unit tests, and build for isolated extraction-wheel checks).
-test = [
-    "pytest>=7.4,<10.0",
-    "pytest-asyncio>=0.23,<2.0",
+test-suite = [
+    "modupy[test]",
     "pytest-timeout>=2.1,<3.0",
     "build>=1.2,<2.0",
     "hatchling>=1.27",
@@ -190,11 +197,11 @@ test = [
 #     test (postgresql+psycopg://) — asyncpg can't drive Alembic's sync engine
 #   - pymysql: the SYNC driver Alembic uses for the MySQL migration test
 #     (mysql+pymysql://), same reason — aiomysql can't drive it either
-# Layered on `test` so it also gets pytest, redis, fastapi, etc. Run with
+# Layered on `test-suite` so it also gets pytest, redis, fastapi, etc. Run with
 # `pip install modupy[integration] && pytest -m integration`; the suite
 # auto-skips these when Docker is unreachable (see tests/conftest.py).
 integration = [
-    "modupy[test]",
+    "modupy[test-suite]",
     "testcontainers>=4.0,<5.0",
     "asyncpg>=0.29,<1.0",
     "aiomysql>=0.2,<1.0",
@@ -211,8 +218,8 @@ all = [
 ]
 
 # Development dependencies — for working ON modulith, not WITH it.
-# Includes `integration` so contributors can run the full testcontainers
-# suite locally; `all` alone only covers the sqlite-backed default tests.
+# Includes `integration`, which layers on `test-suite`, so contributors can
+# run both the default suite and the testcontainers suite locally.
 dev = [
     "modupy[all,integration]",
     "ruff>=0.4,<1.0",

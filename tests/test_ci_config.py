@@ -100,6 +100,42 @@ def test_integration_extra_provides_testcontainers_drivers() -> None:
     assert "psycopg" in names
 
 
+def test_test_extra_is_only_the_pytest_plugin_dependencies() -> None:
+    """``modupy[test]`` is what users install for the pytest plugin, and
+    ``modulith/testing.py`` imports only pytest and the standard library."""
+    reqs = _optional_dependencies()["test"]
+    assert {Requirement(req).name for req in reqs} == {"pytest", "pytest-asyncio"}, (
+        f"test extra {reqs!r} must hold only pytest and pytest-asyncio"
+    )
+
+
+def test_test_suite_extra_layers_on_the_test_extra() -> None:
+    """``test-suite`` carries what the default suite imports, on top of ``test``."""
+    reqs = _optional_dependencies()["test-suite"]
+    assert "modupy[test]" in reqs
+    names = {Requirement(req).name for req in reqs}
+    assert {"pytest-timeout", "build", "hatchling", "sqlalchemy", "alembic", "aiosqlite"} <= names
+    assert {"pyyaml", "httpx2", "modupy"} <= names
+
+
+def test_integration_extra_requires_the_suite_extra() -> None:
+    """The integration lane runs the default suite's imports plus real drivers."""
+    reqs = _optional_dependencies()["integration"]
+    assert "modupy[test-suite]" in reqs
+    assert "modupy[test]" not in reqs
+
+
+def test_focused_shm_job_installs_the_suite_extra() -> None:
+    """The focused SHM job runs tests that import the suite's dependencies."""
+    installs = [
+        step["run"]
+        for step in _job_steps("shm")
+        if isinstance(step.get("run"), str) and "uv pip install" in step["run"]
+    ]
+    assert len(installs) == 1, f"shm job must have one install step, found {installs!r}"
+    assert '-e ".[test-suite]"' in installs[0]
+
+
 def test_mypy_job_type_checks_tests() -> None:
     """mypy in CI must cover tests/, not just modulith/ — and it
     must run under --strict. The earlier form of this regex made ``--strict``
@@ -615,18 +651,19 @@ def test_projects_using_the_starlette_test_client_declare_httpx2(project: Path) 
     tests with it and does not install ``httpx2``."""
     with (project / "pyproject.toml").open("rb") as fh:
         extras = tomllib.load(fh)["project"]["optional-dependencies"]
-    names = {Requirement(req).name for req in extras["test"]}
+    extra = "test-suite" if project == REPO_ROOT else "test"
+    names = {Requirement(req).name for req in extras[extra]}
     assert "httpx2" in names, (
-        f"{project.name}: the `test` extra must declare httpx2, it declares {sorted(names)}"
+        f"{project.name}: the `{extra}` extra must declare httpx2, it declares {sorted(names)}"
     )
 
 
-def test_test_extra_floors_httpx2_at_the_release_starlette_accepts() -> None:
+def test_test_suite_extra_floors_httpx2_at_the_release_starlette_accepts() -> None:
     """Starlette's own ``full`` extra requires ``httpx2>=2.0.0``; the test client is not
     exercised against an older release."""
-    reqs = _optional_dependencies()["test"]
+    reqs = _optional_dependencies()["test-suite"]
     assert any(re.match(r"httpx2>=2\.0\b", req) for req in reqs), (
-        f"test extra {reqs!r} must floor httpx2 at >=2.0"
+        f"test-suite extra {reqs!r} must floor httpx2 at >=2.0"
     )
 
 

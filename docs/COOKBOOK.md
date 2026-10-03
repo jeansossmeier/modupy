@@ -1025,8 +1025,8 @@ without `sleep`s or real infrastructure.
 The `modulith` pytest plugin ships fixtures that reset the runtime per test
 and capture what was published. It registers through the `pytest11` entry
 point and loads in any pytest run where `modupy` is installed — the
-`modupy[test]` extra adds pytest, pytest-asyncio and the other libraries
-modupy's own test suite uses, and does not gate registration. Disable it in an unrelated suite with `pytest -p
+`modupy[test]` extra adds pytest and pytest-asyncio, and does not gate
+registration. Disable it in an unrelated suite with `pytest -p
 no:modulith`.
 
 `pip install 'modupy[test]'` brings `pytest` and `pytest-asyncio`. Two settings
