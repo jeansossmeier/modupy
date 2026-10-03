@@ -59,7 +59,7 @@ def _target_filter(
     targets: list[str] | tuple[str, ...] | None,
 ) -> tuple[str, tuple[str, ...]]:
     """SQL fragment and parameters restricting a claim to ``targets``."""
-    # ponytail: rows for excluded targets are skipped inside the range scan,
+    # rows for excluded targets are skipped inside the range scan,
     # so a large backlog on a no-longer-consumed target costs each poll a scan
     # of it; ``modulith broker drop-group --target`` removes that backlog.
     if targets is None:

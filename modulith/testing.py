@@ -8,10 +8,10 @@ Registered as a pytest plugin via the `pytest11` entry point in
 pyproject.toml, under the entry-point name `modulith`. That entry point is
 unconditional — fixtures and markers load in any pytest run where modupy
 is installed, regardless of which extras were requested at install time.
-The `modupy[test]` extra only adds the libraries the fixtures need (e.g.
-`httpx` for `modulith_app`'s test client); it does not gate registration.
+The `modupy[test]` extra adds pytest, pytest-asyncio and the other
+libraries modupy's own test suite uses; it does not gate registration.
 Eventually the plugin may move into a standalone `pytest-modupy`
-distribution (v2) — separate release cadence, smaller install for users
+distribution — separate release cadence, smaller install for users
 who only test — but the fixture/marker names will stay identical.
 
 Do not add `pytest_plugins = ["modulith.testing"]` to a conftest.py: pytest

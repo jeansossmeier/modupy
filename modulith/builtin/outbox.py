@@ -44,9 +44,8 @@ Critical correctness properties:
 Reference implementation: Spring Modulith's Event Publication Registry. We
 mirror its semantics, including completion modes (update / delete / archive).
 
-Two deliberate design decisions, where the storage-agnostic architecture
-(SPEC §7.2: "this plugin is storage-agnostic; it just calls the store")
-takes precedence over the granular plan:
+Two deliberate design decisions keep this plugin storage-agnostic, so that it
+only ever calls the ``PublicationStore``:
 
   * **Persistence runs in async code, driven by the runtime** — not inside
     the synchronous ``modulith_before_event_published`` pluggy hook. pluggy
@@ -92,7 +91,7 @@ from modulith.serializers import JsonEventSerializer, _event_type_name
 
 logger = logging.getLogger("modulith.outbox")
 
-# The broker WIRE serializer. The wire format is fixed JSON in v1: the worker
+# The broker WIRE serializer. The wire format is fixed JSON: the worker
 # consumer and the direct (non-durable) publish path both speak
 # JsonEventSerializer, so the durable path must put the same bytes on the
 # wire. The *configured* outbox serializer (``configure(serializer=...)``)
@@ -103,7 +102,7 @@ _WIRE_SERIALIZER = JsonEventSerializer()
 
 # The current transaction's session. Private, and deliberately absent from
 # ``__all__``: the supported way to bind and release one is
-# ``modulith.adapters.postgres_outbox.bind_session`` / ``unbind_session``,
+# ``modulith.builtin.outbox.bind_session`` / ``unbind_session``,
 # which restore the previous value on exit so nested binds don't clobber the
 # outer session. The plugin only reads this to decide whether a publish is
 # transactional; the adapter's ``save`` uses it to enlist the record. Read it
@@ -594,7 +593,7 @@ def _cancel_retry_task() -> None:
 
 @hookimpl
 def modulith_before_event_published(event: Any) -> None:
-    """Validation/enrichment slot (SPEC §4.2). The outbox does not persist
+    """Validation/enrichment slot (SPEC §4.1). The outbox does not persist
     here — persistence is async and is driven by ``persist`` from the runtime
     (pluggy hooks cannot ``await``). Kept so the hookspec stays exercised and
     so other plugins composing on this hook see a registered implementation.
@@ -673,7 +672,7 @@ async def persist_broker_route(event: Any, target: str) -> EventPublication:
     ``_BROKER_ROUTE_LISTENER_PREFIX`` for why the send must not happen inside
     publish() itself.
 
-    The payload is serialized with the WIRE serializer (fixed JSON in v1),
+    The payload is serialized with the WIRE serializer (fixed JSON),
     not the configured storage serializer — the row's payload goes to the
     broker verbatim, and the worker consumer decodes the wire format (see
     ``_WIRE_SERIALIZER``).
@@ -1141,7 +1140,7 @@ async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
             # Release early: holding a full lease on a not-yet-due row, or on
             # a row only a sibling worker can deliver, would block every other
             # sweeper from picking it up sooner.
-            # ponytail: foreign rows still occupy claim_batch slots, so a large
+            # foreign rows still occupy claim_batch slots, so a large
             # sibling backlog can delay this worker's own rows; filter the
             # claim query by local listener ids if that shows up.
             if pub.claim_token:

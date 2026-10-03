@@ -616,7 +616,7 @@ def _on_owning_loop(
         owner = self._check_cross_loop_usage()
         if owner is None:
             return await method(self, *args, **kwargs)
-        # ponytail: an owner that stops between the is_running() check and
+        # an owner that stops between the is_running() check and
         # running this task leaves the call waiting forever; bound the wait if
         # an owner loop ever stops while other loops are still publishing.
         future = asyncio.run_coroutine_threadsafe(method(self, *args, **kwargs), owner)

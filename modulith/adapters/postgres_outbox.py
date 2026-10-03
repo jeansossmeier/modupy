@@ -24,8 +24,8 @@ Critical correctness pattern:
      queued-but-uncommitted publications are never dispatched, and logs each
      such discard at WARNING with the event types.
 
-Two deliberate deviations from the literal SPEC §10.1 schema, both forced by
-the ``PublicationStore`` Protocol (the authoritative contract):
+Two deliberate schema choices, both forced by the ``PublicationStore``
+Protocol (the authoritative contract):
 
   * ``payload`` is ``BYTEA``/``LargeBinary``, not ``JSONB``. The Protocol
     types payload as ``bytes`` precisely so binary serializers (Avro,

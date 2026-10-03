@@ -15,7 +15,7 @@ OpenAPI schema and no docs UI, so ``/openapi.json``, ``/docs`` and ``/redoc``
 are proxied or 404 like any other path (see ``create_proxy_app``).
 
 Uses ``httpx.AsyncClient`` for streaming proxying. Hop-by-hop headers are
-stripped per RFC 7230. WebSocket support is a v2.1 enhancement; v1 is HTTP only.
+stripped per RFC 7230. WebSocket requests are not proxied: the proxy speaks HTTP only.
 """
 
 from __future__ import annotations

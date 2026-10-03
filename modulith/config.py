@@ -1041,7 +1041,7 @@ def _validate(data: dict[str, Any]) -> None:
     if "broker" in data and isinstance(data["broker"], str) and not data["broker"].strip():
         raise ConfigurationError(f"broker must be a non-empty adapter name, got {data['broker']!r}")
 
-    # "subinterpreters" is reserved but unshipped (SPEC §9.5 option C;
+    # "subinterpreters" is reserved but unshipped (SPEC §9.1 option C;
     # ROADMAP Phase 4). Accepting it would route the app through the real
     # multi-process supervisor as if it were "processes" — silently the
     # wrong isolation model. Checked AFTER the cross-process-broker guard so

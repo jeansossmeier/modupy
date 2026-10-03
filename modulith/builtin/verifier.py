@@ -28,7 +28,7 @@ The six default rules:
      specific names.
   5. Module data ownership — when manifests declare ``owns_tables``, a
      ``Table("x")`` reference in another module is flagged (best-effort,
-     warning; full coverage is v1.1 with runtime SQLAlchemy events).
+     warning only; there is no runtime check of the SQL a module runs).
      Conflicting ownership declarations (two manifests claiming the same
      table) are surfaced as their own warning.
   6. Contracts is a sink — everyone may import from the contracts module;
