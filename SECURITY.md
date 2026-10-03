@@ -14,7 +14,7 @@ Do not open a public issue for security vulnerabilities.
 
 ## Bug Bounty
 
-There is no bug bounty program. Security fixes are welcomed and credited in the changelog.
+There is no bug bounty program. Reports are welcomed, and reporters are credited in the changelog.
 
 ## Supported Versions
 

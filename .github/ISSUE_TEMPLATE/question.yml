@@ -1,0 +1,33 @@
+name: Question
+description: Ask how to use modupy, or how a part of it is meant to work.
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check [docs/COOKBOOK.md](https://github.com/jeansossmeier/modupy/blob/main/docs/COOKBOOK.md)
+        first — it covers the common recipes. A behaviour that differs from the
+        docs is a bug report. Security vulnerabilities do **not** go here —
+        use a [private advisory](https://github.com/jeansossmeier/modupy/security/advisories/new)
+        instead (see SECURITY.md).
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: What you are trying to do, and what is unclear.
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you have tried
+      description: The recipes or docs you read, and the code you wrote. A short snippet helps.
+
+  - type: input
+    id: version
+    attributes:
+      label: modupy version
+      description: "Output of `modulith --version` (or `pip show modupy`)."
+      placeholder: "0.11.0"

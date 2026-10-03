@@ -60,20 +60,17 @@ mypy --strict modulith/ tests/ scripts/ examples/
 ## Database Migrations
 
 Schema revisions live in `modulith/adapters/migrations/versions/` and ship
-inside the package; operators apply them with the packaged `alembic.ini` (see
+inside the package; operators apply them with `modulith migrate`, or with
+Alembic against the packaged `alembic.ini` (see
 [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)).
 
-**A revision that has shipped in a release is immutable.** Alembic records every
-applied revision in `alembic_version` and never re-runs it, so editing a shipped
-revision's DDL changes what *fresh* installs get and nothing else. An existing
-database keeps the old shape permanently, the two schemas diverge silently, and
-the damage surfaces much later as a runtime error against a column that should
-have been migrated. To change a shipped column, add a new revision carrying the
-`ALTER`.
-
-Revisions `0001`–`0005` predate the first release and were edited in place while
-nothing had shipped — which is why `0003` widens `payload` on tables that `0001`
-already creates. That latitude ends at 0.10.0.
+**A revision that appears in a PyPI release is immutable.** Alembic records the
+revision a database is at in `modulith_alembic_version` and never re-runs the
+ones behind it, so editing a shipped revision's DDL changes what *fresh*
+installs get and nothing else. An existing database keeps the old shape
+permanently, the two schemas diverge silently, and the damage surfaces much
+later as a runtime error against a column that should have been migrated. To
+change a shipped column, add a new revision carrying the `ALTER`.
 
 New revisions need a MySQL check, not just Postgres and SQLite: plain
 `sa.LargeBinary()` compiles to MySQL `BLOB`, capped at 65,535 bytes, and an
@@ -98,6 +95,20 @@ All three must pass:
 - `pytest -m "not integration" -v --tb=short` (or integration tests if adding adapters/brokers)
 - `ruff check` and `ruff format --check` (linting and formatting)
 - `mypy --strict` (strict type checking)
+
+CI also enforces:
+- Coverage of at least 90% overall and 100% on `modulith/builtin/outbox.py`.
+- `docs/API_REFERENCE.md` is generated. After changing the signature or
+  docstring of anything exported from `modulith`, run
+  `python scripts/gen_api_reference.py` and commit the result; CI runs it with
+  `--check` and fails if the file is stale.
+- Docs that quote the code stay in sync, as part of the default suite:
+  `docs/STABILITY.md` must name every export in `modulith.__all__`, and the
+  hookspec and protocol counts quoted in Markdown must match the code.
+
+Commit messages follow Conventional Commits: `type(scope): summary`, with types
+such as `feat`, `fix`, `docs`, `test`, `ci` and `chore`, for example
+`fix(outbox): stop the retry loop cooperatively on shutdown`.
 
 ## Design & Scope
 
