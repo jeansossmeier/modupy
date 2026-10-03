@@ -4,8 +4,10 @@ How modupy works internally — the runtime, the plugin contract, the
 transactional outbox, cross-process delivery, and the boundary verifier. This
 is the "how it fits together" companion to the reference material:
 
-- **[SPEC.md](../SPEC.md)** is the canonical, exhaustive design document. Every
-  section here points back to the relevant SPEC part for the full detail.
+- **[SPEC.md](../SPEC.md)** is the design document: the reasoning behind
+  modupy's design. Where it and the code disagree, the code and
+  [STABILITY.md](STABILITY.md) are right. Every section here points back to the
+  relevant SPEC part for the reasoning.
 - **[API_REFERENCE.md](API_REFERENCE.md)** is the generated reference for the
   public surface (`modulith.__all__`).
 - **[COOKBOOK.md](COOKBOOK.md)** is task-oriented recipes.
@@ -65,8 +67,7 @@ flowchart TD
     F -->|no| I["install state,<br>mark bootstrapped"]
 ```
 
-Bootstrap assembles the whole system in one shot (graph hyperedge *Runtime
-bootstrap assembly*):
+Bootstrap assembles the whole system in one shot:
 
 1. `load_configuration()` resolves the effective config (§3).
 2. `detect_application_package()` finds the app's root package (§4).
@@ -117,12 +118,13 @@ silently guess:
   than coercing garbage to `False`. Broker adapters additionally layer their
   own `MODULITH_BROKER_<KEY>` environment contract over `broker_options`.
 - **Subtable spellings are policed.** `[tool.modulith.outbox_options]` is the
-  *only* outbox-options subtable; the legacy `[tool.modulith.outbox]` subtable
-  raises (pointing at the new spelling — `outbox` is the scalar adapter name).
+  *only* outbox-options subtable; a `[tool.modulith.outbox]` subtable raises,
+  pointing at `outbox_options` (`outbox` is the scalar adapter name).
   `broker`/`broker_options` are aliases but colliding subtables raise; a typo of
-  a real subtable raises with a "did you mean" hint; the reserved `verify`
-  subtable and genuinely-unknown subtables are dropped silently for
-  forward-compatibility.
+  a real subtable raises with a "did you mean" hint. `[tool.modulith.verify]`
+  supports `disabled_rules`, a list of boundary-rule names to turn off (a
+  malformed value raises), and ignores any other key; genuinely-unknown
+  subtables are dropped silently for forward-compatibility.
 - **A `pyproject.toml` that fails to parse raises** — including the
   duplicate-key collision TOML throws when a key is written as both a scalar and
   a table. Silently skipping it would revert every setting (including
@@ -272,8 +274,9 @@ misspelled hook *name* fails at startup rather than silently never firing.
 
 The critical safety property here is the **observe-contract shield**. The
 per-listener observe hooks (`on_listener_dispatch` / `_complete` / `_error`)
-are documented as observers that *never gate* dispatch. The manager enforces
-this: exceptions raised by those hook implementations are logged and swallowed.
+and `modulith_on_publish_error` are documented as observers that *never gate*
+dispatch. The manager enforces this: exceptions raised by those hook
+implementations are logged and swallowed.
 A failing span exporter or a broken alerting plugin can therefore never mask a
 listener's own outcome, and — crucially — can never kill the outbox retry loop:
 an unshielded observer exception propagating out of the retry task would stall
@@ -307,8 +310,7 @@ flowchart TD
     M --> X
 ```
 
-`Runtime.publish()` is the single funnel. Its sequence (graph community
-*Publish sequence*):
+`Runtime.publish()` is the single funnel. Its sequence:
 
 1. Fire `modulith_before_event_published` (validation/enrichment/audit at the
    boundary; raising here aborts the publish and rolls back an enclosing
@@ -374,7 +376,9 @@ before you flush, as `place_order` in the
     submits a call from another loop to the loop that first used it and runs
     the call there, so that loop must stay running and unblocked.
 
-  See DEPLOYMENT.md's outbox section and §A.
+  See [DEPLOYMENT.md](DEPLOYMENT.md): "Durable Single-Process (Outbox Pattern)"
+  for the outbox and "A. SQLite Database Broker (Zero Infrastructure)" for the
+  database broker.
 - **Sync listeners** run in the event loop's default executor
   (`wrap_sync_listener`). Two sharp edges: only *synchronous* SQLAlchemy
   sessions work in an executor thread (an `AsyncSession` needs the greenlet
@@ -451,7 +455,9 @@ stateDiagram-v2
     Waiting --> Delivering: sweep after backoff
     Delivering --> Dead: failed, attempt_count reaches 10
     Dead --> Delivering: --retry-all, attempt_count reset
-    Delivering --> Pending: lease expired, no attempt charged
+    Delivering --> Pending: lease expired, dispatch never started, no attempt charged
+    Delivering --> Waiting: lease expired after dispatch started, one attempt charged
+    Delivering --> Dead: lease expired after dispatch started, attempt_count reaches 10
     Completed --> [*]
     note right of Waiting
         backoff after the n-th failure
@@ -497,41 +503,22 @@ A background retry loop drives redelivery:
 - Under `"advisory_lock"` the row's lock lives as long as the dead process's
   Postgres session. When the process dies on a live host, its kernel closes
   the socket, the session ends, and the startup sweep recovers the row at
-  once. The exception is a descendant forked from the process, such as a
-  fork-started `multiprocessing` or `ProcessPoolExecutor` child: it keeps a
-  copy of the lock connection's socket, so the session and its locks outlive
-  the process until that descendant exits, and every sweep skips the row
-  meanwhile. Start such children with the `spawn` or `forkserver` method
-  (`multiprocessing.get_context("spawn")`, passed as `ProcessPoolExecutor`'s
-  `mp_context`), which does not inherit the connection. After a host loss or
-  a network partition nothing closes the socket,
-  so the row stays locked and every sweep skips it until Postgres drops the
-  dead session through TCP keepalive. With stock Linux defaults that takes
-  about 2 h 11 min: 7200 s idle, then 9 probes 75 s apart. To shorten it,
-  lower the server's `tcp_keepalives_idle`, `tcp_keepalives_interval` and
-  `tcp_keepalives_count`, either in `postgresql.conf` or per connection:
-  `connect_args={"server_settings": {"tcp_keepalives_idle": "60",
-  "tcp_keepalives_interval": "10", "tcp_keepalives_count": "3"}}` for
-  asyncpg, or `connect_args={"options": "-c tcp_keepalives_idle=60 -c
-  tcp_keepalives_interval=10 -c tcp_keepalives_count=3"}` for psycopg (about
-  90 s). Lock connections are opened with the engine's connect arguments.
-  Postgres ignores these settings on Unix-domain socket connections. An
-  engine built from `outbox_url` takes no `connect_args`. With psycopg, put
-  them in the URL's `options` query parameter:
-  `?options=-c%20tcp_keepalives_idle%3D60%20-c%20tcp_keepalives_interval%3D10%20-c%20tcp_keepalives_count%3D3`.
-  With asyncpg, set them in `postgresql.conf` or with `ALTER ROLE ... SET`.
-  psycopg's `options` connect argument replaces any `options` in the URL,
-  such as a `search_path`.
-  A process that hangs without exiting keeps its session, and so its locks,
-  until it resumes, or until it and every descendant forked from it have
-  exited. Leave `idle_session_timeout` unset for the
-  outbox's role: a lock connection sits idle while its listener runs, so
-  ending that session releases the lock mid-delivery and a peer's sweep can
-  deliver the row again. Advisory locks need a server session that stays
-  with one client connection: behind PgBouncer use session pooling, never
-  transaction or statement pooling, and set PgBouncer's own `tcp_keepalive`
-  options, because the server's keepalive then watches PgBouncer, not your
-  process.
+  once. Three cases keep the lock longer, and every sweep skips the row
+  meanwhile:
+  - A descendant forked from the process, such as a fork-started
+    `multiprocessing` or `ProcessPoolExecutor` child: it keeps a copy of the
+    lock connection's socket, so the session and its locks outlive the process
+    until that descendant exits. Start such children with the `spawn` or
+    `forkserver` method (`multiprocessing.get_context("spawn")`, passed as
+    `ProcessPoolExecutor`'s `mp_context`), which does not inherit the
+    connection.
+  - A host loss or a network partition: nothing closes the socket, so the row
+    stays locked until Postgres drops the dead session through TCP keepalive.
+    With stock Linux defaults that takes about 2 h 11 min: 7200 s idle, then 9
+    probes 75 s apart.
+  - A process that hangs without exiting keeps its session, and so its locks,
+    until it resumes, or until it and every descendant forked from it have
+    exited.
 - Backoff is exponential, measured from `last_attempt_at` (not `published_at`),
   and **capped at 5 minutes** — a persistently-failing listener actually backs
   off instead of being retried every sweep.
@@ -539,6 +526,13 @@ A background retry loop drives redelivery:
   `modulith outbox status` and the doctor command) instead of retrying forever.
 - The retry loop is exception-shielded end to end: an ack/observe/error-hook
   failure is logged, never allowed to kill the loop.
+
+**Postgres session settings for `"advisory_lock"`.** Shortening the wait after a
+host loss or a partition takes server keepalive settings, and running behind
+PgBouncer takes session pooling and PgBouncer's own keepalive settings.
+DEPLOYMENT.md's
+[Postgres and PgBouncer settings for `advisory_lock`](DEPLOYMENT.md#postgres-and-pgbouncer-settings-for-advisory_lock)
+lists them, with the URL, `connect_args` and `ALTER ROLE` forms.
 
 ### 7.3 Completion modes
 
@@ -610,7 +604,7 @@ at-least-once and **listeners must be idempotent**.
 
 `EventSerializer` governs **storage** of publication records; the default is
 `JsonEventSerializer`. Note the deliberate asymmetry (SPEC §10.2): the **broker
-wire format is fixed JSON in v1**, spoken identically by the direct publish
+wire format is fixed JSON**, spoken identically by the direct publish
 path, the durable broker-route path, and the worker consumer — a pluggable
 *storage* serializer does not change what goes on the wire. Because
 `event_type` drives `importlib`-based class resolution on deserialize, records
@@ -727,34 +721,38 @@ configured, or stores a retained source for replay; it never silently reports
 success after writing zero delivery rows.
 
 *Competing consumers.* `DatabaseConsumer` polls, claiming a batch of due rows
-with `FOR UPDATE SKIP LOCKED` (Postgres / MySQL 8.0.1+ / MariaDB 10.6+) so concurrent
-workers of a replicated module partition the backlog instead of blocking or
-double-claiming. An older MySQL or MariaDB server is rejected with a
+with `FOR UPDATE SKIP LOCKED` (Postgres / MySQL 8.0.1+ / MariaDB 10.6+) so
+concurrent workers of a replicated module partition the backlog instead of
+blocking or double-claiming. An older MySQL or MariaDB server is rejected with a
 `ConfigurationError` when a consumer subscribes. It gets no unlocked claim,
-because InnoDB's REPEATABLE READ would let two consumers claim the same rows. It deserializes each row by its `event_type` header, dispatches
-to the local listeners, then removes the row (`completion_mode="delete"`, the
-default) or marks it `done` (`"mark"`, leaving it for the prune job). Poison rows
-(missing `event_type` / undeserializable payload) are dead-lettered immediately;
+because InnoDB's REPEATABLE READ would let two consumers claim the same rows.
+It deserializes each row by its `event_type` header, dispatches to the local
+listeners, then removes the row (`completion_mode="delete"`, the default) or
+marks it `done` (`"mark"`, leaving it for the prune job). Poison rows (missing
+`event_type` / undeserializable payload) are dead-lettered immediately;
 dispatch failures increment `attempts` with capped backoff and dead-letter after
-`max_delivery_attempts` (default 5). A worker that crashes between claim and ack
-leaves its row `claimed`; the next claim reclaims it once `claimed_at` is older
-than `reclaim_stale_seconds` (default 60) — the DB analogue of the Redis
-`XAUTOCLAIM` recovery, and what keeps delivery at-least-once across a crash;
-that same claim-time reclaim now enforces `max_delivery_attempts` too — a row
-reclaimed past the cap is dead-lettered directly instead of redelivered
-forever, since a crashed/wedged consumer never reaches `fail()` to run the
-cap itself. The reclaim charges an attempt only to a row whose dispatch had
-started: the consumer marks `dispatch_started` in the owner-guarded renewal it
-already makes just before handing a row to its listener. Rows claimed in the
-same batch but still queued behind the concurrency gate when the consumer died
-are reclaimed without losing an attempt. A consumer that stops gracefully
-hands such rows back itself (`release_claims`, owner-guarded and limited to
-rows whose dispatch never started), so a peer claims them on its next poll
-instead of after `reclaim_stale_seconds`. Rows already dispatching
-beside a crash-looping row are charged with it, so with
-`dispatch_concurrency` above 1 a crash loop can still dead-letter those. Idle polling backoff never narrows below the configured
-`poll_interval_ms`: it grows exponentially while the queue is empty but is
-capped at `max(poll_interval, 0.5s)`.
+`max_delivery_attempts` (default 5). Idle polling backoff never narrows below
+the configured `poll_interval_ms`: it grows exponentially while the queue is
+empty but is capped at `max(poll_interval, 0.5s)`.
+
+*Crash recovery.* A worker that crashes between claim and ack leaves its row
+`claimed`; the next claim reclaims it once `claimed_at` is older than
+`reclaim_stale_seconds` (default 60) — the DB analogue of the Redis `XAUTOCLAIM`
+recovery, and what keeps delivery at-least-once across a crash. That same
+claim-time reclaim enforces `max_delivery_attempts` too — a row reclaimed past
+the cap is dead-lettered directly instead of redelivered forever, since a
+crashed/wedged consumer never reaches `fail()` to run the cap itself.
+
+The reclaim charges an attempt only to a row whose dispatch had started: the
+consumer marks `dispatch_started` in the owner-guarded renewal it already makes
+just before handing a row to its listener. Rows claimed in the same batch but
+still queued behind the concurrency gate when the consumer died are reclaimed
+without losing an attempt. A consumer that stops gracefully hands such rows back
+itself (`release_claims`, owner-guarded and limited to rows whose dispatch never
+started), so a peer claims them on its next poll instead of after
+`reclaim_stale_seconds`. Rows already dispatching beside a crash-looping row are
+charged with it, so with `dispatch_concurrency` above 1 a crash loop can still
+dead-letter those.
 
 *Completions are owner-guarded.* `ack` / `fail` / `dead_letter` are each a
 compare-and-swap on `status='claimed' AND claimed_by=<this consumer>`: a late
@@ -772,11 +770,16 @@ consumer. While the batch runs, the consumer renews its claims every
 the stuck rows. With one worker per module, the default, no peer exists.
 Past that deadline the consumer's health reports `degraded`, naming the stuck
 event type, target and row. It also logs one ERROR line that names the same
-rows. The listener is never cancelled, because modupy cannot know whether
-its side effects are safe to interrupt. The remedy is a restart: an orchestrator
-that restarts a worker on degraded health (see DEPLOYMENT "Health Checks and
-Monitoring") frees it, and the restarted consumer reclaims the stuck rows. The
-SHM consumer (§8.5) shares this dispatch code and behaves the same way.
+rows. While the worker runs, modupy never cancels the listener, because it
+cannot know whether its side effects are safe to interrupt. A worker stop does
+cancel the delivery: `stop()` waits `PollingConsumer._stop_drain_grace_s` (1 s,
+in `modulith/adapters/_polling_consumer.py`) for the running batch to finish,
+then cancels it. An async listener gets `CancelledError`; a sync listener's
+thread cannot be interrupted and keeps running. The stuck row stays claimed
+either way. The remedy is a restart: an orchestrator that restarts a worker on
+degraded health (see DEPLOYMENT "Health Checks and Monitoring") frees it, and
+the restarted consumer reclaims the stuck rows. The SHM consumer (§8.5) shares
+this dispatch code and behaves the same way.
 
 *Cross-host clock skew.* Every timing-sensitive value — a message's claim
 visibility (`available_at`), the reclaim cutoff (`claimed_at`), the retry
@@ -791,12 +794,16 @@ message TTL and reclaim windows do not depend on the application clock), at the
 cost of a query per timestamp.
 
 *Retention.* Terminal rows (`done`/`dead`) accumulate, so the consumer runs a
-background prune when a retention knob is set: by age (`retention_age_seconds`,
-measured from `created_at`) and/or by count (`retention_count`, newest-N per
-`(target, consumer_group)`). Pending/claimed rows are never touched, so prune
-can't drop undelivered work. A permanently-defunct consumer group's pending
-rows are, by that same rule, never pruned — remove the group with
-`modulith broker drop-group` when retiring a module.
+background prune. By default it deletes terminal rows, `done` and
+dead-lettered, older than 3 days: `retention_age_seconds` defaults to 259200
+and is measured from `created_at`. `prune_interval_seconds` (default 300) sets
+how often it runs, and `prune_interval_seconds = 0` disables pruning. Raise
+`retention_age_seconds` to keep terminal rows longer. `retention_count`
+(newest-N per `(target, consumer_group)`) adds a count cap on top of the age
+cutoff, which stays in force when only the count is set. Pending/claimed rows
+are never touched, so prune can't drop undelivered work. A permanently-defunct
+consumer group's pending rows are, by that same rule, never pruned — remove the
+group with `modulith broker drop-group` when retiring a module.
 
 *Stale targets.* Subscriptions are never removed automatically, so a group
 keeps a target its module no longer consumes (a listener moved to another
@@ -861,55 +868,50 @@ the same disk; set `sqlite_synchronous="FULL"` for the last commits to survive
 OS failure or power loss.
 
 Resource limits are enforced before and inside the authoritative store.
-`max_payload_bytes` defaults to 16 MiB (maximum 1 GiB) and rejects oversized
-payloads before opening a publish transaction — but that is a write-side
-guard only. `JsonEventSerializer.deserialize` re-checks the same cap on
-every consume, since it is the sole chokepoint where broker/outbox bytes
-become a Python object; an oversized row is dead-lettered instead of parsed.
-The consumer resolves its cap lazily on first deserialize, from the same
-env/`broker_options` precedence the broker uses. `max_store_bytes` defaults to
-1 GiB (maximum 1 TiB) and sets SQLite `max_page_count` on the database file
-(`broker.db`; the `-wal` file is separate and unbounded, see the Cookbook).
-Publishes stop earlier: one that would leave
+`max_payload_bytes` defaults to 16 MiB (maximum 1 GiB) and `max_store_bytes` to
+1 GiB (maximum 1 TiB); both accept `MODULITH_BROKER_*` environment overrides.
+
+`max_payload_bytes` rejects oversized payloads before opening a publish
+transaction — but that is a write-side guard only.
+`JsonEventSerializer.deserialize` re-checks the same cap on every consume,
+since it is the sole chokepoint where broker/outbox bytes become a Python
+object; an oversized row is dead-lettered instead of parsed. The consumer
+resolves its cap lazily on first deserialize, from the same env/`broker_options`
+precedence the broker uses.
+
+`max_store_bytes` sets SQLite `max_page_count` on the SQLite file
+(`.modulith-shm-broker.db` by default; the `-wal` file is separate and
+unbounded). Publishes stop earlier: one that would leave
 `page_count - freelist_count` above the configured page count minus a consumer
 reserve rolls back with a store-full `ConfigurationError`, applying
 backpressure without corrupting existing rows. The reserve is 32 pages
 (128 KiB at 4 KiB pages), or one eighth of the pages for stores under 256
-pages. Consumer writes (claims, renewals, acks, fails, dead-letters, prunes)
-only change rows the store already holds, but claims, error text, mark-mode
-completions and prune tombstones still grow them, and no fixed reserve covers
-a whole backlog. So `SqliteQueueStore._consumer_write` retries a consumer
-write, or a subscribe too big for even its subscription row, that hits
-`max_page_count` with the limit lifted (to
-2147483647 pages, which SQLite builds that parse the pragma as a 32-bit int
-also accept; it reads the limit back and fails with the store-full error and a
-note naming the SQLite version if it did not rise). Consumers always finish
-the backlog they can see, a group's subscribe never fails on the store limit,
-and the file can grow past `max_store_bytes` by that growth while publishes
-stay refused. A subscribe replay is bounded by the publish budget instead:
-`_shm_publications._replay` selects the retained publications the group holds
-no delivery or completion tombstone for, inserts their deliveries oldest first,
-each under a savepoint, and rolls back the one that would leave used pages
-above 8 pages below the publish budget (`REPLAY_PUBLISH_HEADROOM_PAGES`), so a
-small publish that fit before the replay still fits right after it. Under
-`completion_mode="mark"`, `_subscribe` halves the room the replay may use,
-because claiming and mark-acking the replayed rows grows them in place
-(measured at about half the pages the replay added); that covers one group
-draining its own replay with succeeding listeners. Draining can still take the
-store past the budget, as any consumer write can: failed and dead-lettered rows
-keep their error text, and under mark mode claiming and acking grows every row,
-including rows other groups replayed, which the halving does not reserve for.
-Publishes are then refused until prune frees pages or `max_store_bytes` is
-raised. A replay cut short logs one WARNING naming the group,
-the target and the replayed and skipped counts; the target then counts as
-subscribed, so the skipped publications reach that group only through another
-replay. Its recovery drains the group's backlog on the target first, since
-`drop-group --target` deletes pending and claimed deliveries whose
-publications may have expired, and a replay restores only retained ones. The same retry drains a store opened
-above its limit (filled before the reserve existed, or with `max_store_bytes`
-lowered). Both accept `MODULITH_BROKER_*` environment overrides. The legacy
-`shm_slot_size` option is deprecated and ignored because hint slots are
-fixed-size sequence records.
+pages.
+
+A full store still lets consumers finish. Consumer writes (claims, renewals,
+acks, fails, dead-letters, prunes) only change rows the store already holds,
+but claims, error text, mark-mode completions and prune tombstones still grow
+them, and no fixed reserve covers a whole backlog. So a consumer write, or a
+subscribe too big for even its subscription row, that hits `max_page_count` is
+retried with the limit lifted; if SQLite does not raise the limit, the write
+fails with the store-full error and a note naming the SQLite version.
+Consumers always finish the backlog they can see, a group's subscribe never
+fails on the store limit, and the file can grow past `max_store_bytes` by that
+growth while publishes stay refused. The same retry drains a store opened above
+its limit, such as one whose `max_store_bytes` was lowered.
+
+A subscribe replay is bounded by the publish budget instead: it replays the
+retained publications the group holds no delivery or completion record for,
+oldest first, and stops 8 pages below the budget, so a small publish that fit
+before the replay still fits right after it. A replay cut short logs one
+WARNING naming the group, the target and the replayed and skipped counts; the
+target then counts as subscribed, so the skipped publications reach that group
+only through another replay. Draining can still take the store past the budget,
+as any consumer write can, and publishes are then refused until prune frees
+pages or `max_store_bytes` is raised. The page accounting, including the
+mark-mode headroom, the recovery steps and the disk to budget for the `-wal`
+file, is in
+[DEPLOYMENT.md, "Sizing the Default SHM Store"](DEPLOYMENT.md#sizing-the-default-shm-store).
 
 ---
 
@@ -925,13 +927,18 @@ surfaces by cost (`modulith/manifest.py` module docstring):
   declared `publishes` name is defined in the package namespace (catches dead
   code and renamed events). A failure aborts boot with a `file:line`.
 - **The AST boundary verifier** (`modulith/builtin/verifier.py`, run via
-  `modulith verify` in CI / pre-commit, *not* at bootstrap): the rules that
-  need static analysis — no cross-module imports of internals, no dependency
-  cycles, cross-module imports match `declared_dependencies`, the contracts
-  module is a sink, and best-effort data-ownership (`owns_tables`). It supports
-  a **ratcheting baseline** (count-aware): grandfather existing violations by a
-  stable hash so you can adopt modupy on a messy codebase and enforce
-  "no new violations" while paying down the old ones.
+  `modulith verify` in CI / pre-commit, and at bootstrap when
+  `strict_boundaries = true`): the rules that need static analysis — no
+  cross-module imports of internals, no dependency cycles, cross-module imports
+  match `declared_dependencies`, the contracts module is a sink, and best-effort
+  data-ownership (`owns_tables`). It supports a **ratcheting baseline**
+  (count-aware): grandfather existing violations by a stable hash so you can
+  adopt modupy on a messy codebase and enforce "no new violations" while paying
+  down the old ones. `strict_boundaries` is off by default, because the scan
+  parses every source file under every module. With it on, bootstrap runs the
+  same checks after manifest verification and raises `ConfigurationError` on any
+  violation, warnings included, so a violating app cannot start; the baseline
+  does not apply to this check, and single-process `modulith dev` only warns.
 
 `consumes` is descriptive only (drives docs/audit) — no single process knows
 every publisher, so it isn't cross-validated at bootstrap.
@@ -947,26 +954,26 @@ split-readiness) with 80%/95% thresholds.
 
 ![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](images/processes.svg)
 
-**SPEC Part IX.** The three moving parts (graph hyperedge *Process-Per-Module
-Runtime*):
+**SPEC Part IX.** The three moving parts:
 
 - **The worker** (`modulith/_worker.py`): `create_app()` builds a FastAPI app
   exposing exactly **one** module's HTTP surface (and importing the contracts
-  module if present). `derive_specs_from_config()` reads the config, discovers
-  modules, and produces one `WorkerSpec` per module (honoring per-module
-  `[tool.modulith.workers]` counts and port assignment).
-- **The supervisor** (`modulith/supervisor.py`): spawns one uvicorn subprocess
-  per worker spec, forwards each worker's logs, and monitors them. Crash
-  recovery restarts a dead worker with **exponential backoff (1s→60s)** plus a
-  crash-loop breaker. On shutdown: POSIX `SIGTERM`s all workers, waits, then
-  `SIGKILL`s stragglers; Windows has no signal delivery on `subprocess.Popen`
-  — `terminate()`/`kill()` both call `TerminateProcess`, an immediate,
-  unmaskable hard kill with no graceful pass, so the SIGKILL step there is
-  skipped as a no-op rather than run twice. `PDEATHSIG` (so orphaned workers
-  die with a SIGKILL'd/crashed supervisor) is Linux-only; on any other
+  module if present).
+- **The supervisor** (`modulith/supervisor.py`): `derive_specs_from_config()`
+  reads the config, discovers modules, and produces one `WorkerSpec` per module
+  (honoring per-module `[tool.modulith.workers]` counts and port assignment).
+  The supervisor spawns one uvicorn subprocess per worker spec, forwards each
+  worker's logs, and monitors them. Crash recovery restarts a dead worker with
+  **exponential backoff (1 s doubling to 16 s)** plus a crash-loop breaker that
+  gives up after six consecutive crashes. On shutdown: POSIX `SIGTERM`s all
+  workers, waits, then `SIGKILL`s stragglers; Windows has no signal delivery on
+  `subprocess.Popen` — `terminate()`/`kill()` both call `TerminateProcess`, an
+  immediate, unmaskable hard kill with no graceful pass, so the SIGKILL step
+  there is skipped as a no-op rather than run twice. `PDEATHSIG` (so orphaned
+  workers die with a SIGKILL'd/crashed supervisor) is Linux-only; on any other
   platform a hard-killed supervisor can orphan workers holding their
-  statically-assigned ports, and the supervisor logs a warning once at
-  startup when that protection is unavailable.
+  statically-assigned ports, and the supervisor logs a warning once at startup
+  when that protection is unavailable.
 - **The reverse proxy** (`modulith/proxy.py`): a FastAPI ASGI app that routes
   each request to the right worker by **URL prefix** (longest prefix wins),
   strips hop-by-hop headers before forwarding, strips query strings from logs so
@@ -976,8 +983,39 @@ Runtime*):
   bearer token on its actuator surface.
 
 Cross-module events between workers travel through the broker (§8); local
-listeners within a worker still dispatch in-process. The module code is
-identical to single-process mode — that's the point.
+listeners within a worker still dispatch in-process. Event code — `@event`,
+`@listener`, `publish()` — is identical to single-process mode; that's the
+point. HTTP routes are the one thing to arrange. A module with routes
+re-exports its `router` from `__init__.py`, because a module running in its own
+process serves exactly that `router` under `/<module>`. Declare its routes
+without the `/<module>` prefix, since the worker adds it. The application's
+`main.py`, with its middleware and lifespan, is not served in a worker.
+
+**No merged OpenAPI document at runtime.** Each worker serves its own schema at
+`/<module>/openapi.json`, and the proxy publishes none of its own
+(`create_proxy_app` sets `openapi_url=None`). A merged schema is out of scope
+for the supervisor, and not for want of plumbing: the proxy already fans out to
+every worker to aggregate readiness. Four problems keep it out:
+
+- **The pieces do not merge cleanly.** Two modules that both define an `Order`
+  publish two different definitions under the same `components.schemas` key. A
+  merge either keeps one, which mistypes the other module's API, or renames
+  them, which rewrites identifiers your generated clients already use.
+- **Nothing owns the envelope.** In every worker `info.title` is
+  `modulith-<module>` and `info.version` is FastAPI's default, and each module
+  declares its own security schemes. A merged document needs one of each, and
+  nothing at runtime supplies them.
+- **It cannot be both fresh and cheap.** Fanning out to every worker per request
+  puts an N-worker round trip on a public endpoint; caching serves a schema that
+  silently lags a rolling deploy.
+- **Rollouts have no good answer.** While a worker is respawning, its schema is
+  unavailable. A per-module URL returns 502 for that one module, while a merged
+  document must either omit a whole module's API without saying so or fail as a
+  whole.
+
+For one document, `modulith openapi` merges the modules' schemas offline,
+prefixing each schema name with its module and failing on a conflict; see
+[DEPLOYMENT.md](DEPLOYMENT.md), "API Documentation".
 
 ---
 
@@ -1014,10 +1052,12 @@ for the full contract.
 | Plugin system | `hooks.py`, `markers.py`, `manager.py`, `protocols.py`, `types.py` |
 | Event bus | `event_bus.py` |
 | Outbox | `builtin/outbox.py`, `adapters/postgres_outbox.py`, `_claims.py`, `serializers.py` |
-| Brokers | `brokers.py`, `adapters/redis_broker.py`, `adapters/db_broker.py`, `adapters/shm_broker.py`, `adapters/_shm_*.py`, `_consumer.py` |
+| Schema migrations | `adapters/migrations/` and `adapters/alembic.ini` (the packaged Alembic revisions for the outbox and broker tables, applied by `modulith migrate`) |
+| Brokers | `brokers.py`, `adapters/redis_broker.py`, `adapters/db_broker.py`, `adapters/shm_broker.py`, `adapters/_shm_*.py`, `_consumer.py`, `adapters/_state_path.py` (private per-user paths for local broker state), `adapters/_dead_letter.py` (the shape `modulith broker dead-letter` reads) |
+| Consumer internals | `adapters/_polling_consumer.py`, `adapters/_delivery_dispatch.py` and `adapters/_consumer_protocol.py` (the lifecycle, delivery and contract the database and SHM consumers share), `_health_failures.py` and `_shutdown.py` (consumer health and bounded shutdown, shared with the Redis consumer) |
 | Process topology | `_worker.py`, `supervisor.py`, `proxy.py` |
-| Verification & tooling | `builtin/verifier.py`, `builtin/docs.py`, `audit.py`, `doctor.py`, `cli.py` |
+| Verification & tooling | `builtin/verifier.py`, `builtin/docs.py`, `audit.py`, `doctor.py`, `cli.py`, `__main__.py` (`python -m modulith`) |
+| Extraction & deployment output | `extract.py` (`modulith extract`), `k8s.py` (`modulith k8s-manifest`), `openapi.py` (`modulith openapi`) |
 | Observability & testing | `builtin/observability.py`, `testing.py` |
 
-For the design rationale behind any of these, the corresponding SPEC part is the
-authoritative source.
+For the design rationale behind any of these, see the corresponding SPEC part.
