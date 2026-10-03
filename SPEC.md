@@ -918,7 +918,9 @@ consumer_group = "modulith-orders"
 Each option also has an environment variable that takes precedence at deploy
 time: `REDIS_URL`, `MODULITH_CONSUMER_GROUP`, `MODULITH_STREAM_PREFIX`,
 `MODULITH_STREAM_MAXLEN`. (Values are literal — there is no `${VAR}`
-interpolation inside the TOML.)
+interpolation inside the TOML.) `consumer_group` sets the adapter's default
+group, used only where no group is given; process-per-module workers always
+pass their own, `modulith-<module>`.
 
 Retention caveat: `max_stream_len` / `MODULITH_STREAM_MAXLEN` is enforced via
 `XADD MAXLEN ~`, which trims by stream length alone and is blind to

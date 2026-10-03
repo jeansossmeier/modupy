@@ -1102,6 +1102,27 @@ def test_build_worker_env_redis_aliases_do_not_override_explicit_specific_names(
     assert env["REDIS_URL"] == "redis://explicit-override:6379"
 
 
+def test_build_worker_env_does_not_alias_consumer_group(monkeypatch) -> None:
+    """Module workers join modulith-<module>; a configured Redis consumer group
+    must not be mirrored onto MODULITH_CONSUMER_GROUP, which they never read."""
+    monkeypatch.delenv("MODULITH_CONSUMER_GROUP", raising=False)
+    spec = WorkerSpec(
+        module_name="orders",
+        package="myapp",
+        port=9001,
+        env={
+            "MODULITH_BROKER": "redis-streams",
+            "MODULITH_BROKER_URL": "redis://generic:6379",
+            "MODULITH_BROKER_CONSUMER_GROUP": "workers",
+        },
+    )
+
+    env = _build_worker_env(spec)
+
+    assert "MODULITH_CONSUMER_GROUP" not in env
+    assert env["REDIS_URL"] == "redis://generic:6379"  # the other aliases still apply
+
+
 def test_build_worker_env_preserves_inherited_broker_url(monkeypatch) -> None:
     """Inherited MODULITH_BROKER_URL beats a pyproject URL forwarded in spec.env
     — matches adapter env > broker_options precedence."""

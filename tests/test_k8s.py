@@ -315,7 +315,7 @@ def test_render_manifests_redis_options_use_consumable_aliases() -> None:
     env_by_name = {e["name"]: e for e in container["env"]}
 
     assert env_by_name["MODULITH_STREAM_PREFIX"]["value"] == "wf"
-    assert env_by_name["MODULITH_CONSUMER_GROUP"]["value"] == "workers"
+    assert "MODULITH_CONSUMER_GROUP" not in env_by_name  # workers join modulith-<module>
     assert env_by_name["MODULITH_STREAM_MAXLEN"]["value"] == "5000"
     assert "MODULITH_BROKER_STREAM_PREFIX" not in env_by_name
     assert "MODULITH_BROKER_CONSUMER_GROUP" not in env_by_name

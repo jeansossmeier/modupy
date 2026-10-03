@@ -925,8 +925,9 @@ Each Deployment's `replicas` comes from that module's
 --port <port>`. The manifest sets module, package, topology, broker, and
 `MODULITH_CONTRACTS_MODULE` explicitly. It emits only database broker options
 with a supported `MODULITH_BROKER_*` contract and Redis options with their
-established `MODULITH_CONSUMER_GROUP`, `MODULITH_STREAM_PREFIX`, and
-`MODULITH_STREAM_MAXLEN` names; unknown or credential-like options are omitted.
+established `MODULITH_STREAM_PREFIX` and `MODULITH_STREAM_MAXLEN` names.
+Unknown or credential-like options are omitted, and so is `consumer_group`,
+because module workers always join `modulith-<module>`.
 The broker URL is never embedded: `MODULITH_BROKER_URL` (and `REDIS_URL` for
 Redis) reads key `url` from the generated `<package>-broker` Secret reference:
 
