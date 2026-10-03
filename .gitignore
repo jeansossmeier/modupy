@@ -203,6 +203,10 @@ graphify-out/
 # Local AI tool directories
 .opencode/
 
+# Local engineering notes, kept out of the published repository and its sdist
+tech_debt/
+known_fixes/
+
 # Private local broker state. The defaults normally live outside the project in
 # a per-user state directory; these patterns protect explicit project-local paths.
 .modulith-broker.db*
