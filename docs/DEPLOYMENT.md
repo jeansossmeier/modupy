@@ -2,6 +2,39 @@
 
 This guide covers scaling modupy from a single-process monolith to a distributed topology of separate worker processes. modupy installs the `modulith` package, so you `import modulith` and run `modulith`.
 
+**Which setup do I need?**
+
+| You need | Use | Details |
+|---|---|---|
+| One process, nothing to install; losing an in-flight event in a crash is acceptable | In-memory monolith (the default) | [Single-Process Monolith](#single-process-monolith-default) |
+| One process whose events survive a crash | Durable outbox in your application's database | [Durable Single-Process](#durable-single-process-outbox-pattern) |
+| Modules that scale or fail independently, on one host | `modulith run --topology processes`, with the default `shm` broker | [Process-Per-Module Topology](#process-per-module-topology), [Default Broker: `shm`](#default-broker-shm) |
+| Modules on several hosts or Kubernetes pods | Process-per-module with a Postgres or MySQL `database` broker, or Redis Streams | [C. Postgres Broker](#c-postgres-broker-advanced), [B. Redis Streams Broker](#b-redis-streams-broker), [Broker Comparison](#reference-broker-comparison) |
+| One module as its own service | `modulith extract` | [Migration Path](#migration-path-monolith--processes--microservices) |
+
+**Contents**
+
+- [Single-Process Monolith (Default)](#single-process-monolith-default)
+- [Durable Single-Process (Outbox Pattern)](#durable-single-process-outbox-pattern), with [Reference: outbox details](#reference-outbox-details) and [Postgres and PgBouncer settings for `advisory_lock`](#postgres-and-pgbouncer-settings-for-advisory_lock)
+- [Process-Per-Module Topology](#process-per-module-topology)
+  - [Default Broker: `shm`](#default-broker-shm)
+  - [A. SQLite Database Broker (Zero Infrastructure)](#a-sqlite-database-broker-zero-infrastructure)
+  - [B. Redis Streams Broker](#b-redis-streams-broker)
+  - [C. Postgres Broker (Advanced)](#c-postgres-broker-advanced)
+  - [Sizing the Default SHM Store](#sizing-the-default-shm-store)
+- [Docker Deployment](#docker-deployment)
+- [Kubernetes Deployment](#kubernetes-deployment)
+- [Scaling Strategies](#scaling-strategies)
+- [Actuator Access (`/_modulith/*`)](#actuator-access-_modulith)
+- [API Documentation (`/<module>/docs`, `/<module>/openapi.json`)](#api-documentation-moduledocs-moduleopenapijson)
+- [Health Checks and Monitoring](#health-checks-and-monitoring)
+- [Operational Playbooks](#operational-playbooks)
+- [Migration Path: Monolith → Processes → Microservices](#migration-path-monolith--processes--microservices), with [What `modulith extract` copies and checks](#what-modulith-extract-copies-and-checks)
+- [Troubleshooting](#troubleshooting)
+- [Reference: Supervisor, Proxy, and Boundary Environment Variables](#reference-supervisor-proxy-and-boundary-environment-variables)
+- [Reference: Broker Comparison](#reference-broker-comparison)
+- [Next Steps](#next-steps)
+
 ---
 
 ## Single-Process Monolith (Default)
@@ -16,7 +49,7 @@ MODULITH_BROKER=memory uvicorn myapp.main:app --workers 1
 **Characteristics:**
 - No infrastructure required
 - Events are in-memory; lost on crash
-- Listeners are synchronous (or wrapped async in an event loop)
+- Listeners are `async def` or plain `def` (plain ones run in the event loop's thread pool), and all listeners of one event run concurrently
 - Ideal for: development, testing, non-critical background work
 
 **Trade-off:** No durability. A crash between publishing an event and dispatching it to listeners loses the event.
@@ -61,8 +94,11 @@ without the outbox. Each worker starts the retry loop itself.
 ```toml
 [tool.modulith]
 outbox = "postgres"
-outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTBOX_URL
+outbox_url = "postgresql+asyncpg://app@localhost/mydb"  # set MODULITH_OUTBOX_URL instead if it needs a password
 ```
+
+A committed `pyproject.toml` should carry no password. Put the full URL in
+`MODULITH_OUTBOX_URL`, which overrides the file.
 
 - modupy builds a `PostgresPublicationStore` on its own engine for that URL
   and binds it in every process: the single-process server, each
@@ -73,7 +109,8 @@ outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTB
   `claim_strategy`, `claim_lease_seconds`, `claim_batch_size`,
   `dead_letter_after_attempts`, `retry_interval_seconds`,
   `retry_stale_seconds`, `max_retry_backoff_seconds` and `completion_mode`
-  (`update`, `delete` or `archive`).
+  (`update`, `delete` or `archive`). For `claim_strategy = "advisory_lock"`, see
+  [Postgres and PgBouncer settings for `advisory_lock`](#postgres-and-pgbouncer-settings-for-advisory_lock).
 - `sqlite_wal = true` in the same table switches a SQLite `outbox_url` to WAL
   journal mode on every connection of that engine. It is off by default:
   modupy never changes a database file's journal mode unless asked. In the
@@ -121,13 +158,11 @@ outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTB
 
   The chain records its revision in its own table, `modulith_alembic_version`
   (in the migration schema when one is set), so it can share a database with
-  your application's Alembic history in `alembic_version`. Installs migrated
-  by an earlier release tracked modulith in `alembic_version`. The first run
-  of either command above moves that revision into `modulith_alembic_version`
-  before upgrading, inside the upgrade's transaction on PostgreSQL. It moves
-  only revisions from modulith's own chain, leaves any other row in place, and
-  drops `alembic_version` only when nothing else remains in it. No migration
-  runs twice.
+  your application's Alembic history in `alembic_version`. After upgrading
+  modupy, run `modulith migrate` again before the new version starts: the
+  store maps each of its columns on every save, so against a table that lacks
+  one each publish fails, and with a bound session that takes the business
+  transaction down with it.
 - In a single-process app, call `modulith.bootstrap()` and then
   `outbox.start()` in the lifespan's startup half. Bootstrap binds the store,
   and it is lazy: without the explicit call it first runs at the first
@@ -145,23 +180,6 @@ outbox_url = "postgresql+asyncpg://user:pass@localhost/mydb"  # or MODULITH_OUTB
   later: under `"lease"` once its lease expires, under `"advisory_lock"` by a
   later sweep once its lock is released, at the latest when the dead
   process's lock connection closes, and under `"none"` by the next sweep.
-
-**Upgrading to the release that adds migration 0008.** Migration
-`0008_outbox_trace_context` adds a nullable `trace_context` column to
-`event_publications` and `event_publications_archive`. Run `modulith migrate`
-before the new version starts: the new code maps the column on every save, so
-against an unmigrated schema each publish fails, and with a bound session that
-takes the business transaction down with it. Rows written by the old version
-stay valid; their `trace_context` reads back as `None`.
-
-**Stored listener ids.** Each outbox row names its listener. A plain function
-is stored as `module.function`. A callable instance or bound method
-registered from an application module is stored as
-`<module package>:<class module>.<ClassName>`, for example
-`myapp.orders:myapp.shared.Notifier`, so one class used by two modules is
-delivered per module. Rows written by an earlier release under the bare
-`<class module>.<ClassName>` id no longer match a listener: drain them
-(`modulith outbox status` shows none incomplete) before upgrading.
 
 **Wiring the store yourself.** Bind the store in code, with your own engine,
 when `outbox_url` does not offer what you need: `connect_args` or a
@@ -234,26 +252,6 @@ no `--url`.
 - Single point of failure: the database
 - Ideal for: critical transactional workflows where losing an event is unacceptable
 
-**One event loop per engine.** Drive one `PostgresPublicationStore`/outbox
-`AsyncEngine` from a single event loop. `await publish()` on the app loop and
-`publish_sync()` (which runs on a daemon-thread loop — see below) share the
-same engine across two loops. asyncpg and aiomysql connections only work on
-the loop that opened them, so on Postgres and MySQL the first query a loop
-runs on a pooled connection the other loop opened raises `RuntimeError: ...
-attached to a different loop`, even when the pool has idle connections; an
-asyncpg connection is then also unusable from its own loop (`InterfaceError:
-cannot perform operation: another operation is in progress`). On SQLite,
-connections work from any loop, but the pool's wait queue belongs to the first
-loop that ever waited for a free connection. Another loop that later has to
-wait raises `RuntimeError: <Queue> is bound to a different event loop`, and
-waiting happens only once every pooled and overflow connection is checked
-out, so the SQLite failure depends on load. modupy logs one warning the
-first time a second loop uses the engine. Keep every publish for one outbox
-engine on one loop; a larger pool only delays the SQLite failure and does not
-help on Postgres or MySQL. Unlike the outbox store,
-the database broker hands a call from another loop to the loop that owns its
-engine; see §A. This also applies to the store bound from `outbox_url`.
-
 **Listeners and durability:**
 - The outbox persists only the **first hop** of events (e.g., `orders` → `inventory`).
 - If `inventory` publishes a downstream event (e.g., `StockReserved` → `notifications`), that hop is **not durable by default**—it rides the in-memory bus.
@@ -315,6 +313,36 @@ app that wires the outbox only inside a FastAPI lifespan gets "no outbox store"
 from the CLI even while the server is up, and the message names the remedy;
 inspect that outbox through the running app, or set `outbox_url`.
 
+### Reference: outbox details
+
+**Stored listener ids.** Each outbox row names its listener. A plain function
+is stored as `module.function`. A callable instance or bound method
+registered from an application module is stored as
+`<module package>:<class module>.<ClassName>`, for example
+`myapp.orders:myapp.shared.Notifier`, so one class used by two modules is
+delivered per module.
+
+**One event loop per engine.** Drive one `PostgresPublicationStore`/outbox
+`AsyncEngine` from a single event loop. `await publish()` on the app loop and
+`publish_sync()` (which runs on a daemon-thread loop — see below) share the
+same engine across two loops. asyncpg and aiomysql connections only work on
+the loop that opened them, so on Postgres and MySQL the first query a loop
+runs on a pooled connection the other loop opened raises `RuntimeError: ...
+attached to a different loop`, even when the pool has idle connections; an
+asyncpg connection is then also unusable from its own loop (`InterfaceError:
+cannot perform operation: another operation is in progress`). On SQLite,
+connections work from any loop, but the pool's wait queue belongs to the first
+loop that ever waited for a free connection. Another loop that later has to
+wait raises `RuntimeError: <Queue> is bound to a different event loop`, and
+waiting happens only once every pooled and overflow connection is checked
+out, so the SQLite failure depends on load. modupy logs one warning the
+first time a second loop uses the engine. Keep every publish for one outbox
+engine on one loop; a larger pool only delays the SQLite failure and does not
+help on Postgres or MySQL. Unlike the outbox store,
+the database broker hands a call from another loop to the loop that owns its
+engine; see [A. SQLite Database Broker](#a-sqlite-database-broker-zero-infrastructure).
+This also applies to the store bound from `outbox_url`.
+
 **Per-module Postgres schema.** To keep a module's outbox and broker tables in a DB schema named after the module (see [per-module DB schema ownership](COOKBOOK.md) in the Cookbook), pass `schema_translate_map` to the engine before handing it to `PostgresPublicationStore` — the store takes the app's engine and saves through the app's bound session, so the map applies to every statement it issues, no store-level code change needed:
 
 ```python
@@ -339,21 +367,71 @@ Enabling a named migration schema does not move data and refuses to abandon
 existing modupy tables or Alembic history in `public`; see
 [Migration Guide](../MIGRATION_GUIDE.md) Step 5.
 
+### Postgres and PgBouncer settings for `advisory_lock`
+
+`claim_strategy = "advisory_lock"` is Postgres only; the Cookbook's
+[Coordinating concurrent sweepers](COOKBOOK.md#coordinating-concurrent-sweepers)
+compares the three strategies. The strategy holds a session-level advisory lock
+on a dedicated connection while a row is delivered, and every other sweep skips
+a row whose lock is held. The lock lives as long as that Postgres session. When a
+process dies on a live host, its kernel closes the socket and the lock is
+released at once. After a host loss or a network partition nothing closes the
+socket, and the row stays locked until Postgres drops the dead session through
+TCP keepalive. With stock Linux defaults (7200 s idle, then 9 probes 75 s
+apart) that takes about 2 h 11 min.
+
+**Shorten the wait.** Lower the server's `tcp_keepalives_idle`,
+`tcp_keepalives_interval` and `tcp_keepalives_count`; 60, 10 and 3 give about
+90 s. Lock connections are opened with the outbox engine's connect arguments,
+so a setting that reaches the engine reaches them. The engine modupy builds from
+`outbox_url` takes no `connect_args`, so with a psycopg driver put the settings
+in the URL's `options` query parameter:
+
+```toml
+[tool.modulith]
+outbox_url = "postgresql+psycopg://app@db/mydb?options=-c%20tcp_keepalives_idle%3D60%20-c%20tcp_keepalives_interval%3D10%20-c%20tcp_keepalives_count%3D3"
+```
+
+Setting them on the database role (`ALTER ROLE app SET tcp_keepalives_idle = 60`
+and likewise the other two) or in `postgresql.conf` works with any driver. An
+`asyncpg` URL cannot carry them: the connection fails on the unknown query
+parameter. For an engine you build yourself, pass them in `connect_args`; the
+Cookbook shows the form for both drivers.
+
+- **Unix-domain sockets ignore them.** Postgres ignores these settings on a
+  connection over a Unix-domain socket and reads them as 0, so they matter only
+  where the URL names a host and the connection is TCP.
+- **psycopg's `options` replaces the URL's.** An `options` entry in
+  `connect_args` replaces any `options` in the URL, such as a `search_path`, so
+  put every `-c` setting in one `options` value.
+- **A hung process keeps its session.** A process that hangs without exiting
+  keeps its session, and so its locks, until it resumes or exits. Its host's
+  kernel still answers the keepalive probes, so no keepalive setting shortens
+  that. A fork-started child that outlives the process keeps the session too;
+  the Cookbook covers that case.
+- **Leave `idle_session_timeout` unset for the outbox's role.** A lock
+  connection sits idle while its listener runs, so ending that session releases
+  the lock mid-delivery and a peer's sweep can deliver the row again.
+- **Behind PgBouncer,** use session pooling (`pool_mode = session`, the
+  default) and never transaction or statement pooling: advisory locks need a
+  server session that stays with one client connection. The server's keepalive
+  then watches PgBouncer, not your process, so shorten the wait with PgBouncer's
+  own settings. `tcp_keepalive` is on by default but uses the operating system's
+  timings, so set `tcp_keepidle`, `tcp_keepintvl` and `tcp_keepcnt`.
+
 ---
 
 ## Process-Per-Module Topology
 
 ![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](images/processes.svg)
 
-Split modules across separate worker processes for independent scaling, deployment, and lifecycle. Events flow through a broker (database, Redis, or other transports).
+Split modules across separate worker processes for independent scaling, deployment, and lifecycle. Events flow through a broker: the built-in `shm` broker by default ([Default Broker: `shm`](#default-broker-shm)), a database (SQLite, Postgres or MySQL), Redis Streams, or other transports.
 
-**Actuator note for every recipe in this section.** `modulith run` binds `--host 0.0.0.0`, and the default `actuator_mode="auto"` will not serve an unauthenticated `/_modulith/*` on a non-loopback host: with no token configured the actuator is left unmounted (a startup warning says so) and the health probes further down have nothing to call. Export a token if you want them:
+**Actuator note for every recipe in this section.** `modulith run` binds `--host 0.0.0.0` by default, and the default `actuator_mode="auto"` leaves `/_modulith/*` unmounted there unless a token is configured (a startup warning says so), so the health probes further down have nothing to call. Export a token if you want them; [Actuator Access](#actuator-access-_modulith) has the modes and the rules:
 
 ```bash
 export MODULITH_ACTUATOR_TOKEN="$(openssl rand -hex 32)"
 ```
-
-See [Actuator Access](#actuator-access-_modulith).
 
 **Forwarding headers.** The reverse proxy overwrites `X-Forwarded-For`,
 `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-Port` from the
@@ -370,6 +448,18 @@ the proxy is reachable only through the ingress) on the proxy process so
 **Query strings in logs.** The `modulith.proxy` logger never logs query strings. uvicorn's access log does: on the proxy and on every worker it records each request's full target, query string included, at `INFO`. `modulith run --log-level warning` switches it off on both, together with every other `INFO` line.
 
 **Connection pool.** The proxy holds one upstream connection per in-flight request until the response has finished streaming, so long-polls, server-sent events and slow downloads each occupy one for their whole duration. `MODULITH_PROXY_MAX_CONNECTIONS` (default `1000`) bounds them. A request that finds every connection busy for 5 seconds gets `503` `{"detail": "proxy connection pool exhausted"}`; the worker is not marked down, and `/_modulith/health` and identity probes use a separate 100-connection pool, so a full request pool cannot fail readiness. The warning it logs names the pool that ran out, `request` or `health-probe`. Raise the bound for many concurrent long-lived requests, keeping the proxy's open-file limit (`ulimit -n`) above it.
+
+### Default Broker: `shm`
+
+`--topology processes` with no broker configured uses `shm` (shared memory), so there is nothing to install or run. Events are stored in a SQLite file on the local machine. A memory-mapped ring only tells consumers that new work was committed, and they always read the work itself from SQLite, so a missed hint only delays them. It serves one host: use a database or Redis broker to span machines.
+
+```bash
+pip install 'modupy[fastapi,cli]'
+MODULITH_BROKER_STATE_DIR=/var/lib/myapp/modulith \
+  modulith run myapp.main:app --topology processes
+```
+
+modupy creates a missing state directory with mode 0700. One that already exists must already be 0700 (`chmod 700 /var/lib/myapp/modulith`): modupy never changes an existing directory's permissions and stops with a `ConfigurationError` instead.
 
 **Set `state_dir` for the SHM broker in production.** Without it, the `shm`
 store lives in a per-user directory named after a digest of the package's
@@ -390,66 +480,6 @@ processes log the same line only when the application configures logging at
 INFO. `modulith run --topology processes` also logs a warning while the store
 sits in the default state directory.
 
-**Sizing the default SHM store.** The local `shm` broker keeps a publication
-while any of these holds:
-
-- a subscribed group has not consumed it yet: an undelivered backlog, which
-  includes a retired group that never consumes again;
-- it is younger than `orphan_retention_seconds` (default 3600), even after
-  every group has acked it, so late subscribers can replay it;
-- a delivery of it is kept as a terminal row: every acked delivery under
-  `completion_mode = "mark"`, and every dead letter in either mode, holds it
-  until `retention_age_seconds` (default 259200, 3 days) after completion.
-
-Its store (`max_store_bytes`, default 1 GiB) therefore caps the sustained
-publish rate, not only the backlog:
-
-```
-sustainable publications/s ≈ max_store_bytes / (bytes per publication × longest retention above)
-```
-
-A 1 KiB payload with two subscribed groups uses about 1.8 KB of store, so the
-defaults (delete mode, no dead letters) sustain roughly 165 publications/s; under
-`completion_mode = "mark"` the 3-day terminal retention cuts that below
-2.3 publications/s. Above that rate, every publish fails with "SHM SQLite store
-is full". Size `max_store_bytes` (or `MODULITH_BROKER_MAX_STORE_BYTES`) for the
-longest retention, or shorten `orphan_retention_seconds` before the store
-fills: each publication keeps the orphan retention stamped when it was
-written, so shortening it frees nothing in a store that is already full. A
-backlog frees space only as consumers drain it, or when
-`modulith broker drop-group` removes a retired group. Until then a retired or
-stopped group pins every publication to its targets, and the `modulith run`
-startup warning names a retired group only 24 hours after its last consumer
-activity, so size for that backlog or drop the group with `--force` as soon
-as no host runs it. A new `max_store_bytes`
-or `retention_age_seconds` applies to a process only after it restarts.
-`orphan_retention_seconds` is capped at 100 years (3153600000).
-A group that subscribes after a publication replays it only within that window.
-Publishes stop a 32-page consumer reserve (128 KiB at 4 KiB pages) below
-`max_store_bytes`. Strictly, the numerator above is `max_store_bytes` minus that
-reserve; at the 1 GiB default that is 0.01% and does not change the estimate.
-Consumers drain a backlog while publishes are refused: a consumer write or
-subscription record that `max_store_bytes` refuses is retried past it, so
-`broker.db` can grow past the limit by the growth of rows it already holds. A
-subscribe replay stops 8 pages below the publish budget instead, so a small
-publish that fit before the replay still fits right after it. Under
-`completion_mode="mark"` it uses at most half the room left, which covers
-claiming and acking its own rows when one group drains them and its listeners
-succeed. Draining can still take the store past the budget, as any consumer
-write can: failed and dead-lettered rows keep their error text, and under
-`completion_mode="mark"` claiming and acking grows every row, including rows
-other groups replayed. Publishes are then refused until prune frees pages or
-`max_store_bytes` is raised. A replay cut short logs a WARNING
-with the replayed and skipped counts and a recovery that drains the group's
-backlog before `drop-group --target`, and the skipped publications reach that
-group only through another replay. Size
-`max_store_bytes` for the retained backlog before adding a listener to a busy
-store. This also drains a store that
-filled before this release or that was opened with a lowered limit; publishes
-resume once the drained store is back under the limit. Budget disk for
-`broker.db-wal` on top: it is not counted, reaches about 4 MiB between
-checkpoints, and keeps its largest size.
-
 ### A. SQLite Database Broker (Zero Infrastructure)
 
 ```bash
@@ -459,7 +489,7 @@ MODULITH_BROKER=database \
   modulith run myapp.main:app --topology processes
 ```
 
-> **Single-host only.** All workers must access the same SQLite file, so this mode works only on a single machine (or a shared filesystem volume). For multi-host deployments, use Postgres or Redis instead.
+> **Single-host only.** All workers must access the same SQLite file, so this mode works only on a single machine: the broker runs the file in WAL mode, which does not work over a network filesystem. For multi-host deployments, use Postgres or Redis instead.
 
 Adopting the packaged Alembic migrations after the broker has already
 self-bootstrapped its own tables is supported: `modulith migrate --url <broker
@@ -515,7 +545,7 @@ broker = "database"
 topology = "processes"
 
 [tool.modulith.broker_options]
-url = "sqlite+aiosqlite:////path/to/broker.db"  # or postgres://
+url = "sqlite+aiosqlite:////path/to/broker.db"  # or postgresql+asyncpg://user:pass@host/db
 ```
 
 Or via environment:
@@ -547,12 +577,15 @@ modulith run myapp.main:app --topology processes \
 
 ```bash
 pip install 'modupy[fastapi,cli,redis]'
-docker run -d -p 6379:6379 redis:latest
+export REDIS_PASSWORD="$(openssl rand -hex 16)"   # any password; Redis and modupy must use the same one
+docker run -d -p 127.0.0.1:6379:6379 redis:7-alpine redis-server --requirepass "$REDIS_PASSWORD"
 
 MODULITH_BROKER=redis-streams \
-  REDIS_URL=redis://localhost:6379 \
+  REDIS_URL="redis://:$REDIS_PASSWORD@localhost:6379" \
   modulith run myapp.main:app --topology processes
 ```
+
+The Redis image sets no password, so the command above requires one and publishes the port on the loopback interface only. Never publish an unauthenticated Redis port. To span several hosts, run a Redis you secure yourself and point `REDIS_URL` at it.
 
 **Characteristics:**
 - Scales to high throughput
@@ -564,16 +597,17 @@ MODULITH_BROKER=redis-streams \
 
 **Tuning:**
 
-The Redis adapter reads six environment variables:
+The Redis adapter reads these environment variables:
 
 ```bash
-export REDIS_URL=redis://localhost:6379        # connection URL
-export MODULITH_STREAM_PREFIX=myapp            # stream key prefix
-export MODULITH_CONSUMER_GROUP=myapp-workers   # consumer group name
+export REDIS_URL="redis://:<password>@localhost:6379"  # connection URL
+export MODULITH_STREAM_PREFIX=myapp            # stream key prefix (default modulith.events)
 export MODULITH_STREAM_MAXLEN=100000           # XADD MAXLEN ~ cap (see caveat above)
 export MODULITH_BROKER_DLQ_MAX_STREAM_LEN=1000000  # dead-letter stream cap (default: 10x the stream cap)
 export MODULITH_BROKER_MAX_PAYLOAD_BYTES=1048576   # producer-side payload cap (default 16 MiB)
 ```
+
+Module workers always join the consumer group `modulith-<module>`; `MODULITH_CONSUMER_GROUP` does not change that.
 
 The consumer-loop settings have no environment variable — set them in `pyproject.toml`:
 
@@ -604,15 +638,106 @@ Uses the `broker_message` and `broker_subscription` tables with `FOR UPDATE SKIP
 As with the SQLite broker above, running `modulith migrate` (or the raw
 `alembic upgrade head`) after the broker has already self-bootstrapped is
 supported — migrations `0002` and `0004` skip tables/indexes that already exist
-rather than failing.
+rather than failing. On a `postgresql+asyncpg://` URL both commands connect
+through `psycopg`, which the `postgres` extra installs
+(`pip install 'modupy[postgres]'`).
 
 **Tuning:**
 
+The values below are examples; the defaults are shown beside each variable.
+
 ```bash
-export MODULITH_BROKER_BATCH_SIZE=50              # events per poll
-export MODULITH_BROKER_DISPATCH_CONCURRENCY=5     # parallel listeners
-export MODULITH_BROKER_POLL_INTERVAL_MS=1000      # how often to check for new events
+export MODULITH_BROKER_BATCH_SIZE=200             # rows claimed per poll (default 100)
+export MODULITH_BROKER_DISPATCH_CONCURRENCY=20    # rows dispatched in parallel per batch (default 10)
+export MODULITH_BROKER_POLL_INTERVAL_MS=50        # idle poll cadence in ms (default 20); higher polls less often
 ```
+
+### Sizing the Default SHM Store
+
+The local `shm` broker keeps a publication while any of these holds:
+
+- a subscribed group has not consumed it yet: an undelivered backlog, which
+  includes a retired group that never consumes again;
+- it is younger than `orphan_retention_seconds` (default 3600), even after
+  every group has acked it, so late subscribers can replay it;
+- a delivery of it is kept as a terminal row: every acked delivery under
+  `completion_mode = "mark"`, and every dead letter in either mode, holds it
+  until `retention_age_seconds` (default 259200, 3 days) after completion.
+
+Its store (`max_store_bytes`, default 1 GiB) therefore caps the sustained
+publish rate, not only the backlog:
+
+```
+sustainable publications/s ≈ max_store_bytes / (bytes per publication × longest retention above)
+```
+
+A 1 KiB payload with two subscribed groups uses about 1.8 KB of store, so the
+defaults (delete mode, no dead letters) sustain roughly 165 publications/s; under
+`completion_mode = "mark"` the 3-day terminal retention cuts that below
+2.3 publications/s. Above that rate, every publish fails with "SHM SQLite store
+is full". Size `max_store_bytes` (or `MODULITH_BROKER_MAX_STORE_BYTES`) for the
+longest retention, or shorten `orphan_retention_seconds` before the store
+fills: each publication keeps the orphan retention stamped when it was
+written, so shortening it frees nothing in a store that is already full.
+
+A backlog frees space only as consumers drain it, or when
+`modulith broker drop-group` removes a retired group. Until then a retired or
+stopped group pins every publication to its targets, and the `modulith run`
+startup warning names a retired group only 24 hours after its last consumer
+activity, so size for that backlog or drop the group with `--force` as soon
+as no host runs it.
+
+A new `max_store_bytes` or `retention_age_seconds` applies to a process only
+after it restarts. `orphan_retention_seconds` is capped at 100 years
+(3153600000). A group that subscribes after a publication replays it only
+within that window.
+
+Publishes are refused once the pages in use (the page count minus the free
+pages) pass `max_store_bytes` less a 32-page consumer reserve (128 KiB at 4 KiB
+pages); a store of fewer than 256 pages (1 MiB at 4 KiB pages) reserves one
+eighth of its pages, rounded down, instead. Strictly, the numerator above is
+`max_store_bytes` minus that reserve; at the 1 GiB default that is 0.01% and
+does not change the estimate. The empty schema takes 13 pages (52 KiB at 4 KiB
+pages), so a store under 56 KiB refuses every publish, and a 64 KiB store holds
+about 50 publications of a few bytes each for one subscribed group.
+
+Consumers can always claim, ack, fail, dead-letter and prune the backlog they
+see, and a group can always subscribe, while publishes are refused: a consumer
+write or subscription record that `max_store_bytes` refuses is retried past it,
+so the store file can grow past the limit by the growth of rows it already holds
+(claims, error text, mark-mode completions, prune tombstones). A subscribe
+replay itself never grows the store past its publish budget: it replays the
+retained publications the group lacks, oldest first, and stops 8 pages below the
+budget, so a small publish that fit before the replay still fits right after it.
+Under `completion_mode="mark"` it uses at most half the room left, which covers
+claiming and acking its own rows when one group drains them and its listeners
+succeed. Draining can still take the store past the budget, as any consumer
+write can: failed and dead-lettered rows keep their error text, and under
+`completion_mode="mark"` claiming and acking grows every row, including rows
+other groups replayed. Publishes are then refused until prune frees pages or
+`max_store_bytes` is raised.
+
+A replay cut short logs one WARNING naming the group and the target, with the
+replayed and skipped counts. The skipped publications reach that group only
+through another replay. To replay them without losing work, do this in order:
+
+1. Let the group's workers drain its backlog on that target. The `drop-group` in
+   step 3 deletes every pending and claimed delivery the group holds there,
+   replayed ones included, and a replay restores only publications still within
+   `orphan_retention_seconds` of being written.
+2. Once that backlog is empty, stop the group's workers.
+3. Run `modulith broker drop-group <group> --target <target>`.
+4. Raise `max_store_bytes`.
+5. Restart every process, before the skipped publications expire
+   (`orphan_retention_seconds` after they were written).
+
+Size `max_store_bytes` for the retained backlog before adding a listener to a
+busy store. Consumers drain a store that was opened with a lowered limit the
+same way; publishes resume once the drained store is back under the limit, and
+an existing larger file keeps its size. Budget disk for the store's `-wal` file
+on top: it is not counted, grows to about 4 MiB (SQLite's 1000-page
+autocheckpoint) before checkpoints reuse it, grows further while a long read
+blocks a checkpoint, and keeps its largest size.
 
 ---
 
@@ -652,7 +777,8 @@ COPY myapp/ ./myapp/
 RUN pip install --no-cache-dir .
 EXPOSE 8000
 ENV MODULITH_BROKER=database
-ENV MODULITH_BROKER_URL=postgresql+asyncpg://...
+# Pass MODULITH_BROKER_URL (the broker database's async SQLAlchemy URL) in at
+# run time and never bake it into the image.
 # The supervisor binds 0.0.0.0, where actuator_mode="auto" only mounts
 # /_modulith/* if a bearer token is configured. Pass MODULITH_ACTUATOR_TOKEN in
 # at run time (never bake a secret into an image); omit it and the app still
@@ -663,7 +789,6 @@ CMD ["modulith", "run", "myapp.main:app", "--topology", "processes"]
 With `docker-compose.yml`:
 
 ```yaml
-version: "3.9"
 services:
   app:
     build: .
@@ -671,7 +796,8 @@ services:
       - "8000:8000"
     environment:
       MODULITH_BROKER: database
-      MODULITH_BROKER_URL: postgresql+asyncpg://user:pass@postgres/mydb
+      # Throwaway demo credentials: they must match the postgres service below.
+      MODULITH_BROKER_URL: postgresql+asyncpg://modulith:modulith@postgres/mydb
       # Mounts /_modulith/* on the proxy; drop this line to leave it unmounted.
       MODULITH_ACTUATOR_TOKEN: ${MODULITH_ACTUATOR_TOKEN:?set MODULITH_ACTUATOR_TOKEN}
     depends_on:
@@ -679,7 +805,7 @@ services:
       - redis  # if using redis broker
 
   postgres:
-    image: postgres:15
+    image: postgres:16-alpine
     environment:
       POSTGRES_USER: modulith
       POSTGRES_PASSWORD: modulith
@@ -688,11 +814,13 @@ services:
       - postgres_data:/var/lib/postgresql/data
 
   redis:  # optional
-    image: redis:7
+    image: redis:7-alpine
 
 volumes:
   postgres_data:
 ```
+
+The Postgres credentials are throwaway demo values, and this file publishes no Postgres port. Anywhere else, use a secret of your own.
 
 ---
 
@@ -705,9 +833,17 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: myapp
+  labels:
+    app: myapp
 spec:
   replicas: 2
+  selector:
+    matchLabels:
+      app: myapp
   template:
+    metadata:
+      labels:
+        app: myapp
     spec:
       containers:
         - name: app
@@ -722,7 +858,23 @@ spec:
                 secretKeyRef:
                   name: db-creds
                   key: url
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp
+spec:
+  selector:
+    app: myapp
+  ports:
+    - port: 8000
+      targetPort: 8000
 ```
+
+The Deployment's `selector` must match its pod template's labels, and the
+Service selects the same pods, so the two replicas answer on one cluster
+address, port 8000. Put an Ingress in front of the Service for traffic from
+outside the cluster.
 
 `MODULITH_OUTBOX_URL` is the URL the running app binds its outbox store to;
 `MODULITH_DB_URL` is only the sync-driver URL the Alembic migrations read. Run
@@ -734,6 +886,7 @@ spec:
 `modulith k8s-manifest` generates one Deployment + Service per module discovered under `--topology processes`, plus a single Ingress fanning out `/<module>` paths to each module's Service:
 
 ```bash
+mkdir -p k8s   # k8s-manifest does not create the output directory
 modulith k8s-manifest --output k8s/modulith.yaml --image myapp:1.0.0 --namespace prod
 ```
 
@@ -758,7 +911,7 @@ flowchart TD
 Options: `--output` (default `modulith-k8s.yaml`, `-` for stdout), `--image`
 (default `<package>:latest`), `--namespace`, `--port` (default `8000`, valid
 range 1–65535), and `--host` (Ingress host). Deployment and Service object
-names are normalized to RFC-1123 labels (`fakeapp-order-items`); long names
+names are normalized to RFC-1123 labels (`myapp-order-items`); long names
 keep a readable prefix plus a stable hash, and invalid or colliding names
 fail generation. The Ingress path is **not** normalized — it is the raw
 module name (`/order_items`), matching the worker's own mount point. A
@@ -811,18 +964,18 @@ Run it only against trusted source in the build environment.
 
 ### Horizontal Scaling (Add More Workers)
 
-For **single-process**, add replicas with a load balancer:
+For **single-process**, add replicas with a load balancer. Three copies on one host need three ports; on separate hosts or containers each copy can keep the default port 8000:
 
 ```bash
-MODULITH_OUTBOX=postgres uvicorn myapp.main:app --workers 4 &
-MODULITH_OUTBOX=postgres uvicorn myapp.main:app --workers 4 &
-MODULITH_OUTBOX=postgres uvicorn myapp.main:app --workers 4 &
+MODULITH_OUTBOX=postgres uvicorn myapp.main:app --workers 4 --port 8001 &
+MODULITH_OUTBOX=postgres uvicorn myapp.main:app --workers 4 --port 8002 &
+MODULITH_OUTBOX=postgres uvicorn myapp.main:app --workers 4 --port 8003 &
 ```
 
-For **process-per-module**, increase worker counts via `--workers` JSON flag or `pyproject.toml` configuration:
+For **process-per-module**, increase worker counts via `--workers` JSON flag or `pyproject.toml` configuration. The two `--workers` differ: `uvicorn --workers 4` above is a process count, while `modulith run --workers` takes a JSON object of per-module counts:
 
 ```bash
-# Run more inventory workers:
+# Run more inventory workers (the JSON replaces the pyproject table, so every other module gets one worker):
 MODULITH_BROKER=database modulith run myapp.main:app --topology processes \
   --workers '{"inventory": 4}'
 ```
@@ -869,29 +1022,21 @@ Or scale the broker database (connection pooling, read replicas, etc.).
 
 Bias capacity toward fault-prone or high-load modules by giving them more workers on the nodes that serve them.
 
-**Every discovered module gets at least one worker.** `[tool.modulith.workers]` counts must be `>= 1`; `notifications = 0` is rejected at boot with `ConfigurationError: workers must map string module names to positive integer counts`, and so is a `0` passed through `--workers` JSON. `modulith run` has no per-deployment module opt-out — "this module does not run here" means a separate application package, not a worker count of zero.
+**Every discovered module gets at least one worker.** `[tool.modulith.workers]` counts must be `>= 1`; `notifications = 0` is rejected at boot with `ConfigurationError: workers must map string module names to positive integer counts`, and so is a `0` passed through `--workers` JSON. `modulith run` has no per-deployment module opt-out — "this module does not run here" means a separate application package, not a worker count of zero. To run one module by itself, see **Starting one module on its own** below.
 
-**Approach 1: Separate instances with different worker configurations**
+**Approach 1: Separate deployments with different worker counts**
 
-Configuration file 1 (`prod.toml` - for request-serving nodes):
-```toml
-[tool.modulith.workers]
-orders = 4
-inventory = 4
-notifications = 1    # minimum; cannot be switched off per node
-reporting = 1
+modupy reads `[tool.modulith.workers]` only from the nearest `pyproject.toml`, and that table has no environment variable. To give two deployments of the same code different counts, pass `--workers` to each. The JSON replaces the table entirely, so every module it does not name runs one worker, the minimum (unless the JSON has a `default` key):
+
+```bash
+# request-serving nodes
+modulith run myapp.main:app --topology processes \
+  --workers '{"orders": 4, "inventory": 4}'
+
+# batch nodes
+modulith run myapp.main:app --topology processes \
+  --workers '{"notifications": 2, "reporting": 2}'
 ```
-
-Configuration file 2 (`batch.toml` - for batch nodes):
-```toml
-[tool.modulith.workers]
-orders = 1           # minimum; cannot be switched off per node
-inventory = 1
-notifications = 2
-reporting = 2
-```
-
-Then deploy each with appropriate configuration (via environment or config override).
 
 **Approach 2: All modules in one deployment with specific worker counts**
 
@@ -902,6 +1047,10 @@ inventory = 4
 notifications = 1
 reporting = 1
 ```
+
+Both approaches start every module on every deployment and differ only in worker counts.
+
+**Starting one module on its own.** Two things start a single module without its siblings. `modulith dev myapp.main:app --isolate orders` is for development: the other modules are not started and their routes 404 through the proxy. The worker factory is what the generated Kubernetes manifests and extracted services run: `MODULITH_MODULE=orders MODULITH_APP_PACKAGE=myapp uvicorn modulith._worker:create_app --factory` serves that module's `router` under `/orders`; give it the same broker settings as the rest of the deployment.
 
 ---
 
@@ -969,14 +1118,9 @@ Three consequences worth knowing:
 - Inside a module's prefix, the module's own routes win: a module named `docs` keeps every path under `/docs/*`, and a module defining its own `/docs` route keeps serving it. What loses the collision is the generated doc UI for that one module, never the application's route. The one exception is the worker's own `GET /health`: in a module named `health` it answers before the module's root `GET` route, and startup logs a warning that the module route is unreachable. The module's other routes, including `/health/`, still reach it.
 - Each schema also lists the worker's own unprefixed `/health`. The proxy forwards `/health` only to a module named `health`, so strip it (or ignore the 404) in anything generated against the public port.
 
-**A merged, cross-module schema remains out of scope for the supervisor**, and not for want of plumbing:
+**The supervisor serves no merged, cross-module schema.** Each worker publishes only its own module's schema, and a merged one would have to pick a single answer where two modules define the same model name differently and for the `info` block and security schemes, which belong to each worker.
 
-- **The pieces do not merge cleanly.** Each worker names its models under `components.schemas`, and two modules that both define an `Order` produce two different definitions of the same key. Merging silently picks one and mistypes the other module's API; renaming rewrites identifiers your generated clients already use.
-- **Nothing owns the envelope.** `info.title`, `info.version` and the security schemes are per-worker values. A merged document has to invent one answer, so the version it reports matches no deployed module in particular.
-- **It cannot be both fresh and cheap.** Fanning out to every worker per request puts an N-worker round trip on a public endpoint; caching serves a schema that silently lags a rolling deploy.
-- **Rollouts have no good answer.** While a worker is respawning, its schema is unavailable — a per-module URL simply returns 502 for that one module, while a merged document must either omit a whole module's API without saying so or fail as a whole.
-
-If you need one document, build it where those answers are yours to make:
+If you need one document, build it yourself:
 `modulith openapi` imports every module, generates its document in isolation,
 and prefixes each `components.schemas` key with `<module>_`. Exact duplicates
 are deduplicated, but incompatible paths, components, top-level metadata,
@@ -1046,7 +1190,7 @@ given up on at least one replica). `failed (given up)` is only reported once eve
 replica of that module is unreachable — a module with even one healthy
 replica reports `ok`.
 
-In Kubernetes, probe headers are static strings — template the token in from the same secret the container reads, or set `MODULITH_ACTUATOR_MODE=open` if the port is only reachable inside the cluster and you accept unauthenticated topology/health:
+In Kubernetes, probe headers are static strings, and a probe header cannot reference a Secret: a token templated in from the same secret the container reads becomes a literal in the Deployment spec, readable by anyone who can read Deployments. The probes in generated manifests need no token (see **Per-worker-pod probes** below). To probe the proxy, template the token in anyway, or set `MODULITH_ACTUATOR_MODE=open` if the port is only reachable inside the cluster and you accept unauthenticated topology/health:
 
 ```yaml
 livenessProbe:
@@ -1078,23 +1222,24 @@ A failure on one target never clears because another target succeeded. The excep
 
 **When a stalled consumer degrades `/health`.** A consumer that stops making progress reports `degraded` (503) even when no broker call has failed:
 
-- **A listener that never returns** (database and SHM brokers). The consumer claims nothing new until every row of its current batch has finished. Once a batch has run longer than `reclaim_stale_seconds * 10` (default 600 s), health reports `degraded` with the stuck event type, target and row. The consumer also logs an ERROR line starting `claim renewal for group ... exceeded` that names the same rows. The listener keeps running, because modupy never cancels user code. The consumer recovers only when the listener returns.
+- **A listener that never returns** (database and SHM brokers). The consumer claims nothing new until every row of its current batch has finished. Once a batch has run longer than `reclaim_stale_seconds * 10` (default 600 s), health reports `degraded` with the stuck event type, target and row. The consumer also logs an ERROR line starting `claim renewal for group ... exceeded` that names the same rows. While the worker runs, modupy never cancels a listener, so this one keeps running; a stop of the worker cancels it after a 1 s grace, unless it is a plain `def` listener (see [Graceful Shutdown](#graceful-shutdown)). The consumer recovers only when the listener returns.
 - **A Redis server that stops answering.** Health reports `degraded` ("no broker read completed in N s") once a read has waited `5 * poll_block_ms + 1 s`. The consumer logs one WARNING per stall. The Redis client's socket timeout (see [Redis Streams Broker](#b-redis-streams-broker)) then fails the hung read. The consumer logs `broker read failed`, backs off and retries, and health stays `degraded` until a read succeeds.
 
 Restart a worker whose health stays `degraded` longer than you can tolerate; on a stuck listener a restart is the only remedy. The restarted consumer reclaims the stuck rows and charges each one a delivery attempt, so a listener that hangs on every delivery ends in the dead-letter state after `max_delivery_attempts`. The generated Kubernetes manifests do not do this for you: liveness is a `tcpSocket` check, so a degraded worker is only taken out of readiness. Add a liveness `httpGet /health` (with a generous `failureThreshold`) or an external watchdog if you want automatic restarts.
 
-### Event Metrics
+### Tracing
 
-If OpenTelemetry is enabled (`modupy[otel]`), spans are emitted for:
+modupy emits spans and no metrics. If OpenTelemetry is enabled (`modupy[otel]`), spans are emitted for:
 - `modulith.event.publish` — an event was published
 - `modulith.event.dispatch` — an event was dispatched to a listener
 
 The `listener.name` attribute of a dispatch span is the same for a listener
 whether the event arrived in memory, through the outbox or through a broker:
 `module.qualname` (for example `myapp.inventory.reserve_stock`). A bound method
-or callable instance gets an `owner:` prefix naming the application module that
-registered it (`inventory:myapp.inventory.Reserver.reserve`). It is the id the
-outbox stores for the listener.
+or callable instance gets an `owner:` prefix naming the dotted package of the
+application module that registered it
+(`myapp.inventory:myapp.inventory.Reserver.reserve`). It is the id the outbox
+stores for the listener.
 
 The `observability` setting (`[tool.modulith] observability`, the
 `MODULITH_OBSERVABILITY` environment variable, or `configure(observability=...)`)
@@ -1118,7 +1263,7 @@ the publish span. A third-party broker adapter that drops message headers loses
 that link: its consumers' dispatch spans have no parent. A message without the
 headers behaves the same way.
 
-Export spans to Prometheus, Jaeger, or your observability stack.
+modupy configures no exporter. Set up an OpenTelemetry tracer provider in your application and send the spans to a tracing backend, such as Jaeger, Tempo or any OTLP collector.
 
 ---
 
@@ -1127,8 +1272,8 @@ Export spans to Prometheus, Jaeger, or your observability stack.
 ### Adding a New Module
 
 1. Create the subpackage: `myapp/my_module/__init__.py`
-2. Add manifest: `myapp/my_module/_manifest.py`
-3. Restart the supervisor (in single-process, restart the app; in topology mode, restart the appropriate worker)
+2. Optionally add a manifest: `myapp/my_module/_manifest.py`
+3. Restart: in single-process, restart the app; in topology mode, restart `modulith run`, because it derives its workers and proxy routes once at startup, so a module added later has no worker to restart (under Kubernetes, regenerate the manifests with `modulith k8s-manifest` and roll them out)
 
 ### Retiring a Module
 
@@ -1176,24 +1321,28 @@ Step 6 depends on the broker:
   that never consumes again gets a queued row for every later publication
   to its targets. On SHM those rows also keep prune from reclaiming the
   publications; on the database broker they pile up in `broker_message`.
+
   `modulith run --topology processes` logs a warning at startup for each
   group that no current module derives and no consumer served in the last
   24 hours, naming its backlog. A running consumer re-stamps its
   subscriptions every hour even when idle, and every claim counts too, so
   a group that an extracted service or another host still consumes is not
-  reported. Once the module is gone for good, run
+  reported.
+
+  Once the module is gone for good, run
   `modulith broker drop-group modulith-<module>` with the same broker
   configuration and environment as the service. It first prints the store
   it acts on (the SHM SQLite path, or the database URL with the password
   masked) and exits non-zero without creating anything when that store or
   its broker tables do not exist. It removes the group's subscriptions and
   deletes its pending and claimed messages (they are not delivered); the
-  next prune reclaims the publications they held. It asks for confirmation
-  unless `--yes` is given, exits non-zero when the store holds nothing for
-  the group, and refuses a group that a current module derives or a
-  consumer served in the last 24 hours unless `--force` is given. Before
-  asking, it lists the targets the group is the only subscriber of and says
-  what happens to later publishes to them, which step 2 stops first:
+  next prune reclaims the publications they held.
+
+  It asks for confirmation unless `--yes` is given, exits non-zero when the
+  store holds nothing for the group, and refuses a group that a current module
+  derives or a consumer served in the last 24 hours unless `--force` is given.
+  Before asking, it lists the targets the group is the only subscriber of and
+  says what happens to later publishes to them, which step 2 stops first:
   - database broker, `error` policy (the default): each raises
     `NoSubscribersError`;
   - database broker, `wait` policy: each waits up to
@@ -1215,6 +1364,7 @@ Step 6 depends on the broker:
   to those targets whether or not it subscribes, so dropping it has no
   lasting effect and the startup warning returns. `drop-group` says so;
   remove the group from `expected_consumer_groups` as well.
+
   Nothing is dropped automatically: a module that is only disabled for a
   deploy gets its backlog when it returns.
 - **Redis Streams broker:** no storage cleanup is needed. Streams are
@@ -1227,9 +1377,9 @@ Step 6 depends on the broker:
 
 A module that still exists can stop consuming a target: its last listener
 for an event moved to another module, or an upgrade changed which event
-types a worker consumes. Since the release in which a worker consumes only
-its own module's listeners, a worker no longer subscribes to event types
-that only a sibling module it imports listens to.
+types a worker consumes. A worker consumes only its own module's listeners,
+so it does not subscribe to event types that only a sibling module it imports
+listens to.
 
 On the SHM and database brokers, the pending or claimed messages queued for
 the target are never removed automatically, so a rollback to a release that
@@ -1287,9 +1437,7 @@ its next poll. A broker without dead-letter support, such as a custom one, exits
 On the Redis broker the command reads the `<stream_prefix>.<target>.dead`
 streams. Redis stores no error text for a dead letter, so `last_error` is
 `None`. `attempts` is how many times the consumer group delivered the message
-before it was dead-lettered; a dead letter written by an earlier modupy version
-has no count and shows `1`, a lower bound. The creation time is the entry id's
-timestamp. `--retry-all` re-adds each entry to
+before it was dead-lettered. The creation time is the entry id's timestamp. `--retry-all` re-adds each entry to
 its target's stream and deletes it from the dead stream. Redis cannot address
 one consumer group, so a re-added message reaches every group on that stream:
 a target is resubmitted only when its stream has **one** consumer group. For a
@@ -1299,7 +1447,7 @@ other targets, then names the target and its groups in an error and exits 1.
 **Consuming (every broker):**
 - A failed broker call is logged and retried under capped exponential backoff, 0.05 s doubling up to 5 s. `/health` reports `degraded` until that call succeeds again
 - A message that a stopped or crashed consumer left claimed or pending is delivered again once it has sat idle for `reclaim_stale_seconds` (database and SHM) or `reclaim_min_idle_ms` (Redis). Consumers reclaim it themselves: the supervisor takes no part, and nothing rebalances
-- A database or SHM consumer that stops gracefully hands back the messages it claimed but never started delivering, uncharged, so a peer takes them on its next poll. If a listener is still running when the stop's 1 s grace ends, the stop cancels it, and the messages of that batch wait for the reclaim above
+- A database or SHM consumer that stops gracefully hands back the messages it claimed but never started delivering, uncharged, so a peer takes them on its next poll. If a listener is still running when the stop's 1 s grace ends, the stop cancels it (except a plain `def` listener; see [Graceful Shutdown](#graceful-shutdown)), and the messages of that batch wait for the reclaim above
 
 **Redis broker:**
 - A consumer creates its group when it starts, from the beginning of the stream, and creates it again if Redis reports `NOGROUP`. Entries published while every consumer is down wait in the stream, until the `MODULITH_STREAM_MAXLEN` cap (10000 by default) trims the oldest, unacknowledged ones included (see the Redis durability caveat above)
@@ -1344,8 +1492,12 @@ sequenceDiagram
 ```
 
 The supervisor sends SIGTERM to every worker at once, and SIGKILL to any still running 30 s later.
-Within that window, in-flight requests and after-commit outbox deliveries run to completion, but a listener that a broker consumer is running when its worker stops is cancelled, and its message is delivered again later.
+Within that window, in-flight requests and after-commit outbox deliveries run to completion, but a listener that a broker consumer is running when its worker stops is cancelled, and its message is delivered again later. A plain `def` listener is the exception: it runs on an executor thread, so the stop cancels only the wait for it, the thread keeps running until the listener returns, and the worker does not exit before then unless SIGKILL ends it. Its message is delivered again later as well.
 A pod from the generated Kubernetes manifests runs a worker alone, so it gets SIGTERM directly and skips the supervisor's steps.
+
+A database or SHM consumer's worst-case stop (41 s) is longer than that 30 s window, so SIGKILL can cut a slow stop short. The messages the consumer still held then come back through the reclaim described under [Recovering from Broker Failure](#recovering-from-broker-failure): after `reclaim_stale_seconds` on the database and SHM brokers, after `reclaim_min_idle_ms` on Redis.
+
+In Kubernetes the pod's `terminationGracePeriodSeconds` takes the place of the supervisor's 30 s window. The generated manifests leave it at Kubernetes's default of 30 s, and that window also covers a `preStop` hook such as the one above. Raise it above the `preStop` sleep plus the longest your in-flight requests, after-commit deliveries and consumer stop (up to 20 s on Redis, 41 s on the database broker) need, if you want stops to finish instead of relying on that reclaim.
 
 Windows has no signal delivery on `subprocess.Popen` (`terminate()`
 is an immediate `TerminateProcess`, with no softer step for a worker's
@@ -1371,17 +1523,26 @@ hard-killed supervisor from leaving workers behind is Linux-only.
 3. **Split processes** — `MODULITH_BROKER=database --topology processes`
    - Modules now run in separate workers
    - Module code doesn't change; listeners stay `@listener` decorated
-   - `main.py` does not run in workers: its lifespan, middleware, exception handlers and any `outbox.configure()` there are absent. Set `MODULITH_OUTBOX_URL` (or `[tool.modulith].outbox_url`) so every worker binds the outbox store itself, or bind it from each module's import or a `modulith_after_module_load` hook
+   - `main.py` does not run in workers, so set `MODULITH_OUTBOX_URL` (or `[tool.modulith].outbox_url`) to let every worker bind the outbox store itself (see [Durable Single-Process](#durable-single-process-outbox-pattern))
    - A worker with `MODULITH_OUTBOX` set and no store bound refuses to start with a `ConfigurationError`, so a deployment that exported `MODULITH_OUTBOX` for step 2 must add the URL before this step
    - Each worker starts the outbox retry loop itself at startup
 
 4. **Extract microservice** — `modulith extract <module>` scaffolds a standalone service
-   - Copies the module, its contracts and every package-level helper module they import, transitively, into `--output` (default `<module>-service/`) and generates a `pyproject.toml`, `Dockerfile`, `README.md`, and `.env.example` to run it against `modulith._worker:create_app`. Contracts resolve as Python imports them: a `contracts.py` wins over a same-named directory without `__init__.py`, and a contracts directory without `__init__.py` has its files scanned for helper imports like any contracts package. A package ancestor with no `__init__.py` in the source (a PEP 420 namespace root such as `company/` for `package = "company.shop"`) gets none in the output either, so other portions of that namespace stay importable. The same holds for a helper's parent folder: one without `__init__.py` in the source (such as `shop/common/` holding `money.py`) stays a namespace folder in the output, so the service discovers no extra module; one with an `__init__.py` gets an empty initializer
+   - Copies the module, its contracts and every package-level helper module they import, transitively, into `--output` (default `<module>-service/`) and generates a `pyproject.toml`, `Dockerfile`, `README.md`, and `.env.example` to run it against `modulith._worker:create_app`
    - Blocked (exit 1) by the module's own outbound boundary violations, tables it shares with another module, or a runtime import of another declared module from any copied file — `--force` overrides only these three and records what it overrode in the generated README; a non-empty `--output` directory is never overridable
-   - Before publishing, imports the extracted module in a subprocess from the staged tree and exits 1 naming the failing import if that fails, or if the import loads first-party code from the source tree outside the extracted copy (reachable through `PYTHONPATH` or an editable install), so the service's third-party dependencies must be installed where you run `extract`. First-party code is anything under the directory that holds the app's top-level package. Modules under the interpreter's prefixes, standard library and site-packages directories are exempt, except that a directory containing that source tree exempts nothing: a virtualenv inside the project stays exempt, and a project inside a virtualenv is still checked (on Windows, `site.getsitepackages()` lists the virtualenv root itself). When the app resolves to an installed copy in the interpreter's site-packages or user site (a plain or `--user` `pip install`), only the app's own top-level package counts as first-party there, and other installed distributions stay exempt. A directory the app was installed into with `pip install --target` or `--prefix` and reached through `PYTHONPATH`, a `.pth` file or any other `sys.path` entry is not one of the interpreter's library directories, so everything in it counts as first-party: `extract` reports the app's dependencies installed there and exits 1. `--force` never overrides this import check, so a module-level import of another declared module fails even when forced; only a deferred one (inside a function) can be forced through
-   - Other modules keep sending events via the broker; the extracted service subscribes and acts. The service binds its outbox store from `MODULITH_OUTBOX_URL` (`[tool.modulith].outbox_url`) at startup, and refuses to start without a store when `MODULITH_OUTBOX` is not `memory` (unless module code it imports binds one itself with `outbox.configure()`): the app's `main.py` is not copied, so its lifespan wiring never runs. The generated `.env.example` and README list `MODULITH_OUTBOX` and `MODULITH_OUTBOX_URL`
+   - Before publishing, imports the extracted module in a subprocess from the staged tree and exits 1 naming the failing import if that fails, or if the import loads first-party code from the source tree outside the extracted copy (reachable through `PYTHONPATH` or an editable install), so the service's third-party dependencies must be installed where you run `extract`
+   - Other modules keep sending events via the broker; the extracted service subscribes and acts. As in a worker, the service binds its outbox store from `MODULITH_OUTBOX_URL` (`[tool.modulith].outbox_url`) and refuses to start without a store when `MODULITH_OUTBOX` is not `memory`, because the app's `main.py` is not copied (see [Durable Single-Process](#durable-single-process-outbox-pattern)). The generated `.env.example` and README list `MODULITH_OUTBOX` and `MODULITH_OUTBOX_URL`
+   - How contracts, namespace folders and first-party code are resolved: [What `modulith extract` copies and checks](#what-modulith-extract-copies-and-checks)
 
 This path is why modupy exists: **every module is a potential microservice, but you pay that cost only when it's profitable.**
+
+### What `modulith extract` copies and checks
+
+- **Contracts.** Contracts resolve as Python imports them: a `contracts.py` wins over a same-named directory without `__init__.py`, and a contracts directory without `__init__.py` has its files scanned for helper imports like any contracts package.
+- **Namespace folders.** A package ancestor with no `__init__.py` in the source (a PEP 420 namespace root such as `company/` for `package = "company.shop"`) gets none in the output either, so other portions of that namespace stay importable. The same holds for a helper's parent folder: one without `__init__.py` in the source (such as `shop/common/` holding `money.py`) stays a namespace folder in the output, so the service discovers no extra module; one with an `__init__.py` gets an empty initializer.
+- **First-party code in the import check.** First-party code is anything under the directory that holds the app's top-level package. Modules under the interpreter's prefixes, standard library and site-packages directories are exempt, except that a directory containing that source tree exempts nothing: a virtualenv inside the project stays exempt, and a project inside a virtualenv is still checked (on Windows, `site.getsitepackages()` lists the virtualenv root itself).
+- **Installed copies.** When the app resolves to an installed copy in the interpreter's site-packages or user site (a plain or `--user` `pip install`), only the app's own top-level package counts as first-party there, and other installed distributions stay exempt. A directory the app was installed into with `pip install --target` or `--prefix` and reached through `PYTHONPATH`, a `.pth` file or any other `sys.path` entry is not one of the interpreter's library directories, so everything in it counts as first-party: `extract` reports the app's dependencies installed there and exits 1.
+- **`--force`.** `--force` never overrides the import check, so a module-level import of another declared module fails even when forced; only a deferred one (inside a function) can be forced through.
 
 ---
 
@@ -1389,11 +1550,11 @@ This path is why modupy exists: **every module is a potential microservice, but 
 
 ### Events Not Delivered
 
-1. Check that the listener's module was actually imported: `modulith info` → the module must appear under `modules` marked `[manifest]`. (`info` prints modules, configuration, plugins, and registered broker schemes — there is no per-listener listing. A module that silently failed to import is the most common cause, and manifest verification is what turns a declared-but-unregistered listener into a boot failure.)
-2. Verify the manifest declares the event: `_manifest.py` → check `consumes`
+1. Check that the listener's module was discovered: `modulith info` lists it under `modules`, and the INFO-level startup log names it in the `discovered N module(s)` line. A module without a `_manifest.py` shows `[no manifest]`, which is normal: manifests are optional. (`info` prints modules, configuration, plugins, and registered broker schemes — there is no per-listener listing. A module whose import fails stops the boot with a `ConfigurationError` that names it, and for a module that has a manifest, a declared listener that never registered is a boot failure too.)
+2. If the module has a manifest, verify that it declares the event: `_manifest.py` → check `consumes`
 3. Inspect broker state:
    - Database: `SELECT * FROM broker_message WHERE status IN ('pending','claimed')` for work still in flight, and `WHERE status = 'dead'` for the dead-letter view. The column only ever holds `pending`, `claimed`, `done`, or `dead`.
-   - Redis: `xinfo groups myapp-events`
+   - Redis: `xinfo groups modulith.events.<target>`, where `<target>` is the event's destination, by default its module and class name (for example `myapp.contracts.events.OrderPlaced`), and `modulith.events` is the default stream prefix (`MODULITH_STREAM_PREFIX` replaces it). List the streams with `SCAN 0 MATCH 'modulith.events.*'`, repeating with the returned cursor until it is `0`.
 
 ### Worker Crash Loop
 
@@ -1422,14 +1583,14 @@ stateDiagram-v2
     end note
 ```
 
-1. Check logs: `modulith run --topology processes 2>&1 | grep ERROR`
-2. Verify broker connectivity: `modulith doctor`
+1. Read the supervisor's output (the terminal running `modulith run`, or the container logs): it prefixes every worker line with the worker's name, such as `[orders]`
+2. Test the broker itself: connect to its URL with `psql` (without the `+asyncpg` driver suffix) or `redis-cli`, or read a worker's `/health`, which answers 503 while its broker consumer is not ready. `modulith doctor` does not do this: it reports on configuration, module boundaries and the outbox, and its Redis check skips the live query without failing when no server answers
 3. Check disk space (SQLite needs it)
 
 ### High Latency
 
-1. Database broker — tune batch size: `MODULITH_BROKER_BATCH_SIZE=200`
-2. Database broker — increase concurrency: `MODULITH_BROKER_DISPATCH_CONCURRENCY=20`
+1. Database broker — tune batch size: `MODULITH_BROKER_BATCH_SIZE=200` (default 100)
+2. Database broker — increase concurrency: `MODULITH_BROKER_DISPATCH_CONCURRENCY=20` (default 10)
 3. Redis broker — neither knob exists; add workers instead (`[tool.modulith.workers]`)
 4. Profile with `modupy[otel]` and check span duration
 
@@ -1459,8 +1620,10 @@ sync-driver URL the raw Alembic command reads, and `modulith migrate` reads
 | Broker | Setup | Durability | Scale | Ideal For |
 |---|---|---|---|---|
 | `memory` | None | No | Single-process | Dev/test |
-| `database` (SQLite) | Local file | Yes | Single-host process-per-module (shared filesystem required for multi-process) | Dev, single-host staging |
+| `shm` (the default for `--topology processes`) | None (a SQLite file in `state_dir`) | Yes | Single-host process-per-module | Single host, nothing extra to run |
+| `database` (SQLite) | Local file | Yes | Single-host process-per-module | Dev, single-host staging |
 | `database` (Postgres) | Existing DB | Yes | Multi-host process-per-module | Production monolith and distributed |
+| `database` (MySQL or MariaDB) | Existing DB (MySQL 8.0.1+ or MariaDB 10.6+) | Yes | Multi-host process-per-module | Production on MySQL or MariaDB |
 | `redis-streams` | Docker/Cloud | Yes | High throughput, multi-host | High-load production |
 
 ---
