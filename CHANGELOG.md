@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-10-02
+
+The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record builds that were never published.
+
 ### Added
 
 - `bind_session()` and `unbind_session()` join the stable wiring API in `modulith.builtin.outbox`. `modulith.adapters.postgres_outbox` keeps both names as aliases of the same functions, so existing imports keep working
@@ -35,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The packaged migrations record their revision in their own `modulith_alembic_version` table, so they can share a database with your application's Alembic history in `alembic_version`
 - The `test` extra and each example's test dependencies install `httpx2`, which Starlette 1.7's test client imports in preference to `httpx`. Without it, the client warns with `StarletteDeprecationWarning`. The `fastapi` extra keeps `httpx` for the reverse proxy
 - COOKBOOK and ARCHITECTURE explain that under the memory outbox `publish()` runs listeners while the publisher's transaction is still open, so on SQLite a publisher that has flushed a write makes a writing listener fail with `database is locked`. They also explain that the first `publish_sync()` bootstraps modupy lazily inside its timeout. The planned standalone test plugin and Django integration are named `pytest-modupy` and `django-modupy`
+- STABILITY.md states one rule for breaking changes before 1.0. A change to a stable surface (the top-level `modulith` exports, the hookspecs and driver protocols, and the pytest plugin) first goes through a deprecation period of at least one minor release, after which a later 0.x minor may make it. Before, the page said both that any 0.x minor may break the API and that only a major release may
+- The guides were corrected again where they disagreed with the code. A process-per-module worker serves only the `router` its module re-exports from `__init__.py`, delivery is at-least-once, and the database broker prunes dead-lettered rows after 3 days by default (`prune_interval_seconds = 0` turns pruning off). SPEC.md now calls itself the design document: where it and the code disagree, the code and STABILITY.md are right
 
 ### Fixed
 
@@ -57,6 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Database and SHM consumers: a graceful `stop()` hands the messages it claimed but never started delivering back to the group, uncharged, so another consumer takes them on its next poll. Before, every restart could leave up to a whole batch (100 by default) claimed for `reclaim_stale_seconds` (60 s by default). Messages whose listener is still running when the stop's grace ends still wait for that reclaim
 - `modulith outbox status`, `retry`, `purge`, `dead-letter` and `failing` close the database engine built from `outbox_url` before they exit, instead of leaving its connections to be dropped unclosed when the process ends
 - `modulith outbox dead-letter --retry-all` delivers each resubmitted publication under the claim or advisory lock a retry sweep takes, so a process sweeping at the same time can no longer deliver it as well. The command also waits until the events its listeners publish are delivered before it exits. Before, those events stayed claimed until the lease expired and another process's sweep delivered them
+- CLI help no longer shows raw double backticks, and `modulith migrate --help` prints `[tool.modulith]` instead of dropping it as markup
 
 ### Upgrade notes
 
@@ -275,70 +282,3 @@ The `v0.10.0` tag first marked an unpublished build of 2026-09-02 and now marks 
 - Connection pooling for database brokers
 - Claim-lease-based lock-free fan-out (Postgres broker)
 - Concurrent listener invocation within a worker (configurable concurrency)
-
----
-
-## v0.9.0 Statistics
-
-Measured at the 0.9.0 tag; these drift with every release and are not a
-contract.
-
-- **Lines of code (core):** ~20,600 across 54 modules in `modulith/`
-- **Test suite:** 1,439 tests in the default (non-integration) suite, 0 failures
-- **Test code:** ~37,300 lines in `tests/`
-- **Type safety:** 100% typed, mypy `--strict` passing
-- **Documentation:** ~5,400 lines of Markdown (README, SPEC, guides, cookbook)
-
----
-
-## Roadmap
-
-### v1.1 (Demand-Driven)
-- Additional broker adapters: Kafka, RabbitMQ, AWS SQS
-- Alternative outbox stores: MongoDB, DynamoDB
-- Subinterpreter topology (when Python 3.13+ ecosystem ready)
-- Django integration package
-
-### v2.0 (Post-Adoption)
-- Performance optimization based on production workload telemetry
-- Extended plugin APIs for custom storage and transport layers
-- GraphQL subscription support for event-driven subscriptions
-
-See [ROADMAP.md](ROADMAP.md) for detailed phase breakdowns and kill criteria.
-
----
-
-## Migration Guide
-
-**For existing FastAPI applications:**
-- Adopt modulith as a dependency; no refactor required to start
-- Gradually migrate request handlers to event-driven modules
-- Use outbox for durability; process topology for horizontal scale
-- See [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)
-
-**For new applications:**
-- Start with `modupy[fastapi,cli]` and in-memory broker
-- Add durability via `modupy[postgres]` when needed
-- Scale to processes with the `database` broker and `--topology processes`
-
----
-
-## Installation
-
-```bash
-pip install modupy
-
-# With FastAPI and CLI:
-pip install 'modupy[fastapi,cli]'
-
-# With Postgres outbox:
-pip install 'modupy[postgres]'
-
-# With database broker:
-pip install 'modupy[database]'
-
-# Full stack (all adapters):
-pip install 'modupy[all]'
-```
-
-**Requires:** Python 3.11+

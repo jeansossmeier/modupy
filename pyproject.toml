@@ -33,7 +33,7 @@ build-backend = "hatchling.build"
 # `modulith` belongs to an unrelated project, so the distribution ships as
 # `modupy` (`pip install modupy` then `import modulith`).
 name = "modupy"
-version = "0.10.0"
+version = "0.11.0"
 description = "Modular monolith pattern for Python — module structure, event-driven boundaries, transactional outbox, optional process-per-module runtime."
 readme = "README.md"
 requires-python = ">=3.11"

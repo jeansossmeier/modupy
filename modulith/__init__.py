@@ -23,7 +23,7 @@ from importlib.metadata import version as _pkg_version
 try:
     __version__ = _pkg_version("modupy")
 except _PackageNotFoundError:  # running from a source checkout that isn't installed
-    __version__ = "0.10.0"
+    __version__ = "0.11.0"
 
 # ----- Application-facing API (what most users need) -----------------------
 # ----- Broker dispatch registry --------------------------------------------

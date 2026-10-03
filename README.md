@@ -3,11 +3,11 @@
 [![CI Status](https://github.com/jeansossmeier/modupy/actions/workflows/ci.yml/badge.svg)](https://github.com/jeansossmeier/modupy/actions?query=workflow%3ACI)
 [![PyPI Version](https://img.shields.io/pypi/v/modupy)](https://pypi.org/project/modupy/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/modupy)](https://pypi.org/project/modupy/)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/jeansossmeier/modupy/blob/main/LICENSE)
 
 **Start as one app. Grow into processes and services without re-architecting.**
 
-![The same three modules in three shapes: one process on day one, one process per module when a feature gets busy, and payments split off into its own service](docs/images/growth.svg)
+![The same three modules in three shapes: one process on day one, one process per module when a feature gets busy, and payments split off into its own service](https://raw.githubusercontent.com/jeansossmeier/modupy/main/docs/images/growth.svg)
 
 modupy helps you build a Python backend as a **modular monolith**: one codebase, split into modules that talk through events and can't reach into each other's code.
 On day one it is a plain FastAPI app.
@@ -73,7 +73,7 @@ async def write_thank_you_note(event: OrderCreated) -> None:
     await notes.save(event.order_id, note)  # llm and notes: your model client and your storage
 ```
 
-![In one process the customer waits for the LLM call; with the outbox or a worker process the request returns at once, and the call runs and retries in the background](docs/images/ai-listener.svg)
+![In one process the customer waits for the LLM call; with the outbox or a worker process the request returns at once, and the call runs and retries in the background](https://raw.githubusercontent.com/jeansossmeier/modupy/main/docs/images/ai-listener.svg)
 
 Then choose how it runs. The listener does not change:
 
@@ -108,7 +108,7 @@ Three modules and one shared contract.
 `orders` publishes an event, `payments` and `inventory` react to it, and no module imports another.
 An event is any class marked `@event`; a frozen dataclass is the recommended shape.
 
-![orders publishes OrderCreated, which payments and inventory receive; payments publishes PaymentReceived, which orders receives; both events live in contracts](docs/images/event-flow.svg)
+![orders publishes OrderCreated, which payments and inventory receive; payments publishes PaymentReceived, which orders receives; both events live in contracts](https://raw.githubusercontent.com/jeansossmeier/modupy/main/docs/images/event-flow.svg)
 
 ```python
 # myapp/contracts/events.py
@@ -287,8 +287,6 @@ pip install 'modupy[fastapi,cli]'
 The other extras are `postgres` (the durable outbox), `redis` and `database` (brokers for more than one machine), `otel` (tracing), `test` (what the pytest fixtures use) and `all`.
 The core alone, `pip install modupy`, has one dependency: `pluggy`.
 
-> The outbox wiring in [step 2](#2-never-lose-an-event) (`bind_session`, `modulith migrate` and the retry settings) arrives in the first release after 0.10.0. Until then, install from this repository: `pip install 'modupy[fastapi,cli] @ git+https://github.com/jeansossmeier/modupy'`.
-
 ### Lay out your project
 
 ```text
@@ -348,7 +346,7 @@ $ modulith run myapp.main:app --topology=processes
 modulith → process-per-module: 3 worker(s) [inventory:9001, orders:9002, payments:9003], reverse proxy on http://0.0.0.0:8000
 ```
 
-![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](docs/images/processes.svg)
+![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](https://raw.githubusercontent.com/jeansossmeier/modupy/main/docs/images/processes.svg)
 
 Each module now runs in its own process behind one public port, so the URLs do not change:
 
@@ -400,7 +398,7 @@ pytest
 
 A module may call another module's public functions and use the events in `contracts`; `modulith verify` refuses the rest:
 
-![payments may import the public API of orders and the events in contracts, but modulith verify refuses an import of a private name such as _orders](docs/images/boundaries.svg)
+![payments may import the public API of orders and the events in contracts, but modulith verify refuses an import of a private name such as _orders](https://raw.githubusercontent.com/jeansossmeier/modupy/main/docs/images/boundaries.svg)
 
 Put the boundary check in CI, so nobody, human or AI, quietly couples two modules:
 
@@ -434,7 +432,7 @@ The outbox writes each event you publish inside a database session into the same
 If the transaction rolls back, the event is gone too; if the process crashes after the commit, the event is still there and is delivered after the app restarts.
 A `publish()` outside a session is delivered directly and saves nothing, so the session wiring below is required.
 
-![One commit saves the order and one event_publications row per listener; after the commit each listener runs in the background, and a failing one is retried, then dead-lettered](docs/images/outbox.svg)
+![One commit saves the order and one event_publications row per listener; after the commit each listener runs in the background, and a failing one is retried, then dead-lettered](https://raw.githubusercontent.com/jeansossmeier/modupy/main/docs/images/outbox.svg)
 
 ```bash
 pip install 'modupy[postgres]'   # for MySQL or SQLite, use 'modupy[database]'
@@ -505,7 +503,7 @@ modulith outbox dead-letter --retry-all   # replay the events whose listeners ga
 ```
 
 Retries are tuned under `[tool.modulith.outbox_options]`.
-[`examples/demo_app`](examples/demo_app) runs all of this on SQLite, then on Postgres.
+[`examples/demo_app`](https://github.com/jeansossmeier/modupy/tree/main/examples/demo_app) runs all of this on SQLite, then on Postgres.
 
 ### 3. Give busy modules their own processes
 
@@ -524,7 +522,7 @@ reports = 4   # every other module keeps the default of 1
 
 Each process has its own memory and the proxy spreads requests across them, so keep that module's state in your database.
 A supervisor restarts a crashed worker after 1, 2, 4, 8, then 16 seconds, and gives up after six crashes in a row, leaving that module down until you fix it.
-Events between processes travel through a built-in queue on the same machine, so there is still nothing extra to install; in production, set its `state_dir` under `[tool.modulith.broker_options]` ([DEPLOYMENT.md](docs/DEPLOYMENT.md#process-per-module-topology)).
+Events between processes travel through a built-in queue on the same machine, so there is still nothing extra to install; in production, set its `state_dir` under `[tool.modulith.broker_options]` ([DEPLOYMENT.md](https://github.com/jeansossmeier/modupy/blob/main/docs/DEPLOYMENT.md#process-per-module-topology)).
 
 ### 4. Spread across machines
 
@@ -537,7 +535,7 @@ broker = "redis-streams"   # reads REDIS_URL; pip install 'modupy[redis]'
 ```
 
 Rather not run Redis?
-`broker = "database"` puts the queue in Postgres or MySQL instead: install `modupy[database]` and set `url` under `[tool.modulith.broker_options]` ([Cookbook](docs/COOKBOOK.md#use-a-shared-database-broker)).
+`broker = "database"` puts the queue in Postgres or MySQL instead: install `modupy[database]` and set `url` under `[tool.modulith.broker_options]` ([Cookbook](https://github.com/jeansossmeier/modupy/blob/main/docs/COOKBOOK.md#use-a-shared-database-broker)).
 Delivery is at least once, so listeners must be safe to run twice.
 Then place modules on different machines: `modulith k8s-manifest` ([step 6](#6-run-it-in-production)) writes one Deployment per module, or start a single module anywhere with `MODULITH_MODULE=reports MODULITH_APP_PACKAGE=myapp uvicorn modulith._worker:create_app --factory`.
 
@@ -580,7 +578,7 @@ modulith verify --mode=ratchet      # from now on, fails only on new violations
 ```
 
 Keep `strict_boundaries` off while you adopt: with it on, `verify` fails at boot on the very violations the baseline should record.
-[MIGRATION_GUIDE.md](MIGRATION_GUIDE.md) walks through the whole move.
+[MIGRATION_GUIDE.md](https://github.com/jeansossmeier/modupy/blob/main/MIGRATION_GUIDE.md) walks through the whole move.
 
 ## Configuration
 
@@ -601,7 +599,7 @@ reports = 4
 ```
 
 Every setting directly under `[tool.modulith]` can also come from an environment variable, such as `MODULITH_OUTBOX_URL` or `MODULITH_BROKER`.
-[API_REFERENCE.md](docs/API_REFERENCE.md#configuration) lists every setting and its default, [ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how settings resolve (§3), outbox retries (§7) and brokers (§8), and [DEPLOYMENT.md](docs/DEPLOYMENT.md#actuator-access-_modulith) covers securing the actuator endpoints.
+[API_REFERENCE.md](https://github.com/jeansossmeier/modupy/blob/main/docs/API_REFERENCE.md#configuration) lists every setting and its default, [ARCHITECTURE.md](https://github.com/jeansossmeier/modupy/blob/main/docs/ARCHITECTURE.md) explains how settings resolve (§3), outbox retries (§7) and brokers (§8), and [DEPLOYMENT.md](https://github.com/jeansossmeier/modupy/blob/main/docs/DEPLOYMENT.md#actuator-access-_modulith) covers securing the actuator endpoints.
 
 ## CLI
 
@@ -637,16 +635,16 @@ CI runs every command in every example's README exactly as written, from a fresh
 
 | Example | Size | What it shows |
 |---|---|---|
-| [`quickstart`](examples/quickstart) | small: 3 modules | the code above, in one process and in one process per module |
-| [`demo_app`](examples/demo_app) | mid: a shop with a database | the durable outbox on SQLite, `modulith migrate`, a scaled module, then Postgres and Redis |
-| [`marketplace`](examples/marketplace) | large: 7 modules | a payment saga that undoes itself on failure, dead-letter recovery, a team boundary rule shipped as a plugin, tracing, Kubernetes and extracting a service |
+| [`quickstart`](https://github.com/jeansossmeier/modupy/tree/main/examples/quickstart) | small: 3 modules | the code above, in one process and in one process per module |
+| [`demo_app`](https://github.com/jeansossmeier/modupy/tree/main/examples/demo_app) | mid: a shop with a database | the durable outbox on SQLite, `modulith migrate`, a scaled module, then Postgres and Redis |
+| [`marketplace`](https://github.com/jeansossmeier/modupy/tree/main/examples/marketplace) | large: 7 modules | a payment saga that undoes itself on failure, dead-letter recovery, a team boundary rule shipped as a plugin, tracing, Kubernetes and extracting a service |
 
-Single-file plugin examples: [a verifier rule](examples/naming_convention_verifier.py), [a Redis Streams broker](examples/redis_streams_broker.py) and [a storage serializer](examples/versioned_json_serializer.py).
+Single-file plugin examples: [a verifier rule](https://github.com/jeansossmeier/modupy/blob/main/examples/naming_convention_verifier.py), [a Redis Streams broker](https://github.com/jeansossmeier/modupy/blob/main/examples/redis_streams_broker.py) and [a storage serializer](https://github.com/jeansossmeier/modupy/blob/main/examples/versioned_json_serializer.py).
 
 ## Is modupy right for you?
 
 It fits teams of roughly 3 to 15 engineers building a Python product, often B2B SaaS, who want to put off microservices for as long as possible without painting themselves into a corner.
-If that is not you, it may not be the right fit; [SPEC.md](SPEC.md) Part II explains who it is for.
+If that is not you, it may not be the right fit; [SPEC.md](https://github.com/jeansossmeier/modupy/blob/main/SPEC.md) Part II explains who it is for.
 
 | | modupy | FastAPI + folders | FastAPI + Celery + import-linter | Microservices |
 |---|---|---|---|---|
@@ -662,29 +660,29 @@ modupy is inspired by [Spring Modulith](https://spring.io/projects/spring-moduli
 
 ## Status
 
-modupy is a **pre-1.0 alpha**: breaking changes may land in 0.x minor releases, and each one is listed in [CHANGELOG.md](CHANGELOG.md).
-The core, the transactional outbox, the tooling and the process-per-module runtime are code-complete and pass `pytest`, `mypy --strict` and `ruff`; more adapters follow after 1.0, as users ask for them ([ROADMAP.md](ROADMAP.md)).
-Every pull request and every push to `main` runs ~2,380 hermetic tests on Python 3.11, 3.12 and 3.13 (Linux, with the SHM broker also on macOS and Windows), plus 116 integration tests against real Postgres, MySQL and Redis containers, which include every example README run from the built wheel.
-[STABILITY.md](docs/STABILITY.md) states what stays stable across 0.x releases.
+modupy is a **pre-1.0 alpha**: breaking changes may land in 0.x minor releases, and each one is listed in [CHANGELOG.md](https://github.com/jeansossmeier/modupy/blob/main/CHANGELOG.md).
+The core, the transactional outbox, the tooling and the process-per-module runtime are code-complete and pass `pytest`, `mypy --strict` and `ruff`; more adapters follow after 1.0, as users ask for them ([ROADMAP.md](https://github.com/jeansossmeier/modupy/blob/main/ROADMAP.md)).
+Every pull request and every push to `main` runs more than 2,600 hermetic tests on Python 3.11, 3.12 and 3.13 (Linux, with the SHM broker also on macOS and Windows), plus more than 140 integration tests against real Postgres, MySQL and Redis containers, which include every example README run from the built wheel.
+[STABILITY.md](https://github.com/jeansossmeier/modupy/blob/main/docs/STABILITY.md) states what stays stable across 0.x releases.
 
 ## Documentation
 
-- [SPEC.md](SPEC.md): the full specification and every design decision
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how modupy works inside, from the runtime and plugins to the outbox, cross-process delivery and the verifier
-- [docs/COOKBOOK.md](docs/COOKBOOK.md): step-by-step recipes for common jobs
-- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): Docker and Kubernetes, scaling, health probes and operations
-- [docs/API_REFERENCE.md](docs/API_REFERENCE.md): the public API, generated from docstrings
-- [docs/STABILITY.md](docs/STABILITY.md): what is guaranteed across 0.x releases
-- [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md): adopting modupy in an existing codebase
-- [ROADMAP.md](ROADMAP.md): what comes next
-- [CHANGELOG.md](CHANGELOG.md): what changed in each release
+- [SPEC.md](https://github.com/jeansossmeier/modupy/blob/main/SPEC.md): the design document, with the reasoning behind modupy's design; where it and the code disagree, the code and docs/STABILITY.md are right
+- [docs/ARCHITECTURE.md](https://github.com/jeansossmeier/modupy/blob/main/docs/ARCHITECTURE.md): how modupy works inside, from the runtime and plugins to the outbox, cross-process delivery and the verifier
+- [docs/COOKBOOK.md](https://github.com/jeansossmeier/modupy/blob/main/docs/COOKBOOK.md): step-by-step recipes for common jobs
+- [docs/DEPLOYMENT.md](https://github.com/jeansossmeier/modupy/blob/main/docs/DEPLOYMENT.md): Docker and Kubernetes, scaling, health probes and operations
+- [docs/API_REFERENCE.md](https://github.com/jeansossmeier/modupy/blob/main/docs/API_REFERENCE.md): the public API, generated from docstrings
+- [docs/STABILITY.md](https://github.com/jeansossmeier/modupy/blob/main/docs/STABILITY.md): what is guaranteed across 0.x releases
+- [MIGRATION_GUIDE.md](https://github.com/jeansossmeier/modupy/blob/main/MIGRATION_GUIDE.md): adopting modupy in an existing codebase
+- [ROADMAP.md](https://github.com/jeansossmeier/modupy/blob/main/ROADMAP.md): what comes next
+- [CHANGELOG.md](https://github.com/jeansossmeier/modupy/blob/main/CHANGELOG.md): what changed in each release
 
 ## Contributing
 
-The design is opinionated, so please read [SPEC.md](SPEC.md) before opening a large PR.
+The design is opinionated, so please read [SPEC.md](https://github.com/jeansossmeier/modupy/blob/main/SPEC.md) before opening a large PR.
 The plugin contract (13 hookspecs, 5 protocols) is the most stable part of the project: additions are easy, and signature changes need strong justification.
-Development setup and both test suites, the hermetic default and the Docker-backed integration suite, are in [CONTRIBUTING.md](CONTRIBUTING.md).
+Development setup and both test suites, the hermetic default and the Docker-backed integration suite, are in [CONTRIBUTING.md](https://github.com/jeansossmeier/modupy/blob/main/CONTRIBUTING.md).
 
 ## License
 
-Copyright 2026 Jean Sossmeier. Apache-2.0, see [LICENSE](LICENSE).
+Copyright 2026 Jean Sossmeier. Apache-2.0, see [LICENSE](https://github.com/jeansossmeier/modupy/blob/main/LICENSE).
