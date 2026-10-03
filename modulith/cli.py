@@ -842,24 +842,24 @@ def dev(
         None,
         min=1,
         max=65535,
-        help=r"First worker port under --topology processes (default: \[tool.modulith] "
+        help=r"First worker port under --topology processes (default: \\[tool.modulith] "
         "worker_port_base, else 9001); replicas take the following ports",
     ),
 ) -> None:
     """Run the application in development mode.
 
     Startup runs the boundary verifier and echoes violations as *non-fatal*
-    warnings — the dev-time signal promised by SPEC §3.2 (``modulith verify``
+    warnings — the dev-time signal promised by SPEC §3.2 (`modulith verify`
     remains the hard CI gate). The single-process path execs uvicorn
-    (optionally with ``--reload``), so the dev experience is identical to
-    running uvicorn directly. The process-per-module path (``--topology
-    processes``) runs the supervisor + reverse proxy: one worker subprocess
-    per module behind a routing proxy on ``(host, port)``. ``--isolate
-    MODULE`` also selects this path but restricts it to MODULE only — every
+    (optionally with `--reload`), so the dev experience is identical to
+    running uvicorn directly. The process-per-module path (`--topology
+    processes`) runs the supervisor + reverse proxy: one worker subprocess
+    per module behind a routing proxy on `(host, port)`. `--isolate
+    MODULE` also selects this path but restricts it to MODULE only — every
     other discovered module is not started, and its routes 404 through the
-    proxy. (``--reload`` does not apply to the process topology in v1.)
+    proxy. (`--reload` does not apply to the process topology.)
 
-    ``--log-level`` sets this process's root log level and is passed on to
+    `--log-level` sets this process's root log level and is passed on to
     uvicorn (and, under the process topology, to every worker subprocess), so
     the whole deployment's verbosity comes from one flag.
 
@@ -922,20 +922,20 @@ def run(
         None,
         min=1,
         max=65535,
-        help=r"First worker port under --topology processes (default: \[tool.modulith] "
+        help=r"First worker port under --topology processes (default: \\[tool.modulith] "
         "worker_port_base, else 9001); replicas take the following ports",
     ),
 ) -> None:
     r"""Run the application in production mode.
 
-    Like ``dev`` minus reload (and minus the dev-time verifier warnings).
-    Per-module worker counts (``--workers``) apply to the process-per-module
+    Like `dev` minus reload (and minus the dev-time verifier warnings).
+    Per-module worker counts (`--workers`) apply to the process-per-module
     topology: each module's worker count comes from the JSON map (with a
-    ``default`` fallback). Passing ``--workers`` replaces the pyproject
-    ``\[tool.modulith.workers]`` table entirely — a full override, not a
+    `default` fallback). Passing `--workers` replaces the pyproject
+    \[tool.modulith.workers] table entirely — a full override, not a
     per-module patch. The single-process path execs a plain uvicorn.
 
-    ``--log-level`` sets this process's root log level and is passed on to
+    `--log-level` sets this process's root log level and is passed on to
     uvicorn (and, under the process topology, to every worker subprocess), so
     the whole deployment's verbosity comes from one flag.
 
@@ -984,9 +984,9 @@ def verify(
 
     Exit code 0 when no ERROR-severity violations are reported (strict) or
     none are new relative to the baseline (ratchet) — WARNING-severity
-    violations are printed but pass unless ``--fail-on-warnings`` is set.
+    violations are printed but pass unless `--fail-on-warnings` is set.
     Exit code 1 on violations or invalid usage; 2 on unexpected internal
-    errors. Designed to drop into CI as a single line. ``--update-baseline``
+    errors. Designed to drop into CI as a single line. `--update-baseline`
     records the current violation set as the accepted baseline and exits 0.
     """
     # Argument validation precedes bootstrap: a typo'd mode used to fall
@@ -1103,7 +1103,7 @@ def extract(
 
     Copies the module, its contracts and the package-level helpers they
     import into --output and generates the files needed to run it as its own
-    process via ``modulith._worker:create_app``. Before publishing, imports
+    process via `modulith._worker:create_app`. Before publishing, imports
     the extracted module in a subprocess, so the service's third-party
     dependencies must be installed. Exit codes: 0 on success, 1 on an
     unknown module, boundary violations / shared tables / imports of other
@@ -1192,7 +1192,7 @@ def audit(
 ) -> None:
     """Analyze an existing codebase for modulith readiness.
 
-    Non-destructive — only reads files (parsed via ``ast``, never imported).
+    Non-destructive — only reads files (parsed via `ast`, never imported).
     Produces a Markdown report with the proposed module structure, the
     cross-module imports that would become violations, shared tables that
     need ownership decisions, and a 0-100 readiness score.
@@ -1258,10 +1258,10 @@ def k8s_manifest(
     """Generate Kubernetes Deployment/Service/Ingress manifests.
 
     One Deployment + Service per module discovered in the process-per-module
-    topology, plus a single Ingress fanning out ``/<module>`` paths to each
+    topology, plus a single Ingress fanning out `/<module>` paths to each
     module's Service. The broker connection URL is never embedded in the
-    manifest — see the generated header comment for the ``kubectl create
-    secret`` commands to run once per cluster/namespace.
+    manifest — see the generated header comment for the `kubectl create
+    secret` commands to run once per cluster/namespace.
     """
     from . import k8s
 
@@ -1361,7 +1361,7 @@ def openapi(
 ) -> None:
     """Aggregate every module's OpenAPI document into one build-time spec.
 
-    Each worker process (see ``modulith._worker.create_app``) only ever
+    Each worker process (see `modulith._worker.create_app`) only ever
     serves its own module's document — there is no single running process
     with the whole application's surface. This command builds that surface
     offline: importing each module, generating its document in isolation,
@@ -1550,9 +1550,9 @@ def broker_drop_group(
     Applies to the shm and database brokers, which fan every publication out
     to each subscribed group and never prune undelivered rows. The group's
     queued messages are deleted, not delivered; prune then reclaims them.
-    With ``--target``, only those targets are removed, which is how a stale
+    With `--target`, only those targets are removed, which is how a stale
     target reported at worker start is cleaned up; a current module's group
-    then needs no ``--force``.
+    then needs no `--force`.
     """
     _runtime.configure(topology="processes")
     _exit_unless_shm_store_exists()
@@ -1660,10 +1660,10 @@ def broker_dead_letter(
 ) -> None:
     """List dead-lettered broker deliveries for inspection, or resubmit them all.
 
-    Listing is the default; ``--list`` makes it explicit and is refused with
-    ``--retry-all``. A resubmitted delivery reaches only the consumer group
+    Listing is the default; `--list` makes it explicit and is refused with
+    `--retry-all`. A resubmitted delivery reaches only the consumer group
     whose delivery died. Supported by the database, shm and redis-streams
-    brokers. On redis-streams, ``--retry-all`` resubmits a target only when
+    brokers. On redis-streams, `--retry-all` resubmits a target only when
     its stream has one consumer group, and exits 1 naming any target it left.
     """
     # The flag conflict is an argument error: report it before any environment check.
@@ -1829,9 +1829,9 @@ def outbox_dead_letter(
 ) -> None:
     """List dead-lettered events for manual inspection, or resubmit them all.
 
-    Listing is the default; ``--list`` makes it explicit. ``--list`` and
-    ``--retry-all`` are mutually exclusive — passing both is an error rather
-    than silently doing one (the previously-inert ``--list`` masked this).
+    Listing is the default; `--list` makes it explicit. `--list` and
+    `--retry-all` are mutually exclusive — passing both is an error rather
+    than silently doing one (the previously-inert `--list` masked this).
     """
     # Argument validation precedes environment preconditions: the flag
     # conflict must be reported even when no store is configured.
@@ -1864,7 +1864,7 @@ def outbox_failing() -> None:
     """List publications that are failing but not yet dead-lettered.
 
     One line per row with its attempts, last error and when the retry loop
-    next considers it due. Needs a store with ``find_failing`` (the built-in
+    next considers it due. Needs a store with `find_failing` (the built-in
     SQL store has it); exits 1 for one without.
     """
     _bootstrap_or_exit()
@@ -1985,17 +1985,17 @@ def migrate(
     url: str | None = typer.Option(
         None,
         "--url",
-        help=r"SQLAlchemy URL to migrate (default: \[tool.modulith] outbox_url)",
+        help=r"SQLAlchemy URL to migrate (default: \\[tool.modulith] outbox_url)",
     ),
     schema: str | None = typer.Option(None, "--schema", help="Target schema (PostgreSQL only)"),
 ) -> None:
-    """Apply the packaged outbox and broker migrations.
+    r"""Apply the packaged outbox and broker migrations.
 
     Reads configuration only and never bootstraps the application, so it runs
-    before any table exists and under ``strict_boundaries``. Without ``--url``
-    it migrates ``[tool.modulith] outbox_url`` (env ``MODULITH_OUTBOX_URL``),
+    before any table exists and under `strict_boundaries`. Without `--url`
+    it migrates `\[tool.modulith] outbox_url` (env `MODULITH_OUTBOX_URL`),
     swapping its async driver for the sync one the migrations use. The chain
-    creates the outbox tables and the ``broker_*`` tables of the database broker.
+    creates the outbox tables and the `broker_` tables of the database broker.
     """
     try:
         from alembic import command

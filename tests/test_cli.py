@@ -25,6 +25,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import click
@@ -3528,3 +3529,74 @@ def test_migrate_schema_option_is_ignored_on_sqlite_as_the_migrations_do(
     assert result.exit_code == 0, result.output
     assert "only supported on PostgreSQL" in caplog.text
     assert _sqlite_revision(db_file) == _packaged_head()
+
+
+def _collect_all_commands(
+    cmd_obj: Any, prefix: list[str] | None = None
+) -> list[tuple[list[str], Any]]:
+    """Recursively collect all commands from the typer app and subcommands."""
+    if prefix is None:
+        prefix = []
+    commands = []
+
+    # Get all commands from the current object
+    if hasattr(cmd_obj, "registered_commands"):
+        for cmd in cmd_obj.registered_commands:
+            commands.append(([*prefix, cmd.name], cmd))
+
+    # Get subcommand groups
+    if hasattr(cmd_obj, "registered_groups"):
+        for group in cmd_obj.registered_groups:
+            # Recursively collect from the group
+            sub_commands = _collect_all_commands(group, [*prefix, group.name])
+            commands.extend(sub_commands)
+
+    return commands
+
+
+@pytest.mark.parametrize(
+    "command_path",
+    [
+        ["run"],
+        ["dev"],
+        ["verify"],
+        ["docs"],
+        ["extract"],
+        ["audit"],
+        ["k8s-manifest"],
+        ["doctor"],
+        ["openapi"],
+        ["migrate"],
+        ["info"],
+        ["outbox", "status"],
+        ["outbox", "retry"],
+        ["outbox", "purge"],
+        ["outbox", "dead-letter"],
+        ["outbox", "failing"],
+        ["broker", "drop-group"],
+        ["broker", "dead-letter"],
+    ],
+)
+def test_cli_help_output_has_no_raw_double_backticks(command_path: list[str]) -> None:
+    """Verify that --help output contains no raw double backticks.
+
+    Rich markup interprets double backticks as special formatting; raw backticks
+    break the help text display. All backticks must be escaped or removed.
+    """
+    result = runner.invoke(app, [*command_path, "--help"])
+    assert result.exit_code == 0, (
+        f"Failed to get help for {' '.join(command_path)}: {result.output}"
+    )
+    assert "``" not in result.output, (
+        f"Raw double backticks found in {' '.join(command_path)} help output. "
+        f"Backticks must be escaped or removed for rich markup compatibility."
+    )
+
+
+def test_migrate_help_contains_literal_tool_modulith() -> None:
+    """Verify that migrate --help contains the literal text [tool.modulith]."""
+    result = runner.invoke(app, ["migrate", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "[tool.modulith]" in result.output, (
+        "migrate --help must contain literal '[tool.modulith]' in the help text"
+    )
