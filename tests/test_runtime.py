@@ -941,6 +941,29 @@ def test_strict_boundaries_blocks_bootstrap_on_a_plugin_rule_violation(make_fake
         _runtime.ensure_bootstrapped()
 
 
+def test_memory_outbox_logs_migration_guidance(
+    make_fake_app, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When outbox is 'memory', bootstrap logs guidance naming outbox = 'postgres',
+    outbox_url, modulith migrate, and the README section for session/lifespan wiring."""
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", outbox="memory", production=False)
+
+    with caplog.at_level(logging.INFO, logger="modulith"):
+        _runtime.ensure_bootstrapped()
+
+    records = [r for r in caplog.records if "outbox disabled" in r.getMessage()]
+    assert records, "Expected a log record mentioning 'outbox disabled'"
+
+    message = records[0].getMessage()
+    assert "outbox = 'postgres'" in message, "Message must name outbox = 'postgres'"
+    assert "outbox_url" in message, "Message must mention outbox_url"
+    assert "modulith migrate" in message, "Message must mention 'modulith migrate' command"
+    assert "Never lose an event" in message, (
+        "Message must reference README's 'Never lose an event' section"
+    )
+
+
 def test_disabled_rules_lets_strict_boundaries_boot_past_a_plugin_rule(make_fake_app) -> None:
     make_fake_app({"orders": ""})
     configure(package="fakeapp", strict_boundaries=True, verify_disabled_rules=("team-rule",))

@@ -64,6 +64,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `modulith outbox status`, `retry`, `purge`, `dead-letter` and `failing` close the database engine built from `outbox_url` before they exit, instead of leaving its connections to be dropped unclosed when the process ends
 - `modulith outbox dead-letter --retry-all` delivers each resubmitted publication under the claim or advisory lock a retry sweep takes, so a process sweeping at the same time can no longer deliver it as well. The command also waits until the events its listeners publish are delivered before it exits. Before, those events stayed claimed until the lease expired and another process's sweep delivered them
 - CLI help no longer shows raw double backticks, and `modulith migrate --help` prints `[tool.modulith]` instead of dropping it as markup
+- The startup log line under the memory outbox no longer suggests that `outbox = 'postgres'` alone turns on durable delivery. It also names `outbox_url`, `modulith migrate`, and the README section "Never lose an event" for the session and lifespan wiring
 
 ### Upgrade notes
 

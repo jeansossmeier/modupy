@@ -98,7 +98,7 @@ INFO:     Waiting for application startup.
 INFO:modulith:detected application package 'shop'
 INFO:modulith:discovered 4 module(s): contracts, inventory, notifications, orders
 INFO:modulith:outbox=memory, broker=memory, topology=single
-INFO:modulith:outbox disabled — set [tool.modulith].outbox = 'postgres' for durable event delivery
+INFO:modulith:outbox disabled — for durable delivery, set [tool.modulith].outbox = 'postgres' and outbox_url (or MODULITH_OUTBOX_URL), run `modulith migrate`, and wire the session and lifespan as modupy's README section "Never lose an event" shows
 INFO:modulith:ready
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)

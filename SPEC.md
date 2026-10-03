@@ -519,11 +519,11 @@ Logged at INFO via the `modulith` logger:
 modulith: detected application package 'myapp'
 modulith: discovered 3 module(s): orders, inventory, reports
 modulith: outbox=memory, broker=memory, topology=single
-modulith: outbox disabled — set [tool.modulith].outbox = 'postgres' for durable event delivery
+modulith: outbox disabled — for durable delivery, set [tool.modulith].outbox = 'postgres' and outbox_url (or MODULITH_OUTBOX_URL), run `modulith migrate`, and wire the session and lifespan as modupy's README section "Never lose an event" shows
 modulith: ready
 ```
 
-(The contracts subpackage, when present, is discovered and listed as a module too. The outbox line names only the first step; the rest are in [§7.2](#72-sqlalchemy-integration).)
+(The contracts subpackage, when present, is discovered and listed as a module too. [§7.2](#72-sqlalchemy-integration) details each step the outbox line names.)
 
 Five log lines that tell the user exactly what's active and how to change it. If they don't want any of it, the message tells them where to turn it off.
 

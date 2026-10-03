@@ -1218,8 +1218,10 @@ class Runtime:
             )
         if cfg.outbox == "memory" and not cfg.production:
             logger.info(
-                "outbox disabled — set [tool.modulith].outbox = 'postgres' "
-                "for durable event delivery"
+                "outbox disabled — for durable delivery, set [tool.modulith].outbox = "
+                "'postgres' and outbox_url (or MODULITH_OUTBOX_URL), run `modulith migrate`, "
+                "and wire the session and lifespan as modupy's README section "
+                '"Never lose an event" shows'
             )
         logger.info("ready")
 
