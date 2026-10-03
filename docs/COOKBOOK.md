@@ -1,10 +1,10 @@
 # modupy Cookbook
 
-Task-oriented recipes for common jobs. Each one uses only the documented public
-API (see [API_REFERENCE.md](API_REFERENCE.md)) plus the documented wiring
-surface (see [STABILITY.md](STABILITY.md)); for the design behind them see
-[ARCHITECTURE.md](ARCHITECTURE.md) and [SPEC.md](../SPEC.md). The runnable
-end-to-end version of recipes 1–3, 5, 6 and 8 lives in
+Task-oriented recipes for common jobs, each using only API documented in
+[API_REFERENCE.md](API_REFERENCE.md) and [STABILITY.md](STABILITY.md). Start
+with recipes 1–3 and 9.
+
+The runnable end-to-end version of recipes 1–3, 5, 6 and 8 lives in
 [`examples/demo_app`](../examples/demo_app). Recipe 4 (`publish_sync`) is not
 in it: the demo publishes from async code only.
 
@@ -55,8 +55,8 @@ class OrderPlaced:
     total: float
 
 @listener
-async def reserve_stock(event: OrderPlaced) -> None:
-    await stock_service.reserve(event.order_id)
+async def reserve_stock(evt: OrderPlaced) -> None:
+    await stock_service.reserve(evt.order_id)
 ```
 
 The event type is inferred from the annotation, so `@listener` needs no
@@ -166,8 +166,9 @@ async def place_order(customer_id: str, total: float) -> str:
 `place_order` knows nothing about who reacts to `OrderPlaced`. In single-process
 mode `publish()` dispatches in-memory; with the outbox enabled and a transaction
 bound (recipe 6) the same call persists the event durably and dispatches after
-commit. **Your code does not change between those modes** — only configuration
-does.
+commit. **Your events, listeners and `publish()` calls do not change between
+those modes.** Configuration does, and the outbox adds a few lines of session
+wiring around the transaction (recipe 6).
 
 Under the memory outbox (`outbox = "memory"`, the default) `publish()` runs the
 listeners inline. It returns only after they have finished, while your own
@@ -203,8 +204,8 @@ def place_order_sync(customer_id: str, total: float) -> str:
     return order_id
 
 @listener
-def send_receipt(event: OrderPlaced) -> None:   # sync listener, runs in a thread
-    mailer.send(event.customer_id, event.order_id)
+def send_receipt(evt: OrderPlaced) -> None:   # sync listener, runs in a thread
+    mailer.send(evt.customer_id, evt.order_id)
 ```
 
 `publish_sync()` hands the dispatch to a loop on its own thread and waits for it:
@@ -290,10 +291,11 @@ declare_module(
 
 At bootstrap (when `verify_manifests` is on, the default) modupy verifies two
 cheap things: every declared `listeners` entry actually registered against the
-bus, and every `publishes` name is defined in the package namespace. A mismatch
-aborts boot with a `file:line` instead of silently dropping events. Declaring
-`listeners` is the highest-value check — it catches a module that failed to
-import:
+bus, and every `publishes` name is defined in the package namespace, so a
+module's `__init__.py` must import each event it publishes. A mismatch aborts
+boot, naming the file (and the line, for a listener), instead of silently
+dropping events. Declaring `listeners` is the highest-value check — it catches a
+module that failed to import:
 
 ```python
 # myapp/inventory/_manifest.py
@@ -307,6 +309,15 @@ declare_module(
     owns_tables=["inventory_stock_levels"],
     declared_dependencies=["contracts"],
 )
+```
+
+`StockReserved` lives in `contracts`, so `inventory/__init__.py` re-exports it
+for the `publishes` check to find:
+
+```python
+# myapp/inventory/__init__.py
+from . import handlers
+from myapp.contracts.events import StockReserved as StockReserved
 ```
 
 `consumes`, `owns_tables`, and `declared_dependencies` are consumed by the docs
@@ -408,9 +419,9 @@ dependency's teardown: FastAPI runs that teardown after the response is sent,
 so a commit that fails there still answers 200.
 
 Now a `publish()` inside a bound transaction is persisted atomically with your
-data: a rollback discards the event (no ghosts), a commit guarantees delivery
-(no losses), and listeners are retried at-least-once after commit. Because
-delivery is at-least-once, **listeners must be idempotent**.
+data: a rollback discards the event (no ghosts), and a commit stores it, to be
+retried until it is delivered or set aside as a dead letter. Because delivery is
+at-least-once, **listeners must be idempotent**.
 
 A publish joins whatever transaction the bound session has open, and only a
 later `commit()` delivers it. A transaction that ends uncommitted (a rollback,
@@ -741,7 +752,7 @@ from modulith import event, externalized
 class OrderPlaced:
     order_id: str
 
-@externalized(target="shm:orders.placed")             # explicitly pins local SHM
+@externalized(target="shm:stock.reserved")            # explicitly pins local SHM
 @event
 @dataclass(frozen=True)
 class StockReserved:
@@ -867,52 +878,12 @@ Payloads over `max_payload_bytes` are rejected before a transaction starts.
 (`broker.db`), not the size of the file itself. A full store rejects new
 publishes until retained publications expire, consumers drain their backlog,
 `modulith broker drop-group` removes a retired group, or every process restarts
-with a raised limit. Publishes are refused a small reserve early, once
-`page_count - freelist_count` would pass the configured page count minus 32
-pages (one eighth of the pages below 256 pages). Consumers can always claim,
-ack, fail, dead-letter and prune the backlog they see, and a group can always
-subscribe: a consumer write or subscription record the limit refuses is
-retried past it, so the database file can grow past `max_store_bytes` by the
-growth of rows it already holds (claims, error text, mark-mode completions,
-prune tombstones) while publishes stay refused. A subscribe replay itself never
-grows the store past its publish budget: it replays the retained publications
-the group lacks, oldest first, and stops 8 pages below the budget, so a small
-publish that fit before the replay still fits right after it. Under
-`completion_mode="mark"` it uses at most half the room left, which covers
-claiming and acking its own rows when one group drains them and its listeners
-succeed. Draining can still take the store past the budget, as any consumer
-write can: failed and dead-lettered rows keep their error text, and under
-`completion_mode="mark"` claiming and acking grows every row, including rows
-other groups replayed. Publishes are then refused until prune frees pages or
-`max_store_bytes` is raised. A replay cut short logs one WARNING with the group, the target and the replayed and skipped
-counts. The skipped publications reach that group only through another replay.
-To replay them without losing work, first let the group's workers drain its
-backlog on that target: `modulith broker drop-group <group> --target <target>`
-deletes every pending and claimed delivery the group holds there, replayed ones
-included, and a replay restores only publications still retained. Then stop
-the group's workers, run that drop-group, raise `max_store_bytes` and restart
-every process before the skipped publications expire. This
-also drains a store that filled before this release or whose `max_store_bytes`
-was lowered below its size; an existing larger file keeps its size. The
-`broker.db-wal` file is not counted: it grows to about 4 MiB (SQLite's
-1000-page autocheckpoint) before checkpoints reuse it, further while a long
-read blocks a checkpoint, and it keeps its largest size, so budget disk for
-it on top of `max_store_bytes`. The empty schema takes 13 pages, so a store
-under 56 KiB refuses every publish, and a 64 KiB store holds about 50 small
-publications. A publication stays while any group has not
-consumed it, for `orphan_retention_seconds` after it is written, and, under
-`completion_mode = "mark"` or once dead-lettered, until `retention_age_seconds`
-(default 3 days) after completion. The store sustains about
-`max_store_bytes / (bytes per publication × the longest of those retentions)`
-publications per second: roughly 165/s for 1 KiB payloads and two groups with
-the defaults in delete mode, and under 2.3/s in mark mode. Raise
-`max_store_bytes` or shorten `orphan_retention_seconds` (at most 100 years)
-before the store fills; publications already stored keep the retention they
-were written with, and late subscribers replay only within the shorter window.
-Override these
-with `MODULITH_BROKER_MAX_PAYLOAD_BYTES`, `MODULITH_BROKER_MAX_STORE_BYTES`, and
+with a raised limit. Override `max_payload_bytes`, `max_store_bytes` and
+`orphan_retention_seconds` with `MODULITH_BROKER_MAX_PAYLOAD_BYTES`,
+`MODULITH_BROKER_MAX_STORE_BYTES` and
 `MODULITH_BROKER_ORPHAN_RETENTION_SECONDS`.
-`shm_slot_size` is deprecated and ignored because hint slots are fixed-size.
+DEPLOYMENT.md's [Sizing the Default SHM Store](DEPLOYMENT.md#sizing-the-default-shm-store)
+covers the page budget, the replay runbook and how fast a store fills.
 
 Explicit `broker = "shm"` rejects DSNs and SQLAlchemy/network URLs. If the
 broker name is omitted but `broker_options.url`/`dsn` (or the equivalent
@@ -973,7 +944,7 @@ re-added message reaches every group on the stream.
 
 With `broker = "database"`, a bare `@externalized` event's default target is
 `database:{event-fqn}`; pin one explicitly with
-`@externalized(target="database:orders.placed")` exactly as with Redis. Every
+`@externalized(target="database:orders.placed")`. Every
 `broker_options` key is env-overridable via `MODULITH_BROKER_<KEY>` (e.g.
 `MODULITH_BROKER_URL`, `MODULITH_BROKER_POLL_INTERVAL_MS`), and the env var
 wins over the pyproject value. That is also how a worker process gets its
@@ -992,6 +963,10 @@ group yet, `no_subscriber_policy` decides what happens:
 | `error` (default) | Raise `NoSubscribersError` immediately; no row is written |
 | `wait` | Poll for subscribers until `no_subscriber_wait_timeout_seconds` |
 | `store` | Persist a retained source message and replay per `orphan_replay_policy` |
+
+`NoSubscribersError` lives in `modulith.adapters.db_broker`, an adapter module
+that [STABILITY.md](STABILITY.md#experimental-surface-broker-adapter-internals)
+lists as experimental, so the import path may move.
 
 `orphan_replay_policy` (store mode only): `ttl_all_groups` (default — every
 group that registers before expiry gets a copy), `first_groups` (fan out to
@@ -1036,8 +1011,8 @@ targets are declared: `declare_module(broker_targets=...)`,
 The broker creates its `broker_message` / `broker_subscription` tables
 automatically on first use; to manage the schema explicitly instead, they ship
 in the packaged alembic migration — see
-[MIGRATION_GUIDE.md](../MIGRATION_GUIDE.md), Step 5. Delivery is at-least-once
-with the same crash-recovery and dead-lettering as the Redis broker; see
+[MIGRATION_GUIDE.md](../MIGRATION_GUIDE.md), Step 5. Delivery is at-least-once,
+with the crash recovery and dead-lettering described above; see
 [ARCHITECTURE.md](ARCHITECTURE.md) §8.4 for the design.
 
 ---
@@ -1050,17 +1025,29 @@ without `sleep`s or real infrastructure.
 The `modulith` pytest plugin ships fixtures that reset the runtime per test
 and capture what was published. It registers through the `pytest11` entry
 point and loads in any pytest run where `modupy` is installed — the
-`modupy[test]` extra only adds the libraries the fixtures need, it does not
-gate registration. Disable it in an unrelated suite with `pytest -p
+`modupy[test]` extra adds pytest, pytest-asyncio and the other libraries
+modupy's own test suite uses, and does not gate registration. Disable it in an unrelated suite with `pytest -p
 no:modulith`.
+
+`pip install 'modupy[test]'` brings `pytest` and `pytest-asyncio`. Two settings
+finish the setup: `pythonpath = ["."]` lets your tests import your package, and
+`asyncio_mode = "auto"` lets pytest-asyncio run the `async def` test below
+without a marker:
+
+```toml
+# pyproject.toml
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+```
 
 Capture and assert directly with the `modulith_app` fixture:
 
 ```python
-from myapp.contracts.events import OrderPlaced, StockReserved
-from myapp.orders import place_order
-
 async def test_order_reserves_stock(modulith_app):
+    from myapp.contracts.events import StockReserved
+    from myapp.orders import place_order
+
     await place_order(customer_id="c-1", total=19.99)
 
     reserved = modulith_app.published_events_of_type(StockReserved)
@@ -1070,9 +1057,9 @@ async def test_order_reserves_stock(modulith_app):
 Or use the fluent `scenario` fixture for trigger-then-expect flows:
 
 ```python
-from myapp.contracts.events import OrderPlaced, StockReserved
-
 def test_order_flow(scenario):
+    from myapp.contracts.events import OrderPlaced, StockReserved
+
     (
         scenario
         .publish(OrderPlaced(order_id="o-1", customer_id="c-1", total=9.99))
@@ -1081,6 +1068,12 @@ def test_order_flow(scenario):
         .within(seconds=2)
     )
 ```
+
+The imports sit inside the tests because each test gets a fresh copy of your
+modules. A module-scope import of a module with `@listener` functions registers
+them before the fixture resets the runtime, so the test runs without them; if
+its manifest declares them, boot fails with "not registered against the event
+bus — module may have failed to import", although the import succeeded.
 
 `.within()` is the terminal step: it fires the trigger, then polls the captured
 events for a match, raising `AssertionError` on a miss (never a bare
@@ -1127,10 +1120,13 @@ convention). `--fail-on-warnings` makes the gate cover every new violation, not
 just the ERROR-severity ones:
 
 ```yaml
-# .github/workflows/ci.yml
+# .github/workflows/ci.yml, in the job that installs your app's dependencies
 - run: pip install 'modupy[cli]'
 - run: modulith verify --mode=ratchet --fail-on-warnings
 ```
+
+`verify` imports every module package, so a job that lacks your app's own
+dependencies exits 1 with a module import failure.
 
 `modulith doctor` complements this with operational + architectural health
 checks (outbox health, boundary health, split-readiness) for a running app.
@@ -1144,16 +1140,19 @@ imports or event interactions; `actuator_mode="token"` without
 
 **Goal:** add your own verification rule, broker, or documentation output.
 
-modupy's own behavior is built from plugins, and yours load exactly the same
-way — via the `modulith` entry-point group. No application code changes; install
+modupy's own behavior is built from plugins, and yours implement the same
+hooks. The built-in plugins ship in the package; a third-party plugin loads
+through the `modulith` entry-point group. No application code changes; install
 the package and the plugin's hooks run.
 
 **A custom verification rule** (aggregate hook — your rule's violations combine
-with the built-in ones):
+with the built-in ones). The skeleton below leaves the body out; the complete
+rule is
+[`examples/naming_convention_verifier.py`](../examples/naming_convention_verifier.py):
 
 ```python
 # modulith_naming_rules/plugin.py
-from modulith import ModuleInfo, Violation, ViolationSeverity, hookimpl
+from modulith import ModuleInfo, Violation, hookimpl
 
 @hookimpl
 def modulith_verify_module(
@@ -1190,10 +1189,14 @@ def modulith_register_brokers(registry) -> None:
     registry.register("my-scheme", MyBroker())
 ```
 
-Events targeting `my-scheme:destination` (via `@externalized`) now route to your
-broker. Full worked examples ship in
-[`examples/naming_convention_verifier.py`](../examples/naming_convention_verifier.py)
-and [`examples/redis_streams_broker.py`](../examples/redis_streams_broker.py).
+With `topology = "processes"`, events targeting `my-scheme:destination` (via
+`@externalized`) now route to your broker. In the default single-process
+topology `@externalized` is an inert marker and nothing is sent. Registering a
+`Broker` covers only the sending side: for the workers to receive these events,
+set `broker = "my-scheme"` and register a consumer factory for the same scheme
+through `modulith_register_consumers`; it turns a `ConsumerSpec` into a
+`Consumer`. A worked example of the sending side ships in
+[`examples/redis_streams_broker.py`](../examples/redis_streams_broker.py).
 The complete extension contract — all 13 hookspecs and 5 protocols — is in
 [ARCHITECTURE.md §5](ARCHITECTURE.md#5-the-plugin-contract) and
 [SPEC.md Part IV](../SPEC.md).
