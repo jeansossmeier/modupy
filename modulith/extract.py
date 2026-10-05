@@ -430,10 +430,15 @@ def _toml_scalar(value: Any) -> str:
 _REQUIREMENT_HEAD = re.compile(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[([^\]]*)\])?")
 
 
+def _is_modupy_requirement(dep: str) -> bool:
+    match = _REQUIREMENT_HEAD.match(dep)
+    return match is not None and _canonical_name(match.group(1)) == "modupy"
+
+
 def _extract_modupy_extras(source_deps: list[str]) -> set[str]:
     for dep in source_deps:
         match = _REQUIREMENT_HEAD.match(dep)
-        if match and re.sub(r"[-_.]+", "-", match.group(1)).lower() == "modupy":
+        if match and _is_modupy_requirement(dep):
             return {extra.strip() for extra in (match.group(2) or "").split(",") if extra.strip()}
     return set()
 
@@ -455,7 +460,7 @@ def _dependencies(cfg: Configuration, source_deps: list[str]) -> list[str]:
     from . import __version__
 
     dependencies = [f"modupy[{','.join(merged_extras)}]=={__version__}"]
-    dependencies.extend(dep for dep in source_deps if not dep.startswith("modupy"))
+    dependencies.extend(dep for dep in source_deps if not _is_modupy_requirement(dep))
     broker_url = _configured_broker_url(cfg.broker_options)
     if (
         cfg.broker == "database"
@@ -514,6 +519,10 @@ def _render_pyproject(*, cfg: Configuration, module: str, source_deps: list[str]
     if module_subscriptions:
         lines += ["", "[tool.modulith.subscriptions]"]
         lines.append(f"{json.dumps(module)} = {_toml_scalar(module_subscriptions)}")
+
+    if cfg.is_explicit("verify_disabled_rules") and cfg.verify_disabled_rules:
+        lines += ["", "[tool.modulith.verify]"]
+        lines.append(f"disabled_rules = {_toml_scalar(list(cfg.verify_disabled_rules))}")
 
     return "\n".join(lines) + "\n"
 
@@ -579,6 +588,14 @@ _UNDECLARED_NOTE = (
 )
 
 
+_DEPENDENCIES_OUTSIDE_PROJECT_NOTE = (
+    "The source `pyproject.toml` declares dependencies outside `[project].dependencies` "
+    "(`dynamic` lists `dependencies`, or `[tool.poetry]` is present). The generated "
+    "`pyproject.toml` takes its dependencies from `[project].dependencies` only, so add "
+    "the ones the service needs to `dependencies` by hand."
+)
+
+
 def _render_readme(
     *,
     cfg: Configuration,
@@ -588,6 +605,7 @@ def _render_readme(
     notes: list[str],
     dynamic_imports: Sequence[str] = (),
     undeclared: Sequence[str] = (),
+    dependencies_outside_project: bool = False,
 ) -> str:
     lines = [
         f"# {module}-service",
@@ -677,8 +695,10 @@ def _render_readme(
         ]
         lines += [f"- `{helper}`" for helper in helpers]
 
-    if notes or dynamic_imports or undeclared:
+    if notes or dynamic_imports or undeclared or dependencies_outside_project:
         lines += ["", "## Extraction notes"]
+    if dependencies_outside_project:
+        lines += ["", _DEPENDENCIES_OUTSIDE_PROJECT_NOTE]
     if notes:
         lines += [
             "",
@@ -751,13 +771,17 @@ def _validate_package_initializers(package_dir: Path, package: str) -> None:
     _validate_initializers(_required_package_initializers(package_dir, package))
 
 
-def _source_dependencies() -> list[str]:
+def _source_dependencies() -> tuple[list[str], bool]:
+    """The source's ``[project].dependencies`` and whether it declares others elsewhere."""
     pyproject_path = _find_pyproject()
     if pyproject_path is None:
-        return []
+        return [], False
     with pyproject_path.open("rb") as file:
         data = tomllib.load(file)
-    return [dep for dep in data.get("project", {}).get("dependencies", []) if isinstance(dep, str)]
+    project = data.get("project", {})
+    dependencies = [dep for dep in project.get("dependencies", []) if isinstance(dep, str)]
+    outside = "dependencies" in project.get("dynamic", []) or "poetry" in data.get("tool", {})
+    return dependencies, outside
 
 
 def _write_generated_files(
@@ -770,6 +794,7 @@ def _write_generated_files(
     dynamic_imports: list[str],
     source_deps: list[str],
     undeclared: list[str],
+    dependencies_outside_project: bool,
 ) -> list[str]:
     assert cfg.package is not None
     generated = {
@@ -784,6 +809,7 @@ def _write_generated_files(
             notes=notes,
             dynamic_imports=dynamic_imports,
             undeclared=undeclared,
+            dependencies_outside_project=dependencies_outside_project,
         ),
     }
     for name, content in generated.items():
@@ -839,7 +865,7 @@ def write_extraction(
             output=staging,
             helpers=helpers,
         )
-        source_deps = _source_dependencies()
+        source_deps, dependencies_outside_project = _source_dependencies()
         loaded = _check_imports(
             staging,
             f"{cfg.package}.{module}",
@@ -867,6 +893,7 @@ def write_extraction(
             ),
             source_deps=source_deps,
             undeclared=undeclared,
+            dependencies_outside_project=dependencies_outside_project,
         )
         if output.is_symlink():
             raise FileExistsError(f"--output {output} appeared during extraction")

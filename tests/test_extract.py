@@ -379,6 +379,100 @@ def test_render_pyproject_no_source_modupy_dependency():
     assert "click" in deps
 
 
+def test_render_pyproject_filters_modupy_by_requirement_name():
+    source_deps = [
+        "Modupy[otel]>=0.10",
+        "modupy-extras>=1",
+        "modupy_tools",
+        "MODUPY",
+        "requests",
+    ]
+
+    deps = tomllib.loads(
+        _render_pyproject(
+            cfg=Configuration(package="fakeapp"), module="orders", source_deps=source_deps
+        )
+    )["project"]["dependencies"]
+
+    assert [dep for dep in deps if dep.startswith("modupy[")] == [
+        f"modupy[cli,fastapi,otel]=={__version__}"
+    ]
+    assert deps[1:] == ["modupy-extras>=1", "modupy_tools", "requests"]
+
+
+def test_render_pyproject_keeps_verify_disabled_rules():
+    cfg = Configuration(
+        package="fakeapp",
+        verify_disabled_rules=("no-cyclic-dependency", "parse-error"),
+        explicit_keys=frozenset({"verify_disabled_rules"}),
+    )
+
+    parsed = tomllib.loads(_render_pyproject(cfg=cfg, module="orders", source_deps=[]))
+
+    assert parsed["tool"]["modulith"]["verify"] == {
+        "disabled_rules": ["no-cyclic-dependency", "parse-error"]
+    }
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        Configuration(package="fakeapp"),
+        Configuration(package="fakeapp", explicit_keys=frozenset({"verify_disabled_rules"})),
+    ],
+    ids=["unset", "explicit-empty"],
+)
+def test_render_pyproject_omits_verify_table_without_disabled_rules(cfg):
+    parsed = tomllib.loads(_render_pyproject(cfg=cfg, module="orders", source_deps=[]))
+
+    assert "verify" not in parsed["tool"]["modulith"]
+
+
+_DEPENDENCY_SOURCE_NOTE = "`[project].dependencies` only"
+
+
+@pytest.mark.parametrize(
+    "pyproject",
+    [
+        '[project]\nname = "app"\nversion = "0"\ndynamic = ["dependencies"]\n',
+        '[project]\nname = "app"\nversion = "0"\n\n[tool.poetry.dependencies]\nrequests = "^2"\n',
+    ],
+    ids=["dynamic-dependencies", "poetry"],
+)
+def test_extract_notes_when_source_dependencies_live_outside_project_dependencies(
+    make_fake_app, monkeypatch, tmp_path, pyproject
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text(pyproject)
+    make_fake_app({"orders": ""}, extra_files={"contracts/__init__.py": ""})
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    notes = _readme_section((out_dir / "README.md").read_text(), "Extraction notes")
+    assert sum(_DEPENDENCY_SOURCE_NOTE in line for line in notes.splitlines()) == 1, notes
+
+
+def test_extract_has_no_dependency_source_note_for_plain_project_dependencies(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "app"\nversion = "0"\ndynamic = ["version"]\n'
+        'dependencies = ["requests"]\n'
+    )
+    make_fake_app({"orders": ""}, extra_files={"contracts/__init__.py": ""})
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert _DEPENDENCY_SOURCE_NOTE not in (out_dir / "README.md").read_text()
+
+
 def test_extract_unknown_module_exits_one_and_lists_modules(make_fake_app, monkeypatch, tmp_path):
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app({"orders": "", "inventory": ""})

@@ -150,6 +150,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - A late consumer group's replay of a large retained SHM backlog no longer holds the SQLite write lock for the whole replay: it commits in batches of 5,000 publications with a short pause between them, so other processes sharing the store can publish during it, and the subscription is recorded only after the last batch
 - A busy `--port` stops `modulith run --topology processes` before any worker starts, with exit 1 and "port N is already in use; choose another --port", instead of exit 3 after the workers spawned; when a dead worker's descendant still holds its port, the crash-loop give-up message says so instead of blaming the module, and a port probe that cannot run is logged as a warning
 - An `@externalized` event published in a module's worker runs that module's own listeners once: the broker copy carries a `publisher_module` header naming the module (also on an outbox-routed send), and consumers skip that module's listeners, including on its other replicas; other modules' listeners still run from the broker copy, as do all listeners for a message without the header
+- `modulith extract` drops only the source's `modupy` requirement, matched by normalized name (so `Modupy[otel]>=0.10` is replaced and `modupy-extras` is kept), carries `[tool.modulith.verify] disabled_rules` into the generated `pyproject.toml`, and says in the README's extraction notes when the source keeps its dependencies outside `[project].dependencies`
 
 ### Security
 
