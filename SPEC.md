@@ -1033,8 +1033,10 @@ Extra: `modupy[otel]` (built-in plugin `modulith/builtin/observability.py`; a si
 `modulith/builtin/docs.py`. Generates:
 
 - `docs/modulith/architecture.mmd` — Mermaid flowchart of modules and their dependencies
-- `docs/modulith/modules/<name>.md` — Application Module Canvas (public API, events published, events consumed, dependencies, internals)
+- `docs/modulith/modules/<name>.md` — Application Module Canvas (public API, events published, events consumed, dependencies, owned tables, internal files)
 - `docs/modulith/events.mmd` — Sequence diagram of event flows
+
+A module with a `_manifest.py` gets the canvas's events, dependencies and owned tables from it. Without one, the canvas reads the source instead: the module's `@event` classes are listed under `## Events Published`, the event type annotated on the first parameter of each `@listener` under `## Events Consumed`, and dependencies and owned tables are left out. The configured contracts module (`[tool.modulith].contracts_module`) defines the shared event types and publishes none itself, so without a manifest its `@event` classes are listed under `## Events Defined` instead.
 
 The default output directory is `docs/modulith`; `modulith docs --output-dir=DIR` redirects it.
 

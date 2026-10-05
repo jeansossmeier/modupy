@@ -26,6 +26,7 @@ from pathlib import Path
 from modulith import ModuleInfo, hookimpl
 from modulith.builtin.verifier import (
     _collect_imports,
+    _configured_contracts_module,
     _owning_module,
     _package_dir,
     _parse_source,
@@ -81,11 +82,18 @@ _MERMAID_RESERVED = frozenset(
 def _mermaid_id(name: str) -> str:
     """A Mermaid-safe node/participant id for a module name.
 
-    Names colliding with Mermaid reserved words get an ``m_`` prefix; the
-    display label / participant alias still carries the real name, so the
-    rendered diagram reads identically while staying parseable.
+    A name that is a reserved word, or one wrapped in ``m_`` prefixes
+    (``end``, ``m_end``, ``m_m_end``), gets one more ``m_``. Prefixing every
+    name of that shape keeps the mapping injective: ``end`` becomes ``m_end``
+    and a module really called ``m_end`` becomes ``m_m_end``, so two modules
+    never share a node. The display label / participant alias still carries
+    the real name, so the rendered diagram reads identically while staying
+    parseable.
     """
-    return f"m_{name}" if name.lower() in _MERMAID_RESERVED else name
+    bare = name
+    while bare.startswith("m_"):
+        bare = bare.removeprefix("m_")
+    return f"m_{name}" if bare.lower() in _MERMAID_RESERVED else name
 
 
 def _validate_module_names(modules: list[ModuleInfo]) -> None:
@@ -287,8 +295,11 @@ def _render_module_canvas(module: ModuleInfo) -> str:
     not, the events sections fall back to AST introspection (``@event`` classes
     → Published, ``@listener`` param types → Consumed) so modules using the
     ``@event``/``@listener`` API without the optional manifest still document
-    their event topology. Dependencies and Owned Tables are manifest-only (they
-    have no reliable introspection signal).
+    their event topology. The configured contracts module only defines the
+    shared event types and publishes none, so without a manifest its
+    ``@event`` classes are listed under ``## Events Defined`` instead.
+    Dependencies and Owned Tables are manifest-only (they have no reliable
+    introspection signal).
     """
     lines = [
         f"# {module.name.title()} Module",
@@ -304,14 +315,17 @@ def _render_module_canvas(module: ModuleInfo) -> str:
         lines.append("")
 
     manifest = get_manifest(module.package)
+    published_heading = "## Events Published"
     if manifest is not None:
         published: list[str] = list(manifest.publishes)
         consumed: list[str] = list(manifest.consumes)
     else:
         published, consumed = _introspect_events(module)
+        if module.name == _configured_contracts_module():
+            published_heading = "## Events Defined"
 
     if published:
-        lines.append("## Events Published")
+        lines.append(published_heading)
         lines.extend(f"- `{name}`" for name in published)
         lines.append("")
     if consumed:
@@ -366,8 +380,10 @@ def _introspect_events(module: ModuleInfo) -> tuple[list[str], list[str]]:
     """Best-effort ``(published, consumed)`` event names via AST, no manifest.
 
     The documented introspection fallback: a module's ``@event``-decorated
-    classes are what it publishes; the event type annotated on the first
-    parameter of each ``@listener`` handler is what it consumes. Names only
+    classes are what it publishes (the canvas lists them as defined instead
+    for the contracts module, which holds event types and publishes none); the
+    event type annotated on the first parameter of each ``@listener`` handler
+    is what it consumes. Names only
     (the canvas lists names), de-duplicated and sorted. Modules following the
     ``@event``/``@listener`` API but shipping no ``_manifest.py`` still get
     their event topology documented.

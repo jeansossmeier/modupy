@@ -28,6 +28,18 @@ def _declare(package: str, **kw) -> None:
     manifest_module._manifests[package] = manifest_module.Manifest(package=package, **kw)
 
 
+def _defines_event(name: str) -> str:
+    return f"""
+        from dataclasses import dataclass
+        from modulith import event
+
+        @event
+        @dataclass(frozen=True)
+        class {name}:
+            order_id: str
+    """
+
+
 # ---------------------------------------------------------------------------
 # Architecture diagram
 # ---------------------------------------------------------------------------
@@ -160,6 +172,69 @@ def test_module_canvas_introspects_events_without_manifest(make_fake_app) -> Non
     assert "## Events Consumed" in canvas and "PaymentReceived" in canvas
     # Dependencies/Owned Tables remain manifest-only (no introspection signal).
     assert "## Owned Tables" not in canvas
+
+
+def test_contracts_canvas_without_manifest_lists_events_as_defined(make_fake_app) -> None:
+    # The contracts module only defines the shared event types; the modules
+    # that publish them live elsewhere, so introspection must not report every
+    # event class it holds as published by it.
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+    make_fake_app({"contracts": _defines_event("OrderPlaced")})
+    canvas = docs._render_module_canvas(_module("contracts"))
+
+    assert "## Events Defined\n- `OrderPlaced`\n" in canvas
+    assert "## Events Published" not in canvas
+
+
+def test_contracts_canvas_with_manifest_keeps_the_declared_events_published(make_fake_app) -> None:
+    # A manifest is the module's own declaration of what it publishes, so only
+    # the introspection fallback is relabelled.
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+    make_fake_app({"contracts": _defines_event("OrderPlaced")})
+    _declare("fakeapp.contracts", publishes=("OrderPlaced",))
+    try:
+        canvas = docs._render_module_canvas(_module("contracts"))
+    finally:
+        manifest_module._reset_for_testing()
+
+    assert "## Events Published\n- `OrderPlaced`\n" in canvas
+    assert "## Events Defined" not in canvas
+
+
+def test_docs_command_lists_the_configured_contracts_module_events_as_defined(
+    make_fake_app, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The name that decides is the configured one, read through the CLI's
+    bootstrap: with ``contracts_module = "shared"``, ``shared`` defines its
+    events and a module that is merely called ``contracts`` publishes its own."""
+    from typer.testing import CliRunner
+
+    from modulith.cli import app
+
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_CONTRACTS_MODULE", "shared")
+    make_fake_app(
+        {
+            "shared": _defines_event("OrderPlaced"),
+            "contracts": _defines_event("LegacyEvent"),
+            "orders": "",
+        }
+    )
+    out = tmp_path / "generated-docs"
+
+    result = CliRunner().invoke(app, ["docs", "--output-dir", str(out)])
+
+    assert result.exit_code == 0, result.output
+    shared = (out / "modules" / "shared.md").read_text(encoding="utf-8")
+    assert "## Events Defined\n- `OrderPlaced`\n" in shared
+    assert "## Events Published" not in shared
+    contracts = (out / "modules" / "contracts.md").read_text(encoding="utf-8")
+    assert "## Events Published\n- `LegacyEvent`\n" in contracts
+    assert "## Events Defined" not in contracts
 
 
 def test_event_edges_skip_manifests_outside_render_set(make_fake_app) -> None:
@@ -455,6 +530,72 @@ def test_event_flow_escapes_reserved_mermaid_participants(make_fake_app) -> None
     assert "  participant m_end as end" in lines  # sanitized id, aliased name
     assert "  orders->>m_end: OrderCreated" in lines  # edges use the same id
     assert "  participant orders" in lines  # non-reserved names untouched
+
+
+def test_mermaid_ids_of_end_and_m_end_do_not_collide(make_fake_app) -> None:
+    """Sanitizing the reserved ``end`` to ``m_end`` must not merge it into a
+    module that is really called ``m_end``: two modules stay two nodes."""
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+    make_fake_app({"end": "", "m_end": "", "orders": ""})
+    _declare("fakeapp.orders", publishes=("OrderCreated",))
+    _declare("fakeapp.end", consumes=("OrderCreated",))
+    _declare("fakeapp.m_end", consumes=("OrderCreated",))
+    try:
+        mmd = docs._render_architecture_diagram(
+            [_module("end"), _module("m_end"), _module("orders")]
+        )
+    finally:
+        manifest_module._reset_for_testing()
+
+    lines = mmd.splitlines()
+    assert "  m_end[End Module]" in lines
+    assert "  m_m_end[M_End Module]" in lines
+    assert "  orders -->|publishes OrderCreated| m_end" in lines
+    assert "  orders -->|publishes OrderCreated| m_m_end" in lines
+
+
+def test_event_flow_participants_of_end_and_m_end_do_not_collide(make_fake_app) -> None:
+    """The sequence diagram sanitizes ids with the same function, so ``end`` and
+    ``m_end`` stay two participants there too."""
+    from modulith import manifest as manifest_module
+
+    manifest_module._reset_for_testing()
+    make_fake_app({"end": "", "m_end": "", "orders": ""})
+    _declare("fakeapp.orders", publishes=("OrderCreated",))
+    _declare("fakeapp.end", consumes=("OrderCreated",))
+    _declare("fakeapp.m_end", consumes=("OrderCreated",))
+    try:
+        mmd = docs._render_event_flow_diagram([_module("end"), _module("m_end"), _module("orders")])
+    finally:
+        manifest_module._reset_for_testing()
+
+    lines = mmd.splitlines()
+    assert "  participant m_end as end" in lines
+    assert "  participant m_m_end as m_end" in lines
+    assert "  orders->>m_end: OrderCreated" in lines
+    assert "  orders->>m_m_end: OrderCreated" in lines
+
+
+def test_mermaid_id_never_gives_two_module_names_one_id() -> None:
+    """Names that are a reserved word wrapped in any number of ``m_`` prefixes
+    (in either case), plus names that merely look similar, all keep distinct
+    ids, and no id is itself a reserved word."""
+    wrapped = [
+        f"{'m_' * depth}{word}"
+        for word in (*sorted(docs._MERMAID_RESERVED), "End", "BREAK")
+        for depth in range(4)
+    ]
+    names = [*wrapped, "orders", "m_orders", "M_end", "m_", "m", "endpoint", "m_endpoint"]
+    names_by_id: dict[str, list[str]] = {}
+    for name in names:
+        names_by_id.setdefault(docs._mermaid_id(name), []).append(name)
+
+    assert {i: ns for i, ns in names_by_id.items() if len(ns) > 1} == {}
+    assert not {i.lower() for i in names_by_id} & docs._MERMAID_RESERVED
+    assert docs._mermaid_id("orders") == "orders"
+    assert docs._mermaid_id("m_orders") == "m_orders"
 
 
 def test_render_documentation_rejects_path_traversal_module_name(tmp_path: Path) -> None:

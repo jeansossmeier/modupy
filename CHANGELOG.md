@@ -89,6 +89,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `modulith openapi` prefixes `$ref`s under a schema or property named `example`, `examples` or `x-*`, so the merged document no longer has dangling references there. Only an actual `example`, `examples` or `x-*` keyword value is left as it is
 - A `@pytest.mark.modulith_isolated` test that monkeypatches `builtins.open` reports its real outcome instead of failing with a misleading "exited 0 before the test finished". A `--junitxml` or `--junit-xml` given to pytest no longer makes the isolated child write a second report under the rootdir
 - A bootstrap retried after a module's import failed registers that module's listeners once instead of twice, so each of them no longer runs twice per event. A `modulith_resolve_event_target` hook that returns a target with an empty scheme or destination raises `ConfigurationError` at publish, instead of a bare `ValueError` or a message about an unregistered scheme `''`
+- `modulith docs`: the canvas of the configured contracts module lists its events under `## Events Defined` instead of `## Events Published` when the module has no manifest, because it defines the shared event types and publishes none. Modules named `end` and `m_end` no longer share one Mermaid node in `architecture.mmd` and `events.mmd`; a name that is a Mermaid reserved word after any `m_` prefixes gets one more `m_`, so the node id of a module named `m_` plus a reserved word changes
 
 ### Security
 
