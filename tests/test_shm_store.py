@@ -17,7 +17,11 @@ import pytest
 from modulith import ConfigurationError
 from modulith.adapters import _shm_publications
 from modulith.adapters._shm_coldstore import ShmColdStore
-from modulith.adapters._shm_schema import immediate_transaction
+from modulith.adapters._shm_schema import (
+    _configure_max_page_count,
+    immediate_transaction,
+    open_database,
+)
 from modulith.adapters._shm_store import (
     _UNCAPPED_PAGES,
     ClaimToken,
@@ -848,6 +852,85 @@ def test_the_uncapped_page_count_fits_the_32_bit_pragma_parser(tmp_path: Path) -
         assert store.read_pragma("max_page_count") == _UNCAPPED_PAGES
     finally:
         store.close()
+
+
+def _fsync_pragmas(conn: sqlite3.Connection) -> tuple[int, int]:
+    return (
+        conn.execute("PRAGMA fullfsync").fetchone()[0],
+        conn.execute("PRAGMA checkpoint_fullfsync").fetchone()[0],
+    )
+
+
+def test_full_synchronous_also_turns_on_the_full_fsync_pragmas(tmp_path: Path) -> None:
+    conn = open_database(str(tmp_path / "full.db"), "FULL", 1024 * 1024)
+    try:
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2
+        assert _fsync_pragmas(conn) == (1, 1)
+    finally:
+        conn.close()
+
+
+def test_normal_synchronous_leaves_the_full_fsync_pragmas_off(tmp_path: Path) -> None:
+    conn = open_database(str(tmp_path / "normal.db"), "NORMAL", 1024 * 1024)
+    try:
+        assert _fsync_pragmas(conn) == (0, 0)
+    finally:
+        conn.close()
+
+
+class _SiblingGrowsOnPageCount:
+    """A real connection whose page_count read is followed by a sibling's insert."""
+
+    def __init__(self, conn: sqlite3.Connection, sibling: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._sibling = sibling
+
+    def execute(self, sql: str, *parameters: Any) -> sqlite3.Cursor:
+        cursor = self._conn.execute(sql, *parameters)
+        if sql == "PRAGMA page_count":
+            self._sibling.execute("INSERT INTO filler VALUES (randomblob(512 * 1024))")
+        return cursor
+
+
+def test_a_file_that_grows_under_a_sibling_while_opening_does_not_fail_the_cap(
+    tmp_path: Path,
+) -> None:
+    path = str(tmp_path / "sibling.db")
+    conn = open_database(path, "NORMAL", 1024 * 1024)
+    sibling = sqlite3.connect(path, isolation_level=None, timeout=5.0)
+    try:
+        sibling.execute("CREATE TABLE filler(data BLOB)")
+        pages_before = conn.execute("PRAGMA page_count").fetchone()[0]
+        _configure_max_page_count(_SiblingGrowsOnPageCount(conn, sibling), 1024)  # type: ignore[arg-type]
+        assert conn.execute("PRAGMA page_count").fetchone()[0] > pages_before
+        assert (
+            conn.execute("PRAGMA max_page_count").fetchone()[0]
+            >= (conn.execute("PRAGMA page_count").fetchone()[0])
+        )
+    finally:
+        sibling.close()
+        conn.close()
+
+
+class _CapRefusingConnection:
+    """A real connection whose SQLite refuses every cap above the file size."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def execute(self, sql: str, *parameters: Any) -> sqlite3.Cursor:
+        if sql.startswith("PRAGMA max_page_count="):
+            sql = "PRAGMA max_page_count=1"
+        return self._conn.execute(sql, *parameters)
+
+
+def test_a_cap_below_the_requested_page_count_still_fails_the_open(tmp_path: Path) -> None:
+    conn = open_database(str(tmp_path / "refused.db"), "NORMAL", 1024 * 1024)
+    try:
+        with pytest.raises(ConfigurationError, match="could not enforce SHM max_store_bytes"):
+            _configure_max_page_count(_CapRefusingConnection(conn), 4 * 1024 * 1024)  # type: ignore[arg-type]
+    finally:
+        conn.close()
 
 
 class _CapLiftIgnoringConnection:

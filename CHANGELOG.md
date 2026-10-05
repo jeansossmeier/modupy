@@ -130,6 +130,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `modulith run` refuses at start-up a module whose replica ports run past 65535 and two replicas assigned the same port, and `WorkerSpec` rejects a non-integer port when it is built
 - The proxy's worker identity check no longer trusts a port again when a probe sent before a respawn answers late, asks for an uncompressed `/health` and treats a compressed one as foreign instead of decoding it past its 64 KiB cap, and treats a deeply nested JSON `/health` body as foreign instead of failing the request with a 500
 - Pushing a release tag creates a GitHub Release once the PyPI upload succeeds, with generated notes, a link to the changelog and the built wheel and sdist attached; only that job is granted `contents: write`
+- Under `sqlite_synchronous="FULL"` the SHM store also turns on SQLite's `fullfsync` and `checkpoint_fullfsync`, which flush the drive cache on macOS, and opening a store no longer fails when another process grows the file during start-up
 
 ### Security
 

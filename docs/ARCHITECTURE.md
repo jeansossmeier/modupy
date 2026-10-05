@@ -918,7 +918,8 @@ redeploy to another path opens a new, empty store; production deploys set
 `state_dir` (see DEPLOYMENT.md). Explicit SHM rejects DSNs and SQLAlchemy/network URLs. SQLite uses WAL with
 `synchronous=NORMAL` by default, which survives application/process restart on
 the same disk; set `sqlite_synchronous="FULL"` for the last commits to survive
-OS failure or power loss.
+OS failure or power loss (on macOS it also turns on SQLite's `fullfsync` and
+`checkpoint_fullfsync`, which flush through the drive cache and slow each commit).
 
 Resource limits are enforced before and inside the authoritative store.
 `max_payload_bytes` defaults to 16 MiB (maximum 1,000,000,000 bytes, the largest

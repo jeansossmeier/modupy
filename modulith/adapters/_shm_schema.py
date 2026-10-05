@@ -116,6 +116,11 @@ def open_database(
         _migrate(conn)
         _enable_wal(conn)
         conn.execute(f"PRAGMA synchronous={synchronous}")
+        if synchronous.upper() == "FULL":
+            # SQLite on macOS reaches F_FULLFSYNC (a flush through the drive
+            # cache) only with these set; elsewhere they are no-ops.
+            conn.execute("PRAGMA fullfsync=ON")
+            conn.execute("PRAGMA checkpoint_fullfsync=ON")
         _configure_max_page_count(conn, max_store_bytes)
     except BaseException:
         conn.close()
@@ -136,7 +141,10 @@ def _configure_max_page_count(conn: sqlite3.Connection, max_store_bytes: int) ->
     target_pages = max(current_pages, configured_pages)
     conn.execute(f"PRAGMA max_page_count={target_pages}")
     actual_pages = int(conn.execute("PRAGMA max_page_count").fetchone()[0])
-    if actual_pages != target_pages:
+    # SQLite raises a cap below the file size to the file size, so a sibling
+    # growing the file mid-open yields a larger value; only a smaller one
+    # means the cap was refused.
+    if actual_pages < target_pages:
         raise ConfigurationError(
             "could not enforce SHM max_store_bytes: "
             f"SQLite set max_page_count={actual_pages}, expected {target_pages}"
