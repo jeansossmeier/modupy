@@ -1540,12 +1540,21 @@ class PostgresPublicationStore:
         configured store's retry sweep delivers them), but nothing is
         dispatched or logged at that commit.
         """
-        global _active_store, _hook_installed
         await self.wait_for_dispatch()
         self._disposed = True
         if self._lock_engine is not None:
             await self._lock_engine.dispose()
             self._lock_engine = None
+        self._deactivate()
+
+    def _deactivate(self) -> None:
+        """Drop this store from the live-store stack and the session hooks.
+
+        The synchronous half of ``dispose()``. It also undoes a store that
+        ``outbox.configure()`` refused, where nothing was dispatched.
+        """
+        global _active_store, _hook_installed
+        self._disposed = True
         if self in _store_stack:
             _store_stack.remove(self)
         if _active_store is self:

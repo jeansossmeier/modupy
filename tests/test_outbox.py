@@ -4076,3 +4076,159 @@ def test_bootstrap_and_retry_loop_docstrings_mention_lease_expiry() -> None:
 
         assert "lease expires" in doc, documented.__qualname__
         assert "advisory lock" in doc, documented.__qualname__
+
+
+def _sqlite_outbox_url(tmp_path: Path) -> str:
+    return f"sqlite+aiosqlite:///{tmp_path / 'app.db'}"
+
+
+def _modulith_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name.startswith("modulith") and r.levelno >= logging.WARNING
+    ]
+
+
+def test_outbox_options_ignored_for_an_explicit_store_are_logged(
+    make_fake_app: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    make_fake_app(_ORDERS_APP)
+    outbox.configure(StubStore(), JsonEventSerializer(), start_loop=False)
+    _runtime.configure(
+        package="fakeapp",
+        outbox="postgres",
+        outbox_url=_sqlite_outbox_url(tmp_path),
+        outbox_options={"claim_strategy": "lease", "claim_lease_seconds": 7, "sqlite_wal": True},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="modulith"):
+        _runtime.ensure_bootstrapped()
+
+    messages = [m for m in _modulith_warnings(caplog) if "outbox_options" in m]
+    assert len(messages) == 1
+    assert "claim_strategy" in messages[0]
+    assert "claim_lease_seconds" in messages[0]
+    assert "sqlite_wal" not in messages[0]
+    assert "same claim_strategy" in messages[0]
+
+
+def test_outbox_options_without_tuning_keys_do_not_warn_for_an_explicit_store(
+    make_fake_app: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    make_fake_app(_ORDERS_APP)
+    outbox.configure(StubStore(), JsonEventSerializer(), start_loop=False)
+    _runtime.configure(
+        package="fakeapp",
+        outbox="postgres",
+        outbox_url=_sqlite_outbox_url(tmp_path),
+        outbox_options={"sqlite_wal": True},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="modulith"):
+        _runtime.ensure_bootstrapped()
+
+    assert _modulith_warnings(caplog) == []
+
+
+def test_failed_store_bind_leaves_no_store_or_engine_behind(
+    make_fake_app: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlalchemy.ext.asyncio as sa_asyncio
+
+    from modulith.adapters import postgres_outbox
+
+    created: list[Any] = []
+    disposed: list[Any] = []
+    real_create = sa_asyncio.create_async_engine
+
+    def recording_create(*args: Any, **kwargs: Any) -> Any:
+        engine = real_create(*args, **kwargs)
+        created.append(engine)
+        sqlalchemy_event.listen(
+            engine.sync_engine, "engine_disposed", lambda eng: disposed.append(eng)
+        )
+        return engine
+
+    monkeypatch.setattr(sa_asyncio, "create_async_engine", recording_create)
+    make_fake_app(_ORDERS_APP)
+
+    stacks: list[int] = []
+    for _ in range(3):
+        _runtime.configure(
+            package="fakeapp",
+            outbox="postgres",
+            outbox_url=_sqlite_outbox_url(tmp_path),
+            outbox_options={"claim_strategy": "advisory_lock"},
+        )
+        with pytest.raises(ConfigurationError, match="advisory_lock"):
+            _runtime.ensure_bootstrapped()
+        stacks.append(len(postgres_outbox._store_stack))
+        _runtime._reset_for_testing()
+
+    assert (len(created), len(disposed), stacks) == (3, 3, [0, 0, 0])
+    assert postgres_outbox._active_store is None
+    assert outbox._store is None
+
+
+def _bootstrap_postgres_outbox_url_without_discovery(tmp_path: Path) -> None:
+    _runtime.configure(
+        package="outboxtest",
+        auto_discover=False,
+        outbox="postgres",
+        outbox_url=_sqlite_outbox_url(tmp_path),
+    )
+    _runtime.ensure_bootstrapped()
+
+
+def test_publish_with_a_bound_session_and_no_store_warns_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _bootstrap_postgres_outbox_url_without_discovery(tmp_path)
+    assert outbox._store is None
+
+    async def scenario() -> None:
+        token = outbox.bind_session(FakeSession())
+        try:
+            await publish(OutboxEvent(1))
+            await publish(OutboxEvent(2))
+        finally:
+            outbox.unbind_session(token)
+
+    with caplog.at_level(logging.WARNING, logger="modulith"):
+        asyncio.run(scenario())
+
+    messages = [m for m in _modulith_warnings(caplog) if "outbox" in m]
+    assert len(messages) == 1
+    assert "no outbox store is bound" in messages[0]
+    assert "auto_discover" in messages[0]
+
+
+def test_publish_without_a_bound_session_does_not_warn_about_a_missing_store(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _bootstrap_postgres_outbox_url_without_discovery(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="modulith"):
+        asyncio.run(publish(OutboxEvent(1)))
+
+    assert _modulith_warnings(caplog) == []
+
+
+def test_publish_with_a_bound_session_and_the_memory_outbox_does_not_warn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _runtime.configure(package="outboxtest", auto_discover=False)
+    _runtime.ensure_bootstrapped()
+
+    async def scenario() -> None:
+        token = outbox.bind_session(FakeSession())
+        try:
+            await publish(OutboxEvent(1))
+        finally:
+            outbox.unbind_session(token)
+
+    with caplog.at_level(logging.WARNING, logger="modulith"):
+        asyncio.run(scenario())
+
+    assert _modulith_warnings(caplog) == []

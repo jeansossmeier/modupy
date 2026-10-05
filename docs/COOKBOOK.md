@@ -504,7 +504,12 @@ that order, from an ASGI lifespan or equivalent shutdown hook.
 ### Coordinating concurrent sweepers
 
 Every process that wires the outbox runs its own retry loop against the same
-table. `claim_strategy` decides how those sweepers stay off each other's rows:
+table. `claim_strategy` decides how those sweepers stay off each other's rows,
+so every process on one table must use the same `claim_strategy`: a `lease`
+sweeper and an `advisory_lock` sweeper cannot see each other's claims. A store
+you bind with `outbox.configure()` before bootstrap keeps its own settings, and
+bootstrap logs a WARNING naming the `[tool.modulith.outbox_options]` tuning
+keys it did not apply, so set the same strategy on every process:
 
 | `claim_strategy` | Behaviour |
 |---|---|

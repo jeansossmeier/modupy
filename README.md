@@ -433,6 +433,7 @@ Single-process `modulith dev` only warns, so a violation never stops your dev se
 The outbox writes each event you publish inside a database session into the same transaction as your data.
 If the transaction rolls back, the event is gone too; if the process crashes after the commit, the event is still there and is delivered after the app restarts.
 A `publish()` outside a session is delivered directly and saves nothing, so the session wiring below is required.
+With `auto_discover = false` the store is not bound at bootstrap: call `outbox.configure()` yourself, or a publish inside a session is also delivered directly, with one logged WARNING per process.
 
 ![One commit saves the order and one event_publications row per listener; after the commit each listener runs in the background, and a failing one is retried, then dead-lettered](https://raw.githubusercontent.com/jeansossmeier/modupy/main/docs/images/outbox.svg)
 

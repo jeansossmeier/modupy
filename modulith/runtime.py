@@ -195,6 +195,7 @@ class Runtime:
         # The (store, engine) pair bind_configured_outbox built from
         # ``outbox_url``; shutdown() disposes both.
         self._owned_outbox: tuple[Any, Any] | None = None
+        self._warned_missing_outbox_store = False
 
         # Plugins injected programmatically (not via entry points), registered
         # at bootstrap. Embedding contexts — most notably the pytest plugin's
@@ -416,7 +417,9 @@ class Runtime:
         """Bind a ``PostgresPublicationStore`` on ``outbox_url`` when none is bound.
 
         No-op for the memory outbox, without a URL, or when the application
-        already called ``outbox.configure()``: an explicit store wins. The
+        already called ``outbox.configure()``: an explicit store wins, and a
+        WARNING names any ``outbox_options`` tuning keys it left unapplied. A
+        ``configure()`` that raises leaves no store or engine behind. The
         serializer admits only the event types of this process's local
         listeners on ``bus`` (default: the installed bus), the only rows it
         may deserialize. The claim, retry,
@@ -438,14 +441,8 @@ class Runtime:
         from .builtin import outbox
 
         cfg = self._config
-        if cfg is None or cfg.outbox == "memory" or not cfg.outbox_url or outbox._store is not None:
+        if cfg is None or cfg.outbox == "memory" or not cfg.outbox_url:
             return
-        from sqlalchemy import event
-        from sqlalchemy.ext.asyncio import create_async_engine
-
-        from .adapters.postgres_outbox import PostgresPublicationStore
-        from .serializers import JsonEventSerializer
-
         tuning = {
             key: cfg.outbox_options[key]
             for key in (
@@ -460,14 +457,38 @@ class Runtime:
             )
             if key in cfg.outbox_options
         }
+        if outbox._store is not None:
+            if tuning:
+                logger.warning(
+                    "outbox_options %s are ignored: an outbox store bound with "
+                    "outbox.configure() before bootstrap keeps its own settings. "
+                    "Every process on one outbox table must use the same "
+                    "claim_strategy: lease and advisory_lock sweepers cannot see "
+                    "each other's claims.",
+                    ", ".join(sorted(tuning)),
+                )
+            return
+        from sqlalchemy import event
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        from .adapters.postgres_outbox import PostgresPublicationStore
+        from .serializers import JsonEventSerializer
+
         if bus is None:
             bus = self._event_bus
         engine = create_async_engine(cfg.outbox_url)
         if cfg.outbox_options.get("sqlite_wal") and engine.dialect.name == "sqlite":
             event.listen(engine.sync_engine, "connect", _set_journal_mode_wal)
         store = PostgresPublicationStore(engine)
-        event_types = self.local_event_types(bus) if bus is not None else []
-        outbox.configure(store, JsonEventSerializer(allowed_event_types=event_types), **tuning)
+        try:
+            event_types = self.local_event_types(bus) if bus is not None else []
+            outbox.configure(store, JsonEventSerializer(allowed_event_types=event_types), **tuning)
+        except BaseException:
+            # A refused configure() must not strand the store on the live-store
+            # stack or the engine's pool: each retried bootstrap leaked both.
+            store._deactivate()
+            engine.sync_engine.dispose()
+            raise
         self._owned_outbox = outbox._owned_resources = (store, engine)
 
     def local_event_types(self, bus: Any) -> list[type]:
@@ -552,7 +573,37 @@ class Runtime:
             pm.hook.modulith_after_event_published(event=event, publication=receipt)
             return
 
+        self._warn_once_if_outbox_store_missing()
         await self._dispatch_with_hooks(event)
+
+    def _warn_once_if_outbox_store_missing(self) -> None:
+        """Warn once per process that a bound session's publish skipped the outbox.
+
+        With a non-memory ``outbox`` and a session bound but no store bound
+        (``auto_discover = false`` skips the ``outbox_url`` binding), the event
+        is dispatched in memory right away: not durable, and before the
+        business commit. Bootstrap cannot refuse this, because an application
+        may still call ``outbox.configure()`` after it.
+        """
+        from .builtin import outbox
+
+        cfg = self._config
+        if (
+            self._warned_missing_outbox_store
+            or cfg is None
+            or cfg.outbox == "memory"
+            or outbox._store is not None
+            or outbox._bound_session() is None
+        ):
+            return
+        self._warned_missing_outbox_store = True
+        logger.warning(
+            "outbox is %r but no outbox store is bound, so a publish with a "
+            "transaction session bound is dispatched in memory: not durable, and "
+            "before the transaction commits. Call outbox.configure(), or set "
+            "auto_discover = true so outbox_url binds a store at bootstrap.",
+            cfg.outbox,
+        )
 
     def _outbox_owns_dispatch(self) -> bool:
         """True when the durable outbox path will dispatch this publish.
@@ -1417,6 +1468,7 @@ class Runtime:
         self._unresolved_listener_modules = {}
         self._hosted_module = None
         self._consumer_built = False
+        self._warned_missing_outbox_store = False
         if self._owned_outbox is not None:
             from .adapters import postgres_outbox
 

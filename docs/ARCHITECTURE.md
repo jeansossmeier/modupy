@@ -168,7 +168,8 @@ DEPLOYMENT.md covers what WAL changes on disk.
 Any other key in the table is accepted and ignored, so a `pyproject.toml`
 written for a newer release still loads. An application that calls
 `outbox.configure()` before bootstrap keeps its own store and settings:
-`outbox_url` and these keys are then not applied.
+`outbox_url` and these keys are then not applied, and bootstrap logs a WARNING
+naming the tuning keys it ignored.
 
 Two cross-field safety checks run in `_validate()`:
 

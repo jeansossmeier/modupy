@@ -130,7 +130,10 @@ A committed `pyproject.toml` should carry no password. Put the full URL in
   listeners.
 - The binding needs module discovery (`auto_discover`, the default) outside a
   worker, because the allowlist comes from the discovered listeners. With
-  `auto_discover = false`, call `outbox.configure()` yourself. The
+  `auto_discover = false`, call `outbox.configure()` yourself: without a
+  bound store, a publish inside a bound session is dispatched in memory, not
+  saved, and logs one WARNING per process (bootstrap does not refuse, because
+  the store may be bound later). The
   `modulith outbox` commands then bind no store, because bootstrap itself
   imports none of your modules. Either run them with
   `MODULITH_AUTO_DISCOVER=true` when discovery can import the package, or bind
