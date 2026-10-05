@@ -1576,7 +1576,15 @@ modulith broker dead-letter --retry-all   # resubmit every one, with attempts re
 ```
 
 A delivery is dead-lettered after `max_delivery_attempts` failed dispatches or
-reclaims, or at once when its payload cannot be read. Each belongs to one
+reclaims, or at once when its payload cannot be read. Several event types can
+share one target (an explicit `@externalized(target=...)`), so a module can
+receive messages for types it has no listener for. Its consumer compares the
+message's `event_type` header with the types the module listens to before
+deserializing, and acks (Redis Streams) or completes (database and SHM) such a
+message without dead-lettering it, logging it at DEBUG. A message whose header
+is missing, empty, undecodable or names a class the process has not loaded
+(including a class renamed or removed since publishing), or whose payload cannot
+be read, is still dead-lettered. Each dead-lettered delivery belongs to one
 consumer group, so `--retry-all` hands it back only to that group; a group that
 already completed the same message does not receive it again. `--list` and
 `--retry-all` are mutually exclusive. The command runs against the broker store

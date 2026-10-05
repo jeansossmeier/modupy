@@ -765,7 +765,9 @@ because InnoDB's REPEATABLE READ would let two consumers claim the same rows.
 It deserializes each row by its `event_type` header, dispatches to the local
 listeners, then removes the row (`completion_mode="delete"`, the default) or
 marks it `done` (`"mark"`, leaving it for the prune job). Poison rows (missing
-`event_type` / undeserializable payload) are dead-lettered immediately;
+`event_type` / undeserializable payload) are dead-lettered immediately, but a
+row of an event type the module has no listener for, which a target shared by
+several event types carries, is completed unread and logged at DEBUG;
 dispatch failures increment `attempts` with capped backoff and dead-letter after
 `max_delivery_attempts` (default 5). Idle polling backoff never narrows below
 the configured `poll_interval_ms`: it grows exponentially while the queue is

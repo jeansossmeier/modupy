@@ -8,6 +8,7 @@ import logging
 import time
 from typing import Any, Protocol, cast, runtime_checkable
 
+from .._consumer import is_foreign_event_type
 from ..runtime import _runtime
 from ._consumer_protocol import PollingBroker
 
@@ -288,6 +289,14 @@ class DeliveryDispatch:
             self._logger.warning("message %s missing event_type -- dead-lettering", row_id)
             await self._dead_letter(row_id, "missing event_type", target)
             return
+        if is_foreign_event_type(event_type, self._bus):
+            self._logger.debug(
+                "message %s has event type %s, which this module has no listener for -- completing",
+                row_id,
+                event_type,
+            )
+            await self._ack(row_id, target)
+            return
         try:
             event = self._serializer.deserialize(payload, event_type)
         except Exception as exc:
@@ -330,6 +339,9 @@ class DeliveryDispatch:
             )
             await self._fail(row_id, str(exc), target)
             return
+        await self._ack(row_id, target)
+
+    async def _ack(self, row_id: str, target: str) -> None:
         try:
             await self._broker.ack(row_id, consumer_name=self._consumer_name)
         except asyncio.CancelledError:

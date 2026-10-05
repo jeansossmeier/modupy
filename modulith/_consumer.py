@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 from typing import Any
 
@@ -82,6 +83,40 @@ def _as_str(value: Any) -> str:
 
 def _optional_str(value: Any) -> str | None:
     return None if value is None else _as_str(value)
+
+
+def _loaded_class(name: str) -> type | None:
+    """The class a fully-qualified name points at, looked up only in modules this
+    process has already imported — never imported on a wire-supplied name."""
+    parts = name.split(".")
+    for split in range(len(parts) - 1, 0, -1):
+        obj: Any = sys.modules.get(".".join(parts[:split]))
+        if obj is None:
+            continue
+        try:
+            for attr in parts[split:]:
+                obj = getattr(obj, attr)
+        except Exception:
+            continue
+        return obj if isinstance(obj, type) else None
+    return None
+
+
+def is_foreign_event_type(event_type: object, bus: Any) -> bool:
+    """Whether a message's ``event_type`` header names a loaded class that the
+    module has no listener for (several event types can share one target).
+
+    Decided from the name alone, before deserializing: the serializer's allowlist
+    must never be asked to import it. A missing, empty, undecodable or
+    unresolvable name is not foreign, so it still reaches the dead-letter path.
+    """
+    if not isinstance(event_type, str) or not event_type:
+        return False
+    if any(
+        f"{t.__module__}.{t.__qualname__}" == event_type for t in _runtime.local_event_types(bus)
+    ):
+        return False
+    return _loaded_class(event_type) is not None
 
 
 class BrokerConsumer:
@@ -438,10 +473,11 @@ class BrokerConsumer:
     async def _dispatch_one(self, target: str, message_id: Any, fields: dict[bytes, bytes]) -> None:
         """Deserialize one message and dispatch it to local listeners.
 
-        ACKs on success. Malformed/undeserializable messages are poison →
-        dead-lettered immediately. Dispatch failures are NOT ACK'd (so they stay
-        pending for reclaim/redelivery) until they exceed the attempt cap, then
-        dead-lettered.
+        ACKs on success. A message whose event type the module has no listener
+        for (``is_foreign_event_type``) is ACK'd unread. Malformed/undeserializable
+        messages are poison → dead-lettered immediately. Dispatch failures are NOT
+        ACK'd (so they stay pending for reclaim/redelivery) until they exceed the
+        attempt cap, then dead-lettered.
         """
         mid = _as_str(message_id)
         key = (target, mid)
@@ -455,7 +491,26 @@ class BrokerConsumer:
             return
 
         try:
-            event = self._serializer.deserialize(data, _as_str(event_type))
+            type_name = _as_str(event_type)
+        except UnicodeDecodeError:
+            logger.exception(
+                "undecodable event_type header on %s on %s — dead-lettering", mid, target
+            )
+            await self._dead_letter(target, mid, fields)
+            return
+
+        if is_foreign_event_type(type_name, self._bus):
+            logger.debug(
+                "message %s on %s has event type %s, which this module has no listener for — acking",
+                mid,
+                target,
+                type_name,
+            )
+            await self._ack(target, mid, key)
+            return
+
+        try:
+            event = self._serializer.deserialize(data, type_name)
         except Exception:
             logger.exception("undeserializable message %s on %s — dead-lettering", mid, target)
             await self._dead_letter(target, mid, fields)
@@ -491,6 +546,9 @@ class BrokerConsumer:
                 )
             return
 
+        await self._ack(target, mid, key)
+
+    async def _ack(self, target: str, mid: str, key: tuple[str, str]) -> None:
         try:
             await self._broker.ack(target, mid, self._group)
         except asyncio.CancelledError:

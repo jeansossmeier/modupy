@@ -40,6 +40,14 @@ class CrossEvent:
     value: int
 
 
+@event
+@dataclass(frozen=True)
+class SiblingCrossEvent:
+    """Shares a broker target with CrossEvent; the consuming module has no listener for it."""
+
+    value: int
+
+
 # ---------------------------------------------------------------------------
 # Test doubles
 # ---------------------------------------------------------------------------
@@ -646,7 +654,13 @@ async def test_oversized_payload_is_dead_lettered_without_deserializing(
 
     monkeypatch.setattr("modulith.serializers.json.loads", _boom)
 
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
     bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
     broker = FakeConsumerBroker()
     consumer = BrokerConsumer(
         broker=broker,
@@ -670,12 +684,6 @@ async def test_oversized_payload_is_dead_lettered_without_deserializing(
     # process a subsequent well-formed one — under the same cap, so restore
     # json.loads and use a payload that fits within max_payload_bytes=10.
     monkeypatch.undo()
-    received: list[int] = []
-
-    async def handler(evt: CrossEvent) -> None:
-        received.append(evt.value)
-
-    bus.register(CrossEvent, handler)
     ok_fields = {b"data": b'{"value":1}', b"h:event_type": fqn.encode()}
     await consumer._dispatch_one("t", b"10-0", ok_fields)
 
@@ -693,6 +701,93 @@ async def test_missing_event_type_header_is_dead_lettered() -> None:
     await consumer._dispatch_one("t", b"3-0", fields)
 
     assert broker.dead == [("t", "3-0", fields)]
+
+
+class _SpySerializer(JsonEventSerializer):
+    def __init__(self) -> None:
+        super().__init__(allowed_event_types=[CrossEvent])
+        self.deserialized: list[str] = []
+
+    def deserialize(self, data: bytes, event_type: str) -> Any:
+        self.deserialized.append(event_type)
+        return super().deserialize(data, event_type)
+
+
+@pytest.mark.asyncio
+async def test_event_types_the_module_does_not_listen_to_are_acked_not_dead_lettered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Several event types can share one target: the module that listens to one of them
+    acks the others at DEBUG, without deserializing them or dead-lettering anything."""
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    broker = FakeConsumerBroker()
+    serializer = _SpySerializer()
+    consumer = BrokerConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="orders:1",
+        group="modulith-orders",
+        targets=["shared"],
+        poll_block_ms=10,
+        reclaim_min_idle_ms=0,
+    )
+    cross = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+    sibling = f"{SiblingCrossEvent.__module__}.{SiblingCrossEvent.__qualname__}"
+    mine = broker.deliver(
+        "shared", JsonEventSerializer().serialize(CrossEvent(value=1)), {"event_type": cross}
+    )
+    # An undecodable payload proves the foreign message is never deserialized.
+    foreign = [
+        broker.deliver("shared", b"not json", {"event_type": sibling}),
+        broker.deliver(
+            "shared",
+            JsonEventSerializer().serialize(SiblingCrossEvent(value=2)),
+            {"event_type": sibling},
+        ),
+    ]
+
+    caplog.set_level(logging.DEBUG, logger="modulith.consumer")
+    await consumer.start()
+    try:
+        await _until(lambda: len(broker.acked) == 3)
+    finally:
+        await consumer.stop()
+
+    assert received == [1]
+    assert broker.dead == []
+    assert sorted(mid for _, mid in broker.acked) == sorted([mine, *foreign])
+    assert serializer.deserialized == [cross]
+    assert [r.levelno for r in caplog.records if sibling in r.getMessage()] == [
+        logging.DEBUG,
+        logging.DEBUG,
+    ]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "header",
+    [b"", b"\xff\xfe", b"nonexistent.module.Ghost"],
+    ids=["empty", "undecodable", "unknown-class"],
+)
+async def test_event_type_header_that_names_no_loaded_class_is_dead_lettered(
+    header: bytes,
+) -> None:
+    broker = FakeConsumerBroker()
+    consumer = _make_consumer(broker, InMemoryEventBus(), targets=["t"])
+
+    fields = {b"data": b"{}", b"h:event_type": header}
+    await consumer._dispatch_one("t", b"4-0", fields)
+
+    assert broker.dead == [("t", "4-0", fields)]
+    assert broker.acked == []
 
 
 @pytest.mark.asyncio
