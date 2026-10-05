@@ -6,6 +6,7 @@ import builtins
 import mmap
 import multiprocessing
 import os
+import random
 import stat
 import struct
 import tempfile
@@ -450,3 +451,84 @@ def test_idle_prescan_never_reduces_over_a_capacity_sized_sequence(
         monkeypatch.undo()
         small.close()
         large.close()
+
+
+_REAL_SLOT_STRUCT = shm_ring_module._SLOT_STRUCT
+
+
+class _CountingSlotStruct:
+    """Stands in for ``_SLOT_STRUCT`` and counts every slot a read decodes."""
+
+    def __init__(self) -> None:
+        self.unpacks = 0
+
+    def unpack(self, buffer: bytes) -> tuple[int, int]:
+        self.unpacks += 1
+        sequence, complement = _REAL_SLOT_STRUCT.unpack(buffer)
+        return int(sequence), int(complement)
+
+
+@pytest.fixture()
+def slot_counter(monkeypatch: pytest.MonkeyPatch) -> _CountingSlotStruct:
+    counter = _CountingSlotStruct()
+    monkeypatch.setattr(shm_ring_module, "_SLOT_STRUCT", counter)
+    return counter
+
+
+def test_a_small_gap_reads_only_the_slots_between_cursor_and_peak(
+    tmp_path: Path, slot_counter: _CountingSlotStruct
+) -> None:
+    ring = ShmRing(tmp_path / "large.mmap", capacity=1_000_000, create=True)
+    try:
+        assert ring.notify(7)
+        assert ring.notify(8)
+
+        assert ring.read_hints(after_sequence=6) == [7, 8]
+        assert slot_counter.unpacks == 2
+
+        slot_counter.unpacks = 0
+        assert ring.read_hints(after_sequence=-1) == [7, 8]
+        assert slot_counter.unpacks == 9
+    finally:
+        ring.close()
+
+
+def test_a_gap_at_or_above_capacity_still_scans_the_whole_ring(
+    tmp_path: Path, slot_counter: _CountingSlotStruct
+) -> None:
+    ring = ShmRing(tmp_path / "gap.mmap", capacity=16, create=True)
+    try:
+        assert all(ring.notify(sequence) for sequence in range(25, 41))
+
+        assert ring.read_hints(after_sequence=25) == list(range(26, 41))
+        assert slot_counter.unpacks == 15
+
+        slot_counter.unpacks = 0
+        assert ring.read_hints(after_sequence=24) == list(range(25, 41))
+        assert slot_counter.unpacks == 16
+
+        slot_counter.unpacks = 0
+        assert ring.read_hints(after_sequence=-1) == list(range(25, 41))
+        assert slot_counter.unpacks == 16
+    finally:
+        ring.close()
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_read_hints_matches_the_slot_contents_for_any_cursor(tmp_path: Path, seed: int) -> None:
+    """Whatever the gap, the result is the newest sequence per slot past the cursor."""
+    rng = random.Random(seed)
+    capacity = rng.randint(1, 12)
+    ring = ShmRing(tmp_path / "model.mmap", capacity=capacity, create=True)
+    try:
+        slots: dict[int, int] = {}
+        for _ in range(rng.randint(1, 30)):
+            sequence = rng.randint(0, capacity * 4)
+            assert ring.notify(sequence)
+            slots[sequence % capacity] = sequence
+        for after in range(-1, capacity * 4 + 2):
+            assert ring.read_hints(after_sequence=after) == sorted(
+                sequence for sequence in slots.values() if sequence > after
+            )
+    finally:
+        ring.close()

@@ -24,6 +24,7 @@ import asyncio
 import logging
 import math
 import os
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -146,6 +147,34 @@ def _resolve_notifier_path(shm_name: str, db_path: str) -> Path:
     return Path(os.path.abspath(os.path.expanduser(db_path))).parent / candidate
 
 
+def _publication_high_water(db_path: Path) -> int | None:
+    """Highest publication sequence the store ever issued, or None if it cannot be read.
+
+    ``shm_publication`` is AUTOINCREMENT, so ``sqlite_sequence`` keeps this
+    value across deletes; a missing store or an untouched table reads as 0.
+    """
+    if not db_path.exists():
+        return 0
+    try:
+        connection = sqlite3.connect(f"{db_path.absolute().as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        has_sequences = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'"
+        ).fetchone()
+        if not has_sequences:
+            return 0
+        row = connection.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='shm_publication'"
+        ).fetchone()
+        return int(row[0]) if row else 0
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+
+
 # ---------------------------------------------------------------------------
 # ShmBroker (producer + consumer-side operations)
 # ---------------------------------------------------------------------------
@@ -260,6 +289,25 @@ class ShmBroker:
             create=False,
             label="SHM hint file",
         )
+        # A hint file that outlived a store reset (SQLite files deleted, hint
+        # file kept) holds a peak the new store has not reached, so every new
+        # hint would sit below the old high-water mark and wake nobody. The
+        # peak is read before the store's sequence: a publish commits before
+        # it notifies, so a concurrent publisher can only make the store look
+        # further ahead, never the ring.
+        ring_peak = self._ring.peak
+        if ring_peak:
+            store_peak = _publication_high_water(resolved_db_path)
+            if store_peak is not None and ring_peak > store_peak:
+                logger.warning(
+                    "shm hint file %s was at sequence %d but the SQLite store %s only reached "
+                    "%d; the store was reset without its hint file. Resetting the hints.",
+                    notifier_path,
+                    ring_peak,
+                    resolved_db_path,
+                    store_peak,
+                )
+                self._ring.reset()
         self._db_path = resolved_db_path
         self._orphan_retention_seconds = orphan_retention_seconds
         self._cold = ShmColdStore(

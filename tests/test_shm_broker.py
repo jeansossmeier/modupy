@@ -17,7 +17,7 @@ import pytest
 from modulith import ConfigurationError, configure
 from modulith.adapters import _shm_claims
 from modulith.adapters._shm_coldstore import ShmColdStore
-from modulith.adapters._shm_ring import _HEADER_SIZE, _SLOT_SIZE, _SLOT_STRUCT
+from modulith.adapters._shm_ring import _HEADER_SIZE, _SLOT_SIZE, _SLOT_STRUCT, ShmRing
 from modulith.adapters._shm_schema import open_database
 from modulith.adapters._shm_store import SqliteQueueStore
 from modulith.adapters._state_path import default_state_directory
@@ -500,7 +500,7 @@ async def test_idle_hint_reads_answer_without_unpacking_every_slot(
     assert unpacks == 0
 
     assert broker._ring.read_hints(after_sequence=6) == [7]
-    assert unpacks == broker._ring.capacity
+    assert unpacks == 1
 
 
 async def test_hint_prescan_returns_exactly_what_the_per_slot_scan_returns(
@@ -599,6 +599,101 @@ async def test_producer_without_local_subscriptions_discovers_persisted_groups(
         await producer.close()
         await consumer.close()
         consumer._ring.unlink()
+
+
+async def _publish_and_close(db_path: Path, hint_path: Path, count: int) -> None:
+    broker = ShmBroker(shm_name=str(hint_path), db_path=str(db_path), capacity=16)
+    try:
+        await _publish_many(broker, "old", count)
+    finally:
+        await broker.close()
+
+
+async def test_store_reset_that_keeps_the_hint_file_does_not_blind_hint_wakeups(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "reset.db"
+    hint_path = tmp_path / "reset.hints"
+    await _publish_and_close(db_path, hint_path, 5)
+    for leftover in tmp_path.glob("reset.db*"):
+        leftover.unlink()
+
+    broker = ShmBroker(shm_name=str(hint_path), db_path=str(db_path), capacity=16)
+    try:
+        await broker.publish("events", b"new")
+
+        assert await broker.wait_for_hint(after_sequence=0, safety_timeout=0) == 1
+    finally:
+        await broker.close()
+
+
+async def test_hint_file_ahead_of_a_store_whose_database_exists_is_reset(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "behind.db"
+    hint_path = tmp_path / "behind.hints"
+    await _publish_and_close(db_path, hint_path, 5)
+    store = sqlite3.connect(db_path)
+    try:
+        store.execute("UPDATE sqlite_sequence SET seq=2 WHERE name='shm_publication'")
+        store.commit()
+    finally:
+        store.close()
+
+    broker = ShmBroker(shm_name=str(hint_path), db_path=str(db_path), capacity=16)
+    try:
+        assert await broker.wait_for_hint(after_sequence=0, safety_timeout=0) is None
+    finally:
+        await broker.close()
+
+
+async def test_reopening_a_store_that_is_not_behind_its_hint_file_keeps_the_hints(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "kept.db"
+    hint_path = tmp_path / "kept.hints"
+    await _publish_and_close(db_path, hint_path, 5)
+
+    broker = ShmBroker(shm_name=str(hint_path), db_path=str(db_path), capacity=16)
+    try:
+        assert await broker.wait_for_hint(after_sequence=0, safety_timeout=0) == 5
+    finally:
+        await broker.close()
+
+
+async def test_opening_beside_a_live_writer_keeps_the_hints_it_published(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "live.db")
+    hint_path = str(tmp_path / "live.hints")
+    writer = ShmBroker(shm_name=hint_path, db_path=db_path, capacity=16)
+    try:
+        await _publish_many(writer, "live", 3)
+
+        joiner = ShmBroker(shm_name=hint_path, db_path=db_path, capacity=16, create=False)
+        try:
+            assert await joiner.wait_for_hint(after_sequence=0, safety_timeout=0) == 3
+        finally:
+            await joiner.close()
+    finally:
+        await writer.close()
+
+
+async def test_unreadable_store_leaves_the_hint_file_alone(tmp_path: Path) -> None:
+    db_path = tmp_path / "corrupt.db"
+    hint_path = tmp_path / "corrupt.hints"
+    await _publish_and_close(db_path, hint_path, 5)
+    for leftover in tmp_path.glob("corrupt.db-*"):
+        leftover.unlink()
+    db_path.write_bytes(b"not a sqlite database" * 100)
+
+    broker = ShmBroker(shm_name=str(hint_path), db_path=str(db_path), capacity=16)
+    await broker.close()
+    ring = ShmRing(hint_path, 16)
+    try:
+        assert ring.read_hints(after_sequence=0) == [1, 2, 3, 4, 5]
+    finally:
+        ring.close()
 
 
 async def test_subscribe_replays_publications_created_before_group_exists(

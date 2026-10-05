@@ -132,6 +132,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - Pushing a release tag creates a GitHub Release once the PyPI upload succeeds, with generated notes, a link to the changelog and the built wheel and sdist attached; only that job is granted `contents: write`
 - Under `sqlite_synchronous="FULL"` the SHM store also turns on SQLite's `fullfsync` and `checkpoint_fullfsync`, which flush the drive cache on macOS, and opening a store no longer fails when another process grows the file during start-up
 - `outbox.unbind_session` ends only the binding its own `bind_session` call created, so a later binding that is still open stays bound when binds overlap
+- SHM broker: a hint read after a small gap touches only the slots between the consumer's cursor and the ring's peak instead of the whole ring (about 200 ms to under 0.1 ms per hint at `shm_capacity` 1,000,000), and a hint file that outlived a store reset is reset at open, so hint wake-ups work again
 
 ### Security
 

@@ -12,6 +12,7 @@ import os
 import struct
 import tempfile
 import time
+from collections.abc import Iterable
 from contextlib import suppress
 from pathlib import Path
 from typing import BinaryIO
@@ -115,17 +116,53 @@ class ShmRing:
         try:
             if self._nothing_newer(mapping, after_sequence):
                 return []
-            for index in range(self._capacity):
+            peak = self._peak(mapping)
+            capacity = self._capacity
+            # A gap under one lap can only have touched the slots of the
+            # sequences between the cursor and the peak. A wider gap may hold
+            # hints from several laps, so it keeps the full pass.
+            indexes: Iterable[int] = range(capacity)
+            if peak - after_sequence < capacity:
+                indexes = (
+                    sequence % capacity for sequence in range(max(after_sequence + 1, 0), peak + 1)
+                )
+            for index in indexes:
                 offset = _HEADER_SIZE + index * _SLOT_SIZE
                 sequence, complement = _SLOT_STRUCT.unpack(mapping[offset : offset + _SLOT_SIZE])
                 if complement != sequence ^ _SEQUENCE_MASK:
                     continue
-                if sequence % self._capacity != index or sequence <= after_sequence:
+                if sequence % capacity != index or sequence <= after_sequence:
                     continue
                 hints.append(sequence)
         except (BufferError, OSError, ValueError, struct.error):
             return []
         return sorted(hints)
+
+    @property
+    def peak(self) -> int:
+        """Highest sequence this file was ever notified of; 0 if none or unavailable."""
+        mapping = self._mapping
+        if not self.available or mapping is None:
+            return 0
+        try:
+            return self._peak(mapping)
+        except (BufferError, OSError, ValueError, struct.error):
+            return 0
+
+    def reset(self) -> None:
+        """Forget every hint, for a store whose sequences restarted below the peak."""
+        mapping = self._mapping
+        if not self.available or mapping is None:
+            return
+        try:
+            struct.pack_into("<Q", mapping, _MAX_SEQ_OFFSET, 0)
+            mapping[_HEADER_SIZE:] = bytes(self._capacity * _SLOT_SIZE)
+        except (BufferError, OSError, ValueError, struct.error):
+            return
+
+    @staticmethod
+    def _peak(mapping: mmap.mmap) -> int:
+        return int(struct.unpack_from("<Q", mapping, _MAX_SEQ_OFFSET)[0])
 
     def _nothing_newer(self, mapping: mmap.mmap, after_sequence: int) -> bool:
         """Rule out the whole ring in O(1) via the header's running-max word.
@@ -137,11 +174,10 @@ class ShmRing:
         loop at the largest accepted one. ``notify`` keeps a monotonically
         increasing high-water mark in the header, so no slot can hold anything
         newer than ``after_sequence`` if that single word does not either;
-        when it might, this falls through to the slower per-slot pass, which
-        remains authoritative (including for a never-notified, all-zero ring).
+        when it might, this falls through to the per-slot pass, which remains
+        authoritative (including for a never-notified, all-zero ring).
         """
-        peak = int(struct.unpack_from("<Q", mapping, _MAX_SEQ_OFFSET)[0])
-        return peak <= after_sequence
+        return self._peak(mapping) <= after_sequence
 
     def close(self) -> None:
         """Close this process's handles; repeated calls are safe."""
