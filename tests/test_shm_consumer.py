@@ -1522,3 +1522,56 @@ async def test_empty_shm_consumer_warns_about_deliveries_its_group_still_holds(
     warnings = _stale_warnings(caplog, "stale-stream")
     assert len(warnings) == 1
     assert "1 undelivered" in warnings[0]
+
+
+async def test_shm_stale_warning_does_not_say_publishes_keep_adding_to_a_dropped_subscription(
+    broker: ShmBroker, caplog: pytest.LogCaptureFixture
+) -> None:
+    await broker.subscribe([TARGET, "stale-stream"], GROUP)
+    await broker.publish("stale-stream", b"{}", {"event_type": "t.Stale"})
+    consumer = _consumer(broker, InMemoryEventBus(), JsonEventSerializer())
+    caplog.set_level(logging.WARNING)
+    await consumer.start()
+    try:
+        subscriptions = await broker._cold.get_subscriptions()
+    finally:
+        await consumer.stop()
+
+    assert "stale-stream" not in subscriptions
+    (warning,) = _stale_warnings(caplog, "stale-stream")
+    assert "1 undelivered message(s) stay queued." in warning
+    assert "keep adding" not in warning
+    assert f"modulith broker drop-group {GROUP} --target stale-stream" in warning
+
+
+async def test_database_stale_warning_keeps_saying_publishes_keep_adding_to_the_subscription(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    pytest.importorskip("aiosqlite")
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from modulith.adapters.db_broker import DatabaseBroker, DatabaseConsumer
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'db.db'}", poolclass=NullPool)
+    try:
+        db_broker = DatabaseBroker(engine=engine)
+        await db_broker.subscribe([TARGET, "stale-stream"], GROUP)
+        await db_broker.publish("stale-stream", b"{}", {"event_type": "t.Stale"})
+        consumer = DatabaseConsumer(
+            broker=db_broker,
+            bus=InMemoryEventBus(),
+            serializer=JsonEventSerializer(),
+            consumer_name="worker-1",
+            group=GROUP,
+            targets=[TARGET],
+            poll_interval_s=0.01,
+        )
+        caplog.set_level(logging.WARNING)
+        await consumer.start()
+        await consumer.stop()
+    finally:
+        await engine.dispose()
+
+    (warning,) = _stale_warnings(caplog, "stale-stream")
+    assert "1 undelivered message(s) stay queued and new publishes keep adding to them." in warning

@@ -139,20 +139,28 @@ class PollingConsumer(DeliveryDispatch):
     async def _warn_stale_targets(self) -> None:
         """Report targets this group still holds but this module no longer consumes.
 
-        Subscriptions and their undelivered rows are never removed here, so a
-        rollback still finds them; the operator removes them explicitly.
+        Undelivered rows are never removed here, so a rollback still finds
+        them; the operator removes them explicitly. A broker whose subscribe
+        drops stale subscriptions (``drops_stale_subscriptions``) adds nothing
+        further to them; any other broker keeps the subscription, so new
+        publishes keep adding to the backlog.
         """
         stale = await self._broker.stale_targets(self._group, self._targets)
+        adds_more = (
+            ""
+            if getattr(self._broker, "drops_stale_subscriptions", False)
+            else " and new publishes keep adding to them"
+        )
         for target, backlog in stale.items():
             self._logger.warning(
                 "consumer group %r still subscribes to or holds deliveries for target "
                 "%r, which this module no longer consumes; %d undelivered message(s) "
-                "stay queued and new publishes keep adding to them. If no release "
-                "that consumes it will run again, remove them with: "
-                "modulith broker drop-group %s --target %s",
+                "stay queued%s. If no release that consumes it will run again, "
+                "remove them with: modulith broker drop-group %s --target %s",
                 self._group,
                 target,
                 backlog,
+                adds_more,
                 self._group,
                 target,
             )

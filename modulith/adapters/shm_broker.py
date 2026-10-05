@@ -160,6 +160,10 @@ class ShmBroker:
     fixed-size sequence numbers.
     """
 
+    # ``subscribe`` replaces the group's subscriptions, so a stale target stops
+    # receiving new publishes at start; only its pending deliveries remain.
+    drops_stale_subscriptions = True
+
     def __init__(
         self,
         *,
