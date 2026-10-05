@@ -849,6 +849,175 @@ def test_extract_blocks_import_of_another_declared_module_and_force_overrides(
     assert "imports declared module(s): inventory" in (out_dir / "README.md").read_text()
 
 
+@pytest.mark.parametrize("guard", ["False", "0"])
+def test_extract_ignores_sibling_import_under_constant_false_if(
+    make_fake_app, monkeypatch, tmp_path, guard
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {
+            "orders": f"if {guard}:\n    from fakeapp.inventory import reserve\n",
+            "inventory": "def reserve():\n    return 1\n",
+        },
+        extra_files={"contracts/__init__.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert not (out_dir / "fakeapp" / "inventory").exists()
+    assert "imports declared module(s)" not in (out_dir / "README.md").read_text()
+
+
+def test_extract_still_blocks_sibling_import_under_version_guard_and_force_overrides(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {
+            "orders": (
+                "import sys\n"
+                "if sys.version_info < (3, 0):\n"
+                "    from fakeapp.inventory import reserve\n"
+            ),
+            "inventory": "def reserve():\n    return 1\n",
+        },
+        extra_files={"contracts/__init__.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    blocked = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+    assert blocked.exit_code == 1, blocked.output
+    assert "imports declared module(s): inventory" in blocked.output
+
+    forced = runner.invoke(app, ["extract", "orders", "--output", str(out_dir), "--force"])
+    assert forced.exit_code == 0, forced.output
+    assert "imports declared module(s): inventory" in (out_dir / "README.md").read_text()
+
+
+def test_extract_follows_relative_dynamic_import_with_literal_package(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {
+            "orders": (
+                "import importlib\n"
+                "def load():\n"
+                '    return importlib.import_module(".helper", package="fakeapp")\n'
+            ),
+        },
+        extra_files={"helper.py": "VALUE = 1\n", "unused.py": "", "contracts/__init__.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "fakeapp" / "helper.py").read_text() == "VALUE = 1\n"
+    assert not (out_dir / "fakeapp" / "unused.py").exists()
+    readme = (out_dir / "README.md").read_text()
+    assert "- `fakeapp.helper`" in readme
+    assert "Extraction notes" not in readme
+
+
+def test_extract_blocks_relative_dynamic_import_of_another_declared_module(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {
+            "orders": (
+                "import importlib\n"
+                "def load():\n"
+                '    return importlib.import_module(".inventory", package="fakeapp")\n'
+            ),
+            "inventory": "",
+        },
+        extra_files={"contracts/__init__.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 1, result.output
+    assert "imports declared module(s): inventory" in result.output
+
+
+def test_extract_readme_lists_dynamic_imports_it_cannot_resolve(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {
+            "orders": (
+                "import importlib\n"
+                "from importlib import import_module\n"
+                "def load(name, pkg):\n"
+                '    importlib.import_module("fakeapp." + name)\n'
+                "    __import__(name)\n"
+                '    import_module(".x", package=pkg)\n'
+                '    importlib.import_module(".y")\n'
+                '    importlib.import_module("json")\n'
+                "if False:\n"
+                "    importlib.import_module(name)\n"
+            ),
+        },
+        extra_files={"contracts/__init__.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    notes = _readme_section((out_dir / "README.md").read_text(), "Extraction notes")
+    bullets = [line for line in notes.splitlines() if line.startswith("- ")]
+    assert len(bullets) == 4, notes
+    for bullet, line, call in zip(
+        bullets,
+        (4, 5, 6, 7),
+        (
+            "importlib.import_module('fakeapp.' + name)",
+            "__import__(name)",
+            "import_module('.x', package=pkg)",
+            "importlib.import_module('.y')",
+        ),
+        strict=True,
+    ):
+        assert f"`fakeapp/orders/__init__.py:{line}`" in bullet, bullet
+        assert call in bullet, bullet
+    assert "--force" not in notes
+
+
+def test_extract_force_notes_and_dynamic_import_notes_share_one_section(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {
+            "orders": (
+                "import importlib\n"
+                "def use(name):\n"
+                "    from fakeapp.inventory._internal import secret\n"
+                "    return importlib.import_module(name), secret\n"
+            ),
+            "inventory": "",
+        },
+        extra_files={"inventory/_internal.py": "secret = 1\n", "contracts/__init__.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir), "--force"])
+
+    assert result.exit_code == 0, result.output
+    readme = (out_dir / "README.md").read_text()
+    assert readme.count("## Extraction notes") == 1
+    notes = _readme_section(readme, "Extraction notes")
+    assert "no-internal-imports" in notes
+    assert "importlib.import_module(name)" in notes
+
+
 def test_extract_fails_when_extracted_module_does_not_import(make_fake_app, monkeypatch, tmp_path):
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app(

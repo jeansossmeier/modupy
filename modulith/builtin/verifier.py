@@ -345,24 +345,41 @@ def _file_package(root: Path, root_package: str, path: Path) -> str:
     return root_package
 
 
+def _string_arg(call: ast.Call, index: int, keyword: str) -> str | None:
+    """The string literal passed as positional *index* or as *keyword*, else None."""
+    arg = call.args[index] if len(call.args) > index else None
+    if arg is None:
+        arg = next((kw.value for kw in call.keywords if kw.arg == keyword), None)
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return arg.value
+    return None
+
+
 class _ImportCollector(ast.NodeVisitor):
     """Collect Import/ImportFrom records, tagging TYPE_CHECKING-guarded ones.
 
     Imports inside ``if TYPE_CHECKING:`` blocks are collected with
     ``type_only=True`` so the boundary rules (1, 3, 4) still see them —
     wrapping an import in the guard must not bypass encapsulation
-    — while cycle detection (rule 2) can skip them.
+    — while cycle detection (rule 2) can skip them. The body of a
+    constant-false ``if`` (``if False:``, ``if 0:``) is tagged the same way:
+    it never runs. Any other guard, such as a ``sys.version_info`` check, is
+    treated as runtime code.
 
     ``importlib.import_module(<literal>)`` and ``__import__(<literal>)``
     calls (plain, attribute, or aliased form) are also recorded, tagged the
     same as a static ``import <literal>`` — a dynamic import is otherwise
-    invisible to every boundary rule. Only a string-literal argument can be
-    resolved statically; a computed target (a variable, a call result) is a
-    documented residual limitation and produces no ImportRecord.
+    invisible to every boundary rule. A relative
+    ``import_module(".x", package="<literal>")`` is resolved against that
+    package. A target the source cannot name (a variable, a call result, a
+    relative name without a literal package) produces no ImportRecord;
+    ``unresolved`` lists each such call outside type-only code as
+    ``(line, source)`` so a caller can report what the scan did not follow.
     """
 
     def __init__(self, source_file: Path, file_package: str) -> None:
         self.records: list[ImportRecord] = []
+        self.unresolved: list[tuple[int, str]] = []
         self.source_file = source_file
         self.file_package = file_package
         self._tc_aliases: set[str] = {"TYPE_CHECKING"}
@@ -371,7 +388,9 @@ class _ImportCollector(ast.NodeVisitor):
         self._import_module_aliases: set[str] = set()
 
     def visit_If(self, node: ast.If) -> None:
-        if _is_type_checking(node.test, self._tc_aliases):
+        if _is_type_checking(node.test, self._tc_aliases) or (
+            isinstance(node.test, ast.Constant) and not node.test.value
+        ):
             self._type_only_depth += 1
             for child in node.body:
                 self.visit(child)
@@ -432,22 +451,26 @@ class _ImportCollector(ast.NodeVisitor):
             )
 
     def visit_Call(self, node: ast.Call) -> None:
-        target = self._dynamic_import_target(node.func, node.args)
-        if target is not None:
-            self.records.append(
-                ImportRecord(
-                    self.source_file,
-                    node.lineno,
-                    target,
-                    [],
-                    local_names=[],
-                    type_only=self._type_only_depth > 0,
+        if self._is_dynamic_import(node.func):
+            target = self._dynamic_import_target(node)
+            if target is None:
+                if self._type_only_depth == 0:
+                    self.unresolved.append((node.lineno, ast.unparse(node)))
+            else:
+                self.records.append(
+                    ImportRecord(
+                        self.source_file,
+                        node.lineno,
+                        target,
+                        [],
+                        local_names=[],
+                        type_only=self._type_only_depth > 0,
+                    )
                 )
-            )
         self.generic_visit(node)
 
-    def _dynamic_import_target(self, func: ast.expr, args: list[ast.expr]) -> str | None:
-        is_dynamic_import = (
+    def _is_dynamic_import(self, func: ast.expr) -> bool:
+        return (
             isinstance(func, ast.Name)
             and (func.id == "__import__" or func.id in self._import_module_aliases)
         ) or (
@@ -456,12 +479,28 @@ class _ImportCollector(ast.NodeVisitor):
             and isinstance(func.value, ast.Name)
             and func.value.id in self._importlib_aliases
         )
-        if not is_dynamic_import or not args:
+
+    def _dynamic_import_target(self, node: ast.Call) -> str | None:
+        """The dotted module a dynamic import names, or None when only a run could tell.
+
+        A relative ``import_module(".x", package="<literal>")`` resolves against
+        that package, as ``importlib.util.resolve_name`` does at runtime.
+        """
+        name = _string_arg(node, 0, "name")
+        if name is None:
             return None
-        arg = args[0]
-        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-            return arg.value
-        return None
+        if not name.startswith(".") or not self._is_import_module(node.func):
+            return name
+        package = _string_arg(node, 1, "package")
+        if package is None:
+            return None
+        try:
+            return importlib.util.resolve_name(name, package)
+        except ImportError:
+            return None
+
+    def _is_import_module(self, func: ast.expr) -> bool:
+        return not (isinstance(func, ast.Name) and func.id == "__import__")
 
     def _resolve(self, node: ast.ImportFrom) -> str:
         if not node.level:  # absolute import

@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Any
 from .config import _configured_broker_url, _find_pyproject
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .config import Configuration
     from .runtime import Runtime
     from .types import Violation
@@ -426,8 +428,31 @@ def _render_env_example(*, cfg: Configuration, module: str, package: str) -> str
     return "\n".join(lines) + "\n"
 
 
+def _unresolved_dynamic_imports(output: Path, dest_pkg: Path, package: str) -> list[str]:
+    """README bullets for each dynamic import in the copied sources the scan could not resolve."""
+    from .builtin.verifier import _file_package, _ImportCollector, _parse_source
+
+    entries: list[str] = []
+    for path in sorted(dest_pkg.rglob("*.py")):
+        try:
+            tree = _parse_source(path)
+        except SyntaxError:
+            continue
+        collector = _ImportCollector(path, _file_package(dest_pkg, package, path))
+        collector.visit(tree)
+        where = path.relative_to(output).as_posix()
+        entries += [f"`{where}:{line}` `{call}`" for line, call in collector.unresolved]
+    return entries
+
+
 def _render_readme(
-    *, cfg: Configuration, module: str, pkg_name: str, helpers: list[str], notes: list[str]
+    *,
+    cfg: Configuration,
+    module: str,
+    pkg_name: str,
+    helpers: list[str],
+    notes: list[str],
+    dynamic_imports: Sequence[str] = (),
 ) -> str:
     lines = [
         f"# {module}-service",
@@ -517,15 +542,23 @@ def _render_readme(
         ]
         lines += [f"- `{helper}`" for helper in helpers]
 
+    if notes or dynamic_imports:
+        lines += ["", "## Extraction notes"]
     if notes:
         lines += [
-            "",
-            "## Extraction notes",
             "",
             "Extracted with `--force`, overriding the following blockers:",
             "",
         ]
         lines += [f"- {note}" for note in notes]
+    if dynamic_imports:
+        lines += [
+            "",
+            "The import scan is static and could not resolve these dynamic imports, so "
+            "anything they load was not copied. Check that each target is in the service:",
+            "",
+        ]
+        lines += [f"- {entry}" for entry in dynamic_imports]
 
     return "\n".join(lines) + "\n"
 
@@ -596,6 +629,7 @@ def _write_generated_files(
     module: str,
     helpers: list[str],
     notes: list[str],
+    dynamic_imports: list[str],
 ) -> list[str]:
     assert cfg.package is not None
     generated = {
@@ -612,6 +646,7 @@ def _write_generated_files(
             pkg_name=cfg.package,
             helpers=helpers,
             notes=notes,
+            dynamic_imports=dynamic_imports,
         ),
     }
     for name, content in generated.items():
@@ -784,6 +819,7 @@ def _populate_extraction(
             module=module,
             helpers=helpers,
             notes=notes,
+            dynamic_imports=_unresolved_dynamic_imports(output, dest_pkg, cfg.package),
         )
     )
 
