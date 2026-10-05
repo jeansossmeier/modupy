@@ -69,6 +69,10 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - CLI help no longer shows raw double backticks, and `modulith migrate --help` prints `[tool.modulith]` instead of dropping it as markup
 - The startup log line under the memory outbox no longer suggests that `outbox = 'postgres'` alone turns on durable delivery. It also names `outbox_url`, `modulith migrate`, and the README section "Never lose an event" for the session and lifespan wiring
 
+### Security
+
+- The release workflow's publish job pins both of its actions to a commit, the PyPI publish action to v1.14.2 and `actions/download-artifact` to v8.0.1, instead of movable refs such as `release/v1`. Every step of that job can request the PyPI publishing token
+
 ### Upgrade notes
 
 - Durable outbox: run `modulith migrate` (migration `0008_outbox_trace_context`) before starting this version. On an outbox table without the new `trace_context` column every durable publish, claim and delivery fails, while `modulith outbox status` still prints counts. Tables created from the ORM metadata already have the column, and the migration skips it there. Rows written by an earlier version deliver as before, without a trace context

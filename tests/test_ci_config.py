@@ -438,8 +438,67 @@ def test_focused_shm_matrix_covers_supported_operating_systems() -> None:
     assert isinstance(strategy, dict)
     matrix = strategy.get("matrix")
     assert isinstance(matrix, dict)
-    assert matrix.get("os") == ["ubuntu-latest", "macos-latest", "windows-latest"]
+    assert matrix.get("os") == ["ubuntu-24.04", "macos-latest", "windows-latest"]
     assert matrix.get("python-version") == ["3.11", "3.13"]
+
+
+def _runner_labels(text: str) -> set[str]:
+    """Every runner label a workflow's jobs can run on, ``matrix.os`` expanded."""
+    labels: set[str] = set()
+    for job in _jobs(text).values():
+        runs_on = job.get("runs-on")
+        if runs_on == "${{ matrix.os }}":
+            runs_on = job["strategy"]["matrix"]["os"]
+        if runs_on is not None:
+            labels.update([runs_on] if isinstance(runs_on, str) else runs_on)
+    return labels
+
+
+@pytest.mark.parametrize("workflow", [CI_YML, RELEASE_YML], ids=lambda path: path.name)
+def test_linux_runners_are_pinned_to_a_ubuntu_release(workflow: Path) -> None:
+    """``ubuntu-latest`` moves to Ubuntu 26 on 2026-10-19 (actions/runner-images#14748),
+    so a job on that label changes OS image without a commit; a versioned label
+    changes only when we do."""
+    linux = {
+        label
+        for label in _runner_labels(workflow.read_text(encoding="utf-8"))
+        if label.startswith("ubuntu")
+    }
+    assert linux, f"{workflow.name} must run at least one job on Linux"
+    assert all(re.fullmatch(r"ubuntu-\d{2}\.\d{2}", label) for label in linux), (
+        f"{workflow.name} runs on floating Linux labels: {sorted(linux)}"
+    )
+
+
+# First major of each action whose action.yml runs on Node 24. Earlier majors
+# target Node 20, which runners already force onto Node 24 with a deprecation
+# warning.
+NODE24_ACTION_FLOORS = {
+    "actions/checkout": 5,
+    "actions/setup-python": 6,
+    "actions/upload-artifact": 6,
+    "actions/download-artifact": 7,
+    "astral-sh/setup-uv": 7,
+}
+
+
+@pytest.mark.parametrize("workflow", [CI_YML, RELEASE_YML], ids=lambda path: path.name)
+def test_workflow_actions_run_on_node24_majors(workflow: Path) -> None:
+    text = workflow.read_text(encoding="utf-8")
+    stale = []
+    for job in _jobs(text).values():
+        for step in job.get("steps", []):
+            action, _, ref = str(step.get("uses", "")).partition("@")
+            # yaml.safe_load drops comments; a SHA pin names its release in one.
+            label = re.search(rf"\buses: {re.escape(str(step.get('uses')))} # (v\d+)\.", text)
+            if label and re.fullmatch(r"[0-9a-f]{40}", ref):
+                ref = label[1]
+            major = re.fullmatch(r"v(\d+)", ref)
+            if action in NODE24_ACTION_FLOORS and not (
+                major and int(major[1]) >= NODE24_ACTION_FLOORS[action]
+            ):
+                stale.append(step["uses"])
+    assert stale == [], f"{workflow.name} uses actions below their Node 24 major: {stale}"
 
 
 def test_integration_matrix_covers_311_and_313() -> None:
@@ -842,7 +901,11 @@ def test_release_publish_job_has_oidc_permission() -> None:
 
 
 def test_release_publish_job_uses_pypa_action() -> None:
-    """publish job must use pypa/gh-action-pypi-publish@release/v1."""
+    """publish job must pin pypa/gh-action-pypi-publish to a full commit SHA.
+
+    The step runs with ``id-token: write``, so a movable ref such as
+    ``release/v1`` would let whoever can move it publish as this project.
+    """
     workflow = _release_workflow()
     jobs = workflow.get("jobs")
     assert isinstance(jobs, dict)
@@ -860,9 +923,33 @@ def test_release_publish_job_uses_pypa_action() -> None:
     assert len(pypa_steps) == 1, (
         "publish job must use exactly one pypa/gh-action-pypi-publish action"
     )
-    assert pypa_steps[0]["uses"] == "pypa/gh-action-pypi-publish@release/v1", (
-        "publish job must use pypa/gh-action-pypi-publish@release/v1"
+    uses = pypa_steps[0]["uses"]
+    assert re.fullmatch(r"pypa/gh-action-pypi-publish@[0-9a-f]{40}", uses), (
+        f"publish job must pin the publish action to a full commit SHA, got {uses!r}"
     )
+    # yaml.safe_load drops comments, so the version label is read from the raw text.
+    assert re.search(
+        rf"\buses: {re.escape(uses)} # v1\.\d+\.\d+[ \t]*$", _release_text(), re.MULTILINE
+    ), "the pinned SHA must name its release in a trailing `# v1.x.y` comment"
+
+
+def test_release_publish_job_pins_every_action_to_a_commit() -> None:
+    """Every step of the publish job can request the PyPI token (``id-token:
+    write``), so a movable tag on any action there could publish as this
+    project, not only one on the publish action."""
+    text = _release_text()
+    unpinned = [
+        step["uses"]
+        for step in _jobs(text)["publish"]["steps"]
+        if "uses" in step
+        and not (
+            re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", step["uses"])
+            and re.search(
+                rf"\buses: {re.escape(step['uses'])} # v\d+\.\d+\.\d+[ \t]*$", text, re.MULTILINE
+            )
+        )
+    ]
+    assert unpinned == [], f"publish job actions not pinned to a commit: {unpinned}"
 
 
 def test_release_publish_job_needs_full_ci_test_and_build() -> None:
