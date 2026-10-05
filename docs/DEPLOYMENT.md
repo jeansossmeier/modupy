@@ -180,6 +180,15 @@ A committed `pyproject.toml` should carry no password. Put the full URL in
   later: under `"lease"` once its lease expires, under `"advisory_lock"` by a
   later sweep once its lock is released, at the latest when the dead
   process's lock connection closes, and under `"none"` by the next sweep.
+  Run one lifespan per process. `outbox.shutdown()` is final: the store it
+  disposes stays bound, and `modulith.bootstrap()` does nothing the second
+  time, so it never rebinds one. A second lifespan in the same process (a
+  second `asyncio.run()` over the same app, say) therefore reuses the disposed
+  store. Its after-commit hook is gone, so every row waits for the retry
+  loop's sweep, and nothing disposes the engine again at the second shutdown.
+  Restart the process instead. Tests that need a second lifespan reset the
+  runtime with `_reset_for_testing`, which the `modulith_app` fixture calls
+  for every test.
 
 **Wiring the store yourself.** Bind the store in code, with your own engine,
 when `outbox_url` does not offer what you need: `connect_args` or a
@@ -342,6 +351,17 @@ help on Postgres or MySQL. Unlike the outbox store,
 the database broker hands a call from another loop to the loop that owns its
 engine; see [A. SQLite Database Broker](#a-sqlite-database-broker-zero-infrastructure).
 This also applies to the store bound from `outbox_url`.
+
+**Replica clocks.** Replicas that share an outbox table must keep their clocks
+within about a second of each other: run NTP or chrony on every host. Unlike
+the database broker, the outbox does not use the database's clock. Each
+replica stamps a claim's lease expiry (`claim_until`) and a failed row's
+`last_attempt_at` from its own clock, and the other replicas compare those
+stamps with theirs. With more skew, the replica whose clock runs ahead
+re-dispatches early: it reads a peer's lease as expired, and a failed row's
+retry backoff as elapsed, sooner by the skew. The first retry waits 1 s, so a
+skew of 1 s makes it immediate. A clock that runs behind only delays recovery
+and retries. See [ARCHITECTURE.md section 7.4](ARCHITECTURE.md#74-the-postgres-adapter).
 
 **Per-module Postgres schema.** To keep a module's outbox and broker tables in a DB schema named after the module (see [per-module DB schema ownership](COOKBOOK.md) in the Cookbook), pass `schema_translate_map` to the engine before handing it to `PostgresPublicationStore` — the store takes the app's engine and saves through the app's bound session, so the map applies to every statement it issues, no store-level code change needed:
 

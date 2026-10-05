@@ -607,7 +607,7 @@ Any other key in the table is accepted and ignored. An application that binds it
 
 A background task started by the outbox plugin sweeps for incomplete publications:
 
-- On startup: one sweep with `older_than=timedelta(0)` to catch crash recovery
+- On startup: one sweep with `older_than=timedelta(0)` over the records a previous process left incomplete. A record the dead process still holds, under a lease or an advisory lock, waits: the first sweep that runs after the lease expires or the lock's session ends retries it. Recovery is immediate, with no grace period for fresh records: under `lease`, a record published just before the sweep claims its batch is delivered behind the older records of that batch, because its own after-commit delivery finds it claimed and leaves it to the sweep. The cost is delay, not loss
 - During normal operation: a sweep every `retry_interval_seconds` (30 by default) over records at least `retry_stale_seconds` (30 by default) old, to avoid thrashing fresh events
 
 How a sweep finds its records depends on `claim_strategy`:

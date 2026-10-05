@@ -474,6 +474,18 @@ A background retry loop drives redelivery:
   `retry_interval_seconds` (30) and takes only rows at least
   `retry_stale_seconds` (30) old, so it doesn't thrash on freshly-published
   events.
+- Start-up recovery is immediate: no grace period holds fresh rows back, so a
+  new publication can wait behind a crashed process's backlog. Under the
+  default `"lease"` strategy, `claim_batch` takes up to `claim_batch_size`
+  rows with `older_than=0`, a row committed moments ago among them, and
+  orders them by `coalesce(last_attempt_at, published_at)`, oldest first. It
+  claims the whole batch before the sweep delivers its first row, and the
+  sweep delivers the rows in that order. A publication committed just before
+  the claim therefore sits behind the older rows of its batch, and its own
+  after-commit delivery finds the row claimed and leaves it to the sweep. The
+  cost is delay, not loss: the row waits for the delivery of the rows ahead of
+  it. A row committed after the claim is claimed and delivered by its own
+  after-commit task as usual.
 - A row the crashed process was delivering under a lease (`claim_strategy=
   "lease"`, the default, which after-commit dispatch also takes) stays claimed
   until that lease expires: the startup sweep skips it, and the first sweep
@@ -591,6 +603,19 @@ reclaim the row; it also bounds how long a crashed process's in-flight rows
 wait for recovery, see §7.2) and `claim_batch_size` (default 100 rows per claim). A
 renewal that raises (a database blip) is logged and retried until the lease
 expires; it never fails the delivery.
+
+**Replica clocks.** The outbox keeps time with each replica's own clock, where
+the database broker uses the database server's (§8.4). `claim_batch()`,
+`claim_publication()` and `renew_claim()` stamp `claim_until` from the claiming
+process's `datetime.now(UTC)`, and the next claimant compares it with its own
+clock. `last_attempt_at` is stamped by the process whose delivery failed, and
+the sweeping process compares it with its own clock to apply the backoff. Keep
+the clocks of replicas that share an outbox table within about a second of each
+other, by running NTP or chrony on every host. With more skew, the replica
+whose clock runs ahead re-dispatches early: it reads a peer's lease as expired,
+and a failed row's backoff as elapsed, sooner by the skew, so with 1 s of skew
+the first retry's 1 s backoff is over at once. A clock that runs behind only
+delays a recovery or a retry.
 
 Note what `FOR UPDATE SKIP LOCKED` does and does not buy on its own: under
 `"none"` and `"advisory_lock"` the row locks taken by the sweep query are

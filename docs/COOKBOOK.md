@@ -451,7 +451,12 @@ process left undelivered are swept at startup instead of waiting for the first
 transactional publish. In a single-process app, call `outbox.shutdown()` in the
 lifespan's teardown: it stops the retry loop and closes the engine modulith
 created from `outbox_url`, but never a store or engine you configured
-yourself. The outbox table must live in the
+yourself. Run one lifespan per process: `outbox.shutdown()` is final, so a
+second lifespan in the same process reuses the store it disposed, whose
+after-commit hook is gone and whose rows then wait for the retry loop's sweep.
+Restart the process instead; tests reset the runtime with
+`_reset_for_testing`, which the `modulith_app` fixture calls for every test.
+The outbox table must live in the
 database that holds your business data, or the row and your data cannot commit
 in one transaction. Under `--topology processes`, `main.py` (its lifespan and
 middleware) does not run in workers; with `outbox_url` set, each worker binds
