@@ -397,6 +397,125 @@ async def test_skip_locked_partitions_backlog_across_competing_consumers(
     assert len(ids1) + len(ids2) == n  # every row claimed exactly once
 
 
+async def test_overlapping_claims_split_a_backlog_larger_than_the_batch(
+    broker_engine: Any,
+) -> None:
+    """While one consumer's claim transaction is still open, a second claim of
+    the same group, and a claim of another group, each still get a full batch.
+    InnoDB locks every row an unindexed OR / ORDER BY scan visits, so a claim
+    that scans the whole backlog starves the overlapping one on MySQL."""
+    from sqlalchemy import text
+
+    _, _, message = broker_schema()
+    groups = ["g", "other"]
+    base = datetime.now(UTC) - timedelta(hours=1)
+    async with broker_engine.begin() as conn:
+        for group in groups:
+            await conn.execute(
+                message.insert(),
+                [
+                    {
+                        "id": str(uuid4()),
+                        "target": _TARGET,
+                        "consumer_group": group,
+                        "event_type": _EVENT_TYPE,
+                        "payload": b"{}",
+                        "headers": None,
+                        "status": "pending",
+                        "attempts": 0,
+                        "available_at": base + timedelta(milliseconds=i),
+                        "claimed_at": None,
+                        "claimed_by": None,
+                        "created_at": base,
+                        "last_error": None,
+                        "dispatch_started": False,
+                    }
+                    for i in range(3000)
+                ],
+            )
+    if broker_engine.dialect.name == "mysql":
+        async with broker_engine.connect() as conn:
+            await conn.execute(text("ANALYZE TABLE broker_message"))
+
+    first_claimed, release = asyncio.Event(), asyncio.Event()
+
+    class HoldingBroker(DatabaseBroker):
+        async def _write(self, operation: Any) -> Any:
+            async def held(conn: Any) -> Any:
+                result = await operation(conn)
+                first_claimed.set()
+                await release.wait()
+                return result
+
+            return await super()._write(held)
+
+    holder, other = HoldingBroker(engine=broker_engine), DatabaseBroker(engine=broker_engine)
+    await holder._ensure_schema()
+    first = asyncio.create_task(holder.claim_batch("g", batch_size=10, consumer_name="c1"))
+    try:
+        await asyncio.wait_for(first_claimed.wait(), 30)
+        overlapping = [
+            asyncio.create_task(other.claim_batch(group, batch_size=10, consumer_name="c2"))
+            for group in groups
+        ]
+        # Their SELECTs run while the first claim's locks are held; the
+        # row UPDATEs may then wait for that commit, so release it after a
+        # pause rather than after they return.
+        await asyncio.sleep(1.0)
+    finally:
+        release.set()
+    rows = await asyncio.wait_for(first, 30)
+    same_group, other_group = await asyncio.wait_for(asyncio.gather(*overlapping), 30)
+
+    assert (len(rows), len(same_group), len(other_group)) == (10, 10, 10)
+    assert {r["id"] for r in rows}.isdisjoint({r["id"] for r in same_group})
+
+
+@pytest.mark.parametrize("broker_engine", ["postgres"], indirect=True)
+async def test_postgres_claim_orders_a_stale_claim_ahead_of_newer_pending_rows(
+    broker_engine: Any,
+) -> None:
+    """Postgres keeps one select ordered by ``available_at``: an orphaned claim
+    older than a full batch of pending rows is reclaimed in that batch instead
+    of waiting for the backlog to drain."""
+    _, _, message = broker_schema()
+    long_ago = datetime.now(UTC) - timedelta(hours=2)
+    recent = datetime.now(UTC) - timedelta(hours=1)
+
+    def row(row_id: str, status: str, available_at: datetime) -> dict[str, Any]:
+        claimed = status == "claimed"
+        return {
+            "id": row_id,
+            "target": _TARGET,
+            "consumer_group": "g",
+            "event_type": _EVENT_TYPE,
+            "payload": b"{}",
+            "headers": None,
+            "status": status,
+            "attempts": 0,
+            "available_at": available_at,
+            "claimed_at": long_ago if claimed else None,
+            "claimed_by": "crashed" if claimed else None,
+            "created_at": long_ago,
+            "last_error": None,
+            "dispatch_started": False,
+        }
+
+    async with broker_engine.begin() as conn:
+        await conn.execute(
+            message.insert(),
+            [row("stale", "claimed", long_ago)]
+            + [row(f"p{i}", "pending", recent + timedelta(seconds=i)) for i in range(5)],
+        )
+
+    broker = DatabaseBroker(engine=broker_engine)
+    rows = await broker.claim_batch(
+        "g", batch_size=5, consumer_name="c1", reclaim_stale_seconds=60.0
+    )
+
+    assert [r["id"] for r in rows] == ["stale", "p0", "p1", "p2", "p3"]
+
+
 async def test_target_filtered_claim_skips_locked_rows_only_within_its_targets(
     broker_engine: Any,
 ) -> None:

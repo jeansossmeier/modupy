@@ -892,14 +892,13 @@ traceback. Policy knobs: `no_subscriber_policy` (`error`/`wait`/`store`, default
 `error`) and `orphan_replay_policy` (`ttl_all_groups`/`first_groups`/
 `expected_groups`) control publish-before-subscribe behavior; see COOKBOOK.
 
-*SQLite specifics.* SQLite has no row locking and rejects `SKIP LOCKED`, so it
-degrades to a plain single-transaction claim — correct for sequential
-consumption but not the concurrency guarantee Postgres/MySQL give. For
-best-effort multi-process use it is hardened with WAL journaling + `busy_timeout`
-on every connection, plus a bounded application-level retry on a transient
-"database is locked" (SQLite raises `SQLITE_BUSY` immediately, ignoring
-`busy_timeout`, when a read lock upgrades to a write lock — exactly what a claim
-does). Postgres `LISTEN`/`NOTIFY` (a low-latency alternative to polling) is a
+*SQLite specifics.* SQLite has no row locking and rejects `SKIP LOCKED`, so a
+claim opens with `BEGIN IMMEDIATE`, taking the database write lock before it
+reads. Two consumers of one group on one file never claim the same row, but
+their claims run one after another instead of partitioning the backlog in
+parallel as on Postgres/MySQL. Every connection uses WAL journaling and
+`busy_timeout`, plus a bounded application-level retry on a transient
+"database is locked". Postgres `LISTEN`/`NOTIFY` (a low-latency alternative to polling) is a
 planned opt-in; today the transport polls on every dialect.
 
 ### 8.5 The durable local SHM broker

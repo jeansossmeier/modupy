@@ -83,14 +83,15 @@ MySQL 8.0.1+ and MariaDB 10.6+ lets concurrent consumers partition the backlog
 instead of blocking or double-claiming (see ``_supports_skip_locked``). An
 older MySQL-family server is rejected with a ``ConfigurationError``
 (``_require_skip_locked``), never given an unlocked claim. SQLite has no row locking at
-all and rejects the clause, so it degrades to a plain claim inside one
-transaction — correct for sequential consumption in tests, but not a
-substitute for the Postgres/MySQL concurrency guarantee. SQLite is hardened
-for best-effort multi-process use: WAL journaling + ``busy_timeout`` on every
-connection (``_install_sqlite_pragmas``) plus a bounded application retry on a
-transient "database is locked" (``_write`` / ``_SQLITE_BUSY_MAX_RETRIES``,
-needed because SQLite raises SQLITE_BUSY immediately — ignoring busy_timeout —
-when a read lock upgrades to a write lock, exactly what the claim does).
+all and rejects the clause, so the claim opens with ``BEGIN IMMEDIATE``:
+claims on one file run one at a time and never hand a row to two consumers,
+but they do not run in parallel the way Postgres/MySQL claims do. SQLite is
+hardened for best-effort multi-process use: WAL journaling + ``busy_timeout``
+on every connection (``_install_sqlite_pragmas``) plus a bounded application
+retry on a transient "database is locked" (``_write`` /
+``_SQLITE_BUSY_MAX_RETRIES``, needed because SQLite raises SQLITE_BUSY
+immediately — ignoring busy_timeout — when a read lock upgrades to a write
+lock, as a deferred transaction's first write does).
 
 Retention: terminal rows ('done' left by ``completion_mode='mark'``, and
 'dead' letters) accumulate unless pruned. ``DatabaseBroker.prune()`` deletes
@@ -1919,7 +1920,13 @@ class DatabaseBroker:
         latter are orphans left by a consumer that crashed between claim and
         ack, so reclaiming them is what preserves at-least-once delivery across
         a consumer crash (the DB analogue of the Redis adapter's XAUTOCLAIM
-        reclaim).
+        reclaim). The order is dialect-specific. Postgres and SQLite run one
+        select over both kinds, ordered by ``available_at``, so an orphaned
+        claim is reclaimed ahead of newer pending rows. MySQL and MariaDB claim
+        pending rows first and let stale claims fill only what is left of
+        ``batch_size``, so a stale claim waits behind a backlog that fills the
+        page: InnoDB would otherwise lock the whole backlog and starve an
+        overlapping claim.
 
         A reclaim re-stamps ``claimed_at``/``claimed_by``, and bumps
         ``attempts`` only when the abandoned claim had started dispatching
@@ -1936,8 +1943,9 @@ class DatabaseBroker:
 
         Postgres/MySQL: ``FOR UPDATE SKIP LOCKED`` lets concurrent consumers
         partition the backlog instead of blocking or double-claiming. SQLite
-        (no row locking) degrades to a plain claim inside one transaction —
-        see ``_supports_skip_locked`` and the module docstring.
+        (no row locking) opens the claim with ``BEGIN IMMEDIATE`` so claims on
+        one file run one at a time — see ``_supports_skip_locked`` and the
+        module docstring.
         """
         await self._ensure_schema()
         server_version = await self._mysql_server_version()
@@ -1948,30 +1956,42 @@ class DatabaseBroker:
         cap = None if max_attempts is None else _positive_int(max_attempts, "max_attempts")
 
         async def op(conn: Any) -> list[dict[str, Any]]:
+            if self._is_sqlite:
+                # SQLite has no row locks: take the write reservation before
+                # the SELECT, as _write_target_locked does, so two consumers
+                # of one group cannot both read the same pending rows.
+                await conn.exec_driver_sql("BEGIN IMMEDIATE")
             now = await self._now(conn)
             stale_cutoff = now - timedelta(seconds=reclaim_stale_seconds)
-            stmt = (
-                select(message)
-                .where(
-                    message.c.consumer_group == group,
-                    message.c.available_at <= now,
-                    or_(
-                        message.c.status == "pending",
-                        and_(
-                            message.c.status == "claimed",
-                            message.c.claimed_at <= stale_cutoff,
-                        ),
-                    ),
+
+            async def due(*status_filter: Any, limit: int) -> list[dict[str, Any]]:
+                stmt = (
+                    select(message)
+                    .where(
+                        message.c.consumer_group == group,
+                        message.c.available_at <= now,
+                        *status_filter,
+                    )
+                    .order_by(message.c.available_at)
+                    .limit(limit)
                 )
-                .order_by(message.c.available_at)
-                .limit(batch_size)
-            )
-            if targets is not None:
-                stmt = stmt.where(message.c.target.in_(list(targets)))
-            if _supports_skip_locked(self._engine, server_version):
-                stmt = stmt.with_for_update(skip_locked=True)
-            result = await conn.execute(stmt)
-            rows = [dict(row._mapping) for row in result]
+                if targets is not None:
+                    stmt = stmt.where(message.c.target.in_(list(targets)))
+                if _supports_skip_locked(self._engine, server_version):
+                    stmt = stmt.with_for_update(skip_locked=True)
+                return [dict(row._mapping) for row in await conn.execute(stmt)]
+
+            stale = and_(message.c.status == "claimed", message.c.claimed_at <= stale_cutoff)
+            dialect = getattr(getattr(self._engine, "dialect", None), "name", "sqlite")
+            if dialect in _MYSQL_FAMILY_DIALECTS:
+                # Two selects rather than one OR: InnoDB locks every row an
+                # OR / ORDER BY scan visits, so a single select over the whole
+                # backlog makes an overlapping claim skip all of it.
+                rows = await due(message.c.status == "pending", limit=batch_size)
+                if len(rows) < batch_size:
+                    rows += await due(stale, limit=batch_size - len(rows))
+            else:
+                rows = await due(or_(message.c.status == "pending", stale), limit=batch_size)
 
             charged = [
                 row for row in rows if row["status"] == "claimed" and row["dispatch_started"]

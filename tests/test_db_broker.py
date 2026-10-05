@@ -1558,6 +1558,103 @@ async def test_orphaned_claim_is_reclaimed_after_visibility_timeout(engine: Any)
     assert reclaimed[0]["id"] == first[0]["id"]
 
 
+async def test_two_consumers_of_one_group_on_one_sqlite_file_never_claim_the_same_row(
+    tmp_path: Path,
+) -> None:
+    """SQLite has no row locks, so the claim's SELECT and its UPDATEs must run
+    in one write transaction; otherwise both consumers read the same pending
+    rows before either marks them claimed (6 to 8 of 8 rounds duplicated)."""
+    url = f"sqlite+aiosqlite:///{tmp_path / 'claim-race.db'}"
+    target = "fakeapp.orders.WidgetCreated"
+    rounds, backlog = 8, 100
+    groups = [f"g{i}" for i in range(rounds)]
+    first, second = DatabaseBroker(url=url), DatabaseBroker(url=url)
+    try:
+        for group in groups:
+            await first.subscribe([target], group)
+        for i in range(backlog):
+            await first.publish(target, f"p{i}".encode(), {"event_type": target})
+
+        for group in groups:
+            rows_a, rows_b = await asyncio.gather(
+                first.claim_batch(group, batch_size=backlog, consumer_name="c1"),
+                second.claim_batch(group, batch_size=backlog, consumer_name="c2"),
+            )
+            ids_a = {row["id"] for row in rows_a}
+            ids_b = {row["id"] for row in rows_b}
+            assert ids_a.isdisjoint(ids_b), group
+            assert len(ids_a) + len(ids_b) == backlog, group
+    finally:
+        await asyncio.gather(first.close(), second.close(), return_exceptions=True)
+
+
+async def test_sqlite_claim_orders_a_stale_claim_ahead_of_newer_pending_rows(
+    engine: Any,
+) -> None:
+    """Off MySQL a claim is one select ordered by ``available_at``, so an
+    orphaned claim older than a full batch of pending rows is reclaimed in
+    that batch instead of waiting for the backlog to drain."""
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    from sqlalchemy import update
+
+    _, _, message = broker_schema()
+    await _insert_ex(engine, id="stale", status="claimed", claimed_by="crashed")
+    for i in range(5):
+        await _insert_ex(engine, id=f"p{i}", status="pending")
+    long_ago = datetime.now(UTC) - timedelta(hours=2)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(message)
+            .where(message.c.id == "stale")
+            .values(available_at=long_ago, claimed_at=long_ago)
+        )
+
+    rows = await broker.claim_batch(
+        "g", batch_size=5, consumer_name="c1", reclaim_stale_seconds=60.0
+    )
+
+    assert "stale" in {r["id"] for r in rows}
+    assert len(rows) == 5
+
+
+async def _row_times(engine: Any, row_id: str) -> Any:
+    from sqlalchemy import select
+
+    _, _, message = broker_schema()
+    async with engine.connect() as conn:
+        return (await conn.execute(select(message).where(message.c.id == row_id))).one()
+
+
+async def test_failed_row_stays_unclaimable_until_its_backoff_has_passed(engine: Any) -> None:
+    """``fail`` pushes ``available_at`` into the future; ``claim_batch`` must not
+    hand the row out before the claim's own clock reaches it, and must once it
+    has. Attempt 5 backs off 0.8s: long enough that an immediate claim cannot
+    pass by timing luck, short enough to wait out."""
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="r1", status="claimed", attempts=4, claimed_by="c1")
+
+    await broker.fail("r1", "boom", consumer_name="c1", max_attempts=100)
+    row = await _row_times(engine, "r1")
+    assert row.status == "pending" and row.attempts == 5
+    available_at = row.available_at.replace(tzinfo=UTC)
+
+    assert await broker.claim_batch("g", batch_size=10, consumer_name="c2") == []
+
+    async def _claimed() -> list[dict[str, Any]]:
+        return await broker.claim_batch("g", batch_size=10, consumer_name="c2")
+
+    claimed: list[dict[str, Any]] = []
+    for _ in range(100):
+        claimed = await _claimed()
+        if claimed:
+            break
+        await asyncio.sleep(0.05)
+    assert [r["id"] for r in claimed] == ["r1"]
+    assert (await _row_times(engine, "r1")).claimed_at.replace(tzinfo=UTC) >= available_at
+
+
 async def test_reclaim_of_a_started_dispatch_counts_as_a_delivery_attempt(engine: Any) -> None:
     """A consumer that dies (or wedges) after handing a row to its listener
     and before ack never reaches ``fail()``, so the reclaim itself has to burn
