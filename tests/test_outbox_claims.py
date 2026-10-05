@@ -817,6 +817,74 @@ async def test_lease_sweep_does_not_offer_optional_keywords_to_a_catch_all_store
     ]
 
 
+class _LegacyStoreReturning(StubStore):
+    """A four-keyword store, so the sweep cannot exclude its in-flight ids."""
+
+    def __init__(self, row: EventPublication) -> None:
+        super().__init__()
+        self.rows[row.id] = row
+        self.renewed: list[tuple[UUID, float]] = []
+
+    async def claim_batch(
+        self, *, owner: str, batch_size: int, lease_seconds: float, older_than: timedelta
+    ) -> list[EventPublication]:
+        return list(self.rows.values())
+
+    async def renew_claim(
+        self, publication_id: UUID, claim_token: str, lease_seconds: float
+    ) -> bool:
+        self.renewed.append((publication_id, lease_seconds))
+        return True
+
+
+async def test_lease_sweep_leaves_a_row_it_is_delivering_when_the_store_returns_it() -> None:
+    """A store without ``exclude_ids`` can hand back a row this process is still
+    delivering: the sweep neither re-arms nor dispatches it, so the next claim
+    charges no interruption and the listener does not run twice."""
+    _bootstrap_with_listener(record)
+    row = _make_pub(record, claim_token="token")
+    store = _LegacyStoreReturning(row)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    with outbox._inflight_lock:
+        outbox._inflight_ids.add(row.id)
+
+    await outbox._sweep(timedelta(0))
+
+    assert store.renewed == []
+    assert received == []
+    assert store.completed == []
+
+
+class _UnreadableSignatureClaim:
+    """``inspect.signature`` raises TypeError on a non-Signature ``__signature__``."""
+
+    __signature__ = "unreadable"
+
+    def __init__(self) -> None:
+        self.kwargs: list[dict[str, Any]] = []
+
+    async def __call__(self, **kwargs: Any) -> list[EventPublication]:
+        self.kwargs.append(kwargs)
+        return []
+
+
+async def test_lease_sweep_offers_no_optional_keyword_when_claim_batch_has_no_readable_signature() -> (
+    None
+):
+    store = StubStore()
+    claim = _UnreadableSignatureClaim()
+    store.claim_batch = claim  # type: ignore[attr-defined]
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    with outbox._inflight_lock:
+        outbox._inflight_ids.add(uuid4())
+
+    await outbox._sweep(timedelta(0))
+
+    assert [set(kwargs) for kwargs in claim.kwargs] == [
+        {"owner", "batch_size", "lease_seconds", "older_than"}
+    ]
+
+
 def test_the_claiming_store_protocol_documents_exclude_ids() -> None:
     from modulith import _claims
 
