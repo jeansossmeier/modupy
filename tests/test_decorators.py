@@ -296,6 +296,105 @@ def test_async_bound_method_listener_id_is_prefixed_with_its_module_package(
     ]
 
 
+def test_sync_bound_method_listener_id_is_prefixed_with_its_module_package(
+    make_fake_app,
+) -> None:
+    """A sync bound method gets the owner prefix its async twin gets; plain
+    functions and partials of them keep their module-qualified ids."""
+    make_fake_app(
+        {
+            "orders": """
+                import functools
+                from dataclasses import dataclass
+
+                from modulith import event, listener
+
+                @event
+                @dataclass(frozen=True)
+                class Placed:
+                    order_id: str
+
+                class SyncNotifier:
+                    def on_placed(self, evt: Placed) -> None: ...
+
+                class AsyncNotifier:
+                    async def on_placed(self, evt: Placed) -> None: ...
+
+                def plain(evt: Placed) -> None: ...
+
+                listener(SyncNotifier().on_placed)
+                listener(AsyncNotifier().on_placed)
+                listener(plain)
+                partial_of_plain = functools.partial(plain)
+            """
+        }
+    )
+    _runtime.configure(package="fakeapp")
+    import fakeapp.orders as orders
+
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.event_bus is not None
+    handlers = _runtime.event_bus.listeners_for(orders.Placed)
+    assert sorted(outbox._listener_id(h) for h in handlers) == [
+        "fakeapp.orders.plain",
+        "fakeapp.orders:fakeapp.orders.AsyncNotifier.on_placed",
+        "fakeapp.orders:fakeapp.orders.SyncNotifier.on_placed",
+    ]
+    assert outbox._listener_id(orders.partial_of_plain) == "fakeapp.orders.plain"
+
+
+def _wrapping_decorator(is_async: bool):
+    """A ``functools.wraps`` decorator defined in a module of its own, so the
+    wrapper's ``__globals__`` do not contain this file's event types."""
+    namespace: dict[str, object] = {}
+    source = textwrap.dedent(
+        """
+        import functools
+
+        def timing(f):
+            @functools.wraps(f)
+            {kw}def wrapped(*args, **kwargs):
+                return {aw}f(*args, **kwargs)
+
+            return wrapped
+        """
+    ).format(kw="async " if is_async else "", aw="await " if is_async else "")
+    exec(source, namespace)
+    return namespace["timing"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+async def test_listener_accepts_a_bound_method_with_a_wrapping_decorator(is_async: bool) -> None:
+    """The event type comes from the method's own annotation, ``self`` excluded."""
+    calls: list[tuple[object, E]] = []
+    timing = _wrapping_decorator(is_async)
+
+    class Service:
+        if is_async:
+
+            @timing
+            async def on_order(self, evt: E) -> None:
+                calls.append((self, evt))
+
+        else:
+
+            @timing
+            def on_order(self, evt: E) -> None:
+                calls.append((self, evt))
+
+    service = Service()
+
+    listener(service.on_order)
+
+    event_type, registered = _runtime._pending_listeners[0]
+    assert event_type is E
+    event_instance = E()
+    await registered(event_instance)
+    assert calls == [(service, event_instance)]
+
+
 class AsyncEmailSender:
     async def __call__(self, evt: E) -> None:
         pass

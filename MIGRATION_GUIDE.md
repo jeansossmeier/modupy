@@ -429,6 +429,23 @@ outbox.configure(
 
 The session binding above is the same either way.
 
+### Upgrading to 0.11.0: sync bound-method listener ids
+
+A sync `def` method registered as a bound method (`listener(Service().on_order)`)
+now gets the same stored outbox listener id an `async def` method already had:
+`<module package>:<class module>.<ClassName>.<method>`. Before, the
+`<module package>:` prefix was missing. Plain functions, callable instances and
+`functools.partial` keep their ids.
+
+An outbox row stored under the old, unprefixed id no longer matches any
+listener after the upgrade. Drain the outbox first: stop publishing, then let
+the retry sweep deliver (or clear) every pending and failed row for such
+listeners before you deploy. A row left behind is never delivered to the
+method. In a single-process app each sweep logs `no registered listener` and
+counts a failed attempt until the row dead-letters (after 10 attempts by
+default). In a process-per-module worker the sweep skips the row as belonging
+to another worker, so it stays pending with no attempts and no error recorded.
+
 ---
 
 ## Step 6 (optional) — Process-per-module (when one module needs more CPU)

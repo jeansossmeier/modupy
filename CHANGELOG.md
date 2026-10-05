@@ -171,6 +171,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `modulith doctor` names the exception type when a check fails with an exception that carries no message, instead of an empty `check raised:` summary
 - `modulith audit` no longer overwrites a report file that appears while the audit runs unless `--force` is passed, and relative sqlite URLs keep their `///` form when the CLI prints them masked
 - The Redis Streams broker in the parent process trims streams at `MODULITH_BROKER_MAX_STREAM_LEN` when `MODULITH_STREAM_MAXLEN` is not set, the cap the supervisor gives workers; the parent used to keep the 10000 default
+- `@listener` accepts a bound method whose function carries a `functools.wraps` decorator, sync or async, instead of raising "must annotate its event parameter"; and a sync bound-method listener's stored outbox id gets the owning module prefix an async one already had (`orders:orders.Notifier.on_placed`), see Upgrade notes
 
 ### Security
 
@@ -185,6 +186,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - Migrations: the first `modulith migrate`, or raw `alembic upgrade`, after upgrading moves modupy's revision from `alembic_version` into the new `modulith_alembic_version` table before it migrates. It runs no migration again, leaves any other revision in `alembic_version` alone, and drops that table only if it is then empty
 - Boundary verification: package-level imports of a sibling module are now checked (see Changed). Run `modulith verify` before upgrading a project that sets `strict_boundaries = true`, because such an import now stops the app from starting
 - Broker configuration: `max_payload_bytes` is checked when the app starts, for every broker (see Fixed). On the shm broker a value above 1,000,000,000 bytes, including the 1 GiB the documentation gave as the maximum, now stops the app from starting, as do a bool or a float under any broker and an invalid `MODULITH_BROKER_MAX_PAYLOAD_BYTES` under the in-memory broker. Lower an shm value to 1,000,000,000 or less
+- Durable outbox: a sync `def` method registered as a bound method stores a new listener id (see Fixed). Drain pending and failed outbox rows for such listeners before upgrading: a row left under the old id is never delivered, and either dead-letters (single process) or stays pending (process-per-module). MIGRATION_GUIDE.md "Upgrading to 0.11.0" has the details
 
 ## [0.10.0] — 2026-09-29
 

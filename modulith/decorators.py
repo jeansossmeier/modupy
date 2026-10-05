@@ -114,6 +114,9 @@ def _annotation_globals(target: Callable[..., Any]) -> dict[str, Any]:
     """
     while isinstance(target, functools.partial):
         target = target.func
+    # A wrapper's ``__globals__`` belong to the decorator's module, not to the
+    # module whose annotations are being resolved.
+    target = inspect.unwrap(target)
     found = getattr(target, "__globals__", None)
     if found is None:
         found = getattr(type(target).__call__, "__globals__", {})
@@ -262,7 +265,9 @@ def listener(
         # functools.wraps chains can hide an async target behind a sync wrapper.
         unwrapped = inspect.unwrap(handler)
         target_is_async = inspect.iscoroutinefunction(unwrapped)
-        resolve_target = unwrapped
+        # A bound method keeps its binding: inspect.signature drops ``self`` and
+        # follows ``functools.wraps`` through ``__func__``, which unwrap() cannot.
+        resolve_target = handler if inspect.ismethod(handler) else unwrapped
         if not target_is_async:
             call = getattr(unwrapped, "__call__", None)  # noqa: B004
             if call is not None and inspect.iscoroutinefunction(call):
@@ -289,16 +294,17 @@ def listener(
                 return result
 
             async_adapter.__modulith_sync_wrapped__ = handler  # type: ignore[attr-defined]
-            if inspect.ismethod(handler):
-                # outbox._listener_id adds the owning module package to a bound
-                # method's id only when it sees a method or this marker.
-                async_adapter.__modulith_instance_listener__ = True  # type: ignore[attr-defined]
             registered = async_adapter
         else:
             from .sync import wrap_sync_listener
 
             registered = wrap_sync_listener(handler)
 
+        if inspect.ismethod(handler):
+            # outbox._listener_id adds the owning module package to a bound
+            # method's id only when it sees a method or this marker, and the
+            # registered adapter or wrapper is not a method.
+            registered.__modulith_instance_listener__ = True  # type: ignore[union-attr]
         if registered is not handler and not hasattr(handler, "__qualname__"):
             # A callable instance has no __qualname__, so functools.wraps leaves
             # the adapter's own and every instance in a module would share one
