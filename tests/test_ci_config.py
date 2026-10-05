@@ -380,8 +380,8 @@ def test_unit_matrix_collects_coverage_once_on_311() -> None:
     assert isinstance(strategy, dict), "test job must define a matrix strategy"
     matrix = strategy.get("matrix")
     assert isinstance(matrix, dict)
-    assert matrix.get("python-version") == ["3.11", "3.12", "3.13"], (
-        "test matrix must cover exactly Python 3.11, 3.12, and 3.13"
+    assert matrix.get("python-version") == ["3.11", "3.12", "3.13", "3.14"], (
+        "test matrix must cover exactly Python 3.11, 3.12, 3.13, and 3.14"
     )
 
     coverage_run = [
@@ -1077,3 +1077,46 @@ def test_release_build_job_has_inspection_and_smoke_test() -> None:
     assert "Smoke-test wheel installs" in step_names, (
         "build job must include 'Smoke-test wheel installs' step"
     )
+
+
+def test_ci_fails_when_the_lockfile_is_stale() -> None:
+    """``uv.lock`` is committed, so a pyproject edit that forgets to refresh it
+    must fail CI rather than leave the lock silently out of date."""
+    assert any(
+        isinstance(step.get("run"), str)
+        and _has_shell_command(step["run"], ["uv", "lock", "--check"])
+        for job in _jobs()
+        for step in _job_steps(job)
+    ), "ci.yml must run `uv lock --check` in some job"
+
+
+def test_ci_runs_on_a_weekly_schedule() -> None:
+    """Dependencies are unpinned in CI, so a scheduled run is what surfaces a
+    newly released dependency that breaks the suite without any push."""
+    workflow = yaml.safe_load(_ci_text())
+    assert isinstance(workflow, dict)
+    triggers = workflow.get("on", workflow.get(True))  # YAML 1.1 parses `on` as True
+    assert isinstance(triggers, dict)
+    schedule = triggers.get("schedule")
+    assert isinstance(schedule, list) and schedule, "ci.yml must define a `schedule:` trigger"
+    crons = [entry["cron"] for entry in schedule]
+    assert all(len(cron.split()) == 5 and cron.split()[4] != "*" for cron in crons), (
+        f"schedule must run weekly (a fixed day-of-week), got {crons!r}"
+    )
+
+
+def test_readme_names_every_python_in_the_unit_matrix() -> None:
+    """The README's test-coverage sentence lists the Python versions CI runs."""
+    matrix = _jobs()["test"]["strategy"]["matrix"]["python-version"]
+    sentence = next(
+        line
+        for line in (REPO_ROOT / "README.md").read_text(encoding="utf-8").splitlines()
+        if "hermetic tests on Python" in line
+    )
+    missing = [v for v in matrix if not re.search(rf"(?<![\d.]){re.escape(v)}(?![\d])", sentence)]
+    assert not missing, f"README sentence {sentence!r} omits {missing!r}"
+
+
+def test_contributing_explains_how_to_refresh_the_lockfile() -> None:
+    text = (REPO_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    assert "uv lock" in text and "uv lock --check" in text

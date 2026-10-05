@@ -664,7 +664,7 @@ modupy is inspired by [Spring Modulith](https://spring.io/projects/spring-moduli
 
 modupy is a **pre-1.0 alpha**: breaking changes may land in 0.x minor releases, and each one is listed in [CHANGELOG.md](https://github.com/jeansossmeier/modupy/blob/main/CHANGELOG.md).
 The core, the transactional outbox, the tooling and the process-per-module runtime are code-complete and pass `pytest`, `mypy --strict` and `ruff`; more adapters follow after 1.0, as users ask for them ([ROADMAP.md](https://github.com/jeansossmeier/modupy/blob/main/ROADMAP.md)).
-Every pull request and every push to `main` runs more than 2,600 hermetic tests on Python 3.11, 3.12 and 3.13 (Linux, with the SHM broker also on macOS and Windows), plus more than 140 integration tests against real Postgres, MySQL and Redis containers, which include every example README run from the built wheel.
+Every pull request and every push to `main` runs more than 2,600 hermetic tests on Python 3.11, 3.12, 3.13 and 3.14 (Linux, with the SHM broker also on macOS and Windows), plus more than 140 integration tests against real Postgres, MySQL and Redis containers, which include every example README run from the built wheel.
 [STABILITY.md](https://github.com/jeansossmeier/modupy/blob/main/docs/STABILITY.md) states what stays stable across 0.x releases.
 
 ## Documentation

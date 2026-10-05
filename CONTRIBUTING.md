@@ -17,6 +17,11 @@ the `>=3.11` this project requires (the install then fails to resolve).
 
 This installs the framework, all feature extras (postgres, redis, database, otel, fastapi, cli), and dev tools (ruff, mypy, pytest, pytest-cov, integration test dependencies).
 
+CI fails when `uv.lock` is out of date (`uv lock --check`). After changing
+dependencies in `pyproject.toml`, refresh the lock with `uv lock` and commit
+the result; `uv lock --check` verifies it locally. CI also runs weekly, so a
+new upstream release that breaks the suite shows up without a push.
+
 ## Running Tests
 
 There are two test suites. Both require the dev setup above.
