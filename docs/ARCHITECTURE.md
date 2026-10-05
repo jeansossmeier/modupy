@@ -628,7 +628,7 @@ at-least-once and **listeners must be idempotent**.
 ### 7.5 Serialization
 
 `EventSerializer` governs **storage** of publication records; the default is
-`JsonEventSerializer`. Note the deliberate asymmetry (SPEC §10.2): the **broker
+`JsonEventSerializer`. Note the deliberate asymmetry (SPEC §4.2): the **broker
 wire format is fixed JSON**, spoken identically by the direct publish
 path, the durable broker-route path, and the worker consumer — a pluggable
 *storage* serializer does not change what goes on the wire. Because

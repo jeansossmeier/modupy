@@ -240,6 +240,14 @@ Fields decode by their annotations:
   an alias whose value cannot be evaluated at runtime (a `TYPE_CHECKING`-only
   name) or that refers back to itself is left opaque: those fields pass
   through as their JSON values.
+- A parameterized generic dataclass, such as `Box[int]` for a
+  `@dataclass class Box(Generic[T])`, is not reconstructed, even from a value
+  of exactly that class: the listener receives the plain `dict` of its stored
+  fields (`{"v": 3}`), every value still in its JSON form (a `datetime`,
+  `Decimal` or `UUID` is a string, a nested dataclass a `dict`). This holds
+  wherever the hint appears, for example as a `list` element, a `dict` value
+  or an `Optional` member. Annotate the field with a non-generic dataclass to
+  receive an instance.
 - Two field shapes carry a type tag,
   `{"__modulith_union_type__": "<module>.<qualname>", "value": ...}`: a
   multi-member union, and a nested dataclass holding an instance of a subclass
