@@ -721,15 +721,20 @@ written, so shortening it frees nothing in a store that is already full.
 
 A backlog frees space only as consumers drain it, or when
 `modulith broker drop-group` removes a retired group. Until then a retired or
-stopped group pins every publication to its targets, and the `modulith run`
-startup warning names a retired group only 24 hours after its last consumer
-activity, so size for that backlog or drop the group with `--force` as soon
-as no host runs it.
+stopped group pins every publication to its targets. Only the supervisor of
+`modulith run --topology processes` checks for a retired group at startup, and
+its warning names the group only 24 hours after its last consumer activity; a
+single-process or Kubernetes deployment gets none. Size for that backlog, or
+drop the group with `--force` as soon as no host runs it.
 
 A new `max_store_bytes` or `retention_age_seconds` applies to a process only
-after it restarts. `orphan_retention_seconds` is capped at 100 years
-(3153600000). A group that subscribes after a publication replays it only
-within that window.
+after it restarts. Every process that shares a store must use the same
+`max_store_bytes`; restart them all after changing it. Each process enforces its
+own limit on its own publishes, so a process with a larger limit fills the pages
+that a process with a smaller limit reserves for its consumers, and the
+smaller-limit process then has its publishes refused as store full.
+`orphan_retention_seconds` is capped at 100 years (3153600000). A group that
+subscribes after a publication replays it only within that window.
 
 Publishes are refused once the pages in use (the page count minus the free
 pages) pass `max_store_bytes` less a 32-page consumer reserve (128 KiB at 4 KiB
@@ -754,7 +759,14 @@ succeed. Draining can still take the store past the budget, as any consumer
 write can: failed and dead-lettered rows keep their error text, and under
 `completion_mode="mark"` claiming and acking grows every row, including rows
 other groups replayed. Publishes are then refused until prune frees pages or
-`max_store_bytes` is raised.
+`max_store_bytes` is raised. Measured on a store filled to its publish budget
+with small publications and then drained by one group, acking every delivery
+left the file at 0.97x (delete mode) to 1.17x (mark mode) of `max_store_bytes`.
+Dead-lettering every delivery with a 500-character error, the most the
+dispatcher stores, left it at about 3x in either mode. Larger payloads lower
+that ratio and more groups failing the same publications raise it. The file does
+not shrink afterwards, so budget disk for that growth if a listener can fail
+every delivery.
 
 A replay cut short logs one WARNING naming the group and the target, with the
 replayed and skipped counts. The skipped publications reach that group only
@@ -776,7 +788,10 @@ same way; publishes resume once the drained store is back under the limit, and
 an existing larger file keeps its size. Budget disk for the store's `-wal` file
 on top: it is not counted, grows to about 4 MiB (SQLite's 1000-page
 autocheckpoint) before checkpoints reuse it, grows further while a long read
-blocks a checkpoint, and keeps its largest size.
+blocks a checkpoint, grows by about 115 bytes for every publication a subscribe
+replays (the replay is one transaction, so no checkpoint runs inside it: 5.4 MiB
+for 50,000 replayed publications, 22.3 MiB for 200,000), and keeps its largest
+size.
 
 ---
 
