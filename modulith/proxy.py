@@ -40,6 +40,7 @@ from urllib.parse import quote, unquote, urlsplit
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.convertors import PathConvertor, register_url_convertor
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -52,6 +53,16 @@ _DOWN_RETRY_SECONDS = 5.0
 DEFAULT_IDENTITY_PROBE_TIMEOUT = 30.0
 _MAX_HEALTH_BODY_BYTES = 64 * 1024
 _PROBE_MAX_CONNECTIONS = 100
+
+
+class _AnyCharPathConvertor(PathConvertor):
+    """Starlette's ``path`` convertor (``.*``) stops at a newline, so a path
+    holding ``%0A`` fell through to Starlette's 404 instead of reaching the worker."""
+
+    regex = "(?s:.*)"
+
+
+register_url_convertor("any_path", _AnyCharPathConvertor())
 
 
 def _cookieless_jar() -> http.cookiejar.CookieJar:
@@ -271,6 +282,10 @@ def create_proxy_app(
     probe, so a stalled backend holds one probe connection however many
     requests are waiting for it; a waiting request that is cancelled leaves
     that probe running for the others.
+
+    The proxy never follows a backend redirect, whatever the client's own
+    ``follow_redirects`` setting: the redirect reaches the caller intact, with
+    its ``Location`` and ``Set-Cookie``.
 
     No client stores upstream cookies: both owned clients, and an injected
     ``client`` (whose jar is replaced), refuse every ``Set-Cookie``, so one
@@ -541,7 +556,7 @@ def create_proxy_app(
     # ("Duplicate Operation ID") once per collision while building the schema.
     # A catch-all that forwards opaque bytes has nothing to describe anyway.
     @app.api_route(
-        "/{path:path}",
+        "/{path:any_path}",
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
         include_in_schema=False,
     )
@@ -626,8 +641,13 @@ def create_proxy_app(
         # host is the client's own (its Host header, which _RejectMalformedHost
         # has already vetted); the scheme and port come from the ASGI scope, so
         # no client-supplied text is parsed to produce them.
+        # The client's Content-Length goes too: httpx derives it from the
+        # buffered body, and a stale one beside Transfer-Encoding makes the
+        # upstream writer raise (a 500) on a request that is valid HTTP/1.1.
         fwd_headers = [
-            (k, v) for k, v in fwd_headers if k.lower() not in _DROPPED_FORWARDING_HEADERS
+            (k, v)
+            for k, v in fwd_headers
+            if k.lower() not in _DROPPED_FORWARDING_HEADERS and k.lower() != "content-length"
         ]
         client_host = request.client.host if request.client is not None else ""
         fwd_headers.extend(
@@ -674,7 +694,9 @@ def create_proxy_app(
                         failover = no_worker(rule)
                         break
                     probing = False
-                    upstream_resp = await http_client.send(upstream_req, stream=True)
+                    upstream_resp = await http_client.send(
+                        upstream_req, stream=True, follow_redirects=False
+                    )
                 except TimeoutError:
                     failover = identity_timed_out(backend)
                     break
@@ -723,11 +745,9 @@ def create_proxy_app(
                         break
                     return JSONResponse({"detail": "backend unreachable"}, status_code=502)
                 except httpx.RequestError as exc:
-                    # RequestError siblings outside the TransportError subtree —
-                    # httpx.TooManyRedirects (a redirect-looping backend behind an
-                    # injected follow_redirects=True client) and
-                    # httpx.DecodingError. Both mean "no valid response could be
-                    # obtained from the backend" → 502, honoring the
+                    # RequestError siblings outside the TransportError subtree,
+                    # such as httpx.DecodingError, mean "no valid response could
+                    # be obtained from the backend" → 502, honoring the
                     # never-an-uncaught-500 contract documented above.
                     logger.warning(
                         "backend %s returned no usable response for %s: %s",

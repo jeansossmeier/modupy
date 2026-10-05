@@ -527,7 +527,7 @@ class _FailingClient:
     def build_request(self, *, method, url, headers=None, content=None):
         return httpx.Request(method, url, headers=headers, content=content)
 
-    async def send(self, request, *, stream: bool = False):
+    async def send(self, request, *, stream: bool = False, follow_redirects: bool = True):
         raise self._exc
 
     async def aclose(self) -> None:
@@ -570,7 +570,7 @@ class _BuildRequestFailingClient:
     def build_request(self, *, method, url, headers=None, content=None):
         raise self._exc
 
-    async def send(self, request, *, stream: bool = False):
+    async def send(self, request, *, stream: bool = False, follow_redirects: bool = True):
         self.send_calls += 1
         raise AssertionError("send() must not be reached when build_request raises")
 
@@ -632,28 +632,57 @@ def test_proxy_succeeds_with_slow_upstream() -> None:
     assert resp.json() == {"delayed": "response"}
 
 
-def test_proxy_maps_redirect_loop_to_502(caplog) -> None:
-    """httpx.TooManyRedirects is a RequestError sibling of TransportError —
-    with an injected follow_redirects=True client (the documented seam) a
-    redirect-looping backend escaped the TransportError-only mapping as a raw
-    500, violating the never-uncaught-500 contract. It must map to 502."""
-    caplog.set_level("WARNING", logger="modulith.proxy")
+def test_proxy_hands_a_redirect_loop_to_the_client_instead_of_following_it() -> None:
+    """The proxy sends with ``follow_redirects=False``, so even an injected
+    redirect-following client never follows a backend's redirect: the client
+    gets the 302 and decides, and the backend is contacted once."""
+    seen: list[httpx.Request] = []
 
     def _always_redirect(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(302, headers={"location": str(request.url)})
+        seen.append(request)
+        return httpx.Response(
+            302, headers={"location": str(request.url)}, stream=httpx.ByteStream(b"")
+        )
 
-    # A REAL httpx client that genuinely follows the loop until its own
-    # max_redirects trips — not a stub raising the exception by hand.
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(_always_redirect), follow_redirects=True
     )
     app = create_proxy_app([RoutingRule("/orders", "http://orders-worker")], client=client)
 
     with TestClient(app) as test_client:
-        resp = test_client.get("/orders/ping")
+        resp = test_client.get("/orders/ping", follow_redirects=False)
 
-    assert resp.status_code == 502  # mapped, never an uncaught 500
-    assert "/orders/ping" in caplog.text
+    assert resp.status_code == 302
+    assert len(seen) == 1
+
+
+def test_proxy_keeps_cookie_and_set_cookie_across_a_backend_redirect() -> None:
+    """An injected ``follow_redirects=True`` client used to drop ``Cookie`` on
+    the followed hop and lose the first hop's ``Set-Cookie``; the redirect now
+    reaches the client with the backend's own ``Set-Cookie``."""
+    seen: list[httpx.Request] = []
+
+    def redirect(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            302,
+            headers={"location": "/orders/b", "set-cookie": "hop1=1; Path=/"},
+            stream=httpx.ByteStream(b""),
+        )
+
+    app = create_proxy_app(
+        [RoutingRule("/orders", "http://orders-worker")],
+        client=httpx.AsyncClient(transport=httpx.MockTransport(redirect), follow_redirects=True),
+    )
+    with TestClient(app) as test_client:
+        resp = test_client.get("/orders/a", headers={"cookie": "sid=abc"}, follow_redirects=False)
+
+    assert (resp.status_code, resp.headers["location"], resp.headers["set-cookie"]) == (
+        302,
+        "/orders/b",
+        "hop1=1; Path=/",
+    )
+    assert [r.headers.get("cookie") for r in seen] == ["sid=abc"]
 
 
 def test_proxy_transport_error_logs_omit_query_string_secrets(caplog) -> None:
@@ -705,12 +734,9 @@ def test_proxy_relativizes_a_redirect_against_the_replica_that_served_it() -> No
 def test_proxy_logs_a_request_error_against_the_replica_that_served_it(caplog) -> None:
     caplog.set_level("WARNING", logger="modulith.proxy")
 
-    def replica(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(302, headers={"location": str(request.url)})
-
     app = create_proxy_app(
         [_two_replica_rule()],
-        client=httpx.AsyncClient(transport=httpx.MockTransport(replica), follow_redirects=True),
+        client=_FailingClient(httpx.DecodingError("bad content encoding")),
     )
     with TestClient(app) as client:
         resp = client.get("/orders/ping")
@@ -753,7 +779,7 @@ class _EventuallyBindingClient:
     def build_request(self, *, method, url, headers=None, content=None):
         return httpx.Request(method, url, headers=headers, content=content)
 
-    async def send(self, request, *, stream: bool = False):
+    async def send(self, request, *, stream: bool = False, follow_redirects: bool = True):
         self.send_calls += 1
         if self.send_calls <= self._fail_count:
             raise httpx.ConnectError("worker port not bound yet")
@@ -796,7 +822,7 @@ class _AlwaysFailingClient:
     def build_request(self, *, method, url, headers=None, content=None):
         return httpx.Request(method, url, headers=headers, content=content)
 
-    async def send(self, request, *, stream: bool = False):
+    async def send(self, request, *, stream: bool = False, follow_redirects: bool = True):
         self.send_calls += 1
         raise httpx.ConnectError("worker port never bound")
 
@@ -853,7 +879,7 @@ class _DiesMidStreamClient:
     def build_request(self, *, method, url, headers=None, content=None):
         return httpx.Request(method, url, headers=headers, content=content)
 
-    async def send(self, request, *, stream: bool = False):
+    async def send(self, request, *, stream: bool = False, follow_redirects: bool = True):
         return httpx.Response(
             200,
             headers={"content-type": "text/plain"},
@@ -994,6 +1020,8 @@ async def test_proxy_rejects_dot_segments(raw_path: bytes) -> None:
         b"/orders/@127.0.0.1:1/x",
         b"/orders//127.0.0.1:1/x",
         b"/orders/..x/.y",
+        b"/orders/a%0Ab",
+        b"/orders/a%0A",
     ],
 )
 async def test_proxy_forwards_accepted_targets_only_to_the_backend(raw_path: bytes) -> None:
@@ -1082,6 +1110,59 @@ async def test_proxy_over_real_parser_sends_crafted_targets_nowhere(http: str) -
     assert crafted == ["HTTP/1.1 400 Bad Request"] * 4
     assert control == "HTTP/1.1 200 OK"
     assert worker_saw == ["/orders/x"]
+
+
+def _body_recording_app(seen: list[tuple[str, bytes]]) -> Any:
+    async def app(scope: MutableMapping[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            return
+        body = b""
+        more = True
+        while more:
+            message = await receive()
+            body += message.get("body", b"")
+            more = message.get("more_body", False)
+        seen.append((scope["method"], body))
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"reached"})
+
+    return app
+
+
+@pytest.mark.real_process
+async def test_proxy_forwards_a_request_with_transfer_encoding_and_content_length() -> None:
+    """A client sending both headers (the length is ignored per RFC 9112 6.3)
+    is forwarded with its decoded body, not answered 500 by the upstream
+    request writer rejecting the stale client Content-Length."""
+    worker_port, proxy_port = _free_port(), _free_port()
+    worker_saw: list[tuple[str, bytes]] = []
+    proxy = create_proxy_app(
+        [RoutingRule("/orders", f"http://127.0.0.1:{worker_port}")],
+        actuator_enabled=False,
+        connect_retry_attempts=1,
+    )
+    servers = [
+        await _serve(_body_recording_app(worker_saw), worker_port, "h11"),
+        await _serve(proxy, proxy_port, "h11"),
+    ]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+        writer.write(
+            b"POST /orders/x HTTP/1.1\r\nHost: public.example\r\n"
+            b"Transfer-Encoding: chunked\r\nContent-Length: 1\r\nConnection: close\r\n\r\n"
+            b"a\r\n0123456789\r\n0\r\n\r\n"
+        )
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(), timeout=10.0)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        for server, _ in servers:
+            server.should_exit = True
+        await asyncio.gather(*(task for _, task in servers))
+
+    assert response.split(b"\r\n", 1)[0] == b"HTTP/1.1 200 OK"
+    assert worker_saw == [("POST", b"0123456789")]
 
 
 # ---------------------------------------------------------------------------
