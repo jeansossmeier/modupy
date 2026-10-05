@@ -1879,3 +1879,29 @@ async def test_retry_dead_letters_with_nothing_dead_returns_zero(broker: ShmBrok
 
     assert await broker.retry_dead_letters() == 0
     assert len(await broker.claim_batch("orders", batch_size=5, consumer_name="c1")) == 1
+
+
+async def test_group_backlog_with_targets_reports_one_groups_pending_rows_per_target(
+    tmp_path: Path,
+) -> None:
+    broker = ShmBroker(shm_name=str(tmp_path / "hints"), db_path=str(tmp_path / "q.db"))
+    try:
+        await broker.subscribe(["t.A", "t.B"], "modulith-orders")
+        await broker.subscribe(["t.A"], "modulith-other")
+        for _ in range(3):
+            await broker.publish("t.A", b"x", {"event_type": "t.A"})
+        await broker.publish("t.B", b"y", {"event_type": "t.B"})
+        done = await broker.claim_batch(
+            "modulith-orders", batch_size=1, consumer_name="modulith-orders:w", targets=["t.A"]
+        )
+        await broker.ack(done[0]["id"], consumer_name="modulith-orders:w")
+
+        assert await broker.group_backlog() == {"modulith-orders": 3, "modulith-other": 3}
+        assert await broker.group_backlog(targets=["t.A"]) == {
+            "modulith-orders": 2,
+            "modulith-other": 3,
+        }
+        assert await broker.group_backlog(targets=("t.B",)) == {"modulith-orders": 1}
+        assert await broker.group_backlog(targets=["t.none"]) == {}
+    finally:
+        await broker.close()

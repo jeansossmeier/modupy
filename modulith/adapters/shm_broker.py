@@ -390,9 +390,16 @@ class ShmBroker:
         """Persist exact subscriptions and replay retained publications."""
         await self._cold.subscribe(targets, group)
 
-    async def group_backlog(self) -> dict[str, int]:
-        """Map every subscribed group, or group with undelivered work, to its backlog."""
-        return await self._cold.group_backlog()
+    async def group_backlog(
+        self, *, targets: list[str] | tuple[str, ...] | None = None
+    ) -> dict[str, int]:
+        """Map every subscribed group, or group with undelivered work, to its backlog.
+
+        ``targets``, when given, counts only deliveries on those targets (the rows
+        ``drop_group`` with the same ``targets`` deletes) and lists only groups
+        subscribed to or holding deliveries on them.
+        """
+        return await self._cold.group_backlog(None if targets is None else list(targets))
 
     async def subscribed_groups(self) -> set[str]:
         """Groups that still hold at least one subscription."""

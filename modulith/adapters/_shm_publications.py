@@ -409,26 +409,45 @@ def _replay(
         time.sleep(REPLAY_BATCH_PAUSE_SECONDS)
 
 
-def group_backlog(conn: sqlite3.Connection) -> dict[str, int]:
+def group_backlog(
+    conn: sqlite3.Connection,
+    targets: list[str] | None = None,
+) -> dict[str, int]:
     """Map every group to its pending and claimed delivery count.
 
     A group counts when it is subscribed or still holds pending or claimed
     deliveries, so deliveries left behind by an unsubscribed group show up.
+    ``targets``, when given, counts only deliveries of those targets' publications
+    (what ``drop_group`` with the same ``targets`` deletes) and lists only groups
+    subscribed to or holding deliveries on them.
     """
+    if targets is None:
+        subscription_filter = ""
+        delivery_filter = ""
+        names: tuple[str, ...] = ()
+    else:
+        names = tuple(targets)
+        marks = ",".join("?" * len(names))
+        subscription_filter = f" WHERE target IN ({marks})"
+        delivery_filter = (
+            f" AND publication_id IN (SELECT id FROM shm_publication WHERE target IN ({marks}))"
+        )
     rows = conn.execute(
-        """
+        f"""
         SELECT s.consumer_group, (
-            SELECT COUNT(*) FROM shm_delivery AS d
-            WHERE d.consumer_group=s.consumer_group
-              AND d.status IN ('pending', 'claimed')
+            SELECT COUNT(*) FROM shm_delivery
+            WHERE consumer_group=s.consumer_group
+              AND status IN ('pending', 'claimed'){delivery_filter}
         ) AS backlog
         FROM (
-            SELECT consumer_group FROM shm_subscription
+            SELECT consumer_group FROM shm_subscription{subscription_filter}
             UNION
-            SELECT consumer_group FROM shm_delivery WHERE status IN ('pending', 'claimed')
+            SELECT consumer_group FROM shm_delivery
+            WHERE status IN ('pending', 'claimed'){delivery_filter}
         ) AS s
         ORDER BY s.consumer_group
-        """
+        """,
+        (*names, *names, *names),
     )
     return {str(row["consumer_group"]): int(row["backlog"]) for row in rows}
 

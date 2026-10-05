@@ -2511,3 +2511,44 @@ def test_prune_expired_publications_query_uses_expiry_index(tmp_path: Path) -> N
         assert "idx_shm_publication_expiry" in plan
     finally:
         store.close()
+
+
+def test_group_backlog_with_targets_counts_only_that_groups_undelivered_rows_on_them(
+    tmp_path: Path,
+) -> None:
+    store = _bounded_store(tmp_path / "backlog.db", 4 * 1024 * 1024, completion_mode="mark")
+    try:
+        store.subscribe(["events.A", "events.B"], "g")
+        store.subscribe(["events.A"], "other")
+        for index in range(3):
+            store.publish("events.A", b'{"a":%d}' % index, None, None)
+        for index in range(2):
+            store.publish("events.B", b'{"b":%d}' % index, None, None)
+        done = store.claim("g", 1, _LONG_CONSUMER, 30.0)
+        assert store.ack(done[0]["claim_token"], _LONG_CONSUMER, None)
+        assert store.claim("g", 1, _LONG_CONSUMER, 30.0), "a claimed row still counts"
+
+        assert store.group_backlog() == {"g": 4, "other": 3}
+        assert store.group_backlog(["events.A"]) == {"g": 2, "other": 3}
+        assert store.group_backlog(["events.B"]) == {"g": 2}
+        assert store.group_backlog(["events.A", "events.B"]) == {"g": 4, "other": 3}
+        assert store.group_backlog(["events.never"]) == {}
+        assert store.group_backlog([]) == {}
+    finally:
+        store.close()
+
+
+def test_group_backlog_with_targets_counts_the_rows_drop_group_deletes(tmp_path: Path) -> None:
+    store = _bounded_store(tmp_path / "drop-count.db", 4 * 1024 * 1024)
+    try:
+        store.subscribe(["events.A", "events.B"], "g")
+        for target in ("events.A", "events.A", "events.B"):
+            store.publish(target, b"{}", None, None)
+        store.claim("g", 1, _LONG_CONSUMER, 30.0)
+
+        counted = store.group_backlog(["events.A"])["g"]
+
+        assert counted == 2
+        assert store.drop_group("g", ["events.A"])[1] == counted
+    finally:
+        store.close()

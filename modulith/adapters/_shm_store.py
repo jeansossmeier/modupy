@@ -153,8 +153,8 @@ class SqliteQueueStore:
     def get_subscriptions(self) -> dict[str, list[str]]:
         return _shm_publications.get_subscriptions(self._conn)
 
-    def group_backlog(self) -> dict[str, int]:
-        return _shm_publications.group_backlog(self._conn)
+    def group_backlog(self, targets: list[str] | None = None) -> dict[str, int]:
+        return _shm_publications.group_backlog(self._conn, targets)
 
     def active_groups(self, within_seconds: float) -> set[str]:
         """Groups a consumer refreshed, claimed or completed within ``within_seconds``."""
