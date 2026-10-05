@@ -23,6 +23,7 @@ dispatches before commit" property is observable.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import importlib.util
 import inspect
@@ -252,6 +253,51 @@ async def test_runtime_shutdown_stops_outbox_retry_loop() -> None:
     await _runtime.shutdown()
 
     assert outbox._retry_task is None
+
+
+# ---------------------------------------------------------------------------
+# unbind_session ends the binding its own token's bind_session created
+# ---------------------------------------------------------------------------
+
+
+def test_unbind_session_ends_the_binding_its_token_created() -> None:
+    """Unbinding A while B is bound inside it ends A's binding only: a task that
+    copied B's context keeps its session, one that copied A's context loses it."""
+
+    def scenario() -> None:
+        session_a, session_b = object(), object()
+        token_a = bind_session(session_a)
+        context_a = contextvars.copy_context()
+        bind_session(session_b)
+        context_b = contextvars.copy_context()
+
+        unbind_session(token_a)
+
+        assert outbox._bound_session() is None
+        assert context_a.run(outbox._bound_session) is None
+        assert context_b.run(outbox._bound_session) is session_b
+
+    contextvars.copy_context().run(scenario)
+
+
+def test_unbind_session_in_the_middle_of_three_binds_ends_only_that_binding() -> None:
+    def scenario() -> None:
+        sessions = [object(), object(), object()]
+        tokens = []
+        contexts = []
+        for session in sessions:
+            tokens.append(bind_session(session))
+            contexts.append(contextvars.copy_context())
+
+        unbind_session(tokens[1])
+
+        assert [context.run(outbox._bound_session) for context in contexts] == [
+            sessions[0],
+            None,
+            sessions[2],
+        ]
+
+    contextvars.copy_context().run(scenario)
 
 
 # ---------------------------------------------------------------------------

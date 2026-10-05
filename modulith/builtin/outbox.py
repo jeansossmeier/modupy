@@ -84,7 +84,7 @@ import math
 import threading
 import time
 from collections.abc import Callable
-from contextvars import Context, ContextVar
+from contextvars import Context, ContextVar, Token
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -131,10 +131,13 @@ class _SessionBinding:
     instead of enlisting in a session nobody will commit again.
     """
 
-    __slots__ = ("session",)
+    __slots__ = ("previous", "session")
 
-    def __init__(self, session: Any) -> None:
+    def __init__(self, session: Any, previous: Any | None) -> None:
         self.session: Any | None = session
+        # The value ``_current_session`` held before this bind: ``unbind_session``
+        # follows these links to find the holder a token's bind created.
+        self.previous = previous
 
 
 def _bound_session() -> Any | None:
@@ -177,7 +180,7 @@ def bind_session(session: Any) -> Any:
     this session under the same rule, and its publishes after then take the
     unbound path (direct dispatch, no outbox row).
     """
-    return _current_session.set(_SessionBinding(session))
+    return _current_session.set(_SessionBinding(session, _current_session.get()))
 
 
 def unbind_session(token: Any) -> None:
@@ -188,16 +191,23 @@ def unbind_session(token: Any) -> None:
     (``None`` at the outermost scope, or an outer session if this bind was
     nested inside one) rather than unconditionally clearing it — the same
     guarantee ``contextvars.ContextVar.reset()`` gives, which this wraps.
-    The binding also ends for every task that inherited it.
+    The binding that token's ``bind_session`` call created ends for every task
+    that inherited it, even when a later bind is still open: that later
+    binding is left bound.
 
     Unbinding neither commits nor discards: publications enlisted since the
     last commit are still delivered if the session commits afterwards, and
     are discarded, with a WARNING, if it closes or rolls back instead.
     """
-    binding = _current_session.get()
+    newest = _current_session.get()
     _current_session.reset(token)
-    if isinstance(binding, _SessionBinding):
-        binding.session = None
+    before = None if token.old_value is Token.MISSING else token.old_value
+    binding = newest
+    while isinstance(binding, _SessionBinding):
+        if binding.previous is before:
+            binding.session = None
+            return
+        binding = binding.previous
 
 
 # Module-level state. Bound during configure().
