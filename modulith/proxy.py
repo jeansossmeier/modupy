@@ -24,13 +24,14 @@ import asyncio
 import hmac
 import http.cookiejar
 import logging
+import secrets
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from itertools import cycle
 from typing import Any
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit
 
 # These are imported at module level (not lazily) so FastAPI's get_type_hints
 # can resolve the route handlers' string annotations against this module's
@@ -39,7 +40,10 @@ from urllib.parse import quote, unquote
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+from ._worker import NONCE_HEADER, identity_proof
 
 logger = logging.getLogger("modulith.proxy")
 DEFAULT_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
@@ -214,17 +218,25 @@ def create_proxy_app(
     report such a module as ``"failed (given up)"`` instead of the generic
     ``"unreachable"`` a worker mid-restart-backoff also produces.
 
-    ``deployment_token`` (set by ``run_supervised``) is the value this
-    deployment's workers echo as ``"deployment"`` on their ``/health``. A
-    backend answering without it — another deployment's worker, or any other
-    process holding the port — is reported ``"foreign deployment"`` and marked
-    foreign: skipped by routing, including the all-down fallback, until
-    re-verified. Identity is checked before a backend's first request, again
-    after it was marked down or foreign, and after ``forget_identity`` (which
-    ``run_supervised`` calls whenever the supervisor respawns that worker).
-    The token tells this deployment's workers from another deployment's after
-    an accidental port collision; it is not a secret and does not defend
-    against a hostile local process. Each identity probe is bounded by
+    ``deployment_token`` (set by ``run_supervised``) is the secret this
+    deployment's workers hold; no worker response contains it. Each identity
+    probe sends a fresh random nonce in the ``x-modulith-nonce`` header of its
+    ``/health`` request, and a worker answers with ``"proof"``: an HMAC-SHA256
+    keyed by the token over the nonce, its module name and the port the probe
+    arrived on (``modulith._worker.identity_proof``). The proxy accepts only
+    the proof it computes itself for that backend's module and port. A backend
+    answering without it — another deployment's worker, a listener that cannot
+    compute it, or any other process holding the port — is reported
+    ``"foreign deployment"`` and marked foreign: skipped by routing, including
+    the all-down fallback, until re-verified. Because the proof binds the
+    nonce, module and port, an answer relayed from another live worker or
+    replayed from an earlier probe does not match. Identity is checked before
+    a backend's first request, again after it was marked down or foreign, and
+    after ``forget_identity`` (which ``run_supervised`` calls whenever the
+    supervisor respawns that worker); between checks a verified port is
+    trusted. The check tells this deployment's workers from other listeners
+    on loopback ports; it does not authenticate individual connections. Each
+    identity probe is bounded by
     ``identity_probe_timeout`` seconds in total and 64 KiB of body; past the
     deadline the request gets 504 and the backend is not marked down.
     Concurrent requests to one unverified backend wait on a single shared
@@ -269,14 +281,18 @@ def create_proxy_app(
     http_client.cookies = _cookieless_jar()
     probe_client.cookies = _cookieless_jar()
 
-    async def read_health(url: str) -> httpx.Response:
-        """GET ``url``/health, keeping at most ``_MAX_HEALTH_BODY_BYTES`` of it.
+    async def read_health(url: str, nonce: str | None = None) -> httpx.Response:
+        """GET ``url``/health with ``nonce`` as the identity challenge, keeping at
+        most ``_MAX_HEALTH_BODY_BYTES`` of the answer.
 
         An oversized body is replaced by an empty one, which answers for no
         deployment. The read timeout is off: the caller bounds the total time.
         """
         async with probe_client.stream(
-            "GET", url + "/health", timeout=httpx.Timeout(5.0, read=None)
+            "GET",
+            url + "/health",
+            headers={NONCE_HEADER: nonce} if nonce else None,
+            timeout=httpx.Timeout(5.0, read=None),
         ) as resp:
             body = bytearray()
             async for chunk in resp.aiter_bytes():
@@ -306,6 +322,7 @@ def create_proxy_app(
     # it in-process.
     app = FastAPI(title="modulith-proxy", lifespan=lifespan, openapi_url=None)
     app.add_middleware(_RejectUnsafeTargets)
+    app.add_middleware(_RejectMalformedHost)
 
     def _actuator_auth_response(request: Request) -> JSONResponse | None:
         if actuator_token is None:
@@ -319,11 +336,16 @@ def create_proxy_app(
             return None
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
 
-    def record_identity(rule: RoutingRule, url: str, health: httpx.Response) -> bool:
-        """Mark ``url`` verified or foreign from its ``/health`` answer."""
-        if deployment_token is None:
+    def new_challenge() -> str | None:
+        return None if deployment_token is None else secrets.token_hex(16)
+
+    def record_identity(
+        rule: RoutingRule, url: str, health: httpx.Response, nonce: str | None
+    ) -> bool:
+        """Mark ``url`` verified or foreign from its ``/health`` answer to ``nonce``."""
+        if deployment_token is None or nonce is None:
             return True
-        if _answers_for(health, deployment_token):
+        if _answers_for(health, deployment_token, nonce, rule.prefix.lstrip("/"), _port(url)):
             rule.mark_verified(url)
             return True
         rule.mark_foreign(url)
@@ -335,8 +357,9 @@ def create_proxy_app(
         return False
 
     async def probe_identity(rule: RoutingRule, url: str) -> bool:
-        health = await asyncio.wait_for(read_health(url), identity_probe_timeout)
-        return record_identity(rule, url, health)
+        nonce = new_challenge()
+        health = await asyncio.wait_for(read_health(url, nonce), identity_probe_timeout)
+        return record_identity(rule, url, health, nonce)
 
     identity_probes: dict[tuple[str, str], asyncio.Task[bool]] = {}
 
@@ -443,12 +466,13 @@ def create_proxy_app(
 
             async def check_one(rule: RoutingRule) -> tuple[str, str]:
                 async def check_backend(url: str) -> str:
+                    nonce = new_challenge()
                     try:
-                        resp = await asyncio.wait_for(read_health(url), 2.0)
+                        resp = await asyncio.wait_for(read_health(url, nonce), 2.0)
                     except Exception:
                         rule.mark_down(url)
                         return "unreachable"
-                    if not record_identity(rule, url, resp):
+                    if not record_identity(rule, url, resp, nonce):
                         return "foreign deployment"
                     if resp.status_code == 200:
                         rule.mark_up(url)
@@ -568,18 +592,20 @@ def create_proxy_app(
         # peer unconditionally (uvicorn's proxy_headers/forwarded_allow_ips
         # defaults), so an unfiltered client value would let any caller spoof
         # its own IP, scheme, host and port to every module. Overwrite with
-        # values the proxy itself observed on this connection instead.
+        # values the proxy itself observed on this connection instead. Only the
+        # host is the client's own (its Host header, which _RejectMalformedHost
+        # has already vetted); the scheme and port come from the ASGI scope, so
+        # no client-supplied text is parsed to produce them.
         fwd_headers = [
             (k, v) for k, v in fwd_headers if k.lower() not in _DROPPED_FORWARDING_HEADERS
         ]
         client_host = request.client.host if request.client is not None else ""
-        port = request.url.port or (443 if request.url.scheme == "https" else 80)
         fwd_headers.extend(
             [
                 ("x-forwarded-for", client_host),
-                ("x-forwarded-proto", request.url.scheme),
+                ("x-forwarded-proto", request.scope.get("scheme", "http")),
                 ("x-forwarded-host", request.headers.get("host", "")),
-                ("x-forwarded-port", str(port)),
+                ("x-forwarded-port", str(_listening_port(request.scope))),
             ]
         )
         try:
@@ -819,6 +845,47 @@ class _RejectUnsafeTargets:
         await self.app(scope, receive, send)
 
 
+class _RejectMalformedHost:
+    """Answer 400 for a Host header whose port is not a number from 0 to 65535.
+
+    The header reaches workers as ``X-Forwarded-Host``, and parsing it (as
+    ``request.url`` does) raises on such a port. Runs ahead of routing, like
+    ``_RejectUnsafeTargets``, so no route, actuators included, sees the request.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and not _host_is_well_formed(
+            Headers(scope=scope).get("host", "")
+        ):
+            response = JSONResponse({"detail": "invalid Host header"}, status_code=400)
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+def _host_is_well_formed(host: str) -> bool:
+    """Whether ``host`` is a host name or address with an optional port in 0-65535."""
+    try:
+        _ = urlsplit(f"//{host}").port
+    except ValueError:
+        return False
+    return True
+
+
+def _listening_port(scope: Scope) -> int:
+    """The port of the socket the request arrived on, never one the client named.
+
+    ``server`` is absent, or ``(path, None)``, for a Unix socket; the scheme's
+    default port stands in then.
+    """
+    server = scope.get("server")
+    port: int | None = server[1] if server else None
+    return port or (443 if scope.get("scheme") == "https" else 80)
+
+
 def _has_dot_segment(path: str) -> bool:
     """Whether the decoded ``path`` has a ``.`` or ``..`` segment.
 
@@ -846,14 +913,27 @@ def _upstream_url(backend: str, raw_path: bytes, query: bytes) -> httpx.URL:
     return url
 
 
-def _answers_for(resp: httpx.Response, deployment_token: str) -> bool:
-    """Whether a worker ``/health`` response echoes this deployment's token."""
+def _port(url: str) -> int:
+    base = httpx.URL(url)
+    return base.port or (443 if base.scheme == "https" else 80)
+
+
+def _answers_for(
+    resp: httpx.Response, deployment_token: str, nonce: str, module: str, port: int
+) -> bool:
+    """Whether a worker ``/health`` response proves this deployment's token.
+
+    The proof must be the HMAC this proxy computes itself for the ``nonce`` it
+    just sent, the ``module`` the backend serves and the ``port`` it dialed, so
+    an answer lifted from another worker, module, port or probe does not match.
+    """
     try:
-        echoed = resp.json().get("deployment")
+        proof = resp.json().get("proof")
     except (ValueError, AttributeError):
         return False
-    return isinstance(echoed, str) and hmac.compare_digest(
-        echoed.encode("utf-8"), deployment_token.encode("utf-8")
+    expected = identity_proof(deployment_token, nonce, module, port)
+    return isinstance(proof, str) and hmac.compare_digest(
+        proof.encode("utf-8"), expected.encode("utf-8")
     )
 
 

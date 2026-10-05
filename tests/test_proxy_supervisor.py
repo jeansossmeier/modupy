@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import signal
 import sys
@@ -22,7 +23,7 @@ from typing import Any
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 from modulith.proxy import RoutingRule, create_proxy_app
@@ -35,7 +36,7 @@ from modulith.supervisor import (
     run_supervised,
 )
 
-from conftest import _free_port, _held_backend, _serve, _wait_for
+from conftest import _free_port, _health_answer, _held_backend, _serve, _wait_for
 
 # ---------------------------------------------------------------------------
 # Replica round-robin: every replica gets HTTP traffic and a health check
@@ -1164,6 +1165,22 @@ def test_build_worker_env_preserves_nonempty_inherited_state_paths(
     assert _build_worker_env(spec)[key] == "/deployment/state"
 
 
+def test_build_worker_env_does_not_inherit_forwarded_allow_ips(monkeypatch) -> None:
+    """A supervisor's FORWARDED_ALLOW_IPS is for the proxy only and must not
+    reach workers. Workers should trust forwarded headers only from the local
+    proxy at 127.0.0.1, which is uvicorn's default when the variable is unset."""
+    monkeypatch.setenv("FORWARDED_ALLOW_IPS", "192.168.1.0/24")
+    spec = WorkerSpec(
+        module_name="orders",
+        package="myapp",
+        port=9001,
+    )
+
+    env = _build_worker_env(spec)
+
+    assert "FORWARDED_ALLOW_IPS" not in env
+
+
 # ---------------------------------------------------------------------------
 # Deployment identity: a proxy never vouches for another deployment's worker
 # ---------------------------------------------------------------------------
@@ -1183,17 +1200,22 @@ def _health_upstream(body: Any) -> FastAPI:
     "foreign_body",
     [
         {"status": "ok", "module": "orders", "deployment": "deployment-a"},
+        {"status": "ok", "module": "orders", "deployment": "deployment-b"},
         {"status": "ok", "module": "orders"},
         "not a worker",
     ],
 )
 async def test_health_rejects_a_backend_answering_for_another_deployment(foreign_body) -> None:
+    ours = FastAPI()
+
+    @ours.get("/health")
+    async def ours_health(request: Request) -> Any:
+        return _health_answer(request, "deployment-b", "inventory")
+
     client = httpx.AsyncClient(
         mounts={
             "http://theirs": httpx.ASGITransport(app=_health_upstream(foreign_body)),
-            "http://ours": httpx.ASGITransport(
-                app=_health_upstream({"status": "ok", "deployment": "deployment-b"})
-            ),
+            "http://ours": httpx.ASGITransport(app=ours),
         }
     )
     rules = [
@@ -1252,8 +1274,9 @@ async def test_run_supervised_hands_one_deployment_token_to_its_workers_and_prox
 
     await run_supervised(specs, "127.0.0.1", _free_port(), serve=probe)
 
-    token = seen["worker"]["deployment"]
-    assert isinstance(token, str) and len(token) >= 32
+    token = (specs[0].env or {})["MODULITH_DEPLOYMENT_TOKEN"]
+    assert len(token) >= 32
+    assert token not in json.dumps(seen["worker"])
     assert seen["proxy"] == {"status": "ok", "backends": {"/orders": "ok"}}
 
 
@@ -1280,9 +1303,9 @@ def _identified_upstream(name: str, token: str, hits: list[str]) -> FastAPI:
         return {"served_by": name}
 
     @up.get("/health")
-    async def health() -> dict[str, str]:
+    async def health(request: Request) -> dict[str, str]:
         hits.append("/health")
-        return {"status": "ok", "module": "orders", "deployment": token}
+        return _health_answer(request, token)
 
     return up
 

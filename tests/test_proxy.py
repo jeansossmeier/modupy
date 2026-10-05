@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import inspect
 import json
 import warnings
 from collections.abc import MutableMapping
@@ -24,9 +25,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.testclient import TestClient
 
+from modulith._worker import NONCE_HEADER, identity_proof
 from modulith.proxy import RoutingRule, _match_rule, create_proxy_app
 
-from conftest import _free_port, _held_backend, _serve, _wait_for
+from conftest import _free_port, _health_answer, _held_backend, _serve, _wait_for
 
 # ---------------------------------------------------------------------------
 # _match_rule (pure)
@@ -325,6 +327,172 @@ async def test_proxy_overwrites_spoofed_forwarded_headers() -> None:
     assert body["x-forwarded-port"] == "443"
     assert body["forwarded"] == ""
     assert body["x-real-ip"] == ""
+
+
+def _recording_proxy(calls: list[httpx.Request]) -> FastAPI:
+    """A proxy whose backend client records every request it is asked to send."""
+
+    def record(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, stream=httpx.ByteStream(b"ok"))
+
+    return create_proxy_app(
+        [RoutingRule("/orders", "http://orders-worker")],
+        client=httpx.AsyncClient(transport=httpx.MockTransport(record)),
+        connect_retry_attempts=1,
+    )
+
+
+async def _get_with_host(
+    app: Any, path: str, host: str, base_url: str = "http://public.example.com:8080"
+) -> httpx.Response:
+    """GET ``path`` from a client that reaches ``app`` at ``base_url`` but sends
+    ``host`` as its Host header."""
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=base_url
+    ) as client:
+        return await client.get(path, headers={"host": host})
+
+
+@pytest.mark.parametrize(
+    ("base_url", "host", "port"),
+    [
+        ("http://public.example.com:8080", "public.example.com:9999", "8080"),
+        ("http://public.example.com:8080", "public.example.com", "8080"),
+        ("https://public.example.com:8443", "public.example.com:443", "8443"),
+        ("http://public.example.com", "public.example.com:9999", "80"),
+        ("https://public.example.com", "public.example.com:9999", "443"),
+    ],
+)
+async def test_x_forwarded_port_is_the_port_the_connection_arrived_on(
+    base_url: str, host: str, port: str
+) -> None:
+    """A worker sees the proxy's listening port, whatever port the client's Host
+    header names. httpx's ASGI transport reports no port for a scheme's default
+    one, so the last two rows also cover the fallback to that default."""
+    calls: list[httpx.Request] = []
+    response = await _get_with_host(_recording_proxy(calls), "/orders/ping", host, base_url)
+    assert response.status_code == 200
+    assert [c.headers["x-forwarded-port"] for c in calls] == [port]
+    assert [c.headers["x-forwarded-host"] for c in calls] == [host]
+
+
+@pytest.mark.parametrize(("scheme", "port"), [("http", "80"), ("https", "443")])
+@pytest.mark.parametrize("server", [None, ("/run/modulith.sock", None)])
+async def test_x_forwarded_port_defaults_to_the_scheme_port_on_a_unix_socket(
+    server: tuple[str, None] | None, scheme: str, port: str
+) -> None:
+    """A Unix socket has no TCP port: the ASGI scope omits ``server`` or gives
+    ``(path, None)``. The port falls back to the scheme's default, never to the
+    one in the Host header."""
+    calls: list[httpx.Request] = []
+    proxy = _recording_proxy(calls)
+
+    async def on_unix_socket(scope: MutableMapping[str, Any], receive: Any, send: Any) -> None:
+        listening = {key: value for key, value in scope.items() if key != "server"}
+        if server is not None:
+            listening["server"] = server
+        await proxy(listening, receive, send)
+
+    response = await _get_with_host(
+        on_unix_socket, "/orders/ping", "public.example.com:9999", f"{scheme}://public.example.com"
+    )
+    assert response.status_code == 200
+    assert [c.headers["x-forwarded-port"] for c in calls] == [port]
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "example.com:99999",
+        "example.com:65536",
+        "example.com:abc",
+        "example.com:8080x",
+        "example.com:-1",
+        "[::1]:99999",
+        "[::1]:abc",
+        "[::1",
+    ],
+)
+async def test_a_host_header_with_a_bad_port_answers_400_and_reaches_no_backend(host: str) -> None:
+    """The request is malformed: answering it (500 for an out-of-range port) or
+    forwarding the value to a worker would both be wrong."""
+    calls: list[httpx.Request] = []
+    response = await _get_with_host(_recording_proxy(calls), "/orders/ping", host)
+    assert response.status_code == 400
+    assert response.json() == {"detail": "invalid Host header"}
+    assert calls == []
+
+
+@pytest.mark.parametrize("path", ["/orders/ping", "/no-such-module", "/_modulith/live"])
+async def test_a_malformed_host_header_answers_400_on_every_route(path: str) -> None:
+    calls: list[httpx.Request] = []
+    response = await _get_with_host(_recording_proxy(calls), path, "example.com:99999")
+    assert response.status_code == 400
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "public.example.com",
+        "public.example.com:8080",
+        "public.example.com:65535",
+        "127.0.0.1:8000",
+        "[::1]:8080",
+        "[::1]",
+        "orders_svc.internal:8080",
+    ],
+)
+async def test_a_well_formed_host_header_is_forwarded_as_given(host: str) -> None:
+    calls: list[httpx.Request] = []
+    response = await _get_with_host(_recording_proxy(calls), "/orders/ping", host)
+    assert response.status_code == 200
+    assert [c.headers["x-forwarded-host"] for c in calls] == [host]
+
+
+def _header_echo_app(seen: list[dict[str, str]]) -> Any:
+    async def app(scope: MutableMapping[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            return
+        seen.append({k.decode("latin-1"): v.decode("latin-1") for k, v in scope["headers"]})
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    return app
+
+
+@pytest.mark.real_process
+async def test_x_forwarded_port_under_uvicorn_is_the_port_the_proxy_listens_on() -> None:
+    """End to end over real sockets: uvicorn fills the ASGI ``server`` entry from
+    the accepted connection, so a worker sees the proxy's own port however the
+    Host header names it, and a malformed Host never reaches the worker."""
+    worker_port, proxy_port = _free_port(), _free_port()
+    seen: list[dict[str, str]] = []
+    proxy = create_proxy_app(
+        [RoutingRule("/orders", f"http://127.0.0.1:{worker_port}")],
+        actuator_enabled=False,
+        connect_retry_attempts=1,
+    )
+    servers = [
+        await _serve(_header_echo_app(seen), worker_port, "h11"),
+        await _serve(proxy, proxy_port, "h11"),
+    ]
+    try:
+        async with httpx.AsyncClient(
+            base_url=f"http://127.0.0.1:{proxy_port}", trust_env=False
+        ) as client:
+            named = await client.get("/orders/x", headers={"host": "example.com:9999"})
+            malformed = await client.get("/orders/x", headers={"host": "example.com:99999"})
+    finally:
+        for server, _ in servers:
+            server.should_exit = True
+        await asyncio.gather(*(task for _, task in servers))
+
+    assert named.status_code == 200
+    assert malformed.status_code == 400
+    assert [headers["x-forwarded-port"] for headers in seen] == [str(proxy_port)]
+    assert [headers["x-forwarded-host"] for headers in seen] == ["example.com:9999"]
 
 
 def test_proxy_makes_a_backend_redirect_client_followable(proxy_app) -> None:
@@ -1063,7 +1231,7 @@ def _cookie_setting_backend(token: str, seen: list[tuple[str, str | None]]) -> F
     @up.get("/health")
     async def health(request: Request) -> Any:
         seen.append(("/health", request.headers.get("cookie")))
-        resp = JSONResponse({"status": "ok", "module": "orders", "deployment": token})
+        resp = JSONResponse(_health_answer(request, token))
         resp.set_cookie("probe", "PROBE_COOKIE", path="/")
         return resp
 
@@ -1111,10 +1279,10 @@ def _slow_health_backend(token: str, delay: float, calls: list[str]) -> FastAPI:
         return {"ok": True}
 
     @up.get("/health")
-    async def health() -> dict[str, str]:
+    async def health(request: Request) -> dict[str, str]:
         calls.append("/health")
         await asyncio.sleep(delay)
-        return {"status": "ok", "module": "orders", "deployment": token}
+        return _health_answer(request, token)
 
     return up
 
@@ -1170,7 +1338,8 @@ async def test_identity_probe_refuses_an_oversized_health_body() -> None:
     def backend(request: httpx.Request) -> httpx.Response:
         hits.append(request.url.path)
         if request.url.path == "/health":
-            return httpx.Response(200, json={"deployment": "tok", "pad": "x" * (2 * 1024 * 1024)})
+            proof = identity_proof("tok", request.headers[NONCE_HEADER], "orders", 80)
+            return httpx.Response(200, json={"proof": proof, "pad": "x" * (2 * 1024 * 1024)})
         return httpx.Response(200, json={"ok": True})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(backend))
@@ -1186,20 +1355,30 @@ async def test_identity_probe_refuses_an_oversized_health_body() -> None:
 
 
 async def _gated_worker(
-    token: str, gate: asyncio.Event, seen: list[str]
+    token: str, gate: asyncio.Event, seen: list[str], module: str = "orders"
 ) -> tuple[asyncio.Server, str]:
     """Loopback worker that accepts every connection but answers nothing until
     ``gate`` is set, then answers any path with this deployment's ``/health``."""
-    body = json.dumps({"status": "ok", "deployment": token}).encode()
-    answer = (
-        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n"
-        b"content-length: %d\r\n\r\n%s" % (len(body), body)
-    )
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             head = await reader.readuntil(b"\r\n\r\n")
             seen.append(head.split(b" ", 2)[1].decode())
+            nonce = next(
+                (
+                    line.split(b":", 1)[1].strip().decode()
+                    for line in head.split(b"\r\n")
+                    if line.lower().startswith(NONCE_HEADER.encode() + b":")
+                ),
+                None,
+            )
+            port = writer.get_extra_info("sockname")[1]
+            proof = identity_proof(token, nonce, module, port) if nonce else None
+            body = json.dumps({"status": "ok", "proof": proof}).encode()
+            answer = (
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n"
+                b"content-length: %d\r\n\r\n%s" % (len(body), body)
+            )
             await gate.wait()
             writer.write(answer)
             await writer.drain()
@@ -1250,8 +1429,8 @@ async def test_a_stalled_unverified_worker_leaves_readiness_and_other_modules_se
     stall, open_gate = asyncio.Event(), asyncio.Event()
     open_gate.set()
     a_seen: list[str] = []
-    a_server, a_url = await _gated_worker("tok", stall, a_seen)
-    b_server, b_url = await _gated_worker("tok", open_gate, [])
+    a_server, a_url = await _gated_worker("tok", stall, a_seen, "a")
+    b_server, b_url = await _gated_worker("tok", open_gate, [], "b")
     a_rule, b_rule = RoutingRule("/a", a_url), RoutingRule("/b", b_url)
     proxy_app = create_proxy_app([a_rule, b_rule], deployment_token="tok")
     try:
@@ -1284,8 +1463,8 @@ async def test_health_probe_pool_exhaustion_names_the_probe_pool_and_its_limit(
     stall, open_gate = asyncio.Event(), asyncio.Event()
     open_gate.set()
     a_seen: list[str] = []
-    a_server, a_url = await _gated_worker("tok", stall, a_seen)
-    b_server, b_url = await _gated_worker("tok", open_gate, [])
+    a_server, a_url = await _gated_worker("tok", stall, a_seen, "a")
+    b_server, b_url = await _gated_worker("tok", open_gate, [], "b")
     a_rule, b_rule = RoutingRule("/a", a_url), RoutingRule("/b", b_url)
     proxy_app = create_proxy_app([a_rule, b_rule], deployment_token="tok")
     try:
@@ -1311,3 +1490,189 @@ async def test_health_probe_pool_exhaustion_names_the_probe_pool_and_its_limit(
     )
     assert "request pool" not in caplog.text
     assert (b_url in b_rule._down, held_resp.status_code) == (False, 200)
+
+
+# ---------------------------------------------------------------------------
+# Identity challenge: a listener proves the deployment token, never echoes it
+# ---------------------------------------------------------------------------
+
+_OURS = "http://127.0.0.1:9001"
+_OTHER_WORKER = "http://127.0.0.1:9002"
+
+
+def _worker_app(token: str, module: str = "orders", hits: list[str] | None = None) -> FastAPI:
+    """A genuine worker of the deployment holding ``token``."""
+    up = FastAPI()
+
+    @up.get(f"/{module}/ping")
+    async def ping() -> dict[str, str]:
+        if hits is not None:
+            hits.append("ping")
+        return {"served_by": module}
+
+    @up.get("/health")
+    async def health(request: Request) -> dict[str, str]:
+        return _health_answer(request, token, module)
+
+    return up
+
+
+def _listener_app(answer: Any, hits: list[str]) -> FastAPI:
+    """A foreign listener on the worker's port; ``answer(request)`` is its ``/health``."""
+    up = FastAPI()
+
+    @up.get("/orders/ping")
+    async def ping() -> dict[str, str]:
+        hits.append("ping")
+        return {"served_by": "listener"}
+
+    @up.get("/health")
+    async def health(request: Request) -> Any:
+        result = answer(request)
+        return await result if inspect.isawaitable(result) else result
+
+    return up
+
+
+async def _through_proxy(mounts: dict[str, FastAPI], *, token: str | None = "tok") -> Any:
+    """GET /orders/ping then readiness, with ``_OURS`` as the module's backend."""
+    client = httpx.AsyncClient(
+        mounts={url: httpx.ASGITransport(app=app) for url, app in mounts.items()}
+    )
+    rule = RoutingRule(prefix="/orders", backend_url=_OURS)
+    proxy_app = create_proxy_app([rule], client=client, deployment_token=token)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+    ) as c:
+        served = await c.get("/orders/ping")
+        readiness = await c.get("/_modulith/health")
+    return served, readiness.json()["backends"]["/orders"]
+
+
+def _proof(request: Request, module: str, port: int, token: str = "tok") -> str:
+    return identity_proof(token, request.headers[NONCE_HEADER], module, port)
+
+
+async def test_a_genuine_worker_answering_the_challenge_is_verified_and_served() -> None:
+    hits: list[str] = []
+    served, readiness = await _through_proxy({_OURS: _worker_app("tok", hits=hits)})
+
+    assert (served.status_code, served.json(), readiness) == (200, {"served_by": "orders"}, "ok")
+    assert hits == ["ping"]
+
+
+async def _relay_to_a_live_worker(request: Request) -> Any:
+    """Forwards the proxy's nonce to a live worker of the same deployment on another
+    port and returns that worker's real answer."""
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_worker_app("tok")), base_url=_OTHER_WORKER
+    ) as other:
+        resp = await other.get("/health", headers={NONCE_HEADER: request.headers[NONCE_HEADER]})
+    return resp.json()
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param(
+            lambda r: {"status": "ok", "module": "orders", "deployment": "tok"},
+            id="echoes-raw-token",
+        ),
+        pytest.param(lambda r: {"status": "ok", "module": "orders"}, id="no-proof"),
+        pytest.param(lambda r: {"status": "ok", "proof": 12345}, id="proof-not-a-string"),
+        pytest.param(lambda r: {"status": "ok", "proof": None}, id="proof-null"),
+        pytest.param(lambda r: {"status": "ok", "proof": ["x"]}, id="proof-a-list"),
+        pytest.param(lambda r: {"status": "ok", "proof": ""}, id="proof-empty"),
+        pytest.param(lambda r: {"status": "ok", "proof": "zz-not-hex"}, id="proof-garbage"),
+        pytest.param(lambda r: ["not", "an", "object"], id="body-a-list"),
+        pytest.param(lambda r: "not a worker", id="body-a-string"),
+        pytest.param(
+            lambda r: {
+                "status": "ok",
+                "proof": identity_proof("other", r.headers[NONCE_HEADER], "orders", 9001),
+            },
+            id="another-deployments-token",
+        ),
+        pytest.param(
+            lambda r: {"status": "ok", "proof": _proof(r, "inventory", 9001)},
+            id="same-deployment-other-module",
+        ),
+        pytest.param(
+            lambda r: {"status": "ok", "proof": _proof(r, "orders", 9002)},
+            id="same-deployment-other-port",
+        ),
+        pytest.param(
+            lambda r: {"status": "ok", "proof": _proof(r, "orders", 9001).upper()},
+            id="proof-altered-case",
+        ),
+        pytest.param(_relay_to_a_live_worker, id="relays-nonce-to-a-live-worker-on-another-port"),
+    ],
+)
+async def test_a_listener_that_cannot_compute_this_backends_proof_gets_no_traffic(answer) -> None:
+    hits: list[str] = []
+    served, readiness = await _through_proxy({_OURS: _listener_app(answer, hits)})
+
+    assert (served.status_code, readiness) == (503, "foreign deployment")
+    assert hits == []
+
+
+async def test_a_proof_replayed_from_an_earlier_probe_is_rejected() -> None:
+    answers: list[dict[str, str]] = []
+    hits: list[str] = []
+
+    def replaying(request: Request) -> Any:
+        if not answers:
+            answers.append(_health_answer(request, "tok"))
+        return answers[0]
+
+    client = httpx.AsyncClient(
+        mounts={_OURS: httpx.ASGITransport(app=_listener_app(replaying, hits))}
+    )
+    rule = RoutingRule(prefix="/orders", backend_url=_OURS)
+    proxy_app = create_proxy_app([rule], client=client, deployment_token="tok")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+    ) as c:
+        first = await c.get("/orders/ping")
+        rule.forget_identity(_OURS)
+        second = await c.get("/orders/ping")
+
+    assert (first.status_code, second.status_code) == (200, 503)
+    assert hits == ["ping"]
+
+
+async def test_each_identity_probe_sends_a_fresh_random_nonce() -> None:
+    nonces: list[str] = []
+
+    def record(request: Request) -> Any:
+        nonces.append(request.headers[NONCE_HEADER])
+        return _health_answer(request, "tok")
+
+    client = httpx.AsyncClient(mounts={_OURS: httpx.ASGITransport(app=_listener_app(record, []))})
+    rule = RoutingRule(prefix="/orders", backend_url=_OURS)
+    proxy_app = create_proxy_app([rule], client=client, deployment_token="tok")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+    ) as c:
+        await c.get("/orders/ping")
+        rule.forget_identity(_OURS)
+        await c.get("/orders/ping")
+        await c.get("/_modulith/health")
+
+    assert len(nonces) == 3 and len(set(nonces)) == 3
+    assert all(len(n) >= 32 and n.isalnum() for n in nonces)
+
+
+async def test_a_proxy_without_a_token_sends_no_challenge_and_serves_any_listener() -> None:
+    health_headers: list[str | None] = []
+
+    def anything(request: Request) -> Any:
+        health_headers.append(request.headers.get(NONCE_HEADER))
+        return {"status": "ok"}
+
+    hits: list[str] = []
+    served, readiness = await _through_proxy({_OURS: _listener_app(anything, hits)}, token=None)
+
+    assert (served.status_code, readiness) == (200, "ok")
+    assert health_headers == [None]
+    assert hits == ["ping"]

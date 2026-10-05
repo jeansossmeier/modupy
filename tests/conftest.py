@@ -174,9 +174,28 @@ async def _serve(app: Any, port: int, http: Any) -> tuple[Any, asyncio.Task[None
     return server, task
 
 
+def _health_answer(request: Any, token: str, module: str = "orders") -> dict[str, str]:
+    """What a worker of the deployment holding ``token`` answers ``/health`` with.
+
+    Built by the worker's own ``health_identity``, so a fake backend and the real
+    worker prove identity the same way. A Starlette ``Request`` carries the nonce
+    header and the ASGI ``server`` entry; ``httpx.ASGITransport`` leaves the port
+    ``None`` for a default-port URL, which the proxy reads as 80.
+    """
+    from modulith._worker import NONCE_HEADER, health_identity
+
+    server = request.scope["server"]
+    server = (server[0], server[1] or 80)
+    return {
+        "status": "ok",
+        **health_identity(module, token, request.headers.get(NONCE_HEADER), server),
+    }
+
+
 def _held_backend(release: asyncio.Event, in_flight: list[int], deployment: str = "") -> Any:
     """Worker app whose ``/orders/slow`` holds its connection until ``release``."""
     from fastapi import FastAPI
+    from starlette.responses import JSONResponse
 
     up = FastAPI()
 
@@ -190,10 +209,10 @@ def _held_backend(release: asyncio.Event, in_flight: list[int], deployment: str 
     async def fast() -> dict[str, str]:
         return {"ok": "fast"}
 
-    @up.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok", "deployment": deployment}
+    async def health(request: Any) -> Any:
+        return JSONResponse(_health_answer(request, deployment))
 
+    up.add_route("/health", health)
     return up
 
 

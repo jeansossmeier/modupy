@@ -32,6 +32,8 @@ to remove subscriptions left by an earlier deployment.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import importlib
 import logging
 import os
@@ -44,6 +46,102 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
 
 logger = logging.getLogger("modulith.worker")
+
+NONCE_HEADER = "x-modulith-nonce"
+
+
+def identity_proof(token: str, nonce: str, module: str, port: int) -> str:
+    """HMAC-SHA256, keyed by the deployment token, over a challenge nonce, the
+    answering module and the port the challenge arrived on. The proxy computes the
+    same value for the backend it probed and accepts only that."""
+    message = f"{nonce}\n{module}\n{port}".encode()
+    return hmac.new(token.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def health_identity(
+    module: str, token: str | None, nonce: str | None, server: Any
+) -> dict[str, str]:
+    """The identity fields of a worker's ``/health`` answer.
+
+    ``server`` is the ASGI scope's ``server`` entry, the address of the socket the
+    request arrived on. It is the only source of the port: a header would let a
+    process that relays a challenge to another worker choose the port it is
+    proven for. The token never appears in the answer, only a proof of it, and
+    only when the caller sent a nonce.
+    """
+    identity = {"module": module}
+    if token and nonce and server and isinstance(server[1], int):
+        identity["proof"] = identity_proof(token, nonce, module, server[1])
+    return identity
+
+
+class AccessLogQueryFilter(logging.Filter):
+    """Cut the query string out of the request target in uvicorn's access lines.
+
+    uvicorn logs ``'%s - "%s %s HTTP/%s" %d'`` with the client, method, request
+    target, HTTP version and status as arguments, and its ``AccessFormatter``
+    unpacks all five, so only the target is replaced and the tuple keeps its
+    shape. The target is percent-encoded, which makes the first ``?`` in it the
+    start of the query. A record of any other shape passes through untouched.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+            record.args = (*args[:2], args[2].partition("?")[0], *args[3:])
+        return True
+
+
+class LogTargetQueryFilter(logging.Filter):
+    """Cut the query string out of the request target a log record carries as an argument.
+
+    A record is picked by the start of its message template, and its target is
+    the argument at ``target_index``: a ``str``, or an object whose ``str()`` is
+    the target, such as httpx's ``URL``. A record with another template passes
+    through untouched.
+    """
+
+    def __init__(self, message_prefix: str, target_index: int) -> None:
+        super().__init__()
+        self.message_prefix = message_prefix
+        self.target_index = target_index
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if (
+            isinstance(record.msg, str)
+            and record.msg.startswith(self.message_prefix)
+            and isinstance(args, tuple)
+            and self.target_index < len(args)
+        ):
+            target = str(args[self.target_index]).partition("?")[0]
+            record.args = (*args[: self.target_index], target, *args[self.target_index + 1 :])
+        return True
+
+
+def install_filter_once(logger_name: str, new_filter: logging.Filter) -> None:
+    """Add the filter to the named logger unless it already has one of that class."""
+    target = logging.getLogger(logger_name)
+    if not any(type(f) is type(new_filter) for f in target.filters):
+        target.addFilter(new_filter)
+
+
+# uvicorn's WebSocket protocols (all three it ships) log a handshake on
+# ``uvicorn.error`` as ``'%s - "WebSocket %s" [accepted]'``, ``... 403`` or
+# ``... %d``, with the client and the request target as the first two arguments.
+_WEBSOCKET_LINE = '%s - "WebSocket %s"'
+
+
+def install_access_log_filter() -> None:
+    """Keep query strings out of uvicorn's request lines, once per process.
+
+    HTTP access lines go to ``uvicorn.access`` and WebSocket handshake lines to
+    ``uvicorn.error``. Both halves of process-per-module mode call this:
+    ``create_app`` for each worker, however it was launched, and the supervisor
+    for the proxy's server.
+    """
+    install_filter_once("uvicorn.access", AccessLogQueryFilter())
+    install_filter_once("uvicorn.error", LogTargetQueryFilter(_WEBSOCKET_LINE, 1))
 
 
 def create_app() -> FastAPI:
@@ -67,6 +165,11 @@ def create_app() -> FastAPI:
     The OpenAPI schema and doc UIs are served under the module prefix too
     (``/<module>/openapi.json``, ``/<module>/docs``, ``/<module>/redoc``), which
     is what makes them reachable through the reverse proxy on the public port.
+
+    It also calls ``install_access_log_filter``, so a worker's access lines and
+    WebSocket handshake lines never carry a query string, whoever launched
+    uvicorn: the supervisor, a Kubernetes manifest or the Dockerfile
+    ``modulith extract`` writes.
     """
     module_name = os.environ.get("MODULITH_MODULE")
     app_package = os.environ.get("MODULITH_APP_PACKAGE")
@@ -76,7 +179,9 @@ def create_app() -> FastAPI:
             "MODULITH_APP_PACKAGE environment variables to be set"
         )
 
-    from fastapi import FastAPI
+    install_access_log_filter()
+
+    from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
     from starlette.routing import Match
 
@@ -176,17 +281,20 @@ def create_app() -> FastAPI:
         redoc_url=None,
     )
 
-    # Echoed on /health so the supervisor's proxy can tell its own workers from
-    # another deployment's listener on the same loopback port.
-    identity = {"module": module_name}
-    if deployment_token := os.environ.get("MODULITH_DEPLOYMENT_TOKEN"):
-        identity["deployment"] = deployment_token
+    # /health proves this worker's deployment to the supervisor's proxy, which
+    # sends a fresh nonce with each probe; see ``health_identity``.
+    deployment_token = os.environ.get("MODULITH_DEPLOYMENT_TOKEN")
 
     # Registered BEFORE include_router: Starlette matches in registration
     # order, and the proxy's identity check reads this route, so a module named
     # "health" with a root route must not be able to answer it instead.
-    @app.get("/health")
-    async def health() -> Any:
+    async def health(request: Request) -> Any:
+        identity = health_identity(
+            module_name,
+            deployment_token,
+            request.headers.get(NONCE_HEADER),
+            request.scope.get("server"),
+        )
         consumer = getattr(app.state, "consumer", None)
         if consumer is None:
             return {"status": "ok", **identity}
@@ -208,6 +316,12 @@ def create_app() -> FastAPI:
         if snapshot.ready:
             return response
         return JSONResponse(status_code=503, content=response)
+
+    # This module's ``from __future__ import annotations`` leaves the annotation
+    # a string that FastAPI cannot resolve against the function-local import, so
+    # it would read ``request`` as a query parameter and answer 422.
+    health.__annotations__["request"] = Request
+    app.get("/health")(health)
 
     # Docs live UNDER the module prefix. The supervisor's reverse proxy
     # forwards /<module>/* to this worker verbatim and nothing else, so

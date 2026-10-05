@@ -15,10 +15,13 @@ routing is a separate concern (covered with the topology/proxy work).
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import sqlite3
 import sys
 import time
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -28,7 +31,15 @@ from fastapi.testclient import TestClient
 
 import modulith._worker as worker_module
 from modulith import ConfigurationError, Consumer, ConsumerSpec, EventPublication, configure
-from modulith._worker import _build_consumer, create_app
+from modulith._worker import (
+    AccessLogQueryFilter,
+    LogTargetQueryFilter,
+    _build_consumer,
+    create_app,
+    health_identity,
+    identity_proof,
+    install_access_log_filter,
+)
 from modulith.adapters.shm_broker import ShmBroker, ShmConsumer
 from modulith.builtin import outbox
 from modulith.config import DEFAULT_MAX_PAYLOAD_BYTES
@@ -82,6 +93,175 @@ def test_missing_env_raises(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="MODULITH_MODULE"):
         create_app()
+
+
+# ---------------------------------------------------------------------------
+# uvicorn access log: no query strings
+# ---------------------------------------------------------------------------
+
+# uvicorn's access record: client, method, request target, HTTP version, status.
+_ACCESS_MSG = '%s - "%s %s HTTP/%s" %d'
+
+
+class _Lines(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(record.getMessage())
+
+
+def _capturing(name: str) -> Iterator[_Lines]:
+    logger = logging.getLogger(name)
+    filters, handlers = logger.filters[:], logger.handlers[:]
+    level, propagate = logger.level, logger.propagate
+    capture = _Lines()
+    logger.filters.clear()
+    logger.handlers[:] = [capture]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    yield capture
+    logger.filters[:] = filters
+    logger.handlers[:] = handlers
+    logger.setLevel(level)
+    logger.propagate = propagate
+
+
+@pytest.fixture
+def access_log() -> Iterator[_Lines]:
+    """uvicorn's access logger with no filters and one capturing handler.
+
+    Every ``create_app()`` in this module leaves the filters installed, so without
+    the reset a test would see a filter an earlier test put there.
+    """
+    yield from _capturing("uvicorn.access")
+
+
+@pytest.fixture
+def error_log() -> Iterator[_Lines]:
+    """The same for ``uvicorn.error``, which carries the WebSocket handshake lines."""
+    yield from _capturing("uvicorn.error")
+
+
+def _access_record(target: str) -> logging.LogRecord:
+    args = ("127.0.0.1:51234", "GET", target, "1.1", 200)
+    return logging.LogRecord("uvicorn.access", logging.INFO, __file__, 0, _ACCESS_MSG, args, None)
+
+
+@pytest.mark.parametrize(
+    ("target", "logged_target"),
+    [
+        ("/orders/42?token=hunter2&page=2", "/orders/42"),
+        ("/orders/42", "/orders/42"),
+        ("/orders?next=/a?b=c", "/orders"),
+        ("/a%3Fb?token=hunter2", "/a%3Fb"),
+    ],
+    ids=[
+        "with-query",
+        "without-query",
+        "question-mark-only-in-query",
+        "encoded-question-mark-in-path",
+    ],
+)
+def test_access_log_filter_drops_the_query_string_and_keeps_the_rest(
+    target: str, logged_target: str
+) -> None:
+    record = _access_record(target)
+
+    assert AccessLogQueryFilter().filter(record) is True
+    assert record.getMessage() == f'127.0.0.1:51234 - "GET {logged_target} HTTP/1.1" 200'
+
+
+def test_access_log_filter_leaves_a_record_that_is_not_an_access_line_alone() -> None:
+    record = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 0, "why?", (), None)
+
+    assert AccessLogQueryFilter().filter(record) is True
+    assert record.getMessage() == "why?"
+
+
+def test_installing_the_access_log_filter_twice_keeps_one_filter_per_logger(
+    access_log: _Lines, error_log: _Lines
+) -> None:
+    install_access_log_filter()
+    install_access_log_filter()
+
+    assert [type(f) for f in logging.getLogger("uvicorn.access").filters] == [AccessLogQueryFilter]
+    assert [type(f) for f in logging.getLogger("uvicorn.error").filters] == [LogTargetQueryFilter]
+
+
+def test_create_app_hides_query_strings_in_the_access_log(
+    make_fake_app, monkeypatch, access_log: _Lines
+) -> None:
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+
+    create_app()
+    logging.getLogger("uvicorn.access").info(
+        _ACCESS_MSG, "127.0.0.1:51234", "GET", "/orders/42?token=hunter2", "1.1", 200
+    )
+
+    assert access_log.lines == ['127.0.0.1:51234 - "GET /orders/42 HTTP/1.1" 200']
+
+
+# uvicorn's three WebSocket protocols log the handshake on ``uvicorn.error`` with
+# these templates: client, request target and, for a rejection that carries a
+# response, its status.
+@pytest.mark.parametrize(
+    ("message", "extra", "logged"),
+    [
+        ('%s - "WebSocket %s" [accepted]', (), '"WebSocket {target}" [accepted]'),
+        ('%s - "WebSocket %s" 403', (), '"WebSocket {target}" 403'),
+        ('%s - "WebSocket %s" %d', (404,), '"WebSocket {target}" 404'),
+    ],
+    ids=["accepted", "closed-403", "rejected-with-status"],
+)
+@pytest.mark.parametrize(
+    ("target", "logged_target"),
+    [
+        ("/ws/42?token=hunter2&room=a", "/ws/42"),
+        ("/ws/42", "/ws/42"),
+        ("/ws?next=/a?b=c", "/ws"),
+    ],
+    ids=["with-query", "without-query", "question-mark-only-in-query"],
+)
+def test_websocket_handshake_lines_lose_the_query_string(
+    error_log: _Lines,
+    message: str,
+    extra: tuple[int, ...],
+    logged: str,
+    target: str,
+    logged_target: str,
+) -> None:
+    install_access_log_filter()
+
+    logging.getLogger("uvicorn.error").info(message, "127.0.0.1:51234", target, *extra)
+
+    assert error_log.lines == [f"127.0.0.1:51234 - {logged.format(target=logged_target)}"]
+
+
+def test_other_uvicorn_error_lines_keep_their_question_marks(error_log: _Lines) -> None:
+    install_access_log_filter()
+
+    logging.getLogger("uvicorn.error").error(
+        "ASGI callable should return None, but returned '%s'.", "what?x"
+    )
+
+    assert error_log.lines == ["ASGI callable should return None, but returned 'what?x'."]
+
+
+def test_create_app_hides_query_strings_in_websocket_handshake_lines(
+    make_fake_app, monkeypatch, error_log: _Lines
+) -> None:
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+
+    create_app()
+    logging.getLogger("uvicorn.error").info(
+        '%s - "WebSocket %s" [accepted]', "127.0.0.1:51234", "/orders/ws?token=hunter2"
+    )
+
+    assert error_log.lines == ['127.0.0.1:51234 - "WebSocket /orders/ws" [accepted]']
 
 
 # ---------------------------------------------------------------------------
@@ -1650,7 +1830,78 @@ async def test_lifespan_consumer_build_failure_still_runs_runtime_shutdown(
     assert shutdown_called, "runtime.shutdown() was skipped because _build_consumer() raised"
 
 
-def test_health_endpoint_echoes_the_deployment_token(make_fake_app, monkeypatch) -> None:
+def test_health_endpoint_never_returns_the_deployment_token(make_fake_app, monkeypatch) -> None:
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.setenv("MODULITH_DEPLOYMENT_TOKEN", "deployment-b")
+
+    app = create_app()
+    with TestClient(app) as client:
+        plain = client.get("/health")
+        challenged = client.get("/health", headers={"x-modulith-nonce": "n-1"})
+
+    assert (plain.status_code, plain.json()) == (200, {"status": "ok", "module": "orders"})
+    assert "deployment-b" not in plain.text
+    assert "deployment-b" not in challenged.text
+    assert "deployment" not in challenged.json()
+
+
+def test_health_answers_a_nonce_with_an_hmac_over_nonce_module_and_arrival_port(
+    make_fake_app, monkeypatch
+) -> None:
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.setenv("MODULITH_DEPLOYMENT_TOKEN", "deployment-b")
+
+    app = create_app()
+    with TestClient(app, base_url="http://testserver:8123") as client:
+        resp = client.get(
+            "/health",
+            headers={
+                "x-modulith-nonce": "n-1",
+                # Headers a client controls must not move the port the proof binds.
+                "x-forwarded-port": "9999",
+                "x-forwarded-host": "evil.example:9999",
+            },
+        )
+
+    expected = hmac.new(b"deployment-b", b"n-1\norders\n8123", hashlib.sha256).hexdigest()
+    assert resp.json() == {"status": "ok", "module": "orders", "proof": expected}
+
+
+def test_identity_proof_differs_per_token_nonce_module_and_port() -> None:
+    base = identity_proof("deployment-b", "n-1", "orders", 8123)
+
+    assert base == identity_proof("deployment-b", "n-1", "orders", 8123)
+    others = {
+        identity_proof("deployment-a", "n-1", "orders", 8123),
+        identity_proof("deployment-b", "n-2", "orders", 8123),
+        identity_proof("deployment-b", "n-1", "inventory", 8123),
+        identity_proof("deployment-b", "n-1", "orders", 8124),
+    }
+    assert base not in others and len(others) == 4
+
+
+@pytest.mark.parametrize("server", [None, ("testserver", None), ("/run/worker.sock", None)])
+def test_health_identity_offers_no_proof_without_a_tcp_port(server) -> None:
+    assert health_identity("orders", "deployment-b", "n-1", server) == {"module": "orders"}
+
+
+def test_health_without_a_token_still_serves_and_offers_no_proof(
+    make_fake_app, monkeypatch
+) -> None:
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.delenv("MODULITH_DEPLOYMENT_TOKEN", raising=False)
+
+    app = create_app()
+    with TestClient(app) as client:
+        resp = client.get("/health", headers={"x-modulith-nonce": "n-1"})
+
+    assert (resp.status_code, resp.json()) == (200, {"status": "ok", "module": "orders"})
+
+
+def test_health_without_a_nonce_offers_no_proof(make_fake_app, monkeypatch) -> None:
     make_fake_app({"orders": ""})
     _set_worker_env(monkeypatch, "orders")
     monkeypatch.setenv("MODULITH_DEPLOYMENT_TOKEN", "deployment-b")
@@ -1659,8 +1910,7 @@ def test_health_endpoint_echoes_the_deployment_token(make_fake_app, monkeypatch)
     with TestClient(app) as client:
         resp = client.get("/health")
 
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "ok", "module": "orders", "deployment": "deployment-b"}
+    assert resp.json() == {"status": "ok", "module": "orders"}
 
 
 def test_a_module_named_health_cannot_shadow_the_workers_own_health(
@@ -1691,7 +1941,7 @@ def test_a_module_named_health_cannot_shadow_the_workers_own_health(
         own = client.get("/health")
         module_route = client.get("/health/detail")
 
-    assert own.json() == {"status": "ok", "module": "health", "deployment": "deployment-b"}
+    assert own.json() == {"status": "ok", "module": "health"}
     assert module_route.json() == {"module_says": "detail"}
 
 

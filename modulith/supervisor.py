@@ -52,6 +52,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from ._worker import LogTargetQueryFilter, install_access_log_filter, install_filter_once
+
 if TYPE_CHECKING:
     from .proxy import RoutingRule
 
@@ -225,8 +227,12 @@ def _build_worker_env(spec: WorkerSpec) -> dict[str, str]:
     ``spec.env`` for the same key. That matches the adapter's documented
     env > broker_options order and prevents a pyproject URL forwarded in
     ``spec.env`` from clobbering a deployment ``MODULITH_BROKER_URL``.
+
+    ``FORWARDED_ALLOW_IPS`` is dropped from the inherited environment so
+    workers trust forwarded headers only from the local proxy at 127.0.0.1.
     """
     env = dict(os.environ)
+    env.pop("FORWARDED_ALLOW_IPS", None)
     if spec.env:
         for key, value in spec.env.items():
             if key.startswith("MODULITH_BROKER") and env.get(key):
@@ -786,6 +792,11 @@ def _rules_from_specs(specs: list[WorkerSpec]) -> list[RoutingRule]:
     ]
 
 
+# What httpx logs for each request it sends: method, URL, HTTP version, status
+# and reason phrase.
+_HTTPX_REQUEST_LINE = 'HTTP Request: %s %s "%s %d %s"'
+
+
 async def _serve_uvicorn(app: Any, host: str, port: int) -> None:
     """Default proxy server: run uvicorn until a shutdown signal arrives.
 
@@ -798,12 +809,23 @@ async def _serve_uvicorn(app: Any, host: str, port: int) -> None:
     than a hardcoded one: the CLI's ``--log-level`` sets that root level, and
     a proxy that ignored it would keep narrating every forwarded request into
     an operator's deliberately quiet terminal.
+
+    The access lines it writes carry no query string: the proxy sees every
+    client's request, and tokens passed as query parameters must not reach the
+    logs. Each worker does the same in ``create_app``. The proxy forwards
+    through httpx, which logs every request it sends at INFO with the URL it
+    requested, query string included; those lines lose the query too. A filter
+    rather than a higher level for the ``httpx`` logger, because that line is
+    this process's only record of which worker answered a forwarded request or
+    a readiness probe.
     """
     import uvicorn
 
     config = uvicorn.Config(
         app, host=host, port=port, log_level=logging.getLogger().getEffectiveLevel()
     )
+    install_access_log_filter()
+    install_filter_once("httpx", LogTargetQueryFilter(_HTTPX_REQUEST_LINE, 1))
     await uvicorn.Server(config).serve()
 
 

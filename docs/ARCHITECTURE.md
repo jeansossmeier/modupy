@@ -976,11 +976,13 @@ split-readiness) with 80%/95% thresholds.
   when that protection is unavailable.
 - **The reverse proxy** (`modulith/proxy.py`): a FastAPI ASGI app that routes
   each request to the right worker by **URL prefix** (longest prefix wins),
-  strips hop-by-hop headers before forwarding, strips query strings from logs so
-  credentials aren't persisted, bounds request bodies (no response-body cap
-  exists — the response streams through unbounded), aggregates
-  worker `/health` into a single readiness signal, and supports an optional
-  bearer token on its actuator surface.
+  strips hop-by-hop headers before forwarding, keeps query strings out of its
+  own logger, of uvicorn's access and WebSocket handshake lines and of httpx's
+  request lines (each worker filters its uvicorn lines the same way) so
+  credentials aren't persisted, bounds request bodies
+  (no response-body cap exists — the response streams through unbounded),
+  aggregates worker `/health` into a single readiness signal, and supports an
+  optional bearer token on its actuator surface.
 
 Cross-module events between workers travel through the broker (§8); local
 listeners within a worker still dispatch in-process. Event code — `@event`,

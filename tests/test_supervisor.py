@@ -19,10 +19,12 @@ import contextlib
 import errno
 import logging
 import os
+import re
 import signal
 import socket
 import sys
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -40,7 +42,7 @@ from modulith.supervisor import (
     run_supervised,
 )
 
-from conftest import _free_port
+from conftest import _free_port, _health_answer
 
 # Trivial worker commands — stand in for the real uvicorn worker.
 _SLEEP = [sys.executable, "-c", "import time; time.sleep(30)"]
@@ -204,9 +206,9 @@ async def test_proxy_reverifies_a_worker_port_after_the_supervisor_respawns_it()
         return {"ok": True}
 
     @backend.get("/health")
-    async def health() -> dict[str, str]:
+    async def health(request: Request) -> dict[str, str]:
         hits.append("/health")
-        return {"status": "ok", "module": "orders", "deployment": answering["token"]}
+        return _health_answer(request, answering["token"])
 
     proxy_app = captured["app"]
     server, task = await _serve(backend, port, "h11")
@@ -265,9 +267,9 @@ async def test_proxy_reverifies_a_worker_port_as_soon_as_its_worker_exits(
         return {"ok": True}
 
     @backend.get("/health")
-    async def health() -> dict[str, str]:
+    async def health(request: Request) -> dict[str, str]:
         hits.append(("/health", None, None))
-        return {"status": "ok", "module": "orders", "deployment": answering["token"]}
+        return _health_answer(request, answering["token"])
 
     statuses: list[int] = []
 
@@ -1484,6 +1486,129 @@ async def test_run_supervised_default_serve_binds_real_uvicorn() -> None:
         assert resp.status_code == 200
         assert resp.json() == {"status": "ok", "backends": {}}
     finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+class _LogLines(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(record.getMessage())
+
+
+@pytest.fixture
+def no_access_filters() -> Iterator[None]:
+    """Start from a ``uvicorn.access`` logger without filters, and leave it as found.
+
+    A worker app built by an earlier test installs the filter for the rest of the
+    process; without the reset this test would pass on that filter alone.
+    """
+    logger = logging.getLogger("uvicorn.access")
+    filters = logger.filters[:]
+    logger.filters.clear()
+    yield
+    logger.filters[:] = filters
+
+
+@pytest.mark.real_process
+async def test_proxy_access_log_hides_the_query_string(caplog, no_access_filters: None) -> None:
+    """uvicorn's own access record, from the proxy ``run_supervised`` really serves,
+    reaches its handlers without the query string.
+
+    The request goes through the real h11/httptools protocol, so the record has
+    whatever shape the installed uvicorn gives it, not one this test assumes.
+    """
+    import httpx
+
+    # _serve_uvicorn takes uvicorn's log level from the root logger, and the
+    # access line is INFO.
+    caplog.set_level(logging.INFO)
+    access = logging.getLogger("uvicorn.access")
+    seen = _LogLines()
+    port = _free_port()
+    task = asyncio.create_task(run_supervised([], "127.0.0.1", port))
+
+    try:
+        async with httpx.AsyncClient() as client:
+            deadline = time.monotonic() + 15.0
+            while True:
+                try:
+                    await client.get(f"http://127.0.0.1:{port}/_modulith/health")
+                    break
+                except httpx.TransportError:
+                    assert not task.done(), f"server died during startup: {task.exception()!r}"
+                    assert time.monotonic() < deadline, "uvicorn never became reachable"
+                    await asyncio.sleep(0.05)
+
+            # Configuring the server replaced the logger's handlers, so ours goes on now.
+            access.addHandler(seen)
+            resp = await client.get(f"http://127.0.0.1:{port}/_modulith/health?token=hunter2")
+
+        assert resp.status_code == 200
+        assert len(seen.lines) == 1
+        assert re.fullmatch(
+            r'127\.0\.0\.1:\d+ - "GET /_modulith/health HTTP/1\.1" 200', seen.lines[0]
+        ), seen.lines[0]
+    finally:
+        access.removeHandler(seen)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.fixture
+def no_httpx_filters() -> Iterator[None]:
+    """Start from an ``httpx`` logger without filters, and leave it as found."""
+    logger = logging.getLogger("httpx")
+    filters = logger.filters[:]
+    logger.filters.clear()
+    yield
+    logger.filters[:] = filters
+
+
+@pytest.mark.real_process
+async def test_proxy_process_httpx_lines_hide_the_query_string(
+    caplog, no_httpx_filters: None
+) -> None:
+    """httpx logs every request it sends at INFO with the full URL, and the proxy
+    forwards through it, so the process ``run_supervised`` serves the proxy from
+    must keep the query string out of those lines.
+
+    The requests come from a real httpx client in that process, so the record
+    has whatever shape the installed httpx gives it, not one this test assumes.
+    """
+    import httpx
+
+    caplog.set_level(logging.INFO)
+    httpx_logger = logging.getLogger("httpx")
+    seen = _LogLines()
+    httpx_logger.addHandler(seen)
+    port = _free_port()
+    task = asyncio.create_task(run_supervised([], "127.0.0.1", port))
+
+    try:
+        async with httpx.AsyncClient() as client:
+            deadline = time.monotonic() + 15.0
+            while True:
+                try:
+                    await client.get(f"http://127.0.0.1:{port}/_modulith/health")
+                    break
+                except httpx.TransportError:
+                    assert not task.done(), f"server died during startup: {task.exception()!r}"
+                    assert time.monotonic() < deadline, "uvicorn never became reachable"
+                    await asyncio.sleep(0.05)
+
+            resp = await client.get(f"http://127.0.0.1:{port}/_modulith/health?token=hunter2")
+
+        assert resp.status_code == 200
+        line = f'HTTP Request: GET http://127.0.0.1:{port}/_modulith/health "HTTP/1.1 200 OK"'
+        assert seen.lines == [line, line]
+    finally:
+        httpx_logger.removeHandler(seen)
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
