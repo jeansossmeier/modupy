@@ -1277,6 +1277,25 @@ def test_pyproject_outbox_options_accepts_valid_claim_lease_seconds() -> None:
     assert cfg.outbox_options == {"claim_lease_seconds": 45.5}
 
 
+@pytest.mark.parametrize("value", [86_400.5, 86_401, 1e12])
+def test_claim_lease_seconds_above_the_cap_is_rejected(tmp_path: Path, value: float) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        f"[tool.modulith.outbox_options]\nclaim_lease_seconds = {value!r}\n"
+    )
+    with pytest.raises(ConfigurationError, match=r"outbox_options\.claim_lease_seconds.*86400"):
+        load_configuration()
+
+
+@pytest.mark.parametrize("value", [0.03, 86_400, 86_400.0])
+def test_claim_lease_seconds_from_milliseconds_up_to_one_day_is_accepted(
+    tmp_path: Path, value: float
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        f"[tool.modulith.outbox_options]\nclaim_lease_seconds = {value!r}\n"
+    )
+    assert load_configuration().outbox_options == {"claim_lease_seconds": value}
+
+
 @pytest.mark.parametrize("value", [0, -1, 1.5, "100", True])
 def test_pyproject_outbox_options_rejects_invalid_claim_batch_size(value: object) -> None:
     with pytest.raises(ConfigurationError, match="claim_batch_size"):

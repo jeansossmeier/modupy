@@ -48,6 +48,9 @@ MAX_PAYLOAD_BYTES = 1024**3
 _SHM_MAX_PAYLOAD_BYTES = 1_000_000_000
 _SHM_MAX_STORE_BYTES = 1024**4
 _MAX_PAYLOAD_BYTES_ENV = "MODULITH_BROKER_MAX_PAYLOAD_BYTES"
+# One day. claim_batch adds the lease to the clock, and a lease near the datetime
+# range raises OverflowError on every sweep. outbox.configure() applies the same bound.
+MAX_CLAIM_LEASE_SECONDS = 86_400
 
 
 class ConfigurationError(Exception):
@@ -789,6 +792,14 @@ def _validate_outbox_options(options: dict[str, Any]) -> None:
                 raise ConfigurationError(
                     f"outbox_options.{key} must be a finite number greater than 0, got {value!r}"
                 )
+    if (
+        "claim_lease_seconds" in options
+        and options["claim_lease_seconds"] > MAX_CLAIM_LEASE_SECONDS
+    ):
+        raise ConfigurationError(
+            f"outbox_options.claim_lease_seconds must be at most {MAX_CLAIM_LEASE_SECONDS} "
+            f"seconds (one day), got {options['claim_lease_seconds']!r}"
+        )
     for key in _POSITIVE_INTEGER_KEYS:
         if key in options:
             value = options[key]

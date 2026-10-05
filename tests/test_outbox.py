@@ -1491,6 +1491,51 @@ def test_configure_rejects_invalid_lease_and_batch_values() -> None:
         outbox.configure(store, JsonEventSerializer(), claim_batch_size=True, start_loop=False)
 
 
+@pytest.mark.parametrize("lease", [86_400.5, 86_401, 1e12])
+def test_configure_rejects_a_lease_that_overflows(lease: float) -> None:
+    """A lease of 1e12 s used to validate, and every sweep then raised
+    OverflowError adding it to the clock, so nothing was delivered."""
+    with pytest.raises(ConfigurationError, match=r"claim_lease_seconds.*86400"):
+        outbox.configure(
+            StubStore(), JsonEventSerializer(), claim_lease_seconds=lease, start_loop=False
+        )
+
+    assert outbox._store is None
+
+
+@pytest.mark.parametrize("lease", [0.03, 86_400])
+def test_configure_accepts_a_lease_from_milliseconds_up_to_one_day(lease: float) -> None:
+    outbox.configure(
+        StubStore(), JsonEventSerializer(), claim_lease_seconds=lease, start_loop=False
+    )
+
+    assert outbox._claim_lease_seconds == lease
+
+
+def test_outbox_url_forwards_the_longest_lease_the_config_accepts(
+    make_fake_app: Any, tmp_path: Path
+) -> None:
+    make_fake_app(_ORDERS_APP)
+    _runtime.configure(
+        package="fakeapp",
+        outbox="postgres",
+        outbox_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
+        outbox_options={"claim_lease_seconds": 86_400},
+    )
+    _runtime.ensure_bootstrapped()
+    bound = outbox._claim_lease_seconds
+    asyncio.run(_runtime.shutdown())
+
+    assert bound == 86_400.0
+
+
+def test_module_docstring_covers_the_row_locks_a_forked_child_keeps_under_a_lease() -> None:
+    doc = _normalized_doc(outbox)
+
+    assert "row locks" in doc
+    assert "idle_in_transaction_session_timeout" in doc
+
+
 def test_cancel_retry_task_schedules_cancellation_on_a_foreign_loop() -> None:
     loop = asyncio.new_event_loop()
     task = loop.create_task(asyncio.sleep(60))

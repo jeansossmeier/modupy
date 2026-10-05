@@ -142,7 +142,7 @@ check:
 | Key | Default | Accepted |
 |---|---|---|
 | `claim_strategy` | `"lease"` | `"lease"`, `"advisory_lock"`, `"none"` (§7.4) |
-| `claim_lease_seconds` | `60` | finite number > 0 |
+| `claim_lease_seconds` | `60` | finite number > 0, at most 86400 (one day) |
 | `claim_batch_size` | `100` | integer > 0 |
 | `dead_letter_after_attempts` | `10` | integer > 0 |
 | `retry_interval_seconds` | `30` | finite number > 0 |
@@ -613,7 +613,10 @@ stall, not your slowest listener; a lease that lapses lets a peer legitimately
 reclaim the row; it also bounds how long a crashed process's in-flight rows
 wait for recovery, see §7.2) and `claim_batch_size` (default 100 rows per claim). A
 renewal that raises (a database blip) is logged and retried until the lease
-expires; it never fails the delivery.
+expires; it never fails the delivery. `outbox.configure()` and
+`outbox_options` reject a `claim_lease_seconds` above 86400 (one day): no
+delivery needs a longer lease, and an enormous one overflows the clock
+arithmetic of every claim. Any positive value up to that is accepted.
 
 **Replica clocks.** The outbox keeps time with each replica's own clock, where
 the database broker uses the database server's (§8.4). `claim_batch()`,

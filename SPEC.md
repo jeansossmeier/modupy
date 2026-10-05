@@ -601,7 +601,7 @@ When the runtime binds the store from `outbox_url`, it validates these keys and 
 |---|---|---|
 | `completion_mode` | `"update"` | `"update"`, `"delete"` or `"archive"`, as above |
 | `claim_strategy` | `"lease"` | how concurrent sweepers coordinate: `"lease"`, `"advisory_lock"` (Postgres only) or `"none"` ([§7.4](#74-the-retry-loop)) |
-| `claim_lease_seconds` | 60 | how long a claimed batch belongs to one sweeper |
+| `claim_lease_seconds` | 60 | how long a claimed batch belongs to one sweeper; at most 86400 (one day) |
 | `claim_batch_size` | 100 | records claimed per sweep |
 | `dead_letter_after_attempts` | store's own setting, else 10 | attempts before a record is dead-lettered |
 | `retry_interval_seconds` | 30 | pause between sweeps |

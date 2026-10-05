@@ -553,8 +553,9 @@ listener keeps its row. A lease expires mid-dispatch only when renewal cannot
 run: a listener that blocks the event loop for longer than the lease, or
 renewals that keep failing for longer than it. A peer can then legitimately
 reclaim the row — a duplicate delivery, not a bug. Raise
-`claim_lease_seconds` rather than lowering it to chase latency. The lease is
-also the crash-recovery bound: rows a crashed process was delivering are
+`claim_lease_seconds` rather than lowering it to chase latency, but not above
+86400 seconds (one day): `outbox.configure()` and `outbox_options` reject more.
+The lease is also the crash-recovery bound: rows a crashed process was delivering are
 recovered once their lease expires, normally within `claim_lease_seconds`
 plus `retry_interval_seconds` of the crash. Recovery takes longer when
 `retry_stale_seconds` exceeds the lease, while a slow sweep is still running,
@@ -716,7 +717,7 @@ the matching `outbox.configure()` keyword arguments:
 | Key | Value |
 |---|---|
 | `claim_strategy` | `"lease"`, `"advisory_lock"` or `"none"` (recipe 6) |
-| `claim_lease_seconds` | positive finite number |
+| `claim_lease_seconds` | positive finite number, at most 86400 (one day) |
 | `claim_batch_size` | positive integer |
 | `dead_letter_after_attempts` | positive integer |
 | `retry_interval_seconds` | positive finite number |

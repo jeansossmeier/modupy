@@ -17,9 +17,16 @@ Critical correctness properties:
      the first sweep after expiry, normally within ``claim_lease_seconds``
      plus ``retry_interval_seconds`` of the crash; a ``retry_stale_seconds``
      above the lease, a slow sweep still running, or a runtime not yet
-     bootstrapped make it longer. An advisory lock ends with the dead
-     process's Postgres session. On a live host that is at once, so the
-     crash sweep recovers those rows immediately. The exception is a
+     bootstrapped make it longer. Under a lease, a fork-started descendant
+     (``multiprocessing`` or ``ProcessPoolExecutor`` child) can also keep the
+     dead process's row locks: a claim or completion transaction holds them
+     until it commits, so if the process dies inside one while the descendant
+     holds a copy of that connection's socket, the session sits idle in its
+     open transaction and every sweep skips those rows until the descendant
+     exits or Postgres ends the session. ``idle_in_transaction_session_timeout``
+     on the outbox's role makes Postgres end it. An advisory lock ends with
+     the dead process's Postgres session. On a live host that is at once, so
+     the crash sweep recovers those rows immediately. The exception is a
      descendant forked from the process, such as a fork-started
      ``multiprocessing`` or ``ProcessPoolExecutor`` child: it keeps a copy
      of the lock connection's socket, so the session and its locks outlive
@@ -89,7 +96,7 @@ from modulith._claims import (
     VALID_CLAIM_STRATEGIES,
 )
 from modulith.brokers import _split_broker_target
-from modulith.config import ConfigurationError
+from modulith.config import MAX_CLAIM_LEASE_SECONDS, ConfigurationError
 from modulith.serializers import JsonEventSerializer, _event_type_name
 
 logger = logging.getLogger("modulith.outbox")
@@ -447,6 +454,11 @@ def configure(
         # config.py's _validate_outbox_options, which already does this.
         raise ValueError(
             f"claim_lease_seconds must be a positive finite number, got {claim_lease_seconds!r}"
+        )
+    if claim_lease_seconds > MAX_CLAIM_LEASE_SECONDS:
+        raise ConfigurationError(
+            f"claim_lease_seconds must be at most {MAX_CLAIM_LEASE_SECONDS} seconds (one day), "
+            f"got {claim_lease_seconds!r}"
         )
     if (
         not isinstance(claim_batch_size, int)
