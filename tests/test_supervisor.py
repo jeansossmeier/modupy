@@ -107,6 +107,44 @@ def test_derive_specs_isolate_filters_modules(make_fake_app) -> None:
     assert {s.module_name for s in specs} == {"orders"}
 
 
+@pytest.mark.parametrize(
+    ("config", "unknown"),
+    [
+        ({"workers": {"ordrs": 4}}, "ordrs"),
+        ({"isolate": ["ordrs"]}, "ordrs"),
+        ({"isolate": ["orders", "inventry"]}, "inventry"),
+        ({"isolate": ["contracts"]}, "contracts"),
+        ({"workers": {"contracts": 2}}, "contracts"),
+    ],
+)
+def test_derive_specs_rejects_a_name_that_is_not_a_discoverable_module(
+    config, unknown, make_fake_app
+) -> None:
+    """A typo in --workers, --isolate or [tool.modulith.workers] used to be
+    ignored: the count silently never applied, and an unknown isolate yielded
+    no workers at all. The contracts package is not a module either."""
+    from modulith import ConfigurationError
+
+    make_fake_app({"orders": "", "inventory": "", "contracts": ""})
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        derive_specs_from_config({"package": "fakeapp", **config})
+
+    message = str(excinfo.value)
+    assert repr(unknown) in message
+    assert "inventory, orders" in message
+
+
+def test_derive_specs_accepts_the_default_key_and_known_module_names(make_fake_app) -> None:
+    make_fake_app({"orders": "", "inventory": ""})
+
+    specs = derive_specs_from_config(
+        {"package": "fakeapp", "workers": {"default": 2, "orders": 3}, "isolate": ["orders"]}
+    )
+
+    assert [(s.module_name, s.worker_count) for s in specs] == [("orders", 3)]
+
+
 def test_derive_specs_requires_package() -> None:
     with pytest.raises(ValueError, match="package"):
         derive_specs_from_config({})

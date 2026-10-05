@@ -1208,6 +1208,8 @@ Or scale the broker database (connection pooling, read replicas, etc.).
 
 Bias capacity toward fault-prone or high-load modules by giving them more workers on the nodes that serve them.
 
+**Names must match a discovered module.** Every key of `[tool.modulith.workers]` or `--workers` (other than `default`) and the `--isolate` value must name a module the package contains; the contracts package is not one. A misspelling such as `{"ordrs": 4}` is rejected at boot with `ConfigurationError` (exit 1) naming the unknown module and listing the discovered ones, instead of leaving the intended module on one worker.
+
 **Every discovered module gets at least one worker.** `[tool.modulith.workers]` counts must be `>= 1`; `notifications = 0` is rejected at boot with `ConfigurationError: workers must map string module names to positive integer counts`, and so is a `0` passed through `--workers` JSON. `modulith run` has no per-deployment module opt-out — "this module does not run here" means a separate application package, not a worker count of zero. To run one module by itself, see **Starting one module on its own** below.
 
 **Approach 1: Separate deployments with different worker counts**

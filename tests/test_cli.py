@@ -1706,6 +1706,57 @@ def test_run_workers_json_non_object_is_clean_error(make_fake_app, monkeypatch) 
     assert not isinstance(result.exception, AttributeError)
 
 
+def test_run_workers_json_unknown_module_is_clean_error(make_fake_app, monkeypatch) -> None:
+    """A mistyped module name in --workers used to be ignored, leaving the
+    intended module on one worker. It must exit 1 naming the bad key and the
+    modules that exist."""
+    make_fake_app({"orders": "", "inventory": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        pytest.fail("must not spawn workers")
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(
+        app, ["run", "myapp:app", "--topology", "processes", "--workers", '{"ordrs": 4}']
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "ordrs" in result.stderr
+    assert "inventory, orders" in result.stderr
+
+
+def test_dev_isolate_unknown_module_is_clean_error(make_fake_app, monkeypatch) -> None:
+    make_fake_app({"orders": "", "inventory": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        pytest.fail("must not spawn workers")
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["dev", "myapp:app", "--isolate", "ordrs"])
+
+    assert result.exit_code == 1, result.output
+    assert "ordrs" in result.stderr
+    assert "inventory, orders" in result.stderr
+
+
+@pytest.mark.parametrize(("command", "option"), [("run", "--workers"), ("dev", "--isolate")])
+def test_help_states_that_the_names_must_be_discovered_modules(command, option) -> None:
+    result = runner.invoke(app, [command, "--help"], env={"COLUMNS": "200"})
+
+    assert result.exit_code == 0, result.output
+    help_text = " ".join(click.unstyle(result.stdout).replace("│", " ").split())
+    assert option in help_text
+    assert "must name a discovered module" in help_text
+
+
 @pytest.mark.parametrize("count", ["0", "-3", '"many"', '"2"', "true"])
 def test_run_workers_json_bad_count_is_clean_error(count, make_fake_app, monkeypatch) -> None:
     """A bad worker count reached derive_specs_from_config and surfaced as a

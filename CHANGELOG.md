@@ -142,6 +142,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - The proxy's `/_modulith/health` readiness polls share one probe per worker, so a stalled worker holds one probe connection however often it is polled, and the worker probe pool grows to one connection per replica above 100, so a large fleet no longer reads `unreachable` behind a stalled worker
 - The `modulith extract` import check no longer refuses a first-party-looking package whose installed distribution the source `[project].dependencies` declares, and its refusal suggests declaring it; extension modules under `<prefix>/DLLs` and pip VCS checkouts under `<prefix>/src` no longer count as first-party when the environment is the project root, and the path comparison ignores case on Windows
 - The database broker raises a `ConfigurationError` naming `dispatch_started`, `modulith migrate` and migration `0006_broker_dispatch_started` when the application role cannot add that column, instead of the raw driver privilege error, and a SQLite file still locked when the schema deadline passes raises `TimeoutError` instead of `OperationalError`
+- `modulith run --workers`, `modulith dev --isolate` and the `[tool.modulith.workers]` table reject a name that is not a discovered module, exiting 1 with the unknown name and the list of modules, instead of silently ignoring a typo
 
 ### Security
 

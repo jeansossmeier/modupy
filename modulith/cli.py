@@ -825,7 +825,11 @@ def _run_process_topology(
             err=True,
         )
 
-    specs = derive_specs_from_config(config)
+    try:
+        specs = derive_specs_from_config(config)
+    except ConfigurationError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
     if not specs:
         typer.echo("no modules discovered to run", err=True)
         raise typer.Exit(code=1)
@@ -866,7 +870,9 @@ def dev(
         None, help=r"single | processes (default: \[tool.modulith] topology, else single)"
     ),
     isolate: str | None = typer.Option(
-        None, help="Restrict the deployment to only this module (all others are not started)"
+        None,
+        help="Restrict the deployment to only this module (all others are not started); "
+        "must name a discovered module",
     ),
     reload: bool = typer.Option(True, help="Reload on file changes"),
     host: str = typer.Option("127.0.0.1"),
@@ -955,7 +961,8 @@ def run(
         # bare [tool.modulith.workers] is parsed as a style and deleted from
         # the output — leaving "replaces the pyproject  table entirely" with
         # the one load-bearing name missing. \[ escapes it back to a literal.
-        help=r'JSON: {"reports": 4} (replaces the pyproject \[tool.modulith.workers] table entirely)',
+        help=r'JSON: {"reports": 4} (replaces the pyproject \[tool.modulith.workers] table entirely); '
+        "each key must name a discovered module, or be `default`",
     ),
     host: str = typer.Option("0.0.0.0"),
     port: int = typer.Option(8000),
@@ -977,7 +984,9 @@ def run(
     topology: each module's worker count comes from the JSON map (with a
     `default` fallback). Passing `--workers` replaces the pyproject
     \[tool.modulith.workers] table entirely — a full override, not a
-    per-module patch. The single-process path execs a plain uvicorn.
+    per-module patch. Each key must name a discovered module (or be
+    `default`); an unknown name exits 1 listing the valid ones. The
+    single-process path execs a plain uvicorn.
 
     `--log-level` sets this process's root log level and is passed on to
     uvicorn (and, under the process topology, to every worker subprocess), so

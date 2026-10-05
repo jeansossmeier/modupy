@@ -1240,6 +1240,10 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
       - ``package``  — application root package (required)
       - ``workers``  — ``{module_name: count}`` plus optional ``default``
       - ``isolate``  — restrict to this subset of modules (optional)
+
+    Every ``workers`` key other than ``default`` and every ``isolate`` entry
+    must name a discovered, non-contract module; anything else raises
+    ``ConfigurationError`` listing the valid names rather than being ignored.
       - ``contracts_module`` — the shared-types package (default
         ``"contracts"``), which discovery lists as a module but which gets no
         worker of its own: it exposes no router and no listeners, so a process
@@ -1262,15 +1266,29 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
         )
 
     names = discover_module_names(package, config.get("contracts_module") or "contracts")
-
+    workers = config.get("workers") or {}
     isolate = config.get("isolate")
+
+    for option, given in (
+        ("workers", [k for k in workers if k != "default"]),
+        ("isolate", list(isolate or ())),
+    ):
+        unknown = [n for n in given if n not in names]
+        if unknown:
+            from .config import ConfigurationError
+
+            raise ConfigurationError(
+                f"{option} names {', '.join(repr(n) for n in unknown)}, which "
+                f"{'is not a module' if len(unknown) == 1 else 'are not modules'} "
+                f"of package {package!r}; discovered modules: {', '.join(names) or 'none'}"
+            )
+
     if isolate:
         wanted = set(isolate)
         names = [n for n in names if n in wanted]
 
     _log_http_surface(package, names)
 
-    workers = config.get("workers") or {}
     default_count = int(workers.get("default", 1))
     if default_count < 1:
         raise ValueError(f"[tool.modulith.workers] default must be >= 1, got {default_count}")
