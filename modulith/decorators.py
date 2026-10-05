@@ -263,8 +263,12 @@ def listener(
 
     def register(handler: F) -> F:
         # functools.wraps chains can hide an async target behind a sync wrapper.
+        # The reverse holds too: an async wrapper over a sync function returns a
+        # coroutine that the sync path would discard unawaited.
         unwrapped = inspect.unwrap(handler)
-        target_is_async = inspect.iscoroutinefunction(unwrapped)
+        target_is_async = inspect.iscoroutinefunction(unwrapped) or inspect.iscoroutinefunction(
+            handler
+        )
         # A bound method keeps its binding: inspect.signature drops ``self`` and
         # follows ``functools.wraps`` through ``__func__``, which unwrap() cannot.
         resolve_target = handler if inspect.ismethod(handler) else unwrapped

@@ -2143,7 +2143,9 @@ def _masked_url(url: str) -> str:
 
     masked_base = make_url(url).render_as_string(hide_password=True)
 
-    parsed = urlparse(masked_base)
+    # A database URL has no fragment; a "#" belongs to the database name, and
+    # treating it as one would hide the query, secrets included, from masking.
+    parsed = urlparse(masked_base, allow_fragments=False)
     if not parsed.query:
         return masked_base
 

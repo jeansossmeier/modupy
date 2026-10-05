@@ -395,6 +395,51 @@ async def test_listener_accepts_a_bound_method_with_a_wrapping_decorator(is_asyn
     assert calls == [(service, event_instance)]
 
 
+def _async_over_sync_decorator():
+    """An ``async`` ``functools.wraps`` wrapper around a sync function."""
+    namespace: dict[str, object] = {}
+    source = textwrap.dedent(
+        """
+        import functools
+
+        def offload(f):
+            @functools.wraps(f)
+            async def wrapped(*args, **kwargs):
+                return f(*args, **kwargs)
+
+            return wrapped
+        """
+    )
+    exec(source, namespace)
+    return namespace["offload"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound", [True, False], ids=["method", "function"])
+async def test_an_async_wrapper_over_a_sync_listener_runs_the_listener(bound: bool) -> None:
+    """``inspect.unwrap`` reaches the sync function, but the registered callable
+    is the async wrapper, so its coroutine must be awaited, not discarded."""
+    calls: list[E] = []
+    offload = _async_over_sync_decorator()
+
+    class Service:
+        @offload
+        def on_order(self, evt: E) -> None:
+            calls.append(evt)
+
+    @offload
+    def on_order(evt: E) -> None:
+        calls.append(evt)
+
+    listener(Service().on_order if bound else on_order)
+
+    event_type, registered = _runtime._pending_listeners[0]
+    assert event_type is E
+    event_instance = E()
+    await registered(event_instance)
+    assert calls == [event_instance]
+
+
 class AsyncEmailSender:
     async def __call__(self, evt: E) -> None:
         pass

@@ -1512,6 +1512,55 @@ def test_register_hook_stream_cap_matches_what_the_worker_resolves(
     assert worker._max_stream_len == expected
 
 
+def _redis_target(broker: RedisStreamsBroker) -> tuple[object, object, object, str]:
+    kwargs = broker._client.connection_pool.connection_kwargs
+    return kwargs.get("host"), kwargs.get("port"), kwargs.get("db"), broker._stream_prefix
+
+
+@pytest.mark.parametrize(
+    ("specific", "generic", "value"),
+    [
+        ("REDIS_URL", "MODULITH_BROKER_URL", "redis://cache.example:6380/2"),
+        ("MODULITH_STREAM_PREFIX", "MODULITH_BROKER_STREAM_PREFIX", "shop"),
+    ],
+)
+def test_register_hook_reads_the_generic_env_the_supervisor_gives_workers(
+    monkeypatch: pytest.MonkeyPatch, specific: str, generic: str, value: str
+) -> None:
+    """Only the generic ``MODULITH_BROKER_*`` name set: the supervisor copies it
+    onto each worker's specific variable, so the parent must connect to the
+    same Redis and use the same stream prefix."""
+    from modulith.config import Configuration
+    from modulith.runtime import _runtime
+    from modulith.supervisor import WorkerSpec, _build_worker_env
+
+    def registered() -> RedisStreamsBroker:
+        registry = BrokerRegistry()
+        modulith_register_brokers(registry=registry)
+        broker = registry.get("redis-streams")
+        assert isinstance(broker, RedisStreamsBroker)
+        return broker
+
+    for name in ("REDIS_URL", "MODULITH_BROKER_URL", "MODULITH_STREAM_PREFIX"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("MODULITH_BROKER_STREAM_PREFIX", raising=False)
+    monkeypatch.setenv("MODULITH_BROKER", "redis-streams")
+    monkeypatch.setenv(generic, value)
+    monkeypatch.setattr(
+        _runtime,
+        "_config",
+        Configuration(package="fakeapp", broker="redis-streams", broker_options={}),
+    )
+    parent = registered()
+
+    worker_env = _build_worker_env(WorkerSpec(module_name="orders", package="fakeapp", port=9000))
+    monkeypatch.setenv(specific, worker_env[specific])
+    worker = registered()
+
+    assert worker_env[specific] == value
+    assert _redis_target(parent) == _redis_target(worker)
+
+
 @pytest.mark.parametrize(
     "env_var",
     [

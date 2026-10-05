@@ -4392,6 +4392,10 @@ def test_masked_url_keeps_non_secret_query_parameters_visible() -> None:
         ("sqlite+aiosqlite://", "sqlite+aiosqlite://"),
         ("sqlite+aiosqlite://?password=secret", "sqlite+aiosqlite://?password=***"),
         (
+            "sqlite+aiosqlite:///a#b.db?password=secret",
+            "sqlite+aiosqlite:///a#b.db?password=***",
+        ),
+        (
             "postgresql+psycopg://user:s3cret@db.example:5432/app?token=abc&sslmode=require",
             "postgresql+psycopg://user:***@db.example:5432/app?sslmode=require&token=***",
         ),
