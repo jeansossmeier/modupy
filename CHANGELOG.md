@@ -94,6 +94,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `modulith verify`, `docs`, `doctor` and `extract` log one WARNING per module or application package whose source directory they cannot find on `sys.path`, so a clean `verify` no longer hides that a package was never scanned. When a package name has several portions on `sys.path`, they read the portion holding `__init__.py`, the one Python imports, instead of an earlier directory without one
 - A worker's `/health` answer cuts a consumer `detail` longer than 1,024 characters and logs the full text once at WARNING. A consumer that failed with a very large error used to push the answer past the 64 KiB the proxy reads when it checks a worker's identity, so the proxy marked the deployment's own worker foreign and stopped routing to it
 - `outbox.configure()` and `[tool.modulith.outbox_options]` reject a `claim_lease_seconds` above 86400 seconds (one day) with a `ConfigurationError`. A value such as `1e12` used to pass validation and then made every sweep raise `OverflowError`, so nothing was delivered
+- Redis Streams consumers on Redis 6.2 acknowledge a pending message that the stream already trimmed and log it at ERROR, as on Redis 7, instead of leaving it pending forever with an INFO line. A message that left the group's pending list before its retry is logged as acknowledged or dead-lettered, not as vanished delivery metadata
 
 ### Security
 

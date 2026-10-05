@@ -672,6 +672,8 @@ The Redis image sets no password, so the command above requires one and publishe
 
 **⚠️ Redis Durability Caveat:** XADD MAXLEN `~` (approximate trimming) is blind to consumer-group PEL state. An undersized `max_stream_len` can permanently drop unacked entries, violating at-least-once delivery. Size `max_stream_len` well above worst-case backlog: **publish_rate × (consumer_downtime + processing_latency + reclaim_min_idle_ms)**. Default SHM and database brokers are NOT affected.
 
+**Supported Redis versions:** Redis 6.2 or newer, because the consumer recovers pending entries with `XAUTOCLAIM`. A pending entry that `MAXLEN` trimmed is acknowledged and logged at `ERROR` on both 6.2 and 7: Redis 7 reports its id in the `XAUTOCLAIM` reply, while 6.2 answers with a nil row and keeps the entry pending, so the consumer finds it in the group's pending list, confirms with `XRANGE` that it is gone, and acknowledges it.
+
 **Redis persistence:** the events live in Redis streams, so they are only as durable as the Redis behind them. Redis ships with the append-only file off (`appendonly no`) and takes periodic snapshots, which can lose the latest writes in a crash. For events to survive a crash or restart, set `appendonly yes`, choose an `appendfsync` policy, and keep Redis's data directory on a persistent volume, or use a managed Redis with AOF enabled. `everysec` (Redis's default policy) can lose about the last second of writes in a crash, `always` syncs every write at a large cost in speed, and `no` leaves flushing to the operating system. The Docker command above does none of this, so it suits a first try only. See [Redis persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/).
 
 **Tuning:**

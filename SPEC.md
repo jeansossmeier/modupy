@@ -937,8 +937,11 @@ consumer-group pending state — an undersized cap lets a publish burst silently
 trim entries that were delivered but never ACK'd (permanently losing them
 despite the XAUTOCLAIM recovery path) or never delivered at all. Only a trimmed
 pending entry is reported: the consumer logs it at ERROR level (via
-XAUTOCLAIM's deleted-ids element). An entry trimmed before a consumer group
-read it is not in that group's pending list, so its loss is not reported.
+XAUTOCLAIM's deleted-ids element on Redis 7; on Redis 6.2, which answers with a
+nil row and no id, it finds the entry through the pending list, confirms with
+XRANGE that it is gone, and acknowledges it before logging). An entry trimmed
+before a consumer group read it is not in that group's pending list, so its
+loss is not reported.
 Size `max_stream_len` well above the worst-case backlog (publish rate ×
 consumer downtime/latency). The dead-letter stream is likewise bounded
 (`dlq_max_stream_len`, default 10× `max_stream_len`) and best-effort, not a

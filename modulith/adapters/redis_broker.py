@@ -57,7 +57,9 @@ Production hardening over the bare example (examples/redis_streams_broker.py):
     pending (delivered but never ACK'd) or not yet delivered at all. Both
     are PERMANENTLY LOST (at-least-once is violated for them), but only a
     trimmed pending entry is reported: the consumer finds it via
-    XAUTOCLAIM's deleted-ids element and logs it at ERROR. An entry trimmed
+    XAUTOCLAIM's deleted-ids element (Redis 7) or, for Redis 6.2's id-less nil
+    row, via the pending list and XRANGE (``purge_trimmed_pending``), and logs
+    it at ERROR. An entry trimmed
     before a group read it is not in that group's PEL, so the consumer
     cannot see the loss and logs nothing. Size ``max_stream_len`` well above
     the worst-case backlog: publish rate x (consumer downtime + processing
@@ -102,6 +104,8 @@ _DEAD_SUFFIX = ".dead"
 _DEAD_ONLY_FIELDS = frozenset({b"h:source_message_id", b"h:source_group", b"h:attempts"})
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _SOCKET_TIMEOUT_MARGIN_S = 5.0
+# Most of one consumer's pending entries examined per purge_trimmed_pending call.
+_PURGE_SCAN_LIMIT = 1000
 
 
 def _env(name: str) -> str | None:
@@ -356,6 +360,32 @@ class RedisStreamsBroker:
                 break
             cursor = next_cursor
         return (b"0-0", claimed, deleted)
+
+    async def purge_trimmed_pending(
+        self, target: str, *, consumer: str, group: str | None = None
+    ) -> list[str]:
+        """XACK this consumer's pending entries that no longer exist in the stream.
+
+        Redis < 7.0 answers XAUTOCLAIM with a nil row, no id, for a pending entry
+        the stream trimmed, and keeps it in the pending list forever; 7.0+ drops
+        it and reports its id. An entry is acknowledged only after XRANGE confirms
+        it is gone, so a live entry this consumer is still working on is never
+        touched. Returns the acknowledged ids.
+        """
+        stream = self._stream_name(target)
+        group_name = group or self._consumer_group
+        pending = await self._client.xpending_range(
+            stream, group_name, min="-", max="+", count=_PURGE_SCAN_LIMIT, consumername=consumer
+        )
+        purged: list[str] = []
+        for entry in pending:
+            raw_id = entry["message_id"] if isinstance(entry, dict) else entry[0]
+            entry_id = _cursor_str(raw_id)
+            if await self._client.xrange(stream, min=entry_id, max=entry_id, count=1):
+                continue
+            await self._client.xack(stream, group_name, entry_id)
+            purged.append(entry_id)
+        return purged
 
     async def delivery_attempts(
         self, target: str, message_id: str, group: str | None = None

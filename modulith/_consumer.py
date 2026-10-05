@@ -388,27 +388,31 @@ class BrokerConsumer:
         claimed = result[1] if result and len(result) > 1 else []
         deleted = result[2] if result and len(result) > 2 else []
         if deleted:
-            lost_ids = [_as_str(d) for d in deleted]
-            logger.error(
-                "%d pending message(s) on %s were trimmed from the stream before "
-                "reclaim and are permanently lost (MAXLEN trim of unacked entries; "
-                "increase max_stream_len or reduce processing latency): %s",
-                len(lost_ids),
-                target,
-                lost_ids,
-            )
-            for lost in lost_ids:
-                self._attempts.pop((target, lost), None)
+            self._report_lost(target, [_as_str(d) for d in deleted])
         await self._dispatch_claimed(target, claimed)
 
-    async def _dispatch_claimed(self, target: str, claimed: Any) -> None:
-        """Dispatch reclaimed entries, skipping nil rows defensively.
+    def _report_lost(self, target: str, lost_ids: list[str]) -> None:
+        logger.error(
+            "%d pending message(s) on %s were trimmed from the stream before "
+            "reclaim and are permanently lost (MAXLEN trim of unacked entries; "
+            "increase max_stream_len or reduce processing latency): %s",
+            len(lost_ids),
+            target,
+            lost_ids,
+        )
+        for lost in lost_ids:
+            self._attempts.pop((target, lost), None)
 
-        XAUTOCLAIM on Redis < 7.0 returns nil for a pending entry that was
-        deleted from the stream (7.0+ moves these to the ``deleted`` reply
-        element instead). There is nothing to dispatch for a nil row — skip
-        it so one nil entry cannot kill the consumer task and crash-loop
-        worker startup.
+    async def _dispatch_claimed(self, target: str, claimed: Any) -> None:
+        """Dispatch reclaimed entries, skipping nil rows.
+
+        XAUTOCLAIM on Redis < 7.0 returns nil, without the id, for a pending
+        entry that was deleted from the stream and leaves it pending (7.0+
+        moves these to the ``deleted`` reply element and drops them). There is
+        nothing to dispatch for a nil row, and it must not kill the consumer
+        task, so it is skipped and the broker is asked to acknowledge whatever
+        pending entry it can confirm is gone, which is then reported like a
+        Redis 7 deleted id.
         """
         nil_entries = 0
         for entry in claimed:
@@ -421,9 +425,28 @@ class BrokerConsumer:
                 continue
             await self._dispatch_one(target, message_id, fields)
         if nil_entries:
-            logger.info(
-                "reclaim on %s returned %d nil entr(y/ies) (Redis < 7.0 "
-                "reporting stream-deleted pending messages) — skipped",
+            await self._purge_trimmed_pending(target, nil_entries)
+
+    async def _purge_trimmed_pending(self, target: str, nil_entries: int) -> None:
+        purge = getattr(self._broker, "purge_trimmed_pending", None)
+        lost_ids: list[str] = []
+        if callable(purge):
+            try:
+                lost_ids = [
+                    _as_str(mid)
+                    for mid in await purge(target, consumer=self._consumer_name, group=self._group)
+                ]
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._mark_broker_failure("reclaim", target, exc)
+                logger.exception("could not acknowledge trimmed pending entries on %s", target)
+        if lost_ids:
+            self._report_lost(target, lost_ids)
+        else:
+            logger.warning(
+                "reclaim on %s returned %d nil entr(y/ies) for pending messages "
+                "deleted from the stream, but none could be confirmed and acknowledged",
                 target,
                 nil_entries,
             )
@@ -587,7 +610,8 @@ class BrokerConsumer:
             return None
         if attempts is None:
             logger.warning(
-                "durable delivery metadata vanished for %s on %s — leaving pending",
+                "message %s on %s is no longer in the group's pending list "
+                "(acknowledged or dead-lettered) — nothing left to retry",
                 message_id,
                 target,
             )

@@ -95,6 +95,9 @@ class FakeConsumerBroker:
         self.pending_idle_ms: dict[tuple[str, str], float] = {}
         # target -> ids to report via reclaim's deleted element (once).
         self.lost: dict[str, list[str]] = {}
+        # target -> ids a nil claimed row stood for (Redis < 7.0 hides the id);
+        # ``purge_trimmed_pending`` acks and returns them once.
+        self.trimmed: dict[str, list[str]] = {}
         self.groups: list[tuple[str, str]] = []
         self.acked: list[tuple[str, str]] = []
         self.dead: list[tuple[str, str, dict[bytes, bytes]]] = []
@@ -171,6 +174,13 @@ class FakeConsumerBroker:
         else:
             self.pending.pop(target, None)
         return (b"0-0", claimed, self.lost.pop(target, []))
+
+    async def purge_trimmed_pending(
+        self, target: str, *, consumer: str, group: str | None = None
+    ) -> list[str]:
+        purged = self.trimmed.pop(target, [])
+        self.acked.extend((target, mid) for mid in purged)
+        return purged
 
     async def dead_letter(
         self, target: str, message_id: str, fields: dict[bytes, bytes], group: str | None = None
@@ -1243,6 +1253,61 @@ async def test_reclaim_survives_nil_claimed_entries() -> None:
 
     assert received == [17]  # the entry after the nil row was still dispatched
     assert ("t", "5-0") in broker.acked
+
+
+@pytest.mark.asyncio
+async def test_nil_claimed_entry_is_acked_and_reported_lost_like_redis_7(caplog) -> None:
+    """Redis 6.2 reports a pending entry trimmed from the stream as a nil row with
+    no id, and leaves it in the pending list for good. The consumer must confirm
+    the entry is gone, acknowledge it and log it at ERROR with the text Redis 7's
+    deleted-ids element gets."""
+    broker = FakeConsumerBroker()
+    broker.pending["t"] = [None]
+    broker.trimmed["t"] = ["4-0"]
+    consumer = _make_consumer(broker, InMemoryEventBus(), targets=["t"])
+    consumer._attempts[("t", "4-0")] = 3
+
+    with caplog.at_level("INFO", logger="modulith.consumer"):
+        await consumer._reclaim("t")
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "permanently lost" in errors[0].getMessage()
+    assert "4-0" in errors[0].getMessage()
+    assert broker.acked == [("t", "4-0")]
+    assert broker.dead == []
+    assert ("t", "4-0") not in consumer._attempts
+
+
+@pytest.mark.asyncio
+async def test_entry_that_left_the_pending_list_is_not_described_as_vanished_metadata(
+    caplog,
+) -> None:
+    """``delivery_attempts`` returns None only once the entry left the group's
+    pending list: it was acknowledged or dead-lettered, never "left pending"."""
+
+    class GoneFromPendingBroker(FakeConsumerBroker):
+        async def delivery_attempts(
+            self, target: str, message_id: str, group: str | None = None
+        ) -> int | None:
+            return None
+
+    async def boom(evt: CrossEvent) -> None:
+        raise ValueError("listener down")
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, boom)
+    consumer = _make_consumer(GoneFromPendingBroker(), bus, targets=["t"])
+    fields = {
+        b"data": JsonEventSerializer().serialize(CrossEvent(value=1)),
+        b"h:event_type": f"{CrossEvent.__module__}.{CrossEvent.__qualname__}".encode(),
+    }
+
+    with caplog.at_level("WARNING", logger="modulith.consumer"):
+        await consumer._dispatch_one("t", b"7-0", fields)
+
+    assert "no longer in the group's pending list" in caplog.text
+    assert "leaving pending" not in caplog.text
 
 
 @pytest.mark.asyncio

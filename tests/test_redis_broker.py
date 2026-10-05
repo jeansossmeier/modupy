@@ -1308,3 +1308,86 @@ async def test_socket_options_in_the_url_win_over_defaults() -> None:
         assert kwargs["socket_keepalive"] is False
     finally:
         await broker.close()
+
+
+@event
+@dataclass(frozen=True)
+class TrimmedPending:
+    n: int
+
+
+@pytest.fixture(scope="module")
+def redis_6_2_url():
+    """A throwaway ``redis:6.2`` container: XAUTOCLAIM answers a nil row there, not Redis 7's deleted-ids list."""
+    try:
+        from testcontainers.community.redis import RedisContainer
+    except ImportError:
+        try:
+            from testcontainers.redis import RedisContainer
+        except ImportError:
+            pytest.skip("testcontainers not installed")
+    try:
+        import docker
+
+        docker.from_env().ping()
+    except Exception:
+        pytest.skip("Docker unavailable")
+    with RedisContainer("redis:6.2-alpine") as container:
+        yield f"redis://{container.get_container_host_ip()}:{container.get_exposed_port(6379)}"
+
+
+@pytest.mark.integration
+async def test_integration_redis_6_2_trimmed_pending_entries_are_acked_and_reported(
+    redis_6_2_url, caplog
+) -> None:
+    """Redis 6.2 keeps a trimmed pending entry in the pending list forever and
+    hands XAUTOCLAIM a nil row for it. The consumer must XACK the entry and log
+    it at ERROR, exactly as it does for Redis 7's deleted-ids element."""
+    from uuid import uuid4
+
+    prefix = f"modupy.test.{uuid4().hex}"
+    broker = RedisStreamsBroker(url=redis_6_2_url, stream_prefix=prefix, consumer_group="g")
+    received: list[int] = []
+
+    async def handler(evt: TrimmedPending) -> None:
+        received.append(evt.n)
+
+    bus = InMemoryEventBus()
+    bus.register(TrimmedPending, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[TrimmedPending])
+    consumer = BrokerConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="c1",
+        group="g",
+        targets=["t"],
+        poll_block_ms=100,
+        reclaim_min_idle_ms=1,
+    )
+    stream = f"{prefix}.t"
+    try:
+        await broker.ensure_group("t")
+        for n in range(3):
+            await broker.publish(
+                "t",
+                serializer.serialize(TrimmedPending(n)),
+                {"event_type": f"{__name__}.TrimmedPending"},
+            )
+        read = await broker.read("t", consumer="crashed-peer", count=10, block_ms=100)
+        ids = [mid for _stream, entries in read for mid, _fields in entries]
+        await broker._client.xdel(stream, ids[0], ids[1])
+        await asyncio.sleep(0.05)
+
+        with caplog.at_level("INFO", logger="modulith.consumer"):
+            await consumer._reclaim("t")
+
+        assert (await broker._client.xpending(stream, "g"))["pending"] == 0
+        assert received == [2]
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1
+        assert "permanently lost" in errors[0]
+        assert all(mid.decode() in errors[0] for mid in ids[:2])
+    finally:
+        await broker._client.delete(stream)
+        await broker.close()
