@@ -54,11 +54,13 @@ Production hardening over the bare example (examples/redis_streams_broker.py):
     stream can't grow without limit. CAVEAT: trimming is by stream length
     alone — it is blind to consumer-group PEL state, so an undersized
     ``max_stream_len`` lets a publish burst push out entries that are still
-    pending (delivered but never ACK'd) or not yet delivered at all. A
-    trimmed pending entry is PERMANENTLY LOST (at-least-once is violated for
-    it); the consumer detects such losses via XAUTOCLAIM's deleted-ids
-    element and logs them at ERROR. Size ``max_stream_len`` well above the
-    worst-case backlog: publish rate x (consumer downtime + processing
+    pending (delivered but never ACK'd) or not yet delivered at all. Both
+    are PERMANENTLY LOST (at-least-once is violated for them), but only a
+    trimmed pending entry is reported: the consumer finds it via
+    XAUTOCLAIM's deleted-ids element and logs it at ERROR. An entry trimmed
+    before a group read it is not in that group's PEL, so the consumer
+    cannot see the loss and logs nothing. Size ``max_stream_len`` well above
+    the worst-case backlog: publish rate x (consumer downtime + processing
     latency + reclaim_min_idle_ms).
   - Pending-entry recovery via XAUTOCLAIM, run at startup and periodically
     from the consumer poll loop (reclaims messages a crashed or stalled

@@ -679,6 +679,8 @@ installs (`pip install 'modupy[postgres]'`). Offline `--sql` output has no
 connection to inspect and skips nothing, so apply it only to a database
 without those objects, as described above.
 
+**Redis persistence:** the events live in Redis streams, so they are only as durable as the Redis behind them. Redis ships with the append-only file off (`appendonly no`) and takes periodic snapshots, which can lose the latest writes in a crash. For events to survive a crash or restart, set `appendonly yes`, choose an `appendfsync` policy, and keep Redis's data directory on a persistent volume, or use a managed Redis with AOF enabled. `everysec` (Redis's default policy) can lose about the last second of writes in a crash, `always` syncs every write at a large cost in speed, and `no` leaves flushing to the operating system. The Docker command above does none of this, so it suits a first try only. See [Redis persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/).
+
 **Tuning:**
 
 The values below are examples; the defaults are shown beside each variable.
@@ -852,7 +854,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
-  redis:  # optional
+  redis:  # optional; not durable as written, see "Redis persistence" above
     image: redis:7-alpine
 
 volumes:
@@ -1722,7 +1724,9 @@ sync-driver URL the raw Alembic command reads, and `modulith migrate` reads
 | `database` (SQLite) | Local file | Yes | Single-host process-per-module | Dev, single-host staging |
 | `database` (Postgres) | Existing DB | Yes | Multi-host process-per-module | Production monolith and distributed |
 | `database` (MySQL or MariaDB) | Existing DB (MySQL 8.0.1+ or MariaDB 10.6+) | Yes | Multi-host process-per-module | Production on MySQL or MariaDB |
-| `redis-streams` | Docker/Cloud | Yes | High throughput, multi-host | High-load production |
+| `redis-streams` | Docker/Cloud | Yes, with AOF¹ | High throughput, multi-host | High-load production |
+
+¹ Redis streams are only as durable as Redis's own persistence: set `appendonly yes` with an `appendfsync` policy and keep Redis's data directory on a persistent volume, or use a managed Redis with AOF enabled. See [B. Redis Streams Broker](#b-redis-streams-broker).
 
 ---
 

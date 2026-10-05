@@ -925,15 +925,19 @@ url = "redis://localhost:6379"
 ```
 
 Each option also has an environment variable that takes precedence at deploy
-time: `REDIS_URL`, `MODULITH_STREAM_PREFIX`, `MODULITH_STREAM_MAXLEN`. (Values
-are literal — there is no `${VAR}` interpolation inside the TOML.)
+time: `REDIS_URL`, `MODULITH_STREAM_PREFIX`, `MODULITH_STREAM_MAXLEN`. An empty
+or whitespace-only value counts as unset, so the TOML option or the default
+applies. (Values are literal — there is no `${VAR}` interpolation inside the
+TOML.)
 
 Retention caveat: `max_stream_len` / `MODULITH_STREAM_MAXLEN` is enforced via
 `XADD MAXLEN ~`, which trims by stream length alone and is blind to
 consumer-group pending state — an undersized cap lets a publish burst silently
 trim entries that were delivered but never ACK'd (permanently losing them
-despite the XAUTOCLAIM recovery path) or never delivered at all. The consumer
-surfaces such losses at ERROR level (via XAUTOCLAIM's deleted-ids element).
+despite the XAUTOCLAIM recovery path) or never delivered at all. Only a trimmed
+pending entry is reported: the consumer logs it at ERROR level (via
+XAUTOCLAIM's deleted-ids element). An entry trimmed before a consumer group
+read it is not in that group's pending list, so its loss is not reported.
 Size `max_stream_len` well above the worst-case backlog (publish rate ×
 consumer downtime/latency). The dead-letter stream is likewise bounded
 (`dlq_max_stream_len`, default 10× `max_stream_len`) and best-effort, not a
