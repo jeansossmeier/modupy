@@ -1154,13 +1154,16 @@ def extract(
     Copies the module, its contracts and the package-level helpers they
     import into --output and generates the files needed to run it as its own
     process via `modulith._worker:create_app`. Before publishing, imports
-    the extracted module in a subprocess, so the service's third-party
-    dependencies must be installed. Exit codes: 0 on success, 1 on an
+    the extracted module, its contracts module and its `_manifest` in a
+    subprocess, so the service's third-party dependencies must be installed,
+    and warns about third-party distributions that import loaded but the
+    generated dependencies do not cover. Exit codes: 0 on success, 1 on an
     unknown module, boundary violations / shared tables / imports of other
     modules not overridden by --force, or (never overridable) an extracted
-    module that fails to import or loads code from the source tree outside
-    the extracted service, or an existing/unsafe --output path. A module-level
-    import of another module therefore fails even with --force.
+    module, contracts module or manifest that fails to import or loads code
+    from the source tree outside the extracted service, or an existing/unsafe
+    --output path. A module-level import of another module therefore fails
+    even with --force.
     """
     from .extract import extraction_blockers, import_closure, write_extraction
 
