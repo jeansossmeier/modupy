@@ -9,6 +9,7 @@ that don't exist on disk.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from modulith.builtin.verifier import (
     load_baseline,
     write_baseline,
 )
+from modulith.extract import _validate_initializers, import_closure
 from modulith.types import ViolationSeverity
 
 
@@ -1253,6 +1255,169 @@ def test_configured_disabled_rules_warns_only_for_a_typo(
     ]
     assert bool(warnings) is warns
     assert all(name in r.message for r in warnings)
+
+
+# ---------------------------------------------------------------------------
+# Sources the interpreter accepts but a UTF-8 text read rejects: a UTF-8 BOM
+# and a PEP 263 coding line, at every verifier and extract parse site.
+# Each body below carries a non-ASCII character so the latin-1 variant is not
+# valid UTF-8.
+# ---------------------------------------------------------------------------
+
+
+def _utf8_bom(body: str) -> bytes:
+    return b"\xef\xbb\xbf" + body.encode("utf-8")
+
+
+def _latin1_coding_line(body: str) -> bytes:
+    return b"# -*- coding: latin-1 -*-\n" + body.encode("latin-1")
+
+
+_interpreter_sources = pytest.mark.parametrize(
+    "encode", [_utf8_bom, _latin1_coding_line], ids=["utf8-bom", "latin1-coding-line"]
+)
+
+
+@_interpreter_sources
+def test_bom_and_pep263_modules_are_not_parse_errors(
+    encode: Callable[[str], bytes], make_fake_app, tmp_path: Path
+) -> None:
+    make_fake_app({"orders": "", "inventory": ""})
+    legacy = tmp_path / "fakeapp" / "orders" / "legacy.py"
+    legacy.write_bytes(encode('NAME = "café"\nfrom fakeapp.inventory._internal import secret\n'))
+
+    violations = verifier.modulith_verify_module(
+        _module("orders"), [_module("orders"), _module("inventory")]
+    )
+
+    assert [v.rule for v in violations] == ["no-internal-imports"]
+
+
+def test_a_source_the_interpreter_rejects_is_still_a_parse_error(make_fake_app, tmp_path) -> None:
+    """Undecodable bytes surface as a ``parse-error`` violation, not a crash.
+
+    Freezes behavior that holds with a text read and with a bytes parse alike.
+    """
+    make_fake_app({"orders": ""})
+    (tmp_path / "fakeapp" / "orders" / "broken.py").write_bytes(b"NAME = 'caf\xe9'\n")
+
+    violations = verifier.modulith_verify_module(_module("orders"), [_module("orders")])
+
+    assert [(v.rule, v.severity) for v in violations] == [("parse-error", ViolationSeverity.ERROR)]
+
+
+@_interpreter_sources
+def test_runtime_names_are_read_from_a_bom_or_pep263_module(
+    encode: Callable[[str], bytes], make_fake_app, tmp_path: Path
+) -> None:
+    make_fake_app({"orders": "", "payments": ""})
+    legacy = tmp_path / "fakeapp" / "orders" / "legacy.py"
+    legacy.write_bytes(
+        encode(
+            "from fakeapp.payments import Invoice, PaymentError\n"
+            'NAME = "café"\n\n\n'
+            "def pay(invoice: Invoice) -> None:\n"
+            "    raise PaymentError(NAME)\n"
+        )
+    )
+
+    violations = verifier.modulith_verify_module(
+        _module("orders"), [_module("orders"), _module("payments")]
+    )
+
+    messages = [v.message for v in violations if v.rule == "use-contracts"]
+    assert len(messages) == 1
+    assert "type(s) Invoice from payments" in messages[0]
+    assert "PaymentError" not in messages[0]
+
+
+@_interpreter_sources
+def test_table_refs_are_read_from_a_bom_or_pep263_module(
+    encode: Callable[[str], bytes], make_fake_app, tmp_path: Path
+) -> None:
+    make_fake_app({"orders": ""})
+    legacy = tmp_path / "fakeapp" / "orders" / "legacy.py"
+    legacy.write_bytes(
+        encode('from sqlalchemy import Table\nNAME = "café"\nstock = Table("stock")\n')
+    )
+
+    refs = verifier._collect_table_refs(_module("orders"))
+
+    assert [(table, location.split(":")[0], kind) for table, location, kind in refs] == [
+        ("stock", "fakeapp/orders/legacy.py", "define")
+    ]
+
+
+@_interpreter_sources
+def test_import_closure_follows_a_bom_or_pep263_helper(
+    encode: Callable[[str], bytes], make_fake_app, monkeypatch, tmp_path: Path
+) -> None:
+    from modulith.cli import _bootstrap_or_exit
+
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "from fakeapp.util import fmt\n"},
+        extra_files={"money.py": "cents = 100\n", "contracts/__init__.py": ""},
+    )
+    (tmp_path / "fakeapp" / "util.py").write_bytes(
+        encode('NAME = "café"\nfrom fakeapp.money import cents\n\n\ndef fmt():\n    return cents\n')
+    )
+
+    helpers, siblings = import_closure(_bootstrap_or_exit(inspection=True), "orders")
+
+    assert helpers == ["fakeapp.money", "fakeapp.util"]
+    assert siblings == []
+
+
+@_interpreter_sources
+def test_package_initializer_check_accepts_a_bom_or_pep263_docstring_only_file(
+    encode: Callable[[str], bytes], tmp_path: Path
+) -> None:
+    initializer = tmp_path / "__init__.py"
+    initializer.write_bytes(encode('"""Café."""\n'))
+
+    _validate_initializers([initializer])
+
+
+@_interpreter_sources
+def test_package_initializer_check_still_rejects_code_in_a_bom_or_pep263_file(
+    encode: Callable[[str], bytes], tmp_path: Path
+) -> None:
+    initializer = tmp_path / "__init__.py"
+    initializer.write_bytes(encode('NAME = "café"\nimport os\n'))
+
+    with pytest.raises(ValueError, match="executable behavior"):
+        _validate_initializers([initializer])
+
+
+def _verify_checkout(root: Path, monkeypatch: pytest.MonkeyPatch) -> list[Violation]:
+    """The ``orders`` module's violations for one copy of an app holding a
+    syntax error, with *root* as the project's source root."""
+    import sys
+
+    package = root / "fakeapp"
+    (package / "orders").mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "orders" / "__init__.py").write_text("")
+    (package / "orders" / "broken.py").write_text("def broken(:\n")
+    with monkeypatch.context() as checkout:
+        checkout.delitem(sys.modules, "fakeapp", raising=False)
+        checkout.syspath_prepend(str(root))
+        return verifier.modulith_verify_module(_module("orders"), [_module("orders")])
+
+
+def test_parse_error_baseline_entry_is_checkout_independent(monkeypatch, tmp_path: Path) -> None:
+    """The same project checked out at two paths — a developer's and a CI
+    runner's — must fingerprint a parse error identically, or the ratchet
+    reopens it on every other machine."""
+    alice = _verify_checkout(tmp_path / "alice", monkeypatch)
+    runner = _verify_checkout(tmp_path / "runner", monkeypatch)
+    baseline = tmp_path / "baseline.json"
+    write_baseline(baseline, alice)
+
+    assert [v.rule for v in alice] == ["parse-error"]
+    assert filter_against_baseline(runner, load_baseline(baseline)) == []
+    assert alice[0].message.startswith("fakeapp/orders/broken.py could not be parsed: ")
 
 
 # Keep ImportRecord referenced for import-time coverage of the dataclass.

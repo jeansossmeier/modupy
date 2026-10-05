@@ -444,6 +444,17 @@ class _ImportCollector(ast.NodeVisitor):
         return f"{base}.{node.module}" if node.module else base
 
 
+def _parse_source(path: Path) -> ast.Module:
+    """Parse the ``.py`` file at *path* the way the interpreter reads it.
+
+    The bytes go to ``ast.parse`` undecoded, so a UTF-8 BOM and a PEP 263
+    coding line are honored; decoding as UTF-8 first rejects both. Any source
+    the interpreter cannot read, undecodable bytes included, raises
+    ``SyntaxError``.
+    """
+    return ast.parse(path.read_bytes(), filename=str(path))
+
+
 def _collect_imports(
     module: ModuleInfo, parse_errors: list[tuple[Path, str]] | None = None
 ) -> list[ImportRecord]:
@@ -463,8 +474,8 @@ def _collect_imports(
     records: list[ImportRecord] = []
     for path in sorted(root.rglob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        except (SyntaxError, UnicodeDecodeError) as exc:
+            tree = _parse_source(path)
+        except SyntaxError as exc:
             logger.warning("skipping unparseable file %s: %s", path, exc)
             if parse_errors is not None:
                 parse_errors.append((path, str(exc)))
@@ -481,16 +492,21 @@ def _check_parse_errors(
     """A file that fails to parse must surface as an ERROR, not be silently
     skipped — a syntax/encoding error hides that file's imports from every
     other rule, so verification could pass while blind to real violations."""
-    return [
-        Violation(
-            rule="parse-error",
-            message=f"{path} could not be parsed: {message}",
-            module=module.name,
-            location=_portable_path(path, module),
-            severity=ViolationSeverity.ERROR,
+    violations: list[Violation] = []
+    for path, message in parse_errors:
+        # The message is hashed into the baseline fingerprint, so it carries
+        # the portable path: an absolute one differs in every checkout.
+        location = _portable_path(path, module)
+        violations.append(
+            Violation(
+                rule="parse-error",
+                message=f"{location} could not be parsed: {message}",
+                module=module.name,
+                location=location,
+                severity=ViolationSeverity.ERROR,
+            )
         )
-        for path, message in parse_errors
-    ]
+    return violations
 
 
 # ---------------------------------------------------------------------------
@@ -669,8 +685,8 @@ def _runtime_loaded_names_by_file(module: ModuleInfo) -> dict[Path, set[str]]:
     names_by_file: dict[Path, set[str]] = {}
     for path in sorted(root.rglob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        except (SyntaxError, UnicodeDecodeError):
+            tree = _parse_source(path)
+        except SyntaxError:
             continue
         # Fresh collector per file: TYPE_CHECKING aliases are file-scoped.
         collector = _NameUsageCollector()
@@ -918,8 +934,8 @@ def _collect_table_refs(module: ModuleInfo) -> list[tuple[str, str, str]]:
     refs: list[tuple[str, str, str]] = []
     for path in sorted(root.rglob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        except (SyntaxError, UnicodeDecodeError):
+            tree = _parse_source(path)
+        except SyntaxError:
             continue
         portable_path: str | None = None
         for table, line, kind in _table_refs_from_tree(tree):

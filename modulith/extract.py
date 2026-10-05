@@ -117,7 +117,13 @@ def import_closure(rt: Runtime, module: str) -> tuple[list[str], list[str]]:
     ``target_module`` alone names only ``pkg``. Type-only imports of another
     module are not reported: they never execute.
     """
-    from .builtin.verifier import _file_package, _ImportCollector, _owning_module, _package_dir
+    from .builtin.verifier import (
+        _file_package,
+        _ImportCollector,
+        _owning_module,
+        _package_dir,
+        _parse_source,
+    )
 
     cfg = rt.config
     target = next((m for m in rt.modules if m.name == module), None)
@@ -146,8 +152,8 @@ def import_closure(rt: Runtime, module: str) -> tuple[list[str], list[str]]:
             continue
         for path in sorted(source.rglob("*.py")) if source.is_dir() else [source]:
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-            except (SyntaxError, UnicodeDecodeError):
+                tree = _parse_source(path)
+            except SyntaxError:
                 continue
             collector = _ImportCollector(path, _file_package(package_dir, package, path))
             collector.visit(tree)
@@ -539,6 +545,8 @@ def _required_package_initializers(package_dir: Path, package: str) -> list[Path
 
 
 def _validate_initializers(initializers: list[Path]) -> None:
+    from .builtin.verifier import _parse_source
+
     for initializer in initializers:
         if initializer.parent.is_symlink():
             raise ValueError(f"source package {initializer.parent} is a symlink")
@@ -547,8 +555,8 @@ def _validate_initializers(initializers: list[Path]) -> None:
         if not initializer.exists():
             continue
         try:
-            tree = ast.parse(initializer.read_text(encoding="utf-8"), filename=str(initializer))
-        except (OSError, SyntaxError, UnicodeDecodeError) as exc:
+            tree = _parse_source(initializer)
+        except (OSError, SyntaxError) as exc:
             raise ValueError(f"cannot validate package initializer {initializer}: {exc}") from None
         statements = [
             statement
