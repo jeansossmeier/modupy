@@ -20,6 +20,8 @@ import asyncio
 import json
 import logging
 import os
+import select
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -2757,6 +2759,15 @@ def test_broker_drop_group_refuses_a_recently_active_group_without_force(
     assert _shm_group_backlog(db_path) == {"modulith-extracted": 3}
 
 
+def test_a_consumer_missing_two_subscription_refreshes_still_counts_as_live() -> None:
+    """A failed refresh is retried one interval later, so two failures in a row age the
+    subscription to three intervals; the group must still read as live then."""
+    from modulith.adapters._polling_consumer import SUBSCRIPTION_REFRESH_S
+    from modulith.cli import _LIVE_GROUP_WINDOW_S
+
+    assert SUBSCRIPTION_REFRESH_S * 3 <= _LIVE_GROUP_WINDOW_S
+
+
 def test_broker_drop_group_of_an_unknown_group_fails(make_fake_app, monkeypatch, tmp_path):
     make_fake_app({"orders": ""})
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
@@ -2796,6 +2807,28 @@ def test_broker_drop_group_does_not_create_a_missing_shm_store(
     assert result.exit_code == 1, result.output
     assert "no shm broker store" in result.output
     assert not state_home.exists()
+
+
+def test_broker_drop_group_refuses_a_broker_without_a_group_ledger_before_connecting(
+    make_fake_app, monkeypatch
+):
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "redis-streams")
+    with socket.socket() as redis_stand_in:
+        redis_stand_in.bind(("127.0.0.1", 0))
+        redis_stand_in.listen()
+        monkeypatch.setenv("REDIS_URL", f"redis://127.0.0.1:{redis_stand_in.getsockname()[1]}")
+
+        result = runner.invoke(app, ["broker", "drop-group", "modulith-retired", "--yes"])
+
+        assert result.exit_code == 1, result.output
+        assert (
+            "error: broker 'redis-streams' keeps no per-group subscription ledger; "
+            "drop-group applies to shm and database"
+        ) in result.stderr
+        pending, _, _ = select.select([redis_stand_in], [], [], 0)
+        assert not pending, "drop-group connected to the broker before refusing it"
 
 
 def _database_project(tmp_path: Path, monkeypatch, db_file: Path) -> str:
