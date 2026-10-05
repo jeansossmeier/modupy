@@ -541,7 +541,7 @@ This is the technically hardest piece and the one feature users can't easily bui
 
 Without an outbox: publish an event inside a DB transaction. Transaction commits. Process crashes before the event reaches its listener. Event is lost. Or: transaction rolls back, but the event was already dispatched. Inconsistent state.
 
-With an outbox: publish writes to a database table in the same transaction as the business work. After commit, a dispatcher picks up the row and delivers to the listener. If the dispatcher crashes mid-delivery, the row stays incomplete and gets retried on restart.
+With an outbox: publish writes to a database table in the same transaction as the business work. After commit, a dispatcher picks up the row and delivers to the listener. If the dispatcher crashes mid-delivery, the row stays incomplete, and the first sweep that runs after the dead process's lease expires or its advisory lock's session ends retries it.
 
 ![One commit saves the order and one event_publications row per listener; after the commit each listener runs in the background, and a failing one is retried, then dead-lettered](docs/images/outbox.svg)
 
