@@ -131,9 +131,11 @@ A committed `pyproject.toml` should carry no password. Put the full URL in
 - The binding needs module discovery (`auto_discover`, the default) outside a
   worker, because the allowlist comes from the discovered listeners. With
   `auto_discover = false`, call `outbox.configure()` yourself. The
-  `modulith outbox` commands then bind no store, because they import none of
-  your modules; run them with `MODULITH_AUTO_DISCOVER=true` when discovery can
-  import the package.
+  `modulith outbox` commands then bind no store, because bootstrap itself
+  imports none of your modules. Either run them with
+  `MODULITH_AUTO_DISCOVER=true` when discovery can import the package, or bind
+  the store from an entry-point plugin's import, which bootstrap loads in every
+  process.
 - The outbox table must already exist; the URL must name the database holding
   your business tables. `modulith migrate` creates it. It migrates `outbox_url`
   by default, swapping the async driver for the sync one Alembic runs on

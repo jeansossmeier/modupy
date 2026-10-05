@@ -1832,6 +1832,26 @@ def test_outbox_store_error_with_discovery_off_points_at_auto_discover(
     assert "module import time" not in result.stderr
 
 
+def test_outbox_store_error_with_discovery_off_names_the_plugin_route(
+    make_fake_app, monkeypatch
+) -> None:
+    """Bootstrap loads entry-point plugins even with auto_discover off, so the
+    message must say it imports none of *your* modules itself and offer the
+    plugin import as the second way to bind a store."""
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_OUTBOX", "postgres")
+    monkeypatch.setenv("MODULITH_AUTO_DISCOVER", "false")
+    make_fake_app({"orders": ""})
+
+    result = runner.invoke(app, ["outbox", "status"])
+
+    assert result.exit_code == 1
+    stderr = " ".join(result.stderr.split())
+    assert "bootstrap itself imports none of your modules" in stderr
+    assert "MODULITH_AUTO_DISCOVER=true" in stderr
+    assert "bind the store from an entry-point plugin's import" in stderr
+
+
 def test_outbox_status_uses_store_built_from_outbox_url(make_fake_app, monkeypatch, tmp_path):
     from sqlalchemy.ext.asyncio import create_async_engine
 

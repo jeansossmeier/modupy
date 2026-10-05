@@ -485,8 +485,9 @@ def _require_outbox_store() -> None:
     Pointing at ``[tool.modulith].outbox`` unconditionally is a dead end once
     that key is set: on its own it binds nothing, and bootstrap builds a store
     only when ``outbox_url`` is set too, and only with ``auto_discover`` on.
-    With discovery off the command imports no application module either, so
-    neither ``outbox_url`` nor an import-time ``configure()`` reaches it.
+    With discovery off bootstrap itself imports no application module, so
+    neither ``outbox_url`` nor an import-time ``configure()`` reaches the
+    command — except one an entry-point plugin's import runs.
     """
     if outbox._store is not None:
         return
@@ -502,11 +503,12 @@ def _require_outbox_store() -> None:
         cause = f"[tool.modulith].outbox is {configured!r} but no store is bound in this process"
     if cfg is not None and not cfg.auto_discover:
         remedy = (
-            "auto_discover is off, so bootstrap imports none of your modules and "
-            "binds no store here. When discovery can import your package, run the "
-            "command with auto_discover on (env MODULITH_AUTO_DISCOVER=true) and "
-            "outbox_url set (env MODULITH_OUTBOX_URL), and bootstrap binds the "
-            "store from outbox_url."
+            "auto_discover is off, so bootstrap itself imports none of your modules "
+            "and binds no store here. Either run the command with auto_discover on "
+            "(env MODULITH_AUTO_DISCOVER=true) and outbox_url set (env "
+            "MODULITH_OUTBOX_URL), and bootstrap binds the store from outbox_url, "
+            "or bind the store from an entry-point plugin's import, which bootstrap "
+            "loads in every process."
         )
     else:
         remedy = (
