@@ -1341,12 +1341,13 @@ What each file is. [ROADMAP.md](ROADMAP.md) holds the live delivery status, and 
 | `extract.py` | ✅ | `modulith extract`: scaffold a standalone service from one module |
 | `k8s.py` | ✅ | `modulith k8s-manifest`: a Deployment and Service per module plus one Ingress |
 | `openapi.py` | ✅ | `modulith openapi`: build each module's OpenAPI document and merge them |
+| `py.typed` | ✅ | PEP 561 marker: type checkers read the package's inline annotations |
 
 ### Built-in plugins: `modulith/builtin/`
 
 | File | Status | Notes |
 |---|---|---|
-| `__init__.py` | ✅ | Namespace package |
+| `__init__.py` | ✅ | Regular package: its docstring says the built-ins are ordinary first-party plugins with no special privileges |
 | `discovery.py` | ✅ | Default subpackage walker |
 | `verifier.py` | ✅ | AST-based boundary verification (Phase 1) |
 | `outbox.py` | ✅ | Outbox plugin core, calls store adapter (Phase 1) |
@@ -1357,7 +1358,7 @@ What each file is. [ROADMAP.md](ROADMAP.md) holds the live delivery status, and 
 
 | File | Status | Notes |
 |---|---|---|
-| `__init__.py` | ✅ | Namespace package |
+| `__init__.py` | ✅ | Regular package: its docstring lists the shipped adapters and the extra each needs |
 | `postgres_outbox.py` | ✅ | SQLAlchemy + Postgres PublicationStore, alembic migrations (Phase 1) |
 | `redis_broker.py` | ✅ | Redis Streams Broker (Phase 2) |
 | `db_broker.py` | ✅ | Postgres/MySQL/SQLite database broker |
@@ -1367,6 +1368,8 @@ What each file is. [ROADMAP.md](ROADMAP.md) holds the live delivery status, and 
 | `_consumer_protocol.py` | ✅ | `PollingBroker`: the store operations a polling consumer needs |
 | `_delivery_dispatch.py` | ✅ | Concurrent delivery and fenced completion for polling consumers |
 | `_dead_letter.py` | ✅ | The dead-letter shape `modulith broker dead-letter` reads from any adapter |
+| `alembic.ini` | ✅ | Alembic configuration for the packaged migrations; its `sqlalchemy.url` is empty because `migrations/env.py` takes the URL from `-x url=` or `MODULITH_DB_URL` |
+| `migrations/` | ✅ | The packaged Alembic environment and revision chain for the outbox and broker schemas: `env.py`, `script.py.mako`, `version_table.py` (keeps the revision in `modulith_alembic_version`) and `versions/` |
 | `kafka_broker.py` | ⏳ | Kafka Broker (Phase 4 — not shipped, see §10.3) |
 
 ### Tests: `tests/`

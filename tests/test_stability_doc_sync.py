@@ -1,6 +1,6 @@
 """Guard tests: hand-written prose must stay in sync with the code it describes.
 
-Two documents make claims nothing recomputes:
+Hand-written prose makes claims nothing recomputes:
 
 - ``docs/STABILITY.md`` scopes its "these exports are considered stable"
   promise to a hand-maintained list. Without a guard that list silently falls
@@ -13,6 +13,10 @@ Two documents make claims nothing recomputes:
   the driver protocols, the shared plugin-contract types. A count guard does
   not catch a list that names four of five and never says how many there are,
   so the enumerations are checked separately against the same source.
+- ``SPEC.md`` Part XVI inventories, by hand, every file the wheel ships under
+  ``modulith/``. A data file or a migration directory is as easy to leave out
+  as a module, so the shipped set is asked of the build backend and every file
+  in it must be named.
 
 ``docs/API_REFERENCE.md`` has an equivalent generator-backed guard
 (tests/test_api_reference_sync.py); these are the same protection for the
@@ -24,6 +28,7 @@ surface.
 
 from __future__ import annotations
 
+import fnmatch
 import inspect
 import re
 from collections.abc import Iterator
@@ -35,6 +40,7 @@ import modulith
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STABILITY_DOC = REPO_ROOT / "docs" / "STABILITY.md"
+SPEC_DOC = REPO_ROOT / "SPEC.md"
 
 
 def test_every_public_export_is_named_in_stability_doc() -> None:
@@ -237,4 +243,110 @@ def test_prose_lists_of_a_modules_names_leave_none_out(stem: str, names: frozens
     assert not incomplete, (
         f"shipped prose enumerates what {source} declares but leaves some out, so a "
         "reader cannot tell the list is partial: " + "; ".join(incomplete)
+    )
+
+
+# ---------------------------------------------------------------------------
+# SPEC Part XVI: the file inventory
+# ---------------------------------------------------------------------------
+
+
+def _shipped_package_files() -> list[str]:
+    """Every file the wheel build puts under ``modulith/``, as posix paths.
+
+    Asked of hatchling, the backend named in ``[build-system]``: it applies
+    ``packages = ["modulith"]`` and the ``.gitignore`` rules to the files on
+    disk, so a new module, ``py.typed`` or migration shows up here without
+    anyone editing a list, while ``__pycache__`` and broker state files never
+    do.
+    """
+    from hatchling.builders.wheel import WheelBuilder
+
+    selected = WheelBuilder(str(REPO_ROOT)).recurse_included_files()
+    return sorted(
+        file.distribution_path
+        for file in selected
+        if file.distribution_path.startswith("modulith/")
+    )
+
+
+def _inventory_rows() -> Iterator[tuple[str, list[str], str]]:
+    """Yield ``(directory, named files, row)`` for each package-table row of Part XVI.
+
+    ``directory`` comes from the ``### ... `modulith/x/` `` heading above the
+    table, because a bare ``__init__.py`` row only speaks for its own
+    directory. Rows under any other heading (tests, examples, top-level files)
+    are not package inventory and are skipped.
+    """
+    part = SPEC_DOC.read_text(encoding="utf-8").partition("\n## Part XVI")[2].partition("\n## ")[0]
+    assert part.strip(), "SPEC.md has no 'Part XVI' section"
+    directory = ""
+    for _, block in _markdown_blocks(part):
+        if block.lstrip().startswith("#"):
+            heading_directory = re.search(r"`(modulith/[^`]*)`", block)
+            directory = heading_directory.group(1) if heading_directory else ""
+        elif block.startswith("|") and directory:
+            yield directory, re.findall(r"`([^`]+)`", block.split("|")[1]), block
+
+
+def _names_file(token: str, relative_path: str) -> bool:
+    """Whether an inventory ``token`` accounts for ``relative_path``.
+
+    A token is a file name, a glob over file names (``_shm_*.py``) or a
+    directory (``migrations/``), which covers everything beneath it.
+    """
+    if token.endswith("/"):
+        return relative_path.startswith(token)
+    return fnmatch.fnmatchcase(relative_path, token)
+
+
+def test_spec_file_inventory_lists_every_shipped_package_file() -> None:
+    """Part XVI must name every file the wheel ships under ``modulith/``.
+
+    Each file is checked against the rows of the deepest inventoried directory
+    above it, so one directory's ``__init__.py`` row cannot stand in for
+    another's, and ``migrations/`` covers the revisions beneath it without a
+    row per revision.
+    """
+    tokens_by_directory: dict[str, list[str]] = {}
+    for directory, tokens, _ in _inventory_rows():
+        tokens_by_directory.setdefault(directory, []).extend(tokens)
+
+    unlisted: list[str] = []
+    for path in _shipped_package_files():
+        directory = max(
+            (candidate for candidate in tokens_by_directory if path.startswith(candidate)),
+            key=len,
+            default="modulith/",
+        )
+        relative = path.removeprefix(directory)
+        if not any(
+            _names_file(token, relative) for token in tokens_by_directory.get(directory, [])
+        ):
+            unlisted.append(path)
+
+    assert not unlisted, (
+        "SPEC.md Part XVI does not name these files the wheel ships (a directory row "
+        "such as `migrations/` covers everything beneath it): " + ", ".join(unlisted)
+    )
+
+
+def test_spec_file_inventory_calls_no_package_with_an_init_a_namespace_package() -> None:
+    """A directory that ships ``__init__.py`` is a regular package.
+
+    Only a directory without an ``__init__.py`` is a namespace package, so a
+    row for ``__init__.py`` that says "namespace" contradicts the file it names.
+    """
+    shipped = set(_shipped_package_files())
+    mislabelled = [
+        f"{directory}__init__.py"
+        for directory, tokens, row in _inventory_rows()
+        if "__init__.py" in tokens
+        and f"{directory}__init__.py" in shipped
+        and "namespace" in row.lower()
+    ]
+
+    assert not mislabelled, (
+        "SPEC.md Part XVI calls these directories namespace packages, but each ships an "
+        "__init__.py and so is a regular package: " + ", ".join(mislabelled)
     )
