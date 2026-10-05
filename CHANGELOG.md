@@ -135,6 +135,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - SHM broker: a hint read after a small gap touches only the slots between the consumer's cursor and the ring's peak instead of the whole ring (about 200 ms to under 0.1 ms per hint at `shm_capacity` 1,000,000), and a hint file that outlived a store reset is reset at open, so hint wake-ups work again
 - Database broker: a consumer restart under `no_subscriber_policy="store"` commits the subscription first and then replays retained messages one committed page at a time, so a publish to that target waits for at most one page instead of the whole replay, and a crash between pages keeps the committed pages
 - `modulith extract` no longer stalls when the import check leaves a background process holding its pipes, keeps files the import check writes out of `--output`, and removes its hidden staging directory on Ctrl-C; isolated tests (`modulith_isolated`) likewise no longer wait for such a process after the test child exits
+- `JsonEventSerializer`: a union field whose matching member is a `NewType`, a type alias or a parameterized generic (such as `list[date]`) round-trips to that member instead of being decoded as the first member, and a non-dataclass event is encoded and decoded from the same annotations
 
 ### Security
 

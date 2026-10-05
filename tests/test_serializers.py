@@ -1417,3 +1417,123 @@ def test_unknown_tag_lookup_is_not_remembered_across_deserialize_calls(caplog) -
 
     assert type(before.items[0]) is FanBase
     assert type(after.items[0]) is late
+
+
+UnionUserId = NewType("UnionUserId", int)
+UnionStamp = TypeAliasType("UnionStamp", datetime)
+
+
+@dataclass(frozen=True)
+class UnionPoint:
+    x: int
+    when: datetime
+
+
+UnionPointRef = NewType("UnionPointRef", UnionPoint)
+
+
+@dataclass(frozen=True)
+class UnionAliasMembers:
+    ref: date | UnionUserId
+    dates: str | list[date]
+    point: str | UnionPointRef
+    at: int | UnionStamp
+    keyed: str | dict[str, date]
+    fixed: str | tuple[date, ...]
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        UnionAliasMembers(
+            ref=UnionUserId(5),
+            dates="x",
+            point="p",
+            at=1,
+            keyed="k",
+            fixed="f",
+        ),
+        UnionAliasMembers(
+            ref=date(2020, 1, 1),
+            dates=[date(2020, 1, 1)],
+            point="p",
+            at=1,
+            keyed="k",
+            fixed="f",
+        ),
+        UnionAliasMembers(
+            ref=date(2020, 1, 1),
+            dates="x",
+            point=UnionPointRef(UnionPoint(1, datetime(2020, 1, 1, tzinfo=UTC))),
+            at=datetime(2020, 1, 2, tzinfo=UTC),
+            keyed={"a": date(2020, 1, 3)},
+            fixed=(date(2020, 1, 4),),
+        ),
+    ],
+)
+def test_union_members_that_are_newtypes_aliases_or_generics_round_trip(
+    event: UnionAliasMembers,
+) -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[UnionAliasMembers])
+
+    restored = serializer.deserialize(serializer.serialize(event), _fqcn(UnionAliasMembers))
+
+    assert restored == event
+    assert type(restored.ref) is type(event.ref)
+    assert type(restored.point) is type(event.point)
+
+
+def test_union_tag_for_a_newtype_member_is_still_the_members_repr() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[UnionAliasMembers])
+    event = UnionAliasMembers(ref=UnionUserId(5), dates="x", point="p", at=1, keyed="k", fixed="f")
+
+    stored = serializer.serialize(event)
+
+    assert b'"ref":{"__modulith_union_type__":"' + __name__.encode() + b'.UnionUserId"' in stored
+    assert b'"dates":{"__modulith_union_type__":"builtins.str"' in stored
+
+
+@dataclass
+class ShapeBase:
+    x: int
+
+
+@dataclass
+class ShapeSub(ShapeBase):
+    y: int
+
+
+class InitOnlyAnnotated:
+    def __init__(self, shape: ShapeBase, when: datetime | str) -> None:
+        self.shape = shape
+        self.when = when
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, InitOnlyAnnotated) and vars(self) == vars(other)
+
+
+class ClassOnlyAnnotated:
+    shape: ShapeBase
+
+    def __init__(self, shape):  # type: ignore[no-untyped-def]
+        self.shape = shape
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, ClassOnlyAnnotated) and vars(self) == vars(other)
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        InitOnlyAnnotated(ShapeSub(x=1, y=2), datetime(2020, 1, 1, tzinfo=UTC)),
+        InitOnlyAnnotated(ShapeBase(x=1), "text"),
+        ClassOnlyAnnotated(ShapeSub(x=1, y=2)),
+    ],
+)
+def test_non_dataclass_event_is_encoded_and_decoded_from_the_same_hints(event: Any) -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[type(event)])
+
+    restored = serializer.deserialize(serializer.serialize(event), _fqcn(type(event)))
+
+    assert restored == event
+    assert type(restored.shape) is type(event.shape)

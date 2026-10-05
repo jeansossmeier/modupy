@@ -183,6 +183,25 @@ def _unwrap_alias(hint: Any) -> Any:
     return hint
 
 
+def _member_class(member: Any) -> type | None:
+    """The class an ``isinstance`` check for a union member runs against.
+
+    ``NewType``/alias members resolve to what they name and a parameterized
+    generic such as ``list[date]`` to its origin; anything else (``Literal``,
+    a string forward reference) has no class.
+    """
+    hint = _unwrap_alias(member)
+    cls = typing.get_origin(hint) or hint
+    return cls if isinstance(cls, type) else None
+
+
+def _isinstance(obj: Any, cls: type) -> bool:
+    try:
+        return isinstance(obj, cls)
+    except TypeError:  # e.g. a non-runtime-checkable Protocol
+        return False
+
+
 def _is_tagged(value: Any) -> bool:
     return (
         isinstance(value, dict)
@@ -289,22 +308,23 @@ def _to_jsonable_typed(obj: Any, hint: Any) -> Any:
     if origin is Union or origin is types.UnionType:
         members = [member for member in typing.get_args(hint) if member is not type(None)]
         if len(members) > 1:
-            member = next(
-                (
-                    candidate
-                    for candidate in members
-                    if isinstance(candidate, type) and type(obj) is candidate
-                ),
-                None,
-            ) or next(
-                (
-                    candidate
-                    for candidate in members
-                    if dataclasses.is_dataclass(candidate)
-                    and isinstance(candidate, type)
-                    and isinstance(obj, candidate)
-                ),
-                members[0],
+            classes = [(candidate, _member_class(candidate)) for candidate in members]
+            member = (
+                next((m for m, cls in classes if cls is type(obj)), None)
+                or next(
+                    (
+                        m
+                        for m, cls in classes
+                        if cls is not None
+                        and dataclasses.is_dataclass(cls)
+                        and isinstance(obj, cls)
+                    ),
+                    None,
+                )
+                or next(
+                    (m for m, cls in classes if cls is not None and _isinstance(obj, cls)), None
+                )
+                or members[0]
             )
             return {
                 _UNION_TAG: _hint_tag(member),
@@ -330,7 +350,7 @@ def _to_jsonable_typed(obj: Any, hint: Any) -> Any:
                 for key, value in obj.items()
             }
     if isinstance(hint, type) and isinstance(obj, dict):
-        hints = _safe_type_hints(hint)
+        hints = _event_hints(hint)
         return {key: _encode_field(key, value, hints.get(key)) for key, value in obj.items()}
     if (
         dataclasses.is_dataclass(hint)
@@ -459,6 +479,25 @@ def _safe_type_hints(obj: Any) -> dict[str, Any]:
                 hints[name] = eval(annotation, dict(globalns))
             except Exception:
                 hints[name] = None  # unresolvable → leave this field uncoerced
+    return hints
+
+
+def _event_hints(cls: type) -> dict[str, Any]:
+    """Field hints for an event class, shared by encoding and decoding.
+
+    A non-dataclass event also takes its ``__init__`` parameter annotations,
+    which win over the class-level ones when resolvable. Encoding and decoding
+    must read the same hints, or a value is written in one shape and read in
+    another.
+    """
+    hints = _safe_type_hints(cls)
+    if not dataclasses.is_dataclass(cls):
+        # cls is a plain `type` here, so __init__ access is sound; mypy's
+        # instance-__init__ caveat doesn't apply to resolving annotations.
+        init = cls.__init__  # type: ignore[misc]
+        for key, hint in _safe_type_hints(init).items():
+            if hint is not None:
+                hints[key] = hint
     return hints
 
 
@@ -728,14 +767,7 @@ class JsonEventSerializer:
             logger.warning("%s", message)
         cls = _resolve_class(event_type)
         raw = json.loads(data.decode("utf-8"))
-        hints = _safe_type_hints(cls)
-        if not dataclasses.is_dataclass(cls):
-            # cls is a plain `type` here, so __init__ access is sound; mypy's
-            # instance-__init__ caveat doesn't apply to resolving annotations.
-            init = cls.__init__  # type: ignore[misc]
-            for key, hint in _safe_type_hints(init).items():
-                if hint is not None:
-                    hints[key] = hint
+        hints = _event_hints(cls)
         token = _subclass_memo.set({})
         try:
             kwargs = {key: _coerce(val, hints.get(key)) for key, val in raw.items()}
