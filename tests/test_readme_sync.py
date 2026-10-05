@@ -11,7 +11,11 @@ python block in it is a claim with no other checker behind it:
   ``ImportError`` and no file to create;
 - the prescribed directory tree lists ``pyproject.toml``. Every CLI command
   except ``audit`` resolves the application package from it, so a tree that
-  omits it produces a project where the CLI exits 1.
+  omits it produces a project where the CLI exits 1;
+- the 30-second pitch, rebuilt from its own blocks plus the empty package
+  files its prose names, makes modupy discover exactly the modules its banner
+  lists. A directory without an ``__init__.py`` is not a module, so a pitch
+  that never mentions one shows a banner no reader can reproduce.
 
 Every expectation is derived from README.md itself — including the name of the
 example package, taken from the path comments that introduce the blocks — so
@@ -23,7 +27,11 @@ from __future__ import annotations
 import ast
 import difflib
 import re
+import sys
+from collections.abc import Callable
 from pathlib import Path
+
+from modulith.builtin.discovery import modulith_discover_modules
 
 from conftest import Block, fenced_blocks
 
@@ -31,20 +39,26 @@ REPO = Path(__file__).resolve().parent.parent
 README = REPO / "README.md"
 QUICKSTART = REPO / "examples" / "quickstart"
 QUICKSTART_README = QUICKSTART / "README.md"
-QUICKSTART_SECTIONS = ("The 30-second pitch", "Quickstart")
+PITCH = "The 30-second pitch"
+QUICKSTART_SECTIONS = (PITCH, "Quickstart")
 PATH_COMMENT = re.compile(r"^#\s*([\w./-]+\.py)\s*$")
+BANNER = re.compile(r"discovered (\d+) module\(s\): (.+)")
+EMPTY_INIT = re.compile(r"`((?:[\w.-]+/)+__init__\.py)`")
 TREE_BRANCHES = ("├──", "└──")
 
 
-def _python_blocks() -> list[tuple[Block, str | None]]:
+def _python_blocks(blocks: list[Block] | None = None) -> list[tuple[Block, str | None]]:
     """Python blocks paired with the file path their first line declares, if any.
+
+    ``blocks`` defaults to every fenced block in the README; pass one section's
+    blocks to look at only those.
 
     A block without a path comment is a fragment, not a file: it contributes
     nothing to the set of modules the README defines, but its imports are still
     checked.
     """
     paired: list[tuple[Block, str | None]] = []
-    for block in fenced_blocks(README):
+    for block in blocks if blocks is not None else fenced_blocks(README):
         if block.lang != "python":
             continue
         body = block.body.strip()
@@ -205,24 +219,35 @@ def test_readme_project_tree_lists_pyproject_toml() -> None:
     )
 
 
-def _section_blocks(path: Path, title: str) -> list[Block]:
-    """Fenced blocks under the ``## <title>`` heading, sub-headings included."""
-    blocks = fenced_blocks(path)
+def _section_span(path: Path, title: str) -> tuple[int, int]:
+    """Line numbers of the ``## <title>`` heading and of the heading after it."""
+    lines = path.read_text(encoding="utf-8").splitlines()
     fenced_lines = {
         number
-        for block in blocks
+        for block in fenced_blocks(path)
         for number in range(block.line - 1, block.line + len(block.body.splitlines()) + 1)
     }
     headings = [
         (number, text[3:].strip())
-        for number, text in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1)
+        for number, text in enumerate(lines, start=1)
         if text.startswith("## ") and number not in fenced_lines
     ]
     starts = [number for number, name in headings if name == title]
     assert starts, f"{path.name} has no '## {title}' section"
     following = [number for number, _name in headings if number > starts[0]]
-    end = following[0] if following else float("inf")
-    return [block for block in blocks if starts[0] < block.line < end]
+    return starts[0], following[0] if following else len(lines) + 1
+
+
+def _section_blocks(path: Path, title: str) -> list[Block]:
+    """Fenced blocks under the ``## <title>`` heading, sub-headings included."""
+    start, end = _section_span(path, title)
+    return [block for block in fenced_blocks(path) if start < block.line < end]
+
+
+def _section_text(path: Path, title: str) -> str:
+    """Everything under the ``## <title>`` heading, code blocks included."""
+    start, end = _section_span(path, title)
+    return "\n".join(path.read_text(encoding="utf-8").splitlines()[start : end - 1])
 
 
 def _diff(expected: str, actual: str, expected_name: str, actual_name: str) -> str:
@@ -293,3 +318,69 @@ def test_root_readme_quickstart_blocks_run_in_the_quickstart_example() -> None:
         )
 
     assert not problems, "\n\n".join(problems)
+
+
+def _discover(package: str) -> list[str]:
+    """Module names modupy's built-in discovery returns for ``package``.
+
+    The package is imported afresh and forgotten again: the pitch's modules
+    register listeners, and other tests build packages under the same name.
+    """
+
+    def forget() -> None:
+        for name in [n for n in sys.modules if n == package or n.startswith(f"{package}.")]:
+            del sys.modules[name]
+
+    forget()
+    try:
+        return [module.name for module in modulith_discover_modules(package)]
+    finally:
+        forget()
+
+
+def test_readme_pitch_discovers_the_modules_its_banner_lists(
+    make_fake_app: Callable[..., str], tmp_path: Path
+) -> None:
+    """The pitch, rebuilt the way a reader would, discovers the modules its banner lists.
+
+    The tree is the pitch's own ``# myapp/...`` blocks plus every
+    ``dir/__init__.py`` its prose names as an empty file, and nothing else.
+    modupy counts a directory as a module only when it is a package, so a pitch
+    that never mentions ``myapp/contracts/__init__.py`` yields 3 modules where
+    its banner promises 4.
+    """
+    make_fake_app({})  # puts tmp_path on sys.path; its teardown resets the runtime
+    package = _example_package(_python_blocks())
+    pitch = _section_blocks(README, PITCH)
+
+    files = {
+        path: block.body.partition("\n")[2] + "\n" for block, path in _python_blocks(pitch) if path
+    }
+    for path in EMPTY_INIT.findall(_section_text(README, PITCH)):
+        files.setdefault(path, "")
+    for path, code in files.items():
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(code, encoding="utf-8")
+
+    banners = [
+        (block.line + block.body.count("\n", 0, match.start()), match)
+        for block in pitch
+        if block.lang == "bash"
+        for match in BANNER.finditer(block.body)
+    ]
+    assert len(banners) == 1, (
+        f"README.md '{PITCH}' must show one 'discovered N module(s): ...' banner line, "
+        f"found {len(banners)}"
+    )
+    line, banner = banners[0]
+    count, listed = int(banner[1]), banner[2].split(", ")
+
+    found = _discover(package)
+
+    assert (len(found), found) == (count, listed), (
+        f"README.md:{line} says the pitch discovers {count} module(s): {', '.join(listed)}, but "
+        f"a project built from the pitch's own files ({sorted(files)}) discovers "
+        f"{len(found)}: {', '.join(found)}. A directory is a module only when it is a package, "
+        "so the pitch must tell the reader about every __init__.py its blocks do not show"
+    )

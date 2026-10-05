@@ -110,6 +110,8 @@ An event is any class marked `@event`; a frozen dataclass is the recommended sha
 
 ![orders publishes OrderCreated, which payments and inventory receive; payments publishes PaymentReceived, which orders receives; both events live in contracts](https://raw.githubusercontent.com/jeansossmeier/modupy/main/docs/images/event-flow.svg)
 
+Every package also needs an `__init__.py`: the three modules below show theirs, and `myapp/__init__.py` and `myapp/contracts/__init__.py` are empty.
+
 ```python
 # myapp/contracts/events.py
 from dataclasses import dataclass
