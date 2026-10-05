@@ -457,6 +457,87 @@ async def test_broker_consumer_health_recovery_is_scoped_to_target() -> None:
         await consumer.stop()
 
 
+class _SlowFirstCompletionBroker(FakeConsumerBroker):
+    """The first ack and the first dead-letter block, then raise; later ones follow ``later_fail``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_started = {"ack": asyncio.Event(), "dead_letter": asyncio.Event()}
+        self.release = asyncio.Event()
+        self.calls = {"ack": 0, "dead_letter": 0}
+        self.later_fail = False
+
+    async def _complete(self, operation: str) -> None:
+        self.calls[operation] += 1
+        if self.calls[operation] == 1:
+            self.first_started[operation].set()
+            await self.release.wait()
+            raise RuntimeError(f"slow {operation} failed")
+        if self.later_fail:
+            raise RuntimeError(f"later {operation} failed")
+
+    async def ack(self, target: str, message_id: str, group: str | None = None) -> None:
+        await self._complete("ack")
+
+    async def dead_letter(
+        self, target: str, message_id: str, fields: dict[bytes, bytes], group: str | None = None
+    ) -> None:
+        await self._complete("dead_letter")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["ack", "dead_letter"])
+@pytest.mark.parametrize("later_write_fails", [False, True])
+async def test_completion_failure_that_started_before_a_recovery_is_ignored(
+    operation: str, later_write_fails: bool
+) -> None:
+    async def handler(_event: CrossEvent) -> None:
+        pass
+
+    broker = _SlowFirstCompletionBroker()
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    consumer = _make_consumer(broker, bus, targets=["t"], reclaim_min_idle_ms=60_000)
+    run_blocker = asyncio.Event()
+
+    async def blocked_run() -> None:
+        await run_blocker.wait()
+
+    consumer._run = blocked_run  # type: ignore[method-assign]
+    event_type = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+    fields = (
+        {
+            b"data": JsonEventSerializer().serialize(CrossEvent(value=1)),
+            b"h:event_type": event_type.encode(),
+        }
+        if operation == "ack"
+        else {b"data": b"{}"}
+    )
+
+    await consumer.start()
+    try:
+        slow = asyncio.create_task(consumer._dispatch_one("t", b"1-0", fields))
+        await asyncio.wait_for(broker.first_started[operation].wait(), timeout=1)
+
+        # A later write of the same kind succeeds while the first is still in flight.
+        await consumer._dispatch_one("t", b"2-0", fields)
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+
+        broker.release.set()
+        await slow
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+
+        if later_write_fails:
+            # A write that starts after the recovery and fails is a fresh signal.
+            broker.later_fail = True
+            await consumer._dispatch_one("t", b"3-0", fields)
+            health = consumer.health()
+            assert health.status == "degraded"
+            assert health.detail == f"later {operation} failed"
+    finally:
+        await consumer.stop()
+
+
 # ---------------------------------------------------------------------------
 # Headline: full producer → consumer round-trip, no Redis
 # ---------------------------------------------------------------------------

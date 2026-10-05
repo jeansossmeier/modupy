@@ -268,9 +268,15 @@ class BrokerConsumer:
             )
 
     def _mark_broker_failure(
-        self, operation: str, target: str, exc: Exception, message_id: str | None = None
+        self,
+        operation: str,
+        target: str,
+        exc: Exception,
+        message_id: str | None = None,
+        *,
+        started_at: float | None = None,
     ) -> None:
-        self._health_failures.record(operation, target, exc, message_id)
+        self._health_failures.record(operation, target, exc, message_id, started_at=started_at)
 
     def _mark_broker_recovered(self, operation: str, target: str) -> None:
         self._health_failures.recover(operation, target)
@@ -572,6 +578,7 @@ class BrokerConsumer:
         await self._ack(target, mid, key)
 
     async def _ack(self, target: str, mid: str, key: tuple[str, str]) -> None:
+        started_at = time.monotonic()
         try:
             await self._broker.ack(target, mid, self._group)
         except asyncio.CancelledError:
@@ -580,7 +587,7 @@ class BrokerConsumer:
             # Broker-side blip must not kill the loop. The
             # un-ACK'd message stays pending → redelivered via reclaim; the
             # listener side must be idempotent anyway (at-least-once contract).
-            self._mark_broker_failure("ack", target, exc, mid)
+            self._mark_broker_failure("ack", target, exc, mid, started_at=started_at)
             logger.exception(
                 "ack failed for %s on %s — message stays pending and will be redelivered",
                 mid,
@@ -628,12 +635,13 @@ class BrokerConsumer:
         attempt counter is only cleared on success so the retry dead-letters
         immediately rather than restarting the attempt cap.
         """
+        started_at = time.monotonic()
         try:
             await self._broker.dead_letter(target, mid, fields, self._group)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._mark_broker_failure("dead_letter", target, exc, mid)
+            self._mark_broker_failure("dead_letter", target, exc, mid, started_at=started_at)
             logger.exception(
                 "dead-letter failed for %s on %s — message stays pending for retry",
                 mid,

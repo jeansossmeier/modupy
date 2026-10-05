@@ -1382,7 +1382,7 @@ In single-process topology there is no proxy and no actuator: modupy adds no HTT
 
 - On every consumer, the failure expires after the redelivery window: `reclaim_min_idle_ms` for Redis, `reclaim_stale_seconds` for the database and SHM brokers. By then the affected message is eligible for reclaim, here or on a peer replica. A write that fails again on the retry records a fresh failure, so a persistent failure shows up again, but `/health` can report ready between the expiry and that retry.
 - On Redis only, the failure clears as soon as its message is no longer pending in the consumer group, for example because a peer replica reclaimed and acknowledged it.
-- On the database and SHM consumers, a write that fails after a later write of the same kind has succeeded for the same target is never recorded if it started first: these consumers complete up to `dispatch_concurrency` rows at once, so a slow failure can arrive after the broker has already proved healthy again.
+- On every consumer, a write that fails after a later write of the same kind has succeeded for the same target is never recorded if it started first. The database and SHM consumers complete up to `dispatch_concurrency` rows at once, so a slow failure can arrive after the broker has already proved healthy again; the Redis consumer applies the same rule to its ack and dead-letter writes.
 
 A failure on one target never clears because another target succeeded. The exceptions are the database and SHM consumers' claim and claim-renewal heartbeat, which are tracked per consumer group.
 
