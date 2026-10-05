@@ -2352,11 +2352,16 @@ class DatabaseBroker:
         return deleted
 
     @_on_owning_loop
-    async def group_backlog(self) -> dict[str, int]:
+    async def group_backlog(
+        self, *, targets: list[str] | tuple[str, ...] | None = None
+    ) -> dict[str, int]:
         """Map every group to its pending and claimed row count.
 
         A group counts when it is subscribed or still holds pending or
         claimed rows, so rows left behind by an unsubscribed group show up.
+        ``targets``, when given, counts only rows of those targets (what
+        ``drop_group`` with the same ``targets`` deletes) and lists only groups
+        subscribed to or holding rows on them.
         """
         await self._ensure_schema()
         from sqlalchemy import func, select
@@ -2364,13 +2369,17 @@ class DatabaseBroker:
         _, subscription, message = broker_schema()
 
         async def op(conn: Any) -> dict[str, int]:
-            groups = await conn.execute(select(subscription.c.consumer_group).distinct())
-            backlog = {str(row[0]): 0 for row in groups}
-            counts = await conn.execute(
+            groups_query = select(subscription.c.consumer_group).distinct()
+            counts_query = (
                 select(message.c.consumer_group, func.count())
                 .where(message.c.status.in_(("pending", "claimed")))
                 .group_by(message.c.consumer_group)
             )
+            if targets is not None:
+                groups_query = groups_query.where(subscription.c.target.in_(list(targets)))
+                counts_query = counts_query.where(message.c.target.in_(list(targets)))
+            backlog = {str(row[0]): 0 for row in await conn.execute(groups_query)}
+            counts = await conn.execute(counts_query)
             for group, count in counts:
                 backlog[str(group)] = int(count)
             return dict(sorted(backlog.items()))

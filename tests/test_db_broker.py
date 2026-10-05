@@ -5569,6 +5569,50 @@ async def test_group_backlog_reports_undelivered_rows_of_an_unsubscribed_group(
     assert await broker.group_backlog() == {"modulith-live": 2, "modulith-old": 2}
 
 
+async def test_group_backlog_with_targets_counts_what_drop_group_with_those_targets_deletes(
+    engine: Any,
+) -> None:
+    from sqlalchemy import delete
+
+    broker = DatabaseBroker(engine=engine, completion_mode="mark")
+    await broker.subscribe(["t.Stale", "t.Live"], "modulith-orders")
+    await broker.subscribe(["t.Stale"], "modulith-other")
+    await broker.subscribe(["t.Stale"], "modulith-old")
+    for target in ("t.Stale", "t.Stale", "t.Stale", "t.Live"):
+        await broker.publish(target, b"x", {"event_type": target})
+    done_id, dead_id = [
+        row["id"]
+        for row in await broker.claim_batch(
+            "modulith-orders", batch_size=2, consumer_name="o:w", targets=["t.Stale"]
+        )
+    ]
+    await broker.ack(done_id, consumer_name="o:w")
+    await broker.dead_letter(dead_id, "boom", consumer_name="o:w")
+    await broker.claim_batch("modulith-other", batch_size=1, consumer_name="x:w")
+    _, subscription, _ = broker_schema()
+    async with engine.begin() as conn:
+        await conn.execute(
+            delete(subscription).where(subscription.c.consumer_group == "modulith-old")
+        )
+
+    assert await broker.group_backlog() == {
+        "modulith-orders": 2,
+        "modulith-other": 3,
+        "modulith-old": 3,
+    }
+    assert await broker.group_backlog(targets=["t.Stale"]) == {
+        "modulith-orders": 1,
+        "modulith-other": 3,
+        "modulith-old": 3,
+    }
+    assert await broker.group_backlog(targets=("t.Live",)) == {"modulith-orders": 1}
+    assert await broker.group_backlog(targets=["t.none"]) == {}
+    assert await broker.group_backlog(targets=[]) == {}
+
+    counted = (await broker.group_backlog(targets=["t.Stale"]))["modulith-orders"]
+    assert await broker.drop_group("modulith-orders", targets=["t.Stale"]) == (1, counted)
+
+
 async def test_active_groups_counts_recent_subscribes_and_claims(engine: Any) -> None:
     from datetime import UTC, datetime, timedelta
 

@@ -1066,6 +1066,37 @@ async def test_drop_group_removes_a_groups_undelivered_state_on_the_real_dialect
         assert {tuple(row) for row in result} == {(_TARGET, "g-kept")}
 
 
+async def test_group_backlog_with_targets_counts_what_drop_group_with_those_targets_deletes_on_the_real_dialect(
+    broker_engine: Any,
+) -> None:
+    broker = DatabaseBroker(engine=broker_engine, completion_mode="mark")
+    await broker.subscribe([_TARGET, "t.Other"], "g")
+    await broker.subscribe([_TARGET], "g-kept")
+    for target in (_TARGET, "t.Other"):
+        for _ in range(3):
+            await broker.publish(target, b"x", {"event_type": _EVENT_TYPE})
+    claimed = [
+        row["id"]
+        for row in await broker.claim_batch(
+            "g", batch_size=3, consumer_name="c1", targets=[_TARGET]
+        )
+    ]
+    assert len(claimed) == 3
+    done_id, dead_id = claimed[:2]
+    await broker.ack(done_id, consumer_name="c1")
+    await broker.dead_letter(dead_id, "boom", consumer_name="c1")
+
+    assert await broker.group_backlog() == {"g": 4, "g-kept": 3}
+    assert await broker.group_backlog(targets=[_TARGET]) == {"g": 1, "g-kept": 3}
+    assert await broker.group_backlog(targets=("t.Other",)) == {"g": 3}
+    assert await broker.group_backlog(targets=["t.none"]) == {}
+    assert await broker.group_backlog(targets=[]) == {}
+
+    counted = (await broker.group_backlog(targets=[_TARGET]))["g"]
+    assert await broker.drop_group("g", targets=[_TARGET]) == (1, counted)
+    assert await broker.group_backlog() == {"g": 3, "g-kept": 3}
+
+
 async def test_has_schema_reports_whether_the_broker_tables_exist(broker_engine: Any) -> None:
     broker = DatabaseBroker(engine=broker_engine)
     assert await broker.has_schema() is True
