@@ -676,6 +676,22 @@ class StatefulFakeRedis:
             claimed.append((mid, by_id[mid]))
         return (cursor, claimed, deleted)
 
+    async def eval(self, script: str, numkeys: int, *keys_and_args: Any) -> int:
+        """Run the ownership-renewal script: the one Lua script this fake models.
+
+        Returns 1 and resets the idle clock when the entry is pending for the
+        named consumer, else 0 (pending for a peer, or not pending at all).
+        """
+        assert "XCLAIM" in script and "XPENDING" in script, "fake only models renew_claim"
+        (stream, group, mid, consumer) = (
+            a.decode() if isinstance(a, bytes) else str(a) for a in keys_and_args
+        )
+        entry = self.groups[(stream, group)]["pel"].get(mid.encode())
+        if entry is None or entry["consumer"] != consumer:
+            return 0
+        entry["delivered_ms"] = self.now_ms
+        return 1
+
     async def aclose(self) -> None:
         self.closed = True
 
@@ -868,6 +884,105 @@ async def test_trimmed_pending_entry_is_reported_deleted_and_purged(stateful_fak
     _cursor, claimed2, deleted2 = await broker.reclaim("orders", consumer="c2", min_idle_ms=0)
     assert claimed2 == []
     assert deleted2 == []
+
+
+async def test_renew_claim_resets_idle_for_the_owner_and_refuses_a_peer(
+    stateful_fake, stateful_broker
+) -> None:
+    await stateful_broker.ensure_group("orders")
+    await stateful_broker.publish("orders", b"m1")
+    [(_s, [(mid, _f)])] = await stateful_broker.read("orders", consumer="a", count=10, block_ms=1)
+    mid = mid.decode()
+    stateful_fake.advance(900)
+
+    assert await stateful_broker.renew_claim("orders", mid, consumer="b") is False
+    assert await stateful_broker.renew_claim("orders", mid, consumer="a") is True
+    stateful_fake.advance(900)
+
+    # Renewed at t=900, so at t=1800 it is only 900 ms idle: a peer's reclaim
+    # with a 1000 ms threshold leaves it alone.
+    _cursor, claimed, _deleted = await stateful_broker.reclaim(
+        "orders", consumer="b", min_idle_ms=1000
+    )
+    assert claimed == []
+    await stateful_broker.ack("orders", mid)
+    assert await stateful_broker.renew_claim("orders", mid, consumer="a") is False
+
+
+@event
+@dataclass(frozen=True)
+class ReplicaWork:
+    n: int
+
+
+def _replica(
+    broker: RedisStreamsBroker,
+    name: str,
+    listener: Any,
+    serializer: JsonEventSerializer,
+    min_idle_ms: int,
+) -> BrokerConsumer:
+    bus = InMemoryEventBus()
+    bus.register(ReplicaWork, listener)
+    return BrokerConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name=name,
+        group="g",
+        targets=["t"],
+        poll_block_ms=1,
+        reclaim_min_idle_ms=min_idle_ms,
+    )
+
+
+async def _publish_work(
+    broker: RedisStreamsBroker, serializer: JsonEventSerializer, n: int
+) -> None:
+    for i in range(1, n + 1):
+        await broker.publish(
+            "t", serializer.serialize(ReplicaWork(i)), {"event_type": f"{__name__}.ReplicaWork"}
+        )
+
+
+@pytest.mark.parametrize("how", ["read", "reclaim"])
+async def test_peer_reclaim_mid_batch_does_not_double_dispatch(
+    stateful_fake, stateful_broker, how: str
+) -> None:
+    """Replica A works a three-message batch (each listener call 600 ms, under
+    the 1000 ms reclaim threshold). Replica B's reclaim fires as A finishes the
+    second message, when the third has sat unstarted for 1200 ms. Each message
+    must reach a listener once: B runs the third, A skips it."""
+    serializer = JsonEventSerializer(allowed_event_types=[ReplicaWork])
+    calls: list[tuple[str, int]] = []
+    replica_b: BrokerConsumer
+
+    async def on_a(evt: ReplicaWork) -> None:
+        calls.append(("a", evt.n))
+        stateful_fake.advance(600)
+        if evt.n == 2:
+            await replica_b._reclaim("t")
+
+    async def on_b(evt: ReplicaWork) -> None:
+        calls.append(("b", evt.n))
+
+    replica_a = _replica(stateful_broker, "a", on_a, serializer, 1000)
+    replica_b = _replica(stateful_broker, "b", on_b, serializer, 1000)
+    await stateful_broker.ensure_group("t")
+    await _publish_work(stateful_broker, serializer, 3)
+
+    if how == "read":
+        await replica_a._handle(
+            "t", await stateful_broker.read("t", consumer="a", count=10, block_ms=1)
+        )
+    else:
+        await stateful_broker.read("t", consumer="crashed", count=10, block_ms=1)
+        stateful_fake.advance(1000)
+        await replica_a._reclaim("t")
+
+    assert sorted(n for _who, n in calls) == [1, 2, 3]
+    assert ("b", 3) in calls
+    assert stateful_fake.groups[("modulith.events.t", "g")]["pel"] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -1390,4 +1505,82 @@ async def test_integration_redis_6_2_trimmed_pending_entries_are_acked_and_repor
         assert all(mid.decode() in errors[0] for mid in ids[:2])
     finally:
         await broker._client.delete(stream)
+        await broker.close()
+
+
+@pytest.mark.integration
+async def test_integration_renew_claim_keeps_ownership_and_the_delivery_count(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    broker = RedisStreamsBroker(url=redis_url, stream_prefix=redis_key_prefix, consumer_group="g")
+    stream = f"{redis_key_prefix}.t"
+    try:
+        await broker.ensure_group("t")
+        await broker.publish("t", b"m1")
+        [(_s, [(raw_id, _f)])] = await broker.read("t", consumer="a", count=10, block_ms=1000)
+        mid = raw_id.decode()
+        await asyncio.sleep(0.3)
+
+        assert await broker.renew_claim("t", mid, consumer="b") is False
+        [entry] = await redis_client.xpending_range(stream, "g", min=mid, max=mid, count=1)
+        assert (entry["consumer"], entry["times_delivered"]) == (b"a", 1)
+        assert entry["time_since_delivered"] >= 300  # a refused renewal left the clock alone
+
+        assert await broker.renew_claim("t", mid, consumer="a") is True
+        [entry] = await redis_client.xpending_range(stream, "g", min=mid, max=mid, count=1)
+        assert (entry["consumer"], entry["times_delivered"]) == (b"a", 1)
+        assert entry["time_since_delivered"] < 200
+
+        await broker.ack("t", mid)
+        assert await broker.renew_claim("t", mid, consumer="a") is False
+    finally:
+        await redis_client.delete(stream)
+        await broker.close()
+
+
+@pytest.mark.integration
+async def test_integration_replicas_do_not_double_dispatch_while_one_works_a_batch(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    """Replica A works five messages at 0.2 s each (reclaim threshold 0.5 s)
+    while replica B reclaims every 50 ms. Entries wait behind A's earlier ones
+    for longer than the threshold, so B takes some; each listener must still
+    run once."""
+    broker = RedisStreamsBroker(url=redis_url, stream_prefix=redis_key_prefix, consumer_group="g")
+    stream = f"{redis_key_prefix}.t"
+    serializer = JsonEventSerializer(allowed_event_types=[ReplicaWork])
+    calls: list[tuple[str, int]] = []
+
+    async def on_a(evt: ReplicaWork) -> None:
+        calls.append(("a", evt.n))
+        await asyncio.sleep(0.2)
+
+    async def on_b(evt: ReplicaWork) -> None:
+        calls.append(("b", evt.n))
+
+    replica_a = _replica(broker, "a", on_a, serializer, 500)
+    replica_b = _replica(broker, "b", on_b, serializer, 500)
+
+    async def reclaim_forever() -> None:
+        while True:
+            await replica_b._reclaim("t")
+            await asyncio.sleep(0.05)
+
+    try:
+        await broker.ensure_group("t")
+        await _publish_work(broker, serializer, 5)
+        peer = asyncio.create_task(reclaim_forever())
+        try:
+            await replica_a._handle(
+                "t", await broker.read("t", consumer="a", count=10, block_ms=1000)
+            )
+            await asyncio.sleep(0.2)
+        finally:
+            peer.cancel()
+            await asyncio.gather(peer, return_exceptions=True)
+
+        assert sorted(n for _who, n in calls) == [1, 2, 3, 4, 5]
+        assert (await redis_client.xpending(stream, "g"))["pending"] == 0
+    finally:
+        await redis_client.delete(stream)
         await broker.close()

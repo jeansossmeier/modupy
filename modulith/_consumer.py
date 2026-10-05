@@ -17,11 +17,17 @@ streams for exactly the event types that module's local listeners consume
     XAUTOCLAIM redelivers messages left pending (claimed but never ACK'd)
     longer than ``reclaim_min_idle_ms``, whether the claiming peer crashed or
     is merely slow. Reclaim is purely idle-time based — it has NO
-    crash/liveness detection — so a healthy peer whose dispatch takes longer
-    than ``reclaim_min_idle_ms`` has its in-flight message claimed away and
-    double-dispatched. Keep ``reclaim_min_idle_ms`` (default 60s) above the
-    worst-case listener latency; listeners must be idempotent regardless
-    (at-least-once delivery).
+    crash/liveness detection — so a healthy peer whose single listener call
+    takes longer than ``reclaim_min_idle_ms`` has its in-flight message claimed
+    away and double-dispatched. Keep ``reclaim_min_idle_ms`` (default 60s)
+    above the worst-case latency of ONE listener call; listeners must be
+    idempotent regardless (at-least-once delivery). A batch's total time does
+    not matter: a broker with ``renew_claim`` (Redis Streams) is asked to
+    confirm ownership, restarting the idle clock, just before each entry after
+    the first, and an entry a peer took in the meantime is skipped. The
+    remaining windows are the first entry of a batch (as fresh as the read or
+    reclaim that returned it) and the gap between that check and the
+    dispatch's first await.
   * a background loop ``read`` → deserialize (via the ``event_type`` header) →
     dispatch to local listeners → ``ack`` on success, ``dead_letter`` on poison
     or repeated failure. Broker failures retry with capped exponential backoff
@@ -421,6 +427,7 @@ class BrokerConsumer:
         Redis 7 deleted id.
         """
         nil_entries = 0
+        first = True
         for entry in claimed:
             if entry is None:
                 nil_entries += 1
@@ -429,7 +436,8 @@ class BrokerConsumer:
             if fields is None:
                 nil_entries += 1
                 continue
-            await self._dispatch_one(target, message_id, fields)
+            await self._dispatch_if_owned(target, message_id, fields, renew=not first)
+            first = False
         if nil_entries:
             await self._purge_trimmed_pending(target, nil_entries)
 
@@ -493,11 +501,50 @@ class BrokerConsumer:
         """Process an XREADGROUP result: [(stream, [(id, fields), ...]), ...]."""
         if not messages:
             return
+        first = True
         for _stream, entries in messages:
             for message_id, fields in entries:
                 if self._stopping:
                     return
-                await self._dispatch_one(target, message_id, fields)
+                await self._dispatch_if_owned(target, message_id, fields, renew=not first)
+                first = False
+
+    async def _dispatch_if_owned(
+        self, target: str, message_id: Any, fields: dict[bytes, bytes], *, renew: bool
+    ) -> None:
+        """Dispatch one entry of a batch unless a peer has taken it meanwhile.
+
+        Entries are dispatched one after another, so one that waits behind
+        slower siblings can idle past ``reclaim_min_idle_ms`` and be claimed by
+        a peer replica, which then dispatches it as well. Before every entry
+        after the first, a broker offering ``renew_claim`` confirms this
+        consumer still owns it and restarts its idle clock; an entry it no
+        longer owns is skipped, not acknowledged, since the peer now
+        owns its outcome. A broker without ``renew_claim`` is trusted as before.
+        If the check itself fails the entry stays pending for a later reclaim.
+        """
+        renew_claim = getattr(self._broker, "renew_claim", None)
+        if renew and callable(renew_claim):
+            mid = _as_str(message_id)
+            try:
+                owned = await renew_claim(
+                    target, mid, consumer=self._consumer_name, group=self._group
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "could not confirm ownership of %s on %s — leaving it pending", mid, target
+                )
+                return
+            if not owned:
+                logger.info(
+                    "message %s on %s was claimed by another consumer while waiting — skipping",
+                    mid,
+                    target,
+                )
+                return
+        await self._dispatch_one(target, message_id, fields)
 
     async def _dispatch_one(self, target: str, message_id: Any, fields: dict[bytes, bytes]) -> None:
         """Deserialize one message and dispatch it to local listeners.

@@ -1626,3 +1626,139 @@ async def test_integration_publish_then_consume_roundtrip(
         await broker.close()
 
     assert received == [7]
+
+
+# ---------------------------------------------------------------------------
+# Ownership check before each dispatch of a batch (peer reclaim mid-batch)
+# ---------------------------------------------------------------------------
+
+
+class RenewingConsumerBroker(FakeConsumerBroker):
+    """FakeConsumerBroker plus the optional ``renew_claim`` hook.
+
+    ``renew_claim`` answers False for ids in ``taken`` (a peer claimed them)
+    and records every call so tests can assert what the consumer handed over.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.taken: set[str] = set()
+        self.renewed: list[tuple[str, str, str, str]] = []
+
+    async def renew_claim(
+        self, target: str, message_id: str, *, consumer: str, group: str | None = None
+    ) -> bool:
+        self.renewed.append((target, message_id, consumer, group or ""))
+        return message_id not in self.taken
+
+
+def _cross_message(value: int) -> dict[bytes, bytes]:
+    fqn = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+    return {
+        b"data": JsonEventSerializer().serialize(CrossEvent(value=value)),
+        b"h:event_type": fqn.encode(),
+    }
+
+
+async def _run_batch(how: str, broker: FakeConsumerBroker, consumer: BrokerConsumer) -> None:
+    if how == "read":
+        await consumer._handle("t", await broker.read("t", consumer="orders:1", block_ms=1))
+    else:
+        await consumer._reclaim("t")
+
+
+def _stage_batch(how: str, broker: FakeConsumerBroker, count: int) -> list[str]:
+    messages = [_cross_message(n) for n in range(1, count + 1)]
+    if how == "read":
+        return [
+            broker.deliver("t", m[b"data"], {"event_type": m[b"h:event_type"].decode()})
+            for m in messages
+        ]
+    ids = [f"{n}-0" for n in range(1, count + 1)]
+    broker.pending["t"] = list(zip(ids, messages, strict=True))
+    return ids
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["read", "reclaim"])
+async def test_consumer_renews_each_entry_after_the_first_before_dispatching(how: str) -> None:
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    broker = RenewingConsumerBroker()
+    ids = _stage_batch(how, broker, 3)
+    consumer = _make_consumer(broker, bus, targets=["t"])
+
+    await _run_batch(how, broker, consumer)
+
+    assert received == [1, 2, 3]
+    assert broker.renewed == [("t", mid, "orders:1", "modulith-orders") for mid in ids[1:]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["read", "reclaim"])
+async def test_consumer_skips_an_entry_a_peer_took_without_acking_it(how: str) -> None:
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    broker = RenewingConsumerBroker()
+    ids = _stage_batch(how, broker, 3)
+    broker.taken.add(ids[1])
+    consumer = _make_consumer(broker, bus, targets=["t"])
+
+    await _run_batch(how, broker, consumer)
+
+    assert received == [1, 3]
+    assert broker.acked == [("t", ids[0]), ("t", ids[2])]
+    assert broker.dead == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["read", "reclaim"])
+async def test_broker_without_renew_claim_dispatches_every_entry(how: str) -> None:
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    broker = FakeConsumerBroker()
+    ids = _stage_batch(how, broker, 3)
+    consumer = _make_consumer(broker, bus, targets=["t"])
+
+    await _run_batch(how, broker, consumer)
+
+    assert received == [1, 2, 3]
+    assert broker.acked == [("t", mid) for mid in ids]
+
+
+@pytest.mark.asyncio
+async def test_consumer_leaves_an_entry_pending_when_the_ownership_check_fails() -> None:
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    class FailingRenewBroker(RenewingConsumerBroker):
+        async def renew_claim(self, *args: Any, **kwargs: Any) -> bool:
+            raise ConnectionError("redis down")
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    broker = FailingRenewBroker()
+    ids = _stage_batch("read", broker, 2)
+    consumer = _make_consumer(broker, bus, targets=["t"])
+
+    await _run_batch("read", broker, consumer)
+
+    assert received == [1]
+    assert broker.acked == [("t", ids[0])]

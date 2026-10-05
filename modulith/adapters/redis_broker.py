@@ -322,8 +322,10 @@ class RedisStreamsBroker:
         crash/liveness detection), so a message a live, healthy peer is still
         processing WILL be claimed away and re-dispatched once it has been
         pending longer than ``min_idle_ms``. Keep ``min_idle_ms`` above the
-        worst-case handler latency, and keep handlers idempotent regardless
-        (at-least-once delivery).
+        worst-case latency of ONE handler call, and keep handlers idempotent
+        regardless (at-least-once delivery). Time spent on earlier entries of
+        the same batch does not count: the consumer calls ``renew_claim``
+        before each later entry.
 
         XAUTOCLAIM caps each call at ``count`` and returns a continuation
         cursor; a single call therefore drains at most ``count`` entries.
@@ -360,6 +362,40 @@ class RedisStreamsBroker:
                 break
             cursor = next_cursor
         return (b"0-0", claimed, deleted)
+
+    async def renew_claim(
+        self, target: str, message_id: str, *, consumer: str, group: str | None = None
+    ) -> bool:
+        """Reset the idle clock of a pending entry, only while ``consumer`` still owns it.
+
+        The consumer calls this just before dispatching each entry of a batch
+        after the first, so a message that waited behind slower siblings is as
+        fresh as a just-delivered one and a peer's XAUTOCLAIM cannot take it
+        mid-dispatch. Returns False, changing nothing, when the entry is
+        pending for another consumer (a peer reclaimed it while it waited) or
+        no longer pending (acknowledged or dead-lettered by the peer).
+
+        One Lua script makes the ownership check and the XCLAIM atomic; a plain
+        XCLAIM would steal the entry from the peer that holds it. JUSTID
+        leaves the delivery count alone, so renewing never spends the
+        ``max_delivery_attempts`` budget.
+        """
+        stream = self._stream_name(target)
+        group_name = group or self._consumer_group
+        renewed = await self._client.eval(
+            """
+            local owned = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[2], ARGV[2], 1, ARGV[3])
+            if #owned == 0 then return 0 end
+            redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[3], 0, ARGV[2], 'JUSTID')
+            return 1
+            """,
+            1,
+            stream,
+            group_name,
+            message_id,
+            consumer,
+        )
+        return bool(renewed)
 
     async def purge_trimmed_pending(
         self, target: str, *, consumer: str, group: str | None = None
