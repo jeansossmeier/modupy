@@ -97,6 +97,7 @@ class RoutingRule:
     _down: dict[str, float] = field(default_factory=dict, repr=False, compare=False)
     _foreign: dict[str, float] = field(default_factory=dict, repr=False, compare=False)
     _verified: set[str] = field(default_factory=set, repr=False, compare=False)
+    _identity_epoch: dict[str, int] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         urls = self.backend_urls or (self.backend_url,)
@@ -153,6 +154,13 @@ class RoutingRule:
 
     def forget_identity(self, url: str) -> None:
         self._verified.discard(url)
+        self._identity_epoch[url] = self.identity_epoch(url) + 1
+
+    def identity_epoch(self, url: str) -> int:
+        """Counts ``forget_identity`` calls for ``url``: a probe that started
+        in an earlier epoch answers for a process that may no longer hold the
+        port."""
+        return self._identity_epoch.get(url, 0)
 
     def is_verified(self, url: str) -> bool:
         return url in self._verified
@@ -273,10 +281,14 @@ def create_proxy_app(
     a backend's first request, again after it was marked down or foreign, and
     after ``forget_identity`` (which ``run_supervised`` calls whenever the
     supervisor respawns that worker); between checks a verified port is
-    trusted. The check tells this deployment's workers from other listeners
+    trusted; a probe still in flight when ``forget_identity`` runs is
+    discarded, and the request waiting on it gets 503. The check tells this
+    deployment's workers from other listeners
     on loopback ports; it does not authenticate individual connections. Each
     identity probe is bounded by
-    ``identity_probe_timeout`` seconds in total and 64 KiB of body; past the
+    ``identity_probe_timeout`` seconds in total and 64 KiB of body (the probe
+    asks for an uncompressed one; a ``Content-Encoding`` answer is read as
+    empty, so the backend counts as foreign); past the
     deadline the request gets 504 and the backend is not marked down.
     Concurrent requests to one unverified backend wait on a single shared
     probe, so a stalled backend holds one probe connection however many
@@ -328,15 +340,22 @@ def create_proxy_app(
         """GET ``url``/health with ``nonce`` as the identity challenge, keeping at
         most ``_MAX_HEALTH_BODY_BYTES`` of the answer.
 
-        An oversized body is replaced by an empty one, which answers for no
-        deployment. The read timeout is off: the caller bounds the total time.
+        An oversized body, or one with a ``Content-Encoding`` (the request
+        asks for none, and decoding would expand it past the cap), is replaced
+        by an empty one, which answers for no deployment. The read timeout is
+        off: the caller bounds the total time.
         """
+        headers = {"Accept-Encoding": "identity"}
+        if nonce:
+            headers[NONCE_HEADER] = nonce
         async with probe_client.stream(
             "GET",
             url + "/health",
-            headers={NONCE_HEADER: nonce} if nonce else None,
+            headers=headers,
             timeout=httpx.Timeout(5.0, read=None),
         ) as resp:
+            if resp.headers.get("content-encoding", "identity").strip().lower() != "identity":
+                return httpx.Response(resp.status_code)
             body = bytearray()
             async for chunk in resp.aiter_bytes():
                 body += chunk
@@ -383,11 +402,18 @@ def create_proxy_app(
         return None if deployment_token is None else secrets.token_hex(16)
 
     def record_identity(
-        rule: RoutingRule, url: str, health: httpx.Response, nonce: str | None
+        rule: RoutingRule, url: str, health: httpx.Response, nonce: str | None, epoch: int
     ) -> bool:
-        """Mark ``url`` verified or foreign from its ``/health`` answer to ``nonce``."""
+        """Mark ``url`` verified or foreign from its ``/health`` answer to ``nonce``.
+
+        ``epoch`` is ``rule.identity_epoch(url)`` from before the probe was
+        sent. An answer from an earlier epoch is neither recorded nor trusted:
+        the worker was respawned while the probe was in flight.
+        """
         if deployment_token is None or nonce is None:
             return True
+        if rule.identity_epoch(url) != epoch:
+            return False
         if _answers_for(health, deployment_token, nonce, rule.prefix.lstrip("/"), _port(url)):
             rule.mark_verified(url)
             return True
@@ -401,8 +427,9 @@ def create_proxy_app(
 
     async def probe_identity(rule: RoutingRule, url: str) -> bool:
         nonce = new_challenge()
+        epoch = rule.identity_epoch(url)
         health = await asyncio.wait_for(read_health(url, nonce), identity_probe_timeout)
-        return record_identity(rule, url, health, nonce)
+        return record_identity(rule, url, health, nonce, epoch)
 
     identity_probes: dict[tuple[str, str], asyncio.Task[bool]] = {}
 
@@ -515,12 +542,13 @@ def create_proxy_app(
             async def check_one(rule: RoutingRule) -> tuple[str, str]:
                 async def check_backend(url: str) -> str:
                     nonce = new_challenge()
+                    epoch = rule.identity_epoch(url)
                     try:
                         resp = await asyncio.wait_for(read_health(url, nonce), 2.0)
                     except Exception:
                         rule.mark_down(url)
                         return "unreachable"
-                    if not record_identity(rule, url, resp, nonce):
+                    if not record_identity(rule, url, resp, nonce, epoch):
                         return "foreign deployment"
                     if resp.status_code == 200:
                         rule.mark_up(url)
@@ -997,7 +1025,7 @@ def _answers_for(
     """
     try:
         proof = resp.json().get("proof")
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, RecursionError):
         return False
     expected = identity_proof(deployment_token, nonce, module, port)
     return isinstance(proof, str) and hmac.compare_digest(

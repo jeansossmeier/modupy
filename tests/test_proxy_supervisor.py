@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gzip
 import json
 import os
 import signal
@@ -1389,9 +1390,12 @@ def _replica_fleet(
 
     ``dead`` refuses connections, ``foreign`` answers /health without the
     proof, ``stalled`` never answers /health, ``garbage`` breaks the HTTP
-    framing of /health, ``resets`` verifies and then fails the request itself
-    with ``on_request``; anything else is a healthy worker. ``behaviours`` is
-    read per call, so a test can change a replica mid-request.
+    framing of /health, ``gzip`` answers /health with a valid proof inside a
+    gzip-encoded body, ``nested`` answers /health with JSON nested far past the
+    interpreter's recursion limit, ``resets`` verifies and then fails the
+    request itself with ``on_request``; anything else is a healthy worker.
+    ``behaviours`` is read per call, so a test can change a replica
+    mid-request.
     """
     hits: list[_Hit] = []
 
@@ -1408,7 +1412,12 @@ def _replica_fleet(
                 await asyncio.sleep(30)
             if kind == "garbage":
                 raise httpx.RemoteProtocolError("illegal status line", request=request)
+            if kind == "nested":
+                return httpx.Response(200, content=b"[" * 30_000)
             proof = identity_proof("tok", request.headers[NONCE_HEADER], "orders", 80)
+            if kind == "gzip":
+                body = gzip.compress(json.dumps({"status": "ok", "proof": proof}).encode())
+                return httpx.Response(200, headers={"Content-Encoding": "gzip"}, content=body)
             return httpx.Response(200, json={"status": "ok", "proof": proof})
         if kind == "resets":
             assert on_request is not None
@@ -1441,6 +1450,8 @@ def _two_replicas() -> RoutingRule:
     [
         ("dead", True, False),
         ("foreign", False, True),
+        ("gzip", False, True),
+        ("nested", False, True),
         ("garbage", True, False),
         ("stalled", False, False),
     ],
@@ -1471,6 +1482,8 @@ async def test_a_request_is_served_by_the_healthy_replica_when_the_first_is_bad(
         ("dead", 502, "backend unreachable"),
         ("garbage", 502, "backend unreachable"),
         ("foreign", 503, "no worker of this deployment serves /orders"),
+        ("gzip", 503, "no worker of this deployment serves /orders"),
+        ("nested", 503, "no worker of this deployment serves /orders"),
         ("stalled", 504, "worker identity check timed out"),
     ],
 )
@@ -1504,6 +1517,69 @@ async def test_a_replica_turning_foreign_between_the_two_checks_does_not_fail_th
 
     assert (resp.status_code, resp.json().get("served_by")) == (200, "orders-b")
     assert ("orders-a", "GET", "/orders/ping") not in hits
+
+
+async def test_a_probe_answering_after_forget_identity_does_not_verify_the_replica() -> None:
+    """A respawn forgets the replica while its identity probe is in flight; the
+    answer then comes from the process that was replaced, so it proves nothing
+    about whatever holds the port now."""
+    probing, answer = asyncio.Event(), asyncio.Event()
+    served: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            probing.set()
+            await answer.wait()
+            proof = identity_proof("tok", request.headers[NONCE_HEADER], "orders", 80)
+            return httpx.Response(200, json={"proof": proof})
+        served.append(request.url.path)
+        return httpx.Response(200, stream=httpx.ByteStream(b"{}"))
+
+    rule = RoutingRule("/orders", _REPLICA_A)
+    app = create_proxy_app(
+        [rule],
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        deployment_token="tok",
+        identity_probe_timeout=5.0,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as proxy_client:
+        in_flight = asyncio.create_task(proxy_client.get("/orders/ping"))
+        await asyncio.wait_for(probing.wait(), 5.0)
+        rule.forget_identity(_REPLICA_A)
+        answer.set()
+        stale = await in_flight
+        verified_by_stale_probe = rule.is_verified(_REPLICA_A)
+        served_for_stale = list(served)
+        fresh = await proxy_client.get("/orders/ping")
+
+    assert not verified_by_stale_probe
+    assert (stale.status_code, served_for_stale) == (503, [])
+    assert (fresh.status_code, rule.is_verified(_REPLICA_A)) == (200, True)
+
+
+async def test_the_health_probe_asks_for_an_uncompressed_answer() -> None:
+    """The 64 KiB cap counts bytes read, so the probe must never be handed a
+    body that expands past it."""
+    sent: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers.get("accept-encoding"))
+        return httpx.Response(200, json={"status": "ok"})
+
+    rule = RoutingRule("/orders", _REPLICA_A)
+    app = create_proxy_app(
+        [rule],
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        deployment_token="tok",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as proxy_client:
+        await proxy_client.get("/_modulith/health")
+
+    assert sent == ["identity"]
 
 
 @pytest.mark.parametrize("failure", [httpx.ConnectError("refused"), httpx.ConnectTimeout("slow")])
