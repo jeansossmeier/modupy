@@ -668,7 +668,9 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
     synthesize a report from the child's exit code and the outcome it
     records to a private result file, so a skip or xfail stays one and a
     child that ran no test, or exited before the test finished, fails.
-    Returning ``None`` for
+    Setup and teardown reports bracket that call report, as in pytest's own
+    protocol. Retries (``--reruns``) happen inside the child; only the
+    attempt it finishes with decides the outcome. Returning ``None`` for
     every other case hands control straight back to pytest's default
     protocol, so unmarked tests are completely unaffected.
 
@@ -758,6 +760,9 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
                 records = [json.loads(line) for line in fh if line.strip()]
         finally:
             os.unlink(result_path)
+        # The child retries on its own under pytest-rerunfailures and logs each
+        # superseded attempt as a "rerun" report; only the last attempt decides.
+        records = [r for r in records if r["outcome"] != "rerun"]
         if not records:
             raise AssertionError(
                 f"isolated subprocess for {item.nodeid} exited 0 without running "
@@ -781,6 +786,19 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
             None,
         )
 
+    def _report_phase(when: typing.Literal["setup", "teardown"], func: Callable[[], None]) -> None:
+        phase = CallInfo.from_call(
+            func, when=when, reraise=(pytest.exit.Exception, KeyboardInterrupt)
+        )
+        ihook.pytest_runtest_logreport(
+            report=ihook.pytest_runtest_makereport(item=item, call=phase)
+        )
+
+    # Setup, call and teardown reports go through makereport in that order, as
+    # in _pytest.runner.runtestprotocol: pytest-rerunfailures starts its
+    # per-attempt state on the setup report and fails on a call report that
+    # arrives first. Nothing is set up in this process, so setup trivially passes.
+    _report_phase("setup", lambda: None)
     call = CallInfo.from_call(_outcome, when="call")
     report = ihook.pytest_runtest_makereport(item=item, call=call)
     # skip/xfail marks are evaluated in the child only, so its record decides
@@ -800,8 +818,9 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
     # rather than the pytest_runtest_teardown hook: the latter also invokes
     # other plugins' teardown (e.g. logging's caplog stash cleanup) whose
     # matching setup we skipped. teardown_exact only finalizes the collector
-    # stack and does not require this item to have been set up.
-    item.session._setupstate.teardown_exact(nextitem)
+    # stack and does not require this item to have been set up. A finalizer
+    # that fails is this item's teardown error, as for an inline test.
+    _report_phase("teardown", lambda: item.session._setupstate.teardown_exact(nextitem))
     ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
     return True
 

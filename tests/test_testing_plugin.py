@@ -610,6 +610,75 @@ def test_isolated_outcomes_survive_a_user_junitxml(pytester) -> None:
     assert set(cases) == {"test_passes", "test_imperative_skip", "test_xfail"}
 
 
+_FLAKY_ISOLATED = """
+import pytest
+
+attempts = []
+
+@pytest.mark.modulith_isolated
+def test_passes_on_second_attempt():
+    attempts.append(1)
+    assert len(attempts) == 2
+
+@pytest.mark.modulith_isolated
+def test_passes_first_time():
+    pass
+"""
+
+
+@pytest.mark.parametrize(
+    ("cli_args", "expected"),
+    [
+        pytest.param([], {"passed": 1, "failed": 1}, id="no-reruns"),
+        pytest.param(["--reruns", "2"], {"passed": 2}, id="reruns"),
+    ],
+)
+def test_isolated_tests_report_their_final_outcome_under_pytest_rerunfailures(
+    pytester, cli_args: list[str], expected: dict[str, int]
+) -> None:
+    """pytest-rerunfailures 14+ builds its per-attempt state on the item from
+    the setup report, so a call report arriving first crashed the whole session
+    for any isolated test, with or without ``--reruns``. The child retries on
+    its own (the parent's ``--reruns`` is forwarded), and the intermediate
+    ``rerun`` record it writes must not become the parent's outcome."""
+    pytest.importorskip("pytest_rerunfailures")
+    pytester.makepyfile(test_flaky=_FLAKY_ISOLATED)
+
+    result = pytester.runpytest(*cli_args)
+
+    assert "INTERNALERROR" not in result.stdout.str() + result.stderr.str()
+    assert result.parseoutcomes() == expected
+
+
+def test_isolated_test_reports_a_teardown_error_of_the_scope_it_ends(pytester) -> None:
+    """The isolated item is the last user of a module-scoped fixture, so the
+    parent tears that scope down on its behalf. A failing finalizer is a
+    teardown error of that item, as for an inline test, not a crash of the
+    session."""
+    pytester.makepyfile(
+        test_scope_teardown="""
+        import pytest
+
+        @pytest.fixture(scope="module")
+        def shared():
+            yield
+            raise RuntimeError("module finalizer failed")
+
+        def test_uses_shared(shared):
+            pass
+
+        @pytest.mark.modulith_isolated
+        def test_ends_the_module():
+            pass
+        """
+    )
+
+    result = pytester.runpytest()
+
+    result.assert_outcomes(passed=2, errors=1)
+    result.stdout.fnmatch_lines(["*ERROR at teardown of test_ends_the_module*"])
+
+
 @pytest.mark.modulith_no_outbox
 def test_no_outbox_marker_disables_outbox_configuration() -> None:
     from modulith.builtin import outbox
