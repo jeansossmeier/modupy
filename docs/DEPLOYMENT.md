@@ -776,6 +776,16 @@ smaller-limit process then has its publishes refused as store full.
 `orphan_retention_seconds` is capped at 100 years (3153600000). A group that
 subscribes after a publication replays it only within that window.
 
+That window also decides how long a re-dispatch is recognised. The outbox sends
+each row with its id as the publication id, and the store ignores a repeat of an
+id it still holds, so a row dispatched twice (for example after a crash before
+the outbox marked it complete) reaches each group once. The store holds a
+publication for at least `orphan_retention_seconds` after it was written, and
+longer while it keeps a delivery of it (the list above). A re-dispatch after
+that creates the deliveries again, for every group subscribed to the target,
+including a group that already acked the first one. Listeners must stay
+idempotent past the retention window: nothing deduplicates a re-dispatch later.
+
 Publishes are refused once the pages in use (the page count minus the free
 pages) pass `max_store_bytes` less a 32-page consumer reserve (128 KiB at 4 KiB
 pages); a store of fewer than 256 pages (1 MiB at 4 KiB pages) reserves one
@@ -807,6 +817,18 @@ dispatcher stores, left it at about 3x in either mode. Larger payloads lower
 that ratio and more groups failing the same publications raise it. The file does
 not shrink afterwards, so budget disk for that growth if a listener can fail
 every delivery.
+
+The replay's 8-page headroom has two limits. The empty schema already takes 13
+pages, so a store whose publish budget is under 21 pages (84 KiB at 4 KiB pages,
+a `max_store_bytes` under 92 KiB), such as the 64 KiB store above, replays
+nothing to a group that subscribes late: the replay is cut before its first row,
+and the group receives only what is published after it subscribes. And in delete
+mode a claim widens each row it claims in place, by about 0.03 page per row
+(about 0.02 with a short module name, because the row records the consumer's
+name, the module name plus 33 characters), while the headroom stays 8 pages. A
+`batch_size` (`MODULITH_BROKER_BATCH_SIZE`, default 100) above about 250 can
+therefore push the first claim batch of a cut replay past the budget, so
+publishes are refused until the batch is acked and its pages come back.
 
 A replay cut short logs one WARNING naming the group and the target, with the
 replayed and skipped counts. The skipped publications reach that group only
@@ -1723,6 +1745,7 @@ This path is why modupy exists: **every module is a potential microservice, but 
 3. Inspect broker state:
    - Database: `SELECT * FROM broker_message WHERE status IN ('pending','claimed')` for work still in flight, and `WHERE status = 'dead'` for the dead-letter view. The column only ever holds `pending`, `claimed`, `done`, or `dead`.
    - Redis: `xinfo groups modulith.events.<target>`, where `<target>` is the event's destination, by default its module and class name (for example `myapp.contracts.events.OrderPlaced`), and `modulith.events` is the default stream prefix (`MODULITH_STREAM_PREFIX` replaces it). List the streams with `SCAN 0 MATCH 'modulith.events.*'`, repeating with the returned cursor until it is `0`.
+   - SHM (the default broker of `--topology processes`): `modulith broker dead-letter` lists the dead letters (see [Recovering from Broker Failure](#recovering-from-broker-failure)). For the queue, count the deliveries per group and status with a read-only `sqlite3` on the store, `<state_dir>/.modulith-shm-broker.db` (the path `modulith run` logs at startup), as the user that runs the service, since the state directory is mode 0700: `sqlite3 -readonly <state_dir>/.modulith-shm-broker.db "SELECT consumer_group, status, COUNT(*) FROM shm_delivery GROUP BY consumer_group, status"`. `pending` and `claimed` are work in flight and `dead` the dead letters; `done` rows exist only under `completion_mode = "mark"`. The tables are internal: read them, never write to them.
 
 ### Worker Crash Loop
 

@@ -891,7 +891,10 @@ delay consumers until their periodic SQLite safety poll.
 Subscriptions are persisted. Every publication is retained for
 `orphan_retention_seconds` (default one hour), so
 groups that register after publication receive one replay before expiry, while
-the store has room below its publish budget, instead of losing the startup race. Claims use owner and generation fencing. Delivery
+the store has room below its publish budget, instead of losing the startup race. The store ignores a repeat of a publication id it still
+holds, so an outbox re-dispatch inside that window creates no second delivery;
+a later one delivers again to every group, so listeners must be idempotent past
+it. Claims use owner and generation fencing. Delivery
 is at-least-once: a process crash after listener completion but before the
 fenced ack commits can cause the listener to run again. A stale-claim reclaim
 enforces `max_delivery_attempts` too — a row reclaimed past the cap is
