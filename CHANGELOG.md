@@ -96,6 +96,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `outbox.configure()` and `[tool.modulith.outbox_options]` reject a `claim_lease_seconds` above 86400 seconds (one day) with a `ConfigurationError`. A value such as `1e12` used to pass validation and then made every sweep raise `OverflowError`, so nothing was delivered
 - Redis Streams consumers on Redis 6.2 acknowledge a pending message that the stream already trimmed and log it at ERROR, as on Redis 7, instead of leaving it pending forever with an INFO line. A message that left the group's pending list before its retry is logged as acknowledged or dead-lettered, not as vanished delivery metadata
 - `load_configuration` rejects a URL given as the SHM broker's `sqlite_path` or `hint_path`, naming `state_dir` and the database broker's `url` instead, where it created a directory named like `sqlite+aiosqlite:`. A broker name with surrounding whitespace is stripped before validation, so `" memory "` is refused for `--topology processes` like `"memory"`
+- In a module with `from __future__ import annotations`, `@listener` resolves the event type of a `functools.partial` over an async function and of a sync callable instance, where it raised `AttributeError` on `__qualname__`. A listener object without `__qualname__` whose annotation cannot be resolved gets the intended `TypeError`
 
 ### Security
 

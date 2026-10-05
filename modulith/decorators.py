@@ -22,7 +22,7 @@ from __future__ import annotations
 import functools
 import inspect
 from collections.abc import Callable
-from typing import Any, TypeVar, overload
+from typing import Any, TypeVar, cast, overload
 
 from .brokers import _split_broker_target
 from .config import ConfigurationError
@@ -99,6 +99,21 @@ def externalized(cls: type[T] | None = None, *, target: str | None = None) -> An
     return wrap(cls)
 
 
+def _annotation_globals(target: Callable[..., Any]) -> dict[str, Any]:
+    """Return the module globals that stringized annotations of ``target`` resolve in.
+
+    A ``functools.partial`` has no ``__globals__``; its wrapped function (possibly
+    behind further partials) does. A callable instance has none either, so its
+    class's ``__call__`` supplies them.
+    """
+    while isinstance(target, functools.partial):
+        target = target.func
+    found = getattr(target, "__globals__", None)
+    if found is None:
+        found = getattr(type(target).__call__, "__globals__", {})
+    return cast("dict[str, Any]", found)
+
+
 def _resolve_event_type(func: Callable[..., Any], target: Callable[..., Any]) -> type:
     """Resolve the event type from a listener's first parameter annotation.
 
@@ -115,16 +130,17 @@ def _resolve_event_type(func: Callable[..., Any], target: Callable[..., Any]) ->
     signature and ``__globals__`` we read (the unwrapped function for sync
     handlers, so functools.wraps chains don't hide the parameter list).
     """
+    name = getattr(func, "__qualname__", repr(func))
     sig = inspect.signature(target)
     params = list(sig.parameters.values())
     if not params:
-        raise TypeError(f"@listener {func.__qualname__!r} must accept an event argument")
+        raise TypeError(f"@listener {name!r} must accept an event argument")
 
     first = params[0]
     annotation = first.annotation
     if annotation is inspect.Parameter.empty:
         raise TypeError(
-            f"@listener {func.__qualname__!r} must annotate its event "
+            f"@listener {name!r} must annotate its event "
             f"parameter so modulith knows which event type to route. "
             f"Example: 'async def handler(event: OrderCreated)'"
         )
@@ -144,10 +160,10 @@ def _resolve_event_type(func: Callable[..., Any], target: Callable[..., Any]) ->
         # the wrong parameter and rejecting a listener the bus would have called
         # perfectly well (it invokes handlers with the event alone).
         try:
-            annotation = eval(annotation, getattr(target, "__globals__", {}))
+            annotation = eval(annotation, _annotation_globals(target))
         except (NameError, AttributeError, SyntaxError) as exc:
             raise TypeError(
-                f"@listener {func.__qualname__!r} annotates its event parameter "
+                f"@listener {name!r} annotates its event parameter "
                 f"as {first.annotation!r}, but modulith could not resolve that "
                 f"name to a class. Define the event type at module scope so its "
                 f"annotation resolves (classes in local scope are invisible "
@@ -160,7 +176,7 @@ def _resolve_event_type(func: Callable[..., Any], target: Callable[..., Any]) ->
         # be a routing key — fail fast with a clear message instead of a dead
         # listener that silently never fires.
         raise TypeError(
-            f"@listener {func.__qualname__!r} could not resolve its event "
+            f"@listener {name!r} could not resolve its event "
             f"annotation to a class (got {annotation!r})."
         )
     return annotation
