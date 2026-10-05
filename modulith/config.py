@@ -212,13 +212,6 @@ def load_configuration(**overrides: Any) -> Configuration:
     _validate(explicit)
     if "verify_disabled_rules" in explicit:
         explicit["verify_disabled_rules"] = tuple(explicit["verify_disabled_rules"])
-    broker_options = explicit.get("broker_options")
-    if (
-        isinstance(broker_options, dict) and "shm_slot_size" in broker_options
-    ) or "MODULITH_BROKER_SHM_SLOT_SIZE" in os.environ:
-        logger.warning(
-            "shm_slot_size is deprecated and ignored; SHM hints use fixed-size sequence slots"
-        )
 
     # Freeze explicit_keys BEFORE injecting the broker default so
     # cfg.is_explicit("broker") stays False for the auto-default case.

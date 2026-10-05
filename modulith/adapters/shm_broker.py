@@ -638,7 +638,7 @@ _SHM_OPTION_ENV_SUFFIXES = {
 
 
 def _effective_shm_options(opts: dict[str, Any]) -> dict[str, Any]:
-    effective = {key: value for key, value in opts.items() if key != "shm_slot_size"}
+    effective = dict(opts)
     for key, env_suffix in _SHM_OPTION_ENV_SUFFIXES.items():
         value = _broker_opt(opts, key, env_suffix)
         if value is not None:

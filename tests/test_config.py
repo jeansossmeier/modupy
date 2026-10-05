@@ -600,34 +600,20 @@ def test_shm_storage_limits_accept_documented_safe_maxima() -> None:
     assert cfg.broker_options["max_store_bytes"] == 1024**4
 
 
-@pytest.mark.parametrize("source", ["config", "environment"])
-def test_shm_slot_size_is_ignored_with_one_deprecation_warning(
-    source: str,
-    monkeypatch: pytest.MonkeyPatch,
+def test_shm_slot_size_is_silently_ignored_as_unknown_option(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The removed sizing knob accepts legacy values but is never presented as active."""
+    """shm_slot_size is no longer recognized and is silently ignored like any other unknown option."""
     import logging
-
-    options: dict[str, object] = {}
-    if source == "config":
-        options["shm_slot_size"] = "not-a-size"
-    else:
-        monkeypatch.setenv("MODULITH_BROKER_SHM_SLOT_SIZE", "not-a-size")
 
     with caplog.at_level(logging.WARNING, logger="modulith.config"):
         cfg = load_configuration(
             topology="processes",
             broker="shm",
-            broker_options=options,
+            broker_options={"shm_slot_size": "any-value"},
         )
 
-    warnings = [
-        record
-        for record in caplog.records
-        if "shm_slot_size is deprecated and ignored" in record.getMessage()
-    ]
-    assert len(warnings) == 1
+    assert not any("shm_slot_size" in record.getMessage() for record in caplog.records)
     assert cfg.broker == "shm"
 
 

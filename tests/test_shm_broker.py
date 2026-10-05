@@ -924,13 +924,7 @@ async def test_runtime_registration_honors_shm_options_and_environment(
         await instance.publish("events", b"12345")
         with pytest.raises(ConfigurationError, match="max_payload_bytes"):
             await instance.publish("events", b"123456")
-        warnings = [
-            record
-            for record in caplog.records
-            if "shm_slot_size is deprecated and ignored" in record.getMessage()
-        ]
-        assert len(warnings) == 1
-        assert warnings[0].name == "modulith.config"
+        assert not any("shm_slot_size" in record.getMessage() for record in caplog.records)
         assert all("slot_size=" not in record.getMessage() for record in caplog.records)
     finally:
         await instance.close()

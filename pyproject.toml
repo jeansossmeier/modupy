@@ -537,7 +537,6 @@ ignore_missing_imports = true
 # sqlite_synchronous = "NORMAL"          # use "FULL" for power-loss durability
 # max_payload_bytes = 16777216            # default 16 MiB; maximum 1 GiB
 # max_store_bytes = 1073741824            # default 1 GiB; maximum 1 TiB
-# shm_slot_size is deprecated and ignored; hint slots are fixed-size sequences
 # url = "postgresql+asyncpg://..."       # selects database when broker is omitted
 # no_subscriber_policy = "error"   # "error" | "wait" | "store"
 # orphan_replay_policy = "ttl_all_groups"  # "ttl_all_groups" | "first_groups" | "expected_groups"
