@@ -1241,16 +1241,40 @@ async def _release_claims(publications: list[EventPublication]) -> None:
             await _renew_swept_claim(pub, 0.0)
 
 
+@functools.cache
+def _declared_parameters(func: Callable[..., Any]) -> frozenset[str]:
+    try:
+        parameters = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return frozenset()
+    named = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    return frozenset(p.name for p in parameters if p.kind in named)
+
+
+def _optional_claim_batch_kwargs(**candidates: Any) -> dict[str, Any]:
+    """The ``claim_batch`` keywords beyond the protocol's required four that
+    the active store names as parameters (see ``ClaimingStore.claim_batch``).
+    A store's signature is read once per function, and a ``**kwargs`` store
+    receives none of them."""
+    assert _store is not None
+    claim_batch = _store.claim_batch  # type: ignore[attr-defined]
+    declared = _declared_parameters(getattr(claim_batch, "__func__", claim_batch))
+    return {name: value for name, value in candidates.items() if name in declared}
+
+
 async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
     """Lease mode: claim a batch, re-arm each row's lease before its turn,
     renew during dispatch, fence complete/fail. A stop request releases the
     rows not yet dispatched."""
     assert _store is not None
+    with _inflight_lock:
+        delivering = frozenset(_inflight_ids)
     claimed = await _store.claim_batch(  # type: ignore[attr-defined]
         owner=_claim_owner,
         batch_size=_claim_batch_size,
         lease_seconds=_claim_lease_seconds,
         older_than=older_than,
+        **_optional_claim_batch_kwargs(exclude_ids=delivering),
     )
     if claimed and not runtime_ready:
         logger.info(

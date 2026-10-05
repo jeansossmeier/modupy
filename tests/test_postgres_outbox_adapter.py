@@ -2174,6 +2174,81 @@ async def test_a_sweep_skipping_a_row_this_process_is_delivering_charges_nothing
     assert (again.attempt_count, again.last_error) == (1, "boom")
 
 
+async def test_a_sweep_leaves_a_delivery_that_outlived_its_lease_alone(engine: Any) -> None:
+    """A listener running past its lease (the renewal that would extend it
+    failed or is late) is still this process's delivery. A second sweep must
+    neither claim the row nor charge it an interrupted attempt, so the first
+    delivery's fenced completion lands."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow(event: G04Event) -> None:
+        received.append(event.value)
+        entered.set()
+        await release.wait()
+
+    _bootstrap_with_listener(slow)
+    pub = _pub(1, slow)
+    await store.save(pub)
+
+    first = asyncio.create_task(outbox._sweep(timedelta(0)))
+    await entered.wait()
+    held = await _stored_row(engine, pub.id)
+    await _expire_claims(engine)
+
+    await outbox._sweep(timedelta(0))
+
+    after = await _stored_row(engine, pub.id)
+    assert (after.claim_token, after.attempt_count) == (held.claim_token, 0)
+    release.set()
+    await first
+    assert received == [1]
+    assert await _completed_rows(engine) == 1
+
+
+async def _assert_claim_batch_skips_excluded_ids_uncharged(engine: Any) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    now = datetime.now(UTC)
+    kept, skipped = (_pub(i, published_at=now - timedelta(seconds=10 - i)) for i in (1, 2))
+    await store.save(kept)
+    await store.save(skipped)
+    await _claim_start_and_die(store, engine)
+    held = await _stored_row(engine, skipped.id)
+
+    claimed = await store.claim_batch(
+        owner="peer",
+        batch_size=10,
+        lease_seconds=60,
+        older_than=timedelta(0),
+        exclude_ids={skipped.id},
+    )
+
+    assert [p.id for p in claimed] == [kept.id]
+    after = await _stored_row(engine, skipped.id)
+    assert (after.claim_token, after.attempt_count, after.dispatch_started) == (
+        held.claim_token,
+        0,
+        True,
+    )
+
+
+async def test_claim_batch_skips_excluded_ids_uncharged_on_sqlite(engine: Any) -> None:
+    await _assert_claim_batch_skips_excluded_ids_uncharged(engine)
+
+
+@pytest.mark.integration
+async def test_claim_batch_skips_excluded_ids_uncharged_on_postgres(pg_engine: Any) -> None:
+    await _assert_claim_batch_skips_excluded_ids_uncharged(pg_engine)
+
+
+@pytest.mark.integration
+async def test_claim_batch_skips_excluded_ids_uncharged_on_mysql(mysql_url: str) -> None:
+    async with _mysql_engine(mysql_url) as engine:
+        await _assert_claim_batch_skips_excluded_ids_uncharged(engine)
+
+
 def _renew_claim_raising_for(
     store: PostgresPublicationStore,
     monkeypatch: pytest.MonkeyPatch,

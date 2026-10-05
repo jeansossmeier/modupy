@@ -46,7 +46,7 @@ import asyncio
 import json
 import logging
 import weakref
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -911,7 +911,13 @@ class PostgresPublicationStore:
     # ----- claim_strategy="lease" — atomic claim + token fencing ----------
 
     async def claim_batch(
-        self, *, owner: str, batch_size: int, lease_seconds: float, older_than: timedelta
+        self,
+        *,
+        owner: str,
+        batch_size: int,
+        lease_seconds: float,
+        older_than: timedelta,
+        exclude_ids: Collection[UUID] = (),
     ) -> list[EventPublication]:
         """Atomically claim up to ``batch_size`` claimable rows and COMMIT
         before returning — the caller (the outbox retry loop) dispatches only
@@ -940,6 +946,9 @@ class PostgresPublicationStore:
         redelivered. Rows that only waited in a claimed batch never had the
         flag set, so they come back uncharged. ``renew_claim`` sets it: the
         sweep renews each row just before handing it to its listener.
+
+        ``exclude_ids`` are rows the caller is delivering itself: the query
+        skips them, so they are neither claimed nor charged.
         """
         now = datetime.now(UTC)
         cutoff = now - older_than
@@ -963,6 +972,8 @@ class PostgresPublicationStore:
             )
             .limit(batch_size)
         )
+        if exclude_ids:
+            stmt = stmt.where(EventPublicationRow.id.not_in(exclude_ids))
         if not self._supports_skip_locked:
             return await self._claim_unlocked_retrying(stmt, owner=owner, now=now, until=until)
         stmt = stmt.with_for_update(skip_locked=True)

@@ -726,3 +726,98 @@ def test_lock_connection_timeout_is_part_of_the_advisory_protocol() -> None:
         _claims.AdvisoryLockingStore.try_lock_publication.__doc__ or ""
     )
     assert "find_by_id" in (_claims.AdvisoryLockingStore.__doc__ or "")
+
+
+# ---------------------------------------------------------------------------
+# claim_batch's optional keywords reach only the stores that declare them
+# ---------------------------------------------------------------------------
+
+
+class _ExcludingStore(StubStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.claim_calls: list[dict[str, Any]] = []
+
+    async def claim_batch(
+        self,
+        *,
+        owner: str,
+        batch_size: int,
+        lease_seconds: float,
+        older_than: timedelta,
+        exclude_ids: frozenset[UUID] = frozenset(),
+    ) -> list[EventPublication]:
+        self.claim_calls.append({"exclude_ids": exclude_ids})
+        return []
+
+
+class _LegacyClaimingStore(StubStore):
+    """Declares exactly the four keywords the protocol had before the optional
+    ones: a call carrying anything else raises TypeError."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.claim_calls = 0
+
+    async def claim_batch(
+        self, *, owner: str, batch_size: int, lease_seconds: float, older_than: timedelta
+    ) -> list[EventPublication]:
+        self.claim_calls += 1
+        return []
+
+
+class _WildcardClaimingStore(StubStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.claim_kwargs: list[dict[str, Any]] = []
+
+    async def claim_batch(self, **kwargs: Any) -> list[EventPublication]:
+        self.claim_kwargs.append(kwargs)
+        return []
+
+
+async def test_lease_sweep_hands_its_in_flight_ids_to_a_store_that_declares_exclude_ids() -> None:
+    """A row this process is delivering must not be claimed again by its own
+    sweep, so the sweep passes the in-flight ids to the claim query."""
+    store = _ExcludingStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    delivering = uuid4()
+    with outbox._inflight_lock:
+        outbox._inflight_ids.add(delivering)
+
+    await outbox._sweep(timedelta(0))
+
+    assert store.claim_calls == [{"exclude_ids": frozenset({delivering})}]
+
+
+async def test_lease_sweep_calls_a_store_without_exclude_ids_as_before() -> None:
+    """A third-party store written against the four-keyword protocol keeps
+    being swept, with no TypeError, however many sweeps run."""
+    store = _LegacyClaimingStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    with outbox._inflight_lock:
+        outbox._inflight_ids.add(uuid4())
+
+    await outbox._sweep(timedelta(0))
+    await outbox._sweep(timedelta(0))
+
+    assert store.claim_calls == 2
+
+
+async def test_lease_sweep_does_not_offer_optional_keywords_to_a_catch_all_store() -> None:
+    """Only a keyword the store names is passed: a ``**kwargs`` store receives
+    the protocol's four and nothing it did not ask for."""
+    store = _WildcardClaimingStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+
+    await outbox._sweep(timedelta(0))
+
+    assert [set(kwargs) for kwargs in store.claim_kwargs] == [
+        {"owner", "batch_size", "lease_seconds", "older_than"}
+    ]
+
+
+def test_the_claiming_store_protocol_documents_exclude_ids() -> None:
+    from modulith import _claims
+
+    assert "exclude_ids" in (_claims.ClaimingStore.claim_batch.__doc__ or "")

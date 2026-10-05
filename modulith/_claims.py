@@ -81,6 +81,14 @@ class ClaimingStore(Protocol):
 
         Returned publications carry ``claim_owner``/``claim_token``/
         ``claim_until`` populated so the caller can renew and fence on them.
+
+        Optional keywords: the sweep passes one only to a store whose
+        ``claim_batch`` names it as a parameter (``**kwargs`` does not count),
+        so a store written against the four required keywords keeps working.
+
+        * ``exclude_ids`` (a collection of publication ids) — rows this
+          process is delivering right now. They are neither claimed nor
+          charged, however long their lease has lapsed.
         """
         ...
 
