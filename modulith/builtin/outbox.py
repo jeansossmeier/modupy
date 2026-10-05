@@ -707,6 +707,10 @@ async def persist(event: Any) -> list[EventPublication]:
 
     fqcn = f"{type(event).__module__}.{type(event).__qualname__}"
     payload = _serializer.serialize(event)
+    if isinstance(_serializer, JsonEventSerializer):
+        # dispatch deserializes with this serializer, which refuses an oversized
+        # row; a custom serializer owns its own limits.
+        _serializer.check_payload_size(payload, "persist")
     now = datetime.now(UTC)
     trace_context = _publish_trace_context()
     saved: list[EventPublication] = []
@@ -757,9 +761,11 @@ async def persist_broker_route(event: Any, target: str) -> EventPublication:
         # with it. EventPublication has no column for it; every store keeps the
         # carrier as JSON and trace_headers ignores keys it does not know.
         carrier = {**(carrier or {}), _rt._PUBLISHER_MODULE_HEADER: publisher}
+    payload = _WIRE_SERIALIZER.serialize(event)
+    _WIRE_SERIALIZER.check_payload_size(payload, "persist")
     pub = EventPublication(
         id=uuid4(),
-        payload=_WIRE_SERIALIZER.serialize(event),
+        payload=payload,
         event_type=fqcn,
         listener=_BROKER_ROUTE_LISTENER_PREFIX + target,
         published_at=datetime.now(UTC),

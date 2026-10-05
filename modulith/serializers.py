@@ -672,7 +672,9 @@ class JsonEventSerializer:
     Python object, and it is the last chokepoint every consume path shares —
     without a check here, a row larger than the configured cap (written by
     another process, another host, or a legitimately large configuration) is
-    parsed in full, however large it is.
+    parsed in full, however large it is. ``check_payload_size`` is that same
+    check, which the outbox also runs at publish so it never stores a row
+    dispatch would refuse.
 
     Passing an explicit ``max_payload_bytes`` fixes the cap for this instance.
     Leaving it ``None`` (the default) defers resolution to the first
@@ -717,6 +719,29 @@ class JsonEventSerializer:
             sort_keys=True,
         ).encode("utf-8")
 
+    def check_payload_size(self, data: bytes, operation: str) -> None:
+        """Raise ``ConfigurationError`` when ``data`` exceeds ``max_payload_bytes``.
+
+        The one place the cap is resolved and compared: ``deserialize`` calls it
+        on every consume and the outbox calls it before saving a row, so a
+        payload the consume side would refuse never gets stored. A payload
+        exactly at the cap passes. ``operation`` names the refused step in the
+        message.
+        """
+        if self._max_payload_bytes is None:
+            from .runtime import _runtime
+
+            cfg = _runtime.config
+            self._max_payload_bytes = _resolve_max_payload_bytes(
+                cfg.broker_options if cfg is not None else None
+            )
+        if len(data) > self._max_payload_bytes:
+            raise ConfigurationError(
+                f"{operation} payload is {len(data)} bytes, exceeding "
+                f"max_payload_bytes={self._max_payload_bytes}. Refusing to "
+                f"{operation} a payload larger than the configured cap."
+            )
+
     def deserialize(self, data: bytes, event_type: str) -> Any:
         """Decode JSON bytes back into an event instance.
 
@@ -732,19 +757,7 @@ class JsonEventSerializer:
         ``json.loads`` ever run, so an oversized broker/outbox row is
         rejected instead of allocated and parsed in full.
         """
-        if self._max_payload_bytes is None:
-            from .runtime import _runtime
-
-            cfg = _runtime.config
-            self._max_payload_bytes = _resolve_max_payload_bytes(
-                cfg.broker_options if cfg is not None else None
-            )
-        if len(data) > self._max_payload_bytes:
-            raise ConfigurationError(
-                f"deserialize payload is {len(data)} bytes, exceeding "
-                f"max_payload_bytes={self._max_payload_bytes}. Refusing to "
-                "decode a payload larger than the configured cap."
-            )
+        self.check_payload_size(data, "deserialize")
         if self._allowed_event_types is not None and event_type not in self._allowed_event_types:
             raise ValueError(f"event type {event_type!r} is not in the allowed event types")
         if self._allowed_event_types is None and not self._unrestricted_use_announced:

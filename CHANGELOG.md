@@ -155,6 +155,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `outbox.configure(claim_strategy="advisory_lock")` raises `ConfigurationError` for a store without `find_by_id` and for an engine on `StaticPool` or `SingletonThreadPool`, instead of redelivering from a stale snapshot or sharing one Postgres session between dispatches; the lock-connection timeout is now `modulith._claims.LockConnectionTimeout`, part of the advisory-lock store protocol
 - Two consumers of one group on a SQLite database broker no longer claim the same row, and on MySQL and MariaDB overlapping claims split a backlog as on Postgres instead of the second claim getting nothing (there, pending rows are claimed before stale reclaims; Postgres and SQLite still reclaim the oldest rows first)
 - Outbox binding no longer fails quietly: bootstrap logs a WARNING naming the `outbox_options` tuning keys it ignored because a store was bound with `outbox.configure()`, a failed bind disposes the store and engine it created instead of leaking one per retry, and a publish inside a bound session that finds no outbox store bound (for example with `auto_discover = false`) logs one WARNING per process
+- The transactional outbox refuses an event whose JSON payload exceeds `max_payload_bytes` at publish, raising `ConfigurationError` before the row is saved, so the business transaction fails instead of committing a row dispatch can never deserialize; a payload exactly at the cap is accepted
 
 ### Security
 

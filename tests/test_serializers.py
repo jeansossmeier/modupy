@@ -341,6 +341,16 @@ def test_deserialize_rejects_payload_exceeding_max_payload_bytes() -> None:
         serializer.deserialize(data, _fqcn(SimpleEvent))
 
 
+def test_check_payload_size_admits_a_payload_exactly_at_the_cap_and_rejects_one_byte_over() -> None:
+    serializer = JsonEventSerializer(max_payload_bytes=10)
+
+    serializer.check_payload_size(b"x" * 10, "persist")
+    with pytest.raises(
+        ConfigurationError, match=r"persist payload is 11 bytes.*max_payload_bytes=10"
+    ):
+        serializer.check_payload_size(b"x" * 11, "persist")
+
+
 def test_deserialize_rejects_oversized_payload_before_parsing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

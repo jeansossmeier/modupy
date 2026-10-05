@@ -3322,6 +3322,99 @@ async def test_persist_accepts_one_listener_registered_twice() -> None:
     assert [pub.listener for pub in saved] == [f"{__name__}.record"] * 2
 
 
+_ONE_EVENT_BYTES = len(JsonEventSerializer().serialize(OutboxEvent(value=1)))
+
+
+async def _persist_in_session(engine: Any, call: Any) -> None:
+    """Run ``call`` in a bound session, then commit whatever it enlisted."""
+    async with async_sessionmaker(engine)() as session:
+        token = bind_session(session)
+        try:
+            try:
+                await call()
+            finally:
+                await session.commit()
+        finally:
+            unbind_session(token)
+
+
+@pytest.mark.asyncio
+async def test_persist_rejects_an_event_over_max_payload_bytes_before_saving(
+    tmp_path: Path,
+) -> None:
+    _bootstrap_with_listener(record)
+    engine, store = await _sqlite_outbox(tmp_path)
+    outbox._serializer = JsonEventSerializer(max_payload_bytes=_ONE_EVENT_BYTES - 1)
+    try:
+        with pytest.raises(ConfigurationError, match=f"max_payload_bytes={_ONE_EVENT_BYTES - 1}"):
+            await _persist_in_session(engine, lambda: publish(OutboxEvent(value=1)))
+
+        assert await _stored_rows(engine) == []
+        assert received == []
+    finally:
+        await store.dispose()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_persist_accepts_an_event_exactly_at_max_payload_bytes(tmp_path: Path) -> None:
+    _bootstrap_with_listener(record)
+    engine, store = await _sqlite_outbox(tmp_path)
+    outbox._serializer = JsonEventSerializer(max_payload_bytes=_ONE_EVENT_BYTES)
+    try:
+        await _persist_in_session(engine, lambda: publish(OutboxEvent(value=1)))
+        await store.wait_for_dispatch()
+
+        assert received == [1]
+        assert await _stored_rows(engine) == [(f"{__name__}.record", True)]
+    finally:
+        await store.dispose()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_persist_broker_route_rejects_an_event_over_max_payload_bytes_before_saving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bootstrap_with_listener(record)
+    engine, store = await _sqlite_outbox(tmp_path)
+    monkeypatch.setattr(
+        outbox, "_WIRE_SERIALIZER", JsonEventSerializer(max_payload_bytes=_ONE_EVENT_BYTES - 1)
+    )
+    try:
+        with pytest.raises(ConfigurationError, match=f"max_payload_bytes={_ONE_EVENT_BYTES - 1}"):
+            await _persist_in_session(
+                engine, lambda: outbox.persist_broker_route(OutboxEvent(value=1), "test:events")
+            )
+
+        assert await _stored_rows(engine) == []
+    finally:
+        await store.dispose()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_persist_broker_route_accepts_an_event_exactly_at_max_payload_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bootstrap_with_listener(record)
+    engine, store = await _sqlite_outbox(tmp_path)
+    monkeypatch.setattr(
+        outbox, "_WIRE_SERIALIZER", JsonEventSerializer(max_payload_bytes=_ONE_EVENT_BYTES)
+    )
+    try:
+        await _persist_in_session(
+            engine, lambda: outbox.persist_broker_route(OutboxEvent(value=1), "test:events")
+        )
+
+        assert await _stored_rows(engine) == [
+            (f"{outbox._BROKER_ROUTE_LISTENER_PREFIX}test:events", False)
+        ]
+    finally:
+        await store.dispose()
+        await engine.dispose()
+
+
 def test_start_runs_crash_sweep_for_store_configured_without_a_loop() -> None:
     store = StubStore()
     outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)

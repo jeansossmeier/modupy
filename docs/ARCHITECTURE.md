@@ -944,8 +944,13 @@ Resource limits are enforced before and inside the authoritative store.
 blob SQLite stores) and `max_store_bytes` to 1 GiB (maximum 1 TiB); both accept
 `MODULITH_BROKER_*` environment overrides.
 
-`max_payload_bytes` rejects oversized payloads before opening a publish
-transaction — but that is a write-side guard only.
+`max_payload_bytes` rejects oversized payloads at publish, before anything is
+saved: the broker before opening a publish transaction, and the transactional
+outbox (`outbox.persist` and the broker-route row) with `ConfigurationError`
+raised inside the business transaction, so that transaction fails instead of
+committing a row dispatch could never deserialize. A payload exactly at the cap
+is accepted. A custom storage serializer passed to `outbox.configure` is not
+checked; it owns its own limits.
 `JsonEventSerializer.deserialize` re-checks the same cap on every consume,
 since it is the sole chokepoint where broker/outbox bytes become a Python
 object; an oversized row is dead-lettered instead of parsed. The consumer
