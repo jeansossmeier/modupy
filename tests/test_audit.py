@@ -920,6 +920,49 @@ def test_audit_force_writes_the_report_to_the_output(tmp_path: Path, existing: b
     assert f"wrote audit report to {out}" in result.stdout
 
 
+def _create_output_during_the_audit(monkeypatch, out: Path) -> None:
+    """Make ``out`` appear after the existence check, while the audit runs."""
+    import modulith.audit as audit_module
+
+    real_audit = audit_module.audit_codebase
+
+    def audit_then_create(*args, **kwargs):
+        result = real_audit(*args, **kwargs)
+        out.write_text(HAND_WRITTEN, encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(audit_module, "audit_codebase", audit_then_create)
+
+
+def test_audit_does_not_overwrite_an_output_created_after_the_check(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = _make_codebase(tmp_path)
+    out = tmp_path / "notes.md"
+    _create_output_during_the_audit(monkeypatch, out)
+
+    result = runner.invoke(app, ["audit", str(root), "--output", str(out)])
+
+    assert result.exit_code == 1, result.output
+    assert str(out) in result.stderr
+    assert "--force" in result.stderr
+    assert "wrote audit report" not in result.stdout
+    assert out.read_text(encoding="utf-8") == HAND_WRITTEN
+
+
+def test_audit_force_overwrites_an_output_created_after_the_check(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = _make_codebase(tmp_path)
+    out = tmp_path / "notes.md"
+    _create_output_during_the_audit(monkeypatch, out)
+
+    result = runner.invoke(app, ["audit", str(root), "--output", str(out), "--force"])
+
+    assert result.exit_code == 0, result.output
+    assert out.read_text(encoding="utf-8").startswith("# modupy Audit Report")
+
+
 def test_audit_output_to_a_device_needs_no_force(tmp_path: Path) -> None:
     """Pins behavior that predates the refusal and must survive it:
     ``--output /dev/null`` discards the report, and a device holds nothing to

@@ -42,7 +42,7 @@ from collections import defaultdict
 from collections.abc import Coroutine
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, NoReturn, TypeVar
 from uuid import UUID
 
 # typer is an optional dependency — only loaded when the CLI is invoked.
@@ -1264,6 +1264,15 @@ def extract(
 # ---------------------------------------------------------------------------
 
 
+def _exit_output_exists(output: Path) -> NoReturn:
+    typer.echo(
+        f"error: {output} already exists; pass --force to overwrite it or --output to "
+        "write the report elsewhere.",
+        err=True,
+    )
+    raise typer.Exit(code=1)
+
+
 @app.command()
 def audit(
     path: Path | None = typer.Argument(
@@ -1294,12 +1303,7 @@ def audit(
     # is_file, not exists: a directory is not overwritable and a device such as
     # /dev/null (a way to discard the report) holds nothing to lose.
     if output.is_file() and not force:
-        typer.echo(
-            f"error: {output} already exists; pass --force to overwrite it or --output to "
-            "write the report elsewhere.",
-            err=True,
-        )
-        raise typer.Exit(code=1)
+        _exit_output_exists(output)
 
     try:
         cfg = load_configuration()
@@ -1309,8 +1313,15 @@ def audit(
 
     root = find_audit_root(Path(".")) if path is None else path
     result = audit_codebase(root, contracts_module=cfg.contracts_module)
+    report = render_report(result)
+    # Exclusive create closes the window between the is_file check above and
+    # the write; an existing non-file (a device) still opens for writing.
+    mode = "w" if force or (output.exists() and not output.is_file()) else "x"
     try:
-        output.write_text(render_report(result), encoding="utf-8")
+        with output.open(mode, encoding="utf-8") as report_file:
+            report_file.write(report)
+    except FileExistsError:
+        _exit_output_exists(output)
     except OSError as exc:
         # An --output path in a nonexistent directory (or otherwise
         # unwritable) is a user/filesystem error per the documented exit
@@ -2126,7 +2137,7 @@ def _migration_url(url: str) -> str:
 
 
 def _masked_url(url: str) -> str:
-    from urllib.parse import parse_qsl, urlparse, urlunparse
+    from urllib.parse import parse_qsl, urlparse
 
     from sqlalchemy.engine import make_url
 
@@ -2144,9 +2155,9 @@ def _masked_url(url: str) -> str:
     ]
 
     new_query = "&".join(f"{k}={v}" for k, v in masked_params)
-    return urlunparse(
-        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment)
-    )
+    # Swap the query in place: urlunparse drops the empty authority, turning
+    # sqlite:///relative.db into sqlite:/relative.db.
+    return masked_base.replace(f"?{parsed.query}", f"?{new_query}", 1)
 
 
 @app.command()

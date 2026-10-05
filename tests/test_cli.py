@@ -4377,6 +4377,36 @@ def test_masked_url_keeps_non_secret_query_parameters_visible() -> None:
     assert "10" in masked
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "sqlite+aiosqlite:///relative.db?password=secret",
+            "sqlite+aiosqlite:///relative.db?password=***",
+        ),
+        ("sqlite+aiosqlite:///relative.db", "sqlite+aiosqlite:///relative.db"),
+        (
+            "sqlite+aiosqlite:////abs/path.db?password=secret",
+            "sqlite+aiosqlite:////abs/path.db?password=***",
+        ),
+        ("sqlite+aiosqlite://", "sqlite+aiosqlite://"),
+        ("sqlite+aiosqlite://?password=secret", "sqlite+aiosqlite://?password=***"),
+        (
+            "postgresql+psycopg://user:s3cret@db.example:5432/app?token=abc&sslmode=require",
+            "postgresql+psycopg://user:***@db.example:5432/app?sslmode=require&token=***",
+        ),
+        (
+            "redis://user:s3cret@cache.example:6379/0?password=secret",
+            "redis://user:***@cache.example:6379/0?password=***",
+        ),
+    ],
+)
+def test_masked_url_keeps_the_url_form_and_hides_secrets(url: str, expected: str) -> None:
+    from modulith.cli import _masked_url
+
+    assert _masked_url(url) == expected
+
+
 def test_migrate_failure_reports_an_error_without_leaking_the_password(
     tmp_path, monkeypatch
 ) -> None:
