@@ -34,6 +34,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import sys
 import tomllib
 import traceback
@@ -1609,6 +1610,19 @@ def _expected_targets_warning(group: str, expected: list[str]) -> str:
     )
 
 
+def _confirm_interruptibly(prompt: str) -> bool:
+    """`typer.confirm` under the default SIGINT handler.
+
+    Inside `asyncio.run`, asyncio's own handler only cancels the main task, which
+    a blocking `input()` never sees: the first Ctrl-C would be swallowed.
+    """
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        return typer.confirm(prompt)
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 @broker_app.command("drop-group")
 def broker_drop_group(
     group: str = typer.Argument(..., help="Consumer group, e.g. 'modulith-notifications'"),
@@ -1670,7 +1684,10 @@ def broker_drop_group(
             for t in (broker.expected_targets(group) if cfg.broker == "database" else [])
             if targets is None or t in targets
         ]
-        if targets is None and not force and group in await _live_groups(broker, derived):
+
+        async def refuse_if_live() -> None:
+            if targets is not None or force or group not in await _live_groups(broker, derived):
+                return
             if expected:
                 workers = (
                     "its running workers receive no new publications to its other targets "
@@ -1690,6 +1707,8 @@ def broker_drop_group(
                 err=True,
             )
             raise typer.Exit(code=1)
+
+        await refuse_if_live()
         sole = [
             t
             for t in await broker.sole_subscriber_targets(group)
@@ -1700,9 +1719,12 @@ def broker_drop_group(
         if expected:
             typer.echo(_expected_targets_warning(group, expected))
         prompt = f"Drop {scope} and delete its pending and claimed messages?"
-        if not yes and not typer.confirm(prompt):
-            typer.echo("aborted — nothing was removed", err=True)
-            raise typer.Exit(code=1)
+        if not yes:
+            if not _confirm_interruptibly(prompt):
+                typer.echo("aborted — nothing was removed", err=True)
+                raise typer.Exit(code=1)
+            # The prompt has no time bound: a consumer may have started meanwhile.
+            await refuse_if_live()
         removed: tuple[int, int] = await broker.drop_group(group, targets=targets)
         return removed
 

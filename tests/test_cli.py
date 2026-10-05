@@ -2877,6 +2877,63 @@ def test_broker_drop_group_refuses_a_recently_active_group_without_force(
     assert _shm_group_backlog(db_path) == {"modulith-extracted": 3}
 
 
+def test_broker_drop_group_rechecks_liveness_after_the_confirmation_prompt(
+    make_fake_app, monkeypatch, tmp_path
+):
+    import threading
+
+    import typer
+
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    db_path = _seed_shm_groups(tmp_path, monkeypatch, {"modulith-retired": 3})
+
+    def consumer_starts_while_the_prompt_waits(prompt: str) -> bool:
+        worker = threading.Thread(target=_claim_one, args=(db_path, "modulith-retired"))
+        worker.start()
+        worker.join()
+        return True
+
+    monkeypatch.setattr(typer, "confirm", consumer_starts_while_the_prompt_waits)
+
+    result = runner.invoke(app, ["broker", "drop-group", "modulith-retired"])
+
+    assert result.exit_code == 1, result.output
+    assert "'modulith-retired'" in result.output
+    assert "--force" in result.output
+    assert _shm_group_backlog(db_path) == {"modulith-retired": 3}
+
+
+def test_broker_drop_group_confirmation_prompt_is_interruptible_by_ctrl_c(
+    make_fake_app, monkeypatch, tmp_path
+):
+    """asyncio.run installs its own SIGINT handler, which defers the interrupt until a
+    blocking input() returns; the prompt must run under the default handler so the
+    first Ctrl-C aborts it and a later "y" cannot drop the group."""
+    import signal
+
+    import typer
+
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    db_path = _seed_shm_groups(tmp_path, monkeypatch, {"modulith-retired": 3})
+    handlers: list[object] = []
+
+    def interrupted(prompt: str) -> bool:
+        handlers.append(signal.getsignal(signal.SIGINT))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(typer, "confirm", interrupted)
+    before = signal.getsignal(signal.SIGINT)
+
+    result = runner.invoke(app, ["broker", "drop-group", "modulith-retired"])
+
+    assert handlers == [signal.default_int_handler]
+    assert result.exit_code != 0, result.output
+    assert signal.getsignal(signal.SIGINT) is before
+    assert _shm_group_backlog(db_path) == {"modulith-retired": 3}
+
+
 def test_a_consumer_missing_two_subscription_refreshes_still_counts_as_live() -> None:
     """A failed refresh is retried one interval later, so two failures in a row age the
     subscription to three intervals; the group must still read as live then."""

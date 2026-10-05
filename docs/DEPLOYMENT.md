@@ -1461,8 +1461,10 @@ modupy configures no exporter. Set up an OpenTelemetry tracer provider in your a
    renamed module leaves its old name's group behind the same way). Its
    consumer served the group until step 5, so for 24 hours after that the
    group still counts as live: `drop-group` refuses it unless you pass
-   `--force`. Pass `--force` once you have checked that no service or host
-   still runs the group, or wait 24 hours. On the SHM broker, do not wait:
+   `--force`; it checks again after you answer the confirmation prompt, so a
+   consumer that started meanwhile still stops the drop. Pass `--force` once
+   you have checked that no service or host still runs the group, or wait 24
+   hours. On the SHM broker, do not wait:
    the group pins every publication to its targets until it is dropped, and
    a store sized for the one-hour default retention can fill within those 24
    hours. The startup warning for a
