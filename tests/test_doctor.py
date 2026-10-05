@@ -197,6 +197,22 @@ def test_a_check_raising_without_a_message_still_names_the_exception(
     assert check.summary == "check raised: KeyError()"
 
 
+def test_a_check_raising_an_os_error_keeps_the_file_name_in_its_summary(
+    make_fake_app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp")
+
+    def _raise(_rt: object) -> None:
+        raise PermissionError(13, "Permission denied", ".modulith-schemas.json")
+
+    monkeypatch.setattr("modulith.doctor._check_actuator_token", _raise)
+
+    check = _check(run_doctor(), "actuator token")
+
+    assert check.summary == "check raised: [Errno 13] Permission denied: '.modulith-schemas.json'"
+
+
 def test_boundary_health_honors_disabled_rules_for_a_plugin_rule(make_fake_app) -> None:
     make_fake_app({"orders": ""})
     configure(package="fakeapp", verify_disabled_rules=("team-rule",))
