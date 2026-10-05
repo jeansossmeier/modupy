@@ -850,6 +850,56 @@ async def test_sole_subscriber_targets_on_the_real_dialect(broker_engine: Any) -
     assert await broker.sole_subscriber_targets("g-orders") == []
 
 
+async def _message_states(engine: Any) -> dict[str, tuple[str, str]]:
+    """Map every broker_message id to its ``(consumer_group, status)``."""
+    from sqlalchemy import select
+
+    _, _, message = broker_schema()
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            select(message.c.id, message.c.consumer_group, message.c.status)
+        )
+        return {row[0]: (row[1], row[2]) for row in result}
+
+
+async def test_drop_group_removes_a_groups_undelivered_state_on_the_real_dialect(
+    broker_engine: Any,
+) -> None:
+    from sqlalchemy import select
+
+    broker = DatabaseBroker(engine=broker_engine, completion_mode="mark")
+    await broker.subscribe([_TARGET, "t.Other"], "g")
+    await broker.subscribe([_TARGET], "g-kept")
+    for target in (_TARGET, "t.Other"):
+        for _ in range(3):
+            await broker.publish(target, b"x", {"event_type": _EVENT_TYPE})
+    claimed = [row["id"] for row in await broker.claim_batch("g", batch_size=4, consumer_name="c1")]
+    assert len(claimed) == 4
+    done_id, dead_id = claimed[:2]
+    await broker.ack(done_id, consumer_name="c1")
+    await broker.dead_letter(dead_id, "boom", consumer_name="c1")
+    kept = {
+        row_id: state
+        for row_id, state in (await _message_states(broker_engine)).items()
+        if state[0] == "g-kept"
+    }
+    assert len(kept) == 3
+    assert await broker.group_backlog() == {"g": 4, "g-kept": 3}
+
+    assert await broker.drop_group("g") == (2, 4)
+
+    assert await broker.group_backlog() == {"g-kept": 3}
+    assert await _message_states(broker_engine) == {
+        done_id: ("g", "done"),
+        dead_id: ("g", "dead"),
+        **kept,
+    }
+    _, subscription, _ = broker_schema()
+    async with broker_engine.connect() as conn:
+        result = await conn.execute(select(subscription.c.target, subscription.c.consumer_group))
+        assert {tuple(row) for row in result} == {(_TARGET, "g-kept")}
+
+
 async def test_has_schema_reports_whether_the_broker_tables_exist(broker_engine: Any) -> None:
     broker = DatabaseBroker(engine=broker_engine)
     assert await broker.has_schema() is True
