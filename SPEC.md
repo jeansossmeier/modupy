@@ -984,7 +984,8 @@ override, `MODULITH_BROKER_MAX_PAYLOAD_BYTES` and `MODULITH_BROKER_MAX_STORE_BYT
 
 Consumers are not held to that budget:
 
-- Consumer writes (claims, renewals, acks, fails, dead-letters and prunes) and
+- Consumer writes (claims, renewals, claim releases, acks, fails, dead-letters,
+  dead-letter retries, prunes, heartbeat touches and group drops) and
   recording a subscription are never refused this way. One that hits
   `max_page_count` is retried with the limit lifted, so consumers drain a
   backlog that filled the store, including a store opened above its limit, a

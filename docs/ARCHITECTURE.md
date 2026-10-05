@@ -925,7 +925,8 @@ backpressure without corrupting existing rows. The reserve is 32 pages
 pages.
 
 A full store still lets consumers finish. Consumer writes (claims, renewals,
-acks, fails, dead-letters, prunes) only change rows the store already holds,
+claim releases, acks, fails, dead-letters, dead-letter retries, prunes,
+heartbeat touches, group drops) only change rows the store already holds,
 but claims, error text, mark-mode completions and prune tombstones still grow
 them, and no fixed reserve covers a whole backlog. So a consumer write, or a
 subscribe too big for even its subscription row, that hits `max_page_count` is

@@ -871,6 +871,147 @@ def test_a_consumer_write_names_the_sqlite_version_when_the_cap_cannot_be_lifted
         store.close()
 
 
+class _CapRestoreFailingConnection:
+    """A real connection whose PRAGMAs that restore the page cap raise while ``failing``."""
+
+    def __init__(self, conn: sqlite3.Connection, failing_pragma: str) -> None:
+        self._conn = conn
+        self._failing_pragma = failing_pragma
+        self.failing = True
+
+    def execute(self, sql: str, *parameters: Any) -> sqlite3.Cursor:
+        lifts_the_cap = sql == f"PRAGMA max_page_count={_UNCAPPED_PAGES}"
+        if self.failing and sql.startswith(self._failing_pragma) and not lifts_the_cap:
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._conn.execute(sql, *parameters)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
+_CAP_RESTORING_PRAGMAS = ["PRAGMA page_size", "PRAGMA max_page_count="]
+
+
+def _store_that_cannot_restore_its_cap(
+    path: Path, failing_pragma: str
+) -> tuple[SqliteQueueStore, Callable[[], str], _CapRestoreFailingConnection]:
+    store = _bounded_store(path, 256 * 1024)
+    grow = _grow_past_the_limit(store)
+
+    def operation() -> str:
+        grow()
+        return "committed"
+
+    flaky = _CapRestoreFailingConnection(store._conn, failing_pragma)
+    store._conn = cast(sqlite3.Connection, flaky)
+    return store, operation, flaky
+
+
+def _shm_errors(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "modulith.adapters.shm" and record.levelno == logging.ERROR
+    ]
+
+
+@pytest.mark.parametrize("failing_pragma", _CAP_RESTORING_PRAGMAS)
+def test_a_consumer_write_returns_its_committed_result_when_the_cap_restore_fails(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, failing_pragma: str
+) -> None:
+    path = tmp_path / "restore.db"
+    store, operation, _ = _store_that_cannot_restore_its_cap(path, failing_pragma)
+    try:
+        assert store._consumer_write(operation) == "committed"
+
+        [error] = _shm_errors(caplog)
+        assert "max_page_count" in error
+        assert "disk I/O error" in error
+        assert _rows(path, "SELECT COUNT(*) AS n FROM filler")[0]["n"] == 1
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("failing_pragma", _CAP_RESTORING_PRAGMAS)
+def test_the_next_consumer_write_retries_a_failed_cap_restore_before_it_runs(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, failing_pragma: str
+) -> None:
+    store, operation, flaky = _store_that_cannot_restore_its_cap(
+        tmp_path / "retry.db", failing_pragma
+    )
+    try:
+        assert store._consumer_write(operation) == "committed"
+        assert store.read_pragma("max_page_count") == _UNCAPPED_PAGES
+        caplog.clear()
+        flaky.failing = False
+
+        cap_the_next_write_ran_under = store._consumer_write(
+            lambda: store.read_pragma("max_page_count")
+        )
+
+        assert cap_the_next_write_ran_under < _UNCAPPED_PAGES
+        assert store.read_pragma("max_page_count") == cap_the_next_write_ran_under
+        assert _shm_errors(caplog) == []
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("failing_pragma", _CAP_RESTORING_PRAGMAS)
+def test_a_consumer_write_still_runs_while_the_cap_restore_keeps_failing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, failing_pragma: str
+) -> None:
+    store, operation, _ = _store_that_cannot_restore_its_cap(tmp_path / "stuck.db", failing_pragma)
+    try:
+        assert store._consumer_write(operation) == "committed"
+        caplog.clear()
+
+        assert store._consumer_write(lambda: "next") == "next"
+
+        assert len(_shm_errors(caplog)) == 1
+        assert store.read_pragma("max_page_count") == _UNCAPPED_PAGES
+    finally:
+        store.close()
+
+
+def _outgrow_the_limit_on_a_subscription_write(store: SqliteQueueStore, event: str) -> None:
+    store._conn.execute("CREATE TABLE filler(data BLOB)")
+    store._conn.execute(
+        f"CREATE TRIGGER outgrow AFTER {event} ON shm_subscription "
+        "BEGIN INSERT INTO filler VALUES (randomblob(512 * 1024)); END"
+    )
+
+
+def test_touch_subscriptions_runs_as_a_consumer_write_in_a_full_store(tmp_path: Path) -> None:
+    store = _bounded_store(tmp_path / "touch.db", 256 * 1024)
+    try:
+        store.subscribe(["events.Created"], "orders")
+        with store._conn:
+            store._conn.execute("UPDATE shm_subscription SET updated_at=0")
+        _outgrow_the_limit_on_a_subscription_write(store, "UPDATE")
+
+        store.touch_subscriptions(["events.Created"], "orders")
+
+        [row] = store._conn.execute("SELECT updated_at FROM shm_subscription")
+        assert row["updated_at"] > 0
+        assert store.read_pragma("page_count") * store.read_pragma("page_size") > 256 * 1024
+    finally:
+        store.close()
+
+
+def test_drop_group_runs_as_a_consumer_write_in_a_full_store(tmp_path: Path) -> None:
+    store = _bounded_store(tmp_path / "drop.db", 256 * 1024)
+    try:
+        store.subscribe(["events.Created"], "orders")
+        _outgrow_the_limit_on_a_subscription_write(store, "DELETE")
+
+        assert store.drop_group("orders") == (1, 0)
+
+        assert store.get_subscriptions() == {}
+        assert store.read_pragma("page_count") * store.read_pragma("page_size") > 256 * 1024
+    finally:
+        store.close()
+
+
 def test_a_store_opened_above_a_lowered_limit_still_drains(tmp_path: Path) -> None:
     path = tmp_path / "lowered.db"
     store = _bounded_store(path, 1024 * 1024, orphan_retention_seconds=1e-6)

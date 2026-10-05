@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from collections.abc import Callable
@@ -17,6 +18,8 @@ from ._shm_types import ClaimToken, PublishResult
 __all__ = ["ClaimToken", "PublishResult", "SqliteQueueStore"]
 
 _T = TypeVar("_T")
+
+logger = logging.getLogger("modulith.adapters.shm")
 
 # SQLite 3.31.1 and older parse PRAGMA max_page_count as a signed 32-bit int
 # and read a larger value as a query that leaves the cap unchanged.
@@ -46,6 +49,7 @@ class SqliteQueueStore:
         self._max_payload_bytes = max_payload_bytes
         self._max_store_bytes = max_store_bytes
         self._publishes_since_prune = 0
+        self._cap_lifted = False
 
     def _consumer_write(self, operation: Callable[[], _T]) -> _T:
         """Run a consumer write, past max_store_bytes if the limit refuses it.
@@ -53,16 +57,26 @@ class SqliteQueueStore:
         Claims, fails and mark-mode acks grow rows the store already holds, so a
         backlog that filled the store may need more pages than any fixed reserve
         leaves. A subscribe runs here so its subscription row is always
-        recorded; its replay stops below the publish budget on its own. Publishes
-        stay refused while the store is over its publish budget, so the file
-        grows past max_store_bytes only by work it already holds.
+        recorded; its replay stops below the publish budget on its own. A
+        heartbeat touch and a group drop run here too: either can need a page
+        split when the store sits at its cap. Publishes stay refused while the
+        store is over its publish budget, so the file grows past max_store_bytes
+        only by work it already holds.
+
+        The cap goes back once the write is done. A restore that fails is
+        logged and never replaces the write's result; the next consumer write
+        retries it before it runs.
         """
+        if self._cap_lifted:
+            self._restore_page_cap()
         try:
             return operation()
         except sqlite3.OperationalError as error:
             if not _shm_publications._is_store_full(error):
                 raise
             capped_pages = self.read_pragma("max_page_count")
+            # Set before the PRAGMA so a failure after it took effect leaves the restore pending.
+            self._cap_lifted = True
             self._conn.execute(f"PRAGMA max_page_count={_UNCAPPED_PAGES}")
             if self.read_pragma("max_page_count") <= capped_pages:
                 error.add_note(
@@ -74,11 +88,26 @@ class SqliteQueueStore:
         try:
             return operation()
         finally:
+            self._restore_page_cap()
+
+    def _restore_page_cap(self) -> None:
+        try:
             # SQLite keeps the cap at the current file size when that is larger.
             page_size = int(self._conn.execute("PRAGMA page_size").fetchone()[0])
             self._conn.execute(
                 f"PRAGMA max_page_count={max(1, self._max_store_bytes // page_size)}"
             )
+        except sqlite3.Error as error:
+            logger.error(
+                "SHM store could not restore PRAGMA max_page_count to max_store_bytes "
+                "(%d bytes): %s. The consumer write that lifted it has committed and the "
+                "next consumer write retries the restore; until it succeeds, SQLite "
+                "itself no longer stops the file at max_store_bytes.",
+                self._max_store_bytes,
+                error,
+            )
+        else:
+            self._cap_lifted = False
 
     def spill(self, messages: list[dict[str, Any]]) -> None:
         _shm_publications.spill(
@@ -145,12 +174,16 @@ class SqliteQueueStore:
     def touch_subscriptions(self, targets: list[str], group: str) -> None:
         """Stamp this group's subscription rows as served by a running consumer."""
         marks = ",".join("?" * len(targets))
-        with immediate_transaction(self._conn):
-            self._conn.execute(
-                f"UPDATE shm_subscription SET updated_at=? "
-                f"WHERE consumer_group=? AND target IN ({marks})",
-                (time.time(), group, *targets),
-            )
+
+        def touch() -> None:
+            with immediate_transaction(self._conn):
+                self._conn.execute(
+                    f"UPDATE shm_subscription SET updated_at=? "
+                    f"WHERE consumer_group=? AND target IN ({marks})",
+                    (time.time(), group, *targets),
+                )
+
+        self._consumer_write(touch)
 
     def sole_subscriber_targets(self, group: str) -> list[str]:
         """Targets ``group`` subscribes to that no other group subscribes to."""
@@ -169,7 +202,9 @@ class SqliteQueueStore:
         return _shm_publications.stale_targets(self._conn, group, targets)
 
     def drop_group(self, group: str, targets: list[str] | None = None) -> tuple[int, int]:
-        return _shm_publications.drop_group(self._conn, group, targets)
+        return self._consumer_write(
+            lambda: _shm_publications.drop_group(self._conn, group, targets)
+        )
 
     def claim(
         self,
