@@ -34,6 +34,13 @@ class _ClaimReleaser(Protocol):
     async def release_claims(self, row_ids: list[str], *, consumer_name: str) -> int: ...
 
 
+@runtime_checkable
+class _InterruptedClaimReleaser(Protocol):
+    async def release_interrupted_claims(
+        self, row_ids: list[str], *, consumer_name: str
+    ) -> int: ...
+
+
 def _row_headers(row: dict[str, Any]) -> dict[str, str]:
     """The claimed row's string headers; the database broker stores them as a JSON text blob."""
     headers = row.get("headers")
@@ -151,6 +158,34 @@ class DeliveryDispatch:
                 exc_info=True,
             )
 
+    async def _release_interrupted(self, row_id: str, ran_s: float) -> None:
+        """Hand back, uncharged, a row whose listener a stop cancelled.
+
+        A listener that ran past the renew deadline counts as hung: its row
+        stays claimed, so the next reclaim charges the attempt and a listener
+        that hangs on every delivery still ends dead-lettered. A broker
+        without ``release_interrupted_claims`` keeps that charge for every
+        cancelled row.
+        """
+        if ran_s >= self._renew_deadline_s():
+            return
+        if not isinstance(self._broker, _InterruptedClaimReleaser):
+            return
+        try:
+            await self._broker.release_interrupted_claims(
+                [row_id], consumer_name=self._consumer_name
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._logger.warning(
+                "could not release row %s whose listener the stop cancelled; "
+                "another consumer claims it after %gs and charges an attempt",
+                row_id,
+                self._reclaim_stale_seconds,
+                exc_info=True,
+            )
+
     async def _dispatch_guarded(
         self,
         row: dict[str, Any],
@@ -259,6 +294,7 @@ class DeliveryDispatch:
             self._logger.exception("undeserializable message %s -- dead-lettering", row_id)
             await self._dead_letter(row_id, f"deserialize failed: {exc}", target)
             return
+        dispatched_at = time.monotonic()
         try:
             # Runtime.dispatch_local, not bus.publish: a message consumed from
             # another process must fire the same per-listener lifecycle hooks
@@ -279,6 +315,7 @@ class DeliveryDispatch:
         except asyncio.CancelledError:
             task = asyncio.current_task()
             if self._should_stop() or (task is not None and task.cancelling() > 0):
+                await self._release_interrupted(row_id, time.monotonic() - dispatched_at)
                 raise
             self._logger.warning("listener cancelled delivery for %s", row_id)
             await self._fail(row_id, "listener cancelled", target)

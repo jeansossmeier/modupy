@@ -1311,6 +1311,115 @@ async def test_stop_mid_batch_hands_the_rows_it_never_started_to_a_peer_at_once(
     assert [row["attempts"] for row in peer] == [0, 0]
 
 
+async def _stop_consumer_mid_listener(
+    engine: Any, *, consumer_name: str, reclaim_stale_seconds: float, run_s: float
+) -> None:
+    """Start a consumer whose listener never returns, let it run ``run_s``, then stop it."""
+    running = asyncio.Event()
+
+    async def handler(evt: WidgetCreated) -> None:
+        running.set()
+        await asyncio.sleep(3600)
+
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, handler)
+    consumer = DatabaseConsumer(
+        broker=DatabaseBroker(engine=engine),
+        bus=bus,
+        serializer=JsonEventSerializer(allowed_event_types=[WidgetCreated]),
+        consumer_name=consumer_name,
+        group="modulith-inventory",
+        targets=[f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"],
+        poll_interval_s=0.01,
+        batch_size=1,
+        max_attempts=3,
+        reclaim_stale_seconds=reclaim_stale_seconds,
+    )
+    await consumer.start()
+    try:
+        await asyncio.wait_for(running.wait(), timeout=5.0)
+        await asyncio.sleep(run_s)
+    finally:
+        await consumer.stop()
+
+
+async def _publish_one_widget(engine: Any) -> str:
+    broker = DatabaseBroker(engine=engine)
+    target = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    await broker.subscribe([target], "modulith-inventory")
+    payload = JsonEventSerializer().serialize(WidgetCreated(name="w1"))
+    await broker.publish(target, payload, {"event_type": target})
+    (row_id,) = await _all_ids(engine)
+    return row_id
+
+
+async def test_graceful_stops_of_a_running_listener_never_charge_its_row_an_attempt(
+    engine: Any,
+) -> None:
+    """A stop cancels a healthy listener; that is no listener failure. Three
+    restarts must not spend the row's three attempts, and a peer claims the row
+    at once instead of after ``reclaim_stale_seconds``."""
+    row_id = await _publish_one_widget(engine)
+
+    for stop in range(1, 4):
+        await _stop_consumer_mid_listener(
+            engine, consumer_name=f"inventory:{stop}", reclaim_stale_seconds=0.6, run_s=0.0
+        )
+        _, attempts, _ = await _fetch_row(engine, row_id)
+        assert attempts == 0, f"stop {stop} charged an attempt"
+
+    peer = await DatabaseBroker(engine=engine).claim_batch(
+        "modulith-inventory", batch_size=10, consumer_name="peer", reclaim_stale_seconds=3600.0
+    )
+    assert [(row["id"], row["attempts"]) for row in peer] == [(row_id, 0)]
+
+
+async def test_graceful_stop_after_the_stuck_dispatch_threshold_still_charges_the_row(
+    engine: Any,
+) -> None:
+    """A listener that ran past ``reclaim_stale_seconds * 10`` is hung, not
+    healthy: its row stays claimed so the reclaim charges it, and a listener
+    that hangs on every delivery still ends dead-lettered."""
+    row_id = await _publish_one_widget(engine)
+
+    await _stop_consumer_mid_listener(
+        engine, consumer_name="inventory:1", reclaim_stale_seconds=0.05, run_s=0.6
+    )
+
+    assert tuple(await _fetch_row(engine, row_id)) == ("claimed", 0, "inventory:1")
+    peer = await DatabaseBroker(engine=engine).claim_batch(
+        "modulith-inventory", batch_size=10, consumer_name="peer", reclaim_stale_seconds=0.0
+    )
+    assert [row["attempts"] for row in peer] == [1]
+
+
+async def test_release_interrupted_claims_hands_back_started_claims_it_owns(engine: Any) -> None:
+    from sqlalchemy import select
+
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(
+        engine, id="mine", status="claimed", attempts=1, claimed_by="c0", dispatch_started=True
+    )
+    await _insert_ex(engine, id="foreign", status="claimed", claimed_by="c1", dispatch_started=True)
+    await _insert_ex(engine, id="pending", status="pending")
+
+    released = await broker.release_interrupted_claims(
+        ["mine", "foreign", "pending"], consumer_name="c0"
+    )
+
+    assert released == 1
+    assert await broker.release_interrupted_claims([], consumer_name="c0") == 0
+    assert tuple(await _fetch_row(engine, "mine")) == ("pending", 1, None)
+    assert tuple(await _fetch_row(engine, "foreign")) == ("claimed", 0, "c1")
+    _, _, message = broker_schema()
+    async with engine.connect() as conn:
+        started = (
+            await conn.execute(select(message.c.dispatch_started).where(message.c.id == "mine"))
+        ).scalar_one()
+    assert started is False
+
+
 async def test_orphaned_claim_is_reclaimed_after_visibility_timeout(engine: Any) -> None:
     """A row claimed but never ack'd (consumer crashed mid-dispatch) must be
     reclaimed once its claim goes stale — otherwise it is lost forever, breaking

@@ -2064,6 +2064,38 @@ class DatabaseBroker:
         return count
 
     @_on_owning_loop
+    async def release_interrupted_claims(self, row_ids: list[str], *, consumer_name: str) -> int:
+        """Hand rows whose listener a stop cancelled back to ``pending``, uncharged.
+
+        Unlike ``release_claims`` this also releases rows whose dispatch
+        started, and clears that mark. A stop cancelling a healthy listener is
+        no listener failure, so ``attempts`` and ``available_at`` stay as they
+        were; the consumer withholds rows whose listener ran past the
+        stuck-dispatch threshold, which a stale reclaim then charges.
+        Owner-guarded like ``release_claims``. Returns how many rows were released.
+        """
+        if not row_ids:
+            return 0
+        from sqlalchemy import update
+
+        _, _, message = broker_schema()
+
+        async def op(conn: Any) -> int:
+            result = await conn.execute(
+                update(message)
+                .where(
+                    message.c.id.in_(row_ids),
+                    message.c.status == "claimed",
+                    message.c.claimed_by == consumer_name,
+                )
+                .values(status="pending", claimed_at=None, claimed_by=None, dispatch_started=False)
+            )
+            return int(result.rowcount or 0)
+
+        count: int = await self._write(op)
+        return count
+
+    @_on_owning_loop
     async def ack(self, row_id: str, *, consumer_name: str) -> None:
         """Complete a row THIS consumer still owns: delete it (default) or mark
         it 'done' (mark mode, which keeps the row for the prune job — see
