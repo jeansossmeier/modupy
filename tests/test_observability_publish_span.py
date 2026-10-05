@@ -443,7 +443,7 @@ async def test_garbage_trace_context_dispatches_with_a_parentless_span(
             finally:
                 unbind_session(token)
 
-        await outbox.force_retry(pub.id)
+        await store.wait_for_dispatch()
 
         (dispatch_span,) = _dispatch_spans(span_exporter)
         assert dispatch_span.parent is None
