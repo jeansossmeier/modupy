@@ -83,9 +83,16 @@ Bootstrap assembles the whole system in one shot:
 
 `listener` registration works **before, during, and after** bootstrap. Before
 bootstrap the runtime queues the listener and flushes it when the bus is
-created; after bootstrap it registers directly. Either way the listener is
-wired correctly — the decorator never has to care whether bootstrap has
-happened yet.
+created; after bootstrap it registers directly. In a single process the
+listener is wired correctly either way — the decorator never has to care
+whether bootstrap has happened yet.
+
+A process-per-module worker is stricter. It builds its broker consumer once at
+startup, and that subscription list and the serializer's allowed event types
+come from the listeners registered by then. A listener registered after that
+runs locally but is **local-only**: it receives only events published in its
+own process, never broker deliveries, and the worker logs a WARNING naming it.
+Register such a listener while its module is imported.
 
 `configure()`, by contrast, is only legal **before** bootstrap. Once the
 runtime is bootstrapped its configuration is frozen (the `Configuration`

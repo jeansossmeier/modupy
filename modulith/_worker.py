@@ -466,6 +466,7 @@ def _build_consumer(module_name: str, consumer_name: str | None = None) -> Any:
         return None
 
     targets = consumer_targets(bus, cfg, module_name)
+    _runtime.mark_consumer_built()
     if not targets and cfg.broker not in ("shm", "database"):
         return None
     if broker_registry is None or cfg.broker not in broker_registry.schemes():

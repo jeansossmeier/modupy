@@ -176,6 +176,10 @@ class Runtime:
         # local; with none (single topology) every listener is local.
         self._listener_owners: dict[Callable[..., Any], str] = {}
         self._hosted_module: str | None = None
+        # Set once a worker's consumer subscriptions and serializer allow-list
+        # are computed from the listeners then registered; later listeners
+        # are local-only (see register_listener).
+        self._consumer_built = False
         # Importing-module names of listeners registered before the
         # configuration (and so the application package) is known, such as
         # module packages an entry-point plugin imports while the plugin
@@ -296,7 +300,9 @@ class Runtime:
 
         Pre-bootstrap and mid-bootstrap (no *published* bus yet): queue for
         the single flush that runs near the end of bootstrap.
-        Post-bootstrap: register directly on the live bus.
+        Post-bootstrap: register directly on the live bus. In a worker whose
+        consumer is already built, that listener is local-only: it is never
+        subscribed or allow-listed, so a WARNING says so.
 
         The check-then-act runs under the runtime lock, so a registration
         racing _bootstrap()'s flush can never land in a pending list that
@@ -325,9 +331,24 @@ class Runtime:
                 if owner is not None:
                     self._listener_owners[handler] = owner
             if self._event_bus is not None:
+                if self._consumer_built:
+                    logger.warning(
+                        "listener %s.%s for %s.%s was registered after this worker's "
+                        "consumer was built: it receives only events published in this "
+                        "process, not broker deliveries. Register it while the module is "
+                        "imported to subscribe it.",
+                        getattr(handler, "__module__", "?"),
+                        getattr(handler, "__qualname__", repr(handler)),
+                        event_type.__module__,
+                        event_type.__qualname__,
+                    )
                 self._event_bus.register(event_type, handler)
             else:
                 self._pending_listeners.append((event_type, handler))
+
+    def mark_consumer_built(self) -> None:
+        """Record that a worker fixed its broker subscriptions from the current listeners."""
+        self._consumer_built = True
 
     def _owning_module_package(self, importing: tuple[str, ...]) -> str | None:
         """The application module package among a listener's importing modules.
@@ -1376,6 +1397,7 @@ class Runtime:
         self._listener_owners = {}
         self._unresolved_listener_modules = {}
         self._hosted_module = None
+        self._consumer_built = False
         if self._owned_outbox is not None:
             from .adapters import postgres_outbox
 

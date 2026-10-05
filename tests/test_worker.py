@@ -2303,3 +2303,80 @@ def test_worker_sweep_delivers_only_rows_its_module_owns(
         ],
         [("orders", "o1")],
     )
+
+
+_LATE_LISTENER_APP = {
+    "orders": """
+        from dataclasses import dataclass
+        from modulith import event, listener
+
+        @event
+        @dataclass(frozen=True)
+        class Early:
+            order_id: str
+
+        @event
+        @dataclass(frozen=True)
+        class Late:
+            order_id: str
+
+        @listener
+        async def on_early(event: Early) -> None:
+            pass
+    """
+}
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def _late_listener_worker(make_fake_app, monkeypatch) -> tuple[Any, Any]:
+    make_fake_app(_LATE_LISTENER_APP)
+    _set_worker_env(monkeypatch, "orders")
+    app = create_app()
+    assert _runtime.broker_registry is not None
+    assert _runtime.consumer_registry is not None
+    _runtime.broker_registry.register("test-noop-broker", _NoopBroker())
+    _runtime.consumer_registry.register("test-noop-broker", lambda _spec: _NoopConsumer())
+    return app, sys.modules["fakeapp.orders"]
+
+
+def test_listener_registered_after_the_consumer_is_built_warns_that_it_is_local_only(
+    make_fake_app, monkeypatch, caplog
+) -> None:
+    app, orders = _late_listener_worker(make_fake_app, monkeypatch)
+
+    with caplog.at_level(logging.WARNING):
+        with TestClient(app):
+            assert not [w for w in _warnings(caplog) if "on_early" in w or "Early" in w]
+            caplog.clear()
+
+            async def on_late(event: Any) -> None:
+                pass
+
+            _runtime.register_listener(orders.Late, on_late)
+
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1
+    assert "on_late" in warnings[0]
+    assert "fakeapp.orders.Late" in warnings[0]
+    assert "only events published in this process" in warnings[0]
+    assert "broker" in warnings[0]
+
+
+def test_listener_registered_after_the_consumer_is_built_still_runs_locally(
+    make_fake_app, monkeypatch
+) -> None:
+    app, orders = _late_listener_worker(make_fake_app, monkeypatch)
+    ran: list[str] = []
+
+    with TestClient(app):
+
+        async def on_late(event: Any) -> None:
+            ran.append(event.order_id)
+
+        _runtime.register_listener(orders.Late, on_late)
+        asyncio.run(_runtime.dispatch_local(orders.Late("o1"), _runtime.event_bus))
+
+    assert ran == ["o1"]

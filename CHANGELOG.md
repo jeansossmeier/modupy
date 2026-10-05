@@ -111,6 +111,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - Python 3.14: `@listener` registers a listener with deferred annotations when another of its parameters is annotated with a name imported only under `TYPE_CHECKING`, instead of raising `NameError`
 - Python 3.14: an event with one annotation that cannot be resolved, such as a name imported only under `TYPE_CHECKING`, keeps the type hints of its other fields, so they decode as `datetime`, `Decimal`, `UUID` and so on instead of staying strings
 - `modulith broker drop-group` checks again, after the confirmation prompt is answered, that the group did not become live while the prompt waited, and aborts if it did. The first Ctrl-C at the prompt aborts the command; it used to be swallowed, so a later `y` still dropped the group
+- A listener registered after a process-per-module worker has built its broker consumer logs a WARNING that it receives only events published in that process, not broker deliveries; it used to be silently local-only
 
 ### Security
 
