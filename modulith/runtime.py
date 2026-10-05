@@ -12,6 +12,7 @@ doesn't construct anything; the framework constructs itself when needed.
 from __future__ import annotations
 
 import asyncio
+import importlib.machinery
 import logging
 import os
 import pkgutil
@@ -21,6 +22,7 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime
+from types import ModuleType
 from typing import Any
 from uuid import uuid4
 
@@ -34,6 +36,24 @@ from .manager import create_plugin_manager
 from .types import EventPublication, EventPublishReceipt, ModuleInfo
 
 logger = logging.getLogger("modulith")
+
+
+def _is_regular_package(module: Any) -> bool:
+    """Whether ``module`` is a package with an ``__init__``, not a namespace folder.
+
+    Reads the module's own namespace: ``getattr``/``hasattr`` would run a PEP 562
+    ``__getattr__``, which can raise or answer ``__path__`` for a plain file. A
+    package loaded without ``__file__`` (custom loader) still counts; a PEP 420
+    namespace package is told apart by its loader.
+    """
+    if not isinstance(module, ModuleType):
+        return False
+    namespace = vars(module)
+    spec = namespace.get("__spec__")
+    return namespace.get("__path__") is not None and not isinstance(
+        getattr(spec, "loader", None), importlib.machinery.NamespaceLoader
+    )
+
 
 # Set only by the CLI inspection commands (see ``cli._bootstrap_or_exit``).
 # While true, a bootstrap under ``strict_boundaries`` does not abort on
@@ -340,12 +360,10 @@ class Runtime:
                 continue
             segment = name[len(prefix) :].partition(".")[0]
             package = f"{prefix}{segment}"
-            module = sys.modules.get(package)
             if (
                 not segment.startswith("_")
                 and segment != cfg.contracts_module
-                and hasattr(module, "__path__")
-                and getattr(module, "__file__", None) is not None
+                and _is_regular_package(sys.modules.get(package))
             ):
                 return package
         return None

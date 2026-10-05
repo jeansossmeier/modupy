@@ -9,6 +9,7 @@ locally-defined event classes, whose annotations must stay real objects.
 import asyncio
 import contextlib
 import logging
+import sys
 import threading
 from dataclasses import dataclass
 from datetime import timedelta
@@ -1097,3 +1098,82 @@ def test_disabled_rules_lets_strict_boundaries_boot_past_a_plugin_rule(make_fake
     _runtime.ensure_bootstrapped()
 
     assert _runtime._bootstrapped
+
+
+# ---------------------------------------------------------------------------
+# Listener ownership reads the module's own namespace, never its attribute hooks
+# ---------------------------------------------------------------------------
+
+
+_OWNERSHIP_CONTRACTS = """
+    from dataclasses import dataclass
+    from modulith import event
+
+    @event
+    @dataclass(frozen=True)
+    class Ping:
+        n: int
+"""
+
+_OWNERSHIP_LISTENER = """
+from modulith import listener
+from fakeapp.contracts import Ping
+
+@listener
+async def on_ping(evt: Ping) -> None:
+    pass
+"""
+
+
+@pytest.mark.parametrize(
+    "module_getattr",
+    [
+        pytest.param(
+            """
+def __getattr__(name):
+    raise RuntimeError("lazy attribute table broke on " + name)
+""",
+            id="raises-non-attribute-error",
+        ),
+        pytest.param(
+            """
+def __getattr__(name):
+    return object()
+""",
+            id="answers-every-name",
+        ),
+    ],
+)
+def test_listener_in_plain_file_with_module_getattr_belongs_to_the_importing_module(
+    make_fake_app, module_getattr: str
+) -> None:
+    """A plain file's PEP 562 __getattr__ is no business of listener ownership:
+    one that raises must not break bootstrap, and one that answers __path__ must
+    not make the file count as a package of its own."""
+    make_fake_app(
+        {"contracts": _OWNERSHIP_CONTRACTS, "orders": "from fakeapp import shared\n"},
+        extra_files={"shared.py": module_getattr + _OWNERSHIP_LISTENER},
+    )
+    configure(package="fakeapp")
+
+    _runtime.ensure_bootstrapped()
+
+    assert list(_runtime._listener_owners.values()) == ["fakeapp.orders"]
+
+
+def test_listener_in_package_without_file_keeps_its_owner(make_fake_app) -> None:
+    """A regular package loaded without a __file__ (a custom loader, a frozen
+    package) is still a package: its listener belongs to it. Only a namespace
+    package is told apart, by its loader."""
+    make_fake_app(
+        {
+            "contracts": _OWNERSHIP_CONTRACTS,
+            "orders": "del __file__\n" + _OWNERSHIP_LISTENER,
+        }
+    )
+    configure(package="fakeapp")
+
+    _runtime.ensure_bootstrapped()
+
+    assert not hasattr(sys.modules["fakeapp.orders"], "__file__")
+    assert list(_runtime._listener_owners.values()) == ["fakeapp.orders"]
