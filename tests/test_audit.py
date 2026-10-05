@@ -10,9 +10,11 @@ result and the rendered Markdown report.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from textwrap import dedent
 
+import pytest
 from typer.testing import CliRunner
 
 from modulith.audit import audit_codebase, render_report
@@ -811,3 +813,68 @@ def test_report_embeds_no_absolute_paths(tmp_path: Path) -> None:
     assert str(tmp_path) not in report
     assert "`orders/broken.py`" in report
     assert "`orders/service.py`" in report
+
+
+# ---------------------------------------------------------------------------
+# An existing output file is replaced only with --force
+# ---------------------------------------------------------------------------
+
+HAND_WRITTEN = "MY HAND-WRITTEN MIGRATION NOTES\n"
+
+
+def test_audit_refuses_to_overwrite_an_existing_output_without_force(tmp_path: Path) -> None:
+    root = _make_codebase(tmp_path)
+    out = tmp_path / "notes.md"
+    out.write_text(HAND_WRITTEN, encoding="utf-8")
+
+    result = runner.invoke(app, ["audit", str(root), "--output", str(out)])
+
+    assert result.exit_code == 1, result.output
+    assert str(out) in result.stderr
+    assert "--force" in result.stderr
+    assert "wrote audit report" not in result.stdout
+    assert out.read_text(encoding="utf-8") == HAND_WRITTEN
+
+
+def test_bare_audit_refuses_to_overwrite_a_hand_written_migration_md(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """``MIGRATION.md`` is the default report name, so it is the file a team
+    is most likely to have written by hand before running the audit."""
+    project = tmp_path / "brownfield"
+    _write_coupled_app(project / "app", "app")
+    notes = project / "MIGRATION.md"
+    notes.write_text(HAND_WRITTEN, encoding="utf-8")
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["audit"])
+
+    assert result.exit_code == 1, result.output
+    assert "MIGRATION.md" in result.stderr
+    assert notes.read_text(encoding="utf-8") == HAND_WRITTEN
+
+
+@pytest.mark.parametrize("existing", [True, False])
+def test_audit_force_writes_the_report_to_the_output(tmp_path: Path, existing: bool) -> None:
+    root = _make_codebase(tmp_path)
+    out = tmp_path / "notes.md"
+    if existing:
+        out.write_text(HAND_WRITTEN, encoding="utf-8")
+
+    result = runner.invoke(app, ["audit", str(root), "--output", str(out), "--force"])
+
+    assert result.exit_code == 0, result.output
+    assert out.read_text(encoding="utf-8").startswith("# modupy Audit Report")
+    assert f"wrote audit report to {out}" in result.stdout
+
+
+def test_audit_output_to_a_device_needs_no_force(tmp_path: Path) -> None:
+    """Pins behavior that predates the refusal and must survive it:
+    ``--output /dev/null`` discards the report, and a device holds nothing to
+    overwrite, so only an existing regular file needs ``--force``."""
+    root = _make_codebase(tmp_path)
+
+    result = runner.invoke(app, ["audit", str(root), "--output", os.devnull])
+
+    assert result.exit_code == 0, result.output
+    assert "readiness score" in result.stdout

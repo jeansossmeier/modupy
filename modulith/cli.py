@@ -1205,13 +1205,16 @@ def audit(
         "(default: the application package under the current directory)",
     ),
     output: Path = typer.Option(Path("MIGRATION.md")),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing --output file"),
 ) -> None:
     """Analyze an existing codebase for modulith readiness.
 
     Non-destructive — only reads files (parsed via `ast`, never imported).
     Produces a Markdown report with the proposed module structure, the
     cross-module imports that would become violations, shared tables that
-    need ownership decisions, and a 0-100 readiness score.
+    need ownership decisions, and a 0-100 readiness score. Exits 1 without
+    writing when the --output file (default MIGRATION.md) already exists,
+    unless --force is passed.
     """
     from .audit import audit_codebase, find_audit_root, render_report, single_module_warning
 
@@ -1220,6 +1223,15 @@ def audit(
         raise typer.Exit(code=1)
     if path is not None and not path.is_dir():
         typer.echo(f"not a directory: {path} (pass the directory to audit)", err=True)
+        raise typer.Exit(code=1)
+    # is_file, not exists: a directory is not overwritable and a device such as
+    # /dev/null (a way to discard the report) holds nothing to lose.
+    if output.is_file() and not force:
+        typer.echo(
+            f"error: {output} already exists; pass --force to overwrite it or --output to "
+            "write the report elsewhere.",
+            err=True,
+        )
         raise typer.Exit(code=1)
 
     try:

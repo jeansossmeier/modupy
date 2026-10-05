@@ -22,7 +22,7 @@ are optional and gated on real need.
 
 ```bash
 uv add 'modupy[cli]'         # or: pip install 'modupy[cli]'
-modulith audit                 # writes MIGRATION.md (use --output to change)
+modulith audit                 # writes MIGRATION.md (--output to change, --force to replace one)
 ```
 
 (The `cli` extra installs the `modulith` command's dependencies; the bare
@@ -32,7 +32,10 @@ echoes a short summary to stdout, so a redirect onto the same file
 corrupts the report it just wrote.)
 
 `modulith audit` reads your codebase non-destructively and produces a
-Markdown report. Run from the project root without a path, it audits your
+Markdown report. It never replaces a file that already exists: when
+`MIGRATION.md` (or the `--output` file) is there, it exits with code 1
+naming the file and leaves it unchanged, and `--force` replaces it. Run
+from the project root without a path, it audits your
 application package: `src/` holding one package, otherwise the one top-level
 package (`app/`), and that package's subpackages are the module candidates.
 Loose-script directories without an `__init__.py` (`tools/`, `bin/`) beside

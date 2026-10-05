@@ -689,7 +689,7 @@ Same pattern as `mypy --strict` rolling out gradually. The baseline diff in git 
 - List of shared database tables that need ownership decisions
 - modupy-readiness score (0-100): percentage of cross-module interactions that go through events vs direct calls. With fewer than two module candidates the score is reported as not applicable, with a warning. It is also not applicable, with a warning naming the packages, when no import crosses candidates but some imports name packages below the audited folder that are not module candidates.
 
-Output is Markdown. Teams can run it on Friday afternoon, generate a baseline, have green CI on Monday, then tighten over weeks; [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md) walks through the whole path.
+Output is Markdown, written to `MIGRATION.md` or the file `--output` names. An existing output file is never replaced silently: the command exits 1 naming the file and leaves it unchanged unless `--force` is passed. Teams can run it on Friday afternoon, generate a baseline, have green CI on Monday, then tighten over weeks; [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md) walks through the whole path.
 
 ### 8.5 The Doctor Command
 
@@ -1097,7 +1097,7 @@ modulith dev APP_MODULE [--topology=single|processes] [--isolate=MODULE] [--relo
 modulith run APP_MODULE [--topology=single|processes] [--workers=JSON] [--host=HOST] [--port=PORT] [--log-level=LEVEL] [--worker-port-base=PORT]
 modulith verify [--mode=strict|ratchet] [--baseline=PATH] [--update-baseline] [--fail-on-warnings]
 modulith docs [--output-dir=DIR]
-modulith audit [PATH] [--output=FILE]
+modulith audit [PATH] [--output=FILE] [--force]
 modulith extract MODULE [--output=DIR] [--force]
 modulith k8s-manifest [--output=FILE] [--image=IMAGE] [--namespace=NAME] [--port=PORT] [--host=HOST]
 modulith openapi [--output=FILE] [--title=TITLE] [--api-version=VERSION]
@@ -1213,7 +1213,8 @@ The first `publish()` bootstraps modupy ([§6.1](#61-lazy-bootstrap)): it discov
 # 1. Install (the CLI needs the cli extra)
 uv add 'modupy[cli]'
 
-# 2. Audit existing structure (writes MIGRATION.md by default; --output to change.
+# 2. Audit existing structure (writes MIGRATION.md by default; --output to change;
+#    --force to replace a file that already exists.
 #    Don't shell-redirect stdout onto the same file — the command already writes
 #    the report there and echoes a short summary to stdout.)
 modulith audit

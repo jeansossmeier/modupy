@@ -572,7 +572,7 @@ Install `modupy[otel]` and configure an OpenTelemetry tracer provider, and every
 Adopt modupy one module at a time:
 
 ```bash
-modulith audit                      # proposes modules and writes MIGRATION.md with a readiness score
+modulith audit                      # proposes modules and writes MIGRATION.md with a readiness score (--force replaces an existing one)
 modulith verify --update-baseline   # accepts today's violations; commit .modulith-baseline.json
 modulith verify --mode=ratchet      # from now on, fails only on new violations
 ```
@@ -620,7 +620,7 @@ Every setting directly under `[tool.modulith]` can also come from an environment
 | `modulith extract <module>` | turns one module into a standalone service | splitting a service off |
 | `modulith k8s-manifest` | writes Kubernetes manifests, one Deployment per module | deploying |
 | `modulith openapi` | merges every module's API into one OpenAPI file | API portals and clients |
-| `modulith audit` | assesses an existing codebase and writes `MIGRATION.md` | adopting modupy |
+| `modulith audit` | assesses an existing codebase and writes `MIGRATION.md`; an existing file is replaced only with `--force` | adopting modupy |
 
 Commands that inspect your modules find your package through `[tool.modulith].package`, else `[project].name`.
 `disabled_rules = ["use-contracts"]` under `[tool.modulith.verify]` turns off boundary rules by their rule name, whether a built-in rule or one a plugin contributes, in `verify`, `doctor` and the `strict_boundaries` startup check; `parse-error` cannot be turned off.
