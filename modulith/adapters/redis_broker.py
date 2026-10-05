@@ -29,6 +29,10 @@ Configuration resolves env > [tool.modulith.broker] subtable > default:
   max_delivery_attempts                    consumer delivery attempts before dead-lettering
                                             (default 5)
 
+An environment variable that is empty or whitespace-only counts as unset.
+MODULITH_BROKER_MAX_STREAM_LEN, which the supervisor forwards to workers as
+MODULITH_STREAM_MAXLEN, is validated here too, so a bad value stops the parent.
+
 Selected with (broker *name* as a scalar, options in the subtable — TOML
 forbids one key being both, so set the name via ``MODULITH_BROKER`` /
 ``configure(broker=...)`` if you use the subtable)::
@@ -98,12 +102,25 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _SOCKET_TIMEOUT_MARGIN_S = 5.0
 
 
-def _positive_int(value: object, name: str) -> int:
+def _env(name: str) -> str | None:
+    """The variable's value, or None when it is unset, empty or whitespace-only.
+
+    Same contract as ``config._env_str``: a templated deployment renders
+    ``MODULITH_X=" "`` when its source variable is missing.
+    """
+    value = os.environ.get(name)
+    return value if value and value.strip() else None
+
+
+def _positive_int(value: object, name: str, default: int) -> int:
     """Accept a positive int, or a numeric string as env vars deliver it.
 
-    Zero is rejected, not read as "no cap": ``XADD MAXLEN ~ 0`` trims every
-    entry away in the same command that adds it.
+    A blank string counts as unset and yields ``default``. Zero is rejected,
+    not read as "no cap": ``XADD MAXLEN ~ 0`` trims every entry away in the
+    same command that adds it.
     """
+    if isinstance(value, str) and not value.strip():
+        return default
     number: object = value
     if isinstance(value, str):
         try:
@@ -181,18 +198,21 @@ class RedisStreamsBroker:
         self._stream_prefix = stream_prefix
         self._consumer_group = consumer_group or _DEFAULT_GROUP
         self._max_stream_len = _positive_int(
-            max_stream_len, "max_stream_len (MODULITH_STREAM_MAXLEN)"
+            max_stream_len, "max_stream_len (MODULITH_STREAM_MAXLEN)", _DEFAULT_MAXLEN
         )
         # DLQ gets its own (by default larger) cap: poison messages are the
         # stream most likely to accumulate, but they're also the ones worth
         # retaining longest for inspection/replay. Still bounded so a poison
         # burst can't grow Redis memory without limit.
+        default_dlq_cap = self._max_stream_len * 10
         self._dlq_max_stream_len = (
-            _positive_int(
-                dlq_max_stream_len, "dlq_max_stream_len (MODULITH_BROKER_DLQ_MAX_STREAM_LEN)"
+            default_dlq_cap
+            if dlq_max_stream_len is None
+            else _positive_int(
+                dlq_max_stream_len,
+                "dlq_max_stream_len (MODULITH_BROKER_DLQ_MAX_STREAM_LEN)",
+                default_dlq_cap,
             )
-            if dlq_max_stream_len is not None
-            else self._max_stream_len * 10
         )
         if type(max_payload_bytes) is not int or not 1 <= max_payload_bytes <= MAX_PAYLOAD_BYTES:
             raise ConfigurationError(
@@ -570,17 +590,19 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
         return
 
     opts = cfg.broker_options or {}
-    dlq_maxlen = os.environ.get("MODULITH_BROKER_DLQ_MAX_STREAM_LEN") or opts.get(
-        "dlq_max_stream_len"
-    )
+    # The supervisor copies MODULITH_BROKER_MAX_STREAM_LEN onto each worker's
+    # MODULITH_STREAM_MAXLEN (_REDIS_BROKER_ENV_ALIASES in supervisor.py), where
+    # a bad value crash-loops the worker under that other name.
+    if (forwarded_maxlen := _env("MODULITH_BROKER_MAX_STREAM_LEN")) is not None:
+        _positive_int(forwarded_maxlen, "MODULITH_BROKER_MAX_STREAM_LEN", _DEFAULT_MAXLEN)
+    dlq_maxlen = _env("MODULITH_BROKER_DLQ_MAX_STREAM_LEN") or opts.get("dlq_max_stream_len")
     broker = RedisStreamsBroker(
-        url=os.environ.get("REDIS_URL") or opts.get("url") or _DEFAULT_URL,
-        stream_prefix=(
-            os.environ.get("MODULITH_STREAM_PREFIX") or opts.get("stream_prefix") or _DEFAULT_PREFIX
-        ),
-        max_stream_len=(
-            os.environ.get("MODULITH_STREAM_MAXLEN") or opts.get("max_stream_len", _DEFAULT_MAXLEN)
-        ),
+        url=_env("REDIS_URL") or opts.get("url") or _DEFAULT_URL,
+        stream_prefix=_env("MODULITH_STREAM_PREFIX")
+        or opts.get("stream_prefix")
+        or _DEFAULT_PREFIX,
+        max_stream_len=_env("MODULITH_STREAM_MAXLEN")
+        or opts.get("max_stream_len", _DEFAULT_MAXLEN),
         dlq_max_stream_len=dlq_maxlen,
         max_payload_bytes=_resolve_max_payload_bytes(opts),
         poll_block_ms=opts.get("poll_block_ms", 1000),

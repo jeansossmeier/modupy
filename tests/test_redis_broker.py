@@ -340,6 +340,17 @@ def test_stream_caps_reject_non_positive_or_non_integer(option: str, value: obje
         RedisStreamsBroker(client=FakeRedis(), **{option: value})
 
 
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_blank_stream_caps_count_as_unset(fake: FakeRedis, blank: str) -> None:
+    """A blank string is what a templated env var delivers when its source is
+    missing: it takes the default, as ``None`` does, instead of raising."""
+    both = RedisStreamsBroker(client=fake, max_stream_len=blank, dlq_max_stream_len=blank)
+    only_dlq = RedisStreamsBroker(client=fake, max_stream_len=500, dlq_max_stream_len=blank)
+
+    assert (both._max_stream_len, both._dlq_max_stream_len) == (10000, 100000)
+    assert (only_dlq._max_stream_len, only_dlq._dlq_max_stream_len) == (500, 5000)
+
+
 async def test_stream_caps_accept_numeric_strings() -> None:
     fake = FakeRedis()
     broker = RedisStreamsBroker(
@@ -1056,12 +1067,20 @@ def test_env_var_overrides_broker_options_for_dlq_max_stream_len(
 
 
 @pytest.mark.parametrize(
-    "env_var", ["MODULITH_STREAM_MAXLEN", "MODULITH_BROKER_DLQ_MAX_STREAM_LEN"]
+    "env_var",
+    [
+        "MODULITH_STREAM_MAXLEN",
+        "MODULITH_BROKER_DLQ_MAX_STREAM_LEN",
+        "MODULITH_BROKER_MAX_STREAM_LEN",
+    ],
 )
 @pytest.mark.parametrize("value", ["0", "-1", "abc"])
 def test_register_hook_rejects_invalid_stream_cap_env(
     make_fake_app, monkeypatch, env_var: str, value: str
 ) -> None:
+    """The supervisor copies ``MODULITH_BROKER_MAX_STREAM_LEN`` onto the workers'
+    ``MODULITH_STREAM_MAXLEN``, so a bad value must stop the parent under its own
+    name instead of crash-looping every worker under the alias."""
     make_fake_app({"orders": ""})
     from modulith import configure
     from modulith.runtime import _runtime
@@ -1126,6 +1145,67 @@ def test_register_hook_stream_caps_from_env_and_default(make_fake_app, monkeypat
     modulith_register_brokers(registry=registry)
     broker = registry.get("redis-streams")
     assert (broker._max_stream_len, broker._dlq_max_stream_len) == (2500, 25000)
+
+
+@pytest.mark.parametrize(
+    "env_var",
+    [
+        "REDIS_URL",
+        "MODULITH_STREAM_PREFIX",
+        "MODULITH_STREAM_MAXLEN",
+        "MODULITH_BROKER_DLQ_MAX_STREAM_LEN",
+        "MODULITH_BROKER_MAX_STREAM_LEN",
+    ],
+)
+def test_register_hook_whitespace_only_env_counts_as_unset(
+    monkeypatch: pytest.MonkeyPatch, fake: FakeRedis, env_var: str
+) -> None:
+    """A templated ``MODULITH_X=" "`` must fall through to ``broker_options``,
+    as an empty or missing variable does, instead of raising or shadowing it."""
+    from redis.asyncio import Redis
+
+    from modulith.config import Configuration
+    from modulith.runtime import _runtime
+
+    for name in (
+        "REDIS_URL",
+        "MODULITH_STREAM_PREFIX",
+        "MODULITH_STREAM_MAXLEN",
+        "MODULITH_BROKER_DLQ_MAX_STREAM_LEN",
+        "MODULITH_BROKER_MAX_STREAM_LEN",
+        "MODULITH_BROKER_MAX_PAYLOAD_BYTES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(env_var, "  \t ")
+    options = {
+        "url": "redis://from-options:6380",
+        "stream_prefix": "from-options",
+        "max_stream_len": 500,
+        "dlq_max_stream_len": 7000,
+    }
+    monkeypatch.setattr(
+        _runtime,
+        "_config",
+        Configuration(package="fakeapp", broker="redis-streams", broker_options=options),
+    )
+    urls: list[str] = []
+
+    def from_url(url: str, **kwargs: object) -> FakeRedis:
+        urls.append(url)
+        return fake
+
+    monkeypatch.setattr(Redis, "from_url", from_url)
+
+    registry = BrokerRegistry()
+    modulith_register_brokers(registry=registry)
+    broker = registry.get("redis-streams")
+
+    assert urls == ["redis://from-options:6380"]
+    assert (broker._stream_prefix, broker._max_stream_len, broker._dlq_max_stream_len) == (
+        "from-options",
+        500,
+        7000,
+    )
 
 
 # ---------------------------------------------------------------------------
