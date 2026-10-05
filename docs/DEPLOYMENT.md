@@ -730,6 +730,16 @@ installs (`pip install 'modupy[postgres]'`). Offline `--sql` output has no
 connection to inspect and skips nothing, so apply it only to a database
 without those objects, as described above.
 
+**Role privileges.** On first use the broker creates any missing table and adds
+a missing `broker_message.dispatch_started` column to a table an older build
+created, so the application role needs the right to alter those tables. An
+application role that only reads and writes rows cannot, and migrating first
+avoids the need: run `modulith migrate` with the table owner's credentials
+before the application starts, which applies migration
+`0006_broker_dispatch_started`. A role that does not own a table lacking the
+column fails at start-up with a `ConfigurationError` that names the column, the
+command and the migration.
+
 **Tuning:**
 
 The values below are examples; the defaults are shown beside each variable.

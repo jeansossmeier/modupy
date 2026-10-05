@@ -491,7 +491,32 @@ def _add_missing_message_columns(connection: Any, schema: str | None) -> None:
     if schema:
         table = f"{preparer.quote_schema(schema)}.{table}"
     column_ddl = CreateColumn(column).compile(dialect=connection.dialect)
-    connection.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column_ddl}")
+    try:
+        connection.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column_ddl}")
+    except Exception as exc:
+        if not _is_privilege_error(exc):
+            raise
+        raise ConfigurationError(
+            f"the broker table {message.name!r} lacks the {column.name!r} column and the "
+            "database role cannot add it (it does not own the table). Run `modulith migrate` "
+            "with the table owner's credentials to apply migration "
+            "0006_broker_dispatch_started, then start the application again."
+        ) from exc
+
+
+def _is_privilege_error(exc: BaseException) -> bool:
+    """True for a DDL refusal because the role lacks privileges: PostgreSQL
+    ``must be owner of`` / ``permission denied`` (SQLSTATE 42501) or MySQL
+    ``ALTER command denied`` (error 1142)."""
+    from sqlalchemy.exc import DBAPIError
+
+    if not isinstance(exc, DBAPIError):
+        return False
+    orig = exc.orig
+    message = (str(orig) if orig is not None else str(exc)).lower()
+    return any(
+        marker in message for marker in ("must be owner of", "permission denied", "command denied")
+    )
 
 
 def _is_pg_namespace_unique_race(exc: BaseException) -> bool:
@@ -1201,7 +1226,9 @@ class DatabaseBroker:
         missing, both CREATE it, and the loser fails with 'already exists'
         or SQLITE_BUSY. Retries both; on a second 'already exists' the peer
         finished the schema and we mark ready (partial creates are reconciled
-        by the first successful create_all after the race).
+        by the first successful create_all after the race). A SQLite file still
+        locked when the schema deadline passes raises ``TimeoutError``, as
+        ``_write`` does.
         """
         if self._schema_is_ready():
             return
@@ -1275,9 +1302,12 @@ class DatabaseBroker:
                             return
                     if not _is_sqlite_locked(exc):
                         raise
-                    if attempt >= _SQLITE_SCHEMA_BUSY_MAX_RETRIES or (
-                        deadline is not None and loop.time() >= deadline
-                    ):
+                    if deadline is not None and loop.time() >= deadline:
+                        raise TimeoutError(
+                            "SQLite schema creation did not get its lock within "
+                            f"{_SQLITE_SCHEMA_BUSY_BUDGET_S}s"
+                        ) from exc
+                    if attempt >= _SQLITE_SCHEMA_BUSY_MAX_RETRIES:
                         raise
                     logger.warning(
                         "SQLite busy on schema create (attempt %d/%d) — retrying",

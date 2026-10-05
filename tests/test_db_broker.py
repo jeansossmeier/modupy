@@ -34,6 +34,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -4813,6 +4814,191 @@ async def test_ensure_schema_propagates_other_ddl_errors() -> None:
     with pytest.raises(OperationalError):
         await broker._ensure_schema()
     assert broker._schema_ready is False  # genuine failure is not masked
+
+
+class _SequencedRaceConn:
+    """``run_sync`` raises one OperationalError per scripted text, then succeeds."""
+
+    def __init__(self, error_texts: list[str]) -> None:
+        self._error_texts = list(error_texts)
+        self.run_sync_calls = 0
+
+    async def run_sync(self, _fn: Any) -> None:
+        self.run_sync_calls += 1
+        if self._error_texts:
+            from sqlalchemy.exc import OperationalError
+
+            raise OperationalError("CREATE TABLE ...", {}, Exception(self._error_texts.pop(0)))
+
+
+class _SequencedSchemaEngine:
+    def __init__(self, error_texts: list[str]) -> None:
+        self._conn = _SequencedRaceConn(error_texts)
+        self.dialect = SimpleNamespace(name="sqlite")
+
+    def begin(self) -> _RaceBegin:
+        return _RaceBegin(self._conn)  # type: ignore[arg-type]
+
+
+async def test_ensure_schema_raises_the_reconciling_passes_own_error() -> None:
+    from sqlalchemy.exc import OperationalError
+
+    broker = DatabaseBroker(
+        engine=_SequencedSchemaEngine(["table broker_message already exists", "disk I/O error"])
+    )
+
+    with pytest.raises(OperationalError, match="disk I/O error"):
+        await broker._ensure_schema()
+
+    assert broker._engine._conn.run_sync_calls == 2
+    assert broker._schema_ready is False
+
+
+async def test_ensure_schema_retries_when_the_reconciling_pass_finds_the_database_locked() -> None:
+    broker = DatabaseBroker(
+        engine=_SequencedSchemaEngine(["table broker_message already exists", "database is locked"])
+    )
+
+    await broker._ensure_schema()
+
+    assert broker._engine._conn.run_sync_calls == 3
+    assert broker._schema_ready is True
+
+
+async def test_ensure_schema_locked_past_its_deadline_raises_timeout_chained_from_the_lock(
+    monkeypatch: Any,
+) -> None:
+    from sqlalchemy.exc import OperationalError
+
+    import modulith.adapters.db_broker as db_broker_module
+
+    monkeypatch.setattr(db_broker_module, "_SQLITE_SCHEMA_BUSY_BUDGET_S", 0.0)
+    broker = DatabaseBroker(
+        engine=_SchemaRaceEngine(error_text="database is locked", persistent=True)
+    )
+
+    with pytest.raises(TimeoutError, match="schema") as raised:
+        await broker._ensure_schema()
+
+    assert isinstance(raised.value.__cause__, OperationalError)
+    assert "database is locked" in str(raised.value.__cause__)
+    assert broker._schema_ready is False
+
+
+async def _old_broker_message_sqlite_file(path: Path) -> None:
+    """A SQLite file whose broker tables predate ``broker_message.dispatch_started``."""
+    broker = DatabaseBroker(url=f"sqlite+aiosqlite:///{path}")
+    await broker._ensure_schema()
+    await broker.close()
+    with sqlite3.connect(path) as raw:
+        raw.execute("ALTER TABLE broker_message DROP COLUMN dispatch_started")
+
+
+@pytest.mark.parametrize(
+    ("error_type", "driver_text"),
+    [
+        ("ProgrammingError", "must be owner of table broker_message"),
+        ("OperationalError", "(1142, \"ALTER command denied to user 'app'@'%' for table 'x'\")"),
+    ],
+)
+async def test_ensure_schema_names_the_migration_when_the_role_cannot_add_the_column(
+    tmp_path: Path, monkeypatch: Any, error_type: str, driver_text: str
+) -> None:
+    import sqlalchemy.exc
+    from sqlalchemy.engine import Connection
+
+    path = tmp_path / "old-broker.db"
+    await _old_broker_message_sqlite_file(path)
+    error = getattr(sqlalchemy.exc, error_type)
+    real_exec = Connection.exec_driver_sql
+
+    def deny_alter(self: Any, statement: str, *args: Any, **kwargs: Any) -> Any:
+        if statement.startswith("ALTER TABLE"):
+            raise error(statement, {}, Exception(driver_text))
+        return real_exec(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(Connection, "exec_driver_sql", deny_alter)
+    broker = DatabaseBroker(url=f"sqlite+aiosqlite:///{path}")
+    try:
+        with pytest.raises(ConfigurationError) as raised:
+            await broker._ensure_schema()
+        assert broker._schema_ready is False
+    finally:
+        await broker.close()
+
+    message = str(raised.value)
+    assert "dispatch_started" in message
+    assert "modulith migrate" in message
+    assert "0006_broker_dispatch_started" in message
+    assert isinstance(raised.value.__cause__, sqlalchemy.exc.DBAPIError)
+
+
+async def test_ensure_schema_does_not_rename_other_alter_failures(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    from sqlalchemy.engine import Connection
+    from sqlalchemy.exc import OperationalError
+
+    path = tmp_path / "old-broker-io.db"
+    await _old_broker_message_sqlite_file(path)
+    real_exec = Connection.exec_driver_sql
+
+    def fail_alter(self: Any, statement: str, *args: Any, **kwargs: Any) -> Any:
+        if statement.startswith("ALTER TABLE"):
+            raise OperationalError(statement, {}, Exception("disk I/O error"))
+        return real_exec(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(Connection, "exec_driver_sql", fail_alter)
+    broker = DatabaseBroker(url=f"sqlite+aiosqlite:///{path}")
+    try:
+        with pytest.raises(OperationalError, match="disk I/O error"):
+            await broker._ensure_schema()
+    finally:
+        await broker.close()
+
+
+@pytest.mark.integration
+async def test_postgres_non_owner_role_gets_a_configuration_error_naming_the_migration(
+    postgres_url: str,
+) -> None:
+    from sqlalchemy import text
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import SQLAlchemyError
+
+    role = f"modupy_app_{uuid4().hex[:12]}"
+    admin = DatabaseBroker(url=postgres_url)
+    app: DatabaseBroker | None = None
+    try:
+        await admin._ensure_schema()
+        async with admin.engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE broker_message DROP COLUMN dispatch_started"))
+            try:
+                await conn.execute(text(f"CREATE ROLE {role} LOGIN PASSWORD 'pw'"))
+            except SQLAlchemyError as exc:
+                pytest.skip(f"cannot create a non-owner role ({type(exc).__name__})")
+            await conn.execute(
+                text(
+                    f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {role}"
+                )
+            )
+        app_url = make_url(postgres_url).set(username=role, password="pw")
+        app = DatabaseBroker(url=app_url.render_as_string(hide_password=False))
+
+        with pytest.raises(ConfigurationError) as raised:
+            await app.subscribe(["t.owner"], "g")
+
+        message = str(raised.value)
+        assert "dispatch_started" in message
+        assert "modulith migrate" in message
+        assert "0006_broker_dispatch_started" in message
+        assert app._schema_ready is False
+    finally:
+        if app is not None:
+            await app.close()
+        async with admin.engine.begin() as conn:
+            await conn.execute(text(f"DROP OWNED BY {role}"))
+            await conn.execute(text(f"DROP ROLE IF EXISTS {role}"))
+        await admin.close()
 
 
 # ---------------------------------------------------------------------------
