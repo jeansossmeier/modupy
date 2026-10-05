@@ -49,6 +49,11 @@ logger = logging.getLogger("modulith.worker")
 
 NONCE_HEADER = "x-modulith-nonce"
 
+# The proxy reads at most ``_MAX_HEALTH_BODY_BYTES`` (modulith/proxy.py) of a
+# worker's /health answer and takes a longer one for another deployment's, so a
+# consumer's error text must not be able to push the body past that.
+MAX_HEALTH_DETAIL_CHARS = 1024
+
 
 def identity_proof(token: str, nonce: str, module: str, port: int) -> str:
     """HMAC-SHA256, keyed by the deployment token, over a challenge nonce, the
@@ -230,6 +235,7 @@ def create_app() -> FastAPI:
         consumer: Any = None
         _app.state.consumer = None
         _app.state.legacy_health_warning_emitted = False
+        _app.state.logged_cut_detail = None
         try:
             consumer = _build_consumer(module_name, consumer_name)
             _app.state.consumer = consumer
@@ -311,8 +317,22 @@ def create_app() -> FastAPI:
             **identity,
             "ready": snapshot.ready,
         }
-        if snapshot.detail is not None:
-            response["detail"] = snapshot.detail
+        detail = snapshot.detail
+        if detail is not None:
+            if len(detail) > MAX_HEALTH_DETAIL_CHARS:
+                # A failed consumer reports the same text on every poll.
+                if app.state.logged_cut_detail != detail:
+                    app.state.logged_cut_detail = detail
+                    logger.warning(
+                        "worker %r /health cut the consumer's detail from %d to %d "
+                        "characters; full text: %s",
+                        module_name,
+                        len(detail),
+                        MAX_HEALTH_DETAIL_CHARS,
+                        detail,
+                    )
+                detail = detail[: MAX_HEALTH_DETAIL_CHARS - 3] + "..."
+            response["detail"] = detail
         if snapshot.ready:
             return response
         return JSONResponse(status_code=503, content=response)

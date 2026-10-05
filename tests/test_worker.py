@@ -26,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -44,8 +45,11 @@ from modulith.adapters.shm_broker import ShmBroker, ShmConsumer
 from modulith.builtin import outbox
 from modulith.config import DEFAULT_MAX_PAYLOAD_BYTES
 from modulith.protocols import ConsumerHealth, ConsumerStatus
+from modulith.proxy import RoutingRule, create_proxy_app
 from modulith.runtime import _runtime
 from modulith.serializers import JsonEventSerializer
+
+from conftest import _free_port, _serve
 
 
 class _NoopBroker:
@@ -454,6 +458,142 @@ def test_health_state_is_scoped_to_each_app_lifespan(make_fake_app, monkeypatch)
 
     assert first_response.status_code == 200
     assert first_response.json()["status"] == "ready"
+
+
+class _FixedHealthConsumer:
+    """Consumer that reports ``snapshot`` until a test replaces it."""
+
+    def __init__(self, snapshot: ConsumerHealth) -> None:
+        self.snapshot = snapshot
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+    def health(self) -> ConsumerHealth:
+        return self.snapshot
+
+
+def _worker_with_consumer(make_fake_app, monkeypatch, consumer: _FixedHealthConsumer) -> Any:
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.setattr(worker_module, "_build_consumer", lambda _module, _name: consumer)
+    return create_app()
+
+
+def test_health_cuts_a_huge_consumer_detail_and_logs_the_full_text(
+    make_fake_app, monkeypatch, caplog
+) -> None:
+    error = "write failed: " + "x" * (200 * 1024)
+    consumer = _FixedHealthConsumer(ConsumerHealth(ready=False, status="failed", detail=error))
+    app = _worker_with_consumer(make_fake_app, monkeypatch, consumer)
+
+    with caplog.at_level(logging.WARNING, logger="modulith.worker"):
+        with TestClient(app) as client:
+            caplog.clear()
+            response = client.get("/health")
+
+    body = response.json()
+    assert response.status_code == 503
+    assert body == {
+        "status": "failed",
+        "module": "orders",
+        "ready": False,
+        "detail": error[:1021] + "...",
+    }
+    assert len(response.content) < 2048
+    logged = [r.getMessage() for r in caplog.records if r.name == "modulith.worker"]
+    assert [error in message for message in logged] == [True]
+
+
+@pytest.mark.parametrize(
+    ("detail", "shown", "logged_count"),
+    [
+        pytest.param("a" * 1024, "a" * 1024, 0, id="at-the-bound"),
+        pytest.param("b" * 1025, "b" * 1021 + "...", 1, id="one-past-the-bound"),
+    ],
+)
+def test_health_cuts_a_detail_only_past_1024_characters(
+    make_fake_app, monkeypatch, caplog, detail: str, shown: str, logged_count: int
+) -> None:
+    consumer = _FixedHealthConsumer(ConsumerHealth(ready=False, status="degraded", detail=detail))
+    app = _worker_with_consumer(make_fake_app, monkeypatch, consumer)
+
+    with caplog.at_level(logging.WARNING, logger="modulith.worker"):
+        with TestClient(app) as client:
+            caplog.clear()
+            response = client.get("/health")
+
+    assert response.json()["detail"] == shown
+    logged = [r for r in caplog.records if r.name == "modulith.worker"]
+    assert len(logged) == logged_count
+
+
+def test_health_logs_a_cut_detail_once_however_often_it_is_polled(
+    make_fake_app, monkeypatch, caplog
+) -> None:
+    first = "first " + "x" * 5000
+    second = "second " + "y" * 5000
+    consumer = _FixedHealthConsumer(ConsumerHealth(ready=False, status="failed", detail=first))
+    app = _worker_with_consumer(make_fake_app, monkeypatch, consumer)
+
+    with caplog.at_level(logging.WARNING, logger="modulith.worker"):
+        with TestClient(app) as client:
+            caplog.clear()
+            for _ in range(3):
+                client.get("/health")
+            consumer.snapshot = ConsumerHealth(ready=False, status="failed", detail=second)
+            for _ in range(2):
+                client.get("/health")
+
+    logged = [r.getMessage() for r in caplog.records if r.name == "modulith.worker"]
+    assert len(logged) == 2
+    assert first in logged[0] and second in logged[1]
+
+
+async def test_the_proxy_still_verifies_a_worker_whose_consumer_failed_with_a_huge_error(
+    make_fake_app, monkeypatch
+) -> None:
+    make_fake_app(
+        {
+            "orders": """
+                from fastapi import APIRouter
+
+                router = APIRouter()
+
+                @router.get("/x")
+                async def x():
+                    return {"ok": True}
+            """
+        }
+    )
+    _set_worker_env(monkeypatch, "orders")
+    monkeypatch.setenv("MODULITH_DEPLOYMENT_TOKEN", "tok")
+    huge = "write failed: " + "x" * (200 * 1024)
+    consumer = _FixedHealthConsumer(ConsumerHealth(ready=False, status="failed", detail=huge))
+    monkeypatch.setattr(worker_module, "_build_consumer", lambda _module, _name: consumer)
+    port = _free_port()
+    server, task = await _serve(create_app(), port, "h11")
+    url = f"http://127.0.0.1:{port}"
+    rule = RoutingRule(prefix="/orders", backend_url=url)
+    proxy_app = create_proxy_app([rule], deployment_token="tok")
+    try:
+        async with proxy_app.router.lifespan_context(proxy_app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+            ) as c:
+                served = await c.get("/orders/x")
+                verified = rule.is_verified(url)
+                readiness = await c.get("/_modulith/health")
+    finally:
+        server.should_exit = True
+        await task
+
+    assert (served.status_code, served.json()) == (200, {"ok": True})
+    assert verified
+    assert (readiness.status_code, readiness.json()["backends"]) == (503, {"/orders": "unhealthy"})
 
 
 # ---------------------------------------------------------------------------

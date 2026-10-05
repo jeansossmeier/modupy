@@ -1354,6 +1354,32 @@ async def test_identity_probe_refuses_an_oversized_health_body() -> None:
     assert "/orders/x" not in hits
 
 
+async def test_identity_probe_accepts_a_right_proof_in_a_bounded_unready_answer() -> None:
+    def backend(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            proof = identity_proof("tok", request.headers[NONCE_HEADER], "orders", 80)
+            answer = {
+                "status": "failed",
+                "module": "orders",
+                "ready": False,
+                "detail": "x" * 1024,
+                "proof": proof,
+            }
+            return httpx.Response(503, json=answer)
+        return httpx.Response(200, stream=httpx.ByteStream(b"served"))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(backend))
+    rule = RoutingRule(prefix="/orders", backend_url="http://w")
+    proxy_app = create_proxy_app([rule], client=client, deployment_token="tok")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+    ) as c:
+        resp = await c.get("/orders/x")
+
+    assert (resp.status_code, resp.content) == (200, b"served")
+    assert rule.is_verified("http://w")
+
+
 async def _gated_worker(
     token: str, gate: asyncio.Event, seen: list[str], module: str = "orders"
 ) -> tuple[asyncio.Server, str]:
