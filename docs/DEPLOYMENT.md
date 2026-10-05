@@ -229,7 +229,7 @@ async def lifespan(app: FastAPI):
     # Teardown order matters: drain/unregister the store's after-commit hook
     # (store.dispose) BEFORE outbox.shutdown() stops the retry loop, and
     # dispose the engine LAST — both prior steps still need it to flush
-    # in-flight dispatches and run the retry loop's final sweep.
+    # in-flight dispatches and let the sweep in progress finish.
     await store.dispose()
     await outbox.shutdown()
     await async_engine.dispose()
@@ -403,7 +403,7 @@ apart) that takes about 2 h 11 min.
 **Shorten the wait.** Lower the server's `tcp_keepalives_idle`,
 `tcp_keepalives_interval` and `tcp_keepalives_count`; 60, 10 and 3 give about
 90 s. Lock connections are opened with the outbox engine's connect arguments,
-so a setting that reaches the engine reaches them. The engine modupy builds from
+so a setting passed there reaches them. The engine modupy builds from
 `outbox_url` takes no `connect_args`, so with a psycopg driver put the settings
 in the URL's `options` query parameter:
 
@@ -416,7 +416,12 @@ Setting them on the database role (`ALTER ROLE app SET tcp_keepalives_idle = 60`
 and likewise the other two) or in `postgresql.conf` works with any driver. An
 `asyncpg` URL cannot carry them: the connection fails on the unknown query
 parameter. For an engine you build yourself, pass them in `connect_args`; the
-Cookbook shows the form for both drivers.
+Cookbook shows the form for both drivers. Lock connections come from a second
+pool that copies the engine pool's listeners when the first advisory delivery
+builds it, so a pool listener (`connect`, `checkout`) registered afterwards
+never runs for them, and a listener registered on the engine for statement
+events such as `before_cursor_execute` never does. Set per-connection settings
+in `connect_args`, or on the pool before the first advisory delivery.
 
 - **Unix-domain sockets ignore them.** Postgres ignores these settings on a
   connection over a Unix-domain socket and reads them as 0, so they matter only
@@ -429,15 +434,50 @@ Cookbook shows the form for both drivers.
   kernel still answers the keepalive probes, so no keepalive setting shortens
   that. A fork-started child that outlives the process keeps the session too;
   the Cookbook covers that case.
-- **Leave `idle_session_timeout` unset for the outbox's role.** A lock
+- **Under `"lease"`, a fork-started child can keep row locks.** A claim or
+  completion transaction holds row locks until it commits. If the process dies
+  inside one while a forked child still holds a copy of that connection's
+  socket, the session stays idle in its open transaction, and every sweep skips
+  those rows until the child exits or Postgres ends the session. Set
+  `idle_in_transaction_session_timeout` on the outbox's role so that Postgres
+  ends it: `ALTER ROLE app SET idle_in_transaction_session_timeout = '60s'` (it
+  applies to sessions opened afterwards). Pick a value above the longest time
+  any transaction on that role legitimately sits idle between two statements, a
+  listener's included, because the setting ends those sessions too. Lock
+  connections run in AUTOCOMMIT, so they are never idle inside a transaction
+  and the setting does not end them.
+- **Set `idle_session_timeout = 0` for the outbox's role.** A lock
   connection sits idle while its listener runs, so ending that session releases
-  the lock mid-delivery and a peer's sweep can deliver the row again.
+  the lock mid-delivery and a peer's sweep can deliver the row again. A role
+  that leaves the setting unset inherits the database's or the server's value,
+  so set it: `ALTER ROLE app SET idle_session_timeout = 0` (it applies to
+  sessions opened afterwards). Then run `SHOW idle_session_timeout` in a session
+  that logs in as the role the lock sessions use; a setting for that role in one
+  database (`ALTER ROLE app IN DATABASE mydb SET ...`) overrides the role-wide
+  one.
 - **Behind PgBouncer,** use session pooling (`pool_mode = session`, the
   default) and never transaction or statement pooling: advisory locks need a
   server session that stays with one client connection. The server's keepalive
   then watches PgBouncer, not your process, so shorten the wait with PgBouncer's
   own settings. `tcp_keepalive` is on by default but uses the operating system's
-  timings, so set `tcp_keepidle`, `tcp_keepintvl` and `tcp_keepcnt`.
+  timings, so set `tcp_keepidle`, `tcp_keepintvl` and `tcp_keepcnt`. Do not rely
+  on the per-connection `options` or `server_settings` there: PgBouncer raises
+  an error for a startup parameter it does not track, or ignores it when
+  `ignore_startup_parameters` lists it. Two more PgBouncer settings decide
+  whether the lock survives:
+  - `client_idle_timeout` closes a client connection that has idled longer than
+    it. A lock connection idles while its listener runs, so keep it at its
+    default of `0` (disabled). A nonzero value must exceed your longest delivery
+    and, as PgBouncer advises, the client's connection lifetime settings. A
+    `[users]` entry for the outbox's user overrides the global value.
+  - `server_reset_query` runs when PgBouncer releases a server connection, which
+    under session pooling is after the client disconnects, never while it is
+    connected. Keep the default `DISCARD ALL`: it includes
+    `pg_advisory_unlock_all()`, so a lock on a closed connection is dropped,
+    while a lighter query such as `DEALLOCATE ALL` leaves it on the pooled
+    session. Leave `server_reset_query_always` at `0`: set to `1`, PgBouncer
+    also runs the reset query in transaction-pooled pools, after each
+    transaction.
 
 ---
 

@@ -511,7 +511,7 @@ table. `claim_strategy` decides how those sweepers stay off each other's rows:
 | `claim_strategy` | Behaviour |
 |---|---|
 | `"lease"` (default) | claim a batch in one committed transaction, renew the lease while dispatching, fence the completion write on the claim token |
-| `"advisory_lock"` | hold a Postgres advisory lock per row for the dispatch. Rejected at `configure()` on a non-Postgres store. Lock connections come from a second pool sized like the engine's. With a `QueuePool` (the async engine default), a process can hold up to 2×(`pool_size` + `max_overflow`) Postgres connections during a burst and keeps up to `pool_size` idle lock connections afterwards; budget `max_connections` for that. `NullPool` and `max_overflow=-1` are unbounded: one lock connection per in-flight row. An after-commit dispatch that waits past `pool_timeout` for a lock connection logs a WARNING and leaves its row to the sweep, which delivers one row at a time, so a burst larger than the lock pool can serve within `pool_timeout` drains slowly |
+| `"advisory_lock"` | hold a Postgres advisory lock per row for the dispatch. Rejected at `configure()` on a non-Postgres store. Lock connections come from a second pool sized like the engine's. With a `QueuePool` (the async engine default), a process can hold up to 2×(`pool_size` + `max_overflow`) Postgres connections during a burst and keeps up to `pool_size` idle lock connections afterwards; budget `max_connections` for that. `NullPool`, `max_overflow=-1` and `pool_size=0` are unbounded: one lock connection per in-flight row. An after-commit dispatch that waits past `pool_timeout` for a lock connection logs a WARNING and leaves its row to the sweep, which delivers one row at a time, so a burst larger than the lock pool can serve within `pool_timeout` drains slowly |
 | `"none"` | no coordination — two sweepers may dispatch the same row. Warns at `configure()` |
 
 ```python
@@ -558,16 +558,36 @@ also the crash-recovery bound: rows a crashed process was delivering are
 recovered once their lease expires, normally within `claim_lease_seconds`
 plus `retry_interval_seconds` of the crash. Recovery takes longer when
 `retry_stale_seconds` exceeds the lease, while a slow sweep is still running,
-or while the runtime is not bootstrapped. A crash or a graceful stop in the
-middle of a sweep leaves the row being delivered, and every row of its
-claimed batch not yet reached, leased until the lease expires. Rows it had
-already delivered, failed or released are not leased.
+or while the runtime is not bootstrapped. A crash in the middle of a sweep
+leaves the row being delivered, and every row of its claimed batch not yet
+reached, leased until the lease expires. Rows it had already delivered,
+failed or released are not leased. A graceful stop (`outbox.shutdown()`)
+lets the delivery in flight finish and releases the rest of the claimed
+batch at once, uncharged. Only a stop that outlasts the 10 s shutdown
+grace period cancels the sweep: the row being delivered is then released
+at once, and only the rows not yet reached stay leased until the lease
+expires.
+
+Under `"lease"` a fork-started child can also keep a crashed process's row
+locks. A claim or completion transaction holds row locks until it commits. If
+the process dies inside one while a forked `multiprocessing` or
+`ProcessPoolExecutor` child still holds a copy of that connection's socket,
+the session stays idle in its open transaction, and every sweep skips those
+rows until the child exits or Postgres ends the session. Set
+`idle_in_transaction_session_timeout` on the outbox's role so that Postgres
+ends it (`ALTER ROLE app SET idle_in_transaction_session_timeout = '60s'`).
+Pick a value above the longest time any transaction on that role legitimately
+sits idle between two statements, a listener's included, because the setting
+ends those sessions too. Starting such children with the `spawn` or
+`forkserver` method avoids the case.
 
 Under `"advisory_lock"` a crashed process's rows are recovered at once when
 the process dies on a live host, unless a descendant forked from it is still
 running. A fork-started `multiprocessing` or `ProcessPoolExecutor` child keeps
-a copy of the lock connection's socket, so the locks stay held until that
-child exits. Start such children with the `spawn` or `forkserver` method. After a host loss or a network partition
+a copy of the lock connection's socket, so the locks stay held for as long as
+that child lives. An orphaned `ProcessPoolExecutor` worker does not exit on
+its own, so it must be killed to free the locks. Start such children with the
+`spawn` or `forkserver` method. After a host loss or a network partition
 they stay locked until Postgres drops the dead session through TCP
 keepalive, about 2 h 11 min with stock Linux defaults. Lower the server's
 keepalive settings to shorten that; lock connections use the engine's
@@ -584,15 +604,30 @@ engine = create_async_engine(
 )
 ```
 
+Put per-connection settings in `connect_args` as above, or register a pool
+listener (`event.listen(engine.sync_engine.pool, "connect", ...)`) before the
+first advisory delivery. Lock connections come from a second pool that copies
+the engine pool's listeners when that delivery builds it, so a pool listener
+registered later never runs for them, and a listener registered on the engine
+for statement events such as `before_cursor_execute` never does.
+
 An engine built from `outbox_url` takes no `connect_args`. With
 `postgresql+psycopg`, put the keepalives in the URL's `options` query
 parameter:
 `?options=-c%20tcp_keepalives_idle%3D60%20-c%20tcp_keepalives_interval%3D10%20-c%20tcp_keepalives_count%3D3`.
-With asyncpg, set them in `postgresql.conf` or with `ALTER ROLE ... SET`. Leave
-`idle_session_timeout` unset for the outbox's role, because a lock
+With asyncpg, set them in `postgresql.conf` or with `ALTER ROLE ... SET`. Set
+`idle_session_timeout = 0` for the outbox's role
+(`ALTER ROLE app SET idle_session_timeout = 0`), because a lock
 connection sits idle while its listener runs and ending that session frees
-the row for a second delivery. Behind PgBouncer, advisory locks need session
-pooling; transaction pooling breaks them.
+the row for a second delivery. A role that leaves it unset inherits the
+database's or the server's value, so run `SHOW idle_session_timeout` in a
+session that logs in as the role the lock sessions use. Behind PgBouncer,
+advisory locks need session pooling; transaction pooling breaks them. Do not
+rely on the per-connection `options` or `server_settings` there: PgBouncer
+raises an error for a startup parameter it does not track, or ignores it when
+`ignore_startup_parameters` lists it. DEPLOYMENT.md's
+[Postgres and PgBouncer settings for `advisory_lock`](DEPLOYMENT.md#postgres-and-pgbouncer-settings-for-advisory_lock)
+covers PgBouncer's `client_idle_timeout` and `server_reset_query`.
 
 The default strategy needs the lease columns, which arrive in migration
 `0003_outbox_claim_leases`: migrate to `head`, not to `0001_initial`. In your

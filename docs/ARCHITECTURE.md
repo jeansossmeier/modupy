@@ -512,6 +512,16 @@ A background retry loop drives redelivery:
   a delivery started, so such a row is redelivered without limit there.
 - Rows committed but not yet claimed, and rows under `"none"`, are recovered
   by the startup sweep.
+- Under `"lease"`, a descendant forked from the process, such as a
+  fork-started `multiprocessing` or `ProcessPoolExecutor` child, can also keep
+  the dead process's row locks. A claim or completion transaction holds row
+  locks until it commits. When the process dies inside one while a descendant
+  still holds a copy of that connection's socket, the session stays idle in
+  its open transaction, and every sweep skips those rows until the descendant
+  exits or Postgres ends the session. `idle_in_transaction_session_timeout` on
+  the outbox's role makes Postgres end it; DEPLOYMENT.md's
+  [Postgres and PgBouncer settings for `advisory_lock`](DEPLOYMENT.md#postgres-and-pgbouncer-settings-for-advisory_lock)
+  covers it.
 - Under `"advisory_lock"` the row's lock lives as long as the dead process's
   Postgres session. When the process dies on a live host, its kernel closes
   the socket, the session ends, and the startup sweep recovers the row at
@@ -520,10 +530,11 @@ A background retry loop drives redelivery:
   - A descendant forked from the process, such as a fork-started
     `multiprocessing` or `ProcessPoolExecutor` child: it keeps a copy of the
     lock connection's socket, so the session and its locks outlive the process
-    until that descendant exits. Start such children with the `spawn` or
-    `forkserver` method (`multiprocessing.get_context("spawn")`, passed as
-    `ProcessPoolExecutor`'s `mp_context`), which does not inherit the
-    connection.
+    for as long as that descendant lives. An orphaned `ProcessPoolExecutor`
+    worker does not exit on its own, so it must be killed to free the locks.
+    Start such children with the `spawn` or `forkserver` method
+    (`multiprocessing.get_context("spawn")`, passed as `ProcessPoolExecutor`'s
+    `mp_context`), which does not inherit the connection.
   - A host loss or a network partition: nothing closes the socket, so the row
     stays locked until Postgres drops the dead session through TCP keepalive.
     With stock Linux defaults that takes about 2 h 11 min: 7200 s idle, then 9
@@ -593,7 +604,7 @@ is `"lease"`:
 | `claim_strategy` | How it coordinates | Cost |
 |---|---|---|
 | `"lease"` (default) | `claim_batch()` selects `FOR UPDATE SKIP LOCKED` on Postgres, writes `claim_owner`/`claim_token`/`claim_until` and **commits before dispatch**. On MySQL and SQLite it claims each selected row with a conditional `UPDATE` that re-checks `completed_at IS NULL AND (claim_until IS NULL OR claim_until <= now)`, and drops a row a concurrent sweeper claimed first. The lease renews at one third of `claim_lease_seconds` while dispatch is in flight, and completion/failure writes are fenced on `claim_token` so an expired claimant cannot clobber a newer one | Postgres: one extra write per claimed batch. MySQL/SQLite: one `UPDATE` statement per candidate row |
-| `"advisory_lock"` | a per-publication `pg_try_advisory_lock` held for the duration of the dispatch. Postgres-only — a non-Postgres store rejects it at `configure()` | no extra write, but a held AUTOCOMMIT connection (no open transaction) per in-flight row. Lock connections come from a separate pool sized like the engine's, so held locks never starve the listener or the store's own reads of the engine pool. With a `QueuePool` (the async engine default) a process can therefore hold up to 2×(`pool_size` + `max_overflow`) Postgres connections during a burst, and keeps up to `pool_size` idle lock connections open after it. `NullPool` and `max_overflow=-1` bound neither pool, so a burst opens one lock connection per in-flight row. The lock pool also caps how many rows the after-commit path delivers at once: an after-commit dispatch that waits past `pool_timeout` for a lock connection logs a WARNING and leaves its row, untouched and uncharged, to the sweep, which delivers one row at a time. A sweep that itself waits past `pool_timeout` logs a WARNING and leaves the rest of its batch to the next sweep. A lock connection returns to its pool when the lock attempt found the row taken or the unlock confirmed the release; after a failed lock query or unlock it is invalidated, so a lock never outlives its dispatch |
+| `"advisory_lock"` | a per-publication `pg_try_advisory_lock` held for the duration of the dispatch. Postgres-only — a non-Postgres store rejects it at `configure()` | no extra write, but a held AUTOCOMMIT connection (no open transaction) per in-flight row. Lock connections come from a separate pool sized like the engine's, so held locks never starve the listener or the store's own reads of the engine pool. With a `QueuePool` (the async engine default) a process can therefore hold up to 2×(`pool_size` + `max_overflow`) Postgres connections during a burst, and keeps up to `pool_size` idle lock connections open after it. `NullPool`, `max_overflow=-1` and `pool_size=0` bound neither pool, so a burst opens one lock connection per in-flight row. The lock pool also caps how many rows the after-commit path delivers at once: an after-commit dispatch that waits past `pool_timeout` for a lock connection logs a WARNING and leaves its row, untouched and uncharged, to the sweep, which delivers one row at a time. A sweep that itself waits past `pool_timeout` logs a WARNING and leaves the rest of its batch to the next sweep. A lock connection returns to its pool when the lock attempt found the row taken or the unlock confirmed the release; after a failed lock query or unlock it is invalidated, so a lock never outlives its dispatch |
 | `"none"` | no coordination; two sweepers CAN dispatch the same row. Logged as a warning at `configure()` so the tradeoff is visible | none |
 
 Tuning knobs: `claim_lease_seconds` (default 60 — the lease renews every
