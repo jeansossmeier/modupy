@@ -753,6 +753,7 @@ def _validate_initializers(initializers: list[Path]) -> None:
             statement
             for statement in tree.body
             if not isinstance(statement, ast.Pass)
+            and not (isinstance(statement, ast.ImportFrom) and statement.module == "__future__")
             and not (
                 isinstance(statement, ast.Expr)
                 and isinstance(statement.value, ast.Constant)
@@ -831,6 +832,15 @@ def write_extraction(
     Returns the paths written, relative to *output*.
     """
     assert cfg.package is not None
+    from .builtin.verifier import _package_portions
+
+    portions = _package_portions(cfg.package)
+    if len(portions) > 1:
+        raise ValueError(
+            f"package {cfg.package!r} spans {len(portions)} directories "
+            f"({', '.join(str(portion) for portion in portions)}); extraction copies one "
+            "directory and would leave out the others, so merge them into one directory first"
+        )
     _validate_module_name(module, what="module")
     module_path = package_dir / Path(*module.split("."))
     if not (module_path.is_dir() and (module_path / "__init__.py").is_file()):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.machinery
 import ntpath
 import os
@@ -797,6 +798,41 @@ def test_extract_rejects_nontrivial_root_package_initializer(make_fake_app, monk
     make_fake_app(
         {"orders": "", "inventory": ""},
         extra_files={"__init__.py": "from . import inventory\n"},
+    )
+    output = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(output)])
+
+    assert result.exit_code == 1
+    assert "__init__.py" in result.output
+    assert "move" in result.output
+    assert not output.exists()
+
+
+def test_extract_accepts_future_import_in_root_initializer(make_fake_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": ""},
+        extra_files={
+            "__init__.py": '"""Shop."""\nfrom __future__ import annotations\n',
+            "contracts/__init__.py": "",
+        },
+    )
+    output = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(output)])
+
+    assert result.exit_code == 0, result.output
+    assert (output / "fakeapp" / "__init__.py").read_text() == ""
+
+
+def test_extract_still_rejects_other_statements_beside_a_future_import(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": ""},
+        extra_files={"__init__.py": 'from __future__ import annotations\n__version__ = "1"\n'},
     )
     output = tmp_path / "orders-service"
 
@@ -1993,6 +2029,33 @@ def test_extract_keeps_namespace_root_without_initializer(monkeypatch, request, 
         names = set(archive.namelist())
     assert "company/shop/orders/__init__.py" in names
     assert "company/__init__.py" not in names
+
+
+def test_extract_refuses_app_package_spread_over_portions(monkeypatch, tmp_path):
+    first = tmp_path / "q1" / "nsspread" / "shop"
+    second = tmp_path / "q2" / "nsspread" / "shop"
+    (first / "orders").mkdir(parents=True)
+    (first / "orders" / "__init__.py").write_text("")
+    (second / "contracts").mkdir(parents=True)
+    (second / "contracts" / "events.py").write_text("")
+    monkeypatch.syspath_prepend(str(tmp_path / "q2"))
+    monkeypatch.syspath_prepend(str(tmp_path / "q1"))
+    importlib.invalidate_caches()
+    output = tmp_path / "orders-service"
+
+    with pytest.raises(ValueError) as excinfo:
+        write_extraction(
+            cfg=Configuration(package="nsspread.shop"),
+            module="orders",
+            package_dir=first,
+            output=output,
+            helpers=[],
+            notes=[],
+        )
+
+    assert str(first) in str(excinfo.value)
+    assert str(second) in str(excinfo.value)
+    assert not output.exists()
 
 
 def test_extract_resolves_namespace_root_when_other_portion_precedes_project(

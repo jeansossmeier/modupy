@@ -265,6 +265,19 @@ def _package_dir(package: str) -> Path | None:
 def _find_package_dir(package: str) -> Path | None:
     """Resolve a package's on-disk directory without executing its code.
 
+    A package spread over several portions resolves to the first; see
+    ``_package_portions`` for the full list.
+    """
+    portions = _package_portions(package)
+    return portions[0] if portions else None
+
+
+def _package_portions(package: str) -> list[Path]:
+    """Every directory the import system would combine into *package*.
+
+    One directory for a regular package; a PEP 420 namespace package yields one
+    per portion that holds it, in ``sys.path`` order.
+
     ``find_spec`` on a dotted name (e.g. ``"myapp.orders"``) imports every
     ancestor package for real to read its ``__path__`` — a genuine
     execution the module docstring's "never executed" guarantee must not
@@ -279,24 +292,24 @@ def _find_package_dir(package: str) -> Path | None:
     installed portions of the same root live. So every portion is searched,
     in the import system's own order, for the full dotted path. As in the
     path finder, a directory holding ``__init__.py`` wins over a directory
-    without one wherever it sits; with no such regular package, the first
-    namespace directory is returned.
+    without one wherever it sits, and is then the only portion; with no such
+    regular package, every namespace directory is returned.
     """
     parts = package.split(".")
     try:
         spec = importlib.util.find_spec(parts[0])
     except (ImportError, ModuleNotFoundError, ValueError):
-        return None
+        return []
     if spec is None or not spec.submodule_search_locations:
-        return None
-    namespace_dir: Path | None = None
+        return []
+    namespace_dirs: list[Path] = []
     for location in spec.submodule_search_locations:
         directory = Path(location).joinpath(*parts[1:])
         if (directory / "__init__.py").is_file():
-            return directory
-        if namespace_dir is None and directory.is_dir():
-            namespace_dir = directory
-    return namespace_dir
+            return [directory]
+        if directory.is_dir():
+            namespace_dirs.append(directory)
+    return namespace_dirs
 
 
 def _is_submodule(package: str, name: str) -> bool:
