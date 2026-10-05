@@ -2094,6 +2094,56 @@ async def test_prune_uses_completion_time_instead_of_publication_age(
         await store.close()
 
 
+async def _dead_letter_at_claim(path: Path, **options: Any) -> ShmColdStore:
+    """Dead-letter the only delivery through a charged stale reclaim."""
+    store = await _published_store(path, **options)
+    first = (await store.claim("g1", consumer_name="worker-1", max_attempts=1))[0]
+    assert await store.renew_claims([first["claim_token"]], "worker-1", start_dispatch=True) == 1
+    await asyncio.sleep(0.01)
+    reclaimed = await store.claim(
+        "g1", consumer_name="worker-2", reclaim_stale_seconds=0, max_attempts=1
+    )
+    assert reclaimed == []
+    assert _delivery_state(path, "status")[0]["status"] == "dead"
+    return store
+
+
+async def test_a_row_dead_lettered_at_claim_time_is_pruned_once_its_retention_passes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "claim-dead-letter-prune.db"
+    store = await _dead_letter_at_claim(path, orphan_retention_seconds=1e-6)
+    try:
+        before = time.time()
+        [completed_at] = [row["completed_at"] for row in _delivery_state(path, "completed_at")]
+        assert completed_at is not None
+        assert completed_at <= before
+
+        assert await store.prune(retention_age_seconds=3600) == 0
+        assert len(_delivery_state(path)) == 1
+
+        # The delivery goes first, then its now-orphaned, expired publication.
+        assert await store.prune(retention_age_seconds=0) == 2
+        assert _delivery_state(path) == []
+        assert _rows(path, "SELECT id FROM shm_publication") == []
+    finally:
+        await store.close()
+
+
+async def test_a_claim_time_dead_letter_retried_is_not_pruned(tmp_path: Path) -> None:
+    path = tmp_path / "claim-dead-letter-retry.db"
+    store = await _dead_letter_at_claim(path)
+    try:
+        assert await store.retry_dead_letters() == 1
+
+        [row] = _delivery_state(path, "status, completed_at")
+        assert (row["status"], row["completed_at"]) == ("pending", None)
+        assert await store.prune(retention_age_seconds=0) == 0
+        assert len(_delivery_state(path)) == 1
+    finally:
+        await store.close()
+
+
 def test_prune_removes_a_row_completed_on_the_same_clock_tick_as_the_prune_call(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

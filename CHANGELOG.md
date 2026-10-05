@@ -105,6 +105,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `modulith extract` no longer blocks on a sibling import under `if False:` or `if 0:`, follows `importlib.import_module(".x", package="<literal>")` like the matching relative import, and lists every dynamic import it cannot resolve under "Extraction notes" in the extracted README
 - OpenTelemetry: a span processor, exporter or sampler that raises no longer fails `publish()`; modupy logs a WARNING and drops the span. A span started inside a listener is a child of that listener's dispatch span
 - Postgres outbox store: a sweep that outlives `dispose()` fails with `ConfigurationError("store is disposed")` instead of opening an advisory-lock pool nothing disposes. The cross-loop warning still fires after the first event loop has been garbage-collected, and an advisory unlock that finds the lock already gone logs a WARNING naming the publication, which a peer may have delivered too
+- SHM broker: a delivery dead-lettered when it is reclaimed past `max_delivery_attempts` is pruned once its retention passes, like other dead letters; it used to stay in the store forever
 
 ### Security
 

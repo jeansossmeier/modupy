@@ -111,13 +111,15 @@ def claim(
                     """
                     UPDATE shm_delivery
                     SET status='dead', attempts=?, claimed_at=NULL,
-                        claimed_by=NULL, dispatch_started=0, last_error=?
+                        claimed_by=NULL, dispatch_started=0, last_error=?,
+                        completed_at=?
                     WHERE id=?
                     """,
                     (
                         attempts,
                         f"reclaimed {max_attempts} times without completing "
                         "(consumer crashed or wedged mid-dispatch)",
+                        now,
                         delivery_id,
                     ),
                 )
