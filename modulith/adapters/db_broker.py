@@ -1531,63 +1531,71 @@ class DatabaseBroker:
         sources: list[Any],
         groups: list[str],
     ) -> int:
-        """Materialize each source/group pair once using its durable ledger."""
+        """Materialize each source/group pair once using its durable ledger.
+
+        Safe to repeat for the same page: one ledger SELECT per call names the
+        pairs already delivered and only the missing ones are written, so a
+        replayed page inserts nothing and raises nothing. Callers hold the
+        target lock, which keeps a concurrent replay from slipping a pair in
+        between that SELECT and the insert.
+        """
         from sqlalchemy import select
 
-        if not groups:
+        if not groups or not sources:
             return 0
         _, _, message = broker_schema()
         _, delivery = _retained_tables()
         unique_groups = sorted(set(groups))
-        inserted = 0
 
-        for source in sources:
-            source_id = cast(str, source["id"])
-            existing_result = await conn.execute(
-                select(delivery.c.consumer_group).where(
-                    delivery.c.retained_message_id == source_id,
-                    delivery.c.consumer_group.in_(unique_groups),
-                )
+        existing_result = await conn.execute(
+            select(delivery.c.retained_message_id, delivery.c.consumer_group).where(
+                delivery.c.retained_message_id.in_([source["id"] for source in sources]),
+                delivery.c.consumer_group.in_(unique_groups),
             )
-            existing = {row[0] for row in existing_result}
-            missing = [group for group in unique_groups if group not in existing]
-            if not missing:
-                continue
+        )
+        existing = {(row[0], row[1]) for row in existing_result}
+        missing = [
+            (source, group)
+            for source in sources
+            for group in unique_groups
+            if (source["id"], group) not in existing
+        ]
+        if not missing:
+            return 0
 
-            delivered_at = await self._now(conn)
-            ledger_rows = [
+        delivered_at = await self._now(conn)
+        ledger_rows = [
+            {
+                "retained_message_id": source["id"],
+                "consumer_group": group,
+                "broker_message_id": _delivery_message_id(cast(str, source["id"]), group),
+                "delivered_at": delivered_at,
+            }
+            for source, group in missing
+        ]
+        await conn.execute(delivery.insert(), ledger_rows)
+        await conn.execute(
+            message.insert(),
+            [
                 {
-                    "retained_message_id": source_id,
+                    "id": ledger["broker_message_id"],
+                    "target": source["target"],
                     "consumer_group": group,
-                    "broker_message_id": _delivery_message_id(source_id, group),
-                    "delivered_at": delivered_at,
+                    "event_type": source["event_type"],
+                    "payload": source["payload"],
+                    "headers": source["headers"],
+                    "status": "pending",
+                    "attempts": 0,
+                    "available_at": delivered_at,
+                    "claimed_at": None,
+                    "claimed_by": None,
+                    "created_at": delivered_at,
+                    "last_error": None,
                 }
-                for group in missing
-            ]
-            await conn.execute(delivery.insert(), ledger_rows)
-            await conn.execute(
-                message.insert(),
-                [
-                    {
-                        "id": row["broker_message_id"],
-                        "target": source["target"],
-                        "consumer_group": row["consumer_group"],
-                        "event_type": source["event_type"],
-                        "payload": source["payload"],
-                        "headers": source["headers"],
-                        "status": "pending",
-                        "attempts": 0,
-                        "available_at": delivered_at,
-                        "claimed_at": None,
-                        "claimed_by": None,
-                        "created_at": delivered_at,
-                        "last_error": None,
-                    }
-                    for row in ledger_rows
-                ],
-            )
-            inserted += len(missing)
-        return inserted
+                for (source, group), ledger in zip(missing, ledger_rows, strict=True)
+            ],
+        )
+        return len(missing)
 
     async def _publish_stored(
         self,

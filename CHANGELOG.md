@@ -116,6 +116,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `outbox.shutdown()` is final until the next `outbox.configure()`: a listener that publishes during `Runtime.shutdown`'s drain no longer restarts the outbox retry loop after shutdown stopped it, and `outbox.start()` after shutdown does nothing
 - `JsonEventSerializer` restores `field(init=False)` dataclass fields after construction, including on frozen and nested dataclasses, instead of failing to decode them, and `serialize` rejects an `InitVar` without a default with a `TypeError` naming the class and field instead of accepting an event the consumer cannot decode
 - On the SHM broker, the stale-target warning at consumer start no longer claims that new publishes keep adding to the stale subscription, which SHM has already dropped
+- A consumer restart under `no_subscriber_policy="store"` writes the replay ledger with one query per page of retained messages instead of one per message
 
 ### Security
 

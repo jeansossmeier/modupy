@@ -635,6 +635,68 @@ async def test_first_groups_replay_pages_through_every_retained_source(
     assert await _row_count(engine, table=delivery) == 0
 
 
+async def _retained_sources(engine: Any, broker: DatabaseBroker, count: int) -> list[Any]:
+    """Store ``count`` retained messages (no subscriber yet) and read them back."""
+    from sqlalchemy import select
+
+    target = "fakeapp.orders.WidgetCreated"
+    retained = broker_schema()[0].tables["broker_retained_message"]
+    for index in range(count):
+        await broker.publish(target, f"payload-{index}".encode(), {"event_type": target})
+    async with engine.connect() as conn:
+        return [dict(row) for row in (await conn.execute(select(retained))).mappings()]
+
+
+async def test_fan_out_retained_repeated_page_inserts_no_duplicate_ledger_rows(
+    engine: Any,
+) -> None:
+    broker = DatabaseBroker(engine=engine, no_subscriber_policy="store")
+    _, _, message = broker_schema()
+    delivery = broker_schema()[0].tables["broker_retained_delivery"]
+    sources = await _retained_sources(engine, broker, 3)
+
+    async def fan_out(groups: list[str]) -> int:
+        async with engine.begin() as conn:
+            return int(await broker._fan_out_retained(conn, sources, groups))
+
+    assert await fan_out(["g1"]) == 3
+    # A page replayed after a partial earlier run fills only the missing pairs.
+    assert await fan_out(["g1", "g2"]) == 3
+    assert await fan_out(["g1", "g2"]) == 0
+    assert await fan_out(["g2", "g1", "g1"]) == 0
+
+    assert await _row_count(engine, table=delivery) == 6
+    assert await _row_count(engine, table=message) == 6
+
+
+async def test_fan_out_retained_queries_once_per_page_not_once_per_source(engine: Any) -> None:
+    from sqlalchemy import event as sqlalchemy_event
+
+    broker = DatabaseBroker(engine=engine, no_subscriber_policy="store")
+    sources = await _retained_sources(engine, broker, 6)
+
+    statements: list[str] = []
+
+    def record(_conn: Any, _cursor: Any, statement: str, *_: Any) -> None:
+        statements.append(statement)
+
+    async with engine.begin() as conn:
+        sqlalchemy_event.listen(engine.sync_engine, "before_cursor_execute", record)
+        try:
+            assert await broker._fan_out_retained(conn, sources, ["g1", "g2"]) == 12
+        finally:
+            sqlalchemy_event.remove(engine.sync_engine, "before_cursor_execute", record)
+
+    ledger_selects = [
+        s for s in statements if s.startswith("SELECT") and "broker_retained_delivery" in s
+    ]
+    clock_reads = [s for s in statements if "strftime" in s]
+    assert len(ledger_selects) == 1
+    assert len(clock_reads) == 1
+    # One ledger SELECT, one clock read, one ledger insert, one queue insert.
+    assert len(statements) == 4
+
+
 async def test_retained_expiry_uses_database_clock(
     engine: Any,
     monkeypatch: Any,
