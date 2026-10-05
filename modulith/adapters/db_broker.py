@@ -786,10 +786,11 @@ def _install_sqlite_pragmas(engine: Any, busy_timeout_ms: int, synchronous: str)
             # handed to the aiosqlite worker thread running, on a connection the
             # pool never sees. Closing waits for it, so nothing the caller's
             # TimeoutError has already given up on takes the file lock late.
+            # The cursor goes with the connection: aiosqlite 0.21+ raises
+            # "Connection closed" on a cursor close after it, masking the error.
             dbapi_connection.close()
             raise
-        finally:
-            cursor.close()
+        cursor.close()
 
 
 def _create_engine(url: Any, opts: dict[str, Any]) -> Any:
