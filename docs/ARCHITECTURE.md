@@ -356,14 +356,13 @@ before you flush, as `place_order` in the
   is deliberately distinct from a `TimeoutError` raised *by* a listener, so the
   framework never swallows a genuine application failure as a budget overrun.
   That persistent daemon-thread loop is a second event loop.
-  - **Bootstrap:** the first `publish_sync()` bootstraps the runtime on that
-    loop's thread, inside its timeout, so a startup slower than the timeout
-    raises `PublishSyncTimeout`. With a durable outbox bound from `outbox_url`,
-    that bootstrap also starts the retry loop and its crash sweep on that loop,
-    so rows a crashed run left undelivered wait for that first call. Calling
-    `modulith.bootstrap()` first takes the bootstrap out of the timeout, but
-    sync code has no running loop for it to start the retry loop on: the loop
-    then starts at the first publish made inside a bound session.
+  - **Bootstrap:** the first `publish_sync()` bootstraps the runtime on the
+    calling thread, before it hands the event to that loop and outside its
+    timeout, so package auto-detection sees the caller's module and a failing
+    bootstrap raises from the call. Sync code has no running loop to start the
+    durable outbox's retry loop on: with an outbox bound from `outbox_url`, the
+    retry loop and its crash sweep start at the first publish made inside a
+    bound session, as after `modulith.bootstrap()` from sync code.
   - **Outbox:** an outbox `AsyncEngine` also driven by `await publish()` on the
     app loop is shared across both loops. On Postgres and MySQL the first query
     one loop runs on a connection the other loop opened raises `RuntimeError:

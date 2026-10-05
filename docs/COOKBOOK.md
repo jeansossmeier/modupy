@@ -257,17 +257,14 @@ if a listener deadlocks. Do **not** call it from inside async code on the loop's
 own thread — it raises `RuntimeError` telling you to `await publish()` instead.
 
 The first `publish_sync()` also bootstraps modupy, lazily, as the first
-`await publish()` does. It runs the bootstrap on the daemon-thread loop's thread
-and inside that call's `timeout`, so a startup slower than the timeout raises
-`PublishSyncTimeout`, and a failing one raises its error from that first
-publish. With the durable outbox (recipe 6) bound from `outbox_url`, the same
-bootstrap starts the retry loop and its crash-recovery sweep on that loop, so
-rows a crashed run left undelivered wait for that first call.
-
-Call `modulith.bootstrap()` before the first `publish_sync()` to run startup,
-and surface its errors, at a point you choose and outside the timeout. It does
-not start the retry loop: sync code has no running loop to start it on, so the
-loop starts at the first publish made inside a bound session.
+`await publish()` does. It runs the bootstrap on the calling thread, before the
+event goes to the daemon-thread loop and outside that call's `timeout`, so a
+failing bootstrap raises its error from that first publish. Call
+`modulith.bootstrap()` before the first `publish_sync()` to run startup, and
+surface its errors, at a point you choose. Neither starts the durable outbox's
+retry loop (recipe 6): sync code has no running loop to start it on, so the
+retry loop and its crash-recovery sweep start at the first publish made inside
+a bound session.
 
 ---
 

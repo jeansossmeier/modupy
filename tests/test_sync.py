@@ -25,6 +25,7 @@ import contextvars
 import json
 import os
 import signal
+import sys
 import threading
 import time
 import warnings
@@ -34,7 +35,14 @@ from typing import Any
 
 import pytest
 
-from modulith import bootstrap, configure, event, listener, publish, publish_sync
+from modulith import (
+    ConfigurationError,
+    configure,
+    event,
+    listener,
+    publish,
+    publish_sync,
+)
 from modulith import sync as sync_module
 from modulith.sync import wrap_sync_listener
 
@@ -132,10 +140,6 @@ def test_publish_sync_timeout_raises() -> None:
         # cannot complete within the timeout window.
         gate.wait(timeout=5)
 
-    # publish() bootstraps on the daemon loop's thread. Left to it, a loaded
-    # machine can spend the whole budget there, and that bootstrap finishes
-    # after the reset fixture, leaving the next test's runtime bootstrapped.
-    bootstrap()
     try:
         with pytest.raises(TimeoutError):
             publish_sync(Slow(), timeout=0.05)
@@ -160,6 +164,105 @@ async def test_publish_sync_on_loop_thread_raises() -> None:
 
     with pytest.raises(RuntimeError, match="async context"):
         publish_sync(E())
+
+
+# ---------------------------------------------------------------------------
+# publish_sync() bootstrap placement
+# ---------------------------------------------------------------------------
+
+_ORDERS_MODULE = """
+    from dataclasses import dataclass
+    from modulith import event, listener
+
+    @event
+    @dataclass(frozen=True)
+    class OrderPlaced:
+        order_id: str
+
+    seen = []
+
+    @listener
+    async def on_placed(evt: OrderPlaced) -> None:
+        seen.append(evt.order_id)
+"""
+
+_API_MODULE = """
+    from modulith import publish_sync
+    from fakeapp.orders import OrderPlaced
+
+    def fire(order_id):
+        publish_sync(OrderPlaced(order_id=order_id), timeout=10)
+"""
+
+
+def _record_bootstrap_threads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Names of the threads each Runtime._bootstrap call runs on.
+
+    The wrapper is a frame of this test file on the stack package detection
+    walks, so a test using it must configure(package=...) explicitly.
+    """
+    from modulith.runtime import _runtime
+
+    threads: list[str] = []
+    real_bootstrap = _runtime._bootstrap
+
+    def recording_bootstrap() -> None:
+        threads.append(threading.current_thread().name)
+        real_bootstrap()
+
+    monkeypatch.setattr(_runtime, "_bootstrap", recording_bootstrap)
+    return threads
+
+
+def test_publish_sync_as_first_runtime_call_detects_the_package(
+    make_fake_app: Callable[..., str],
+) -> None:
+    """The package comes from the caller's stack, which only exists on the caller's thread."""
+    from modulith.runtime import _runtime
+
+    make_fake_app({"orders": _ORDERS_MODULE}, extra_files={"api.py": _API_MODULE})
+
+    api = __import__("fakeapp.api", fromlist=["fire"])
+    api.fire("s-1")
+
+    assert _runtime.config is not None and _runtime.config.package == "fakeapp"
+    assert sys.modules["fakeapp.orders"].seen == ["s-1"]
+
+
+def test_publish_sync_bootstrap_failure_raises_on_the_caller_thread(
+    make_fake_app: Callable[..., str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing bootstrap surfaces its own error, never a loop-thread bootstrap."""
+    make_fake_app(
+        {"orders": "raise ValueError('orders import blew up')"},
+    )
+    configure(package="fakeapp")
+    threads = _record_bootstrap_threads(monkeypatch)
+
+    @event
+    @dataclass(frozen=True)
+    class Anything:
+        pass
+
+    with pytest.raises(ConfigurationError, match="failed to import"):
+        publish_sync(Anything(), timeout=10)
+
+    assert threads == [threading.current_thread().name]
+
+
+def test_publish_sync_second_call_skips_bootstrap(
+    make_fake_app: Callable[..., str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_fake_app({"orders": _ORDERS_MODULE}, extra_files={"api.py": _API_MODULE})
+    configure(package="fakeapp")  # the recording wrapper below sits on the detection stack
+    threads = _record_bootstrap_threads(monkeypatch)
+
+    api = __import__("fakeapp.api", fromlist=["fire"])
+    api.fire("s-1")
+    api.fire("s-2")
+
+    assert sys.modules["fakeapp.orders"].seen == ["s-1", "s-2"]
+    assert len(threads) == 1
 
 
 # ---------------------------------------------------------------------------

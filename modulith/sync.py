@@ -149,15 +149,16 @@ def publish_sync(event: Any, *, timeout: float | None = 30.0) -> None:
     the shared persistent loop).
 
     The first call also bootstraps modulith, lazily, as the first
-    ``publish()`` does. The bootstrap runs on the daemon-thread loop's
-    thread and inside that call's ``timeout``: one slower than ``timeout``
-    raises PublishSyncTimeout, and a failing one raises its error from this
-    call. With a durable outbox bound from ``outbox_url``, it also starts
-    the outbox retry loop, and its crash-recovery sweep, on that loop. Call
-    ``bootstrap()`` before the first publish_sync() to run startup outside
-    ``timeout``. Called from sync code, ``bootstrap()`` starts no retry
-    loop, because no event loop is running on that thread: the retry loop
-    then starts at the first publish made inside a bound session.
+    ``publish()`` does. The bootstrap runs on the calling thread, before the
+    event is handed to the daemon-thread loop and outside ``timeout``: it
+    sees the caller's stack, so the application package is auto-detected
+    from the module that called publish_sync(), and a failing bootstrap
+    raises its own error from this call. A later call finds modulith
+    already bootstrapped and skips it. Called from sync code, bootstrap
+    starts no outbox retry loop, because no event loop is running on that
+    thread: with a durable outbox bound from ``outbox_url``, the retry loop
+    and its crash-recovery sweep start at the first publish made inside a
+    bound session.
 
     Calling publish_sync() while modulith is bootstrapping on this same
     thread (module code imported by discovery) raises RuntimeError
@@ -186,6 +187,10 @@ def publish_sync(event: Any, *, timeout: float | None = 30.0) -> None:
             "publish_sync() called from inside an async context on the same "
             "thread as the event loop. Use `await publish(event)` instead."
         )
+
+    # Bootstrap here, not on the loop thread: package auto-detection walks THIS
+    # thread's call stack, and a failure should raise from the caller's frame.
+    _runtime.ensure_bootstrapped()
 
     coro = _runtime.publish(event)
 

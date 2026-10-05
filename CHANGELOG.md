@@ -101,6 +101,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `JsonEventSerializer` encodes each element of a fixed-length tuple field, such as `tuple[datetime, Decimal, UUID]`, with its own type instead of the first element's, and an unparameterized `tuple`, `set` or `frozenset` field decodes back to that type instead of `list`
 - A plain module with a module-level `__getattr__` no longer breaks bootstrap when it raises, and is no longer taken for a package when it answers `__path__`. A regular package loaded without `__file__` keeps ownership of its listeners
 - Supervisor: when a worker's descendant keeps its stdout or stderr pipe open after the worker exits, each restart drains the previous spawn's log forwarders and closes its subprocess transport, and `stop()` closes it too, so forwarder tasks, file descriptors and transports no longer build up across restarts
+- `publish_sync()` bootstraps modupy on the calling thread instead of on its background event-loop thread, so as the first runtime call it detects the application package from the caller's module, a failing bootstrap raises its own error from the call, and startup no longer counts against `timeout`
 
 ### Security
 
