@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -16,6 +17,7 @@ import pytest
 
 from modulith import ConfigurationError, configure
 from modulith.adapters import _shm_claims
+from modulith.adapters import shm_broker as shm_broker_module
 from modulith.adapters._shm_coldstore import ShmColdStore
 from modulith.adapters._shm_ring import _HEADER_SIZE, _SLOT_SIZE, _SLOT_STRUCT, ShmRing
 from modulith.adapters._shm_schema import open_database
@@ -1471,29 +1473,231 @@ async def test_registration_logs_default_state_directory_at_info(
         instance._ring.unlink()
 
 
-async def test_worker_given_supervisors_default_state_directory_logs_it_as_default(
+posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX ownership and mode bits")
+
+
+def _home_that_fails_validation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[Any]:
+    """Point the default state home at a world-writable, non-sticky directory
+    and record every call to the default-directory computation."""
+    bad_home = tmp_path / "bad-home"
+    bad_home.mkdir()
+    bad_home.chmod(0o777)
+    monkeypatch.setenv("HOME", str(bad_home))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    calls: list[Any] = []
+
+    def spy(package: str | None) -> Path:
+        calls.append(package)
+        return default_state_directory(package)
+
+    monkeypatch.setattr(shm_broker_module, "default_state_directory", spy)
+    return calls
+
+
+# A worker receives MODULITH_BROKER_STATE_DIR from the supervisor, which also
+# sets it for a defaulted store. Telling the two apart needs the default
+# directory, i.e. the home directory, so an environment-supplied state_dir is
+# reported as explicit and the supervisor's own start-up warning covers the
+# defaulted case.
+@posix_only
+@pytest.mark.parametrize("source", ["env-state-dir", "config-state-dir"])
+async def test_explicit_state_directory_never_reads_the_default_home(
     make_fake_app: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    source: str,
 ) -> None:
     make_fake_app({"orders": ""})
-    _redirect_default_state_home(monkeypatch, tmp_path)
-    forwarded = default_state_directory("fakeapp")
-    monkeypatch.setenv("MODULITH_BROKER_STATE_DIR", str(forwarded))
+    calls = _home_that_fails_validation(monkeypatch, tmp_path)
+    state_dir = tmp_path / "explicit-state"
+    options: dict[str, Any] = {}
+    if source == "env-state-dir":
+        monkeypatch.setenv("MODULITH_BROKER_STATE_DIR", str(state_dir))
+    else:
+        monkeypatch.delenv("MODULITH_BROKER_STATE_DIR", raising=False)
+        options["state_dir"] = str(state_dir)
     with caplog.at_level(logging.INFO, logger="modulith.adapters.shm"):
-        configure(package="fakeapp", topology="processes", broker="shm")
+        configure(package="fakeapp", topology="processes", broker="shm", broker_options=options)
         _runtime.ensure_bootstrapped()
     assert _runtime.broker_registry is not None
     instance = cast(ShmBroker, _runtime.broker_registry.get("shm"))
     try:
         (record,) = _state_dir_records(caplog)
-        message = record.getMessage()
-        assert str(forwarded) in message
-        assert "default location" in message
+        assert "explicit state_dir" in record.getMessage()
+        assert calls == []
     finally:
         await instance.close()
         instance._ring.unlink()
+
+
+@posix_only
+def test_absolute_sqlite_path_never_reads_the_default_home(
+    make_fake_app: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    make_fake_app({"orders": ""})
+    calls = _home_that_fails_validation(monkeypatch, tmp_path)
+    monkeypatch.delenv("MODULITH_BROKER_STATE_DIR", raising=False)
+    pinned = tmp_path / "pinned" / "broker.db"
+    monkeypatch.setenv("MODULITH_BROKER_SQLITE_PATH", str(pinned))
+    configure(package="fakeapp", topology="processes", broker="shm")
+
+    assert shm_broker_module._shm_store_is_defaulted("fakeapp", pinned) is False
+    assert calls == []
+
+
+def _owned_by_someone_else(target: Path) -> Any:
+    """``Path.lstat`` reporting ``target`` as owned by another uid.
+
+    ``os.chown`` to another uid needs root, so the foreign owner is injected
+    at the stat boundary for the one path under test.
+    """
+    real_lstat = Path.lstat
+
+    def lstat(self: Path, **kwargs: Any) -> os.stat_result:
+        info = real_lstat(self, **kwargs)
+        if self != target:
+            return info
+        fields = list(info)
+        fields[4] = os.geteuid() + 1
+        return os.stat_result(fields)
+
+    return lstat
+
+
+@posix_only
+def test_state_directory_owned_by_another_user_is_rejected_naming_path_and_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    owner_uid = state.stat().st_uid
+    monkeypatch.setattr(os, "geteuid", lambda: owner_uid + 1)
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        ShmBroker(shm_name=str(state / "hints"), db_path=str(state / "q.db"))
+
+    message = str(excinfo.value)
+    assert str(state) in message
+    assert f"uid {owner_uid}" in message
+    assert not (state / "q.db").exists()
+
+
+@posix_only
+def test_state_file_owned_by_another_user_is_rejected_naming_path_and_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "q.db"
+    first = ShmBroker(shm_name=str(tmp_path / "hints"), db_path=str(db))
+    asyncio.run(first.close())
+    owner_uid = db.stat().st_uid
+    monkeypatch.setattr(Path, "lstat", _owned_by_someone_else(db))
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        ShmBroker(shm_name=str(tmp_path / "hints"), db_path=str(db))
+
+    message = str(excinfo.value)
+    assert str(db) in message
+    assert f"uid {owner_uid}" in message
+
+
+def _ancestor_stat_reports(target: Path, *, uid: int | None = None) -> Any:
+    """``Path.lstat`` reporting another owner (``uid``) for the one ``target``."""
+    real_lstat = Path.lstat
+
+    def lstat(self: Path, **kwargs: Any) -> os.stat_result:
+        info = real_lstat(self, **kwargs)
+        if self != target or uid is None:
+            return info
+        fields = list(info)
+        fields[4] = uid
+        return os.stat_result(fields)
+
+    return lstat
+
+
+def _loose_ancestor(tmp_path: Path, mode: int, state_exists: bool) -> tuple[Path, Path]:
+    loose = tmp_path / "loose"
+    state = loose / "state"
+    state.mkdir(parents=True, mode=0o700)
+    loose.chmod(mode)
+    if not state_exists:
+        state.rmdir()
+    return loose, state
+
+
+def _assert_ancestor_rejected(loose: Path, state: Path, state_exists: bool) -> None:
+    with pytest.raises(ConfigurationError) as excinfo:
+        ShmBroker(shm_name=str(state / "hints"), db_path=str(state / "q.db"))
+
+    assert str(loose) in str(excinfo.value)
+    assert state.exists() is state_exists
+    assert not (state / "q.db").exists()
+
+
+@posix_only
+@pytest.mark.parametrize("mode", [0o777, 0o707, 0o757])
+@pytest.mark.parametrize("state_exists", [False, True])
+def test_unsticky_other_writable_ancestor_is_rejected_naming_it(
+    tmp_path: Path, mode: int, state_exists: bool
+) -> None:
+    loose, state = _loose_ancestor(tmp_path, mode, state_exists)
+
+    _assert_ancestor_rejected(loose, state, state_exists)
+
+
+@posix_only
+@pytest.mark.parametrize("state_exists", [False, True])
+def test_group_writable_ancestor_of_another_group_is_rejected_naming_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state_exists: bool
+) -> None:
+    loose, state = _loose_ancestor(tmp_path, 0o770, state_exists)
+    monkeypatch.setattr(os, "getegid", lambda: loose.stat().st_gid + 1)
+
+    _assert_ancestor_rejected(loose, state, state_exists)
+
+
+@posix_only
+@pytest.mark.parametrize("owner", ["self", "root"])
+def test_group_writable_ancestor_in_the_users_own_group_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner: str
+) -> None:
+    loose, state = _loose_ancestor(tmp_path, 0o775, state_exists=False)
+    monkeypatch.setattr(os, "getegid", lambda: loose.stat().st_gid)
+    if owner == "root":
+        monkeypatch.setattr(Path, "lstat", _ancestor_stat_reports(loose, uid=0))
+
+    broker = ShmBroker(shm_name=str(state / "hints"), db_path=str(state / "q.db"))
+    try:
+        assert (state / "q.db").is_file()
+    finally:
+        asyncio.run(broker.close())
+
+
+@posix_only
+def test_group_writable_ancestor_owned_by_a_third_user_is_rejected_even_in_the_own_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loose, state = _loose_ancestor(tmp_path, 0o775, state_exists=False)
+    monkeypatch.setattr(os, "getegid", lambda: loose.stat().st_gid)
+    monkeypatch.setattr(Path, "lstat", _ancestor_stat_reports(loose, uid=loose.stat().st_uid + 1))
+
+    _assert_ancestor_rejected(loose, state, state_exists=False)
+
+
+@posix_only
+def test_sticky_world_writable_ancestor_such_as_tmp_stays_accepted(tmp_path: Path) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o1777)
+    state = shared / "state"
+
+    broker = ShmBroker(shm_name=str(state / "hints"), db_path=str(state / "q.db"))
+    try:
+        assert (state / "q.db").is_file()
+    finally:
+        asyncio.run(broker.close())
 
 
 async def test_registration_logs_explicit_state_directory_at_info(

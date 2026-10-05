@@ -638,7 +638,7 @@ How a sweep finds its records depends on `claim_strategy`:
 
 A store without the matching capability falls back to the `find_incomplete` path.
 
-Failed dispatches stay incomplete with `attempt_count` incremented and `last_error` set. Retries use exponential backoff capped at the configured max (`max_retry_backoff_seconds`, default 5 minutes). Once `attempt_count` reaches `dead_letter_after_attempts` (unset by default, which resolves to the store's own setting if it has one, else 10), the record is moved to a dead-letter status (column flag). Dead letters are listed by `modulith outbox dead-letter` and `modulith outbox failing`, and `modulith doctor` counts them. The actuator routes (`/_modulith/topology`, `/_modulith/live`, `/_modulith/health`) do not report them.
+Failed dispatches stay incomplete with `attempt_count` incremented and `last_error` set. Retries use exponential backoff capped at the configured max (`max_retry_backoff_seconds`, default 5 minutes). Once `attempt_count` reaches `dead_letter_after_attempts` (unset by default, which resolves to the store's own setting if it has one, else 10), the record is moved to a dead-letter status (column flag). Rows already at or over a lowered value are dead-lettered at the next sweep. Dead letters are listed by `modulith outbox dead-letter` and `modulith outbox failing`, and `modulith doctor` counts them. The actuator routes (`/_modulith/topology`, `/_modulith/live`, `/_modulith/health`) do not report them.
 
 ### 7.5 Maintenance Operations
 
@@ -981,7 +981,7 @@ but before the fenced acknowledgement commits can cause a duplicate.
 
 Canonical `state_dir`, `sqlite_path`, and `hint_path` resolve to absolute,
 package-namespaced paths under a private per-user directory (`0700` directories
-and `0600` files on POSIX). Explicit SHM rejects DSNs and SQLAlchemy/network
+and `0600` files on POSIX, owned by the effective user; an ancestor directory writable by other users without the sticky bit is rejected; a group-writable ancestor passes only when its group is the effective user's own and that user or root owns it). Explicit SHM rejects DSNs and SQLAlchemy/network
 URLs. WAL with `synchronous=NORMAL` survives application/process restart on the
 same disk; `FULL` is the explicit opt-in for OS-failure and power-loss
 durability.

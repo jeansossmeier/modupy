@@ -144,6 +144,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - The database broker raises a `ConfigurationError` naming `dispatch_started`, `modulith migrate` and migration `0006_broker_dispatch_started` when the application role cannot add that column, instead of the raw driver privilege error, and a SQLite file still locked when the schema deadline passes raises `TimeoutError` instead of `OperationalError`
 - `modulith run --workers`, `modulith dev --isolate` and the `[tool.modulith.workers]` table reject a name that is not a discovered module, exiting 1 with the unknown name and the list of modules, instead of silently ignoring a typo
 - A Redis Streams consumer that stops gracefully deletes its own name from the consumer group with `XGROUP DELCONSUMER` when it has no pending entries, so worker restarts no longer pile up in `XINFO CONSUMERS`, and entries it still owns stay reclaimable; a failed delete is logged and does not fail the stop
+- The default SHM broker refuses a state directory or state file that another user owns, and a parent directory that other users can write to without the sticky bit (a group-writable parent passes when it belongs to your own group, as with umask 002), and it no longer reads your home directory when `state_dir`, `MODULITH_BROKER_STATE_DIR` or an absolute `sqlite_path` is set
 
 ### Security
 

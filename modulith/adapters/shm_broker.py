@@ -784,7 +784,23 @@ def shm_store_path(package: str | None, broker_options: dict[str, Any]) -> Path:
 
 
 def _shm_store_is_defaulted(package: str | None, sqlite_path: Path) -> bool:
-    """Whether the SQLite store sits in the install-path-keyed default directory."""
+    """Whether the SQLite store sits in the install-path-keyed default directory.
+
+    An explicit ``state_dir`` or absolute ``sqlite_path`` (option or environment)
+    answers without computing the default directory, which reads the home
+    directory.
+    """
+    from ..runtime import _runtime
+
+    cfg = _runtime.config
+    opts = (cfg.broker_options if cfg is not None else None) or {}
+    if _broker_opt(opts, "state_dir", "STATE_DIR") is not None:
+        return False
+    sqlite_value = _broker_opt(opts, "sqlite_path", "SQLITE_PATH")
+    if sqlite_value is None:
+        sqlite_value = _broker_opt(opts, "url", "URL")
+    if sqlite_value is not None and Path(os.path.expanduser(str(sqlite_value))).is_absolute():
+        return False
     return sqlite_path.is_relative_to(default_state_directory(package))
 
 
@@ -940,8 +956,6 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
         hint_path,
         capacity,
     )
-    # A worker receives the supervisor's resolution as MODULITH_BROKER_STATE_DIR,
-    # so "was state_dir set" cannot tell a defaulted store apart; compare paths.
     if _shm_store_is_defaulted(cfg.package, db_path):
         logger.info(
             "shm broker SQLite store: %s, state directory: %s (default location, "

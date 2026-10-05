@@ -535,7 +535,7 @@ MODULITH_BROKER_STATE_DIR=/var/lib/myapp/modulith \
   modulith run myapp.main:app --topology processes
 ```
 
-modupy creates a missing state directory with mode 0700. One that already exists must already be 0700 (`chmod 700 /var/lib/myapp/modulith`): modupy never changes an existing directory's permissions and stops with a `ConfigurationError` instead. The directory and the SQLite file must also be owned by the user that runs the service, and no ancestor directory of the state directory may be group- or other-writable unless it has the sticky bit (like `/tmp`), since whoever can write there could swap the private directory out. A home directory with mode 0775, as some distributions create, therefore needs `chmod g-w`, or a `state_dir` elsewhere. Windows has no such checks.
+modupy creates a missing state directory with mode 0700. One that already exists must already be 0700 (`chmod 700 /var/lib/myapp/modulith`): modupy never changes an existing directory's permissions and stops with a `ConfigurationError` instead. The directory and the SQLite file must also be owned by the user that runs the service, and no ancestor directory of the state directory may let another user swap the private directory out: an ancestor writable by others is refused unless it has the sticky bit (like `/tmp`), and a group-writable one is refused unless its group is the service user's own group and the user or root owns it (the umask 002 layout, where each user has a private group). Windows has no such checks.
 
 **Set `state_dir` for the SHM broker in production.** Without it, the `shm`
 store lives in a per-user directory named after a digest of the package's
