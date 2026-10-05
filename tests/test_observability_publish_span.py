@@ -505,7 +505,7 @@ async def test_raising_span_processor_does_not_fail_publish_after_delivery(
         await _publish_with_listener(calls)
 
     assert calls == [7]
-    assert _warnings(caplog)
+    assert len(_warnings(caplog)) == 1
     assert observability._publish_span.get() is None
 
 
@@ -521,4 +521,4 @@ async def test_raising_sampler_does_not_fail_publish_before_delivery(
         await _publish_with_listener(calls)
 
     assert calls == [7]
-    assert _warnings(caplog)
+    assert len(_warnings(caplog)) == 1

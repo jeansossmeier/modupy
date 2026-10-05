@@ -276,6 +276,151 @@ def test_dispatch_span_is_current_until_the_listener_completes(
     assert observability._dispatch_token.get() is None
 
 
+def _publication(listener: str) -> EventPublication:
+    return EventPublication(
+        id=uuid4(),
+        payload=b"",
+        event_type="x.Y",
+        listener=listener,
+        published_at=datetime.now(UTC),
+    )
+
+
+@pytest.mark.parametrize("exception", [None, ValueError("kaboom")], ids=["returned", "raised"])
+def test_a_finished_dispatch_span_is_not_inherited_by_the_next_listener(
+    span_exporter, exception: BaseException | None
+) -> None:
+    tracer = observability._tracer
+    event = object()
+    first, second = _publication("x.first"), _publication("x.second")
+
+    with tracer.start_as_current_span("app.outer") as outer:
+        observability.modulith_on_listener_dispatch(
+            event=event, listener_name="x.first", publication=first
+        )
+        observability.modulith_on_listener_complete(
+            event=event, listener_name="x.first", publication=first, exception=exception
+        )
+        assert trace.get_current_span() is outer
+        observability.modulith_on_listener_dispatch(
+            event=event, listener_name="x.second", publication=second
+        )
+        with tracer.start_as_current_span("app.work"):
+            pass
+        observability.modulith_on_listener_complete(
+            event=event, listener_name="x.second", publication=second, exception=None
+        )
+        with tracer.start_as_current_span("app.after"):
+            pass
+
+    by_name = {
+        s.attributes.get("listener.name", s.name): s for s in span_exporter.get_finished_spans()
+    }
+    outer_id = by_name["app.outer"].context.span_id
+    assert by_name["x.second"].parent.span_id == outer_id
+    assert by_name["app.work"].parent.span_id == by_name["x.second"].context.span_id
+    assert by_name["app.after"].parent.span_id == outer_id
+
+
+_CONCURRENT_APP = {
+    "orders": """
+        from dataclasses import dataclass
+        from modulith import event, publish
+
+        @event
+        @dataclass(frozen=True)
+        class Fanout:
+            n: int
+
+        async def go() -> None:
+            await publish(Fanout(n=1))
+    """,
+    "inventory": """
+        import asyncio
+        from modulith import listener
+        from modulith.builtin import observability
+        from fakeapp.orders import Fanout
+
+        both_started = None
+
+        async def _work(name: str) -> None:
+            global both_started
+            if both_started is None:
+                both_started = asyncio.Barrier(2)
+            with observability._tracer.start_as_current_span(f"work.{name}.before"):
+                await both_started.wait()
+            with observability._tracer.start_as_current_span(f"work.{name}.after"):
+                pass
+
+        @listener
+        async def alpha(evt: Fanout) -> None:
+            await _work("alpha")
+
+        @listener
+        async def beta(evt: Fanout) -> None:
+            await _work("beta")
+    """,
+}
+
+
+async def test_concurrent_listeners_each_parent_to_their_own_dispatch_span(
+    make_fake_app, span_exporter
+) -> None:
+    make_fake_app(_CONCURRENT_APP)
+    configure(package="fakeapp")
+    import fakeapp.orders as orders
+
+    await orders.go()
+
+    dispatch = {
+        s.attributes["listener.name"].rsplit(".", 1)[-1]: s.context.span_id
+        for s in _spans_by_name(span_exporter, "modulith.event.dispatch")
+    }
+    assert set(dispatch) == {"alpha", "beta"}
+    for name in ("alpha", "beta"):
+        for phase in ("before", "after"):
+            (work,) = _spans_by_name(span_exporter, f"work.{name}.{phase}")
+            assert work.parent is not None
+            assert work.parent.span_id == dispatch[name], (name, phase)
+
+
+_SYNC_APP = {
+    "orders": _WORK_APP["orders"],
+    "inventory": """
+        from modulith import listener
+        from modulith.builtin import observability
+        from fakeapp.orders import Work
+
+        @listener
+        def do_work(evt: Work) -> None:
+            with observability._tracer.start_as_current_span("app.work"):
+                if evt.fail:
+                    raise ValueError("kaboom")
+    """,
+}
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["returned", "raised"])
+async def test_span_started_in_a_sync_listener_is_a_child_of_its_dispatch_span(
+    make_fake_app, span_exporter, fail: bool
+) -> None:
+    make_fake_app(_SYNC_APP)
+    configure(package="fakeapp")
+    import fakeapp.orders as orders
+
+    if fail:
+        with pytest.raises(ValueError, match="kaboom"):
+            await orders.go(fail=True)
+    else:
+        await orders.go()
+
+    (work,) = _spans_by_name(span_exporter, "app.work")
+    (dispatch,) = _spans_by_name(span_exporter, "modulith.event.dispatch")
+    assert work.parent is not None
+    assert work.parent.span_id == dispatch.context.span_id
+    assert not trace.get_current_span().get_span_context().is_valid
+
+
 # ---------------------------------------------------------------------------
 # Silent no-op when OTel is unavailable
 # ---------------------------------------------------------------------------
