@@ -362,6 +362,71 @@ async def test_stream_caps_accept_numeric_strings() -> None:
     assert 7 in fake.eval_calls[0][2]
 
 
+_REDIS_MAX_INTEGER = 2**63 - 1
+
+
+@pytest.mark.parametrize("option", ["max_stream_len", "dlq_max_stream_len"])
+@pytest.mark.parametrize("value", [2**63, 10**19, str(2**70)])
+def test_stream_caps_above_redis_integer_range_are_rejected(option: str, value: object) -> None:
+    """Redis answers XADD MAXLEN above 2**63-1 with "value is not an integer or out of range"."""
+    with pytest.raises(ConfigurationError, match=rf"{option}.*at most {_REDIS_MAX_INTEGER}"):
+        RedisStreamsBroker(client=FakeRedis(), **{option: value})
+
+
+def test_stream_caps_accept_the_redis_integer_limit() -> None:
+    broker = RedisStreamsBroker(
+        client=FakeRedis(),
+        max_stream_len=_REDIS_MAX_INTEGER,
+        dlq_max_stream_len=str(_REDIS_MAX_INTEGER),
+    )
+    assert (broker._max_stream_len, broker._dlq_max_stream_len) == (
+        _REDIS_MAX_INTEGER,
+        _REDIS_MAX_INTEGER,
+    )
+
+
+@pytest.mark.parametrize("max_stream_len", [10**18, _REDIS_MAX_INTEGER])
+async def test_default_dead_letter_cap_is_clamped_to_the_redis_integer_limit(
+    max_stream_len: int,
+) -> None:
+    """max_stream_len * 10 overflows 2**63-1 for a large but valid max_stream_len."""
+    fake = FakeRedis()
+    broker = RedisStreamsBroker(client=fake, max_stream_len=max_stream_len)
+    await broker.dead_letter("orders", "1-0", {b"data": b"{}"})
+
+    assert broker._dlq_max_stream_len == _REDIS_MAX_INTEGER
+    assert _REDIS_MAX_INTEGER in fake.eval_calls[0][2]
+
+
+@pytest.mark.parametrize(
+    ("env", "name"),
+    [
+        ("MODULITH_STREAM_MAXLEN", "max_stream_len"),
+        ("MODULITH_BROKER_DLQ_MAX_STREAM_LEN", "dlq_max_stream_len"),
+        ("MODULITH_BROKER_MAX_STREAM_LEN", "MODULITH_BROKER_MAX_STREAM_LEN"),
+    ],
+)
+def test_register_hook_rejects_a_stream_cap_above_the_redis_limit_naming_the_option(
+    monkeypatch, env: str, name: str
+) -> None:
+    from modulith.config import Configuration
+    from modulith.runtime import _runtime
+
+    for variable in (
+        "MODULITH_STREAM_MAXLEN",
+        "MODULITH_BROKER_DLQ_MAX_STREAM_LEN",
+        "MODULITH_BROKER_MAX_STREAM_LEN",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv(env, str(2**63))
+    monkeypatch.setattr(
+        _runtime, "_config", Configuration(package="fakeapp", broker="redis-streams")
+    )
+
+    with pytest.raises(ConfigurationError, match=rf"{name}.*at most {_REDIS_MAX_INTEGER}"):
+        modulith_register_brokers(registry=BrokerRegistry())
+
+
 _DEAD_LETTER_CALL_RE = re.compile(r"redis\.p?call\('(\w+)'[^)]*\)")
 
 
@@ -1583,4 +1648,34 @@ async def test_integration_replicas_do_not_double_dispatch_while_one_works_a_bat
         assert (await redis_client.xpending(stream, "g"))["pending"] == 0
     finally:
         await redis_client.delete(stream)
+        await broker.close()
+
+
+@pytest.mark.integration
+async def test_integration_a_large_max_stream_len_still_dead_letters(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    """The derived dead-letter cap (max_stream_len * 10 = 10**19) is past Redis's
+    int64 range; the clamped cap must reach XADD MAXLEN ~ without an error."""
+    broker = RedisStreamsBroker(
+        url=redis_url,
+        stream_prefix=redis_key_prefix,
+        consumer_group="itest",
+        max_stream_len=10**18,
+    )
+    stream = "bigcap"
+    try:
+        await broker.ensure_group(stream)
+        await broker.publish(stream, b'{"n": 1}')
+        [(_name, entries)] = await broker.read(stream, consumer="c1", count=1, block_ms=1000)
+        msg_id, fields = entries[0]
+        msg_id = msg_id.decode() if isinstance(msg_id, bytes) else msg_id
+
+        await broker.dead_letter(stream, msg_id, fields)
+
+        dead = await redis_client.xrange(f"{redis_key_prefix}.{stream}.dead")
+        assert [f[b"data"] for _id, f in dead] == [b'{"n": 1}']
+        pending = await redis_client.xpending(f"{redis_key_prefix}.{stream}", "itest")
+        assert pending["pending"] == 0
+    finally:
         await broker.close()

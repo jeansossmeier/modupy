@@ -16,7 +16,8 @@ Configuration resolves env > [tool.modulith.broker] subtable > default:
   MODULITH_STREAM_MAXLEN / max_stream_len  bounded retention per stream (default 10000)
   MODULITH_BROKER_DLQ_MAX_STREAM_LEN /
   dlq_max_stream_len                       bounded retention for the dead-letter stream
-                                            (default: max_stream_len * 10)
+                                            (default: max_stream_len * 10);
+                                            both are at most 2**63-1
   MODULITH_BROKER_MAX_PAYLOAD_BYTES /
   max_payload_bytes                        producer-side payload size cap, rejected with
                                             ConfigurationError (default 16 MiB)
@@ -89,7 +90,7 @@ from modulith import (
     hookimpl,
 )
 
-from ..config import DEFAULT_MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES
+from ..config import DEFAULT_MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES, MAX_REDIS_STREAM_LEN
 from ._dead_letter import DeadLetter, DeadLetterRetryRefused
 
 logger = logging.getLogger("modulith.adapters.redis")
@@ -123,7 +124,9 @@ def _positive_int(value: object, name: str, default: int) -> int:
 
     A blank string counts as unset and yields ``default``. Zero is rejected,
     not read as "no cap": ``XADD MAXLEN ~ 0`` trims every entry away in the
-    same command that adds it.
+    same command that adds it. Above ``MAX_REDIS_STREAM_LEN`` is rejected too:
+    Redis answers ``XADD MAXLEN`` with "value is not an integer or out of
+    range" past a signed 64-bit integer.
     """
     if isinstance(value, str) and not value.strip():
         return default
@@ -135,6 +138,8 @@ def _positive_int(value: object, name: str, default: int) -> int:
             pass
     if type(number) is not int or number <= 0:
         raise ConfigurationError(f"{name} must be a positive integer, got {value!r}")
+    if number > MAX_REDIS_STREAM_LEN:
+        raise ConfigurationError(f"{name} must be at most {MAX_REDIS_STREAM_LEN}, got {value!r}")
     return number
 
 
@@ -210,7 +215,7 @@ class RedisStreamsBroker:
         # stream most likely to accumulate, but they're also the ones worth
         # retaining longest for inspection/replay. Still bounded so a poison
         # burst can't grow Redis memory without limit.
-        default_dlq_cap = self._max_stream_len * 10
+        default_dlq_cap = min(self._max_stream_len * 10, MAX_REDIS_STREAM_LEN)
         self._dlq_max_stream_len = (
             default_dlq_cap
             if dlq_max_stream_len is None

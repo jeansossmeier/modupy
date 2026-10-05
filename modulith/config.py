@@ -43,6 +43,8 @@ DEFAULT_SHM_MAX_STORE_BYTES = 1024**3
 # holds space in the max_store_bytes-bounded store for this long.
 DEFAULT_SHM_ORPHAN_RETENTION_SECONDS = 3600.0
 MAX_PAYLOAD_BYTES = 1024**3
+# Redis parses an XADD MAXLEN count as a signed 64-bit integer.
+MAX_REDIS_STREAM_LEN = 2**63 - 1
 # SQLite rejects a blob over its default SQLITE_LIMIT_LENGTH with a raw
 # DataError, so the SHM store cannot hold a larger payload than this.
 _SHM_MAX_PAYLOAD_BYTES = 1_000_000_000
@@ -822,6 +824,9 @@ def _validate_outbox_options(options: dict[str, Any]) -> None:
         )
 
 
+_REDIS_STREAM_LEN_OPTIONS = frozenset({"max_stream_len", "dlq_max_stream_len"})
+
+
 def _validate_redis_broker_options(options: dict[str, Any]) -> None:
     """Reject Redis settings that would disable delivery safety guarantees."""
     for name in (
@@ -837,6 +842,10 @@ def _validate_redis_broker_options(options: dict[str, Any]) -> None:
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ConfigurationError(
                 f"broker_options.{name} must be a positive integer, got {value!r}"
+            )
+        if name in _REDIS_STREAM_LEN_OPTIONS and value > MAX_REDIS_STREAM_LEN:
+            raise ConfigurationError(
+                f"broker_options.{name} must be at most {MAX_REDIS_STREAM_LEN}, got {value!r}"
             )
 
 

@@ -985,6 +985,17 @@ def test_redis_broker_delivery_options_must_be_positive_integers(
         load_configuration(broker="redis-streams", broker_options={option: value})
 
 
+@pytest.mark.parametrize("option", ["max_stream_len", "dlq_max_stream_len"])
+def test_redis_stream_caps_are_bounded_by_redis_integer_range(option: str) -> None:
+    """XADD MAXLEN answers a value above 2**63-1 with "out of range"."""
+    limit = 2**63 - 1
+    assert load_configuration(
+        broker="redis-streams", broker_options={option: limit}
+    ).broker_options == {option: limit}
+    with pytest.raises(ConfigurationError, match=rf"{option}.*at most {limit}"):
+        load_configuration(broker="redis-streams", broker_options={option: limit + 1})
+
+
 @pytest.mark.parametrize(
     ("option", "value"),
     [

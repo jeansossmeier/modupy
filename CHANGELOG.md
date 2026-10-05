@@ -125,6 +125,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - Outbox on MySQL at SERIALIZABLE: concurrent sweepers no longer lose a sweep to a deadlock (error 1213), because the claim transaction is retried up to twice
 - With `auto_discover` off, the `modulith outbox` no-store message says bootstrap itself imports none of your modules and names both routes: `MODULITH_AUTO_DISCOVER=true`, or binding the store from an entry-point plugin's import, which bootstrap loads
 - Packaging: the sdist no longer ships a local `.worktreeinclude`, the `test-suite` extra declares `typing-extensions`, which the tests import, and the classifiers list Python 3.14
+- Redis stream-length options above 2**63-1 are rejected with a `ConfigurationError` naming the option, and the default dead-letter cap (`max_stream_len * 10`) is clamped to 2**63-1, so a large `max_stream_len` no longer makes the dead-letter `XADD MAXLEN` fail
 
 ### Security
 
