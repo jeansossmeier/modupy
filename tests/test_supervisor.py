@@ -1050,6 +1050,72 @@ async def test_stop_returns_within_its_timeout_while_a_descendant_holds_a_worker
             await asyncio.wait_for(proc.wait(), timeout=5.0)
 
 
+def _transport_closing(proc: asyncio.subprocess.Process) -> bool:
+    return proc._transport.is_closing()  # type: ignore[attr-defined,no-any-return]
+
+
+@pytest.mark.real_process
+async def test_restarts_with_a_descendant_holding_the_pipes_release_each_spawns_resources(
+    tmp_path,
+) -> None:
+    """Every respawn must settle the previous spawn: its forwarders end and
+    its transport closes, so nothing accumulates across restarts."""
+    pid_file = tmp_path / "descendants"
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", 9001)],
+        command_builder=_descendant_builder(pid_file, 20, "exit"),
+        restart_initial_delay=0.01,
+        restart_max_delay=0.01,
+        max_restarts=10,
+        restart_healthy_uptime=30.0,
+    )
+    seen: list[asyncio.subprocess.Process] = []
+    try:
+        await sup.start()
+        deadline = time.monotonic() + 20.0
+        while len(seen) < 4 and time.monotonic() < deadline:
+            proc = sup._processes["orders"]
+            if not seen or proc is not seen[-1]:
+                seen.append(proc)
+            await asyncio.sleep(0.02)
+        assert len(seen) == 4, "the worker was not respawned three times"
+
+        # the fourth spawn may still be starting: wait for its predecessor's release
+        while not _transport_closing(seen[-2]) and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+
+        assert [_transport_closing(p) for p in seen[:-1]] == [True, True, True]
+        assert len(sup._log_tasks) <= 2  # at most the live spawn's two forwarders
+    finally:
+        _kill_descendants(pid_file)
+        await sup.stop()
+
+
+@pytest.mark.real_process
+async def test_stop_closes_the_transport_of_a_worker_whose_pipes_a_descendant_holds(
+    tmp_path,
+) -> None:
+    pid_file = tmp_path / "descendants"
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", 9001)],
+        command_builder=_descendant_builder(pid_file, 10, "stay"),
+        shutdown_timeout=1.0,
+    )
+    await sup.start()
+    proc = sup._processes["orders"]
+    try:
+        deadline = time.monotonic() + 5.0
+        while not pid_file.exists() and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert pid_file.exists(), "the worker never started its helper"
+
+        await sup.stop()
+
+        assert _transport_closing(proc)
+    finally:
+        _kill_descendants(pid_file)
+
+
 class _ExitedWithPipesHeld:
     """A process that has exited while something still holds its pipes."""
 

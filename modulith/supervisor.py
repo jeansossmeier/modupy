@@ -394,6 +394,9 @@ class Supervisor:
         # forwarders, so pruning only in stop() would grow this without bound
         # under a crash-looping worker (each restart leaks two done tasks).
         self._log_tasks: set[asyncio.Task[None]] = set()
+        # The forwarders of each instance's current spawn, so a respawn can
+        # settle the previous spawn's (see _release_spawn).
+        self._instance_log_tasks: dict[str, set[asyncio.Task[None]]] = {}
         # Monotonic time any forwarder last received a line; read by stop().
         self._last_log_line = 0.0
         # Instances the breaker has given up on — surfaced for health reporting.
@@ -480,11 +483,11 @@ class Supervisor:
         logger.info("spawned worker %r on port %d (pid %s)", name, port, proc.pid)
         if proc.stdout is not None:
             self._track_log_task(
-                asyncio.create_task(self._forward_logs(name, proc.stdout, logging.INFO))
+                name, asyncio.create_task(self._forward_logs(name, proc.stdout, logging.INFO))
             )
         if proc.stderr is not None:
             self._track_log_task(
-                asyncio.create_task(self._forward_logs(name, proc.stderr, logging.WARNING))
+                name, asyncio.create_task(self._forward_logs(name, proc.stderr, logging.WARNING))
             )
         return proc
 
@@ -500,15 +503,56 @@ class Supervisor:
             except Exception:
                 logger.exception("spawn listener %r failed for port %d", listener, port)
 
-    def _track_log_task(self, task: asyncio.Task[None]) -> None:
+    def _track_log_task(self, name: str, task: asyncio.Task[None]) -> None:
         """Hold a strong reference to a log forwarder only while it runs.
 
         The done-callback prunes the task the moment it finishes (worker
         exited → pipe EOF), so restarts don't accumulate completed tasks
         until stop() — the set stays at ~2 live entries per live worker.
         """
-        self._log_tasks.add(task)
-        task.add_done_callback(self._log_tasks.discard)
+        instance_tasks = self._instance_log_tasks.setdefault(name, set())
+        for tasks in (self._log_tasks, instance_tasks):
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+    async def _drain_log_tasks(self, log_tasks: set[asyncio.Task[None]]) -> None:
+        """Give the forwarders of dead processes a bounded grace period, then cancel.
+
+        Every process is dead by now, so its last output already sits in the
+        OS pipe buffer and the forwarders should reach EOF almost immediately.
+        Cancelling them unconditionally could drop a crashing worker's last,
+        most diagnostically useful lines. A forwarder that stays quiet for
+        _LOG_QUIET_PERIOD is waiting on a pipe a surviving descendant holds
+        open, and is cancelled then.
+        """
+        pending = set(log_tasks)  # done-callbacks discard from the original
+        drain_deadline = time.monotonic() + _LOG_DRAIN_TIMEOUT
+        while pending:
+            _, pending = await asyncio.wait(pending, timeout=_LOG_QUIET_PERIOD)
+            now = time.monotonic()
+            quiet = now - self._last_log_line >= _LOG_QUIET_PERIOD
+            if pending and (quiet or now >= drain_deadline):
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                break
+
+    @staticmethod
+    def _close_transport(proc: asyncio.subprocess.Process) -> None:
+        """Close a dead process's transport, and with it any pipe a descendant holds.
+
+        asyncio has no public handle for this, and the transport (with its pipe
+        descriptors) stays open for as long as a descendant keeps a pipe open.
+        ``Process._transport`` exists on CPython 3.11 to 3.14.
+        """
+        transport = getattr(proc, "_transport", None)
+        if transport is not None:
+            transport.close()
+
+    async def _release_spawn(self, name: str, proc: asyncio.subprocess.Process) -> None:
+        """Settle a dead spawn: drain its forwarders, then close its transport."""
+        await self._drain_log_tasks(self._instance_log_tasks.pop(name, set()))
+        self._close_transport(proc)
 
     async def _monitor_worker(
         self, name: str, spec: WorkerSpec, port: int, proc: asyncio.subprocess.Process
@@ -541,6 +585,7 @@ class Supervisor:
             self._notify_listeners(port)
             if self._stopping:
                 return
+            await self._release_spawn(name, proc)
             uptime = time.monotonic() - started
             delay = policy.on_crash(uptime=uptime, now=time.monotonic())
             if delay is None:
@@ -739,27 +784,12 @@ class Supervisor:
             *(_exited(proc) for proc in self._processes.values()), return_exceptions=True
         )
 
-        # Snapshot: done-callbacks discard from the set as tasks finish, so
-        # iterate and await over a copy. Every process is dead by now, so
-        # its last output already sits in the OS pipe buffer and the
-        # forwarders should reach EOF almost immediately. Cancelling them
-        # unconditionally could drop a crashing worker's last, most
-        # diagnostically useful lines, so they get a bounded grace period.
-        # A forwarder that stays quiet for _LOG_QUIET_PERIOD is waiting on a
-        # pipe a surviving descendant holds open, and is cancelled then.
-        log_tasks = set(self._log_tasks)
-        drain_deadline = time.monotonic() + _LOG_DRAIN_TIMEOUT
-        while log_tasks:
-            _, log_tasks = await asyncio.wait(log_tasks, timeout=_LOG_QUIET_PERIOD)
-            now = time.monotonic()
-            quiet = now - self._last_log_line >= _LOG_QUIET_PERIOD
-            if log_tasks and (quiet or now >= drain_deadline):
-                for task in log_tasks:
-                    task.cancel()
-                await asyncio.gather(*log_tasks, return_exceptions=True)
-                break
+        await self._drain_log_tasks(self._log_tasks)
+        for proc in self._processes.values():
+            self._close_transport(proc)
         self._monitor_tasks.clear()
         self._log_tasks.clear()
+        self._instance_log_tasks.clear()
         logger.info("supervisor stopped")
 
 
