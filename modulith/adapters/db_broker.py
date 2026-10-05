@@ -2455,27 +2455,25 @@ class DatabaseBroker:
 
     @_on_owning_loop
     async def active_groups(self, *, within_seconds: float) -> set[str]:
-        """Groups a consumer refreshed or claimed for within ``within_seconds``.
+        """Groups whose subscription rows were refreshed within ``within_seconds``.
 
         A running consumer re-stamps its subscription rows' ``updated_at``
-        periodically (``touch_subscriptions``) and every claim stamps
-        ``claimed_at``, so a group served by any deployment shows up here
-        even when this one's modules do not derive it. Expects the broker
-        tables to exist; it never creates them.
+        periodically (``touch_subscriptions``), so a group served by any
+        deployment shows up here even when this one's modules do not derive
+        it. Claims do not count: ``broker_message`` has no index on
+        ``claimed_at`` to scan. Expects the broker tables to exist; it never
+        creates them.
         """
-        from sqlalchemy import select, union
+        from sqlalchemy import select
 
-        _, subscription, message = broker_schema()
+        _, subscription, _ = broker_schema()
 
         async def op(conn: Any) -> set[str]:
             cutoff = await self._now(conn) - timedelta(seconds=within_seconds)
             rows = await conn.execute(
-                union(
-                    select(subscription.c.consumer_group).where(
-                        subscription.c.updated_at >= cutoff
-                    ),
-                    select(message.c.consumer_group).where(message.c.claimed_at >= cutoff),
-                )
+                select(subscription.c.consumer_group)
+                .where(subscription.c.updated_at >= cutoff)
+                .distinct()
             )
             return {str(row[0]) for row in rows}
 
@@ -2484,19 +2482,36 @@ class DatabaseBroker:
 
     @_on_owning_loop
     async def touch_subscriptions(self, targets: list[str] | tuple[str, ...], group: str) -> None:
-        """Stamp ``group``'s subscriptions to ``targets`` as served right now."""
-        from sqlalchemy import update
+        """Stamp ``group``'s subscriptions to ``targets`` as served right now.
+
+        A row another transaction holds locked (a replica's ``subscribe``
+        upserting the same subscription) is skipped rather than waited for:
+        that transaction stamps it itself, and one missed hourly touch stays
+        inside the liveness window.
+        """
+        from sqlalchemy import select, update
 
         _, subscription, _ = broker_schema()
+        server_version = await self._mysql_server_version()
 
         async def op(conn: Any) -> None:
-            await conn.execute(
-                update(subscription)
-                .where(
-                    subscription.c.consumer_group == group,
-                    subscription.c.target.in_(list(targets)),
+            match = [
+                subscription.c.consumer_group == group,
+                subscription.c.target.in_(list(targets)),
+            ]
+            if _supports_skip_locked(self._engine, server_version):
+                unlocked = await conn.execute(
+                    select(subscription.c.target)
+                    .where(*match)
+                    .order_by(subscription.c.target)
+                    .with_for_update(skip_locked=True)
                 )
-                .values(updated_at=await self._now(conn))
+                match = [
+                    subscription.c.consumer_group == group,
+                    subscription.c.target.in_([row[0] for row in unlocked]),
+                ]
+            await conn.execute(
+                update(subscription).where(*match).values(updated_at=await self._now(conn))
             )
 
         await self._write(op)

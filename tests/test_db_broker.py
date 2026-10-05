@@ -5818,9 +5818,10 @@ async def test_group_backlog_with_targets_counts_what_drop_group_with_those_targ
     assert await broker.drop_group("modulith-orders", targets=["t.Stale"]) == (1, counted)
 
 
-async def test_active_groups_counts_recent_subscribes_and_claims(engine: Any) -> None:
+async def test_active_groups_counts_only_recent_subscription_touches(engine: Any) -> None:
     from datetime import UTC, datetime, timedelta
 
+    from sqlalchemy import event as sa_event
     from sqlalchemy import update
 
     broker = DatabaseBroker(engine=engine)
@@ -5836,11 +5837,46 @@ async def test_active_groups_counts_recent_subscribes_and_claims(engine: Any) ->
             .where(subscription.c.consumer_group != "modulith-subscribed")
             .values(updated_at=long_ago)
         )
+    statements: list[str] = []
 
-    assert await broker.active_groups(within_seconds=3600) == {
-        "modulith-subscribed",
-        "modulith-claiming",
-    }
+    def record(_conn: Any, _cursor: Any, statement: str, *_rest: Any) -> None:
+        statements.append(statement)
+
+    sa_event.listen(engine.sync_engine, "before_cursor_execute", record)
+    try:
+        live = await broker.active_groups(within_seconds=3600)
+    finally:
+        sa_event.remove(engine.sync_engine, "before_cursor_execute", record)
+
+    # A claim no longer keeps a group live: every consumer touches its
+    # subscriptions hourly, and a claimed_at scan has no index to ride on.
+    assert live == {"modulith-subscribed"}
+    assert not any("broker_message" in statement for statement in statements), statements
+
+
+async def test_touch_subscriptions_stamps_only_the_named_rows(engine: Any) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select, update
+
+    broker = DatabaseBroker(engine=engine)
+    await broker.subscribe(["t.A", "t.B"], "modulith-g")
+    await broker.subscribe(["t.A"], "modulith-other")
+    _, subscription, _ = broker_schema()
+    long_ago = datetime.now(UTC) - timedelta(days=30)
+    async with engine.begin() as conn:
+        await conn.execute(update(subscription).values(updated_at=long_ago))
+
+    await broker.touch_subscriptions(["t.A"], "modulith-g")
+
+    async with engine.connect() as conn:
+        rows = await conn.execute(
+            select(subscription.c.target, subscription.c.consumer_group, subscription.c.updated_at)
+        )
+        touched = {
+            (row[0], row[1]) for row in rows if row[2].replace(tzinfo=UTC) > long_ago + timedelta(1)
+        }
+    assert touched == {("t.A", "modulith-g")}
 
 
 async def test_running_consumer_keeps_an_idle_group_live(engine: Any) -> None:

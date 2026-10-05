@@ -998,7 +998,7 @@ async def _age_subscriptions(engine: Any, *, days: int) -> None:
         )
 
 
-async def test_active_groups_reads_fresh_subscriptions_and_recent_claims(
+async def test_active_groups_reads_fresh_subscriptions_only(
     broker_engine: Any,
 ) -> None:
     broker = DatabaseBroker(engine=broker_engine)
@@ -1009,7 +1009,34 @@ async def test_active_groups_reads_fresh_subscriptions_and_recent_claims(
     await _age_subscriptions(broker_engine, days=30)
     await broker.subscribe([_TARGET], "g-subscribed")
 
-    assert await broker.active_groups(within_seconds=3600) == {"g-subscribed", "g-claiming"}
+    assert await broker.active_groups(within_seconds=3600) == {"g-subscribed"}
+
+
+async def test_touch_subscriptions_skips_rows_a_concurrent_transaction_holds_locked(
+    broker_engine: Any,
+) -> None:
+    from sqlalchemy import select
+
+    broker = DatabaseBroker(engine=broker_engine)
+    held, free = f"{_TARGET}.held", f"{_TARGET}.free"
+    await broker.subscribe([held, free], "g")
+    await _age_subscriptions(broker_engine, days=30)
+    _, subscription, _ = broker_schema()
+
+    # A replica's subscribe holds its upserted rows until it commits.
+    async with broker_engine.connect() as holder:
+        await holder.execute(
+            select(subscription.c.target)
+            .where(subscription.c.target == held, subscription.c.consumer_group == "g")
+            .with_for_update()
+        )
+        await asyncio.wait_for(broker.touch_subscriptions([held, free], "g"), timeout=1.0)
+        await holder.rollback()
+
+    touched = _aware(await _subscription_updated_at(broker_engine, free, "g"))
+    skipped = _aware(await _subscription_updated_at(broker_engine, held, "g"))
+    assert touched > datetime.now(UTC) - timedelta(hours=1)
+    assert skipped < datetime.now(UTC) - timedelta(days=1)
 
 
 async def test_touch_subscriptions_brings_an_aged_group_back_into_the_window(

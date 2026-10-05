@@ -163,6 +163,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `modulith extract` no longer lists every distribution sharing a namespace package under "Extraction notes" (for example `opentelemetry-sdk` and `opentelemetry-semantic-conventions` when only `opentelemetry-api` was loaded): it lists only the distributions whose files the import check actually loaded
 - `modulith broker drop-group` states in its confirmation prompt how many pending and claimed deliveries the drop deletes, per target with `--target`, on the SHM and database brokers; `--yes` output is unchanged, and a broker without a backlog count still prompts without one
 - An outbox lease sweep no longer re-claims, or charges an interrupted attempt to, a publication this process is still delivering after its lease lapsed; a custom store whose `claim_batch` does not declare the new optional `exclude_ids` keyword is called as before
+- The database broker's hourly subscription touch no longer waits on rows a replica's subscribe holds locked: it skips them and stamps the rest; a group now counts as live by its recent subscription touch only, not by a recent claim, so the liveness query no longer scans `broker_message`
 
 ### Security
 
