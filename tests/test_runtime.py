@@ -225,6 +225,90 @@ def test_failed_outbox_bind_rolls_back_and_the_retry_keeps_listeners(
     assert [e.order_id for e in orders.received] == ["o-bind"]
 
 
+# `contracts` and `billing` import cleanly and stay cached in sys.modules. `orders`
+# registers its listener and then raises while ORDERS_IMPORT_FAILS is set, so Python
+# drops it from sys.modules and the retry imports it (and registers it) again.
+_RETRY_APP = {
+    "contracts": """
+        from dataclasses import dataclass
+        from modulith import event
+
+        received = []
+
+        @event
+        @dataclass(frozen=True)
+        class OrderCreated:
+            order_id: str
+    """,
+    "billing": """
+        from modulith import listener
+        from fakeapp.contracts import OrderCreated, received
+
+        @listener
+        async def on_created(evt: OrderCreated) -> None:
+            received.append(("billing", evt.order_id))
+    """,
+    "orders": """
+        import os
+        from modulith import listener
+        from fakeapp.contracts import OrderCreated, received
+
+        @listener
+        async def on_created(evt: OrderCreated) -> None:
+            received.append(("orders", evt.order_id))
+
+        if os.environ.get("ORDERS_IMPORT_FAILS") == "1":
+            raise RuntimeError("orders import fails after its listener registered")
+    """,
+}
+
+
+async def test_bootstrap_retry_does_not_duplicate_the_failed_modules_listeners(
+    make_fake_app, monkeypatch
+) -> None:
+    """A module whose import fails leaves sys.modules, so the retry imports it
+    again and its @listener decorators fire a second time. The failed attempt
+    kept the first run's handler queued and the retry flushed both: one publish
+    ran that module's listener twice. The failed module's listeners register
+    once on the retry, and a sibling whose import succeeded (cached, so its
+    decorators never re-fire) still gets exactly one registration too."""
+    make_fake_app(_RETRY_APP)
+    configure(package="fakeapp")
+    monkeypatch.setenv("ORDERS_IMPORT_FAILS", "1")
+
+    with pytest.raises(ConfigurationError, match=r"fakeapp\.orders"):
+        _runtime.ensure_bootstrapped()
+
+    monkeypatch.delenv("ORDERS_IMPORT_FAILS")
+    _runtime.ensure_bootstrapped()
+
+    import fakeapp.contracts as contracts
+
+    from modulith import publish
+
+    await publish(contracts.OrderCreated(order_id="o-1"))
+    assert sorted(contracts.received) == [("billing", "o-1"), ("orders", "o-1")]
+
+
+def test_failed_bootstrap_forgets_the_listeners_of_a_module_that_left_sys_modules(
+    make_fake_app, monkeypatch
+) -> None:
+    """The queue a failed bootstrap leaves behind is for the retry to flush, so it
+    keeps only handlers whose module is still imported (their decorators never
+    re-fire). A handler whose module failed to import is dropped from the queue
+    together with its ownership entry, which would otherwise pin the dead module's
+    namespace for the process lifetime."""
+    make_fake_app(_RETRY_APP)
+    configure(package="fakeapp")
+    monkeypatch.setenv("ORDERS_IMPORT_FAILS", "1")
+
+    with pytest.raises(ConfigurationError, match=r"fakeapp\.orders"):
+        _runtime.ensure_bootstrapped()
+
+    assert [h.__module__ for _, h in _runtime._pending_listeners] == ["fakeapp.billing"]
+    assert set(_runtime._listener_owners.values()) == {"fakeapp.billing"}
+
+
 # ---------------------------------------------------------------------------
 # Reentrant runtime use during bootstrap must not deadlock
 # ---------------------------------------------------------------------------
@@ -395,6 +479,47 @@ async def test_unregistered_explicit_target_scheme_raises_config_error(make_fake
 
     with pytest.raises(ConfigurationError, match="kafka"):
         await orders.place("o-1")
+
+
+@pytest.mark.parametrize(
+    "bad_target",
+    ["testbroker:", "testbroker:   ", "testbroker", ":orders.placed", " : "],
+    ids=["no-destination", "blank-destination", "no-colon", "no-scheme", "blank-both"],
+)
+async def test_hook_target_with_empty_scheme_or_destination_raises_configuration_error(
+    bad_target: str,
+) -> None:
+    """A modulith_resolve_event_target hook returns a free-form string, and an
+    empty scheme or destination used to pass routing: the publish then failed
+    deep inside the broker registry with a bare ValueError (the durable path
+    would persist a route row that could only dead-letter), and an empty scheme
+    was reported as a missing adapter. Routing rejects it up front with the
+    same ConfigurationError as an unregistered scheme, before any broker is
+    called."""
+
+    class BadRouter:
+        @hookimpl
+        def modulith_resolve_event_target(self, event: Any) -> str:
+            return bad_target
+
+    @event
+    @dataclass(frozen=True)
+    class Routed:
+        n: int
+
+    broker = FakeBroker()
+    configure(package="routebad", auto_discover=False, topology="processes", broker="testbroker")
+    _runtime._extra_plugins.append(BadRouter())
+    _runtime.ensure_bootstrapped()
+    registry = _runtime.broker_registry
+    assert registry is not None
+    registry.register("testbroker", broker)
+
+    from modulith import publish
+
+    with pytest.raises(ConfigurationError, match="non-empty 'scheme:destination'"):
+        await publish(Routed(n=1))
+    assert broker.published == []
 
 
 # ---------------------------------------------------------------------------

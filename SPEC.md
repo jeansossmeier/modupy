@@ -482,7 +482,7 @@ Bootstrap sequence (in `Runtime._bootstrap()`):
 
 A module-level `_runtime: Runtime` instance lives in `modulith/runtime.py`. Decorators and `publish()` reach through it. Double-checked locking guards bootstrap against concurrent first-uses. After bootstrap, the bootstrapped flag is read without locking.
 
-**Critical correctness rule:** `register_listener()` gates on whether the event bus has been **published**, not on whether bootstrap is **complete**. During discovery, modules are imported, which fires their `@listener` decorators. The bus is built locally and published only at the commit point, so listeners registered until then queue and are flushed into it in registration order. Registration runs under the runtime lock: a registration racing the flush either arrives before it or waits until bootstrap finishes and registers directly, so no listener lands in a queue that was already flushed. A failed bootstrap leaves the runtime as it was before the attempt, with the queue intact, so it can be retried.
+**Critical correctness rule:** `register_listener()` gates on whether the event bus has been **published**, not on whether bootstrap is **complete**. During discovery, modules are imported, which fires their `@listener` decorators. The bus is built locally and published only at the commit point, so listeners registered until then queue and are flushed into it in registration order. Registration runs under the runtime lock: a registration racing the flush either arrives before it or waits until bootstrap finishes and registers directly, so no listener lands in a queue that was already flushed. A failed bootstrap leaves the runtime as it was before the attempt, so it can be retried. The queue keeps every listener except those of a module whose import failed, which the retry registers again when it re-imports the module.
 
 ### 6.3 Configuration Resolution
 
@@ -805,7 +805,8 @@ row inside the business transaction and delivered to the broker after commit
 — a rollback discards it, so remote consumers never see an un-committed event.
 Publishing a cross-process event whose target scheme has no registered broker
 adapter raises `ConfigurationError` (uniformly for the default scheme and
-explicit targets).
+explicit targets). So does a target from the `modulith_resolve_event_target`
+hook whose scheme or destination is empty.
 
 ### 9.3 The Supervisor
 

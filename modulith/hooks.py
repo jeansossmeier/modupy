@@ -220,7 +220,8 @@ def modulith_resolve_event_target(event: Any) -> str | None:
     """Resolve a broker target for an event, overriding @externalized.
 
     First plugin to return a non-None target wins. Targets follow the
-    "scheme:destination" format consumed by BrokerRegistry. Return None
+    "scheme:destination" format consumed by BrokerRegistry; a target whose
+    scheme or destination is empty raises ConfigurationError at publish. Return None
     to defer to the next plugin or fall through to the static
     @externalized annotation on the event class. Use this hook for
     dynamic routing — tenant-aware topics, A/B-test channels, or

@@ -832,7 +832,8 @@ class Runtime:
 
         Returns None when topology is ``single`` or when the event carries no
         cross-process signal. When the event DOES resolve to a broker target
-        but no broker is registered for that target's scheme, raises
+        whose scheme or destination is empty (a hook returning ``"scheme:"``),
+        or whose scheme has no registered broker, raises
         ConfigurationError — uniformly for the default scheme and for
         explicit ``@externalized(target=...)`` overrides. (The old behavior
         was the worst of both worlds: the default-scheme case silently
@@ -857,6 +858,13 @@ class Runtime:
 
         event_type = f"{type(event).__module__}.{type(event).__qualname__}"
         scheme, destination = _split_broker_target(target)
+        if not scheme or not destination:
+            raise ConfigurationError(
+                f"cannot route event {event_type} to broker target {target!r}: "
+                f"expected non-empty 'scheme:destination'. Fix the "
+                f"modulith_resolve_event_target hook (or the @externalized "
+                f"target) that produced it."
+            )
         if scheme not in registry.schemes():
             raise ConfigurationError(
                 f"cannot route event {event_type} to broker target {target!r}: "
@@ -902,7 +910,9 @@ class Runtime:
         after fixing the problem starts from a clean slate. Listeners whose
         modules were already imported by the failed attempt stay queued in
         the pending list (Python caches the imports, so their decorators
-        never re-fire) and are flushed by the next attempt.
+        never re-fire) and are flushed by the next attempt. A module whose
+        import failed is not cached, so the failed attempt drops its
+        listeners: the retry imports the module again and re-registers them.
 
         Re-entrant calls from inside bootstrap itself (module import code or
         a plugin hook calling back into publish()/ensure_bootstrapped())
@@ -1129,6 +1139,7 @@ class Runtime:
             # failing (discovery, manifests, modulith_after_module_load)
             # leaked it for the process lifetime.
             self._config = None
+            self._drop_listeners_of_unloaded_modules()
             self._close_provisional_brokers(broker_registry)
             raise
 
@@ -1152,6 +1163,26 @@ class Runtime:
 
         # 8. Mark complete. Future calls take the fast path.
         self._bootstrapped = True
+
+    def _drop_listeners_of_unloaded_modules(self) -> None:
+        """Forget queued listeners whose defining module has left ``sys.modules``.
+
+        Python removes a module whose import raised, so the retry imports it
+        again and its ``@listener`` decorators queue a second handler for the
+        same function. Handlers from modules that stay imported are kept: their
+        cached imports never register them again. Each dropped handler also
+        loses its ownership entry, which would otherwise pin the dead module's
+        namespace for the process lifetime.
+        """
+        kept: list[tuple[type, Callable[..., Any]]] = []
+        for event_type, handler in self._pending_listeners:
+            module = getattr(handler, "__module__", None)
+            if isinstance(module, str) and module not in sys.modules:
+                self._listener_owners.pop(handler, None)
+                self._unresolved_listener_modules.pop(handler, None)
+            else:
+                kept.append((event_type, handler))
+        self._pending_listeners[:] = kept
 
     @staticmethod
     def _close_provisional_brokers(registry: BrokerRegistry) -> None:
