@@ -214,6 +214,8 @@ def load_configuration(**overrides: Any) -> Configuration:
     explicit.update(_read_pyproject())
     explicit.update(_read_env_vars())
     explicit.update(overrides)
+    if isinstance(explicit.get("broker"), str):
+        explicit["broker"] = explicit["broker"].strip()
 
     # Validate before constructing — fail fast on typos and bad values.
     _validate(explicit)
@@ -306,6 +308,13 @@ def _validate_shm_broker_options(options: dict[str, Any]) -> None:
     for name in ("state_dir", "sqlite_path", "hint_path", "shm_name", "url"):
         if name in options and (not isinstance(options[name], str) or not options[name].strip()):
             raise ConfigurationError(f"broker_options.{name} must be a non-empty filesystem path")
+    for name in ("sqlite_path", "hint_path"):
+        if name in options and "://" in options[name]:
+            raise ConfigurationError(
+                f"broker_options.{name} must be a filesystem path, not a URL. "
+                "Use state_dir to choose the directory, or broker='database' with "
+                "broker_options.url for a database URL."
+            )
 
     env_url = _env_str("MODULITH_BROKER_URL")
     option_url = options.get("url")

@@ -484,6 +484,43 @@ def test_explicit_shm_accepts_plain_filesystem_url_alias(tmp_path: Path) -> None
     assert cfg.broker_options["url"] == str(tmp_path / "broker.db")
 
 
+@pytest.mark.parametrize("option", ["sqlite_path", "hint_path"])
+def test_shm_path_options_reject_urls_without_touching_disk(option: str, tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    with pytest.raises(ConfigurationError, match="state_dir"):
+        load_configuration(
+            topology="processes",
+            broker="shm",
+            broker_options={"state_dir": str(state_dir), option: "sqlite+aiosqlite:///x.db"},
+        )
+
+    assert not state_dir.exists()
+    assert not (tmp_path / "sqlite+aiosqlite:").exists()
+
+
+@pytest.mark.parametrize("option", ["sqlite_path", "hint_path"])
+def test_shm_path_options_accept_plain_relative_paths(option: str) -> None:
+    cfg = load_configuration(
+        topology="processes",
+        broker="shm",
+        broker_options={option: "sub/x.db"},
+    )
+
+    assert cfg.broker_options[option] == "sub/x.db"
+
+
+def test_padded_broker_name_is_stripped() -> None:
+    cfg = load_configuration(topology="processes", broker=" shm ")
+
+    assert cfg.broker == "shm"
+    assert cfg.is_explicit("broker") is True
+
+
+def test_padded_memory_broker_is_rejected_for_processes_topology() -> None:
+    with pytest.raises(ConfigurationError, match="memory"):
+        load_configuration(topology="processes", broker=" memory ")
+
+
 def test_implicit_shm_validates_canonical_path_options() -> None:
     with pytest.raises(ConfigurationError, match="state_dir"):
         load_configuration(
