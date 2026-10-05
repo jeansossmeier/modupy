@@ -5282,6 +5282,8 @@ async def test_postgres_non_owner_role_gets_a_configuration_error_naming_the_mig
         async with admin.engine.begin() as conn:
             await conn.execute(text(f"DROP OWNED BY {role}"))
             await conn.execute(text(f"DROP ROLE IF EXISTS {role}"))
+            # postgres_url is one database for the whole session.
+            await conn.run_sync(broker_schema()[0].drop_all)
         await admin.close()
 
 
