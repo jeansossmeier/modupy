@@ -97,6 +97,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - Durable outbox: run `modulith migrate` (migration `0007_outbox_dispatch_started`) before starting this version. On an outbox table without the new column every durable publish, claim and delivery fails, while `modulith outbox status` and `modulith doctor` still print counts and can report the outbox healthy. Tables created from the ORM metadata already have the column, and the migration skips it there
 - Migrations: the first `modulith migrate`, or raw `alembic upgrade`, after upgrading moves modupy's revision from `alembic_version` into the new `modulith_alembic_version` table before it migrates. It runs no migration again, leaves any other revision in `alembic_version` alone, and drops that table only if it is then empty
 - Boundary verification: package-level imports of a sibling module are now checked (see Changed). Run `modulith verify` before upgrading a project that sets `strict_boundaries = true`, because such an import now stops the app from starting
+- Broker configuration: `max_payload_bytes` is checked when the app starts, for every broker (see Fixed). On the shm broker a value above 1,000,000,000 bytes, including the 1 GiB the documentation gave as the maximum, now stops the app from starting, as do a bool or a float under any broker and an invalid `MODULITH_BROKER_MAX_PAYLOAD_BYTES` under the in-memory broker. Lower an shm value to 1,000,000,000 or less
 
 ## [0.10.0] — 2026-09-29
 
