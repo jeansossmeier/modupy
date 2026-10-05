@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.11.0] — 2026-10-02
+## [0.11.0] — 2026-10-05
 
 The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record builds that were never published.
 
