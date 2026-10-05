@@ -16,6 +16,7 @@ import json
 import keyword
 import re
 import shutil
+import site
 import subprocess
 import sys
 import tempfile
@@ -65,11 +66,11 @@ def extraction_blockers(rt: Runtime, module: str, violations: list[Violation]) -
         if v.module == module
     ]
 
-    _helpers, siblings = import_closure(rt, module)
+    _helpers, siblings = _closure(rt, module)
     if siblings:
+        listed = ", ".join(f"{name} ({where})" for name, where in sorted(siblings.items()))
         blockers.append(
-            f"imports declared module(s): {', '.join(siblings)}; the extracted service "
-            "does not contain them"
+            f"imports declared module(s): {listed}; the extracted service does not contain them"
         )
 
     target = next((m for m in rt.modules if m.name == module), None)
@@ -123,6 +124,18 @@ def _contracts_source(package_dir: Path, package: str, contracts_module: str) ->
 def import_closure(rt: Runtime, module: str) -> tuple[list[str], list[str]]:
     """Helper modules the extracted copy needs, and other declared modules it imports.
 
+    See ``_closure`` for what counts as either.
+    """
+    helpers, siblings = _closure(rt, module)
+    return helpers, sorted(siblings)
+
+
+def _closure(rt: Runtime, module: str) -> tuple[list[str], dict[str, str]]:
+    """The helpers and, per imported sibling module, where its import first appears.
+
+    A sibling maps to ``path:line``, the path relative to the directory that holds
+    the application's top-level package and the line of the import that sorts first.
+
     Scans the module, the contracts package and every helper found, until no
     new helper appears. A helper is package-level code outside every declared
     module and outside the contracts package. ``from pkg import name`` also
@@ -141,15 +154,16 @@ def import_closure(rt: Runtime, module: str) -> tuple[list[str], list[str]]:
     cfg = rt.config
     target = next((m for m in rt.modules if m.name == module), None)
     if cfg is None or cfg.package is None or target is None:
-        return [], []
+        return [], {}
     package = cfg.package
     package_dir = _package_dir(package)
     if package_dir is None:
-        return [], []
+        return [], {}
     contracts = f"{package}.{cfg.contracts_module}"
+    source_root = package_dir.parents[len(package.split(".")) - 1]
 
     helpers: set[str] = set()
-    siblings: set[str] = set()
+    siblings: dict[str, tuple[str, int]] = {}
     pending = [target.package, contracts]
     scanned: set[str] = set()
     while pending:
@@ -187,7 +201,8 @@ def import_closure(rt: Runtime, module: str) -> tuple[list[str], list[str]]:
                     owner = _owning_module(candidate, rt.modules)
                     if owner is not None:
                         if owner.name != module and not record.type_only:
-                            siblings.add(owner.name)
+                            where = (path.relative_to(source_root).as_posix(), record.line)
+                            siblings[owner.name] = min(siblings.get(owner.name, where), where)
                         continue
                     # Importing a.b.c runs a/__init__.py and a/b/__init__.py too, so
                     # every resolvable ancestor package is part of the closure.
@@ -197,7 +212,7 @@ def import_closure(rt: Runtime, module: str) -> tuple[list[str], list[str]]:
                         if _source_path(package_dir, package, name) is not None:
                             helpers.add(name)
                             pending.append(name)
-    return sorted(helpers), sorted(siblings)
+    return sorted(helpers), {name: f"{file}:{line}" for name, (file, line) in siblings.items()}
 
 
 _IMPORT_CHECK_UNDER = """
@@ -279,6 +294,25 @@ print("""
 )
 
 _IMPORT_CHECK_TIMEOUT = 120
+_TRACEBACK_FRAME = re.compile(r'^\s*File "(.+)", line (\d+)')
+
+
+def _last_frame(stderr_lines: list[str], gate_root: Path) -> str | None:
+    """``path:line`` of the last traceback frame in a file, or None when there is none.
+
+    A path inside the throw-away *gate_root* is shown relative to it, which is
+    also its path in the source package. The gate script's own frame
+    (``<string>``) and frozen modules have no file to point at.
+    """
+    for line in reversed(stderr_lines):
+        match = _TRACEBACK_FRAME.match(line)
+        if match is None or match[1].startswith("<"):
+            continue
+        path = Path(match[1])
+        if path.is_relative_to(gate_root):
+            path = path.relative_to(gate_root)
+        return f"{path.as_posix()}:{match[2]}"
+    return None
 
 
 def _check_imports(
@@ -342,7 +376,9 @@ def _check_imports(
             lines = stderr_file.read().decode(errors="replace").strip().splitlines()
     if returncode != 0:
         reason = lines[-1] if lines else f"exit code {returncode}"
-        raise ValueError(f"the extracted service cannot import {dotted}: {reason}")
+        frame = _last_frame(lines, gate_root)
+        where = f" (at {frame})" if frame else ""
+        raise ValueError(f"the extracted service cannot import {dotted}: {reason}{where}")
     for line in reversed(lines):
         if line.startswith(_DISTRIBUTIONS_MARKER):
             distributions: list[str] = json.loads(line.removeprefix(_DISTRIBUTIONS_MARKER))
@@ -818,6 +854,34 @@ def _write_generated_files(
     return list(generated)
 
 
+def refuse_split_package(package: str) -> None:
+    """Raise ``ValueError`` naming every directory when *package* spans more than one."""
+    from .builtin.verifier import _package_portions
+
+    portions = _package_portions(package)
+    if len(portions) > 1:
+        raise ValueError(
+            f"package {package!r} spans {len(portions)} directories "
+            f"({', '.join(str(portion) for portion in portions)}); extraction copies one "
+            "directory and would leave out the others, so merge them into one directory first"
+        )
+
+
+def installed_copy_location(package_dir: Path) -> Path | None:
+    """The interpreter library directory holding *package_dir*, or None for a source tree.
+
+    Windows lists each prefix itself among the site-packages directories; a
+    prefix is not a library directory, as in the import check.
+    """
+    resolved = package_dir.resolve()
+    prefixes = {Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix)}
+    for directory in (*site.getsitepackages(), site.getusersitepackages()):
+        library = Path(directory)
+        if library.resolve() not in prefixes and resolved.is_relative_to(library.resolve()):
+            return library
+    return None
+
+
 def write_extraction(
     *,
     cfg: Configuration,
@@ -832,15 +896,7 @@ def write_extraction(
     Returns the paths written, relative to *output*.
     """
     assert cfg.package is not None
-    from .builtin.verifier import _package_portions
-
-    portions = _package_portions(cfg.package)
-    if len(portions) > 1:
-        raise ValueError(
-            f"package {cfg.package!r} spans {len(portions)} directories "
-            f"({', '.join(str(portion) for portion in portions)}); extraction copies one "
-            "directory and would leave out the others, so merge them into one directory first"
-        )
+    refuse_split_package(cfg.package)
     _validate_module_name(module, what="module")
     module_path = package_dir / Path(*module.split("."))
     if not (module_path.is_dir() and (module_path / "__init__.py").is_file()):

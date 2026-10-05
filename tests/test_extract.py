@@ -7,6 +7,7 @@ import importlib.machinery
 import ntpath
 import os
 import py_compile
+import site
 import subprocess
 import sys
 import tomllib
@@ -2099,3 +2100,124 @@ def test_extract_resolves_namespace_root_when_other_portion_precedes_project(
     )
     assert (out_dir / "company" / "shop" / "__init__.py").read_text() == ""
     assert not (out_dir / "company" / "__init__.py").exists()
+
+
+def test_extract_names_the_source_directory_before_anything_else(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "x = 1\n", "inventory": "from fakeapp.orders import x\n"},
+        extra_files={"contracts/__init__.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert lines[0] == f"source package: {tmp_path / 'fakeapp'}"
+    assert lines[1].startswith("note: also imported by: inventory")
+    assert "installed copy" not in result.stderr
+
+
+@pytest.mark.parametrize("lookup", ["getsitepackages", "getusersitepackages"])
+def test_extract_warns_when_the_source_directory_is_an_installed_copy(
+    lookup, make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""}, extra_files={"contracts/__init__.py": ""})
+    monkeypatch.setattr(
+        site,
+        lookup,
+        (lambda: [str(tmp_path)]) if lookup == "getsitepackages" else lambda: str(tmp_path),
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[0] == f"source package: {tmp_path / 'fakeapp'}"
+    assert f"warning: {tmp_path / 'fakeapp'} lies in {tmp_path}" in result.stderr
+    assert "installed copy" in result.stderr
+
+
+def test_extract_gate_error_names_the_file_and_line_that_failed(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": _IN_GATE + "if IN_GATE:\n    import no_such_dependency_xyz\n"},
+        extra_files={"contracts/__init__.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 1, result.output
+    assert "cannot import fakeapp.orders: ModuleNotFoundError" in result.stderr
+    assert "(at fakeapp/orders/__init__.py:4)" in result.stderr
+    assert not out_dir.exists()
+
+
+def test_extract_blocker_names_the_importing_file_and_line_of_each_sibling(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {
+            "orders": "from fakeapp.util import fmt\nfrom fakeapp.billing import charge\n",
+            "inventory": "def reserve():\n    return 1\n",
+            "billing": "def charge():\n    return 1\n",
+        },
+        extra_files={
+            "util.py": "def fmt():\n    from fakeapp.inventory import reserve\n    return reserve()\n",
+            "contracts/__init__.py": "",
+        },
+    )
+    out_dir = tmp_path / "orders-service"
+
+    blocked = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert blocked.exit_code == 1, blocked.output
+    assert (
+        "imports declared module(s): billing (fakeapp/orders/__init__.py:2), "
+        "inventory (fakeapp/util.py:2); the extracted service does not contain them"
+    ) in blocked.stderr
+
+
+def test_extract_refuses_a_package_spread_over_portions_before_listing_blockers(
+    monkeypatch, request, tmp_path
+):
+    first = tmp_path / "q1" / "nsspread" / "shop"
+    second = tmp_path / "q2" / "nsspread" / "shop"
+    (first / "orders").mkdir(parents=True)
+    (first / "orders" / "__init__.py").write_text("from nsspread.shop.inventory import x\n")
+    (second / "inventory").mkdir(parents=True)
+    (second / "inventory" / "__init__.py").write_text("x = 1\n")
+    monkeypatch.syspath_prepend(str(tmp_path / "q2"))
+    monkeypatch.syspath_prepend(str(tmp_path / "q1"))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MODULITH_PACKAGE", "nsspread.shop")
+
+    def reset_namespace_app() -> None:
+        for name in list(sys.modules):
+            if name == "nsspread" or name.startswith("nsspread."):
+                del sys.modules[name]
+        _runtime._reset_for_testing()
+
+    request.addfinalizer(reset_namespace_app)
+    importlib.invalidate_caches()
+    out_dir = tmp_path / "orders-service"
+
+    for flags in ([], ["--force"]):
+        result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir), *flags])
+
+        assert result.exit_code == 1, result.output
+        assert isinstance(result.exception, SystemExit)
+        assert result.stderr.startswith("error: package 'nsspread.shop' spans 2 directories")
+        assert str(first) in result.stderr
+        assert str(second) in result.stderr
+        assert "blocked" not in result.stderr
+        assert "Traceback" not in result.output
+        assert not out_dir.exists()

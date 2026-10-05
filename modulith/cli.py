@@ -1170,11 +1170,19 @@ def extract(
     unknown module, boundary violations / shared tables / imports of other
     modules not overridden by --force, or (never overridable) an extracted
     module, contracts module or manifest that fails to import or loads code
-    from the source tree outside the extracted service, or an existing/unsafe
-    --output path. A module-level import of another module therefore fails
+    from the source tree outside the extracted service, an application package
+    spread over several directories, or an existing/unsafe --output path. The
+    first line printed is the source package directory, with a warning on
+    stderr when it is an installed copy. A module-level import of another module therefore fails
     even with --force.
     """
-    from .extract import extraction_blockers, import_closure, write_extraction
+    from .extract import (
+        extraction_blockers,
+        import_closure,
+        installed_copy_location,
+        refuse_split_package,
+        write_extraction,
+    )
 
     rt = _bootstrap_or_exit(inspection=True)
     known = {m.name for m in rt.modules}
@@ -1188,6 +1196,24 @@ def extract(
 
     cfg = rt.config
     assert cfg is not None and cfg.package is not None  # guaranteed by _bootstrap_or_exit
+
+    try:
+        refuse_split_package(cfg.package)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    package_dir = verifier._package_dir(cfg.package)
+    if package_dir is None:
+        typer.echo(f"error: could not resolve package directory for {cfg.package!r}", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(f"source package: {package_dir}")
+    library = installed_copy_location(package_dir)
+    if library is not None:
+        typer.echo(
+            f"warning: {package_dir} lies in {library}, an installed copy; extract copies that "
+            "installed version, not your working tree",
+            err=True,
+        )
 
     violations = _collect_violations(rt)
     blockers = extraction_blockers(rt, module, violations)
@@ -1211,11 +1237,6 @@ def extract(
         for blocker in blockers:
             typer.echo(f"  {blocker}", err=True)
         typer.echo("Pass --force to extract anyway.", err=True)
-        raise typer.Exit(code=1)
-
-    package_dir = verifier._package_dir(cfg.package)
-    if package_dir is None:
-        typer.echo(f"error: could not resolve package directory for {cfg.package!r}", err=True)
         raise typer.Exit(code=1)
 
     helpers, _siblings = import_closure(rt, module)

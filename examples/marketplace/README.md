@@ -352,6 +352,7 @@ The platform keeps running while you extract.
 
 ```bash
 $ modulith extract notifications --output build/notifications-service
+source package: /path/to/examples/marketplace/marketplace
 extracted 'notifications' to build/notifications-service (12 file(s)):
   marketplace/__init__.py
   marketplace/notifications/__init__.py

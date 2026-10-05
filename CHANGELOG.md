@@ -157,6 +157,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - Outbox binding no longer fails quietly: bootstrap logs a WARNING naming the `outbox_options` tuning keys it ignored because a store was bound with `outbox.configure()`, a failed bind disposes the store and engine it created instead of leaking one per retry, and a publish inside a bound session that finds no outbox store bound (for example with `auto_discover = false`) logs one WARNING per process
 - The transactional outbox refuses an event whose JSON payload exceeds `max_payload_bytes` at publish, raising `ConfigurationError` before the row is saved, so the business transaction fails instead of committing a row dispatch can never deserialize; a payload exactly at the cap is accepted
 - A SHM broker publish refused because the store is full keeps the headroom its due prune freed, and one prune examines at most 1,000 expired publications, resuming where the last one stopped, so a large set of expired publications still held by pending deliveries no longer makes every 100th publish walk all of them
+- `modulith extract` prints the source package directory first and warns when it is an installed copy in site-packages; the import-check error and the sibling-import blocker name the file and line to fix, and an application package spread over several directories is refused before the blocker list instead of after `--force`
 
 ### Security
 
