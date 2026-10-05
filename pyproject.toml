@@ -90,11 +90,12 @@ postgres = [
 # Redis Streams broker. An explicit networked alternative to the local SHM
 # default used by process-per-module mode.
 # redis-py 5.0.1/6/7 are API-compatible for the commands the adapter uses
-# (XADD/XREADGROUP/XAUTOCLAIM/XACK and aclose()); floor excludes 5.0.0, which
+# (XADD/XREADGROUP/XAUTOCLAIM/XACK and aclose()); verified through 8.1.0 (unit
+# tests, the real-Redis e2e suite, mypy --strict); floor excludes 5.0.0, which
 # has close() but not aclose() (added in 5.0.1); upper bound tracks the next
 # unverified major.
 redis = [
-    "redis>=5.0.1,<8.0",
+    "redis>=5.0.1,<9.0",
 ]
 
 # Database broker (relational DB as cross-module transport — Redis-free
@@ -110,9 +111,11 @@ database = [
     "aiomysql>=0.2,<1.0",
     # MySQL 8 defaults to caching_sha2_password auth, which aiomysql can only
     # perform when `cryptography` is present — required in practice for MySQL 8.
-    # cryptography verified through 49.x (its installed test version); bound
-    # tracks the next unverified release like every other extra here.
-    "cryptography>=41.0,<50.0",
+    # Verified through 50.0.2 (caching_sha2_password logins against MySQL 8.0 via
+    # aiomysql). 50.0.0 fixes CVE-2026-69247 (GHSA-g6cj-pr64-35w5, affects
+    # >=44.0.0,<50.0.0), so the bound must keep admitting 50.x; it otherwise
+    # tracks the next unverified major like every other extra here.
+    "cryptography>=41.0,<51.0",
     "aiosqlite>=0.19,<1.0",
     "alembic>=1.13,<2.0",
     # PyMySQL 1.2.1 removed converters.escape_bytes_prefixed, which aiomysql
@@ -145,7 +148,10 @@ fastapi = [
 # the CLI (just `import modulith`) don't pay typer's startup cost.
 cli = [
     "typer>=0.12,<1.0",
-    "rich>=13.0,<15.0",
+    # modulith never imports rich; typer renders help and errors through it.
+    # Verified through 15.0.0 (the typer-driven CLI tests, with and without
+    # GITHUB_ACTIONS forcing ANSI help).
+    "rich>=13.0,<16.0",
 ]
 
 # Test plugin (separate package conceptually, but shipped inside modupy as
@@ -207,8 +213,9 @@ integration = [
     "testcontainers>=4.0,<5.0",
     "asyncpg>=0.29,<1.0",
     "aiomysql>=0.2,<1.0",
-    # aiomysql needs cryptography to auth against MySQL 8 (caching_sha2_password).
-    "cryptography>=41.0,<50.0",
+    # aiomysql needs cryptography to auth against MySQL 8 (caching_sha2_password);
+    # bound and verification as in the `database` extra.
+    "cryptography>=41.0,<51.0",
     "psycopg[binary]>=3.1,<4.0",
     # Capped like the `database` extra: aiomysql breaks on PyMySQL >= 1.2.1.
     "pymysql>=1.1,<1.2.1",
