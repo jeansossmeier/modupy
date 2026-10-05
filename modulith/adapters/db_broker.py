@@ -1749,6 +1749,9 @@ class DatabaseBroker:
         workers see no row, both insert, and one dies with IntegrityError —
         exactly the first-deploy hazard for a replicated module. Refreshes
         ``updated_at`` on conflict so the row doubles as a liveness marker.
+
+        Under ``no_subscriber_policy="store"`` the retained backlog is then
+        replayed one committed page at a time (see the comment below).
         """
         if not targets:
             return
@@ -1758,7 +1761,7 @@ class DatabaseBroker:
         retained, _ = _retained_tables()
         ordered_targets = sorted(set(targets))
 
-        async def op(conn: Any) -> None:
+        async def register(conn: Any) -> dict[str, list[str]]:
             from sqlalchemy import select
 
             now = await self._now(conn)
@@ -1768,26 +1771,13 @@ class DatabaseBroker:
             ]
             await conn.execute(self._upsert_subscription(subscription, rows))
 
+            backlog: dict[str, list[str]] = {}
             if self._no_subscriber_policy != "store":
-                return
+                return backlog
             for target in ordered_targets:
                 await self._prune_expired_retained(conn, now, target)
-                if self._orphan_replay_policy == "ttl_all_groups":
-                    replay_groups = [group]
-                elif self._orphan_replay_policy == "first_groups":
-                    group_result = await conn.execute(
-                        select(subscription.c.consumer_group).where(subscription.c.target == target)
-                    )
-                    replay_groups = [row[0] for row in group_result]
-                else:
+                if self._orphan_replay_policy not in {"ttl_all_groups", "first_groups"}:
                     continue
-                # Page the replay by id. Under ``ttl_all_groups`` the retained
-                # table holds every publish for the whole retention window even
-                # while consumers are healthy, and this runs on every consumer
-                # start — selecting the full rows in one statement would make
-                # the backlog's entire payload volume resident at once
-                # (SQLAlchemy's async execute() prebuffers the whole result),
-                # so a restart after a busy window OOMs on the way up.
                 id_result = await conn.execute(
                     select(retained.c.id)
                     .where(
@@ -1796,19 +1786,50 @@ class DatabaseBroker:
                     )
                     .order_by(retained.c.created_at, retained.c.id)
                 )
-                source_ids = [row[0] for row in id_result]
-                for start in range(0, len(source_ids), _RETAINED_ID_CHUNK):
-                    page = source_ids[start : start + _RETAINED_ID_CHUNK]
-                    page_result = await conn.execute(
-                        select(retained)
-                        .where(retained.c.id.in_(page))
-                        .order_by(retained.c.created_at, retained.c.id)
-                    )
-                    await self._fan_out_retained(conn, list(page_result.mappings()), replay_groups)
-                    if self._orphan_replay_policy == "first_groups":
-                        await self._delete_retained(conn, page)
+                backlog[target] = [row[0] for row in id_result]
+            return backlog
 
-        await self._write_target_locked(ordered_targets, op)
+        # The registration commits first: a publish after it fans out to this
+        # group itself, so the ids listed here are exactly the backlog to
+        # replay. Each page then commits under its own target lock, so a
+        # publish to the target waits for one page, not the whole replay. A
+        # crash between pages leaves the committed pages in place; the next
+        # start replays the rest and the ledger skips what was delivered.
+        backlog = await self._write_target_locked(ordered_targets, register)
+        for target, source_ids in backlog.items():
+            for start in range(0, len(source_ids), _RETAINED_ID_CHUNK):
+                page = source_ids[start : start + _RETAINED_ID_CHUNK]
+                await self._write_target_locked(
+                    [target], functools.partial(self._replay_page, target, group, page)
+                )
+
+    async def _replay_page(self, target: str, group: str, page: list[str], conn: Any) -> None:
+        """Fan one page of retained sources out to the replay groups.
+
+        Paging by id keeps the backlog's payload volume from being resident at
+        once (SQLAlchemy's async ``execute()`` prebuffers a whole result): under
+        ``ttl_all_groups`` the retained table holds every publish of the
+        retention window and this runs on every consumer start.
+        """
+        from sqlalchemy import select
+
+        _, subscription, _ = broker_schema()
+        retained, _ = _retained_tables()
+        if self._orphan_replay_policy == "first_groups":
+            group_result = await conn.execute(
+                select(subscription.c.consumer_group).where(subscription.c.target == target)
+            )
+            replay_groups = [row[0] for row in group_result]
+        else:
+            replay_groups = [group]
+        page_result = await conn.execute(
+            select(retained)
+            .where(retained.c.id.in_(page))
+            .order_by(retained.c.created_at, retained.c.id)
+        )
+        await self._fan_out_retained(conn, list(page_result.mappings()), replay_groups)
+        if self._orphan_replay_policy == "first_groups":
+            await self._delete_retained(conn, page)
 
     def _upsert_subscription(self, subscription: Any, rows: list[dict[str, Any]]) -> Any:
         """Build the dialect-native subscription upsert statement.

@@ -635,6 +635,45 @@ async def test_first_groups_replay_pages_through_every_retained_source(
     assert await _row_count(engine, table=delivery) == 0
 
 
+async def test_replay_commits_each_page_so_a_crash_between_pages_resumes_on_restart(
+    engine: Any,
+    monkeypatch: Any,
+) -> None:
+    import modulith.adapters.db_broker as db_broker_module
+
+    monkeypatch.setattr(db_broker_module, "_RETAINED_ID_CHUNK", 2)
+    broker = DatabaseBroker(engine=engine, no_subscriber_policy="store")
+    _, subscription, _ = broker_schema()
+    target = "fakeapp.orders.WidgetCreated"
+    payloads = [f"payload-{index}".encode() for index in range(5)]
+    for payload in payloads:
+        await broker.publish(target, payload, {"event_type": target})
+
+    fan_out = broker._fan_out_retained
+    calls = 0
+
+    async def crash_on_second_page(conn: Any, sources: list[Any], groups: list[str]) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("process died between pages")
+        return int(await fan_out(conn, sources, groups))
+
+    monkeypatch.setattr(broker, "_fan_out_retained", crash_on_second_page)
+    with pytest.raises(RuntimeError, match="died between pages"):
+        await broker.subscribe([target], "g")
+
+    # The subscription and the first page were committed on their own.
+    assert await _row_count(engine, table=subscription) == 1
+    assert await _row_count(engine) == 2
+
+    monkeypatch.setattr(broker, "_fan_out_retained", fan_out)
+    await broker.subscribe([target], "g")
+
+    rows = await broker.claim_batch("g", batch_size=10, consumer_name="c1")
+    assert sorted(row["payload"] for row in rows) == sorted(payloads)
+
+
 async def _retained_sources(engine: Any, broker: DatabaseBroker, count: int) -> list[Any]:
     """Store ``count`` retained messages (no subscriber yet) and read them back."""
     from sqlalchemy import select

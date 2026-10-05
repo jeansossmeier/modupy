@@ -133,6 +133,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - Under `sqlite_synchronous="FULL"` the SHM store also turns on SQLite's `fullfsync` and `checkpoint_fullfsync`, which flush the drive cache on macOS, and opening a store no longer fails when another process grows the file during start-up
 - `outbox.unbind_session` ends only the binding its own `bind_session` call created, so a later binding that is still open stays bound when binds overlap
 - SHM broker: a hint read after a small gap touches only the slots between the consumer's cursor and the ring's peak instead of the whole ring (about 200 ms to under 0.1 ms per hint at `shm_capacity` 1,000,000), and a hint file that outlived a store reset is reset at open, so hint wake-ups work again
+- Database broker: a consumer restart under `no_subscriber_policy="store"` commits the subscription first and then replays retained messages one committed page at a time, so a publish to that target waits for at most one page instead of the whole replay, and a crash between pages keeps the committed pages
 
 ### Security
 

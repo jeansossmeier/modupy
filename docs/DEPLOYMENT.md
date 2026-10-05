@@ -1550,9 +1550,12 @@ Step 6 depends on the broker:
   - database broker, `store` policy: each is kept for
     `orphan_retention_seconds` (86400 s by default) and replayed to a group
     that subscribes before then (`ttl_all_groups`; only the first such group
-    under `first_groups`), then pruned; under `expected_groups` it fans out
-    at once to `expected_consumer_groups` and nothing is kept for a later
-    subscriber;
+    under `first_groups`), then pruned (the replay commits every 500
+    messages, so a publish to the target waits for one page, not the whole
+    replay); under `expected_groups` it goes
+    at once to the groups `expected_consumer_groups` lists for its target and
+    nothing is kept for a later subscriber, and a publish to a target with no
+    entry there raises `ConfigurationError`;
   - SHM broker: each is kept for `orphan_retention_seconds` (3600 s by
     default) and replayed to a group that subscribes within it while the
     store has room below its publish budget.

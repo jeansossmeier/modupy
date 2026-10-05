@@ -1012,8 +1012,17 @@ group that registers before expiry gets a copy), `first_groups` (fan out to
 the first registration set then delete), or `expected_groups` (pre-create
 delivery rows for configured groups). A group listed in
 `expected_consumer_groups` keeps receiving rows even after `modulith broker
-drop-group` removes its subscription; remove it from that setting when you
-retire its module.
+drop-group` removes its subscription. When you retire its module, delete the
+target's key if the group is the only one listed for it (an empty list is
+rejected) and otherwise remove the group from that key's list; a publish to a
+target with no key raises `ConfigurationError`.
+
+A consumer restart replays the retained messages 500 at a time, each page in
+its own transaction, so a publish to that target waits for at most one page
+rather than the whole replay, and a message published meanwhile can be
+claimed before older retained ones that are still waiting for their page. If
+the process dies between pages, the committed pages stay delivered and the
+next start replays the rest.
 
 The replay policies differ in when each group gets its delivery row:
 

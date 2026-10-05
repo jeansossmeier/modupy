@@ -524,6 +524,53 @@ async def test_store_publish_subscribe_race_never_misses_delivery(
         assert len(rows) == 1, f"publish/subscribe race lost {target}"
 
 
+async def test_publish_during_a_slow_restart_replay_is_not_blocked_for_the_whole_replay(
+    broker_engine: Any,
+    monkeypatch: Any,
+) -> None:
+    import modulith.adapters.db_broker as db_broker_module
+
+    monkeypatch.setattr(db_broker_module, "_RETAINED_ID_CHUNK", 2)
+    broker = DatabaseBroker(engine=broker_engine, no_subscriber_policy="store")
+    _, subscription, _ = broker_schema()
+    target = f"{_TARGET}.slow-replay"
+    backlog = [f"backlog-{index}".encode() for index in range(8)]
+    for payload in backlog:
+        await broker.publish(target, payload, {"event_type": _EVENT_TYPE})
+
+    events: list[str] = []
+    first_page_running = asyncio.Event()
+    fan_out = broker._fan_out_retained
+
+    async def slow_page(conn: Any, sources: list[Any], groups: list[str]) -> int:
+        if len(sources) == 1:  # a publish's own fan-out, not a replay page
+            return int(await fan_out(conn, sources, groups))
+        written = int(await fan_out(conn, sources, groups))
+        first_page_running.set()
+        await asyncio.sleep(0.5)
+        events.append("page-done")
+        return written
+
+    monkeypatch.setattr(broker, "_fan_out_retained", slow_page)
+
+    replay = asyncio.create_task(broker.subscribe([target], "g"))
+    await asyncio.wait_for(first_page_running.wait(), timeout=20)
+    assert await _row_count(broker_engine, subscription) == 1  # committed before the pages
+
+    await asyncio.sleep(0.2)  # the publish queues behind the page that holds the lock
+    await asyncio.wait_for(
+        broker.publish(target, b"live", {"event_type": _EVENT_TYPE}),
+        timeout=20,
+    )
+    events.append("publish-done")
+    await asyncio.wait_for(replay, timeout=60)
+
+    assert events.count("page-done") == 4
+    assert events[-1] == "page-done", f"the publish waited for the whole replay: {events}"
+    rows = await broker.claim_batch("g", batch_size=20, consumer_name="c1")
+    assert sorted(bytes(row["payload"]) for row in rows) == sorted([*backlog, b"live"])
+
+
 # ---------------------------------------------------------------------------
 # Crash recovery — an orphaned claim is reclaimed after the visibility timeout
 # ---------------------------------------------------------------------------
