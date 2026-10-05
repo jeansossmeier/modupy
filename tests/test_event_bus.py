@@ -7,6 +7,7 @@ code that did not yet have it (strict TDD).
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import threading
 from dataclasses import dataclass
@@ -92,6 +93,50 @@ def test_register_accepts_wrapped_sync_and_async_handlers() -> None:
     bus.register(BusEvent, async_handler)
     bus.register(BusEvent, wrap_sync_listener(sync_handler))
     assert len(bus.listeners_for(BusEvent)) == 2
+
+
+async def test_async_contract_check_never_calls_asyncio_iscoroutinefunction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """asyncio.iscoroutinefunction warns on every call on Python 3.14 and is
+    slated for removal in 3.16, so neither lookup of the registration check
+    (the handler, then its __call__) may use it. Every documented handler form
+    must still register and dispatch, and a plain sync handler must still be
+    rejected with the contract's own error."""
+    from modulith.sync import wrap_sync_listener
+
+    def forbidden(func: object) -> bool:
+        pytest.fail("asyncio.iscoroutinefunction is deprecated; use inspect.iscoroutinefunction")
+
+    monkeypatch.setattr(asyncio, "iscoroutinefunction", forbidden)
+
+    bus = InMemoryEventBus()
+    ran: list[str] = []
+
+    async def async_function(event: BusEvent) -> None:
+        ran.append("async function")
+
+    async def async_with_label(label: str, event: BusEvent) -> None:
+        ran.append(label)
+
+    class AsyncCallable:
+        async def __call__(self, event: BusEvent) -> None:
+            ran.append("async __call__")
+
+    def sync_function(event: BusEvent) -> None:
+        ran.append("wrapped sync")
+
+    bus.register(BusEvent, async_function)
+    bus.register(BusEvent, functools.partial(async_with_label, "partial"))
+    bus.register(BusEvent, AsyncCallable())
+    bus.register(BusEvent, wrap_sync_listener(sync_function))
+    with pytest.raises(TypeError, match="sync_function"):
+        bus.register(BusEvent, sync_function)
+
+    await bus.publish(BusEvent(n=1))
+
+    assert sorted(ran) == ["async __call__", "async function", "partial", "wrapped sync"]
+    assert len(bus.listeners_for(BusEvent)) == 4
 
 
 async def test_runtime_register_listener_rejects_sync_handler() -> None:

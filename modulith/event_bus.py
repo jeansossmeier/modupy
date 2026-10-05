@@ -16,6 +16,7 @@ concern stays in its own well-defined layer.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import threading
 from collections import defaultdict
@@ -35,10 +36,10 @@ def _require_async_handler(event_type: type, handler: Callable[..., Any]) -> Non
     ``asyncio.gather()`` batch at publish time with a TypeError that names
     neither the offending handler nor the violated contract.
     """
-    if asyncio.iscoroutinefunction(handler):
+    if inspect.iscoroutinefunction(handler):
         return
     call = getattr(handler, "__call__", None)  # noqa: B004 - duck-typed check
-    if call is not None and asyncio.iscoroutinefunction(call):
+    if call is not None and inspect.iscoroutinefunction(call):
         return
     raise TypeError(
         f"listener {getattr(handler, '__qualname__', repr(handler))!r} for event "
