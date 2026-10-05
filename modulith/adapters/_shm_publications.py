@@ -94,9 +94,9 @@ def publish(
 ) -> PublishResult:
     """Atomically persist one replayable publication and current deliveries."""
     _ensure_payload_size(payload, max_payload_bytes)
-    now = time.time()
     try:
         with immediate_transaction(conn):
+            now = time.time()
             if prune_due:
                 _prune_expired_empty_publications(conn, now, _PUBLISH_PRUNE_LIMIT)
             publication, inserted = _insert_publication(
@@ -265,10 +265,10 @@ def _subscribe(
 ) -> _Subscribed:
     inserted = 0
     cut_short: list[tuple[str, int, int]] = []
-    now = time.time()
-    page_limit = _publish_budget_pages(conn, max_store_bytes) - REPLAY_PUBLISH_HEADROOM_PAGES
+    publish_limit = _publish_budget_pages(conn, max_store_bytes) - REPLAY_PUBLISH_HEADROOM_PAGES
     requested_targets = set(targets)
     with immediate_transaction(conn):
+        now = time.time()
         current_targets = {
             str(row["target"])
             for row in conn.execute(
@@ -294,18 +294,24 @@ def _subscribe(
                 """,
                 (target, group),
             )
-        if completion_mode == "mark":
-            # Claiming and mark-acking a replayed row rewrites it wider in place,
-            # splitting the pages the replay packed full: draining a cut replay
-            # grew the store by about half the pages the replay added. Charging
-            # the replay as much again as it adds covers that growth for one
-            # group whose listeners succeed; error text, dead letters and other
-            # groups' undrained replays are not reserved for.
-            used = _used_pages(conn)
-            if used < page_limit:
-                page_limit = used + (page_limit - used) // 2
+        replayed_pages = 0
         for target in sorted(requested_targets - current_targets):
+            used = _used_pages(conn)
+            page_limit = publish_limit
+            if completion_mode == "mark":
+                # Claiming and mark-acking a replayed row rewrites it wider in place,
+                # splitting the pages the replay packed full: draining a cut replay
+                # grew the store by about half the pages the replay added. Charging
+                # the replay as much again as it adds covers that growth for one
+                # group whose listeners succeed; error text, dead letters and other
+                # groups' undrained replays are not reserved for. The room is
+                # measured per target, without the pages earlier targets replayed,
+                # because the expiry below frees pages.
+                base = used - replayed_pages
+                if base < publish_limit:
+                    page_limit = base + (publish_limit - base) // 2
             replayed, skipped = _replay(conn, target, group, now, page_limit)
+            replayed_pages += _used_pages(conn) - used
             inserted += replayed
             if skipped:
                 cut_short.append((target, replayed, skipped))

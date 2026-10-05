@@ -8,6 +8,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,6 +17,7 @@ import pytest
 from modulith import ConfigurationError
 from modulith.adapters import _shm_publications
 from modulith.adapters._shm_coldstore import ShmColdStore
+from modulith.adapters._shm_schema import immediate_transaction
 from modulith.adapters._shm_store import (
     _UNCAPPED_PAGES,
     ClaimToken,
@@ -669,6 +671,137 @@ def test_draining_a_cut_replay_in_mark_mode_keeps_room_for_a_publish_that_fit_be
         assert len(_drain(store, "late")) == replayed
 
         store.publish("events.V", b"{}", None, None)
+    finally:
+        store.close()
+
+
+def _run_before_the_write_lock(
+    monkeypatch: pytest.MonkeyPatch, store: SqliteQueueStore, action: Callable[[], None]
+) -> None:
+    """Run action once, after store starts a write and before it holds the write lock."""
+    pending = [action]
+
+    def transaction(conn: sqlite3.Connection) -> AbstractContextManager[None]:
+        if conn is store._conn and pending:
+            pending.pop()()
+        return immediate_transaction(conn)
+
+    monkeypatch.setattr(_shm_publications, "immediate_transaction", transaction)
+
+
+def test_a_publish_that_takes_the_write_lock_after_a_subscribe_is_claimed_after_the_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "race.db"
+    publisher = _bounded_store(path, 4 * 1024 * 1024)
+    subscriber = _bounded_store(path, 4 * 1024 * 1024)
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    replayed: list[int] = []
+
+    def subscribe_while_the_publisher_waits() -> None:
+        clock[0] += 10
+        replayed.append(subscriber.subscribe(["events.T"], "g"))
+
+    try:
+        for index in (1, 2, 3):
+            clock[0] += 1
+            publisher.publish("events.T", b"{}", None, f"p{index}")
+        _run_before_the_write_lock(monkeypatch, publisher, subscribe_while_the_publisher_waits)
+
+        publisher.publish("events.T", b"{}", None, "p4")
+
+        assert replayed == [3]
+        clock[0] += 100
+        claimed = subscriber.claim("g", 10, _LONG_CONSUMER, 30.0)
+        assert [row["message_id"] for row in claimed] == ["p1", "p2", "p3", "p4"]
+    finally:
+        publisher.close()
+        subscriber.close()
+
+
+def test_a_subscribe_that_waits_for_the_write_lock_replays_only_what_is_retained_once_it_has_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _bounded_store(tmp_path / "wait.db", 4 * 1024 * 1024, orphan_retention_seconds=5.0)
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    def lock_wait_lasts_ten_seconds() -> None:
+        clock[0] += 10
+
+    try:
+        store.publish("events.T", b"{}", None, "short-lived")
+        _run_before_the_write_lock(monkeypatch, store, lock_wait_lasts_ten_seconds)
+
+        assert store.subscribe(["events.T"], "g") == 0
+
+        assert store.claim("g", 10, _LONG_CONSUMER, 30.0) == []
+    finally:
+        store.close()
+
+
+def test_a_mark_mode_replay_takes_half_the_room_left_after_the_previous_targets_expiry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    max_store_bytes = 2 * 1024 * 1024
+    store = _bounded_store(tmp_path / "freed.db", max_store_bytes, completion_mode="mark")
+    try:
+        for _ in range(150):
+            store.publish("a.old", b"z" * 2000, None, None)
+        used, budget = _used_and_budget_pages(store, max_store_bytes)
+        while used < budget - 60:
+            store.publish("b.live", b"%08d" % used, None, None)
+            used, _ = _used_and_budget_pages(store, max_store_bytes)
+        store._conn.execute("UPDATE shm_publication SET retained_until=0 WHERE target='a.old'")
+        store._conn.commit()
+        used_before_subscribe, _ = _used_and_budget_pages(store, max_store_bytes)
+        publish_limit = budget - _shm_publications.REPLAY_PUBLISH_HEADROOM_PAGES
+
+        # (target, pages used before its replay, pages used after it, publications skipped)
+        replays: list[tuple[str, int, int, int]] = []
+        real_replay = _shm_publications._replay
+
+        def recording_replay(
+            conn: sqlite3.Connection, target: str, group: str, now: float, page_limit: int
+        ) -> tuple[int, int]:
+            used_before = _shm_publications._used_pages(conn)
+            result = real_replay(conn, target, group, now, page_limit)
+            replays.append((target, used_before, _shm_publications._used_pages(conn), result[1]))
+            return result
+
+        monkeypatch.setattr(_shm_publications, "_replay", recording_replay)
+        store.subscribe(["a.old", "b.live"], "g")
+
+        assert [target for target, *_ in replays] == ["a.old", "b.live"]
+        _, used_before, used_after, skipped = replays[1]
+        assert used_before < used_before_subscribe - 40, "the expiry freed too few pages"
+        assert skipped > 0, "the page limit did not cut the replay short"
+        assert used_after - used_before <= (publish_limit - used_before) // 2
+    finally:
+        store.close()
+
+
+def test_a_mark_mode_replay_of_several_targets_adds_at_most_half_the_room_left(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    max_store_bytes = 2 * 1024 * 1024
+    store = _bounded_store(tmp_path / "targets.db", max_store_bytes, completion_mode="mark")
+    try:
+        used, budget = _used_and_budget_pages(store, max_store_bytes)
+        index = 0
+        while used < budget - 60:
+            store.publish(("a.live", "b.live")[index % 2], b"%08d" % index, None, None)
+            index += 1
+            used, _ = _used_and_budget_pages(store, max_store_bytes)
+        publish_limit = budget - _shm_publications.REPLAY_PUBLISH_HEADROOM_PAGES
+
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
+            store.subscribe(["a.live", "b.live"], "g")
+
+        assert len(_warnings(caplog)) == 2, "each target's replay should be cut short"
+        used_after, _ = _used_and_budget_pages(store, max_store_bytes)
+        assert used_after - used <= (publish_limit - used) // 2
     finally:
         store.close()
 
