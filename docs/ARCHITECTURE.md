@@ -718,7 +718,16 @@ creates the consumer group (`XGROUP CREATE`, idempotent), reads new messages
 with `XREADGROUP`, `XACK`s on success, and reclaims messages a crashed consumer
 left pending via `XAUTOCLAIM` past an idle threshold — the at-least-once
 recovery path. Messages lacking an `event_type` header, or that exhaust
-handling, go to a bounded dead-letter stream. Three details carry the
+handling, go to a bounded dead-letter stream. Exhaustion is counted on Redis's
+own delivery count for the entry (`XPENDING`'s times-delivered, raised by the
+first read and by each `XAUTOCLAIM`). The consumer checks it before it
+dispatches a reclaimed entry and dead-letters one that has already had
+`max_delivery_attempts` deliveries (a count above the cap, since it includes
+the reclaim in hand) without running its listener, since a listener that
+kills the worker never reports a failure. A listener that raises is still
+judged by the failure path after its `max_delivery_attempts`-th run. The ownership renewal before each
+later entry of a batch (`XCLAIM ... JUSTID`) leaves the count alone, so
+waiting behind slower siblings spends none of the budget. Three details carry the
 at-least-once guarantee here. A message is never `XACK`ed without a successful
 dispatch. `XAUTOCLAIM`'s third reply element lists pending ids a `MAXLEN` trim
 removed from under the PEL — those *are* permanently lost, so the consumer logs

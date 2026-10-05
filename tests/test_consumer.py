@@ -29,6 +29,7 @@ from modulith.event_bus import InMemoryEventBus
 from modulith.protocols import Consumer, ConsumerHealth, HealthAwareConsumer
 from modulith.runtime import _runtime
 from modulith.serializers import JsonEventSerializer
+from tests.test_redis_broker import StatefulFakeRedis
 
 # Module scope so the serializer resolves the fully-qualified class name on the
 # round trip (consumer deserializes by the event_type header).
@@ -1762,3 +1763,244 @@ async def test_consumer_leaves_an_entry_pending_when_the_ownership_check_fails()
 
     assert received == [1]
     assert broker.acked == [("t", ids[0])]
+
+
+# ---------------------------------------------------------------------------
+# A reclaimed entry at the delivery cap is dead-lettered before its listener runs
+# ---------------------------------------------------------------------------
+
+_CAP = 3
+_POISON_TARGET = f"{CrossEvent.__module__}.{CrossEvent.__qualname__}"
+
+
+class _WorkerKilled(BaseException):
+    """Stands in for a listener that takes the whole worker down (``os._exit``).
+
+    A BaseException skips ``dispatch_local``'s ``except Exception`` handling, so
+    the entry stays pending exactly as it does when the process dies.
+    """
+
+
+def _as_bytes(value: Any) -> bytes:
+    return value if isinstance(value, bytes) else str(value).encode()
+
+
+class _DeadLetteringFakeRedis(StatefulFakeRedis):
+    """StatefulFakeRedis that also runs the dead-letter script.
+
+    It moves the entry to ``<stream>.dead`` and acknowledges the source, which
+    is all ``RedisStreamsBroker.dead_letter`` needs from Redis here.
+    """
+
+    async def eval(self, script: str, numkeys: int, *keys_and_args: Any) -> int:
+        if "XADD" not in script:
+            return await super().eval(script, numkeys, *keys_and_args)
+        stream, dead_stream, _dedup, group, mid, _maxlen, *rest = keys_and_args
+        fields = {_as_bytes(k): _as_bytes(v) for k, v in zip(rest[::2], rest[1::2], strict=True)}
+        await self.xadd(dead_stream, fields)
+        return await self.xack(stream, group, mid)
+
+
+async def _publish_then_deliver_once(
+    broker: Any, starts: list[int], *, kills_worker: bool
+) -> BrokerConsumer:
+    """Publish one entry whose listener fails every time; run delivery 1 (XREADGROUP).
+
+    The listener either kills the worker or raises. Deliveries 2.. are the
+    caller's reclaims, so ``starts`` logs every listener start across all of them.
+    """
+
+    async def failing(evt: CrossEvent) -> None:
+        starts.append(evt.value)
+        if kills_worker:
+            raise _WorkerKilled
+        raise ValueError("listener down")
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, failing)
+    consumer = BrokerConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=JsonEventSerializer(),
+        consumer_name="orders:1",
+        group="modulith-orders",
+        targets=[_POISON_TARGET],
+        poll_block_ms=10,
+        reclaim_min_idle_ms=0,
+        max_delivery_attempts=_CAP,
+    )
+    await broker.ensure_group(_POISON_TARGET, "modulith-orders")
+    payload = JsonEventSerializer().serialize(CrossEvent(value=1))
+    await broker.publish(_POISON_TARGET, payload, {"event_type": _POISON_TARGET})
+    delivered = await broker.read(
+        _POISON_TARGET, consumer="orders:1", group="modulith-orders", block_ms=1
+    )
+    if kills_worker:
+        with pytest.raises(_WorkerKilled):
+            await consumer._handle(_POISON_TARGET, delivered)
+    else:
+        await consumer._handle(_POISON_TARGET, delivered)
+    return consumer
+
+
+async def _reclaim_until_it_stops(consumer: BrokerConsumer, reclaims: int) -> None:
+    """Run ``reclaims`` reclaim cycles, letting a killed worker's death pass."""
+    for _ in range(reclaims):
+        try:
+            await consumer._reclaim(_POISON_TARGET)
+        except _WorkerKilled:
+            pass
+
+
+def _fake_broker() -> tuple[_DeadLetteringFakeRedis, Any]:
+    from modulith.adapters.redis_broker import RedisStreamsBroker
+
+    fake = _DeadLetteringFakeRedis()
+    return fake, RedisStreamsBroker(client=fake, stream_prefix="p", consumer_group="g")
+
+
+def _dead_source_ids(fake: _DeadLetteringFakeRedis) -> list[bytes]:
+    dead = fake.streams.get(f"p.{_POISON_TARGET}.dead", [])
+    return [fields[b"h:source_message_id"] for _mid, fields in dead]
+
+
+async def test_message_that_kills_the_worker_runs_cap_times_then_is_dead_lettered_unrun() -> None:
+    fake, broker = _fake_broker()
+    starts: list[int] = []
+    consumer = await _publish_then_deliver_once(broker, starts, kills_worker=True)
+
+    await _reclaim_until_it_stops(consumer, 2)  # deliveries 2 and 3: at most the cap, dispatched
+    assert starts == [1, 1, 1]
+    assert _dead_source_ids(fake) == []
+
+    await consumer._reclaim(_POISON_TARGET)  # delivery 4: past the cap, dead-lettered unrun
+
+    assert starts == [1, 1, 1]
+    assert _dead_source_ids(fake) == [b"1-0"]
+    assert fake.groups[(f"p.{_POISON_TARGET}", "modulith-orders")]["pel"] == {}
+    await consumer._reclaim(_POISON_TARGET)
+    assert starts == [1, 1, 1]
+
+
+async def test_listener_that_raises_runs_cap_times_then_is_dead_lettered() -> None:
+    fake, broker = _fake_broker()
+    starts: list[int] = []
+    consumer = await _publish_then_deliver_once(broker, starts, kills_worker=False)
+
+    await _reclaim_until_it_stops(consumer, 2)  # deliveries 2 and 3
+
+    assert starts == [1, 1, 1]
+    assert _dead_source_ids(fake) == [b"1-0"]
+    assert fake.groups[(f"p.{_POISON_TARGET}", "modulith-orders")]["pel"] == {}
+
+
+@pytest.mark.integration
+async def test_integration_message_that_kills_the_worker_is_dead_lettered_past_the_cap(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    """Real Redis: XAUTOCLAIM's delivery count passes the cap and stops the crash loop."""
+    from modulith.adapters.redis_broker import RedisStreamsBroker
+
+    broker = RedisStreamsBroker(url=redis_url, stream_prefix=redis_key_prefix, consumer_group="g")
+    starts: list[int] = []
+    try:
+        consumer = await _publish_then_deliver_once(broker, starts, kills_worker=True)
+        await _reclaim_until_it_stops(consumer, 2)
+        assert starts == [1, 1, 1]
+        assert await broker.list_dead_letters() == []
+
+        await consumer._reclaim(_POISON_TARGET)
+
+        assert starts == [1, 1, 1]
+        [dead] = await broker.list_dead_letters()
+        assert dead.attempts == _CAP + 1
+        pending = await redis_client.xpending(
+            f"{redis_key_prefix}.{_POISON_TARGET}", "modulith-orders"
+        )
+        assert pending["pending"] == 0
+    finally:
+        await broker.close()
+
+
+class _CountedBroker(RenewingConsumerBroker):
+    """A consumer broker whose ``delivery_attempts`` answers from ``attempts``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts: dict[str, int | None | Exception] = {}
+
+    async def delivery_attempts(
+        self, target: str, message_id: str, group: str | None = None
+    ) -> int | None:
+        answer = self.attempts[message_id]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+async def _reclaim_one_entry(attempts: int | None | Exception) -> tuple[_CountedBroker, list[int]]:
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    broker = _CountedBroker()
+    broker.attempts["1-0"] = attempts
+    broker.pending["t"] = [("1-0", _cross_message(1))]
+    consumer = _make_consumer(broker, bus, targets=["t"])
+    await consumer._reclaim("t")
+    return broker, received
+
+
+@pytest.mark.parametrize(
+    ("attempts", "runs"),
+    [
+        pytest.param(4, True, id="below-the-cap"),
+        pytest.param(5, True, id="at-the-cap"),
+        pytest.param(6, False, id="past-the-cap"),
+    ],
+)
+async def test_reclaimed_entry_is_dispatched_until_its_count_passes_the_delivery_cap(
+    attempts: int, runs: bool
+) -> None:
+    broker, received = await _reclaim_one_entry(attempts)
+
+    assert received == ([1] if runs else [])
+    assert broker.acked == ([("t", "1-0")] if runs else [])
+    assert [mid for _t, mid, _f in broker.dead] == ([] if runs else ["1-0"])
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [pytest.param(None, id="no-longer-pending"), pytest.param(OSError("down"), id="lookup-fails")],
+)
+async def test_reclaimed_entry_with_unreadable_delivery_count_is_left_alone(
+    answer: int | None | Exception,
+) -> None:
+    broker, received = await _reclaim_one_entry(answer)
+
+    assert received == []
+    assert broker.acked == []
+    assert broker.dead == []
+
+
+async def test_entry_a_peer_took_is_not_dead_lettered_for_its_delivery_count() -> None:
+    received: list[int] = []
+
+    async def handler(evt: CrossEvent) -> None:
+        received.append(evt.value)
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, handler)
+    broker = _CountedBroker()
+    broker.taken.add("2-0")
+    broker.attempts.update({"1-0": 1, "2-0": 99})
+    broker.pending["t"] = [("1-0", _cross_message(1)), ("2-0", _cross_message(2))]
+    consumer = _make_consumer(broker, bus, targets=["t"])
+
+    await consumer._reclaim("t")
+
+    assert received == [1]
+    assert broker.dead == []

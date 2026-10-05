@@ -628,6 +628,9 @@ class StatefulFakeRedis:
         # (stream, group) -> {"cursor": int, "pel": dict[bytes, dict]}
         # pel entry: mid -> {"consumer": str, "delivered_ms": int}
         self.groups: dict[tuple[str, str], dict[str, Any]] = {}
+        # (stream, group, mid) -> Redis's delivery count: XREADGROUP and
+        # XAUTOCLAIM raise it, the JUSTID renewal does not.
+        self.times_delivered: dict[tuple[str, str, bytes], int] = {}
         self._seq: dict[str, int] = {}
         self.closed = False
         # Virtual clock (ms). Deliveries/claims are stamped with it; tests
@@ -678,6 +681,7 @@ class StatefulFakeRedis:
                 if seq > grp["cursor"]:
                     delivered.append((mid, fields))
                     grp["pel"][mid] = {"consumer": consumername, "delivered_ms": self.now_ms}
+                    self.times_delivered[(name, groupname, mid)] = 1
                     grp["cursor"] = seq
                     if count is not None and len(delivered) >= count:
                         break
@@ -738,8 +742,33 @@ class StatefulFakeRedis:
                 continue  # not idle long enough — real XAUTOCLAIM skips it
             entry["consumer"] = consumername  # reassign to the claiming consumer
             entry["delivered_ms"] = self.now_ms  # claiming RESETS the idle clock
+            key = (name, groupname, mid)
+            self.times_delivered[key] = self.times_delivered.get(key, 0) + 1
             claimed.append((mid, by_id[mid]))
         return (cursor, claimed, deleted)
+
+    async def xpending_range(
+        self,
+        name: str,
+        groupname: str,
+        min: str | bytes,
+        max: str | bytes,
+        count: int,
+        consumername: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """XPENDING for the single id ``min == max`` — the only shape modelled."""
+        mid = min if isinstance(min, bytes) else min.encode()
+        entry = self.groups[(name, groupname)]["pel"].get(mid)
+        if entry is None or (consumername is not None and entry["consumer"] != consumername):
+            return []
+        return [
+            {
+                "message_id": mid,
+                "consumer": entry["consumer"].encode(),
+                "time_since_delivered": self.now_ms - entry["delivered_ms"],
+                "times_delivered": self.times_delivered.get((name, groupname, mid), 1),
+            }
+        ]
 
     async def eval(self, script: str, numkeys: int, *keys_and_args: Any) -> int:
         """Run the ownership-renewal script: the one Lua script this fake models.

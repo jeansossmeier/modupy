@@ -436,7 +436,9 @@ class BrokerConsumer:
             if fields is None:
                 nil_entries += 1
                 continue
-            await self._dispatch_if_owned(target, message_id, fields, renew=not first)
+            await self._dispatch_if_owned(
+                target, message_id, fields, renew=not first, reclaimed=True
+            )
             first = False
         if nil_entries:
             await self._purge_trimmed_pending(target, nil_entries)
@@ -510,7 +512,13 @@ class BrokerConsumer:
                 first = False
 
     async def _dispatch_if_owned(
-        self, target: str, message_id: Any, fields: dict[bytes, bytes], *, renew: bool
+        self,
+        target: str,
+        message_id: Any,
+        fields: dict[bytes, bytes],
+        *,
+        renew: bool,
+        reclaimed: bool = False,
     ) -> None:
         """Dispatch one entry of a batch unless a peer has taken it meanwhile.
 
@@ -522,6 +530,12 @@ class BrokerConsumer:
         longer owns is skipped, not acknowledged, since the peer now
         owns its outcome. A broker without ``renew_claim`` is trusted as before.
         If the check itself fails the entry stays pending for a later reclaim.
+
+        A reclaimed entry that has already had ``max_delivery_attempts``
+        deliveries (its durable count, which includes this reclaim, is above
+        the cap) is dead-lettered without running its listener: a listener that
+        kills the worker never reports a failure, so the count of deliveries is
+        the only record that it keeps doing so.
         """
         renew_claim = getattr(self._broker, "renew_claim", None)
         if renew and callable(renew_claim):
@@ -544,7 +558,39 @@ class BrokerConsumer:
                     target,
                 )
                 return
+        if reclaimed and await self._settled_at_delivery_cap(target, message_id, fields):
+            return
         await self._dispatch_one(target, message_id, fields)
+
+    async def _settled_at_delivery_cap(
+        self, target: str, message_id: Any, fields: dict[bytes, bytes]
+    ) -> bool:
+        """Dead-letter a reclaimed entry past the delivery cap; True when it needs no dispatch.
+
+        The durable count already includes the reclaim handing the entry over
+        now, so a count above the cap means the listener has had
+        ``max_delivery_attempts`` deliveries and this one would be an extra.
+
+        Also True when the durable count cannot be read or the entry has left
+        the pending list: it then stays as it is, since dispatching an entry
+        whose budget is unknown risks one more crash.
+        """
+        if not callable(getattr(self._broker, "delivery_attempts", None)):
+            return False
+        mid = _as_str(message_id)
+        attempts = await self._failed_delivery_attempts(target, mid, (target, mid))
+        if attempts is None:
+            return True
+        if attempts <= self._max_delivery_attempts:
+            return False
+        logger.error(
+            "message %s on %s was delivered %d times without completing — dead-lettering",
+            mid,
+            target,
+            self._max_delivery_attempts,
+        )
+        await self._dead_letter(target, mid, fields)
+        return True
 
     async def _dispatch_one(self, target: str, message_id: Any, fields: dict[bytes, bytes]) -> None:
         """Deserialize one message and dispatch it to local listeners.

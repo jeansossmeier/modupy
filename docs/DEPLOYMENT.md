@@ -1638,7 +1638,14 @@ modulith broker dead-letter --retry-all   # resubmit every one, with attempts re
 ```
 
 A delivery is dead-lettered after `max_delivery_attempts` failed dispatches or
-reclaims, or at once when its payload cannot be read. Several event types can
+reclaims, or at once when its payload cannot be read. On Redis the count is
+Redis's own delivery count for the entry, which the first read and every reclaim
+raise by one. A message delivered `max_delivery_attempts` times without
+completing is dead-lettered when it is next reclaimed, before its listener
+runs again, so a listener that kills the worker on every delivery stops after
+`max_delivery_attempts` deliveries instead of crash-looping. The dead letter of
+such a message lists one more attempt than that, because it records the reclaim
+that dead-lettered it. Several event types can
 share one target (an explicit `@externalized(target=...)`), so a module can
 receive messages for types it has no listener for. Its consumer compares the
 message's `event_type` header with the types the module listens to before
