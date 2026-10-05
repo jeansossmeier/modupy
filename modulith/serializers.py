@@ -211,8 +211,13 @@ def _to_jsonable_typed(obj: Any, hint: Any) -> Any:
             return _to_jsonable_typed(obj, members[0])
     if origin in (list, set, frozenset, tuple):
         args = typing.get_args(hint)
-        item_hint = args[0] if args else None
         if isinstance(obj, (list, tuple, set, frozenset)):
+            if origin is tuple and args and not (len(args) == 2 and args[1] is Ellipsis):
+                return [
+                    _to_jsonable_typed(value, args[i] if i < len(args) else None)
+                    for i, value in enumerate(obj)
+                ]
+            item_hint = args[0] if args else None
             return [_to_jsonable_typed(value, item_hint) for value in obj]
     if origin is dict:
         args = typing.get_args(hint)
@@ -388,17 +393,22 @@ def _coerce(value: Any, hint: Any) -> Any:
     if origin is list:
         args = typing.get_args(hint)
         return [_coerce(v, args[0]) for v in value] if args and isinstance(value, list) else value
-    if origin in (set, frozenset):
+    # A bare ``tuple``/``set``/``frozenset`` (or bare ``typing.Tuple``) has no
+    # element hints but still decodes back to its own type, not a list.
+    container = origin if origin is not None else hint
+    if container in (set, frozenset, tuple) and isinstance(value, list):
         args = typing.get_args(hint)
-        if args and isinstance(value, list):
-            return origin(_coerce(v, args[0]) for v in value)
-        return value
-    if origin is tuple:
-        args = typing.get_args(hint)
-        if args and isinstance(value, list):
-            if len(args) == 2 and args[1] is Ellipsis:
-                return tuple(_coerce(v, args[0]) for v in value)
-            return tuple(_coerce(v, a) for v, a in zip(value, args, strict=False))
+        if not args:
+            if container is tuple:
+                return tuple(value)
+            # A set element must be hashable; the wire turned tuple elements into lists.
+            return container(tuple(v) if isinstance(v, list) else v for v in value)
+        if container is not tuple:
+            return container(_coerce(v, args[0]) for v in value)
+        if len(args) == 2 and args[1] is Ellipsis:
+            return tuple(_coerce(v, args[0]) for v in value)
+        return tuple(_coerce(v, a) for v, a in zip(value, args, strict=False))
+    if container in (set, frozenset, tuple):
         return value
     if origin is dict:
         args = typing.get_args(hint)

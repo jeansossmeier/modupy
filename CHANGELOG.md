@@ -98,6 +98,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `load_configuration` rejects a URL given as the SHM broker's `sqlite_path` or `hint_path`, naming `state_dir` and the database broker's `url` instead, where it created a directory named like `sqlite+aiosqlite:`. A broker name with surrounding whitespace is stripped before validation, so `" memory "` is refused for `--topology processes` like `"memory"`
 - In a module with `from __future__ import annotations`, `@listener` resolves the event type of a `functools.partial` over an async function and of a sync callable instance, where it raised `AttributeError` on `__qualname__`. A listener object without `__qualname__` whose annotation cannot be resolved gets the intended `TypeError`
 - Durable outbox: an async `functools.partial` listener is named by the function it wraps instead of by its `repr`, which embeds a memory address, so its stored listener id no longer changes on every restart. Two partials of one function share an id, and publishing to them raises `ConfigurationError`
+- `JsonEventSerializer` encodes each element of a fixed-length tuple field, such as `tuple[datetime, Decimal, UUID]`, with its own type instead of the first element's, and an unparameterized `tuple`, `set` or `frozenset` field decodes back to that type instead of `list`
 
 ### Security
 

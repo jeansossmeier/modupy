@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, NewType, cast
+from typing import TYPE_CHECKING, NewType, Set, Tuple, cast  # noqa: UP035
 from uuid import UUID, uuid4
 
 import pytest
@@ -967,3 +967,125 @@ def test_unevaluable_or_cyclic_type_alias_field_passes_through(
 
     assert wire == b'{"maybe":"X","sku":"ABC-1"}'
     assert (restored.sku, restored.maybe) == ("ABC-1", "X")
+
+
+@dataclass(frozen=True)
+class FixedArityTupleEvent:
+    stamped: tuple[datetime, Decimal, UUID]
+    keyed: tuple[int, BasePayment]
+    nothing: tuple[()]
+
+
+@dataclass(frozen=True)
+class VariadicTupleEvent:
+    payments: tuple[BasePayment, ...]
+    days: tuple[date, ...]
+
+
+@dataclass(frozen=True)
+class BareContainerEvent:
+    plain_tuple: tuple
+    plain_set: set
+    plain_frozenset: frozenset
+    typing_tuple: Tuple  # noqa: UP006
+    typing_set: Set  # noqa: UP006
+
+
+@dataclass(frozen=True)
+class WireStableEvent:
+    pair: tuple[int, int]
+    labelled: tuple[int, str]
+    days: tuple[date, ...]
+    ids: frozenset[UUID]
+    order: list[Decimal]
+
+
+def test_fixed_arity_tuple_encodes_each_element_with_its_own_hint() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[FixedArityTupleEvent])
+    original = FixedArityTupleEvent(
+        stamped=(datetime(2026, 1, 1, tzinfo=UTC), Decimal("1.50"), uuid4()),
+        keyed=(7, CardPayment(amount=1, card_last4="4242")),
+        nothing=(),
+    )
+
+    wire = serializer.serialize(original)
+    restored = serializer.deserialize(wire, _fqcn(FixedArityTupleEvent))
+
+    assert restored == original
+    assert [type(e) for e in restored.stamped] == [datetime, Decimal, UUID]
+    assert type(restored.keyed[1]) is CardPayment
+    assert (
+        b'"keyed":[7,{"__modulith_union_type__":"' + _fqcn(CardPayment).encode() + b'","value":'
+    ) in wire
+
+
+def test_variadic_tuple_keeps_using_its_one_element_hint() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[VariadicTupleEvent])
+    original = VariadicTupleEvent(
+        payments=(
+            BasePayment(amount=1),
+            CardPayment(amount=2, card_last4="1"),
+            PremiumCardPayment(amount=3, card_last4="2", tier="gold"),
+        ),
+        days=(date(2026, 1, 1), date(2026, 1, 2), date(2026, 1, 3)),
+    )
+
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(VariadicTupleEvent))
+
+    assert restored == original
+    assert [type(p) for p in restored.payments] == [BasePayment, CardPayment, PremiumCardPayment]
+    assert all(type(d) is date for d in restored.days)
+
+
+def test_unparameterized_containers_decode_to_their_declared_type() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[BareContainerEvent])
+    original = BareContainerEvent(
+        plain_tuple=(1, "a"),
+        plain_set={1, 2},
+        plain_frozenset=frozenset({3, 4}),
+        typing_tuple=(5, "b"),
+        typing_set={6, 7},
+    )
+
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(BareContainerEvent))
+
+    assert restored == original
+    assert type(restored.plain_tuple) is tuple
+    assert type(restored.plain_set) is set
+    assert type(restored.plain_frozenset) is frozenset
+    assert type(restored.typing_tuple) is tuple
+    assert type(restored.typing_set) is set
+
+
+def test_unparameterized_set_of_tuples_round_trips() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[BareContainerEvent])
+    original = BareContainerEvent(
+        plain_tuple=(),
+        plain_set={(1, 2), (3, 4)},
+        plain_frozenset=frozenset({(5, "a")}),
+        typing_tuple=(),
+        typing_set=set(),
+    )
+
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(BareContainerEvent))
+
+    assert restored == original
+
+
+def test_container_wire_format_that_round_trips_today_is_unchanged() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[WireStableEvent])
+    original = WireStableEvent(
+        pair=(1, 2),
+        labelled=(3, "x"),
+        days=(date(2026, 1, 1),),
+        ids=frozenset({UUID(int=1)}),
+        order=[Decimal("1.5")],
+    )
+
+    wire = serializer.serialize(original)
+
+    assert wire == (
+        b'{"days":["2026-01-01"],"ids":["00000000-0000-0000-0000-000000000001"],'
+        b'"labelled":[3,"x"],"order":["1.5"],"pair":[1,2]}'
+    )
+    assert serializer.deserialize(wire, _fqcn(WireStableEvent)) == original
