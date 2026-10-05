@@ -1535,7 +1535,9 @@ Step 6 depends on the broker:
   masked) and exits non-zero without creating anything when that store or
   its broker tables do not exist. It removes the group's subscriptions and
   deletes its pending and claimed messages (they are not delivered); the
-  next prune reclaims the publications they held.
+  next prune reclaims the publications they held. On the SHM broker, a
+  group that subscribes again within `orphan_retention_seconds` is replayed
+  the retained ones.
 
   It asks for confirmation unless `--yes` is given, exits non-zero when the
   store holds nothing for the group, and refuses a group that a current module
@@ -1564,8 +1566,12 @@ Step 6 depends on the broker:
   `orphan_replay_policy = "expected_groups"`, a group named in
   `expected_consumer_groups` gets a pending message for every later publish
   to those targets whether or not it subscribes, so dropping it has no
-  lasting effect and the startup warning returns. `drop-group` says so;
-  remove the group from `expected_consumer_groups` as well.
+  lasting effect. `drop-group` says so. Delete the target's key from
+  `expected_consumer_groups` when the group is the only one listed for it (an
+  empty list is rejected), and otherwise remove the group from that key's
+  list. The `modulith run --topology processes` startup warning for a retired
+  group returns only while no module derives the group and no consumer served
+  it in the last 24 hours; no other topology runs that check.
 
   Nothing is dropped automatically: a module that is only disabled for a
   deploy gets its backlog when it returns.
@@ -1612,7 +1618,9 @@ longer reach the group, unless `expected_consumer_groups` still lists the
 group for that target (database broker, `store` policy with
 `orphan_replay_policy = "expected_groups"`): the group then keeps receiving a
 pending message for every publish, and the command warns about it. Remove the
-group from `expected_consumer_groups` too. The command asks for confirmation
+group from that target's list in `expected_consumer_groups` too, or delete the
+target's key when the group is the only one listed, since an empty list is
+rejected at start-up. The command asks for confirmation
 unless `--yes` is given. Unlike the whole-group form, it needs no `--force`
 for a current module's group.
 
