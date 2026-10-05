@@ -23,6 +23,7 @@ dispatches before commit" property is observable.
 from __future__ import annotations
 
 import asyncio
+import functools
 import importlib.util
 import inspect
 import logging
@@ -1471,6 +1472,39 @@ def test_listener_id_supports_callable_instances_without_qualname() -> None:
     handler = CallableHandler()
 
     assert outbox._listener_id(handler) == "callable-handler"
+
+
+async def _partial_target(event: OutboxEvent, *, extra: int = 0) -> None:
+    received.append(event.value + extra)
+
+
+def test_async_partial_listener_id_is_the_wrapped_function_name() -> None:
+    plain = functools.partial(_partial_target, extra=1)
+    nested = functools.partial(functools.partial(_partial_target, extra=1), extra=2)
+
+    expected = f"{__name__}.{_partial_target.__qualname__}"
+
+    assert outbox._listener_id(plain) == expected
+    assert outbox._listener_id(nested) == expected
+
+
+@pytest.mark.asyncio
+async def test_durable_publish_rejects_two_partials_of_one_function(tmp_path: Path) -> None:
+    _runtime.configure(package="outboxtest", auto_discover=False)
+    _runtime.ensure_bootstrapped()
+    assert _runtime.event_bus is not None
+    _runtime.event_bus.register(OutboxEvent, functools.partial(_partial_target, extra=1))
+    _runtime.event_bus.register(OutboxEvent, functools.partial(_partial_target, extra=2))
+    engine, store = await _sqlite_outbox(tmp_path)
+    try:
+        with pytest.raises(ConfigurationError, match="share the outbox listener id") as excinfo:
+            await _publish_in_session(engine, OutboxEvent(value=1))
+
+        assert f"{__name__}.{_partial_target.__qualname__}" in str(excinfo.value)
+        assert await _stored_rows(engine) == []
+    finally:
+        await store.dispose()
+        await engine.dispose()
 
 
 def test_configure_rejects_invalid_lease_and_batch_values() -> None:

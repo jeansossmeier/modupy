@@ -325,11 +325,14 @@ inspect that outbox through the running app, or set `outbox_url`.
 ### Reference: outbox details
 
 **Stored listener ids.** Each outbox row names its listener. A plain function
-is stored as `module.function`. A callable instance or bound method
-registered from an application module is stored as
-`<module package>:<class module>.<ClassName>`, for example
-`myapp.orders:myapp.shared.Notifier`, so one class used by two modules is
-delivered per module.
+is stored as `module.function`. A callable instance registered from an
+application module is stored as `<module package>:<class module>.<ClassName>`,
+for example `myapp.orders:myapp.shared.Notifier`, and a bound method as
+`<module package>:<class module>.<ClassName>.<method>`, so one class used by
+two modules is delivered per module. A `functools.partial` is named by the
+function it wraps (nested partials unwrapped), so the id is the same in every
+process; two partials of one function share an id, and publishing to them is
+refused with a `ConfigurationError`.
 
 **One event loop per engine.** Drive one `PostgresPublicationStore`/outbox
 `AsyncEngine` from a single event loop. `await publish()` on the app loop and

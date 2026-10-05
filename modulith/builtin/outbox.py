@@ -77,6 +77,7 @@ loop skips such records; ``status`` counts them separately.
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import logging
 import math
@@ -286,13 +287,21 @@ def _listener_id(handler: Any) -> str:
     id is prefixed with the registering module package (``orders:shared.X``)
     so each module's rows reach only that module's instance, in whichever
     worker sweeps them. A plain function's id stays module-qualified only.
+
+    A ``functools.partial`` is named by the function it wraps (nested partials
+    unwrapped): its ``repr`` embeds a memory address, which would give the row a
+    different id after every restart. Two partials of one function therefore
+    share an id, which ``_require_distinct_listener_ids`` refuses at publish.
     """
     from .. import runtime as _rt
 
-    qualname = getattr(handler, "__qualname__", None)
+    named = handler
+    while isinstance(named, functools.partial):
+        named = named.func
+    qualname = getattr(named, "__qualname__", None)
     if qualname is None:
-        return repr(handler)
-    module = getattr(handler, "__module__", None)
+        return repr(named)
+    module = getattr(named, "__module__", None)
     base = f"{module}.{qualname}" if module else qualname
     owner = None
     if inspect.ismethod(handler) or getattr(handler, "__modulith_instance_listener__", False):
