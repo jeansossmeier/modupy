@@ -718,7 +718,7 @@ def test_dev_processes_topology_env_url_beats_pyproject_url(make_fake_app, monke
         "[tool.modulith.broker_options]\n"
         'url = "sqlite+aiosqlite:///dev.db"\n'
     )
-    monkeypatch.setenv("MODULITH_BROKER_URL", "postgresql+asyncpg://db/prod")
+    monkeypatch.setenv("MODULITH_BROKER_URL", "sqlite+aiosqlite:///prod.db")
     monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
 
     captured: dict[str, object] = {}
@@ -737,7 +737,7 @@ def test_dev_processes_topology_env_url_beats_pyproject_url(make_fake_app, monke
     # Supervisor still inherits the parent's env for the worker process.
     from modulith.supervisor import _build_worker_env
 
-    assert _build_worker_env(spec)["MODULITH_BROKER_URL"] == "postgresql+asyncpg://db/prod"
+    assert _build_worker_env(spec)["MODULITH_BROKER_URL"] == "sqlite+aiosqlite:///prod.db"
 
 
 def _dev_processes_worker_env(make_fake_app, monkeypatch, tmp_path) -> dict[str, str]:
@@ -783,7 +783,7 @@ def test_dev_processes_topology_leaves_env_outbox_settings_to_the_workers_env(
     make_fake_app, monkeypatch, tmp_path
 ):
     monkeypatch.setenv("MODULITH_OUTBOX", "postgres")
-    monkeypatch.setenv("MODULITH_OUTBOX_URL", "postgresql+asyncpg://db/prod")
+    monkeypatch.setenv("MODULITH_OUTBOX_URL", "sqlite+aiosqlite:///prod.db")
 
     env = _dev_processes_worker_env(make_fake_app, monkeypatch, tmp_path)
 
@@ -3489,6 +3489,8 @@ def test_masked_url_keeps_non_secret_query_parameters_visible() -> None:
 def test_migrate_failure_reports_an_error_without_leaking_the_password(
     tmp_path, monkeypatch
 ) -> None:
+    # The error text under test is psycopg's refused connection; no sqlite URL produces it.
+    pytest.importorskip("psycopg", reason="needs the modupy[postgres] extra (psycopg)")
     _migrate_project(
         tmp_path,
         monkeypatch,

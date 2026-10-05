@@ -165,10 +165,12 @@ test = [
 # pull SQLAlchemy + alembic + aiosqlite directly (NOT asyncpg — the sqlite path
 # doesn't need it), plus the feature extras whose libraries the tests import
 # (fastapi/httpx for proxy+worker, typer for CLI, otel for observability, redis
-# for the broker unit tests, and build for isolated extraction-wheel checks).
+# for the broker unit tests, build for isolated extraction-wheel checks, and
+# pytest-cov for the test that runs the isolated marker under `pytest --cov`).
 test-suite = [
     "modupy[test]",
     "pytest-timeout>=2.1,<3.0",
+    "pytest-cov>=4.1,<8.0",
     "build>=1.2,<2.0",
     "hatchling>=1.27",
     "sqlalchemy[asyncio]>=2.0,<3.0",

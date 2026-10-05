@@ -23,6 +23,7 @@ dispatches before commit" property is observable.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import sqlite3
 import threading
@@ -2900,7 +2901,14 @@ def test_outbox_url_leaves_the_journal_mode_alone_unless_sqlite_wal_is_true(
     ("url", "installed"),
     [
         ("sqlite+aiosqlite:///{db}", True),
-        ("postgresql+asyncpg://app:s3cret@db.internal/app", False),
+        pytest.param(
+            "postgresql+asyncpg://app:s3cret@db.internal/app",
+            False,
+            marks=pytest.mark.skipif(
+                importlib.util.find_spec("asyncpg") is None,
+                reason="needs the modupy[postgres] extra (asyncpg)",
+            ),
+        ),
     ],
     ids=["sqlite", "postgresql"],
 )

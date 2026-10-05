@@ -2901,6 +2901,7 @@ def _expected_refusal(server: str) -> str:
 
 @pytest.mark.parametrize(("url", "version"), _SKIP_LOCKED_SERVERS)
 def test_skip_locked_gate_accepts_servers_that_support_the_clause(url: str, version: str) -> None:
+    pytest.importorskip("aiomysql", reason="needs the modupy[database] extra (aiomysql)")
     engine = create_async_engine(url)
 
     assert _supports_skip_locked(engine, version) is True
@@ -2918,6 +2919,7 @@ def test_skip_locked_gate_accepts_servers_that_support_the_clause(url: str, vers
 def test_skip_locked_gate_refuses_servers_older_than_the_clause(
     url: str, version: str, server: str
 ) -> None:
+    pytest.importorskip("aiomysql", reason="needs the modupy[database] extra (aiomysql)")
     from modulith import ConfigurationError
 
     engine = create_async_engine(url)
@@ -2940,6 +2942,7 @@ def test_skip_locked_gate_decides_from_the_reported_version_not_sqlalchemys_pars
     """SQLAlchemy 2.1 keeps only the three numbers before the MariaDB token, so
     it reads ``10.6.12-8-MariaDB-enterprise`` as 6.12.8. The gate must judge the
     server by its own ``VERSION()``, whatever the dialect parsed."""
+    pytest.importorskip("aiomysql", reason="needs the modupy[database] extra (aiomysql)")
     engine = create_async_engine(_MARIADB_URL)
     engine.dialect.server_version_info = parsed
 
@@ -2947,6 +2950,7 @@ def test_skip_locked_gate_decides_from_the_reported_version_not_sqlalchemys_pars
 
 
 def test_skip_locked_gate_refuses_a_mysql_server_whose_version_is_not_yet_known() -> None:
+    pytest.importorskip("aiomysql", reason="needs the modupy[database] extra (aiomysql)")
     from modulith import ConfigurationError
 
     engine = create_async_engine(_MYSQL_URL)
@@ -2957,6 +2961,7 @@ def test_skip_locked_gate_refuses_a_mysql_server_whose_version_is_not_yet_known(
 
 
 def test_skip_locked_gate_selects_lockable_dialects_only() -> None:
+    pytest.importorskip("asyncpg", reason="needs the modupy[postgres] extra (asyncpg)")
     assert _supports_skip_locked(create_async_engine("postgresql+asyncpg://u@localhost/db"), None)
     assert not _supports_skip_locked(create_async_engine("sqlite+aiosqlite://"), None)
 
@@ -3304,6 +3309,7 @@ async def test_sqlite_busy_timeout_defaults_when_unset(tmp_path: Path) -> None:
 
 
 async def test_pool_options_applied_for_non_sqlite() -> None:
+    pytest.importorskip("asyncpg", reason="needs the modupy[postgres] extra (asyncpg)")
     # No connection is opened (create_async_engine is lazy) — inspect the pool.
     engine = _create_engine(
         "postgresql+asyncpg://user:pass@localhost/db", {"pool_size": 7, "max_overflow": 3}
@@ -3359,6 +3365,7 @@ async def test_pool_size_env_override_reaches_engine(monkeypatch: Any) -> None:
     broker option (the module docstring documents these as env-resolvable, and
     pool sizing is a per-deployment value operators tune without editing
     pyproject)."""
+    pytest.importorskip("asyncpg", reason="needs the modupy[postgres] extra (asyncpg)")
     monkeypatch.setenv("MODULITH_BROKER_POOL_SIZE", "9")
     engine = _create_engine("postgresql+asyncpg://user:pass@localhost/db", {})
     try:
@@ -3369,6 +3376,7 @@ async def test_pool_size_env_override_reaches_engine(monkeypatch: Any) -> None:
 
 async def test_max_overflow_env_override_reaches_engine(monkeypatch: Any) -> None:
     """``MODULITH_BROKER_MAX_OVERFLOW`` overrides overflow with no subtable value."""
+    pytest.importorskip("asyncpg", reason="needs the modupy[postgres] extra (asyncpg)")
     monkeypatch.setenv("MODULITH_BROKER_MAX_OVERFLOW", "4")
     engine = _create_engine("postgresql+asyncpg://user:pass@localhost/db", {})
     try:
@@ -5005,6 +5013,9 @@ async def test_has_schema_is_false_without_creating_tables(tmp_path: Path) -> No
 
 
 def test_store_location_masks_the_password() -> None:
+    # SQLAlchemy rejects a SQLite URL that carries a user or host, so only a
+    # server driver gives the URL a password to mask.
+    pytest.importorskip("asyncpg", reason="needs the modupy[postgres] extra (asyncpg)")
     broker = DatabaseBroker(url="postgresql+asyncpg://app:s3cret@db.internal:5432/shop")
 
     assert broker.store_location == "postgresql+asyncpg://app:***@db.internal:5432/shop"
