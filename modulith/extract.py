@@ -260,9 +260,11 @@ new_top_levels.discard(dotted.split(".")[0])
 distributions = sorted({d for top in new_top_levels for d in by_top_level.get(top, ())})
 print("""
     + repr(_DISTRIBUTIONS_MARKER)
-    + """, json.dumps(distributions))
+    + """, json.dumps(distributions), file=sys.stderr)
 """
 )
+
+_IMPORT_CHECK_TIMEOUT = 120
 
 
 def _check_imports(root: Path, dotted: str, source: Path, also: Sequence[str] = ()) -> list[str]:
@@ -283,24 +285,40 @@ def _check_imports(root: Path, dotted: str, source: Path, also: Sequence[str] = 
 
     Runs the extracted module's code, which is acceptable because extract is
     a trusted-source tool that already imports the app to discover modules.
-    ``-B`` keeps the child from writing bytecode caches into *root*, which
-    becomes the published output.
+    The child runs on a throw-away copy of *root*, so files that import writes
+    never reach the published output. Its stderr goes to a temporary file and
+    its stdout nowhere: ``subprocess.run`` waits for a pipe's EOF, which a
+    descendant the import leaves running would hold open past the child's exit.
     """
-    try:
-        result = subprocess.run(
-            [sys.executable, "-B", "-c", _IMPORT_CHECK, str(root), dotted, str(source), *also],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired:
-        raise ValueError(f"importing {dotted} from the extracted tree timed out") from None
-    if result.returncode != 0:
-        lines = result.stderr.strip().splitlines()
-        reason = lines[-1] if lines else f"exit code {result.returncode}"
+    with tempfile.TemporaryDirectory(prefix=f".{root.name}.gate.", dir=root.parent) as scratch:
+        gate_root = Path(scratch) / root.name
+        shutil.copytree(root, gate_root)
+        with tempfile.TemporaryFile() as stderr_file:
+            try:
+                returncode = subprocess.run(
+                    [
+                        sys.executable,
+                        "-B",
+                        "-c",
+                        _IMPORT_CHECK,
+                        str(gate_root),
+                        dotted,
+                        str(source),
+                        *also,
+                    ],
+                    cwd=gate_root,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_file,
+                    timeout=_IMPORT_CHECK_TIMEOUT,
+                ).returncode
+            except subprocess.TimeoutExpired:
+                raise ValueError(f"importing {dotted} from the extracted tree timed out") from None
+            stderr_file.seek(0)
+            lines = stderr_file.read().decode(errors="replace").strip().splitlines()
+    if returncode != 0:
+        reason = lines[-1] if lines else f"exit code {returncode}"
         raise ValueError(f"the extracted service cannot import {dotted}: {reason}")
-    for line in reversed(result.stdout.splitlines()):
+    for line in reversed(lines):
         if line.startswith(_DISTRIBUTIONS_MARKER):
             distributions: list[str] = json.loads(line.removeprefix(_DISTRIBUTIONS_MARKER))
             return distributions
@@ -831,7 +849,7 @@ def write_extraction(
                 raise FileExistsError(f"--output {output} changed during extraction")
             output.rmdir()
         staging.replace(output)
-    except Exception:
+    except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
     return written

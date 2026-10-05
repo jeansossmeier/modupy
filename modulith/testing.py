@@ -669,6 +669,33 @@ def _stream_text(stream: str | bytes | None) -> str:
     return stream
 
 
+def _run_to_files(
+    argv: list[str], *, env: dict[str, str], cwd: str, timeout: float
+) -> tuple[int, str, str]:
+    """Run *argv*; return its exit code, stdout and stderr.
+
+    The output goes to temporary files, not pipes: ``subprocess.run`` waits
+    for a pipe's EOF, which a descendant that outlives the child and holds the
+    pipe never delivers, so a finished child would still stall until the
+    timeout. A timeout raises ``TimeoutExpired`` carrying what was written.
+    """
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+
+        def read(stream: typing.IO[bytes]) -> str:
+            stream.seek(0)
+            return stream.read().decode(errors="replace")
+
+        try:
+            completed = subprocess.run(
+                argv, env=env, cwd=cwd, stdout=out, stderr=err, check=False, timeout=timeout
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise subprocess.TimeoutExpired(
+                exc.cmd, exc.timeout, output=read(out), stderr=read(err)
+            ) from None
+        return completed.returncode, read(out), read(err)
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> bool | None:
     """Run ``@pytest.mark.modulith_isolated`` tests in a fresh subprocess.
@@ -741,15 +768,12 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
         env[_RESULT_FILE_ENV] = result_path
         try:
             try:
-                completed = subprocess.run(
+                returncode, stdout, stderr = _run_to_files(
                     argv,
                     env=env,
                     # Nodeids are rootdir-relative; the parent's incidental cwd
                     # need not be (and often isn't) the rootdir.
                     cwd=str(item.config.rootpath),
-                    capture_output=True,
-                    text=True,
-                    check=False,
                     timeout=timeout,
                 )
             except subprocess.TimeoutExpired as exc:
@@ -760,12 +784,12 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
                     f"--- stdout ---\n{_stream_text(exc.stdout)}\n"
                     f"--- stderr ---\n{_stream_text(exc.stderr)}"
                 ) from exc
-            if completed.returncode != 0:
+            if returncode != 0:
                 raise AssertionError(
                     f"isolated subprocess for {item.nodeid} exited "
-                    f"{completed.returncode}\n"
-                    f"--- stdout ---\n{completed.stdout}\n"
-                    f"--- stderr ---\n{completed.stderr}"
+                    f"{returncode}\n"
+                    f"--- stdout ---\n{stdout}\n"
+                    f"--- stderr ---\n{stderr}"
                 )
             with open(result_path, encoding="utf-8") as fh:
                 records = [json.loads(line) for line in fh if line.strip()]
@@ -779,8 +803,8 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
                 f"isolated subprocess for {item.nodeid} exited 0 without running "
                 "the test (a child-side plugin or option deselected or "
                 "suppressed it)\n"
-                f"--- stdout ---\n{completed.stdout}\n"
-                f"--- stderr ---\n{completed.stderr}"
+                f"--- stdout ---\n{stdout}\n"
+                f"--- stderr ---\n{stderr}"
             )
         # A setup skip or xfail writes a non-passed record and no call record;
         # a passed setup with no call record means the body ended the child.
@@ -789,8 +813,8 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
                 f"isolated subprocess for {item.nodeid} exited 0 before the test "
                 "finished (the test body ended the process, e.g. os._exit(0) or "
                 "pytest.exit(returncode=0))\n"
-                f"--- stdout ---\n{completed.stdout}\n"
-                f"--- stderr ---\n{completed.stderr}"
+                f"--- stdout ---\n{stdout}\n"
+                f"--- stderr ---\n{stderr}"
             )
         return next(
             (r for r in records if r["outcome"] != "passed" or r["wasxfail"] is not None),

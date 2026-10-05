@@ -437,6 +437,35 @@ def test_isolated_test_reports_the_childs_skip_and_xfail_outcomes(pytester) -> N
     )
 
 
+def test_isolated_child_whose_descendant_holds_the_pipes_does_not_stall_the_parent(
+    pytester,
+) -> None:
+    """A descendant that outlives the child and keeps its output open must not
+    make the parent wait for it: the child exited, so its outcome stands."""
+    pytester.makeini(
+        """
+        [pytest]
+        modulith_isolated_timeout = 5
+        """
+    )
+    pytester.makepyfile(
+        test_holder="""
+        import subprocess
+        import sys
+        import pytest
+
+        @pytest.mark.modulith_isolated
+        def test_leaves_a_descendant(capfd):
+            with capfd.disabled():  # the descendant gets the child's real pipes
+                subprocess.Popen([sys.executable, "-c", "import time; time.sleep(12)"])
+        """
+    )
+
+    result = pytester.runpytest()
+
+    result.assert_outcomes(passed=1)
+
+
 def test_isolated_child_that_runs_no_test_fails_the_parent(pytester) -> None:
     """A plugin can end the child with exit 0 without running the test (for
     example one that suppresses pytest's no-tests-ran exit code). The parent

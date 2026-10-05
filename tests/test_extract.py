@@ -89,6 +89,76 @@ def test_extract_import_check_leaves_no_bytecode_in_the_output(
     assert sorted(p.relative_to(out_dir) for p in out_dir.rglob("*.pyc")) == []
 
 
+_IN_GATE = 'import sys\nIN_GATE = sys.argv[:1] == ["-c"]\n'
+
+
+def test_import_gate_returns_when_a_descendant_holds_the_pipes(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setattr(extract, "_IMPORT_CHECK_TIMEOUT", 5)
+    make_fake_app(
+        {
+            "orders": _IN_GATE
+            + "import subprocess\n"
+            + "if IN_GATE:\n"
+            + "    subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(12)'])\n"
+        },
+        extra_files={"contracts/__init__.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "fakeapp" / "orders" / "__init__.py").is_file()
+
+
+def test_extract_import_gate_side_effects_do_not_reach_the_output(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {
+            "orders": _IN_GATE
+            + "from pathlib import Path\n"
+            + "if IN_GATE:\n"
+            + "    (Path(__file__).parent / 'beside_module.txt').write_text('x')\n"
+            + "    Path('in_cwd.txt').write_text('x')\n"
+        },
+        extra_files={"contracts/__init__.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert sorted(p.name for p in out_dir.rglob("*.txt")) == []
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith(".")) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the child interrupts its parent with SIGINT")
+def test_extract_interrupt_removes_the_staging_directory(make_fake_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {
+            "orders": _IN_GATE
+            + "import os, signal, time\n"
+            + "if IN_GATE:\n"
+            + "    os.kill(os.getppid(), signal.SIGINT)\n"
+            + "    time.sleep(30)\n"
+        },
+        extra_files={"contracts/__init__.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code != 0, result.output
+    assert not out_dir.exists()
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith(".")) == []
+
+
 def test_extract_generated_project_builds_a_wheel(make_fake_app, monkeypatch, tmp_path):
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app({"orders": ""}, extra_files={"contracts/__init__.py": ""})
