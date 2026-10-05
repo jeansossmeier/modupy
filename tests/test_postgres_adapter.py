@@ -893,6 +893,28 @@ async def test_fail_claim_is_fenced_by_token(engine) -> None:
         assert row.claim_token is None  # released so the next sweep can reclaim immediately
 
 
+async def test_fail_claim_does_not_touch_a_completed_row(engine) -> None:
+    """Completing a row in ``update`` mode leaves its claim token in place, so a
+    failure reported late under that token must not be written onto the
+    delivered row: it would stamp an error and a dead-letter flag on it."""
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=2)
+    await store.save(_pub(1))
+    (claim,) = await store.claim_batch(
+        owner="worker-a", batch_size=10, lease_seconds=60.0, older_than=timedelta(0)
+    )
+    assert await store.complete_claim(claim.id, claim.claim_token, "update") is True
+    claim.attempt_count = 2
+    claim.last_error = "late failure"
+
+    assert await store.fail_claim(claim, claim.claim_token) is False
+
+    sessionmaker = async_sessionmaker(engine)
+    async with sessionmaker() as s:
+        row = await s.get(EventPublicationRow, claim.id)
+        assert row.completed_at is not None
+        assert (row.attempt_count, row.last_error, row.is_dead_lettered) == (0, None, False)
+
+
 async def test_try_lock_publication_requires_postgres_engine(engine) -> None:
     """advisory_lock mode is Postgres-only (pg_try_advisory_lock); a
     SQLite-backed store must refuse rather than silently no-op."""

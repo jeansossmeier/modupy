@@ -944,9 +944,12 @@ class PostgresPublicationStore:
         primary-key order so concurrent claimers take row locks in the same
         order and cannot deadlock each other. The UPDATE also pins the token
         it read, so the charge for an interrupted delivery (see
-        ``claim_batch``) is computed from the row state it replaces. The
-        candidates stay untouched in memory: the session would otherwise flush
-        them unconditionally at commit."""
+        ``claim_batch``) is computed from the row state it replaces. A matched
+        row is then refreshed inside the same transaction, so the claim carries
+        the state the UPDATE matched, not the SELECT snapshot: a peer may have
+        recorded a failure on the row since. The candidates are never modified
+        in memory: the session would otherwise flush them unconditionally at
+        commit."""
         claimed: dict[UUID, EventPublication] = {}
         charged: list[tuple[UUID, int, bool]] = []
         for row in sorted(rows, key=lambda r: str(r.id)):
@@ -971,11 +974,8 @@ class PostgresPublicationStore:
                 charged.append((row.id, charge["attempt_count"], charge["is_dead_lettered"]))
                 if charge["is_dead_lettered"]:
                     continue
+            await s.refresh(row)
             pub = _row_to_pub(row)
-            if charge:
-                pub.attempt_count = charge["attempt_count"]
-                pub.last_error = charge["last_error"]
-                pub.last_attempt_at = now
             pub.claim_token = token
             claimed[row.id] = pub
         await s.commit()
@@ -1113,7 +1113,10 @@ class PostgresPublicationStore:
         The token predicate lives in the UPDATE itself (like ``renew_claim``),
         not in a preceding SELECT: a read-then-write pair leaves a window in
         which a peer's ``claim_batch`` commits a new claim that the write then
-        clobbers. Rowcount 0 means the row is gone or the peer owns it."""
+        clobbers. A completed row keeps its claim token, so the UPDATE also
+        requires ``completed_at IS NULL`` (as ``renew_claim`` does): a failure
+        reported late must not mark a delivered row. Rowcount 0 means the row
+        is gone, completed, or owned by a peer."""
         dead = publication.attempt_count >= self.dead_letter_after_attempts
         async with self._open_session() as s:
             stmt = (
@@ -1121,6 +1124,7 @@ class PostgresPublicationStore:
                 .where(
                     EventPublicationRow.id == publication.id,
                     EventPublicationRow.claim_token == token,
+                    EventPublicationRow.completed_at.is_(None),
                 )
                 .values(
                     attempt_count=publication.attempt_count,
@@ -1252,7 +1256,8 @@ class PostgresPublicationStore:
         A row a sweep already completed is skipped. Under
         ``claim_strategy="lease"`` the row is claimed first, exactly as a
         sweep claims it, and delivered under that lease with renewal and
-        fenced completion; a row a sweep holds is left to that sweep. Under
+        fenced completion; a row a sweep holds, or one still inside its retry
+        backoff, is left to that sweep. Under
         ``"advisory_lock"`` it is delivered under the row's advisory lock,
         through the same lock/re-read/unlock path the advisory sweep uses.
 
@@ -1280,6 +1285,13 @@ class PostgresPublicationStore:
             if pub is not None and pub.completed_at is not None:
                 logger.debug("after-commit dispatch: publication %s already completed", pub.id)
             elif pub is not None and outbox._claim_strategy == "lease":
+                if not outbox._backoff_elapsed(pub):
+                    logger.debug(
+                        "after-commit dispatch: publication %s is still in its retry "
+                        "backoff, leaving it to the sweep",
+                        pub.id,
+                    )
+                    return
                 claimed = await self.claim_publication(
                     pub.id,
                     owner=outbox._claim_owner,

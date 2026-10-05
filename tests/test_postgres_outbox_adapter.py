@@ -1057,6 +1057,47 @@ async def test_after_commit_dispatch_skips_a_row_already_completed(
     assert await _completed_rows(engine) == 1
 
 
+async def test_after_commit_dispatch_respects_backoff_under_lease(
+    engine: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A row that failed recently waits out its retry backoff, as it does in
+    the sweep and under the advisory lock. The after-commit task must leave it
+    unclaimed for the sweep, then deliver it once the backoff has elapsed."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _pub(1, attempt_count=3, last_attempt_at=datetime.now(UTC))
+    await store.save(pub)
+
+    with caplog.at_level(logging.DEBUG, logger="modulith.adapters.postgres"):
+        await store._dispatch_after_commit(pub.id)
+
+    assert received == []
+    row = await _stored_row(engine, pub.id)
+    assert (row.claim_token, row.completed_at, row.attempt_count) == (None, None, 3)
+    skips = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "modulith.adapters.postgres"
+        and r.levelno == logging.DEBUG
+        and "backoff" in r.getMessage()
+    ]
+    assert len(skips) == 1
+    assert str(pub.id) in skips[0]
+
+    async with async_sessionmaker(engine)() as s:
+        await s.execute(
+            update(EventPublicationRow)
+            .where(EventPublicationRow.id == pub.id)
+            .values(last_attempt_at=datetime.now(UTC) - timedelta(hours=1))
+        )
+        await s.commit()
+    await store._dispatch_after_commit(pub.id)
+
+    assert received == [1]
+    assert await _completed_rows(engine) == 1
+
+
 async def test_sweep_cannot_claim_a_row_after_commit_is_delivering(engine: Any) -> None:
     await _assert_sweep_cannot_claim_a_row_after_commit_is_delivering(engine)
 
@@ -1754,6 +1795,59 @@ async def test_an_interrupted_delivery_is_charged_until_it_dead_letters_on_postg
 @pytest.mark.integration
 async def test_a_claimed_row_never_started_is_not_charged_on_postgres(pg_engine: Any) -> None:
     await _assert_a_claimed_row_never_started_is_not_charged(pg_engine)
+
+
+async def _assert_an_unlocked_claim_returns_the_state_its_update_matched(
+    engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A peer can claim a candidate, fail it and release it between the
+    sweeper's SELECT and its claiming UPDATE. The UPDATE still matches, since
+    the row is unclaimed again, so the claim must carry the attempts and error
+    the row holds now: the claimant's own failure write sets ``attempt_count``
+    absolutely and would roll the peer's attempts back."""
+    store = PostgresPublicationStore(engine=engine)
+    pub = _pub(1, published_at=datetime.now(UTC) - timedelta(seconds=5))
+    await store.save(pub)
+    real_try_claim_row = postgres_outbox._try_claim_row
+
+    async def peer_fails_the_row_first(s: Any, publication_id: Any, **kwargs: Any) -> bool:
+        async with async_sessionmaker(engine)() as peer:
+            await peer.execute(
+                update(EventPublicationRow)
+                .where(EventPublicationRow.id == publication_id)
+                .values(
+                    attempt_count=3,
+                    last_error="peer failure",
+                    last_attempt_at=datetime.now(UTC),
+                )
+            )
+            await peer.commit()
+        return await real_try_claim_row(s, publication_id, **kwargs)
+
+    monkeypatch.setattr(postgres_outbox, "_try_claim_row", peer_fails_the_row_first)
+
+    [claimed] = await store.claim_batch(
+        owner="me", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+
+    assert (claimed.attempt_count, claimed.last_error) == (3, "peer failure")
+    assert claimed.last_attempt_at is not None
+    assert claimed.claim_token is not None
+    assert (await _stored_row(engine, pub.id)).claim_token == claimed.claim_token
+
+
+async def test_an_unlocked_claim_returns_the_state_its_update_matched_on_sqlite(
+    engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _assert_an_unlocked_claim_returns_the_state_its_update_matched(engine, monkeypatch)
+
+
+@pytest.mark.integration
+async def test_an_unlocked_claim_returns_the_state_its_update_matched_on_mysql(
+    mysql_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with _mysql_engine(mysql_url) as engine:
+        await _assert_an_unlocked_claim_returns_the_state_its_update_matched(engine, monkeypatch)
 
 
 async def test_a_released_claim_is_not_charged(engine: Any) -> None:
