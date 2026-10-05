@@ -626,7 +626,10 @@ any symlink in the copied source; `--force` does not bypass these path safety
 rules. Before publishing, it imports the staged module in a fresh interpreter
 and fails if that import fails or loads code from the source tree outside the
 extracted service; `--force` does not bypass that check either, so a
-module-level import of another module fails even with `--force`.
+module-level import of another module fails even with `--force`. A package
+beside the app, such as a sibling library in the same repository, passes that
+check when its installed distribution is listed in the source project's
+`[project].dependencies`: the extracted service installs it instead of copying it.
 
 modupy doesn't do the database split for you (that's a real data
 migration project) but the contracts module, the events, and now

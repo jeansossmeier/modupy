@@ -1156,7 +1156,10 @@ kubectl create secret generic myapp-env \
 `MODULITH_DB_URL` is not a runtime variable; it feeds the migrations only.
 Readiness uses
 `httpGet /health`; liveness uses `tcpSocket` so a temporary broker outage does
-not crash-loop a healthy pod. No `resources` or Secret objects are emitted.
+not crash-loop a healthy pod. No `resources` or Secret objects are emitted,
+and no `securityContext`: pods run as the image's user. Once the image runs as
+a non-root user ([Running as a Non-Root User](#running-as-a-non-root-user)),
+add `runAsNonRoot` and related fields with a patch or overlay.
 
 `modulith k8s-manifest` refuses to generate manifests for a broker that cannot be shared across pods: `memory`, `shm`, or `database` pointed at a `sqlite://` URL. Configure `database` with a networked URL (`postgresql://`, `mysql://`) or `redis-streams` first.
 
@@ -1688,7 +1691,12 @@ deserializing, and acks (Redis Streams) or completes (database and SHM) such a
 message without dead-lettering it, logging it at DEBUG. A message whose header
 is missing, empty, undecodable or names a class the process has not loaded
 (including a class renamed or removed since publishing), or whose payload cannot
-be read, is still dead-lettered. Each dead-lettered delivery belongs to one
+be read, is still dead-lettered. In process-per-module topology this includes a
+sibling module's event type on a shared target when this worker never imports
+the module that defines it: the worker cannot tell that type from a renamed one,
+so it dead-letters the message in its own group rather than dropping it. Import
+the defining module (the contracts module, for example) in the worker to have it
+acked instead. Each dead-lettered delivery belongs to one
 consumer group, so `--retry-all` hands it back only to that group; a group that
 already completed the same message does not receive it again. `--list` and
 `--retry-all` are mutually exclusive. The command runs against the broker store
@@ -1801,7 +1809,7 @@ hard-killed supervisor from leaving workers behind is Linux-only.
    - Before publishing, imports the extracted module, its contracts module and its `_manifest` (as a worker does, tolerating only an absent contracts module or manifest) in a subprocess from the staged tree, and exits 1 naming the failing import if that fails, or if the import loads first-party code from the source tree outside the extracted copy (reachable through `PYTHONPATH` or an editable install), so the service's third-party dependencies must be installed where you run `extract`
    - Warns on stderr, and lists under "Extraction notes" in the generated README, each third-party distribution that import loaded but the generated dependencies and chosen extras do not cover; the warning never fails the extraction
    - Other modules keep sending events via the broker; the extracted service subscribes and acts. As in a worker, the service binds its outbox store from `MODULITH_OUTBOX_URL` (`[tool.modulith].outbox_url`) and refuses to start without a store when `MODULITH_OUTBOX` is not `memory`, because the app's `main.py` is not copied (see [Durable Single-Process](#durable-single-process-outbox-pattern)). The generated `.env.example` and README list `MODULITH_OUTBOX` and `MODULITH_OUTBOX_URL`
-   - How contracts, helpers, symlinks, namespace folders and first-party code are handled: [What `modulith extract` copies and checks](#what-modulith-extract-copies-and-checks)
+   - How contracts, helpers, symlinks, namespace folders and first-party code are handled, and which dependencies the generated `pyproject.toml` declares: [What `modulith extract` copies and checks](#what-modulith-extract-copies-and-checks)
 
 This path is why modupy exists: **every module is a potential microservice, but you pay that cost only when it's profitable.**
 

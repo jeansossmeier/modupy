@@ -679,7 +679,10 @@ module worker stamps its module package in a `publisher_module` broker header
 owns, so the broker copy reaching the publisher's own worker, or a second
 replica of it, does not run them again. Listeners of other modules run from the
 broker copy, as do all listeners for a message without the header (a publisher
-that hosts no module, or one sent before the header existed).
+that hosts no module, or one sent before the header existed). So a process that
+hosts no module stamps nothing, and a listener registered both in its own bus
+and in a worker runs in each; listeners must be idempotent under at-least-once
+delivery anyway.
 In process topology an event with no local listener is routed too, without `@externalized`, because its listeners live in other workers.
 The runtime resolves an event's broker target in
 priority order:
