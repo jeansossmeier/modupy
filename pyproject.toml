@@ -119,7 +119,7 @@ database = [
     # 0.3.2 (the latest release) imports and calls for every bytes parameter;
     # 1.2.3 restores the name as a string, so every MySQL write raises
     # TypeError. Lift the cap once aiomysql ships a compatible release.
-    "pymysql>=1.1,<1.2.1",
+    "pymysql>=1.1,<1.2.4",
 ]
 
 # NOTE: a Kafka broker is on the roadmap (SPEC §10.3) but no adapter ships yet,
@@ -209,7 +209,7 @@ integration = [
     "cryptography>=41.0,<50.0",
     "psycopg[binary]>=3.1,<4.0",
     # Capped like the `database` extra: aiomysql breaks on PyMySQL >= 1.2.1.
-    "pymysql>=1.1,<1.2.1",
+    "pymysql>=1.1,<1.2.4",
 ]
 
 # Everything. For "I want all the features" users.
