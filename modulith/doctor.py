@@ -128,7 +128,7 @@ def run_doctor(baseline_path: Path = _BASELINE_PATH) -> HealthReport:
             checks.append(check(_runtime))
         except Exception as exc:  # one broken check must not abort the rest
             logger.exception("doctor check %r failed", name)
-            checks.append(HealthCheck(name=name, status="error", summary=f"check raised: {exc}"))
+            checks.append(HealthCheck(name=name, status="error", summary=f"check raised: {exc!r}"))
     return HealthReport(checks=checks)
 
 

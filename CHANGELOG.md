@@ -168,6 +168,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - The database broker's SKIP LOCKED refusal prints the server's own `VERSION()` string and both minimums (MySQL 8.0.1, MariaDB 10.6) instead of a mis-parsed version; an out-of-range or non-numeric option names the option, its `MODULITH_BROKER_*` variable and the value you gave; `expected_consumer_groups` keys are stripped and a leading `database:` is dropped, as consumer targets are; and a whitespace-only `MODULITH_BROKER_*` value counts as unset
 - `modulith outbox retry <id>` and `outbox.force_retry()` deliver under the same claim or advisory lock the sweep takes: a row a live peer holds is left to that peer (the command says so and exits 1), and a dead-lettered row gets a fresh attempt budget; `force_retry()` now returns `"retried"`, `"held"` or `"not_found"` instead of `None`
 - A SQLite database broker whose schema setup times out no longer leaves a connection-setup statement running in the background that could lock the database file after the error was raised
+- `modulith doctor` names the exception type when a check fails with an exception that carries no message, instead of an empty `check raised:` summary
 
 ### Security
 

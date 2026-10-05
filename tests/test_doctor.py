@@ -180,6 +180,23 @@ def test_boundary_health_reports_a_plugin_rule_violation(make_fake_app) -> None:
     assert any("team convention broken" in d for d in check.details)
 
 
+def test_a_check_raising_without_a_message_still_names_the_exception(
+    make_fake_app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp")
+
+    def _raise(_rt: object) -> None:
+        raise KeyError
+
+    monkeypatch.setattr("modulith.doctor._check_actuator_token", _raise)
+
+    check = _check(run_doctor(), "actuator token")
+
+    assert check.status == "error"
+    assert check.summary == "check raised: KeyError()"
+
+
 def test_boundary_health_honors_disabled_rules_for_a_plugin_rule(make_fake_app) -> None:
     make_fake_app({"orders": ""})
     configure(package="fakeapp", verify_disabled_rules=("team-rule",))
