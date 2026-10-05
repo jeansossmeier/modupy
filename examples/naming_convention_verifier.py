@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import pkgutil
 
 from modulith import (
     ModuleInfo,
@@ -47,12 +48,22 @@ def modulith_verify_module(
     # already imported it once at startup, so this is essentially free.
     package = importlib.import_module(module.package)
 
-    for name, obj in inspect.getmembers(package):
+    # Events usually live in submodules (``contracts/events.py``) that the
+    # package ``__init__`` need not re-export, so walk those too. A submodule
+    # that fails to import raises, exactly like the package import above.
+    namespaces = [package]
+    for info in pkgutil.walk_packages(getattr(package, "__path__", []), f"{module.package}."):
+        namespaces.append(importlib.import_module(info.name))
+
+    seen: set[int] = set()
+    for name, obj in (member for ns in namespaces for member in inspect.getmembers(ns)):
         # Heuristic: events are classes with a marker attribute set by
         # the @event decorator. Real implementation would use a more
         # robust check (e.g. registration in a per-module event list).
-        if not getattr(obj, "__modulith_event__", False):
+        # ``seen`` collapses an event re-exported by ``__init__``.
+        if not getattr(obj, "__modulith_event__", False) or id(obj) in seen:
             continue
+        seen.add(id(obj))
 
         # Only flag events this module actually defines. Cross-module events
         # live in the shared contracts package and get imported into the

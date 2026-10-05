@@ -21,6 +21,8 @@ import importlib.util
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+
 from modulith import ModuleInfo, Violation, ViolationSeverity
 from modulith.manager import create_plugin_manager
 
@@ -156,3 +158,67 @@ def test_example_verifier_composes_with_the_builtin_rules(make_fake_app) -> None
 
     assert "event-past-tense" in rules  # the example's rule
     assert "no-internal-imports" in rules  # a built-in rule
+
+
+def test_example_verifier_flags_a_command_named_event_in_a_submodule(make_fake_app) -> None:
+    """An event defined in ``contracts/events.py`` is checked, once.
+
+    ``contracts`` is where modulith keeps cross-module events, and the module
+    ``__init__`` need not re-export them, so the rule has to walk the package's
+    submodules. ``ShipItem`` is also re-exported from ``__init__`` and must not
+    be reported twice.
+    """
+    make_fake_app(
+        {"contracts": "from fakeapp.contracts.events import ShipItem\n"},
+        package_name=APP,
+        extra_files={
+            "contracts/events.py": (
+                "from modulith import event\n\n"
+                "@event\nclass PlaceOrder:\n    pass\n\n"
+                "@event\nclass ShipItem:\n    pass\n\n"
+                "@event\nclass OrderPlaced:\n    pass\n"
+            )
+        },
+    )
+
+    violations = _verify(["contracts"], load_builtins=False)
+
+    assert len(violations) == 2, violations
+    assert sorted("PlaceOrder" in v.message for v in violations) == [False, True]
+    assert sorted("ShipItem" in v.message for v in violations) == [False, True]
+    assert {v.module for v in violations} == {"contracts"}
+
+
+def test_example_verifier_reaches_events_in_nested_subpackages(make_fake_app) -> None:
+    """The walk descends into subpackages, not only direct submodules."""
+    make_fake_app(
+        {"contracts": ""},
+        package_name=APP,
+        extra_files={
+            "contracts/v1/__init__.py": "",
+            "contracts/v1/events.py": (
+                "from modulith import event\n\n@event\nclass PlaceOrder:\n    pass\n"
+            ),
+        },
+    )
+
+    violations = _verify(["contracts"], load_builtins=False)
+
+    assert len(violations) == 1, violations
+    assert "PlaceOrder" in violations[0].message
+
+
+def test_example_verifier_lets_a_failing_submodule_import_propagate(make_fake_app) -> None:
+    """A submodule that cannot import fails like the package import does.
+
+    The example never swallows an import error for the package itself; a broken
+    submodule surfaces the same way instead of silently skipping its events.
+    """
+    make_fake_app(
+        {"contracts": ""},
+        package_name=APP,
+        extra_files={"contracts/events.py": "raise ImportError('broken submodule')\n"},
+    )
+
+    with pytest.raises(ImportError, match="broken submodule"):
+        _verify(["contracts"], load_builtins=False)
