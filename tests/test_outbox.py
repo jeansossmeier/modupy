@@ -53,7 +53,7 @@ from modulith.adapters.postgres_outbox import (
 from modulith.adapters.shm_broker import ShmBroker
 from modulith.builtin import outbox
 from modulith.config import ConfigurationError
-from modulith.runtime import _runtime, _set_journal_mode_wal
+from modulith.runtime import _PUBLISHER_MODULE_HEADER, _runtime, _set_journal_mode_wal
 from modulith.serializers import JsonEventSerializer
 
 # ---------------------------------------------------------------------------
@@ -1998,6 +1998,88 @@ async def test_broker_route_threads_publication_id_into_headers() -> None:
     assert received_headers == [
         {"event_type": publication.event_type, "publication_id": str(publication.id)}
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored", "expected_extra"),
+    [
+        (
+            {_PUBLISHER_MODULE_HEADER: "outboxtest.orders"},
+            {_PUBLISHER_MODULE_HEADER: "outboxtest.orders"},
+        ),
+        (
+            {
+                "traceparent": "00-" + "a" * 32 + "-" + "b" * 16 + "-01",
+                _PUBLISHER_MODULE_HEADER: "m",
+            },
+            {
+                "traceparent": "00-" + "a" * 32 + "-" + "b" * 16 + "-01",
+                _PUBLISHER_MODULE_HEADER: "m",
+            },
+        ),
+        ({_PUBLISHER_MODULE_HEADER: 7}, {}),
+        ({_PUBLISHER_MODULE_HEADER: ""}, {}),
+        (None, {}),
+    ],
+)
+async def test_broker_route_sends_the_stored_publisher_module_header(
+    stored: dict[str, Any] | None, expected_extra: dict[str, str]
+) -> None:
+    received_headers: list[dict[str, str] | None] = []
+
+    class Broker:
+        async def publish(
+            self, target: str, payload: bytes, headers: dict[str, str] | None = None
+        ) -> None:
+            received_headers.append(headers)
+
+        async def close(self) -> None:
+            pass
+
+    _runtime.configure(package="outboxtest", auto_discover=False)
+    _runtime.ensure_bootstrapped()
+    assert _runtime.broker_registry is not None
+    _runtime.broker_registry.register("test", Broker())
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    publication = EventPublication(
+        id=uuid4(),
+        payload=b'{"value": 7}',
+        event_type=f"{OutboxEvent.__module__}.{OutboxEvent.__qualname__}",
+        listener=outbox._BROKER_ROUTE_LISTENER_PREFIX + "test:events",
+        published_at=datetime.now(UTC),
+        trace_context=stored,
+    )
+    await store.save(publication)
+
+    await outbox._dispatch_broker_route(publication)
+
+    assert received_headers == [
+        {
+            "event_type": publication.event_type,
+            "publication_id": str(publication.id),
+            **expected_extra,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_persist_broker_route_in_a_hosted_worker_records_its_module() -> None:
+    _runtime.configure(package="outboxtest", auto_discover=False)
+    _runtime.ensure_bootstrapped()
+    _runtime.host_module("outboxtest.orders")
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+
+    hosted = await outbox.persist_broker_route(OutboxEvent(value=2), "test:events")
+    _runtime._hosted_module = None
+    unhosted = await outbox.persist_broker_route(OutboxEvent(value=2), "test:events")
+
+    assert (hosted.trace_context, unhosted.trace_context) == (
+        {_PUBLISHER_MODULE_HEADER: "outboxtest.orders"},
+        None,
+    )
 
 
 @pytest.mark.asyncio

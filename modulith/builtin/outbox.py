@@ -726,17 +726,26 @@ async def persist_broker_route(event: Any, target: str) -> EventPublication:
     ``EventPublishReceipt`` alongside any per-listener records ``persist()``
     saved for the same publish.
     """
+    from .. import runtime as _rt
+
     assert _store is not None  # owns-dispatch guarantees this
     if _retry_loop_enabled:
         _ensure_retry_loop()
     fqcn = f"{type(event).__module__}.{type(event).__qualname__}"
+    carrier = _publish_trace_context()
+    publisher = _rt._runtime._hosted_module
+    if publisher is not None:
+        # Any worker may send this row, so the publisher's module must travel
+        # with it. EventPublication has no column for it; every store keeps the
+        # carrier as JSON and trace_headers ignores keys it does not know.
+        carrier = {**(carrier or {}), _rt._PUBLISHER_MODULE_HEADER: publisher}
     pub = EventPublication(
         id=uuid4(),
         payload=_WIRE_SERIALIZER.serialize(event),
         event_type=fqcn,
         listener=_BROKER_ROUTE_LISTENER_PREFIX + target,
         published_at=datetime.now(UTC),
-        trace_context=_publish_trace_context(),
+        trace_context=carrier,
     )
     await _store.save(pub)
     return pub
@@ -994,15 +1003,16 @@ async def _dispatch_broker_route(publication: EventPublication) -> None:
                 f"(publication {publication.id} targeting {target!r}; "
                 f"registered schemes: {registered or 'none'})"
             )
-        await registry.publish(
-            target,
-            publication.payload,
-            {
-                "event_type": publication.event_type or "",
-                "publication_id": str(publication.id),
-                **trace_headers(publication.trace_context),
-            },
-        )
+        headers = {
+            "event_type": publication.event_type or "",
+            "publication_id": str(publication.id),
+            **trace_headers(publication.trace_context),
+        }
+        carrier = publication.trace_context
+        publisher = carrier.get(_rt._PUBLISHER_MODULE_HEADER) if isinstance(carrier, dict) else None
+        if isinstance(publisher, str) and publisher:
+            headers[_rt._PUBLISHER_MODULE_HEADER] = publisher
+        await registry.publish(target, publication.payload, headers)
     except Exception as exc:
         logger.warning("broker route %s failed for publication %s: %s", target, publication.id, exc)
         await _record_failure(publication, exc)

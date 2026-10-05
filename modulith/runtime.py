@@ -55,6 +55,12 @@ def _is_regular_package(module: Any) -> bool:
     )
 
 
+# Broker header naming the module package whose process published the event, so
+# a consumer can tell which listeners already ran at the publisher. Absent when
+# the publisher hosts no module. The outbox stores the same name in the row's
+# carrier (``builtin.outbox._dispatch_broker_route``), so keep one spelling.
+_PUBLISHER_MODULE_HEADER = "publisher_module"
+
 # Set only by the CLI inspection commands (see ``cli._bootstrap_or_exit``).
 # While true, a bootstrap under ``strict_boundaries`` does not abort on
 # boundary violations, because the command reports them under its own contract.
@@ -935,9 +941,10 @@ class Runtime:
 
         event_type = f"{type(event).__module__}.{type(event).__qualname__}"
         payload = JsonEventSerializer().serialize(event)
-        await registry.publish(
-            target, payload, {"event_type": event_type, **trace_headers(_publish_trace_context())}
-        )
+        headers = {"event_type": event_type, **trace_headers(_publish_trace_context())}
+        if self._hosted_module is not None:
+            headers[_PUBLISHER_MODULE_HEADER] = self._hosted_module
+        await registry.publish(target, payload, headers)
         logger.debug("routed %s to broker target %s", event_type, target)
 
     def ensure_bootstrapped(self) -> None:

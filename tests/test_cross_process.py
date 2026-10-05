@@ -18,7 +18,7 @@ import pytest
 from modulith import EventPublication, configure
 from modulith._consumer import consumer_targets
 from modulith.builtin import outbox
-from modulith.runtime import _runtime
+from modulith.runtime import _PUBLISHER_MODULE_HEADER, _runtime
 from modulith.serializers import JsonEventSerializer
 
 
@@ -289,6 +289,139 @@ async def test_externalized_event_with_local_listener_also_routes_to_broker(make
     assert len(fake.published) == 1  # AND routed to the broker (fan-out)
     destination, _, _ = fake.published[0]
     assert destination == "fakeapp.orders.OrderPlaced"
+
+
+_EXTERNALIZED_ORDERS = """
+    from dataclasses import dataclass
+    from modulith import event, externalized, listener, publish
+
+    @externalized
+    @event
+    @dataclass(frozen=True)
+    class OrderPlaced:
+        order_id: str
+
+    @listener
+    async def on_placed(evt: OrderPlaced) -> None:
+        pass
+
+    async def place(order_id: str) -> None:
+        await publish(OrderPlaced(order_id=order_id))
+"""
+
+
+async def test_direct_broker_send_names_the_publishing_module_in_a_header(make_fake_app) -> None:
+    make_fake_app({"orders": _EXTERNALIZED_ORDERS})
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+    _runtime.ensure_bootstrapped()
+    _runtime.host_module("fakeapp.orders")
+    fake = _register_fake_broker("testbroker")
+
+    import fakeapp.orders as orders
+
+    await orders.place("o-1")
+
+    assert [headers for _, _, headers in fake.published] == [
+        {"event_type": "fakeapp.orders.OrderPlaced", _PUBLISHER_MODULE_HEADER: "fakeapp.orders"}
+    ]
+
+
+async def test_direct_broker_send_outside_any_module_carries_no_publisher_header(
+    make_fake_app,
+) -> None:
+    make_fake_app({"orders": _EXTERNALIZED_ORDERS})
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+    _runtime.ensure_bootstrapped()
+    fake = _register_fake_broker("testbroker")
+
+    import fakeapp.orders as orders
+
+    await orders.place("o-1")
+
+    assert [headers for _, _, headers in fake.published] == [
+        {"event_type": "fakeapp.orders.OrderPlaced"}
+    ]
+
+
+async def _publish_in_transaction(orders, store: Store) -> EventPublication:
+    """Publish inside a bound session; return the broker-route row."""
+    token = outbox._current_session.set(Session())
+    try:
+        await orders.place("o-tx")
+    finally:
+        outbox._current_session.reset(token)
+    (route,) = [
+        p
+        for p in store.saved
+        if (p.listener or "").startswith(outbox._BROKER_ROUTE_LISTENER_PREFIX)
+    ]
+    return route
+
+
+async def test_outbox_broker_route_names_the_publishing_module_in_a_header(make_fake_app) -> None:
+    make_fake_app({"orders": _EXTERNALIZED_ORDERS})
+    store = Store()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+    _runtime.ensure_bootstrapped()
+    _runtime.host_module("fakeapp.orders")
+    fake = _register_fake_broker("testbroker")
+
+    import fakeapp.orders as orders
+
+    route = await _publish_in_transaction(orders, store)
+    await outbox._dispatch_publication(route)
+
+    assert [headers for _, _, headers in fake.published] == [
+        {
+            "event_type": "fakeapp.orders.OrderPlaced",
+            "publication_id": str(route.id),
+            _PUBLISHER_MODULE_HEADER: "fakeapp.orders",
+        }
+    ]
+
+
+async def test_outbox_broker_route_keeps_the_publisher_when_a_sibling_worker_sends_it(
+    make_fake_app,
+) -> None:
+    """Any worker may send a broker-route row, so the stamp lives in the row."""
+    make_fake_app({"orders": _EXTERNALIZED_ORDERS})
+    store = Store()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+    _runtime.ensure_bootstrapped()
+    _runtime.host_module("fakeapp.orders")
+    fake = _register_fake_broker("testbroker")
+
+    import fakeapp.orders as orders
+
+    route = await _publish_in_transaction(orders, store)
+    _runtime.host_module("fakeapp.billing")
+    await outbox._dispatch_publication(route)
+
+    (_, _, headers) = fake.published[0]
+    assert headers is not None
+    assert headers[_PUBLISHER_MODULE_HEADER] == "fakeapp.orders"
+
+
+async def test_outbox_broker_route_outside_any_module_carries_no_publisher_header(
+    make_fake_app,
+) -> None:
+    make_fake_app({"orders": _EXTERNALIZED_ORDERS})
+    store = Store()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+    _runtime.ensure_bootstrapped()
+    fake = _register_fake_broker("testbroker")
+
+    import fakeapp.orders as orders
+
+    route = await _publish_in_transaction(orders, store)
+    await outbox._dispatch_publication(route)
+
+    assert [headers for _, _, headers in fake.published] == [
+        {"event_type": "fakeapp.orders.OrderPlaced", "publication_id": str(route.id)}
+    ]
 
 
 async def test_externalized_explicit_target_overrides_default(make_fake_app) -> None:
