@@ -43,6 +43,9 @@ from .config import (
     _validate_max_payload_bytes,
 )
 
+if sys.version_info >= (3, 14):
+    import annotationlib
+
 __all__ = ["JsonEventSerializer"]
 
 logger = logging.getLogger("modulith.serializers")
@@ -313,7 +316,14 @@ def _safe_type_hints(obj: Any) -> dict[str, Any]:
     names that don't resolve simply yield no coercion for that field.
     """
     try:
-        resolved = typing.get_type_hints(obj)
+        if sys.version_info >= (3, 14):
+            # Under deferred annotations a class has no ``__annotations__``
+            # entry in its dict, so the per-annotation fallback below finds
+            # nothing; FORWARDREF turns each unresolvable name into a
+            # ForwardRef (which ``_coerce`` leaves alone) and keeps the rest.
+            resolved = typing.get_type_hints(obj, format=annotationlib.Format.FORWARDREF)
+        else:
+            resolved = typing.get_type_hints(obj)
     except Exception:
         resolved = None
     if resolved is not None:

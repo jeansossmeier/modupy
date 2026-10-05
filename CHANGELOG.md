@@ -109,6 +109,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `modulith run --topology processes`: the start-up warning about a retired consumer group says, for a database or SHM group that no longer has a subscription, that no new publication reaches it and only its leftover backlog remains. The check gives up after 10 seconds on a broker store that does not answer and starts the workers, instead of waiting forever
 - Reverse proxy: a request to a module with several replicas is served by a healthy replica when the one it picked first is down, answers for another deployment, or misses its identity-check deadline; it answers 502, 503 or 504 only after every replica was tried. A request that may already have reached a replica is never sent to another
 - Python 3.14: `@listener` registers a listener with deferred annotations when another of its parameters is annotated with a name imported only under `TYPE_CHECKING`, instead of raising `NameError`
+- Python 3.14: an event with one annotation that cannot be resolved, such as a name imported only under `TYPE_CHECKING`, keeps the type hints of its other fields, so they decode as `datetime`, `Decimal`, `UUID` and so on instead of staying strings
 
 ### Security
 

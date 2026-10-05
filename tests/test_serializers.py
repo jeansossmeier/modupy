@@ -543,6 +543,42 @@ def test_type_checking_forward_ref_does_not_block_deserialize() -> None:
     assert isinstance(restored.amount, Decimal)  # resolvable fields still coerce
 
 
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="deferred annotations (PEP 649) need 3.14+")
+def test_unresolvable_annotation_keeps_hints_of_other_fields_under_deferred_annotations(
+    monkeypatch,
+) -> None:
+    source = (
+        "from dataclasses import dataclass\n"
+        "from datetime import datetime\n"
+        "from decimal import Decimal\n"
+        "from uuid import UUID\n"
+        "@dataclass\n"
+        "class DeferredEvent:\n"
+        "    amount: Decimal\n"
+        "    created_at: datetime\n"
+        "    ref: UUID\n"
+        "    debug: DebugInfo | None = None\n"
+    )
+    namespace: dict[str, object] = {"__name__": __name__}
+    # dont_inherit: this module's postponed annotations would store strings,
+    # hiding the 3.14 deferred-annotation path under test.
+    exec(compile(source, "<deferred>", "exec", dont_inherit=True), namespace)
+    event_type = cast(type, namespace["DeferredEvent"])
+    monkeypatch.setattr(sys.modules[__name__], "DeferredEvent", event_type, raising=False)
+    serializer = JsonEventSerializer()
+    original = event_type(
+        amount=Decimal("5.00"), created_at=datetime(2026, 1, 5, tzinfo=UTC), ref=uuid4()
+    )
+
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(event_type))
+
+    assert restored == original
+    assert type(restored.amount) is Decimal
+    assert type(restored.created_at) is datetime
+    assert type(restored.ref) is UUID
+    assert restored.debug is None
+
+
 def test_slotted_event_serializes_and_round_trips() -> None:
     """The documented vars() fallback crashed with a raw TypeError
     for __slots__ classes; slots must be read as the instance attributes."""
