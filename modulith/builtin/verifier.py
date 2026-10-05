@@ -239,7 +239,30 @@ class ImportRecord:
     type_only: bool = False
 
 
+_unresolved_reported: set[str] = set()
+
+
 def _package_dir(package: str) -> Path | None:
+    """The directory of an application package, or None.
+
+    Every caller skips a package it cannot read, so a clean result would
+    look the same whether that package was checked or not. None is therefore
+    logged as a warning, once per package. ``_is_submodule`` probes arbitrary
+    import targets, where None is routine, and uses the silent
+    ``_find_package_dir`` instead.
+    """
+    directory = _find_package_dir(package)
+    if directory is None and package not in _unresolved_reported:
+        _unresolved_reported.add(package)
+        logger.warning(
+            "no source directory found on sys.path for package %s; checks that read "
+            "its source skip it, so a clean result does not cover it",
+            package,
+        )
+    return directory
+
+
+def _find_package_dir(package: str) -> Path | None:
     """Resolve a package's on-disk directory without executing its code.
 
     ``find_spec`` on a dotted name (e.g. ``"myapp.orders"``) imports every
@@ -254,7 +277,10 @@ def _package_dir(package: str) -> Path | None:
     order, and the portion holding the package need not be the first: an
     editable install's ``.pth`` entry lands after site-packages, where other
     installed portions of the same root live. So every portion is searched,
-    in the import system's own order, for the full dotted path.
+    in the import system's own order, for the full dotted path. As in the
+    path finder, a directory holding ``__init__.py`` wins over a directory
+    without one wherever it sits; with no such regular package, the first
+    namespace directory is returned.
     """
     parts = package.split(".")
     try:
@@ -263,11 +289,14 @@ def _package_dir(package: str) -> Path | None:
         return None
     if spec is None or not spec.submodule_search_locations:
         return None
+    namespace_dir: Path | None = None
     for location in spec.submodule_search_locations:
         directory = Path(location).joinpath(*parts[1:])
-        if directory.is_dir():
+        if (directory / "__init__.py").is_file():
             return directory
-    return None
+        if namespace_dir is None and directory.is_dir():
+            namespace_dir = directory
+    return namespace_dir
 
 
 def _is_submodule(package: str, name: str) -> bool:
@@ -279,7 +308,7 @@ def _is_submodule(package: str, name: str) -> bool:
     """
     if name == "*" or name.startswith("_"):
         return False
-    directory = _package_dir(package)
+    directory = _find_package_dir(package)
     if directory is None:
         return False
     return (directory / name).is_dir() or (directory / f"{name}.py").is_file()
@@ -468,7 +497,6 @@ def _collect_imports(
     """
     root = _package_dir(module.package)
     if root is None:
-        logger.debug("could not resolve package dir for %s", module.package)
         return []
 
     records: list[ImportRecord] = []

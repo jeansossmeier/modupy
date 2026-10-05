@@ -860,6 +860,109 @@ def test_package_dir_does_not_execute_ancestor_init(make_fake_app) -> None:
     assert "fakeapp" not in sys.modules
 
 
+def test_unresolvable_module_package_warns_once(caplog) -> None:
+    """A module whose package has no directory on ``sys.path`` is scanned by
+    no rule, so a clean result must not be mistaken for a checked one."""
+    import logging
+    from uuid import uuid4
+
+    suffix = uuid4().hex
+    ghost = ModuleInfo(name="ghost", package=f"w4_ghost_{suffix}.ghost")
+    other = ModuleInfo(name="other", package=f"w4_other_{suffix}.other")
+    modules = [ghost, other]
+
+    with caplog.at_level(logging.WARNING, logger="modulith.verifier"):
+        verdicts = [
+            verifier.modulith_verify_module(ghost, modules),
+            verifier.modulith_verify_module(ghost, modules),
+            verifier.modulith_verify_module(other, modules),
+        ]
+
+    assert verdicts == [[], [], []]
+    messages = [r.getMessage() for r in caplog.records if r.name == "modulith.verifier"]
+    assert len(messages) == 2
+    assert sum(ghost.package in message for message in messages) == 1
+    assert sum(other.package in message for message in messages) == 1
+
+
+def test_importing_from_a_plain_module_does_not_warn_about_an_unresolved_package(
+    make_fake_app, caplog
+) -> None:
+    """``from typing import Any`` makes the collector ask whether ``typing`` has
+    a submodule ``Any``. A plain module or an uninstalled library has no package
+    directory, and that is routine, not a module package the verifier failed
+    to scan."""
+    import logging
+
+    make_fake_app(
+        {
+            "orders": """
+                from typing import Any
+                from dataclasses import dataclass
+                from not_installed_library import thing
+            """
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="modulith.verifier"):
+        violations = verifier.modulith_verify_module(_module("orders"), [_module("orders")])
+
+    assert violations == []
+    assert [r.getMessage() for r in caplog.records if r.name == "modulith.verifier"] == []
+
+
+def _namespace_portions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, root: str
+) -> tuple[Path, Path]:
+    """Two ``sys.path`` entries that each hold a ``<root>/shop`` directory, the
+    first ahead of the second. Returns the two ``shop`` directories."""
+    import sys
+
+    def forget_root() -> None:
+        for name in list(sys.modules):
+            if name == root or name.startswith(f"{root}."):
+                del sys.modules[name]
+
+    request.addfinalizer(forget_root)
+    entries = [tmp_path / "first", tmp_path / "second"]
+    for entry in entries:
+        (entry / root / "shop").mkdir(parents=True)
+    monkeypatch.syspath_prepend(str(entries[1]))
+    monkeypatch.syspath_prepend(str(entries[0]))
+    return entries[0] / root / "shop", entries[1] / root / "shop"
+
+
+def test_package_dir_prefers_regular_package_over_earlier_namespace_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    """The path finder skips a directory without ``__init__.py`` while a later
+    portion holds a regular package of that name, so the verifier must scan the
+    directory the interpreter imports, not the stale one ahead of it."""
+    import importlib
+
+    _stale, regular = _namespace_portions(tmp_path, monkeypatch, request, "w4_regular_later")
+    (regular / "__init__.py").write_text("")
+
+    resolved = verifier._package_dir("w4_regular_later.shop")
+
+    assert resolved == regular
+    assert Path(importlib.import_module("w4_regular_later.shop").__file__ or "").parent == resolved
+
+
+def test_package_dir_falls_back_to_first_namespace_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    import importlib
+
+    first, _second = _namespace_portions(tmp_path, monkeypatch, request, "w4_namespace_only")
+
+    resolved = verifier._package_dir("w4_namespace_only.shop")
+
+    assert resolved == first
+    shop = importlib.import_module("w4_namespace_only.shop")
+    assert Path(next(iter(shop.__path__))) == resolved
+
+
 def _reset_namespace_app() -> None:
     import sys
 
