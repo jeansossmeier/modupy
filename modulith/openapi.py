@@ -21,6 +21,9 @@ _SCHEMA_REF_PREFIX = "#/components/schemas/"
 _HTTP_METHODS = frozenset({"get", "put", "post", "delete", "options", "head", "patch", "trace"})
 _SINGLETON_FIELDS = ("openapi", "jsonSchemaDialect", "externalDocs", "security", "servers")
 _EXAMPLE_FIELDS = frozenset({"example", "examples"})
+_NAMED_SCHEMA_MAPS = frozenset(
+    {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"}
+)
 
 
 class OpenAPIMergeError(ValueError):
@@ -54,8 +57,17 @@ def _prefix_schema_ref(value: Any, module_name: str) -> Any:
     return value
 
 
+def _rewrite_named_schemas(names: dict[str, Any], module_name: str) -> dict[str, Any]:
+    return {name: _rewrite_schema_refs(schema, module_name) for name, schema in names.items()}
+
+
 def _rewrite_schema_refs(node: Any, module_name: str) -> Any:
-    """Prefix ``$ref`` and discriminator mappings while preserving examples and extensions."""
+    """Prefix ``$ref`` and discriminator mappings while preserving examples and extensions.
+
+    The children of a name-keyed mapping (``properties``, ``components.schemas``, ...) are
+    schema names, so one called ``example`` or ``x-foo`` is still rewritten; only an
+    ``example``/``examples``/``x-*`` keyword is skipped.
+    """
     if isinstance(node, dict):
         rewritten: dict[str, Any] = {}
         for key, value in node.items():
@@ -63,6 +75,15 @@ def _rewrite_schema_refs(node: Any, module_name: str) -> Any:
                 rewritten[key] = value
             elif key == "$ref":
                 rewritten[key] = _prefix_schema_ref(value, module_name)
+            elif key in _NAMED_SCHEMA_MAPS and isinstance(value, dict):
+                rewritten[key] = _rewrite_named_schemas(value, module_name)
+            elif key == "components" and isinstance(value, dict):
+                rewritten[key] = {
+                    part: _rewrite_named_schemas(item, module_name)
+                    if part == "schemas" and isinstance(item, dict)
+                    else _rewrite_schema_refs(item, module_name)
+                    for part, item in value.items()
+                }
             else:
                 rewritten[key] = _rewrite_schema_refs(value, module_name)
 

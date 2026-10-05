@@ -209,6 +209,47 @@ def test_merge_openapi_rewrites_only_schema_reference_fields() -> None:
     assert merged["components"]["schemas"]["orders_Item"]["example"]["$ref"] == schema_ref
 
 
+def test_merge_openapi_rewrites_refs_under_names_that_look_like_keywords() -> None:
+    schema_ref = "#/components/schemas/Foo"
+    prefixed = "#/components/schemas/orders_Foo"
+    names = ("example", "examples", "x-trace")
+    doc: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "orders", "version": "0.0.0"},
+        "paths": {},
+        "components": {
+            "schemas": {
+                "Foo": {"type": "object"},
+                "example": {"$ref": schema_ref},
+                "Holder": {
+                    "type": "object",
+                    "properties": {name: {"$ref": schema_ref} for name in names},
+                    "patternProperties": {"^x-": {"$ref": schema_ref}},
+                    "$defs": {name: {"$ref": schema_ref} for name in names},
+                    "definitions": {"examples": {"$ref": schema_ref}},
+                    "dependentSchemas": {"x-dep": {"$ref": schema_ref}},
+                    "x-ext": {"$ref": schema_ref},
+                    "example": {"properties": {"p": {"$ref": schema_ref}}},
+                },
+            }
+        },
+    }
+
+    merged = merge_openapi({"orders": doc}, title="t", version="1")
+
+    schemas = merged["components"]["schemas"]
+    holder = schemas["orders_Holder"]
+    assert schemas["orders_example"]["$ref"] == prefixed
+    for name in names:
+        assert holder["properties"][name]["$ref"] == prefixed
+        assert holder["$defs"][name]["$ref"] == prefixed
+    assert holder["patternProperties"]["^x-"]["$ref"] == prefixed
+    assert holder["definitions"]["examples"]["$ref"] == prefixed
+    assert holder["dependentSchemas"]["x-dep"]["$ref"] == prefixed
+    assert holder["x-ext"]["$ref"] == schema_ref
+    assert holder["example"]["properties"]["p"]["$ref"] == schema_ref
+
+
 def test_merge_openapi_rejects_conflicting_path_items() -> None:
     doc_a: dict[str, Any] = {
         "openapi": "3.1.0",
