@@ -22,7 +22,9 @@ Critical correctness pattern:
      commit. An after_transaction_end listener discards the queue explicitly
      when a transaction ends uncommitted (rollback or close), so
      queued-but-uncommitted publications are never dispatched, and logs each
-     such discard at WARNING with the event types.
+     such discard at WARNING with the event types. A SAVEPOINT is handled
+     separately: releasing it dispatches nothing, and rolling it back drops
+     only the ids queued since it began.
 
 Two deliberate schema choices, both forced by the ``PublicationStore``
 Protocol (the authoritative contract):
@@ -223,7 +225,12 @@ def _schedule_after_commit_dispatch(session: Session) -> None:
     Runs inside ``await session.commit()`` (so a loop is running) and pops the
     pending ids queued by ``save``. Each is dispatched as a scheduled task —
     fire-and-forget; the retry loop is the safety net if a task is lost.
+
+    SQLAlchemy also fires after_commit when a SAVEPOINT is released. Nothing
+    is committed then, so the queue is left for the enclosing commit.
     """
+    if session.in_nested_transaction():
+        return
     pending = session.info.pop("_modulith_pending", [])
     session.info.pop("_modulith_pending_types", None)
     if not pending:
@@ -258,6 +265,42 @@ def _schedule_after_commit_dispatch(session: Session) -> None:
         task.add_done_callback(store._inflight.discard)
 
 
+_SAVEPOINT_MARKS = "_modulith_savepoint_marks"
+
+
+def _mark_savepoint_start(session: Session, transaction: Any) -> None:
+    """Record how many ids are queued when a SAVEPOINT begins.
+
+    The queue is flat, so its length at that moment separates the enclosing
+    transaction's ids from the SAVEPOINT's own.
+    """
+    if not transaction.nested:
+        return
+    marks = session.info.setdefault(_SAVEPOINT_MARKS, {})
+    for finished in [t for t in marks if not t.is_active]:
+        del marks[finished]
+    marks[transaction] = len(session.info.get("_modulith_pending", ()))
+
+
+def _drop_rolled_back_savepoint_pending(session: Session, previous_transaction: Any) -> None:
+    """Forget the ids queued inside a SAVEPOINT that was rolled back.
+
+    Their rows went with the rollback, so dispatching them after the outer
+    commit would only log "found no row (deleted before delivery?)". A
+    released SAVEPOINT never reaches this hook, so its ids stay queued.
+    """
+    if not previous_transaction.nested:
+        return
+    mark = session.info.get(_SAVEPOINT_MARKS, {}).pop(previous_transaction, None)
+    pending = session.info.get("_modulith_pending")
+    if mark is None or not pending:
+        return
+    types = session.info.get("_modulith_pending_types", {})
+    for publication_id in pending[mark:]:
+        types.pop(publication_id, None)
+    del pending[mark:]
+
+
 def _discard_uncommitted_pending(session: Session, transaction: Any) -> None:
     """Drop, and report, queued ids whose transaction ended without committing.
 
@@ -275,15 +318,15 @@ def _discard_uncommitted_pending(session: Session, transaction: Any) -> None:
     each logging the "found no row … deleted before delivery?" warning that
     is supposed to mean something has gone wrong with a *committed* row.
 
-    Only the root transaction counts. A flush runs in its own inner
-    transaction, which ends before the root commits. A SAVEPOINT end is left
-    alone too: the queue is flat, so it cannot tell which ids belong to the
-    savepoint and which to the enclosing transaction, and dropping the
-    enclosing ones would silently downgrade them from after-commit dispatch
-    to retry-sweep latency.
+    Only the root transaction counts here. A flush runs in its own inner
+    transaction, which ends before the root commits, and a SAVEPOINT end is
+    left alone: a released SAVEPOINT keeps its ids queued for the enclosing
+    commit, and a rolled-back one has its ids dropped by
+    ``_drop_rolled_back_savepoint_pending`` so they are never dispatched.
     """
     if transaction.parent is not None:
         return
+    session.info.pop(_SAVEPOINT_MARKS, None)
     pending = session.info.pop("_modulith_pending", None)
     types = session.info.pop("_modulith_pending_types", {})
     if not pending:
@@ -296,6 +339,19 @@ def _discard_uncommitted_pending(session: Session, transaction: Any) -> None:
         len(pending),
         ", ".join(sorted({types.get(pid, "<unknown>") for pid in pending})),
     )
+
+
+_SESSION_HOOKS: tuple[tuple[str, Any], ...] = (
+    ("after_commit", _schedule_after_commit_dispatch),
+    ("after_transaction_create", _mark_savepoint_start),
+    ("after_soft_rollback", _drop_rolled_back_savepoint_pending),
+    ("after_transaction_end", _discard_uncommitted_pending),
+)
+
+
+def _remove_session_hooks() -> None:
+    for name, hook in _SESSION_HOOKS:
+        sa_event.remove(Session, name, hook)
 
 
 # ---------------------------------------------------------------------------
@@ -514,8 +570,8 @@ class PostgresPublicationStore:
         global _hook_installed
         if _hook_installed:
             return
-        sa_event.listen(Session, "after_commit", _schedule_after_commit_dispatch)
-        sa_event.listen(Session, "after_transaction_end", _discard_uncommitted_pending)
+        for name, hook in _SESSION_HOOKS:
+            sa_event.listen(Session, name, hook)
         _hook_installed = True
 
     def _check_cross_loop_usage(self) -> None:
@@ -1364,6 +1420,9 @@ class PostgresPublicationStore:
             elif outbox._completion_mode in ("delete", "archive"):
                 # Completing the row removes it under these modes, so a sweep
                 # that delivered it first is the ordinary way to find it gone.
+                # An operator delete or purge lands here at DEBUG too: delete
+                # and archive modes accept that trade-off, as a missing id
+                # cannot be told apart from a delivered one.
                 logger.debug(
                     "after-commit dispatch: publication %s already completed and removed",
                     publication_id,
@@ -1466,8 +1525,7 @@ class PostgresPublicationStore:
         if _active_store is self:
             _active_store = _store_stack[-1] if _store_stack else None
             if _active_store is None and _hook_installed:
-                sa_event.remove(Session, "after_commit", _schedule_after_commit_dispatch)
-                sa_event.remove(Session, "after_transaction_end", _discard_uncommitted_pending)
+                _remove_session_hooks()
                 _hook_installed = False
 
 
@@ -1497,8 +1555,7 @@ def _reset_for_testing() -> None:
     _store_stack.clear()
     _active_store = None
     if _hook_installed:
-        sa_event.remove(Session, "after_commit", _schedule_after_commit_dispatch)
-        sa_event.remove(Session, "after_transaction_end", _discard_uncommitted_pending)
+        _remove_session_hooks()
         _hook_installed = False
 
 

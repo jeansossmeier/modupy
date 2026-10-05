@@ -137,6 +137,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `modulith extract` no longer stalls when the import check leaves a background process holding its pipes, keeps files the import check writes out of `--output`, and removes its hidden staging directory on Ctrl-C; isolated tests (`modulith_isolated`) likewise no longer wait for such a process after the test child exits
 - `JsonEventSerializer`: a union field whose matching member is a `NewType`, a type alias or a parameterized generic (such as `list[date]`) round-trips to that member instead of being decoded as the first member, and a non-dataclass event is encoded and decoded from the same annotations
 - `modulith broker drop-group` describes what actually happens: a publish to an `expected_consumer_groups` target with no entry raises `ConfigurationError`, the start-up warning comes only from `modulith run --topology processes`, it says to delete a target's key when the dropped group is its only entry, it prints retention in plain seconds instead of `2.592e+06`, and on SHM it says a group that subscribes again within `orphan_retention_seconds` is replayed the retained messages
+- Outbox: a publish rolled back with a SAVEPOINT (`session.begin_nested()`) is no longer dispatched after the outer commit, so the "found no row (deleted before delivery?)" warning no longer fires for it, and releasing a SAVEPOINT no longer dispatches its publishes before the outer transaction commits
 
 ### Security
 

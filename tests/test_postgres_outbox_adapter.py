@@ -2311,3 +2311,177 @@ async def test_rollback_discarding_bound_publish_is_logged(
     assert await _completed_rows(engine) == 0
     [message] = _discard_warnings(caplog)
     assert "G04Event" in message
+
+
+# ---------------------------------------------------------------------------
+# A publish rolled back with a SAVEPOINT is never dispatched
+# ---------------------------------------------------------------------------
+
+
+def _dispatched_ids(store: PostgresPublicationStore, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Record the id of every after-commit dispatch the store is asked for, at
+    the moment the after-commit hook schedules it."""
+    dispatched: list[Any] = []
+    original = store._dispatch_after_commit
+
+    def spy(publication_id: Any) -> Any:
+        dispatched.append(publication_id)
+        return original(publication_id)
+
+    monkeypatch.setattr(store, "_dispatch_after_commit", spy)
+    return dispatched
+
+
+def _missing_row_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "found no row" in r.getMessage()
+    ]
+
+
+async def _publish_around_savepoints(
+    engine: Any,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    script: Any,
+) -> tuple[list[int], list[Any], dict[int, Any]]:
+    """Run ``script(session, publish_value)`` in one bound transaction, commit,
+    and return the delivered values, the dispatched ids and value -> id."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+    dispatched = _dispatched_ids(store, monkeypatch)
+    ids: dict[int, Any] = {}
+    original_save = store.save
+
+    async def tracking_save(publication: EventPublication) -> None:
+        ids[json.loads(publication.payload)["value"]] = publication.id
+        await original_save(publication)
+
+    monkeypatch.setattr(store, "save", tracking_save)
+
+    async def publish_value(value: int) -> None:
+        await publish(G04Event(value=value))
+
+    async with async_sessionmaker(engine)() as session:
+        token = bind_session(session)
+        try:
+            with caplog.at_level(logging.DEBUG, logger="modulith"):
+                await script(session, publish_value)
+                assert dispatched == [], "a SAVEPOINT release or rollback scheduled a dispatch"
+                await session.commit()
+                await store.wait_for_dispatch()
+        finally:
+            unbind_session(token)
+    return sorted(received), dispatched, ids
+
+
+async def _assert_a_rolled_back_savepoint_publish_is_not_dispatched(
+    engine: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def script(session: Any, publish_value: Any) -> None:
+        await publish_value(1)
+        savepoint = await session.begin_nested()
+        await publish_value(2)
+        await savepoint.rollback()
+        await publish_value(3)
+
+    delivered, dispatched, ids = await _publish_around_savepoints(
+        engine, caplog, monkeypatch, script
+    )
+
+    assert delivered == [1, 3]
+    assert sorted(dispatched) == sorted([ids[1], ids[3]])
+    assert _missing_row_warnings(caplog) == []
+    assert await _completed_rows(engine) == 2
+
+
+async def _assert_a_released_savepoint_publish_is_dispatched(
+    engine: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def script(session: Any, publish_value: Any) -> None:
+        await publish_value(1)
+        async with session.begin_nested():
+            await publish_value(2)
+        await publish_value(3)
+
+    delivered, dispatched, ids = await _publish_around_savepoints(
+        engine, caplog, monkeypatch, script
+    )
+
+    assert delivered == [1, 2, 3]
+    assert sorted(dispatched) == sorted(ids.values())
+    assert _missing_row_warnings(caplog) == []
+    assert await _completed_rows(engine) == 3
+
+
+async def test_a_publish_rolled_back_with_a_savepoint_is_not_dispatched_or_logged(
+    engine: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _assert_a_rolled_back_savepoint_publish_is_not_dispatched(engine, caplog, monkeypatch)
+
+
+async def test_a_publish_in_a_released_savepoint_is_dispatched(
+    engine: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _assert_a_released_savepoint_publish_is_dispatched(engine, caplog, monkeypatch)
+
+
+@pytest.mark.integration
+async def test_a_publish_rolled_back_with_a_savepoint_is_not_dispatched_on_postgres(
+    pg_engine: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _assert_a_rolled_back_savepoint_publish_is_not_dispatched(pg_engine, caplog, monkeypatch)
+
+
+@pytest.mark.integration
+async def test_a_publish_in_a_released_savepoint_is_dispatched_on_postgres(
+    pg_engine: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _assert_a_released_savepoint_publish_is_dispatched(pg_engine, caplog, monkeypatch)
+
+
+async def test_only_the_rolled_back_savepoint_of_nested_savepoints_is_discarded(
+    engine: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def script(session: Any, publish_value: Any) -> None:
+        await publish_value(1)
+        outer = await session.begin_nested()
+        await publish_value(2)
+        inner = await session.begin_nested()
+        await publish_value(3)
+        await inner.rollback()
+        await publish_value(4)
+        await outer.commit()
+        doomed = await session.begin_nested()
+        await publish_value(5)
+        nested_kept = await session.begin_nested()
+        await publish_value(6)
+        await nested_kept.commit()
+        await doomed.rollback()
+
+    delivered, dispatched, ids = await _publish_around_savepoints(
+        engine, caplog, monkeypatch, script
+    )
+
+    assert delivered == [1, 2, 4]
+    assert sorted(dispatched) == sorted(ids[v] for v in (1, 2, 4))
+    assert _missing_row_warnings(caplog) == []
+
+
+async def test_a_savepoint_rollback_that_holds_the_only_publish_dispatches_nothing(
+    engine: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def script(session: Any, publish_value: Any) -> None:
+        savepoint = await session.begin_nested()
+        await publish_value(1)
+        await savepoint.rollback()
+
+    delivered, dispatched, _ids = await _publish_around_savepoints(
+        engine, caplog, monkeypatch, script
+    )
+
+    assert delivered == []
+    assert dispatched == []
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
