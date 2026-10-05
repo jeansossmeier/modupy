@@ -71,6 +71,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `modulith run` and `modulith dev` without `--topology` use `[tool.modulith] topology` or `MODULITH_TOPOLOGY` instead of always starting one process. The flag still wins, and an invalid configured value exits 1 with the error
 - Process-per-module workers no longer inherit `FORWARDED_ALLOW_IPS` from the supervisor. Set for an ingress in front of the proxy, it made every worker ignore the client address and scheme the proxy forwards from 127.0.0.1, so `request.client` named the proxy and `request.url` used `http` behind an HTTPS ingress. Workers keep uvicorn's default and trust only the local proxy
 - The reverse proxy answers `400` to a request whose `Host` header has a non-numeric or out-of-range port, on every path including the actuator. An out-of-range port such as `Host: example.com:99999` used to answer `500` on every routed path. `X-Forwarded-Port` is now the port the proxy accepted the connection on instead of one taken from the client's `Host` header, so behind an ingress it is the proxy's own port
+- `publish_sync()` works in a child created with `os.fork()` after the parent has used it. The child starts its own event-loop thread; it used to queue the event on the parent's loop, which nothing runs in the child, so the call raised `PublishSyncTimeout` or, with `timeout=None`, blocked forever
 
 ### Security
 

@@ -21,6 +21,7 @@ import atexit
 import contextvars
 import functools
 import logging
+import os
 import threading
 from collections.abc import Callable, Coroutine
 from typing import Any
@@ -54,11 +55,29 @@ _loop: asyncio.AbstractEventLoop | None = None
 _loop_lock = threading.Lock()
 
 
+def _forget_loop_in_child() -> None:
+    """Drop the loop state a forked child inherits, so its first call starts its own.
+
+    fork() copies the cached loop but not the daemon thread that ran it, so a
+    child that reused the loop queued dispatches nothing would run. A copied
+    ``_loop_lock`` stays locked for good when another parent thread held it at
+    fork time, because no child thread exists to release it.
+    """
+    global _loop, _loop_lock
+    _loop = None
+    _loop_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):  # absent on Windows
+    os.register_at_fork(after_in_child=_forget_loop_in_child)
+
+
 def _get_or_create_loop() -> asyncio.AbstractEventLoop:
     """Return a long-lived event loop running on a daemon thread.
 
     First call: starts a thread, creates a loop, runs it forever.
-    Subsequent calls: returns the same loop.
+    Subsequent calls: returns the same loop, except in a process forked after
+    the first call, whose own first call starts a new loop and thread.
     Thread-safe via _loop_lock.
     """
     global _loop
@@ -117,7 +136,9 @@ def publish_sync(event: Any, *, timeout: float | None = 30.0) -> None:
          ``timeout=None``).
       3. Otherwise (no loop in this thread): dispatch on the persistent
          daemon-thread loop from _get_or_create_loop() and block on the
-         result. Covers plain scripts AND threadpool sync views.
+         result. Covers plain scripts AND threadpool sync views. A process
+         created with ``os.fork()`` after the first call starts a loop of its
+         own, so publish_sync() also works in the child.
 
     The timeout protects against listener deadlocks. None disables it.
     Default of 30s matches typical HTTP timeouts; tune via configuration.

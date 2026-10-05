@@ -1,9 +1,10 @@
 """Behavioral tests for the sync entrypoint and sync-listener support.
 
-Covers modulith/sync.py — publish_sync() context detection/dispatch and
-wrap_sync_listener() executor dispatch + contextvars propagation — plus the
-end-to-end sync @listener path. No mocks: real runtime, real event loop(s),
-and real threads (same style as the rest of the suite).
+Covers modulith/sync.py — publish_sync() context detection/dispatch (including
+in a forked child) and wrap_sync_listener() executor dispatch + contextvars
+propagation — plus the end-to-end sync @listener path. No mocks: real runtime,
+real event loop(s), real threads, and a real forked process (same style as the
+rest of the suite).
 
 The runtime needs configuration before bootstrap; these tests use
 auto_discover=False so bootstrap builds the bus and flushes the listeners they
@@ -21,12 +22,20 @@ focused on sync behavior rather than annotation resolution.
 """
 
 import contextvars
+import json
+import os
+import signal
 import threading
+import time
+import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import pytest
 
 from modulith import bootstrap, configure, event, listener, publish, publish_sync
+from modulith import sync as sync_module
 from modulith.sync import wrap_sync_listener
 
 
@@ -151,6 +160,101 @@ async def test_publish_sync_on_loop_thread_raises() -> None:
 
     with pytest.raises(RuntimeError, match="async context"):
         publish_sync(E())
+
+
+# ---------------------------------------------------------------------------
+# publish_sync() after os.fork()
+# ---------------------------------------------------------------------------
+
+
+def _in_forked_child(work: Callable[[], Any], *, budget: float) -> dict[str, Any] | None:
+    """Run ``work()`` in a forked child and return the JSON report it sent back.
+
+    The report is ``{"result": ...}`` or ``{"error": repr(exc)}``. A child still
+    running after ``budget`` seconds is killed and reported as ``None``.
+    """
+    read_fd, write_fd = os.pipe()
+    with warnings.catch_warnings():
+        # Python 3.12+ warns that fork() in a multi-threaded process may deadlock.
+        # The parent's loop thread makes it multi-threaded on purpose: that is the
+        # scenario under test.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        pid = os.fork()
+    if pid == 0:
+        status = 1
+        try:
+            os.close(read_fd)
+            try:
+                report: dict[str, Any] = {"result": work()}
+            except BaseException as exc:
+                report = {"error": repr(exc)}
+            os.write(write_fd, json.dumps(report).encode())
+            status = 0
+        finally:
+            os._exit(status)
+    os.close(write_fd)
+    try:
+        deadline = time.monotonic() + budget
+        while True:
+            done, wait_status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            if time.monotonic() > deadline:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                return None
+            time.sleep(0.01)
+        data = os.read(read_fd, 65536)
+        if not data:
+            return {"error": f"no report; exit code {os.waitstatus_to_exitcode(wait_status)}"}
+        parsed: dict[str, Any] = json.loads(data)
+        return parsed
+    finally:
+        os.close(read_fd)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="os.fork is unavailable on this platform")
+@pytest.mark.parametrize("loop_lock_held", [False, True], ids=["lock_free", "lock_held"])
+def test_publish_sync_works_in_a_forked_child(loop_lock_held: bool) -> None:
+    """A child forked after the parent used publish_sync() gets its own loop thread.
+
+    fork() copies the parent's cached loop but not the daemon thread that ran it,
+    so a child that reused the loop queued its dispatch where nothing ran it and
+    timed out (hung forever under timeout=None). A lock that another parent
+    thread held at fork time is copied locked, and nothing in the child would
+    ever release it.
+    """
+    configure(package="synctest", auto_discover=False)
+
+    @event
+    @dataclass(frozen=True)
+    class Forked:
+        who: str
+
+    received: list[str] = []
+
+    @listener
+    async def on_forked(evt: Forked) -> None:
+        received.append(evt.who)
+
+    publish_sync(Forked(who="parent"))
+    assert received == ["parent"]
+
+    def child_publishes() -> list[str]:
+        publish_sync(Forked(who="child"), timeout=5)
+        return received
+
+    loop_lock = sync_module._loop_lock
+    if loop_lock_held:
+        loop_lock.acquire()
+    try:
+        report = _in_forked_child(child_publishes, budget=20)
+    finally:
+        if loop_lock_held:
+            loop_lock.release()
+
+    assert report is not None, "the forked child did not finish within 20s and was killed"
+    assert report == {"result": ["parent", "child"]}
 
 
 # ---------------------------------------------------------------------------

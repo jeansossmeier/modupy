@@ -144,7 +144,7 @@ Detection strategy:
      ``timeout=None``).
   3. Otherwise (no loop in this thread): dispatch on the persistent
      daemon-thread loop from _get_or_create_loop() and block on the
-     result. Covers plain scripts AND threadpool sync views.
+     result. Covers plain scripts AND threadpool sync views. A process
 
 The timeout protects against listener deadlocks. None disables it.
 Default of 30s matches typical HTTP timeouts; tune via configuration.
