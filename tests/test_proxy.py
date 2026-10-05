@@ -143,6 +143,85 @@ def test_proxy_returns_404_for_unmatched_path(proxy_app) -> None:
     assert resp.status_code == 404
 
 
+def _health_module_worker(token: str, handler_hits: list[str]) -> FastAPI:
+    """A worker of a module named ``health``, routed the way ``_worker.create_app``
+    routes it: its own ``/health`` first, then the module's router under ``/health``.
+
+    ``handler_hits`` records every call of the worker's own ``/health``."""
+    up = FastAPI()
+
+    @up.get("/health")
+    async def own_health(request: Request) -> dict[str, str]:
+        handler_hits.append(str(request.url.query))
+        return {"detail": "consumer error text", **_health_answer(request, token, "health")}
+
+    @up.get("/health/")
+    async def module_root() -> dict[str, str]:
+        return {"route": "module root"}
+
+    @up.get("/health/items")
+    async def module_items() -> dict[str, str]:
+        return {"route": "module items"}
+
+    return up
+
+
+def _proxy_for_health_module(handler_hits: list[str]) -> FastAPI:
+    transport = httpx.ASGITransport(app=_health_module_worker("tok", handler_hits))
+    return create_proxy_app(
+        [RoutingRule(prefix="/health", backend_url="http://health-worker")],
+        client=httpx.AsyncClient(transport=transport),
+        deployment_token="tok",
+    )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "/health",
+        "/health?token=x",
+        "/%68ealth",
+        "/%68ealth?token=x",
+    ],
+)
+def test_proxy_answers_404_for_the_workers_own_health_in_a_module_named_health(
+    target: str,
+) -> None:
+    """Every public spelling of ``/health`` that routing normalises to the worker's
+    own ``/health`` gets 404 and never reaches it, so the worker's health JSON,
+    which carries the consumer's error text, is not public."""
+    handler_hits: list[str] = []
+    with TestClient(_proxy_for_health_module(handler_hits)) as client:
+        resp = client.get(target)
+    assert resp.status_code == 404
+    assert "consumer error text" not in resp.text
+    assert handler_hits == []
+
+
+def test_proxy_still_forwards_the_other_paths_of_a_module_named_health() -> None:
+    handler_hits: list[str] = []
+    with TestClient(_proxy_for_health_module(handler_hits)) as client:
+        items = client.get("/health/items")
+        root = client.get("/health/", follow_redirects=False)
+    assert (items.status_code, items.json()) == (200, {"route": "module items"})
+    assert (root.status_code, root.json()) == (200, {"route": "module root"})
+
+
+def test_actuator_health_and_identity_probes_still_reach_a_module_named_health() -> None:
+    """The proxy's own checks call the worker's ``/health`` directly, not through
+    public routing: ``/_modulith/health`` reports the module ``ok`` from it, and
+    the identity probe that precedes a forwarded request passes through it."""
+    handler_hits: list[str] = []
+    with TestClient(_proxy_for_health_module(handler_hits)) as client:
+        items = client.get("/health/items")
+        reached_by_identity_probe = len(handler_hits)
+        readiness = client.get("/_modulith/health")
+    assert items.status_code == 200
+    assert reached_by_identity_probe == 1
+    assert (readiness.status_code, readiness.json()["backends"]) == (200, {"/health": "ok"})
+    assert len(handler_hits) == 2
+
+
 def test_proxy_schema_builds_without_duplicate_operation_ids(proxy_app) -> None:
     """Building the proxy's OpenAPI document must not warn.
 

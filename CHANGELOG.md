@@ -172,6 +172,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `modulith audit` no longer overwrites a report file that appears while the audit runs unless `--force` is passed, and relative sqlite URLs keep their `///` form when the CLI prints them masked
 - The Redis Streams broker in the parent process trims streams at `MODULITH_BROKER_MAX_STREAM_LEN` when `MODULITH_STREAM_MAXLEN` is not set, the cap the supervisor gives workers; the parent used to keep the 10000 default
 - `@listener` accepts a bound method whose function carries a `functools.wraps` decorator, sync or async, instead of raising "must annotate its event parameter"; and a sync bound-method listener's stored outbox id gets the owning module prefix an async one already had (`orders:orders.Notifier.on_placed`), see Upgrade notes
+- The proxy answers 404 for the public path `/health`, with or without a query string or a percent-encoded spelling, so a module named `health` no longer exposes its worker's health JSON and the consumer error text in it; the module's other paths, such as `/health/items`, still reach it
 
 ### Security
 

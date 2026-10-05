@@ -640,7 +640,9 @@ def create_proxy_app(
         raw_path = _raw_path(request.scope)
         target = unquote(raw_path.decode("latin-1"))
         rule = _match_rule(target, rules)
-        if rule is None:
+        # A module named "health" matches /health, which is the worker's own
+        # health route (consumer error text included), not one of the module's.
+        if rule is None or target == "/health":
             return JSONResponse({"detail": f"no worker route for {target!r}"}, status_code=404)
 
         # Replicas are taken round-robin (skipping any marked down by a failed
