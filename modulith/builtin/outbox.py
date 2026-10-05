@@ -95,6 +95,7 @@ from modulith._claims import (
     DEFAULT_CLAIM_LEASE_SECONDS,
     DEFAULT_CLAIM_STRATEGY,
     VALID_CLAIM_STRATEGIES,
+    LockConnectionTimeout,
 )
 from modulith.brokers import _split_broker_target
 from modulith.config import MAX_CLAIM_LEASE_SECONDS, ConfigurationError
@@ -451,7 +452,10 @@ def configure(
     ``claim_strategy`` coordinates concurrent sweepers (see
     ``modulith._claims``): ``"lease"`` (default), ``"advisory_lock"``, or
     ``"none"``. Stores without the matching capability fall back to the
-    original unclaimed ``find_incomplete`` path at sweep time.
+    original unclaimed ``find_incomplete`` path at sweep time. ``"advisory_lock"``
+    is the exception: it raises ``ConfigurationError`` for a store without
+    ``supports_advisory_lock``, without ``find_by_id``, or whose own
+    ``check_advisory_lock_config()`` rejects its engine.
 
     ``start_loop=False`` binds state without starting the loop — used by
     tests that drive ``_dispatch_publication`` directly, and by callers that
@@ -500,6 +504,16 @@ def configure(
             "claim_strategy='advisory_lock' requires a store with "
             "supports_advisory_lock=True (Postgres pg_try_advisory_lock)"
         )
+    if claim_strategy == "advisory_lock":
+        if not callable(getattr(store, "find_by_id", None)):
+            raise ConfigurationError(
+                "claim_strategy='advisory_lock' requires a store with find_by_id: the row "
+                "is re-read under its lock, and without a lookup a row a peer already "
+                "delivered would be delivered again from the sweep's stale snapshot"
+            )
+        check_lock_config = getattr(store, "check_advisory_lock_config", None)
+        if callable(check_lock_config):
+            check_lock_config()
     if claim_strategy == "none":
         # Intentional contract: concurrent sweepers MAY double-dispatch.
         # Log once per configure so operators see the tradeoff.
@@ -1262,9 +1276,7 @@ async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
             await _dispatch_with_lease_renewal(pub)
 
 
-class _LockConnectionTimeout(Exception):
-    """An advisory-locking store found no free lock connection within its
-    pool timeout. The row was not locked, read or charged an attempt."""
+_LockConnectionTimeout = LockConnectionTimeout  # the name callers imported before the move
 
 
 async def _sweep_advisory(older_than: timedelta, *, runtime_ready: bool) -> None:

@@ -20,6 +20,7 @@ import pytest
 
 from modulith import EventPublication, event, hookimpl
 from modulith.builtin import outbox
+from modulith.config import ConfigurationError
 from modulith.runtime import _runtime
 from modulith.serializers import JsonEventSerializer
 
@@ -655,3 +656,73 @@ def test_inflight_guard_is_atomic_across_threads(
         t.join(timeout=5)
 
     assert max_active == 1  # never delivered concurrently within one process
+
+
+# ---------------------------------------------------------------------------
+# advisory_lock configuration contract
+# ---------------------------------------------------------------------------
+
+
+class _AdvisoryStoreWithoutLookup(StubStore):
+    """Advisory-locking capability only: no ``find_by_id``."""
+
+    supports_advisory_lock = True
+
+    async def try_lock_publication(self, publication_id: UUID) -> object | None:
+        return object()
+
+    async def unlock_publication(self, handle: object, publication_id: UUID) -> None:
+        return None
+
+
+class _AdvisoryStoreWithLookup(_AdvisoryStoreWithoutLookup):
+    async def find_by_id(self, publication_id: UUID) -> EventPublication | None:
+        return self.rows.get(publication_id)
+
+
+def test_advisory_lock_requires_find_by_id() -> None:
+    """Under the lock the row is re-read to see what a peer did since the
+    sweep's snapshot; a store that cannot look a row up would redeliver from
+    the stale snapshot, so configuring it is refused and names the method."""
+    with pytest.raises(ConfigurationError, match="find_by_id"):
+        outbox.configure(
+            _AdvisoryStoreWithoutLookup(),
+            JsonEventSerializer(),
+            claim_strategy="advisory_lock",
+            start_loop=False,
+        )
+
+
+def test_advisory_lock_accepts_a_store_with_find_by_id() -> None:
+    outbox.configure(
+        _AdvisoryStoreWithLookup(),
+        JsonEventSerializer(),
+        claim_strategy="advisory_lock",
+        start_loop=False,
+    )
+
+    assert outbox._claim_strategy == "advisory_lock"
+
+
+def test_find_by_id_is_not_needed_for_the_other_strategies() -> None:
+    outbox.configure(
+        _AdvisoryStoreWithoutLookup(),
+        JsonEventSerializer(),
+        claim_strategy="none",
+        start_loop=False,
+    )
+
+    assert outbox._claim_strategy == "none"
+
+
+def test_lock_connection_timeout_is_part_of_the_advisory_protocol() -> None:
+    """The timeout a lock attempt can raise is defined beside the protocol
+    that documents it, and stays importable from the outbox plugin."""
+    from modulith import _claims
+
+    assert issubclass(_claims.LockConnectionTimeout, Exception)
+    assert outbox._LockConnectionTimeout is _claims.LockConnectionTimeout
+    assert "LockConnectionTimeout" in (
+        _claims.AdvisoryLockingStore.try_lock_publication.__doc__ or ""
+    )
+    assert "find_by_id" in (_claims.AdvisoryLockingStore.__doc__ or "")

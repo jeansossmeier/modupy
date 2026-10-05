@@ -39,6 +39,12 @@ from uuid import UUID
 
 from .types import EventPublication
 
+
+class LockConnectionTimeout(Exception):
+    """An advisory-locking store found no free lock connection within its
+    pool timeout. The row was not locked, read or charged an attempt."""
+
+
 VALID_CLAIM_STRATEGIES = ("lease", "advisory_lock", "none")
 DEFAULT_CLAIM_STRATEGY = "lease"
 DEFAULT_CLAIM_LEASE_SECONDS = 60.0
@@ -102,6 +108,13 @@ class AdvisoryLockingStore(Protocol):
     Postgres-only in practice (backed by ``pg_try_advisory_lock``); a store
     should refuse to be constructed with ``claim_strategy="advisory_lock"``
     on a non-Postgres engine rather than expose this capability unusably.
+
+    A store must also implement ``find_by_id``: the plugin re-reads the row
+    under the lock to see what a peer did since the sweep's snapshot, and
+    ``outbox.configure()`` refuses ``claim_strategy="advisory_lock"`` for a
+    store without it. A store may implement ``check_advisory_lock_config()``,
+    which ``configure()`` calls and which raises ``ConfigurationError`` for a
+    setup that cannot hold one lock per connection safely.
     """
 
     async def try_lock_publication(self, publication_id: UUID) -> object | None:
@@ -109,7 +122,11 @@ class AdvisoryLockingStore(Protocol):
 
         Returns an opaque handle (truthy) on success, or ``None`` if another
         connection already holds it. The caller must pass the SAME handle to
-        ``unlock_publication`` when done, win or lose."""
+        ``unlock_publication`` when done, win or lose.
+
+        Raises ``LockConnectionTimeout`` when no connection for the lock
+        frees up within the store's pool timeout: the row was not locked, read
+        or charged an attempt, and the caller leaves it to a later sweep."""
         ...
 
     async def unlock_publication(self, handle: object, publication_id: UUID) -> None:
@@ -125,4 +142,5 @@ __all__ = [
     "AdvisoryLockingStore",
     "Claim",
     "ClaimingStore",
+    "LockConnectionTimeout",
 ]

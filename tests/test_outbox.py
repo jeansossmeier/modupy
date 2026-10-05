@@ -905,6 +905,9 @@ class ClaimingStubStore(StubStore):
         self.claims.pop(publication.id, None)
         return True
 
+    async def find_by_id(self, publication_id: UUID) -> EventPublication | None:
+        return self.rows.get(publication_id)
+
     async def try_lock_publication(self, publication_id: UUID) -> object | None:
         self.lock_calls.append(publication_id)
         if publication_id in self.locks:

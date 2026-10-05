@@ -635,7 +635,7 @@ A background task started by the outbox plugin sweeps for incomplete publication
 How a sweep finds its records depends on `claim_strategy`:
 
 - **`lease`** (default) — the store claims up to `claim_batch_size` records with `claim_batch`, marking each with the claimant and a lease of `claim_lease_seconds`. The sweeper renews the lease while it dispatches and fences its completion write with the claim token, so a sweeper whose lease has lapsed cannot overwrite a newer claimant's work.
-- **`advisory_lock`** — the sweeper reads candidates with `find_incomplete(older_than=...)` and holds a Postgres advisory lock for each dispatch.
+- **`advisory_lock`** — the sweeper reads candidates with `find_incomplete(older_than=...)` and holds a Postgres advisory lock for each dispatch. The store must implement `find_by_id`, which re-reads the row under the lock, and its engine must not use `StaticPool` or `SingletonThreadPool`; `configure()` raises `ConfigurationError` otherwise.
 - **`none`** — the sweeper reads candidates with `find_incomplete(older_than=...)` and dispatches them with no coordination. Two sweepers can dispatch the same record, which is why listeners must be idempotent; `outbox.configure()` logs a warning when it is chosen.
 
 A store without the matching capability falls back to the `find_incomplete` path.

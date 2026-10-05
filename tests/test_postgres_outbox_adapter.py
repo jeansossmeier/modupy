@@ -26,9 +26,15 @@ import pytest
 from fastapi import BackgroundTasks, Depends, FastAPI
 from sqlalchemy import event as sa_event
 from sqlalchemy import select, text, update
+from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool, SingletonThreadPool, StaticPool
 
 from modulith import EventPublication, event, publish
 from modulith.adapters import postgres_outbox
@@ -2518,3 +2524,80 @@ async def test_a_savepoint_rollback_that_holds_the_only_publish_dispatches_nothi
     assert delivered == []
     assert dispatched == []
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+_PG_URL = "postgresql+asyncpg://user:pw@localhost/db"
+
+
+def _pg_engine_with_pool(pool_class: type) -> AsyncEngine:
+    """An asyncpg engine over ``pool_class``; no connection is made.
+
+    ``create_async_engine`` rejects ``SingletonThreadPool`` for an async
+    dialect, so that pool is wired onto the engine the way the store itself
+    builds its lock engine."""
+    if pool_class is SingletonThreadPool:
+        sync_engine = create_async_engine(_PG_URL).sync_engine
+        return AsyncEngine(
+            Engine(SingletonThreadPool(cast(Any, None)), sync_engine.dialect, sync_engine.url)
+        )
+    return create_async_engine(_PG_URL, poolclass=pool_class)
+
+
+@pytest.mark.parametrize("pool_class", [StaticPool, SingletonThreadPool])
+async def test_advisory_lock_refuses_a_single_connection_pool(pool_class: type) -> None:
+    """These pools hand every lock connection the same DBAPI connection, so
+    concurrent dispatches would share one Postgres session. Configuring the
+    mode on such an engine is refused and names the pool."""
+    eng = _pg_engine_with_pool(pool_class)
+    store = PostgresPublicationStore(engine=eng)
+    try:
+        with pytest.raises(ConfigurationError, match=pool_class.__name__):
+            outbox.configure(
+                store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False
+            )
+    finally:
+        await store.dispose()
+        await eng.dispose()
+
+
+async def test_advisory_lock_accepts_a_queue_pool_engine() -> None:
+    eng = create_async_engine(_PG_URL, poolclass=AsyncAdaptedQueuePool, pool_size=2)
+    store = PostgresPublicationStore(engine=eng)
+    try:
+        outbox.configure(
+            store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False
+        )
+        assert outbox._claim_strategy == "advisory_lock"
+    finally:
+        await store.dispose()
+        await eng.dispose()
+
+
+@pytest.mark.parametrize("pool_class", [StaticPool, SingletonThreadPool])
+async def test_a_single_connection_pool_is_fine_for_the_lease_strategy(pool_class: type) -> None:
+    eng = _pg_engine_with_pool(pool_class)
+    store = PostgresPublicationStore(engine=eng)
+    try:
+        outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+        assert outbox._claim_strategy == "lease"
+    finally:
+        await store.dispose()
+        await eng.dispose()
+
+
+async def test_the_lock_connection_timeout_the_adapter_raises_is_the_protocol_one(
+    tmp_path: Path,
+) -> None:
+    from modulith._claims import LockConnectionTimeout
+
+    eng, store = await _advisory_store_with_one_lock_connection(tmp_path)
+    holder_id = uuid4()
+    holder = await store.try_lock_publication(holder_id)
+    assert holder is not None
+    try:
+        with pytest.raises(LockConnectionTimeout):
+            await store.try_lock_publication(uuid4())
+    finally:
+        await store.unlock_publication(holder, holder_id)
+        await store.dispose()
+        await eng.dispose()

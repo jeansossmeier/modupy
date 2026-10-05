@@ -152,6 +152,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - An `@externalized` event published in a module's worker runs that module's own listeners once: the broker copy carries a `publisher_module` header naming the module (also on an outbox-routed send), and consumers skip that module's listeners, including on its other replicas; other modules' listeners still run from the broker copy, as do all listeners for a message without the header
 - `modulith extract` drops only the source's `modupy` requirement, matched by normalized name (so `Modupy[otel]>=0.10` is replaced and `modupy-extras` is kept), carries `[tool.modulith.verify] disabled_rules` into the generated `pyproject.toml`, and says in the README's extraction notes when the source keeps its dependencies outside `[project].dependencies`
 - `modulith extract` accepts a root `__init__.py` holding only a docstring and `from __future__` imports, and refuses, naming every directory, an application package that is a namespace package spread over several directories instead of silently copying one of them
+- `outbox.configure(claim_strategy="advisory_lock")` raises `ConfigurationError` for a store without `find_by_id` and for an engine on `StaticPool` or `SingletonThreadPool`, instead of redelivering from a stale snapshot or sharing one Postgres session between dispatches; the lock-connection timeout is now `modulith._claims.LockConnectionTimeout`, part of the advisory-lock store protocol
 
 ### Security
 

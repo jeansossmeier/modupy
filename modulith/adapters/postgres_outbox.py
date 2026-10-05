@@ -82,6 +82,7 @@ try:
     from sqlalchemy.exc import TimeoutError as PoolTimeoutError
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
     from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+    from sqlalchemy.pool import SingletonThreadPool, StaticPool
 except ImportError as exc:  # pragma: no cover — exercised in a subprocess test
     raise ImportError(
         "modulith.adapters.postgres_outbox requires SQLAlchemy (async). "
@@ -89,6 +90,7 @@ except ImportError as exc:  # pragma: no cover — exercised in a subprocess tes
     ) from exc
 
 from modulith import EventPublication
+from modulith._claims import LockConnectionTimeout
 from modulith.builtin import outbox
 from modulith.builtin.outbox import (
     _bound_session,
@@ -1275,7 +1277,7 @@ class PostgresPublicationStore:
         try:
             conn = await self._lock_connection_engine().connect()
         except PoolTimeoutError as exc:
-            raise outbox._LockConnectionTimeout(str(exc)) from exc
+            raise LockConnectionTimeout(str(exc)) from exc
         try:
             # AUTOCOMMIT: the lock query would otherwise autobegin a
             # transaction that stays open for the whole dispatch this handle
@@ -1291,6 +1293,23 @@ class PostgresPublicationStore:
             await conn.close()
             return None
         return conn
+
+    def check_advisory_lock_config(self) -> None:
+        """Raise ``ConfigurationError`` when the engine's pool cannot give
+        each lock its own session.
+
+        A ``StaticPool`` or ``SingletonThreadPool`` hands every connection
+        the same DBAPI connection, so concurrent dispatches would share one
+        Postgres session: a lock one dispatch holds counts as held by the
+        next, and the first to unlock frees the others'. The lock pool is
+        built from the engine's, so it would inherit the same sharing."""
+        pool = self._engine.sync_engine.pool
+        if isinstance(pool, (StaticPool, SingletonThreadPool)):
+            raise ConfigurationError(
+                "claim_strategy='advisory_lock' needs a pool that gives each connection "
+                f"its own session; this engine uses {type(pool).__name__}, which shares "
+                "one. Use the default QueuePool (or NullPool)."
+            )
 
     def _lock_connection_engine(self) -> AsyncEngine:
         """The engine advisory-lock connections come from: the store engine's
@@ -1443,7 +1462,7 @@ class PostgresPublicationStore:
                     "(deleted before delivery?) — skipping",
                     publication_id,
                 )
-        except outbox._LockConnectionTimeout:
+        except LockConnectionTimeout:
             logger.warning(
                 "after-commit dispatch of publication %s got no advisory-lock "
                 "connection within the pool timeout; the row is untouched and "
