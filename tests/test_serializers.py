@@ -7,14 +7,15 @@ preserve dataclass equality and correctly reconstruct rich field types
 
 from __future__ import annotations
 
+import abc
 import logging
 import sys
 import warnings
-from dataclasses import InitVar, dataclass, field
+from dataclasses import InitVar, dataclass, field, make_dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, NewType, Set, Tuple, cast  # noqa: UP035
+from typing import TYPE_CHECKING, Any, NewType, Set, Tuple, cast  # noqa: UP035
 from uuid import UUID, uuid4
 
 import pytest
@@ -1210,3 +1211,209 @@ def test_initvar_with_a_default_round_trips() -> None:
 
     assert wire == b'{"name":"n"}'
     assert serializer.deserialize(wire, _fqcn(DefaultedSeedEvent)) == DefaultedSeedEvent("n")
+
+
+@dataclass
+class VirtualBase(metaclass=abc.ABCMeta):
+    x: int
+
+
+@dataclass
+class RegisteredOnly:
+    x: int
+
+
+VirtualBase.register(RegisteredOnly)
+
+
+@dataclass
+class ClaimedBase:
+    x: int
+
+
+@dataclass
+class ClaimedOnly:
+    x: int
+    impostor: bool = True
+
+
+@dataclass
+class VirtualFieldEvent:
+    item: VirtualBase
+
+
+@dataclass
+class VirtualListEvent:
+    items: list[VirtualBase]
+
+
+@dataclass
+class VirtualNestedEvent:
+    inner: VirtualFieldEvent
+
+
+@dataclass
+class VirtualUnionEvent:
+    item: VirtualBase | str
+
+
+@dataclass
+class RealVirtualSub(VirtualBase):
+    y: int = 0
+
+
+class _ClaimsEverythingMeta(type):
+    def __instancecheck__(cls, obj: object) -> bool:
+        return hasattr(obj, "impostor") or super().__instancecheck__(obj)
+
+
+@dataclass
+class ClaimingBase(metaclass=_ClaimsEverythingMeta):
+    x: int
+
+
+@dataclass
+class ClaimingEvent:
+    item: ClaimingBase
+
+
+_REGISTERED: Any = RegisteredOnly(x=1)
+_CLAIMED: Any = ClaimedOnly(x=1)
+
+
+@pytest.mark.parametrize(
+    ("event", "virtual", "field_name"),
+    [
+        (VirtualFieldEvent(item=_REGISTERED), RegisteredOnly, "item"),
+        (VirtualListEvent(items=[_REGISTERED]), RegisteredOnly, "items"),
+        (
+            VirtualNestedEvent(inner=VirtualFieldEvent(item=_REGISTERED)),
+            RegisteredOnly,
+            "item",
+        ),
+        (VirtualUnionEvent(item=_REGISTERED), RegisteredOnly, "item"),
+        (ClaimingEvent(item=_CLAIMED), ClaimedOnly, "item"),
+    ],
+)
+def test_serialize_rejects_a_virtual_subclass_naming_class_and_field(
+    event: object, virtual: type, field_name: str
+) -> None:
+    """An ABC-registered class or an ``__instancecheck__`` override satisfies
+    ``isinstance`` but is not in the hint's MRO, so the tag written for it could
+    never be decoded; the publisher gets the error instead of the consumer."""
+    with pytest.raises(TypeError) as excinfo:
+        JsonEventSerializer().serialize(event)
+
+    message = str(excinfo.value)
+    assert virtual.__qualname__ in message
+    assert f"'{field_name}'" in message
+    assert "virtual subclass" in message
+
+
+def test_serialize_tags_a_real_subclass_of_a_hint_that_also_has_virtual_subclasses() -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[VirtualFieldEvent])
+    event = VirtualFieldEvent(item=RealVirtualSub(x=1, y=2))
+
+    wire = serializer.serialize(event)
+
+    assert wire == (
+        b'{"item":{"__modulith_union_type__":"' + _fqcn(RealVirtualSub).encode() + b'",'
+        b'"value":{"x":1,"y":2}}}'
+    )
+    assert serializer.deserialize(wire, _fqcn(VirtualFieldEvent)) == event
+
+
+@dataclass
+class TwinBase:
+    x: int = 0
+
+
+@dataclass
+class TwinHolder:
+    twin: TwinBase
+
+
+def _make_twin() -> type[TwinBase]:
+    @dataclass
+    class Twin(TwinBase):
+        pass
+
+    return Twin
+
+
+def test_decoding_a_tag_carried_by_two_subclasses_raises_naming_tag_and_candidates() -> None:
+    first, second = _make_twin(), _make_twin()
+    tag = _fqcn(first)
+    assert tag == _fqcn(second)
+    payload = b'{"twin":{"__modulith_union_type__":"' + tag.encode() + b'","value":{"x":1}}}'
+
+    with pytest.raises(ValueError) as excinfo:
+        JsonEventSerializer(allowed_event_types=[TwinHolder]).deserialize(
+            payload, _fqcn(TwinHolder)
+        )
+
+    message = str(excinfo.value)
+    assert tag in message
+    assert f"0x{id(first):x}" in message
+    assert f"0x{id(second):x}" in message
+
+
+@dataclass
+class FanBase:
+    x: int = 0
+
+
+@dataclass
+class FanHolder:
+    items: list[FanBase]
+
+
+def test_forged_unknown_tags_walk_the_subclass_tree_once_per_distinct_tag(
+    monkeypatch, caplog
+) -> None:
+    import modulith.serializers as serializers
+
+    keep = [make_dataclass(f"Fan{i}", [("k", int, 0)], bases=(FanBase,)) for i in range(200)]
+    real_hint_tag = serializers._hint_tag
+    examined: list[object] = []
+
+    def counting(hint: object) -> str:
+        examined.append(hint)
+        return real_hint_tag(hint)
+
+    monkeypatch.setattr(serializers, "_hint_tag", counting)
+    values = b",".join(
+        [b'{"__modulith_union_type__":"nope","value":{"x":1}}'] * 2_000
+        + [b'{"__modulith_union_type__":"nope2","value":{"x":1}}'] * 2_000
+    )
+
+    with caplog.at_level(logging.ERROR, logger="modulith.serializers"):
+        restored = JsonEventSerializer(allowed_event_types=[FanHolder]).deserialize(
+            b'{"items":[' + values + b"]}", _fqcn(FanHolder)
+        )
+
+    assert len(restored.items) == 4_000
+    candidates_examined = [hint for hint in examined if hint is not FanBase]
+    assert len(candidates_examined) == 2 * len(keep)
+
+
+def _make_late_subclass() -> type[FanBase]:
+    @dataclass
+    class Late(FanBase):
+        pass
+
+    return Late
+
+
+def test_unknown_tag_lookup_is_not_remembered_across_deserialize_calls(caplog) -> None:
+    serializer = JsonEventSerializer(allowed_event_types=[FanHolder])
+    tag = f"{__name__}._make_late_subclass.<locals>.Late"
+    payload = b'{"items":[{"__modulith_union_type__":"' + tag.encode() + b'","value":{"x":1}}]}'
+
+    with caplog.at_level(logging.ERROR, logger="modulith.serializers"):
+        before = serializer.deserialize(payload, _fqcn(FanHolder))
+    late = _make_late_subclass()
+    after = serializer.deserialize(payload, _fqcn(FanHolder))
+
+    assert type(before.items[0]) is FanBase
+    assert type(after.items[0]) is late

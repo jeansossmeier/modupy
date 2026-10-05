@@ -126,6 +126,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - With `auto_discover` off, the `modulith outbox` no-store message says bootstrap itself imports none of your modules and names both routes: `MODULITH_AUTO_DISCOVER=true`, or binding the store from an entry-point plugin's import, which bootstrap loads
 - Packaging: the sdist no longer ships a local `.worktreeinclude`, the `test-suite` extra declares `typing-extensions`, which the tests import, and the classifiers list Python 3.14
 - Redis stream-length options above 2**63-1 are rejected with a `ConfigurationError` naming the option, and the default dead-letter cap (`max_stream_len * 10`) is clamped to 2**63-1, so a large `max_stream_len` no longer makes the dead-letter `XADD MAXLEN` fail
+- `JsonEventSerializer` refuses at serialize time a value that is only a virtual subclass (ABC `register` or an `__instancecheck__` override) of its field's type, instead of writing a tag no consumer can decode; decoding a subclass tag that more than one class carries raises `ValueError`; and a payload repeating an unknown tag no longer walks the subclass tree once per value (6.2 s down to 1.1 s for 50,000 values over 200 subclasses)
 
 ### Security
 

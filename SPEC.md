@@ -266,7 +266,11 @@ Fields decode by their annotations:
   fields fit that class, logging one WARNING per tag; import the module
   defining the subclass in the consumer (a process worker imports only the
   contracts package and its own module) to keep the subclass type. When the
-  fields do not fit, decoding raises `TypeError`.
+  fields do not fit, decoding raises `TypeError`. A tag that more than one
+  imported subclass carries raises `ValueError` naming the candidates.
+  Serializing a value that is only a virtual subclass of the declared class
+  (registered with an ABC, or accepted by an `__instancecheck__` override)
+  raises `TypeError`, since no consumer could decode its tag.
 - In a union field, a tag that matches no member and no member's imported
   subclass decodes against the union's single dataclass member the same way;
   with no dataclass member, or more than one, it raises `ValueError`. A tagged

@@ -19,6 +19,7 @@ pass an instance to ``outbox.configure(serializer=...)``.
 
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import functools
 import importlib
@@ -190,20 +191,48 @@ def _is_tagged(value: Any) -> bool:
     )
 
 
+_subclass_memo: contextvars.ContextVar[dict[tuple[type, str], type | None] | None] = (
+    contextvars.ContextVar("_subclass_memo", default=None)
+)
+
+
 def _subclass_for_tag(base: type, tag: str) -> type | None:
     """Find the subclass of ``base`` whose ``_hint_tag`` is ``tag``.
 
     The tag comes from an untrusted payload, and only the top-level event
     type is checked against ``allowed_event_types``. So the tag is matched
     against ``base``'s already-imported subclass tree and never imported.
+    Two subclasses carrying the same tag raise ``ValueError``: decoding one
+    of them silently would hand back the wrong class.
+
+    During ``deserialize`` the answer, including "no such subclass", is
+    memoized per ``(base, tag)`` so a payload repeating a tag walks the tree
+    once, not once per value.
     """
+    memo = _subclass_memo.get()
+    if memo is not None and (base, tag) in memo:
+        return memo[(base, tag)]
+    matches: list[type] = []
+    seen: set[type] = set()
     pending: list[type] = list(base.__subclasses__())
     while pending:
         candidate = pending.pop()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
         if _hint_tag(candidate) == tag:
-            return candidate
+            matches.append(candidate)
         pending.extend(candidate.__subclasses__())
-    return None
+    if len(matches) > 1:
+        raise ValueError(
+            f"nested type tag {tag!r} is carried by {len(matches)} subclasses of "
+            f"{_hint_tag(base)}: {', '.join(f'{m!r} at 0x{id(m):x}' for m in matches)}; "
+            "a tag must name exactly one class"
+        )
+    found = matches[0] if matches else None
+    if memo is not None:
+        memo[(base, tag)] = found
+    return found
 
 
 @functools.lru_cache(maxsize=1024)
@@ -216,6 +245,37 @@ def _warn_unknown_subclass_tag(tag: str, base_tag: str) -> None:
         base_tag,
         base_tag,
     )
+
+
+class _VirtualSubclassError(TypeError):
+    """``obj`` passes ``isinstance`` for a field's hint without inheriting from it.
+
+    An ABC ``register`` call or an ``__instancecheck__`` override does that. The
+    subclass tag written for such a value names a class ``_subclass_for_tag`` can
+    never find, so the value is refused at publish time. ``field`` is filled in
+    by the nearest enclosing field.
+    """
+
+    def __init__(self, cls: type, base: type, field: str | None = None) -> None:
+        where = f" in field {field!r}" if field is not None else ""
+        super().__init__(
+            f"cannot JSON-serialize {cls.__qualname__}{where}: it is only a virtual "
+            f"subclass of {base.__qualname__} (an ABC registration or an "
+            "__instancecheck__ override), so a decoder could never find its class; "
+            "make it inherit from the declared type or declare a Union that names it"
+        )
+        self.cls = cls
+        self.base = base
+        self.field = field
+
+
+def _encode_field(name: str, value: Any, hint: Any) -> Any:
+    try:
+        return _to_jsonable_typed(value, hint)
+    except _VirtualSubclassError as exc:
+        if exc.field is not None:
+            raise
+        raise _VirtualSubclassError(exc.cls, exc.base, name) from None
 
 
 def _to_jsonable_typed(obj: Any, hint: Any) -> Any:
@@ -271,18 +331,20 @@ def _to_jsonable_typed(obj: Any, hint: Any) -> Any:
             }
     if isinstance(hint, type) and isinstance(obj, dict):
         hints = _safe_type_hints(hint)
-        return {key: _to_jsonable_typed(value, hints.get(key)) for key, value in obj.items()}
+        return {key: _encode_field(key, value, hints.get(key)) for key, value in obj.items()}
     if (
         dataclasses.is_dataclass(hint)
         and isinstance(hint, type)
         and type(obj) is not hint
         and isinstance(obj, hint)
     ):
+        if hint not in type(obj).__mro__:
+            raise _VirtualSubclassError(type(obj), hint)
         return {_UNION_TAG: _hint_tag(type(obj)), "value": _to_jsonable_typed(obj, type(obj))}
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         hints = _safe_type_hints(type(obj))
         return {
-            field.name: _to_jsonable_typed(getattr(obj, field.name), hints.get(field.name))
+            field.name: _encode_field(field.name, getattr(obj, field.name), hints.get(field.name))
             for field in _stored_fields(obj)
         }
     return _to_jsonable(obj)
@@ -674,5 +736,9 @@ class JsonEventSerializer:
             for key, hint in _safe_type_hints(init).items():
                 if hint is not None:
                     hints[key] = hint
-        kwargs = {key: _coerce(val, hints.get(key)) for key, val in raw.items()}
+        token = _subclass_memo.set({})
+        try:
+            kwargs = {key: _coerce(val, hints.get(key)) for key, val in raw.items()}
+        finally:
+            _subclass_memo.reset(token)
         return _build(cls, kwargs)
