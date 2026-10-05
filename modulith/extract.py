@@ -286,7 +286,30 @@ if leaked:
     )
 new_top_levels = {n.split(".")[0] for n in sys.modules if n not in loaded_before}
 new_top_levels.discard(dotted.split(".")[0])
-distributions = sorted({d for top in new_top_levels for d in by_top_level.get(top, ())})
+
+
+def loaded_owners(top):
+    owners = by_top_level.get(top, ())
+    if len(owners) < 2:
+        return set(owners)
+    # Namespace packages (opentelemetry-api, -sdk, ...) share one top-level name,
+    # so credit only the distributions shipping a file that was actually loaded.
+    paths = {
+        os.path.realpath(mod.__file__)
+        for name, mod in list(sys.modules.items())
+        if name not in loaded_before
+        and name.split(".")[0] == top
+        and isinstance(getattr(mod, "__file__", None), str)
+    }
+    shipped = set()
+    for d in owners:
+        dist = importlib.metadata.distribution(d)
+        if any(os.path.realpath(dist.locate_file(f)) in paths for f in dist.files or ()):
+            shipped.add(d)
+    return shipped or (set(owners) if paths else set())
+
+
+distributions = sorted({d for top in new_top_levels for d in loaded_owners(top)})
 print("""
     + repr(_DISTRIBUTIONS_MARKER)
     + """, json.dumps(distributions), file=sys.stderr)

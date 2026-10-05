@@ -1391,6 +1391,37 @@ def test_extract_stays_quiet_about_distributions_the_dependencies_cover(
     assert result.stderr == ""
 
 
+def test_extract_notes_only_the_distribution_owning_a_shared_namespace_module(
+    make_fake_app, monkeypatch, tmp_path, tmp_path_factory
+):
+    libs = tmp_path_factory.mktemp("libs")
+    for distribution, part in (("nsdemo-alpha", "alpha"), ("nsdemo-beta", "beta")):
+        (libs / "nsdemo" / part).mkdir(parents=True)
+        (libs / "nsdemo" / part / "__init__.py").write_text("")
+        dist_info = libs / f"{distribution.replace('-', '_')}-1.0.dist-info"
+        dist_info.mkdir()
+        (dist_info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {distribution}\nVersion: 1.0\n"
+        )
+        (dist_info / "top_level.txt").write_text("nsdemo\n")
+        (dist_info / "RECORD").write_text(f"nsdemo/{part}/__init__.py,,\n")
+    monkeypatch.syspath_prepend(str(libs))
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join(filter(None, [str(libs), os.environ.get("PYTHONPATH")]))
+    )
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.chdir(tmp_path)
+    make_fake_app({"orders": "import nsdemo.alpha\n"}, extra_files={"contracts/__init__.py": ""})
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    notes = _readme_section((out_dir / "README.md").read_text(), "Extraction notes")
+    listed = [line for line in notes.splitlines() if line.startswith("- ")]
+    assert listed == ["- `nsdemo-alpha`"], notes
+
+
 def test_extract_copies_helper_file_beside_same_named_non_package_dir(
     make_fake_app, monkeypatch, tmp_path
 ):
