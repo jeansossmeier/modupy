@@ -752,6 +752,55 @@ async def test_durable_delivery_attempts_survive_consumer_handoff() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "lookup_raises",
+    [pytest.param(True, id="raises"), pytest.param(False, id="returns-none")],
+)
+async def test_failed_dispatch_without_durable_attempts_stays_pending(
+    lookup_raises: bool,
+) -> None:
+    """No durable retry budget to judge: the entry stays pending, neither acked nor dead-lettered.
+
+    ``delivery_attempts`` raises on a broker blip and returns ``None`` once the entry left
+    the group's pending list. Reading either as "attempts exhausted" would drop a message
+    that a later redelivery could still complete.
+    """
+
+    class UnreadableAttemptsBroker(FakeConsumerBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lookups: list[tuple[str, str, str | None]] = []
+
+        async def delivery_attempts(
+            self, target: str, message_id: str, group: str | None = None
+        ) -> int | None:
+            self.lookups.append((target, message_id, group))
+            if lookup_raises:
+                raise RuntimeError("simulated Redis blip during XPENDING")
+            return None
+
+    async def boom(evt: CrossEvent) -> None:
+        raise ValueError("listener down")
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, boom)
+    broker = UnreadableAttemptsBroker()
+    consumer = _make_consumer(broker, bus, targets=["t"])
+    fields = {
+        b"data": JsonEventSerializer().serialize(CrossEvent(value=1)),
+        b"h:event_type": f"{CrossEvent.__module__}.{CrossEvent.__qualname__}".encode(),
+    }
+
+    await consumer._dispatch_one("t", b"7-0", fields)
+
+    # Without the recorded lookup the local-counter fallback would satisfy the two
+    # assertions below as well: it also leaves a first failure pending.
+    assert broker.lookups == [("t", "7-0", "modulith-orders")]
+    assert broker.dead == []
+    assert broker.acked == []
+
+
+@pytest.mark.asyncio
 async def test_start_is_noop_without_targets() -> None:
     broker = FakeConsumerBroker()
     consumer = _make_consumer(broker, InMemoryEventBus(), targets=[])
