@@ -13,7 +13,6 @@ cost, and the module imports fine without redis installed.
 Configuration resolves env > [tool.modulith.broker] subtable > default:
   REDIS_URL / url                          connection URL (default redis://localhost:6379)
   MODULITH_STREAM_PREFIX / stream_prefix   stream namespace (default "modulith.events")
-  MODULITH_CONSUMER_GROUP / consumer_group consumer group name (default "modulith")
   MODULITH_STREAM_MAXLEN / max_stream_len  bounded retention per stream (default 10000)
   MODULITH_BROKER_DLQ_MAX_STREAM_LEN /
   dlq_max_stream_len                       bounded retention for the dead-letter stream
@@ -40,7 +39,6 @@ forbids one key being both, so set the name via ``MODULITH_BROKER`` /
     # …or, supplying connection options (set the name out-of-band):
     [tool.modulith.broker]
     url = "redis://cache:6379"
-    consumer_group = "modulith-orders"
 
 Why Redis Streams over pub/sub: streams persist until ACK'd (pub/sub drops
 messages with no live consumer) and support consumer groups for load-sharing
@@ -580,7 +578,6 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
         stream_prefix=(
             os.environ.get("MODULITH_STREAM_PREFIX") or opts.get("stream_prefix") or _DEFAULT_PREFIX
         ),
-        consumer_group=os.environ.get("MODULITH_CONSUMER_GROUP") or opts.get("consumer_group"),
         max_stream_len=(
             os.environ.get("MODULITH_STREAM_MAXLEN") or opts.get("max_stream_len", _DEFAULT_MAXLEN)
         ),

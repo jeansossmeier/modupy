@@ -142,7 +142,7 @@ class Configuration:
     # truth — no scattered globals or hidden config files.
     outbox_options: dict[str, Any] = field(default_factory=dict)
     # Broker connection settings from the [tool.modulith.broker] subtable
-    # (url, consumer_group, stream_prefix, max_stream_len). Consumed by the
+    # (url, stream_prefix, max_stream_len). Consumed by the
     # selected broker adapter's registration hook; env vars still override.
     broker_options: dict[str, Any] = field(default_factory=dict)
     workers: dict[str, int] = field(default_factory=dict)

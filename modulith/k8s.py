@@ -75,8 +75,6 @@ _DATABASE_BROKER_OPTION_KEYS = frozenset(
 )
 
 # Redis accepts these established names; its other options lack an environment contract.
-# consumer_group is deliberately absent: module workers always join
-# _worker.consumer_group(<module>) and ignore MODULITH_CONSUMER_GROUP.
 _REDIS_OPTION_ENV_NAMES = {
     "max_stream_len": _REDIS_BROKER_ENV_ALIASES["MODULITH_BROKER_MAX_STREAM_LEN"],
     "stream_prefix": _REDIS_BROKER_ENV_ALIASES["MODULITH_BROKER_STREAM_PREFIX"],

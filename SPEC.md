@@ -483,7 +483,7 @@ In `modulith/config.py`. Resolution order (highest priority first):
 3. `[tool.modulith]` section in pyproject.toml
 4. Hardcoded defaults
 
-Every *scalar* `Configuration` field has a `MODULITH_<KEY>` env var equivalent: `MODULITH_PACKAGE`, `MODULITH_CONTRACTS_MODULE`, `MODULITH_OUTBOX`, `MODULITH_OUTBOX_URL`, `MODULITH_TOPOLOGY`, `MODULITH_BROKER`, `MODULITH_SUBSCRIPTION_SOURCE`, `MODULITH_ACTUATOR_MODE`, `MODULITH_WORKER_PORT_BASE` (an integer), `MODULITH_PRODUCTION`, `MODULITH_AUTO_DISCOVER`, `MODULITH_OBSERVABILITY`, `MODULITH_VERIFY_MANIFESTS`, `MODULITH_STRICT_BOUNDARIES`. Booleans accept `1`/`true`/`yes` and `0`/`false`/`no` (case-insensitive); any other non-empty value raises `ConfigurationError`. The dict-typed fields (`outbox_options`, `broker_options`, `workers`, `subscriptions`) have **no generic** env var — they come from the `[tool.modulith.*]` subtables in pyproject.toml, listed below. Adapter-specific env vars are separate contracts: SHM and database options use `MODULITH_BROKER_<KEY>`, Redis Streams reads `REDIS_URL`, `MODULITH_CONSUMER_GROUP`, `MODULITH_STREAM_PREFIX`, and `MODULITH_STREAM_MAXLEN`, and the packaged alembic runner reads `MODULITH_DB_URL`.
+Every *scalar* `Configuration` field has a `MODULITH_<KEY>` env var equivalent: `MODULITH_PACKAGE`, `MODULITH_CONTRACTS_MODULE`, `MODULITH_OUTBOX`, `MODULITH_OUTBOX_URL`, `MODULITH_TOPOLOGY`, `MODULITH_BROKER`, `MODULITH_SUBSCRIPTION_SOURCE`, `MODULITH_ACTUATOR_MODE`, `MODULITH_WORKER_PORT_BASE` (an integer), `MODULITH_PRODUCTION`, `MODULITH_AUTO_DISCOVER`, `MODULITH_OBSERVABILITY`, `MODULITH_VERIFY_MANIFESTS`, `MODULITH_STRICT_BOUNDARIES`. Booleans accept `1`/`true`/`yes` and `0`/`false`/`no` (case-insensitive); any other non-empty value raises `ConfigurationError`. The dict-typed fields (`outbox_options`, `broker_options`, `workers`, `subscriptions`) have **no generic** env var — they come from the `[tool.modulith.*]` subtables in pyproject.toml, listed below. Adapter-specific env vars are separate contracts: SHM and database options use `MODULITH_BROKER_<KEY>`, Redis Streams reads `REDIS_URL`, `MODULITH_STREAM_PREFIX`, `MODULITH_STREAM_MAXLEN`, `MODULITH_BROKER_DLQ_MAX_STREAM_LEN`, and `MODULITH_BROKER_MAX_PAYLOAD_BYTES`, and the packaged alembic runner reads `MODULITH_DB_URL`.
 
 Each subtable fills one `Configuration` field:
 
@@ -912,15 +912,11 @@ broker = "redis-streams"
 #   export MODULITH_BROKER=redis-streams
 [tool.modulith.broker]
 url = "redis://localhost:6379"
-consumer_group = "modulith-orders"
 ```
 
 Each option also has an environment variable that takes precedence at deploy
-time: `REDIS_URL`, `MODULITH_CONSUMER_GROUP`, `MODULITH_STREAM_PREFIX`,
-`MODULITH_STREAM_MAXLEN`. (Values are literal — there is no `${VAR}`
-interpolation inside the TOML.) `consumer_group` sets the adapter's default
-group, used only where no group is given; process-per-module workers always
-pass their own, `modulith-<module>`.
+time: `REDIS_URL`, `MODULITH_STREAM_PREFIX`, `MODULITH_STREAM_MAXLEN`. (Values
+are literal — there is no `${VAR}` interpolation inside the TOML.)
 
 Retention caveat: `max_stream_len` / `MODULITH_STREAM_MAXLEN` is enforced via
 `XADD MAXLEN ~`, which trims by stream length alone and is blind to

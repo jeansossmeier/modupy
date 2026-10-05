@@ -744,12 +744,12 @@ def test_pyproject_broker_subtable_maps_to_broker_options(tmp_path: Path) -> Non
     so SPEC-documented TOML broker settings were silently ignored.
     """
     (tmp_path / "pyproject.toml").write_text(
-        '[tool.modulith.broker]\nurl = "redis://cache:6379"\nconsumer_group = "modulith-orders"\n'
+        '[tool.modulith.broker]\nurl = "redis://cache:6379"\nstream_prefix = "myapp.events"\n'
     )
     cfg = load_configuration()
     assert cfg.broker_options == {
         "url": "redis://cache:6379",
-        "consumer_group": "modulith-orders",
+        "stream_prefix": "myapp.events",
     }
     # Subtable form leaves the broker *name* at its default (set out-of-band).
     assert cfg.broker == "memory"
@@ -811,7 +811,7 @@ def test_broker_and_broker_options_subtables_together_raise(tmp_path: Path) -> N
     each other — whichever came last used to win with zero warning."""
     (tmp_path / "pyproject.toml").write_text(
         '[tool.modulith.broker]\nurl = "redis://a:6379"\n'
-        '[tool.modulith.broker_options]\nconsumer_group = "grp"\n'
+        '[tool.modulith.broker_options]\nstream_prefix = "myapp.events"\n'
     )
     with pytest.raises(ConfigurationError, match="broker_options"):
         load_configuration()

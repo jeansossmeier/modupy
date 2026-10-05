@@ -922,12 +922,12 @@ def test_register_hook_reads_broker_options_from_config(make_fake_app, monkeypat
     from modulith.runtime import _runtime
 
     # No env overrides → broker_options is the sole source.
-    for key in ("REDIS_URL", "MODULITH_STREAM_PREFIX", "MODULITH_CONSUMER_GROUP"):
+    for key in ("REDIS_URL", "MODULITH_STREAM_PREFIX"):
         monkeypatch.delenv(key, raising=False)
     configure(
         package="fakeapp",
         broker="redis-streams",
-        broker_options={"stream_prefix": "myapp.evts", "consumer_group": "grp-from-toml"},
+        broker_options={"stream_prefix": "myapp.evts"},
     )
     _runtime.ensure_bootstrapped()
 
@@ -935,27 +935,72 @@ def test_register_hook_reads_broker_options_from_config(make_fake_app, monkeypat
     modulith_register_brokers(registry=registry)
     broker = registry.get("redis-streams")
     assert broker._stream_prefix == "myapp.evts"
-    assert broker._consumer_group == "grp-from-toml"
 
 
-def test_env_var_overrides_broker_options(make_fake_app, monkeypatch) -> None:
-    """Env > TOML: deploy-time MODULITH_CONSUMER_GROUP wins over broker_options."""
+def test_env_var_overrides_broker_options_for_stream_prefix(make_fake_app, monkeypatch) -> None:
+    """Env > TOML: deploy-time MODULITH_STREAM_PREFIX wins over broker_options."""
     make_fake_app({"orders": ""})
     from modulith import configure
     from modulith.runtime import _runtime
 
-    monkeypatch.setenv("MODULITH_CONSUMER_GROUP", "grp-from-env")
+    monkeypatch.setenv("MODULITH_STREAM_PREFIX", "prefix-from-env")
     configure(
         package="fakeapp",
         broker="redis-streams",
-        broker_options={"consumer_group": "grp-from-toml"},
+        broker_options={"stream_prefix": "prefix-from-toml"},
     )
     _runtime.ensure_bootstrapped()
 
     registry = BrokerRegistry()
     modulith_register_brokers(registry=registry)
     broker = registry.get("redis-streams")
-    assert broker._consumer_group == "grp-from-env"
+    assert broker._stream_prefix == "prefix-from-env"
+
+
+@pytest.mark.parametrize(
+    ("env_group", "option_group"),
+    [
+        (None, "grp-from-toml"),
+        ("grp-from-env", None),
+        ("grp-from-env", "grp-from-toml"),
+    ],
+    ids=["option", "env-var", "env-var-and-option"],
+)
+async def test_register_hook_default_group_ignores_consumer_group_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    fake: FakeRedis,
+    env_group: str | None,
+    option_group: str | None,
+) -> None:
+    """``consumer_group`` and ``MODULITH_CONSUMER_GROUP`` are not Redis settings.
+
+    Process-per-module workers pass their own group on every broker call, so
+    the setting only ever renamed the group of a call that passes none. The
+    registration hook leaves that default at the adapter's own, and a stale
+    deployment that still sets either one changes nothing.
+    """
+    from redis.asyncio import Redis
+
+    from modulith.config import Configuration
+    from modulith.runtime import _runtime
+
+    for key in ("REDIS_URL", "MODULITH_STREAM_PREFIX", "MODULITH_CONSUMER_GROUP"):
+        monkeypatch.delenv(key, raising=False)
+    if env_group is not None:
+        monkeypatch.setenv("MODULITH_CONSUMER_GROUP", env_group)
+    options = {} if option_group is None else {"consumer_group": option_group}
+    monkeypatch.setattr(
+        _runtime,
+        "_config",
+        Configuration(package="fakeapp", broker="redis-streams", broker_options=options),
+    )
+    monkeypatch.setattr(Redis, "from_url", lambda *args, **kwargs: fake)
+
+    registry = BrokerRegistry()
+    modulith_register_brokers(registry=registry)
+    await registry.get("redis-streams").ensure_group("orders")
+
+    assert fake.groups == [("modulith.events.orders", "modulith")]
 
 
 def test_env_var_overrides_broker_options_for_max_payload_bytes(make_fake_app, monkeypatch) -> None:

@@ -607,8 +607,6 @@ export MODULITH_BROKER_DLQ_MAX_STREAM_LEN=1000000  # dead-letter stream cap (def
 export MODULITH_BROKER_MAX_PAYLOAD_BYTES=1048576   # producer-side payload cap (default 16 MiB)
 ```
 
-Module workers always join the consumer group `modulith-<module>`; `MODULITH_CONSUMER_GROUP` does not change that.
-
 The consumer-loop settings have no environment variable — set them in `pyproject.toml`:
 
 ```toml
@@ -926,8 +924,7 @@ Each Deployment's `replicas` comes from that module's
 `MODULITH_CONTRACTS_MODULE` explicitly. It emits only database broker options
 with a supported `MODULITH_BROKER_*` contract and Redis options with their
 established `MODULITH_STREAM_PREFIX` and `MODULITH_STREAM_MAXLEN` names.
-Unknown or credential-like options are omitted, and so is `consumer_group`,
-because module workers always join `modulith-<module>`.
+Unknown or credential-like options are omitted.
 The broker URL is never embedded: `MODULITH_BROKER_URL` (and `REDIS_URL` for
 Redis) reads key `url` from the generated `<package>-broker` Secret reference:
 
