@@ -8,6 +8,7 @@ from __init__.py, internal files from the package tree).
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -305,6 +306,105 @@ def test_public_api_returns_empty_for_unparseable_init(make_fake_app) -> None:
     make_fake_app({"badinit": "def broken(:\n    pass\n"})
 
     assert docs._public_api(_module("badinit")) == []
+
+
+# ---------------------------------------------------------------------------
+# Sources the interpreter accepts but a UTF-8 text read rejects: a UTF-8 BOM
+# and a PEP 263 coding line. Each body below carries a non-ASCII character so
+# the latin-1 variant is not valid UTF-8.
+# ---------------------------------------------------------------------------
+
+
+def _utf8_bom(body: str) -> bytes:
+    return b"\xef\xbb\xbf" + body.encode("utf-8")
+
+
+def _latin1_coding_line(body: str) -> bytes:
+    return b"# -*- coding: latin-1 -*-\n" + body.encode("latin-1")
+
+
+_interpreter_sources = pytest.mark.parametrize(
+    "encode", [_utf8_bom, _latin1_coding_line], ids=["utf8-bom", "latin1-coding-line"]
+)
+
+
+@_interpreter_sources
+def test_introspection_reads_events_from_a_bom_or_pep263_module(
+    encode: Callable[[str], bytes], make_fake_app, tmp_path: Path
+) -> None:
+    make_fake_app({"orders": ""})
+    (tmp_path / "fakeapp" / "orders" / "legacy.py").write_bytes(
+        encode(
+            "from dataclasses import dataclass\n"
+            "from modulith import event, listener\n\n"
+            'LABEL = "café"\n\n\n'
+            "@event\n"
+            "@dataclass(frozen=True)\n"
+            "class OrderCreated:\n"
+            "    order_id: str\n\n\n"
+            "@listener\n"
+            "def on_paid(evt: PaymentReceived) -> None: ...\n"
+        )
+    )
+
+    published, consumed = docs._introspect_events(_module("orders"))
+
+    assert published == ["OrderCreated"]
+    assert consumed == ["PaymentReceived"]
+
+
+@_interpreter_sources
+def test_public_api_is_read_from_a_bom_or_pep263_init(
+    encode: Callable[[str], bytes], make_fake_app, tmp_path: Path
+) -> None:
+    make_fake_app({"orders": ""})
+    (tmp_path / "fakeapp" / "orders" / "__init__.py").write_bytes(
+        encode('LABEL = "café"\n\n\ndef place_order() -> None: ...\n\n\nclass Order: ...\n')
+    )
+
+    assert docs._public_api(_module("orders")) == ["place_order", "Order"]
+
+
+def test_introspection_still_skips_an_undecodable_file_and_logs_it(
+    make_fake_app, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event
+
+                @event
+                @dataclass(frozen=True)
+                class OrderCreated:
+                    order_id: str
+            """,
+        }
+    )
+    (tmp_path / "fakeapp" / "orders" / "broken.py").write_bytes(b"NAME = 'caf\xe9'\n")
+
+    with caplog.at_level(logging.WARNING, logger="modulith.docs"):
+        published, consumed = docs._introspect_events(_module("orders"))
+
+    assert published == ["OrderCreated"]
+    assert consumed == []
+    assert "broken.py" in caplog.text
+    assert "0xe9" in caplog.text
+
+
+def test_public_api_still_returns_empty_for_an_undecodable_init(
+    make_fake_app, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    make_fake_app({"orders": ""})
+    (tmp_path / "fakeapp" / "orders" / "__init__.py").write_bytes(
+        b"NAME = 'caf\xe9'\n\n\ndef place_order() -> None: ...\n"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="modulith.docs"):
+        assert docs._public_api(_module("orders")) == []
+
+    assert "__init__.py" in caplog.text
+    assert "0xe9" in caplog.text
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ clears the thread's current loop — restored on teardown, mirroring test_cli.py
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -782,6 +783,72 @@ def test_schema_drift_detects_default_value_change(make_fake_app, tmp_path) -> N
     drift = _check(run_doctor(), "schema drift")
     assert drift.status == "warn"
     assert any("OrderPlaced" in d for d in drift.details)
+
+
+# ---------------------------------------------------------------------------
+# Sources the interpreter accepts but a UTF-8 text read rejects: a UTF-8 BOM
+# and a PEP 263 coding line. Each body below carries a non-ASCII character so
+# the latin-1 variant is not valid UTF-8.
+# ---------------------------------------------------------------------------
+
+
+def _utf8_bom(body: str) -> bytes:
+    return b"\xef\xbb\xbf" + body.encode("utf-8")
+
+
+def _latin1_coding_line(body: str) -> bytes:
+    return b"# -*- coding: latin-1 -*-\n" + body.encode("latin-1")
+
+
+_interpreter_sources = pytest.mark.parametrize(
+    "encode", [_utf8_bom, _latin1_coding_line], ids=["utf8-bom", "latin1-coding-line"]
+)
+
+
+@_interpreter_sources
+def test_schema_drift_reads_events_from_a_bom_or_pep263_module(
+    encode: Callable[[str], bytes], make_fake_app, tmp_path: Path
+) -> None:
+    make_fake_app({"orders": ""})
+    (tmp_path / "fakeapp" / "orders" / "legacy.py").write_bytes(
+        encode(
+            "from dataclasses import dataclass\n"
+            "from modulith import event\n\n"
+            'LABEL = "café"\n\n\n'
+            "@event\n"
+            "@dataclass(frozen=True)\n"
+            "class OrderPlaced:\n"
+            "    order_id: str\n"
+        )
+    )
+    configure(package="fakeapp")
+
+    check = _check(run_doctor(), "schema drift")
+
+    assert check.summary == "recorded 1 event schema(s)"
+    assert "orders.OrderPlaced" in Path(".modulith-schemas.json").read_text(encoding="utf-8")
+
+
+def test_schema_drift_still_skips_an_undecodable_file(make_fake_app, tmp_path: Path) -> None:
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+                from modulith import event
+
+                @event
+                @dataclass(frozen=True)
+                class OrderPlaced:
+                    order_id: str
+            """
+        }
+    )
+    (tmp_path / "fakeapp" / "orders" / "broken.py").write_bytes(b"NAME = 'caf\xe9'\n")
+    configure(package="fakeapp")
+
+    check = _check(run_doctor(), "schema drift")
+
+    assert check.summary == "recorded 1 event schema(s)"
 
 
 def test_outbox_health_uses_unbounded_counts_for_large_backlog(make_fake_app) -> None:

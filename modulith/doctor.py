@@ -134,9 +134,11 @@ def run_doctor() -> HealthReport:
 
 
 def _parse_file(path: Path) -> ast.Module | None:
+    from .builtin.verifier import _parse_source
+
     try:
-        return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    except (SyntaxError, UnicodeDecodeError, OSError) as exc:
+        return _parse_source(path)
+    except (SyntaxError, OSError) as exc:
         logger.debug("doctor: skipping unparseable file %s: %s", path, exc)
         return None
 

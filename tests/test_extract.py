@@ -411,6 +411,21 @@ def test_extract_blocked_when_shared_table_scan_has_parse_failures(
     assert not out_dir.exists()
 
 
+def test_extract_succeeds_for_a_module_holding_a_bom_file(make_fake_app, monkeypatch, tmp_path):
+    """The interpreter reads a UTF-8 BOM file, so the shared-table scan must too:
+    an unparsed file would block extraction as an incomplete scan."""
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": "", "inventory": ""}, extra_files={"contracts/__init__.py": ""})
+    legacy = b"\xef\xbb\xbf" + 'NAME = "café"\n'.encode()
+    (tmp_path / "fakeapp" / "orders" / "legacy.py").write_bytes(legacy)
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "fakeapp" / "orders" / "legacy.py").read_bytes() == legacy
+
+
 def test_extract_contracts_table_not_treated_as_shared(make_fake_app, monkeypatch, tmp_path):
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
     make_fake_app(

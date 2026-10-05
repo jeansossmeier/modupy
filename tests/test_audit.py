@@ -11,6 +11,7 @@ result and the rendered Markdown report.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 from textwrap import dedent
 
@@ -373,6 +374,57 @@ def test_no_parse_failures_omits_disclosure(tmp_path: Path) -> None:
     result = audit_codebase(root)
     assert result.parse_failures == []
     assert "could not be parsed" not in render_report(result)
+
+
+# Sources the interpreter accepts but a UTF-8 text read rejects: a UTF-8 BOM
+# and a PEP 263 coding line. Each body carries a non-ASCII character so the
+# latin-1 variant is not valid UTF-8.
+
+
+def _utf8_bom(body: str) -> bytes:
+    return b"\xef\xbb\xbf" + body.encode("utf-8")
+
+
+def _latin1_coding_line(body: str) -> bytes:
+    return b"# -*- coding: latin-1 -*-\n" + body.encode("latin-1")
+
+
+_interpreter_sources = pytest.mark.parametrize(
+    "encode", [_utf8_bom, _latin1_coding_line], ids=["utf8-bom", "latin1-coding-line"]
+)
+
+
+@_interpreter_sources
+def test_audit_parses_a_bom_or_pep263_module(
+    encode: Callable[[str], bytes], tmp_path: Path
+) -> None:
+    root = tmp_path / "myapp"
+    _write(root, "__init__.py", "")
+    _write(root, "orders/__init__.py", "")
+    _write(root, "inventory/__init__.py", "")
+    (root / "orders" / "legacy.py").write_bytes(
+        encode('from myapp.inventory import stock\nNAME = "café"\n')
+    )
+
+    result = audit_codebase(root)
+
+    assert result.parse_failures == []
+    assert result.files_scanned == 4
+    pairs = {(src, tgt) for src, tgt, _count, _sample in result.cross_module_imports}
+    assert pairs == {("orders", "inventory")}
+
+
+def test_audit_still_reports_an_undecodable_file_as_a_parse_failure(tmp_path: Path) -> None:
+    root = tmp_path / "myapp"
+    _write(root, "__init__.py", "")
+    _write(root, "orders/__init__.py", "")
+    _write(root, "orders/service.py", "def create(): ...\n")
+    (root / "orders" / "broken.py").write_bytes(b"NAME = 'caf\xe9'\n")
+
+    result = audit_codebase(root)
+
+    assert result.files_scanned == 3
+    assert result.parse_failures == [root / "orders" / "broken.py"]
 
 
 # ---------------------------------------------------------------------------

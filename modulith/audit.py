@@ -34,6 +34,7 @@ from .builtin.verifier import (
     CONTRACTS_MODULE,
     _file_package,
     _ImportCollector,
+    _parse_source,
     _table_refs_from_tree,
 )
 
@@ -316,8 +317,8 @@ def _module_of(root: Path, path: Path) -> str:
 def _parse(path: Path) -> ast.Module | None:
     """Parse a file to an AST, returning None on unreadable/invalid source."""
     try:
-        return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    except (SyntaxError, UnicodeDecodeError, OSError) as exc:
+        return _parse_source(path)
+    except (SyntaxError, OSError) as exc:
         logger.debug("skipping unparseable file %s: %s", path, exc)
         return None
 

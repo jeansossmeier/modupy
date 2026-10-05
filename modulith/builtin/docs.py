@@ -24,7 +24,12 @@ from collections import defaultdict
 from pathlib import Path
 
 from modulith import ModuleInfo, hookimpl
-from modulith.builtin.verifier import _collect_imports, _owning_module, _package_dir
+from modulith.builtin.verifier import (
+    _collect_imports,
+    _owning_module,
+    _package_dir,
+    _parse_source,
+)
 from modulith.config import ConfigurationError
 from modulith.manifest import all_manifests, get_manifest
 
@@ -374,8 +379,8 @@ def _introspect_events(module: ModuleInfo) -> tuple[list[str], list[str]]:
     consumed: set[str] = set()
     for path in sorted(root.rglob("*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        except (OSError, SyntaxError, UnicodeDecodeError) as exc:
+            tree = _parse_source(path)
+        except (OSError, SyntaxError) as exc:
             # One unreadable file (broken symlink, permission denied) or
             # unparseable file must degrade this module's introspection, not
             # abort the whole render — and never silently: name the file and
@@ -408,8 +413,8 @@ def _public_api(module: ModuleInfo) -> list[str]:
     if not init.exists():
         return []
     try:
-        tree = ast.parse(init.read_text(encoding="utf-8"), filename=str(init))
-    except (OSError, SyntaxError, UnicodeDecodeError) as exc:
+        tree = _parse_source(init)
+    except (OSError, SyntaxError) as exc:
         # Same graceful-degrade + loud-skip contract as _introspect_events: an
         # unreadable or unparseable __init__.py yields an empty public API,
         # with the file and reason logged.
