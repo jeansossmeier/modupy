@@ -21,6 +21,7 @@ reset, so test order can never matter.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import os
 import re
 import socket
@@ -363,6 +364,21 @@ def _docker_available() -> bool:
         return False
 
 
+def _testcontainer_class(module: str, name: str) -> Any:
+    """Return testcontainers' ``name`` class from ``module`` (postgres, mysql or redis).
+
+    testcontainers 4.15 moved these modules under ``testcontainers.community`` and
+    warns on the old import paths; the earlier 4.x releases, which the
+    ``integration`` extra still allows, have only the old ones. Raises ImportError
+    when testcontainers is not installed.
+    """
+    try:
+        found = importlib.import_module(f"testcontainers.community.{module}")
+    except ImportError:
+        found = importlib.import_module(f"testcontainers.{module}")
+    return getattr(found, name)
+
+
 @pytest.fixture(scope="session")
 def postgres_url() -> Iterator[str]:
     """Yield an isolated disposable PostgreSQL URL using the asyncpg driver."""
@@ -371,7 +387,7 @@ def postgres_url() -> Iterator[str]:
         yield from _disposable_postgres_database(env_url)
         return
     try:
-        from testcontainers.postgres import PostgresContainer
+        PostgresContainer = _testcontainer_class("postgres", "PostgresContainer")
     except ImportError:
         pytest.skip("testcontainers not installed and MODULITH_TEST_POSTGRES_URL unset")
     if not _docker_available():
@@ -428,7 +444,7 @@ def mysql_url() -> Iterator[str]:
         yield from _disposable_mysql_database(env_url)
         return
     try:
-        from testcontainers.mysql import MySqlContainer
+        MySqlContainer = _testcontainer_class("mysql", "MySqlContainer")
     except ImportError:
         pytest.skip("testcontainers not installed and MODULITH_TEST_MYSQL_URL unset")
     if not _docker_available():
@@ -488,7 +504,7 @@ def redis_url() -> Iterator[str]:
         yield env_url
         return
     try:
-        from testcontainers.redis import RedisContainer
+        RedisContainer = _testcontainer_class("redis", "RedisContainer")
     except ImportError:
         pytest.skip("testcontainers not installed and MODULITH_TEST_REDIS_URL unset")
     if not _docker_available():
