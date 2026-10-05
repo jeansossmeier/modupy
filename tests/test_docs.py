@@ -464,7 +464,7 @@ def test_introspection_still_skips_an_undecodable_file_and_logs_it(
     assert published == ["OrderCreated"]
     assert consumed == []
     assert "broken.py" in caplog.text
-    assert "0xe9" in caplog.text
+    assert _names_byte_e9(caplog.text)
 
 
 def test_public_api_still_returns_empty_for_an_undecodable_init(
@@ -479,7 +479,13 @@ def test_public_api_still_returns_empty_for_an_undecodable_init(
         assert docs._public_api(_module("orders")) == []
 
     assert "__init__.py" in caplog.text
-    assert "0xe9" in caplog.text
+    assert _names_byte_e9(caplog.text)
+
+
+def _names_byte_e9(text: str) -> bool:
+    # CPython before 3.14 says "can't decode byte 0xe9"; 3.14 says
+    # "Non-UTF-8 code starting with '\xe9'".
+    return "0xe9" in text or "\\xe9" in text
 
 
 # ---------------------------------------------------------------------------

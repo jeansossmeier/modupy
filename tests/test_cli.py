@@ -4392,10 +4392,6 @@ def test_masked_url_keeps_non_secret_query_parameters_visible() -> None:
         ("sqlite+aiosqlite://", "sqlite+aiosqlite://"),
         ("sqlite+aiosqlite://?password=secret", "sqlite+aiosqlite://?password=***"),
         (
-            "sqlite+aiosqlite:///a#b.db?password=secret",
-            "sqlite+aiosqlite:///a#b.db?password=***",
-        ),
-        (
             "postgresql+psycopg://user:s3cret@db.example:5432/app?token=abc&sslmode=require",
             "postgresql+psycopg://user:***@db.example:5432/app?sslmode=require&token=***",
         ),
@@ -4409,6 +4405,17 @@ def test_masked_url_keeps_the_url_form_and_hides_secrets(url: str, expected: str
     from modulith.cli import _masked_url
 
     assert _masked_url(url) == expected
+
+
+def test_masked_url_hides_query_secrets_after_a_hash_in_the_file_name() -> None:
+    """SQLAlchemy 2.0 renders the ``#`` as is and 2.1 as ``%23``; either way the
+    query after it is masked."""
+    from modulith.cli import _masked_url
+
+    masked = _masked_url("sqlite+aiosqlite:///a#b.db?password=secret")
+
+    assert "secret" not in masked
+    assert masked.endswith("b.db?password=***")
 
 
 def test_migrate_failure_reports_an_error_without_leaking_the_password(
