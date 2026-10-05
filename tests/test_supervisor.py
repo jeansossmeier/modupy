@@ -125,6 +125,57 @@ def test_derive_specs_assigns_contiguous_ports_from_the_configured_base(make_fak
     ]
 
 
+def test_derive_specs_refuses_replicas_past_the_last_port(make_fake_app) -> None:
+    """A base the config accepts can still push a module's last replica past
+    65535; no such port exists, so the spec must not be built."""
+    from modulith import ConfigurationError
+
+    make_fake_app({"orders": ""})
+
+    with pytest.raises(
+        ConfigurationError, match=r"'orders' starts at worker port 65535 with 3 replicas"
+    ):
+        derive_specs_from_config(
+            {"package": "fakeapp", "worker_port_base": 65535, "workers": {"orders": 3}}
+        )
+
+
+def test_derive_specs_accepts_replicas_ending_on_the_last_port(make_fake_app) -> None:
+    make_fake_app({"orders": ""})
+
+    specs = derive_specs_from_config(
+        {"package": "fakeapp", "worker_port_base": 65534, "workers": {"orders": 2}}
+    )
+
+    assert [(s.port, s.worker_count) for s in specs] == [(65534, 2)]
+
+
+async def test_run_supervised_refuses_replicas_that_share_a_port() -> None:
+    """Hand-built specs can overlap (derived ones never do); the second module
+    would never bind and its prefix would reach the first one's worker."""
+    from modulith import ConfigurationError
+
+    sup = _FakeSupervisor()
+    specs = [
+        WorkerSpec("alpha", "app", 9001, worker_count=2),
+        WorkerSpec("beta", "app", 9002),
+    ]
+
+    async def must_not_serve(app: object, h: str, p: int) -> None:
+        raise AssertionError("the proxy must not be served")
+
+    with pytest.raises(ConfigurationError, match=r"'alpha' and 'beta' are both assigned port 9002"):
+        await run_supervised(specs, "127.0.0.1", 8000, supervisor=sup, serve=must_not_serve)
+
+    assert sup.events == []  # no worker was spawned
+
+
+@pytest.mark.parametrize("port", ["9001", 9001.5, True, None])
+def test_worker_spec_rejects_a_non_int_port(port: object) -> None:
+    with pytest.raises(TypeError, match=r"'orders' port must be an int"):
+        WorkerSpec("orders", "app", port)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(("host", "port"), [("0.0.0.0", 9002), ("127.0.0.1", 9003)])
 async def test_run_supervised_refuses_a_proxy_port_inside_the_worker_range(
     host: str, port: int

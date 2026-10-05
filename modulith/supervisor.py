@@ -194,6 +194,14 @@ class WorkerSpec:
     worker_count: int = 1  # multiple processes per module if needed
     env: dict[str, str] | None = None  # additional env vars
 
+    def __post_init__(self) -> None:
+        # bool is an int subclass, so it needs its own check.
+        if not isinstance(self.port, int) or isinstance(self.port, bool):
+            raise TypeError(
+                f"worker {self.module_name!r} port must be an int, "
+                f"got {type(self.port).__name__} {self.port!r}"
+            )
+
 
 def _replica_ports(spec: WorkerSpec) -> list[int]:
     """Every replica's port for one module spec, in instance order."""
@@ -992,6 +1000,26 @@ def _check_proxy_port(specs: list[WorkerSpec], proxy_port: int) -> None:
             )
 
 
+def _check_replica_overlap(specs: list[WorkerSpec]) -> None:
+    """Refuse two replicas assigned the same port.
+
+    Derived specs are consecutive and never overlap; hand-built ones can. The
+    later replica would never bind and its prefix would reach the earlier
+    one's worker.
+    """
+    from .config import ConfigurationError
+
+    owners: dict[int, str] = {}
+    for spec in specs:
+        for port in _replica_ports(spec):
+            if port in owners:
+                raise ConfigurationError(
+                    f"workers {owners[port]!r} and {spec.module_name!r} are both assigned "
+                    f"port {port}; give each replica its own port"
+                )
+            owners[port] = spec.module_name
+
+
 async def run_supervised(
     specs: list[WorkerSpec],
     proxy_host: str,
@@ -1036,7 +1064,8 @@ async def run_supervised(
     ``"foreign deployment"`` rather than healthy.
 
     Raises ``ConfigurationError`` before spawning anything when ``proxy_port``
-    equals any worker replica's port (see ``_check_proxy_port``).
+    equals any worker replica's port (see ``_check_proxy_port``), or when two
+    replicas share a port.
 
     ``supervisor`` and ``serve`` are injection seams for testing; production
     callers pass neither and get a real Supervisor plus a uvicorn server.
@@ -1055,6 +1084,7 @@ async def run_supervised(
     )
 
     _check_proxy_port(specs, proxy_port)
+    _check_replica_overlap(specs)
 
     deployment_token = secrets.token_hex(16)
     for spec in specs:
@@ -1217,7 +1247,8 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
         one and publishing a dead ``/contracts`` prefix on the proxy.
 
     Ports are assigned from ``worker_port_base`` (default 9001), incrementing
-    by each module's worker_count so replicas never collide.
+    by each module's worker_count so replicas never collide; a module whose
+    last replica port would pass 65535 raises ``ConfigurationError``.
 
     Also reports the resulting HTTP surface (see ``_log_http_surface``): this
     is the only process that sees every module, so it is where "nothing in
@@ -1256,6 +1287,13 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
             raise ValueError(
                 f"[tool.modulith.workers] {name} must be >= 1, got {count} — "
                 "a module cannot run zero worker processes"
+            )
+        if port + count - 1 > 65535:
+            from .config import ConfigurationError
+
+            raise ConfigurationError(
+                f"module {name!r} starts at worker port {port} with {count} replicas, "
+                "which runs past port 65535; lower worker_port_base or the replica counts"
             )
         specs.append(
             WorkerSpec(
