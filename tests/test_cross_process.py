@@ -10,6 +10,8 @@ the runtime's broker registry — no real broker required.
 
 from __future__ import annotations
 
+import asyncio
+import json
 from datetime import timedelta
 from uuid import UUID
 
@@ -20,6 +22,9 @@ from modulith._consumer import consumer_targets
 from modulith.builtin import outbox
 from modulith.runtime import _PUBLISHER_MODULE_HEADER, _runtime
 from modulith.serializers import JsonEventSerializer
+from tests.test_broker_consumer import FakePollingBroker, _make_polling_consumer
+from tests.test_consumer import FakeConsumerBroker
+from tests.test_consumer import _make_consumer as _make_redis_consumer
 
 
 class FakeBroker:
@@ -422,6 +427,159 @@ async def test_outbox_broker_route_outside_any_module_carries_no_publisher_heade
     assert [headers for _, _, headers in fake.published] == [
         {"event_type": "fakeapp.orders.OrderPlaced", "publication_id": str(route.id)}
     ]
+
+
+_TWO_LISTENER_APP = {
+    "orders": """
+        from dataclasses import dataclass
+        from modulith import event, externalized, listener, publish
+
+        @externalized
+        @event
+        @dataclass(frozen=True)
+        class OrderPlaced:
+            order_id: str
+
+        seen = []
+
+        @listener
+        async def on_placed(evt: OrderPlaced) -> None:
+            seen.append(evt.order_id)
+
+        async def place(order_id: str) -> None:
+            await publish(OrderPlaced(order_id=order_id))
+    """,
+    "billing": """
+        from modulith import listener
+        from fakeapp.orders import OrderPlaced
+
+        seen = []
+
+        @listener
+        async def bill(evt: OrderPlaced) -> None:
+            seen.append(evt.order_id)
+    """,
+}
+
+_DELIVERY_PATHS = ["redis", "polling-json-headers", "polling-dict-headers"]
+
+
+async def _deliver(path: str, target: str, payload: bytes, headers: dict[str, str]) -> None:
+    """Hand one broker message to the consumer that serves ``path``."""
+    bus = _runtime.event_bus
+    assert bus is not None  # bootstrapped
+    if path == "redis":
+        redis_fields = {b"data": payload}
+        redis_fields.update({f"h:{k}".encode(): v.encode() for k, v in headers.items()})
+        redis_consumer = _make_redis_consumer(FakeConsumerBroker(), bus, targets=[target])
+        await redis_consumer._dispatch_one(target, b"1-0", redis_fields)
+        return
+    polling_consumer = _make_polling_consumer(
+        FakePollingBroker(), poll_interval_s=1.0, max_attempts=3, idle_wait=asyncio.sleep, bus=bus
+    )
+    await polling_consumer._dispatch_one(
+        {
+            "id": "row-1",
+            "target": target,
+            "event_type": headers["event_type"],
+            "payload": payload,
+            "headers": json.dumps(headers) if path == "polling-json-headers" else dict(headers),
+        }
+    )
+
+
+@pytest.mark.parametrize("path", _DELIVERY_PATHS)
+async def test_externalized_event_does_not_rerun_the_publishers_own_listener(
+    make_fake_app, path: str
+) -> None:
+    """The publisher's worker ran its own listener at publish; its consumer must not repeat it."""
+    make_fake_app(_TWO_LISTENER_APP)
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+    _runtime.ensure_bootstrapped()
+    _runtime.host_module("fakeapp.orders")
+    fake = _register_fake_broker("testbroker")
+
+    import fakeapp.orders as orders
+
+    await orders.place("o-1")
+    assert orders.seen == ["o-1"]
+    ((target, payload, headers),) = fake.published
+    assert headers is not None
+
+    await _deliver(path, target, payload, headers)
+
+    assert orders.seen == ["o-1"]
+
+
+@pytest.mark.parametrize("path", _DELIVERY_PATHS)
+async def test_delivery_without_a_publisher_header_runs_every_listener(
+    make_fake_app, path: str
+) -> None:
+    """An unhosted publisher or a message sent before the header existed names no module."""
+    make_fake_app(_TWO_LISTENER_APP)
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+    _runtime.ensure_bootstrapped()
+    _runtime.host_module("fakeapp.orders")
+    fake = _register_fake_broker("testbroker")
+
+    import fakeapp.orders as orders
+
+    await orders.place("o-1")
+    ((target, payload, headers),) = fake.published
+    assert headers is not None
+    unstamped = {k: v for k, v in headers.items() if k != _PUBLISHER_MODULE_HEADER}
+
+    await _deliver(path, target, payload, unstamped)
+
+    assert orders.seen == ["o-1", "o-1"]
+
+
+@pytest.mark.parametrize("path", _DELIVERY_PATHS)
+async def test_sibling_replica_of_the_publisher_module_skips_its_own_listeners(
+    make_fake_app, path: str
+) -> None:
+    """The header names the module, so a replica that never published skips too."""
+    make_fake_app(_TWO_LISTENER_APP)
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+    _runtime.ensure_bootstrapped()
+    _runtime.host_module("fakeapp.orders")
+    fake = _register_fake_broker("testbroker")
+
+    import fakeapp.orders as orders
+
+    await orders.place("o-1")
+    ((target, payload, headers),) = fake.published
+    assert headers is not None
+    orders.seen.clear()  # a replica's process has no record of the publisher's run
+
+    await _deliver(path, target, payload, headers)
+
+    assert orders.seen == []
+
+
+@pytest.mark.parametrize("path", _DELIVERY_PATHS)
+async def test_listeners_of_other_modules_still_run_from_the_broker_copy(
+    make_fake_app, path: str
+) -> None:
+    """Only the publishing module's listeners are skipped; a process owning both runs the rest."""
+    make_fake_app(_TWO_LISTENER_APP)
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+    _runtime.ensure_bootstrapped()
+    fake = _register_fake_broker("testbroker")
+
+    import fakeapp.billing as billing
+    import fakeapp.orders as orders
+
+    _runtime.host_module("fakeapp.orders")
+    await orders.place("o-1")
+    ((target, payload, headers),) = fake.published
+    assert headers is not None
+    orders.seen.clear()
+    _runtime._hosted_module = None  # a consumer process owning both modules' listeners
+
+    await _deliver(path, target, payload, headers)
+
+    assert (orders.seen, billing.seen) == ([], ["o-1"])
 
 
 async def test_externalized_explicit_target_overrides_default(make_fake_app) -> None:

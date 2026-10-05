@@ -779,7 +779,10 @@ under the default target `{broker}:{event-fqn}`: the `OrderPlaced` that `orders`
 publishes and only `inventory` consumes reaches the `inventory` worker as is.
 `@externalized` covers the two cases that rule misses. Marked events go to the
 broker **in addition to** any local listeners (fan-out across processes), and
-`target=` pins the destination:
+`target=` pins the destination. The publishing module's own listeners run once,
+in the publishing worker; the broker copy carries a `publisher_module` header so
+that module's workers (including other replicas) skip it, and only other
+modules' workers run their listeners from it:
 
 ```python
 from dataclasses import dataclass

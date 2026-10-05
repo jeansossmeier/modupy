@@ -301,8 +301,10 @@ Two forms::
     class OrderPlaced: ...        # explicit "scheme:destination"
 
 An externalized event is published to the broker *whether or not it also
-has a local listener* (fan-out across processes). In single-process
-topology this is an inert marker — there is no broker.
+has a local listener* (fan-out across processes). The publishing module's
+own listeners run once, in the publishing process; consumers of the broker
+copy skip them. In single-process topology this is an inert marker — there
+is no broker.
 
 The runtime resolves an event's broker target in priority order:
   1. the ``modulith_resolve_event_target`` hook (dynamic / tenant-aware),

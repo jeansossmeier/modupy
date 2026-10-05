@@ -718,12 +718,18 @@ class Runtime:
         *,
         traceparent: str | None = None,
         tracestate: str | None = None,
+        publisher_module: str | None = None,
     ) -> None:
         """Deliver an event received from another process to local listeners.
 
         ``traceparent`` / ``tracestate`` are the W3C headers the producer sent
         with the message; the dispatch hooks receive them as the publication's
         ``trace_context``, so a dispatch span joins the producer's trace.
+
+        ``publisher_module`` is the message's ``publisher_module`` header: the
+        module package whose process sent it. That process already ran the
+        module's listeners at publish, so they are skipped here; every other
+        listener runs. Without the header, every local listener runs.
 
         The cross-process consumers call this instead of ``bus.publish`` so a
         remotely-delivered event fires the same per-listener lifecycle hooks
@@ -745,6 +751,12 @@ class Runtime:
             await bus.publish(event)
             return
         handlers = self.local_listeners(bus.listeners_for(type(event)))
+        if publisher_module:
+            handlers = [
+                h
+                for h in handlers
+                if self._listener_owners.get(h, self._hosted_module) != publisher_module
+            ]
         if not handlers:
             return
         trace_context = {"traceparent": traceparent} if traceparent else None

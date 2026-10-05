@@ -672,6 +672,13 @@ events have to leave the process. The mechanism:
 Mark an event `@externalized` so it is routed to the configured broker **in
 addition to** any local listeners (fan-out across processes). In single-process
 topology it's an inert marker.
+The publishing module's own listeners run once, in the publishing process. A
+module worker stamps its module package in a `publisher_module` broker header
+(also on an outbox-routed send), and a consumer skips the listeners that module
+owns, so the broker copy reaching the publisher's own worker, or a second
+replica of it, does not run them again. Listeners of other modules run from the
+broker copy, as do all listeners for a message without the header (a publisher
+that hosts no module, or one sent before the header existed).
 In process topology an event with no local listener is routed too, without `@externalized`, because its listeners live in other workers.
 The runtime resolves an event's broker target in
 priority order:

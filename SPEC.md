@@ -356,8 +356,10 @@ Applications adopting the process-per-module topology (Part IX) use a fifth name
 
 **`@externalized`** — marks an event as *externalized*: routed to the configured
 broker so workers in other processes can consume it, even when it also has local
-listeners (fan-out). `@externalized(target="scheme:destination")` overrides the
-destination per event. Single-process applications never need it — the four
+listeners (fan-out). The publishing module's own listeners run once, in the
+publishing process: the broker copy names that module in a `publisher_module`
+header, and consumers skip its listeners.
+`@externalized(target="scheme:destination")` overrides the destination per event. Single-process applications never need it — the four
 names above are the complete single-process API. See [§9.2](#92-the-worker-pattern).
 
 ### 5.2 Sync vs Async

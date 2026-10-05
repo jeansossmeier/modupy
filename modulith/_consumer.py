@@ -58,7 +58,7 @@ from .brokers import _split_broker_target
 from .config import ConfigurationError
 from .manifest import get_manifest
 from .protocols import ConsumerHealth
-from .runtime import _runtime
+from .runtime import _PUBLISHER_MODULE_HEADER, _runtime
 
 logger = logging.getLogger("modulith.consumer")
 
@@ -682,6 +682,9 @@ class BrokerConsumer:
                 self._bus,
                 traceparent=_optional_str(fields.get(b"h:traceparent")),
                 tracestate=_optional_str(fields.get(b"h:tracestate")),
+                publisher_module=_optional_str(
+                    fields.get(b"h:" + _PUBLISHER_MODULE_HEADER.encode())
+                ),
             )
         except Exception:
             attempts = await self._failed_delivery_attempts(target, mid, key)

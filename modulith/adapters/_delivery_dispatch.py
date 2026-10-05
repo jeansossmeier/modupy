@@ -9,7 +9,7 @@ import time
 from typing import Any, Protocol, cast, runtime_checkable
 
 from .._consumer import is_foreign_event_type
-from ..runtime import _runtime
+from ..runtime import _PUBLISHER_MODULE_HEADER, _runtime
 from ._consumer_protocol import PollingBroker
 
 _MAX_LEASE_EXTENSION_FACTOR = 10.0
@@ -323,6 +323,7 @@ class DeliveryDispatch:
                 self._bus,
                 traceparent=headers.get("traceparent"),
                 tracestate=headers.get("tracestate"),
+                publisher_module=headers.get(_PUBLISHER_MODULE_HEADER),
             )
         except asyncio.CancelledError:
             task = asyncio.current_task()
