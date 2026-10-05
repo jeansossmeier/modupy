@@ -2522,6 +2522,70 @@ async def test_lost_lease_stops_renewal_without_cancelling_dispatch() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_state", "warns"),
+    [
+        ("completed", False),
+        ("gone", False),
+        ("open", True),
+        ("lookup_raises", True),
+        ("no_lookup", True),
+    ],
+)
+async def test_a_refused_renewal_warns_only_when_the_row_is_not_already_finished(
+    row_state: str, warns: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A renewal refused on a row a fenced completion just finished (completed,
+    or removed by the delete/archive modes) is not a lost lease. The refusal
+    warns for an open row, and when the row cannot be looked up."""
+    refused = asyncio.Event()
+
+    class RefusingRenewalStore(ClaimingStubStore):
+        async def renew_claim(self, publication_id: UUID, token: str, lease_seconds: float) -> bool:
+            refused.set()
+            return False
+
+        async def find_by_id(self, publication_id: UUID) -> EventPublication | None:
+            if row_state == "lookup_raises":
+                raise OSError("db blip")
+            row = self.rows.get(publication_id)
+            if row is None or row_state == "gone":
+                return None
+            return replace(row, completed_at=datetime.now(UTC)) if row_state == "completed" else row
+
+    if row_state == "no_lookup":
+        RefusingRenewalStore.find_by_id = None  # type: ignore[assignment]
+
+    async def waits_for_the_refusal(event: OutboxEvent) -> None:
+        await refused.wait()
+        await asyncio.sleep(0.05)
+        received.append(event.value)
+
+    store = RefusingRenewalStore()
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        claim_lease_seconds=0.03,
+        start_loop=False,
+    )
+    _bootstrap_with_listener(waits_for_the_refusal)
+    publication = _make_pub(waits_for_the_refusal, value=17)
+    await store.save(publication)
+    [claimed] = await store.claim_batch(
+        owner="me", batch_size=1, lease_seconds=0.03, older_than=timedelta(0)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
+        await asyncio.wait_for(outbox._dispatch_with_lease_renewal(claimed), timeout=2)
+
+    lost = [r.getMessage() for r in caplog.records if "lost lease" in r.getMessage()]
+    assert (len(lost), received) == (1 if warns else 0, [17])
+    if warns:
+        assert str(publication.id) in lost[0]
+
+
+@pytest.mark.asyncio
 async def test_renewal_that_raises_is_retried_and_delivery_completes(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

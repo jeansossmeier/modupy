@@ -2174,6 +2174,204 @@ async def test_a_sweep_skipping_a_row_this_process_is_delivering_charges_nothing
     assert (again.attempt_count, again.last_error) == (1, "boom")
 
 
+def _renew_claim_raising_for(
+    store: PostgresPublicationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    row_id: Any,
+    lease_seconds: float,
+) -> None:
+    """Make ``renew_claim`` fail for one row and one kind of call (a release
+    passes 0.0, a re-arm the lease length); every other call reaches the store."""
+    real_renew = store.renew_claim
+
+    async def renew(publication_id: Any, token: str, seconds: float) -> bool:
+        if publication_id == row_id and seconds == lease_seconds:
+            raise OSError("db blip")
+        return await real_renew(publication_id, token, seconds)
+
+    monkeypatch.setattr(store, "renew_claim", renew)
+
+
+def _outbox_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "modulith.outbox" and r.levelno == logging.WARNING
+    ]
+
+
+async def _claimable_ids(store: PostgresPublicationStore) -> set[Any]:
+    claimed = await store.claim_batch(
+        owner="peer", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+    return {p.id for p in claimed}
+
+
+async def test_a_failing_rearm_costs_one_row_not_the_batch(
+    engine: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A re-arm that raises leaves its row to its lease and is logged with the
+    row's id; the rows behind it in the batch are still re-armed and delivered."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        claim_lease_seconds=60,
+        start_loop=False,
+    )
+    _bootstrap_with_listener(record)
+    now = datetime.now(UTC)
+    pubs = [_pub(i, published_at=now - timedelta(minutes=10 - i)) for i in (1, 2, 3)]
+    for pub in pubs:
+        await store.save(pub)
+    _renew_claim_raising_for(store, monkeypatch, row_id=pubs[1].id, lease_seconds=60)
+
+    with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
+        await outbox._sweep(timedelta(0))
+
+    assert received == [1, 3]
+    assert await _completed_rows(engine) == 2
+    warnings = _outbox_warnings(caplog)
+    assert len(warnings) == 1
+    assert str(pubs[1].id) in warnings[0]
+    assert await _claimable_ids(store) == set()
+
+
+async def test_a_failing_early_release_costs_one_row_not_the_batch(
+    engine: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Rows still in backoff are released at once. A release that raises is
+    logged with the row's id and leaves that row to its lease; the later rows
+    of the batch are still released, and a ready row behind them delivered."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        claim_lease_seconds=60,
+        start_loop=False,
+    )
+    _bootstrap_with_listener(record)
+    now = datetime.now(UTC)
+    waiting = [
+        _pub(i, published_at=now - timedelta(minutes=10 - i), attempt_count=3, last_attempt_at=now)
+        for i in (1, 2)
+    ]
+    ready = _pub(3, published_at=now - timedelta(minutes=1))
+    for pub in [*waiting, ready]:
+        await store.save(pub)
+    _renew_claim_raising_for(store, monkeypatch, row_id=waiting[0].id, lease_seconds=0.0)
+
+    with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
+        await outbox._sweep(timedelta(0))
+
+    assert received == [3]
+    warnings = _outbox_warnings(caplog)
+    assert len(warnings) == 1
+    assert str(waiting[0].id) in warnings[0]
+    assert await _claimable_ids(store) == {waiting[1].id}
+
+
+async def test_a_failing_release_before_bootstrap_costs_one_row_not_the_batch(
+    engine: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A sweep that runs before the runtime is bootstrapped releases every
+    claimed row. One release that raises must not strand the rest."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        claim_lease_seconds=60,
+        start_loop=False,
+    )
+    now = datetime.now(UTC)
+    pubs = [_pub(i, published_at=now - timedelta(minutes=10 - i)) for i in (1, 2, 3)]
+    for pub in pubs:
+        await store.save(pub)
+    _renew_claim_raising_for(store, monkeypatch, row_id=pubs[0].id, lease_seconds=0.0)
+
+    with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
+        await outbox._sweep(timedelta(0))
+
+    warnings = _outbox_warnings(caplog)
+    assert len(warnings) == 1
+    assert str(pubs[0].id) in warnings[0]
+    assert await _claimable_ids(store) == {pubs[1].id, pubs[2].id}
+
+
+async def test_a_renewal_landing_after_a_fenced_completion_logs_no_lost_lease(
+    engine: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The row is completed under the claim while the listener still runs, so
+    the next renewal finds it completed and returns False. That is not a lost
+    lease and must stay quiet."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        claim_lease_seconds=0.3,
+        start_loop=False,
+    )
+
+    async def completes_then_lingers(event: G04Event) -> None:
+        await store.mark_complete(pub.id)
+        await asyncio.sleep(0.4)
+        received.append(event.value)
+
+    _bootstrap_with_listener(completes_then_lingers)
+    pub = _pub(1, completes_then_lingers)
+    await store.save(pub)
+    [claimed] = await store.claim_batch(
+        owner="sweeper", batch_size=10, lease_seconds=0.3, older_than=timedelta(0)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
+        await outbox._dispatch_with_lease_renewal(claimed)
+
+    assert received == [1]
+    assert not [r for r in caplog.records if "lost lease" in r.getMessage()]
+
+
+async def test_a_renewal_lost_to_another_claimant_still_logs_a_lost_lease(
+    engine: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A peer claims the row after this worker's lease lapsed, so the renewal
+    returns False on a row that is still open: that one warns."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        claim_lease_seconds=0.3,
+        start_loop=False,
+    )
+
+    async def lingers_while_a_peer_takes_the_row(event: G04Event) -> None:
+        assert claimed.claim_token is not None
+        await store.renew_claim(pub.id, claimed.claim_token, 0.0)
+        assert await _claimable_ids(store) == {pub.id}
+        await asyncio.sleep(0.4)
+        received.append(event.value)
+
+    _bootstrap_with_listener(lingers_while_a_peer_takes_the_row)
+    pub = _pub(1, lingers_while_a_peer_takes_the_row)
+    await store.save(pub)
+    [claimed] = await store.claim_batch(
+        owner="sweeper", batch_size=10, lease_seconds=0.3, older_than=timedelta(0)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
+        await outbox._dispatch_with_lease_renewal(claimed)
+
+    lost = [r.getMessage() for r in caplog.records if "lost lease" in r.getMessage()]
+    assert len(lost) == 1
+    assert str(pub.id) in lost[0]
+
+
 async def test_lowered_threshold_dead_letters_rows_over_it_and_delivers_the_rest(
     engine: Any,
 ) -> None:

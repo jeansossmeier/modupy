@@ -901,7 +901,7 @@ async def _dead_letter_swept(publication: EventPublication) -> None:
     key = (publication.id, publication.attempt_count)
     if key in _swept_dead_letters:
         if publication.claim_token:
-            await _store.renew_claim(publication.id, publication.claim_token, 0.0)  # type: ignore[attr-defined]
+            await _renew_swept_claim(publication, 0.0)
         return
     if await _persist_failure(publication):
         _swept_dead_letters.add(key)
@@ -1211,12 +1211,34 @@ async def _sweep_unclaimed(older_than: timedelta, *, runtime_ready: bool) -> Non
         await _dispatch_publication(pub)
 
 
+async def _renew_swept_claim(publication: EventPublication, lease_seconds: float) -> bool:
+    """``renew_claim`` for one row of a sweep's batch; False when it did not land.
+
+    A store error is logged and leaves the row to its lease, so one failing row
+    does not strand the rest of the batch under the lease it was claimed with.
+    """
+    assert _store is not None and publication.claim_token
+    try:
+        return bool(
+            await _store.renew_claim(  # type: ignore[attr-defined]
+                publication.id, publication.claim_token, lease_seconds
+            )
+        )
+    except Exception:
+        logger.warning(
+            "outbox sweep: %s publication %s failed; leaving it to its lease",
+            "releasing" if lease_seconds <= 0 else "re-arming the lease on",
+            publication.id,
+            exc_info=True,
+        )
+        return False
+
+
 async def _release_claims(publications: list[EventPublication]) -> None:
     """Hand claimed rows back at once, uncharged (``renew_claim`` with 0 s)."""
-    assert _store is not None
     for pub in publications:
         if pub.claim_token:
-            await _store.renew_claim(pub.id, pub.claim_token, 0.0)  # type: ignore[attr-defined]
+            await _renew_swept_claim(pub, 0.0)
 
 
 async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
@@ -1257,7 +1279,7 @@ async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
             # sibling backlog can delay this worker's own rows; filter the
             # claim query by local listener ids if that shows up.
             if pub.claim_token:
-                await _store.renew_claim(pub.id, pub.claim_token, 0.0)  # type: ignore[attr-defined]
+                await _renew_swept_claim(pub, 0.0)
             continue
         with _inflight_lock:
             delivering_here = pub.id in _inflight_ids
@@ -1275,10 +1297,7 @@ async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
         # while the row is still ours — a lost re-arm means the peer owns the
         # row now, so delivering it here would be a second delivery under a
         # dead lease.
-        still_ours = not pub.claim_token or await _store.renew_claim(  # type: ignore[attr-defined]
-            pub.id, pub.claim_token, _claim_lease_seconds
-        )
-        if still_ours:
+        if not pub.claim_token or await _renew_swept_claim(pub, _claim_lease_seconds):
             await _dispatch_with_lease_renewal(pub)
 
 
@@ -1379,6 +1398,23 @@ async def _dispatch_under_advisory_lock(publication: EventPublication) -> bool:
     return True
 
 
+async def _finished_elsewhere(publication_id: UUID) -> bool:
+    """True when the store shows the row completed, or removed by the delete or
+    archive completion modes. A store without ``find_by_id``, or a lookup that
+    raises, reads as not finished.
+
+    A renewal refused on a row a completion just finished is not a lost lease.
+    """
+    finder = getattr(_store, "find_by_id", None)
+    if finder is None:
+        return False
+    try:
+        row = await finder(publication_id)
+    except Exception:
+        return False
+    return row is None or row.completed_at is not None
+
+
 async def _dispatch_with_lease_renewal(publication: EventPublication) -> None:
     """Dispatch under an active lease, renewing at one-third of the lease.
 
@@ -1423,11 +1459,12 @@ async def _dispatch_with_lease_renewal(publication: EventPublication) -> None:
                     return
                 continue
             if not ok:
-                logger.warning(
-                    "lost lease on publication %s during dispatch — "
-                    "stopping renewals; completion will be fenced",
-                    publication.id,
-                )
+                if not await _finished_elsewhere(publication.id):
+                    logger.warning(
+                        "lost lease on publication %s during dispatch — "
+                        "stopping renewals; completion will be fenced",
+                        publication.id,
+                    )
                 return
             lease_deadline = loop.time() + _claim_lease_seconds
 
