@@ -1927,7 +1927,7 @@ class _CountedBroker(RenewingConsumerBroker):
 
     def __init__(self) -> None:
         super().__init__()
-        self.attempts: dict[str, int | None | Exception] = {}
+        self.attempts: dict[str, int | Exception | None] = {}
 
     async def delivery_attempts(
         self, target: str, message_id: str, group: str | None = None
@@ -1938,7 +1938,7 @@ class _CountedBroker(RenewingConsumerBroker):
         return answer
 
 
-async def _reclaim_one_entry(attempts: int | None | Exception) -> tuple[_CountedBroker, list[int]]:
+async def _reclaim_one_entry(attempts: int | Exception | None) -> tuple[_CountedBroker, list[int]]:
     received: list[int] = []
 
     async def handler(evt: CrossEvent) -> None:
@@ -1977,7 +1977,7 @@ async def test_reclaimed_entry_is_dispatched_until_its_count_passes_the_delivery
     [pytest.param(None, id="no-longer-pending"), pytest.param(OSError("down"), id="lookup-fails")],
 )
 async def test_reclaimed_entry_with_unreadable_delivery_count_is_left_alone(
-    answer: int | None | Exception,
+    answer: int | Exception | None,
 ) -> None:
     broker, received = await _reclaim_one_entry(answer)
 
