@@ -849,7 +849,11 @@ through another replay. To replay them without losing work, do this in order:
 3. Run `modulith broker drop-group <group> --target <target>`.
 4. Raise `max_store_bytes`.
 5. Restart every process, before the skipped publications expire
-   (`orphan_retention_seconds` after they were written).
+   (`orphan_retention_seconds` after they were written). The WARNING states how
+   many minutes remain until the earliest skipped publication expires; with the
+   default hour that is often little, so do steps 1 to 5 as soon as it appears.
+   The rest expire after it, so restarting later replays only those still
+   retained.
 
 Size `max_store_bytes` for the retained backlog before adding a listener to a
 busy store. Consumers drain a store that was opened with a lowered limit the

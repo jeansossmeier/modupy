@@ -270,6 +270,11 @@ def test_store_exhaustion_rolls_back_publish_with_actionable_error(tmp_path: Pat
                 assert "completion_mode" in message
                 assert "retention_age_seconds" in message
                 assert "restart every process" in message
+                assert (
+                    "(the retired-group warning appears at the next modulith run "
+                    "--topology processes start)"
+                ) in message
+                assert "groups are named modulith-<module>" in message
                 # Rows already stored keep their stamped expiry, so a shorter
                 # retention frees nothing in a store that is already full.
                 assert "shorten" not in message
@@ -604,6 +609,33 @@ def test_a_cut_replay_counts_only_the_publications_the_group_lacks_as_skipped(
         store.close()
 
 
+def test_a_cut_replay_warning_states_in_minutes_when_the_earliest_skipped_publication_expires(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = _bounded_store(tmp_path / "deadline.db", 2 * 1024 * 1024)
+    try:
+        _hold_then_drop_target(store, held=10, acked=3)
+        for index in range(5):
+            store.publish("events.T", b'{"missed":%d}' % index, None, None)
+        _publish_until_refused(store, "events.U")
+        now = time.time()
+        for index, minutes in enumerate([50, 40, 10, 30, 20]):
+            store._conn.execute(
+                "UPDATE shm_publication SET retained_until=? WHERE payload=?",
+                (now + minutes * 60 + 30, b'{"missed":%d}' % index),
+            )
+        store._conn.commit()
+
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
+            assert store.subscribe(["events.T"], "g") == 0
+
+        [warning] = _warnings(caplog)
+        assert "expires in about 10 minutes" in warning
+        assert "restart every process within that time" in warning
+    finally:
+        store.close()
+
+
 def test_the_cut_replay_recovery_delivers_every_publication_once(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -764,7 +796,7 @@ def test_a_mark_mode_replay_takes_half_the_room_left_after_the_previous_targets_
 
         def recording_replay(
             conn: sqlite3.Connection, target: str, group: str, now: float, page_limit: int
-        ) -> tuple[int, int]:
+        ) -> tuple[int, int, float | None]:
             used_before = _shm_publications._used_pages(conn)
             result = real_replay(conn, target, group, now, page_limit)
             replays.append((target, used_before, _shm_publications._used_pages(conn), result[1]))
@@ -979,6 +1011,26 @@ def _outgrow_the_limit_on_a_subscription_write(store: SqliteQueueStore, event: s
         f"CREATE TRIGGER outgrow AFTER {event} ON shm_subscription "
         "BEGIN INSERT INTO filler VALUES (randomblob(512 * 1024)); END"
     )
+
+
+def test_a_subscribe_the_cap_cannot_lift_names_the_sqlite_and_disk_remedies(
+    tmp_path: Path,
+) -> None:
+    store = _bounded_store(tmp_path / "stuck-subscribe.db", 256 * 1024)
+    try:
+        _outgrow_the_limit_on_a_subscription_write(store, "INSERT")
+        store._conn = cast(sqlite3.Connection, _CapLiftIgnoringConnection(store._conn))
+
+        with pytest.raises(ConfigurationError) as raised:
+            store.subscribe(["events.Created"], "orders")
+
+        message = str(raised.value)
+        assert "lower max_store_bytes to what this SQLite build can hold" in message
+        assert "or remove a retired group with modulith broker drop-group" in message
+        assert "free disk space" in message
+        assert "restart every process" in message
+    finally:
+        store.close()
 
 
 def test_touch_subscriptions_runs_as_a_consumer_write_in_a_full_store(tmp_path: Path) -> None:

@@ -120,6 +120,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - Redis Streams replicas no longer run a message's listeners twice when a peer's reclaim fires while a replica is still working through a read or reclaimed batch: each entry's claim is renewed before it is dispatched, and an entry a peer took is skipped. `reclaim_min_idle_ms` now only has to exceed one listener call, not a whole batch
 - A worker's last output line without a trailing newline reaches the supervisor log, also when `modulith run --topology processes` stops a worker whose child still holds its pipe, and a worker still writing no longer keeps the other workers' quiet log pipes open at stop or respawn
 - The proxy forwards a request carrying both `Transfer-Encoding` and `Content-Length` instead of answering 500, routes a path containing `%0A` to its worker instead of answering 404, and hands backend redirects to the client instead of following them, so an injected redirect-following client no longer drops `Cookie` and `Set-Cookie`
+- The SHM store-full and cut-replay messages say what to do: the subscribe error names freeing disk space, lowering `max_store_bytes` to what the SQLite build can hold, or `modulith broker drop-group`; the publish error says when the retired-group warning appears and that groups are named `modulith-<module>`; the cut-replay warning states in minutes when the earliest skipped publication expires
 
 ### Security
 
