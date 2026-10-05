@@ -1681,6 +1681,19 @@ def _confirm_interruptibly(prompt: str) -> bool:
         signal.signal(signal.SIGINT, previous)
 
 
+async def _drop_group_prompt(broker: Any, group: str, targets: list[str] | None, scope: str) -> str:
+    """The drop confirmation, with the delivery count when the broker can report it."""
+    prompt = f"Drop {scope} and delete its pending and claimed messages?"
+    group_backlog = getattr(broker, "group_backlog", None)
+    if not callable(group_backlog):
+        return prompt
+    if targets is None:
+        count = (await group_backlog()).get(group, 0)
+        return f"Drop {scope} and delete its {count} pending and claimed messages?"
+    per_target = [f"{t}: {(await group_backlog(targets=[t])).get(group, 0)}" for t in targets]
+    return f"Drop {scope} and delete its pending and claimed messages ({', '.join(per_target)})?"
+
+
 @broker_app.command("drop-group")
 def broker_drop_group(
     group: str = typer.Argument(..., help="Consumer group, e.g. 'modulith-notifications'"),
@@ -1788,8 +1801,8 @@ def broker_drop_group(
             listed: dict[str, list[str]] = broker._expected_consumer_groups
             sole_keys = [t for t in expected if set(listed[t]) == {group}]
             typer.echo(_expected_targets_warning(group, expected, sole_keys))
-        prompt = f"Drop {scope} and delete its pending and claimed messages?"
         if not yes:
+            prompt = await _drop_group_prompt(broker, group, targets, scope)
             if not _confirm_interruptibly(prompt):
                 typer.echo("aborted — nothing was removed", err=True)
                 raise typer.Exit(code=1)

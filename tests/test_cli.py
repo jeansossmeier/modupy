@@ -2898,6 +2898,167 @@ def test_broker_drop_group_asks_before_removing(make_fake_app, monkeypatch, tmp_
     assert _shm_group_backlog(db_path) == {"modulith-retired": 3}
 
 
+def _seed_shm_target_backlogs(tmp_path: Path, monkeypatch, backlogs: dict[str, int]) -> Path:
+    """Subscribe 'modulith-retired' to each target and queue that many deliveries on it."""
+    from modulith.adapters.shm_broker import ShmBroker, _resolve_shm_paths
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    _, db_path, hint_path = _resolve_shm_paths("fakeapp", {})
+
+    async def seed() -> None:
+        broker = ShmBroker(shm_name=str(hint_path), db_path=str(db_path))
+        try:
+            await broker.subscribe(list(backlogs), "modulith-retired")
+            for target, count in backlogs.items():
+                for _ in range(count):
+                    await broker.publish(target, b"x", {"event_type": target})
+        finally:
+            await broker.close()
+
+    asyncio.run(seed())
+    return db_path
+
+
+def test_broker_drop_group_prompt_states_how_many_deliveries_the_drop_deletes(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    db_path = _seed_shm_groups(tmp_path, monkeypatch, {"modulith-orders": 2, "modulith-retired": 3})
+
+    result = runner.invoke(app, ["broker", "drop-group", "modulith-retired"], input="y\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Drop group 'modulith-retired' and delete its 3 pending and claimed messages?" in (
+        result.output
+    )
+    assert "3 pending or claimed delivery(ies)" in result.output
+    assert _shm_group_backlog(db_path) == {"modulith-orders": 2}
+
+
+def test_broker_drop_group_target_prompt_counts_only_that_target(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    db_path = _seed_shm_target_backlogs(tmp_path, monkeypatch, {"t.Stale": 2, "t.Live": 3})
+
+    result = runner.invoke(
+        app, ["broker", "drop-group", "modulith-retired", "--target", "t.Stale"], input="y\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "Drop targets ['t.Stale'] of group 'modulith-retired' and delete its pending and "
+        "claimed messages (t.Stale: 2)?"
+    ) in result.output
+    assert "2 pending or claimed delivery(ies)" in result.output
+    assert _shm_group_backlog(db_path) == {"modulith-retired": 3}
+
+
+def test_broker_drop_group_prompt_lists_each_targets_count_and_the_drop_deletes_their_sum(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    db_path = _seed_shm_target_backlogs(
+        tmp_path, monkeypatch, {"t.Stale": 2, "t.Other": 4, "t.Live": 3}
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "broker",
+            "drop-group",
+            "modulith-retired",
+            "--target",
+            "t.Stale",
+            "--target",
+            "t.Other",
+        ],
+        input="y\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "(t.Stale: 2, t.Other: 4)?" in result.output
+    assert "6 pending or claimed delivery(ies)" in result.output
+    assert _shm_group_backlog(db_path) == {"modulith-retired": 3}
+
+
+def test_broker_drop_group_prompt_counts_the_database_brokers_deliveries(
+    make_fake_app, monkeypatch, tmp_path
+):
+    from modulith.adapters.db_broker import DatabaseBroker
+
+    make_fake_app({"orders": ""})
+    db_file = tmp_path / "broker.db"
+    url = _database_project(tmp_path, monkeypatch, db_file)
+
+    async def seed() -> None:
+        broker = DatabaseBroker(url=url)
+        try:
+            await broker.subscribe(["t.A", "t.B"], "modulith-retired")
+            for target, count in (("t.A", 2), ("t.B", 1)):
+                for _ in range(count):
+                    await broker.publish(target, b"x", {"event_type": target})
+        finally:
+            await broker.close()
+
+    asyncio.run(seed())
+    conn = sqlite3.connect(db_file)
+    conn.execute("UPDATE broker_subscription SET updated_at='2000-01-01 00:00:00.000000'")
+    conn.commit()
+    conn.close()
+
+    result = runner.invoke(
+        app, ["broker", "drop-group", "modulith-retired", "--target", "t.A"], input="y\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "claimed messages (t.A: 2)?" in result.output
+    assert "2 pending or claimed delivery(ies)" in result.output
+
+
+def test_broker_drop_group_with_yes_neither_prompts_nor_reads_the_backlog(
+    make_fake_app, monkeypatch, tmp_path
+):
+    from modulith.adapters.shm_broker import ShmBroker
+
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    _seed_shm_groups(tmp_path, monkeypatch, {"modulith-retired": 3})
+
+    async def unreachable(self, *, targets=None):
+        raise AssertionError("--yes must not read the backlog")
+
+    monkeypatch.setattr(ShmBroker, "group_backlog", unreachable)
+
+    result = runner.invoke(app, ["broker", "drop-group", "modulith-retired", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "pending and claimed messages" not in result.output
+    assert "3 pending or claimed delivery(ies)" in result.output
+
+
+def test_broker_drop_group_still_prompts_without_a_count_on_a_broker_without_group_backlog(
+    make_fake_app, monkeypatch, tmp_path
+):
+    from modulith.adapters.shm_broker import ShmBroker
+
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    db_path = _seed_shm_groups(tmp_path, monkeypatch, {"modulith-retired": 3})
+    monkeypatch.delattr(ShmBroker, "group_backlog")
+
+    result = runner.invoke(app, ["broker", "drop-group", "modulith-retired"], input="y\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Drop group 'modulith-retired' and delete its pending and claimed messages?" in (
+        result.output
+    )
+    assert _shm_group_backlog(db_path) == {}
+
+
 def test_broker_drop_group_refuses_a_current_modules_group_without_force(
     make_fake_app, monkeypatch, tmp_path
 ):

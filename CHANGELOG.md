@@ -161,6 +161,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - The outbox lease sweep no longer abandons the rest of a claimed batch when re-arming or releasing one row's lease fails (it logs a WARNING naming the publication and leaves that row to its lease), and a lease renewal that lands just after the row was completed no longer logs a spurious "lost lease" warning
 - A database broker used from a second event loop drops the stopped owner loop's connection pool when it takes over, so later calls succeed; owner election is thread-safe, and a cross-loop call fails with `RuntimeError` when the owner loop has stopped and with `TimeoutError` after 30 seconds when a running owner never serves it
 - `modulith extract` no longer lists every distribution sharing a namespace package under "Extraction notes" (for example `opentelemetry-sdk` and `opentelemetry-semantic-conventions` when only `opentelemetry-api` was loaded): it lists only the distributions whose files the import check actually loaded
+- `modulith broker drop-group` states in its confirmation prompt how many pending and claimed deliveries the drop deletes, per target with `--target`, on the SHM and database brokers; `--yes` output is unchanged, and a broker without a backlog count still prompts without one
 
 ### Security
 

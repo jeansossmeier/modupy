@@ -864,7 +864,9 @@ through another replay. To replay them without losing work, do this in order:
    replayed ones included, and a replay restores only publications still within
    `orphan_retention_seconds` of being written.
 2. Once that backlog is empty, stop the group's workers.
-3. Run `modulith broker drop-group <group> --target <target>`.
+3. Run `modulith broker drop-group <group> --target <target>`. Its confirmation
+   prompt shows how many deliveries it deletes on that target; answer `n` and go
+   back to step 1 unless the count is 0 or you accept losing that many.
 4. Raise `max_store_bytes`.
 5. Restart every process, before the skipped publications expire
    (`orphan_retention_seconds` after they were written). The WARNING states how
@@ -1558,7 +1560,9 @@ Step 6 depends on the broker:
   group that subscribes again within `orphan_retention_seconds` is replayed
   the retained ones.
 
-  It asks for confirmation unless `--yes` is given, exits non-zero when the
+  It asks for confirmation unless `--yes` is given; the prompt states how many
+  pending and claimed deliveries the drop deletes (per target with `--target`),
+  on the shm and database brokers. It exits non-zero when the
   store holds nothing for the group, and refuses a group that a current module
   derives or a consumer served in the last 24 hours unless `--force` is given.
   Before asking, it lists the targets the group is the only subscriber of and
