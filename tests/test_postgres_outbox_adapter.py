@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import gc
+import importlib.util
 import json
 import logging
 import threading
@@ -2995,6 +2996,10 @@ async def test_a_savepoint_rollback_that_holds_the_only_publish_dispatches_nothi
 
 
 _PG_URL = "postgresql+asyncpg://user:pw@localhost/db"
+_needs_asyncpg = pytest.mark.skipif(
+    importlib.util.find_spec("asyncpg") is None,
+    reason="needs the modupy[postgres] extra (asyncpg)",
+)
 
 
 def _pg_engine_with_pool(pool_class: type) -> AsyncEngine:
@@ -3011,6 +3016,7 @@ def _pg_engine_with_pool(pool_class: type) -> AsyncEngine:
     return create_async_engine(_PG_URL, poolclass=pool_class)
 
 
+@_needs_asyncpg
 @pytest.mark.parametrize("pool_class", [StaticPool, SingletonThreadPool])
 async def test_advisory_lock_refuses_a_single_connection_pool(pool_class: type) -> None:
     """These pools hand every lock connection the same DBAPI connection, so
@@ -3028,6 +3034,7 @@ async def test_advisory_lock_refuses_a_single_connection_pool(pool_class: type) 
         await eng.dispose()
 
 
+@_needs_asyncpg
 async def test_advisory_lock_accepts_a_queue_pool_engine() -> None:
     eng = create_async_engine(_PG_URL, poolclass=AsyncAdaptedQueuePool, pool_size=2)
     store = PostgresPublicationStore(engine=eng)
@@ -3041,6 +3048,7 @@ async def test_advisory_lock_accepts_a_queue_pool_engine() -> None:
         await eng.dispose()
 
 
+@_needs_asyncpg
 @pytest.mark.parametrize("pool_class", [StaticPool, SingletonThreadPool])
 async def test_a_single_connection_pool_is_fine_for_the_lease_strategy(pool_class: type) -> None:
     eng = _pg_engine_with_pool(pool_class)
