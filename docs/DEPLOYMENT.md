@@ -523,9 +523,17 @@ MODULITH_BROKER=database \
 Adopting the packaged Alembic migrations after the broker has already
 self-bootstrapped its own tables is supported: `modulith migrate --url <broker
 url>` (or the raw `alembic upgrade head`) stamps
-cleanly over a database the broker created, since migrations `0002` and
-`0004` inspect the schema first and skip any table/index that already
-exists rather than failing on a duplicate.
+cleanly over a database the broker created, since migrations `0002`, `0004`
+and `0006` inspect the schema first and skip any table, index or column that
+already exists rather than failing on a duplicate.
+
+That inspection needs a connection, so offline output skips nothing. Only the
+raw command has an offline mode (`alembic upgrade head --sql`); `modulith
+migrate` always connects. The offline script creates every table and index of
+`0002` and `0004` unconditionally, and `0006` adds `broker_message.dispatch_started`
+with a plain `ALTER TABLE ... ADD COLUMN`. Apply that script only to a database
+without those objects: a `broker_message` table the broker created already has
+the `dispatch_started` column.
 
 **What changes:**
 - Each module runs in its own worker process.
@@ -664,10 +672,12 @@ Uses the `broker_message` and `broker_subscription` tables with `FOR UPDATE SKIP
 
 As with the SQLite broker above, running `modulith migrate` (or the raw
 `alembic upgrade head`) after the broker has already self-bootstrapped is
-supported — migrations `0002` and `0004` skip tables/indexes that already exist
-rather than failing. On a `postgresql+asyncpg://` URL both commands connect
-through `psycopg`, which the `postgres` extra installs
-(`pip install 'modupy[postgres]'`).
+supported — migrations `0002`, `0004` and `0006` skip tables, indexes and
+columns that already exist rather than failing. On a `postgresql+asyncpg://`
+URL both commands connect through `psycopg`, which the `postgres` extra
+installs (`pip install 'modupy[postgres]'`). Offline `--sql` output has no
+connection to inspect and skips nothing, so apply it only to a database
+without those objects, as described above.
 
 **Tuning:**
 
@@ -1318,9 +1328,9 @@ modupy configures no exporter. Set up an OpenTelemetry tracer provider in your a
    the group pins every publication to its targets until it is dropped, and
    a store sized for the one-hour default retention can fill within those 24
    hours. The startup warning for a
-   forgotten group likewise appears only when `modulith run` restarts at
-   least 24 hours after the group's last consumer activity; the restart in
-   step 5 does not report it.
+   forgotten group likewise appears only when `modulith run --topology
+   processes` restarts at least 24 hours after the group's last consumer
+   activity; the restart in step 5 does not report it.
 
 On the SHM and database brokers, the retired group moves through these states.
 
@@ -1337,7 +1347,7 @@ stateDiagram-v2
         drop-group refuses without --force
     end note
     note right of Idle
-        modulith run warns at startup
+        modulith run --topology processes warns at startup
     end note
 ```
 
@@ -1355,6 +1365,13 @@ Step 6 depends on the broker:
   subscriptions every hour even when idle, and every claim counts too, so
   a group that an extracted service or another host still consumes is not
   reported.
+
+  Only the process-topology supervisor runs that check. A single-process
+  deployment and Kubernetes (the single-process Deployment, or the manifests
+  from `modulith k8s-manifest`, whose pods each run one worker with no
+  supervisor) get no startup warning for a retired group, and no command
+  lists the groups a store holds. There you must know the group yourself:
+  `modulith-<module>` for the module you deleted or renamed.
 
   Once the module is gone for good, run
   `modulith broker drop-group modulith-<module>` with the same broker
@@ -1433,9 +1450,13 @@ modulith broker drop-group modulith-<module> --target <target> [--target <other>
 
 This removes only those subscriptions and deletes their pending and
 claimed messages (they are not delivered). Later publishes to the target no
-longer reach the group. It asks for confirmation unless `--yes` is given.
-Unlike the whole-group form, it needs no `--force` for a current module's
-group.
+longer reach the group, unless `expected_consumer_groups` still lists the
+group for that target (database broker, `store` policy with
+`orphan_replay_policy = "expected_groups"`): the group then keeps receiving a
+pending message for every publish, and the command warns about it. Remove the
+group from `expected_consumer_groups` too. The command asks for confirmation
+unless `--yes` is given. Unlike the whole-group form, it needs no `--force`
+for a current module's group.
 
 ### Recovering from Broker Failure
 
