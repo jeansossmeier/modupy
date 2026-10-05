@@ -143,6 +143,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - The `modulith extract` import check no longer refuses a first-party-looking package whose installed distribution the source `[project].dependencies` declares, and its refusal suggests declaring it; extension modules under `<prefix>/DLLs` and pip VCS checkouts under `<prefix>/src` no longer count as first-party when the environment is the project root, and the path comparison ignores case on Windows
 - The database broker raises a `ConfigurationError` naming `dispatch_started`, `modulith migrate` and migration `0006_broker_dispatch_started` when the application role cannot add that column, instead of the raw driver privilege error, and a SQLite file still locked when the schema deadline passes raises `TimeoutError` instead of `OperationalError`
 - `modulith run --workers`, `modulith dev --isolate` and the `[tool.modulith.workers]` table reject a name that is not a discovered module, exiting 1 with the unknown name and the list of modules, instead of silently ignoring a typo
+- A Redis Streams consumer that stops gracefully deletes its own name from the consumer group with `XGROUP DELCONSUMER` when it has no pending entries, so worker restarts no longer pile up in `XINFO CONSUMERS`, and entries it still owns stay reclaimable; a failed delete is logged and does not fail the stop
 
 ### Security
 

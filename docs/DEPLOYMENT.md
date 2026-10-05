@@ -1692,6 +1692,7 @@ other targets, then names the target and its groups in an error and exits 1.
 
 **Redis broker:**
 - A consumer creates its group when it starts, from the beginning of the stream, and creates it again if Redis reports `NOGROUP`. Entries published while every consumer is down wait in the stream, until the `MODULITH_STREAM_MAXLEN` cap (10000 by default) trims the oldest, unacknowledged ones included (see the Redis durability caveat above)
+- Every worker start names its consumer afresh, and Redis lists a consumer in `XINFO CONSUMERS` until it is deleted. A consumer that stops gracefully deletes itself from the group with `XGROUP DELCONSUMER`, but only when it has no pending entries, because that command also discards them; a failure to delete is logged and does not fail the stop. So a worker that was killed, or stopped while a listener was still running, stays listed with a `pending` count and an ever-growing `idle`. Peers reclaim its entries after `reclaim_min_idle_ms` as usual; once `XPENDING <stream> <group> - + 10 <consumer>` shows none, `XGROUP DELCONSUMER <stream> <group> <consumer>` removes the name
 
 ### Graceful Shutdown
 

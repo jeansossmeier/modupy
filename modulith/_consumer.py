@@ -220,17 +220,55 @@ class BrokerConsumer:
         Never raises for the task's own outcome: a task that already died with
         a real exception is logged, and one that ignores cancellation is
         abandoned rather than wedging shutdown.
+
+        A broker offering ``remove_consumer`` (Redis Streams) is then asked to
+        drop this consumer's identity from the group, so the worker names that
+        every restart mints do not pile up. It runs within the same
+        ``2 * _stop_timeout_s`` budget, only once the task has ended (a
+        running one could read again and recreate the identity), and a failure
+        is logged without failing the stop.
         """
         self._stopping = True
         if self._task is not None:
+            task = self._task
+            deadline = asyncio.get_running_loop().time() + 2 * self._stop_timeout_s
             await cancel_and_wait(
-                self._task,
+                task,
                 timeout_s=self._stop_timeout_s,
                 logger=logger,
                 what=f"consumer {self._consumer_name!r} task",
             )
             self._task = None
+            if task.done():
+                await self._remove_identity(deadline - asyncio.get_running_loop().time())
         self._health = ConsumerHealth(ready=False, status="stopped")
+
+    async def _remove_identity(self, budget_s: float) -> None:
+        remove_consumer = getattr(self._broker, "remove_consumer", None)
+        if not callable(remove_consumer) or budget_s <= 0:
+            return
+        try:
+            async with asyncio.timeout(budget_s):
+                for target in self._targets:
+                    try:
+                        await remove_consumer(
+                            target, consumer=self._consumer_name, group=self._group
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "could not remove consumer %r from group %r on %s: %s",
+                            self._consumer_name,
+                            self._group,
+                            target,
+                            exc,
+                        )
+        except TimeoutError:
+            logger.warning(
+                "removing consumer %r from group %r did not finish within %.1fs",
+                self._consumer_name,
+                self._group,
+                budget_s,
+            )
 
     def health(self) -> ConsumerHealth:
         """Return an immutable snapshot of the consumer's readiness."""

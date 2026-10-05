@@ -176,6 +176,84 @@ async def test_unacked_message_reclaimed_by_peer_consumer(
 
 
 # ---------------------------------------------------------------------------
+# Stopping removes a consumer's identity, unless it still owns pending entries
+# ---------------------------------------------------------------------------
+
+
+async def _consumer_entries(redis_client, redis_key_prefix: str, group: str) -> dict[str, int]:
+    """XINFO CONSUMERS as ``{name: pending}``."""
+    rows = await redis_client.xinfo_consumers(_stream(redis_key_prefix), group)
+    return {
+        (row["name"].decode() if isinstance(row["name"], bytes) else row["name"]): row["pending"]
+        for row in rows
+    }
+
+
+async def test_restarting_a_worker_consumer_does_not_accumulate_identities(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    """Each worker start names its consumer afresh; stopping must not leave the
+    old names listed in the group."""
+    broker = _broker(redis_url, redis_key_prefix)
+    group = "modulith-mod"
+    received: list[int] = []
+    try:
+        for run in range(3):
+            consumer = _consumer(broker, group=group, name=f"mod:{run}", sink=received)
+            await consumer.start()
+            await _publish(broker, run)
+            await _until(lambda run=run: run in received)
+            await consumer.stop()
+
+        assert received == [0, 1, 2]
+        assert await _consumer_entries(redis_client, redis_key_prefix, group) == {}
+    finally:
+        await broker.close()
+
+
+async def test_stopped_consumer_with_a_pending_entry_keeps_its_identity(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    """XGROUP DELCONSUMER discards the consumer's pending entries on real Redis,
+    so a consumer stopped mid-listener stays listed and a peer still reclaims."""
+    broker = _broker(redis_url, redis_key_prefix)
+    group = "modulith-mod"
+    entered = asyncio.Event()
+
+    async def stuck(evt: StreamEvent) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    stuck_bus = InMemoryEventBus()
+    stuck_bus.register(StreamEvent, stuck)
+    holder = BrokerConsumer(
+        broker=broker,
+        bus=stuck_bus,
+        serializer=JsonEventSerializer(),
+        consumer_name="mod:holder",
+        group=group,
+        targets=[_TARGET],
+        poll_block_ms=50,
+        reclaim_min_idle_ms=0,
+    )
+    received: list[int] = []
+    peer = _consumer(broker, group=group, name="mod:peer", sink=received)
+    try:
+        await holder.start()
+        await _publish(broker, 9)
+        await asyncio.wait_for(entered.wait(), timeout=8)
+        await holder.stop()
+
+        assert await _consumer_entries(redis_client, redis_key_prefix, group) == {"mod:holder": 1}
+
+        await peer.start()  # reclaims the holder's idle pending entry
+        await _until(lambda: received == [9])
+    finally:
+        await peer.stop()
+        await broker.close()
+
+
+# ---------------------------------------------------------------------------
 # Dead-letter routing on real Redis
 # ---------------------------------------------------------------------------
 

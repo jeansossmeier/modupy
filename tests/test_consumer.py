@@ -2004,3 +2004,178 @@ async def test_entry_a_peer_took_is_not_dead_lettered_for_its_delivery_count() -
 
     assert received == [1]
     assert broker.dead == []
+
+
+# ---------------------------------------------------------------------------
+# Stopping removes the consumer's own identity from the group
+# ---------------------------------------------------------------------------
+
+
+class _IdentityRecordingBroker(FakeConsumerBroker):
+    """Records ``remove_consumer`` calls; a target can fail or hang."""
+
+    def __init__(self, *, failing: frozenset[str] = frozenset(), hang: bool = False) -> None:
+        super().__init__()
+        self.removed: list[tuple[str, str, str | None]] = []
+        self._failing = failing
+        self._hang = hang
+
+    async def remove_consumer(
+        self, target: str, *, consumer: str, group: str | None = None
+    ) -> bool:
+        if self._hang:
+            await asyncio.Event().wait()
+        if target in self._failing:
+            raise OSError(f"cannot delete on {target}")
+        self.removed.append((target, consumer, group))
+        return True
+
+
+def _redis_consumer(fake: StatefulFakeRedis, name: str, bus: InMemoryEventBus) -> BrokerConsumer:
+    from modulith.adapters.redis_broker import RedisStreamsBroker
+
+    return BrokerConsumer(
+        broker=RedisStreamsBroker(client=fake, stream_prefix="p", consumer_group="g"),
+        bus=bus,
+        serializer=JsonEventSerializer(),
+        consumer_name=name,
+        group="modulith-orders",
+        targets=[_POISON_TARGET],
+        poll_block_ms=10,
+        reclaim_min_idle_ms=0,
+    )
+
+
+def _listed(fake: StatefulFakeRedis) -> set[str]:
+    return fake.consumers.get((f"p.{_POISON_TARGET}", "modulith-orders"), set())
+
+
+async def test_stop_removes_the_idle_consumer_identity_from_the_group() -> None:
+    fake = StatefulFakeRedis()
+    consumer = _redis_consumer(fake, "orders:1", InMemoryEventBus())
+    await consumer.start()
+    assert _listed(fake) == {"orders:1"}
+
+    await consumer.stop()
+
+    assert _listed(fake) == set()
+
+
+async def test_restarting_under_a_new_name_each_time_leaves_no_identities_behind() -> None:
+    fake = StatefulFakeRedis()
+    for run in range(3):
+        consumer = _redis_consumer(fake, f"orders:{run}", InMemoryEventBus())
+        await consumer.start()
+        await consumer.stop()
+
+    assert _listed(fake) == set()
+
+
+async def test_stop_keeps_the_identity_of_a_consumer_that_still_owns_a_pending_entry() -> None:
+    fake = StatefulFakeRedis()
+    entered = asyncio.Event()
+
+    async def never_finishes(evt: CrossEvent) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    bus = InMemoryEventBus()
+    bus.register(CrossEvent, never_finishes)
+    consumer = _redis_consumer(fake, "orders:1", bus)
+    await consumer.start()
+    payload = JsonEventSerializer().serialize(CrossEvent(value=1))
+    await consumer._broker.publish(_POISON_TARGET, payload, {"event_type": _POISON_TARGET})
+    await asyncio.wait_for(entered.wait(), timeout=2)
+
+    await consumer.stop()
+
+    assert _listed(fake) == {"orders:1"}
+    survivor = _redis_consumer(fake, "orders:2", InMemoryEventBus())
+    _cursor, claimed, _deleted = await survivor._broker.reclaim(
+        _POISON_TARGET, consumer="orders:2", min_idle_ms=0, group="modulith-orders"
+    )
+    assert [mid for mid, _fields in claimed] == [b"1-0"]
+
+
+async def test_a_failure_to_remove_the_identity_is_logged_and_does_not_fail_stop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class RefusingFakeRedis(StatefulFakeRedis):
+        async def xgroup_delconsumer(self, *args: Any) -> int:
+            raise ConnectionError("redis went away")
+
+    fake = RefusingFakeRedis()
+    consumer = _redis_consumer(fake, "orders:1", InMemoryEventBus())
+    await consumer.start()
+
+    with caplog.at_level(logging.WARNING, logger="modulith.consumer"):
+        await consumer.stop()
+
+    assert consumer.health() == ConsumerHealth(ready=False, status="stopped")
+    [record] = [r for r in caplog.records if "orders:1" in r.getMessage()]
+    assert record.levelno == logging.WARNING
+    assert _POISON_TARGET in record.getMessage()
+    assert "redis went away" in record.getMessage()
+
+
+async def test_stop_removes_the_identity_on_every_target_even_when_one_fails() -> None:
+    broker = _IdentityRecordingBroker(failing=frozenset({"a"}))
+    consumer = _make_consumer(broker, InMemoryEventBus(), targets=["a", "b"])
+    await consumer.start()
+
+    await consumer.stop()
+
+    assert broker.removed == [("b", "orders:1", "modulith-orders")]
+
+
+async def test_stop_gives_up_on_a_hung_removal_within_its_shutdown_budget(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    broker = _IdentityRecordingBroker(hang=True)
+    consumer = _make_consumer(broker, InMemoryEventBus(), targets=["t"])
+    consumer._stop_timeout_s = 0.05
+    await consumer.start()
+
+    with caplog.at_level(logging.WARNING, logger="modulith.consumer"):
+        await asyncio.wait_for(consumer.stop(), timeout=2)
+
+    assert consumer.health() == ConsumerHealth(ready=False, status="stopped")
+    assert any("did not finish" in r.getMessage() for r in caplog.records)
+
+
+async def test_stop_leaves_the_identity_alone_when_the_poll_task_ignored_cancellation() -> None:
+    broker = _IdentityRecordingBroker()
+    consumer = _make_consumer(broker, InMemoryEventBus(), targets=["t"])
+    consumer._stop_timeout_s = 0.02
+    release = asyncio.Event()
+
+    async def stubborn() -> None:
+        while not release.is_set():
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                continue
+
+    consumer._run = stubborn  # type: ignore[method-assign]
+    await consumer.start()
+    task = consumer._task
+    assert task is not None
+    await asyncio.sleep(0.02)
+
+    await consumer.stop()
+    release.set()
+    await task
+
+    assert broker.removed == []
+
+
+async def test_stop_without_a_running_loop_removes_nothing() -> None:
+    broker = _IdentityRecordingBroker()
+    consumer = _make_consumer(broker, InMemoryEventBus(), targets=["t"])
+
+    await consumer.stop()
+    await consumer.start()
+    await consumer.stop()
+    await consumer.stop()
+
+    assert broker.removed == [("t", "orders:1", "modulith-orders")]

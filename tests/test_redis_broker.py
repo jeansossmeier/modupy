@@ -620,7 +620,11 @@ class StatefulFakeRedis:
         reassigns the consumer and
         RESETS the idle clock; pending ids no longer present in the stream
         (trimmed/XDEL'd while pending) are reported via the third (deleted)
-        tuple element and purged from the PEL.
+        tuple element and purged from the PEL;
+      * a consumer exists in its group from the first XREADGROUP or XAUTOCLAIM
+        naming it (even one that finds nothing) until XGROUP DELCONSUMER, which
+        also drops that consumer's pending entries from the PEL — the data loss
+        an unconditional delete causes.
     """
 
     def __init__(self) -> None:
@@ -631,6 +635,8 @@ class StatefulFakeRedis:
         # (stream, group, mid) -> Redis's delivery count: XREADGROUP and
         # XAUTOCLAIM raise it, the JUSTID renewal does not.
         self.times_delivered: dict[tuple[str, str, bytes], int] = {}
+        # (stream, group) -> consumer names XINFO CONSUMERS would list.
+        self.consumers: dict[tuple[str, str], set[str]] = {}
         self._seq: dict[str, int] = {}
         self.closed = False
         # Virtual clock (ms). Deliveries/claims are stamped with it; tests
@@ -675,6 +681,7 @@ class StatefulFakeRedis:
         out = []
         for name, _sid in streams.items():  # adapter always passes ">"
             grp = self.groups[(name, groupname)]
+            self.consumers.setdefault((name, groupname), set()).add(consumername)
             delivered = []
             for mid, fields in self.streams.get(name, []):
                 seq = int(mid.split(b"-")[0])
@@ -716,6 +723,7 @@ class StatefulFakeRedis:
         count: int | None = None,
     ) -> Any:
         limit = 100 if count is None else count  # Redis COUNT default is 100
+        self.consumers.setdefault((name, groupname), set()).add(consumername)
         pel = self.groups[(name, groupname)]["pel"]
         by_id = dict(self.streams.get(name, []))
         sid = start_id.decode() if isinstance(start_id, bytes) else start_id
@@ -756,11 +764,14 @@ class StatefulFakeRedis:
         count: int,
         consumername: str | None = None,
     ) -> list[dict[str, Any]]:
-        """XPENDING for the single id ``min == max`` — the only shape modelled."""
-        mid = min if isinstance(min, bytes) else min.encode()
-        entry = self.groups[(name, groupname)]["pel"].get(mid)
-        if entry is None or (consumername is not None and entry["consumer"] != consumername):
-            return []
+        """XPENDING over ``min``..``max`` (ids or ``-``/``+``), oldest first, at most ``count``."""
+
+        def seq(bound: str | bytes) -> int:
+            return int((bound.decode() if isinstance(bound, bytes) else bound).split("-")[0])
+
+        low = 0 if min in ("-", b"-") else seq(min)
+        high = float("inf") if max in ("+", b"+") else seq(max)
+        pel = self.groups[(name, groupname)]["pel"]
         return [
             {
                 "message_id": mid,
@@ -768,7 +779,19 @@ class StatefulFakeRedis:
                 "time_since_delivered": self.now_ms - entry["delivered_ms"],
                 "times_delivered": self.times_delivered.get((name, groupname, mid), 1),
             }
-        ]
+            for mid, entry in sorted(pel.items(), key=lambda item: seq(item[0]))
+            if low <= seq(mid) <= high
+            and (consumername is None or entry["consumer"] == consumername)
+        ][:count]
+
+    async def xgroup_delconsumer(self, name: str, groupname: str, consumername: str) -> int:
+        """Remove the consumer and its pending entries; return how many it had pending."""
+        pel = self.groups[(name, groupname)]["pel"]
+        owned = [mid for mid, entry in pel.items() if entry["consumer"] == consumername]
+        for mid in owned:
+            del pel[mid]
+        self.consumers.get((name, groupname), set()).discard(consumername)
+        return len(owned)
 
     async def eval(self, script: str, numkeys: int, *keys_and_args: Any) -> int:
         """Run the ownership-renewal script: the one Lua script this fake models.
@@ -842,6 +865,60 @@ async def test_ack_clears_message_from_pending(stateful_broker) -> None:
         "orders", consumer="c2", min_idle_ms=0
     )
     assert claimed == []
+
+
+async def test_remove_consumer_deletes_an_identity_with_nothing_pending(
+    stateful_broker, stateful_fake
+) -> None:
+    await stateful_broker.ensure_group("orders")
+    await stateful_broker.publish("orders", b"payload")
+    [(_s, [(mid, _f)])] = await stateful_broker.read("orders", consumer="c1", block_ms=1)
+    await stateful_broker.ack("orders", mid.decode())
+    stream = "modulith.events.orders"
+    assert stateful_fake.consumers[(stream, "g")] == {"c1"}
+
+    assert await stateful_broker.remove_consumer("orders", consumer="c1") is True
+
+    assert stateful_fake.consumers[(stream, "g")] == set()
+
+
+async def test_remove_consumer_keeps_an_identity_that_still_owns_a_pending_entry(
+    stateful_broker, stateful_fake
+) -> None:
+    await stateful_broker.ensure_group("orders")
+    await stateful_broker.publish("orders", b"payload")
+    [(_s, [(mid, _f)])] = await stateful_broker.read("orders", consumer="c1", block_ms=1)
+
+    assert await stateful_broker.remove_consumer("orders", consumer="c1") is False
+
+    assert stateful_fake.consumers[("modulith.events.orders", "g")] == {"c1"}
+    _cursor, claimed, _deleted = await stateful_broker.reclaim(
+        "orders", consumer="c2", min_idle_ms=0
+    )
+    assert [m for m, _ in claimed] == [mid]
+
+
+async def test_remove_consumer_ignores_a_peers_pending_entry(
+    stateful_broker, stateful_fake
+) -> None:
+    await stateful_broker.ensure_group("orders")
+    await stateful_broker.publish("orders", b"payload")
+    await stateful_broker.read("orders", consumer="busy", block_ms=1)
+    assert await stateful_broker.read("orders", consumer="idle", block_ms=1) == []
+
+    assert await stateful_broker.remove_consumer("orders", consumer="idle") is True
+
+    assert stateful_fake.consumers[("modulith.events.orders", "g")] == {"busy"}
+
+
+async def test_remove_consumer_uses_the_named_group(stateful_fake) -> None:
+    broker = RedisStreamsBroker(client=stateful_fake, stream_prefix="modulith.events")
+    await broker.ensure_group("orders", "modulith-billing")
+    await broker.read("orders", consumer="c1", group="modulith-billing", block_ms=1)
+
+    assert await broker.remove_consumer("orders", consumer="c1", group="modulith-billing") is True
+
+    assert stateful_fake.consumers[("modulith.events.orders", "modulith-billing")] == set()
 
 
 async def test_group_created_at_id_zero_delivers_pre_existing_backlog(stateful_broker) -> None:

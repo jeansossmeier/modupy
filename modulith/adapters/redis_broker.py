@@ -402,6 +402,28 @@ class RedisStreamsBroker:
         )
         return bool(renewed)
 
+    async def remove_consumer(
+        self, target: str, *, consumer: str, group: str | None = None
+    ) -> bool:
+        """XGROUP DELCONSUMER ``consumer``, unless it still owns a pending entry.
+
+        Redis lists a consumer in ``XINFO CONSUMERS`` from its first read until
+        it is deleted, and each worker start uses a new name, so stopped
+        workers would pile up. XGROUP DELCONSUMER also drops the consumer's
+        pending entries from the group, so an entry it still owns would be
+        lost to XAUTOCLAIM, so a consumer holding one stays listed. Returns
+        True when the consumer was deleted.
+        """
+        stream = self._stream_name(target)
+        group_name = group or self._consumer_group
+        owned = await self._client.xpending_range(
+            stream, group_name, min="-", max="+", count=1, consumername=consumer
+        )
+        if owned:
+            return False
+        await self._client.xgroup_delconsumer(stream, group_name, consumer)
+        return True
+
     async def purge_trimmed_pending(
         self, target: str, *, consumer: str, group: str | None = None
     ) -> list[str]:
