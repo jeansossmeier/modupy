@@ -53,6 +53,46 @@ logger = logging.getLogger("modulith.serializers")
 _UNION_TAG = "__modulith_union_type__"
 
 
+def _stored_fields(obj: Any) -> tuple[dataclasses.Field[Any], ...]:
+    """The dataclass fields that are serialized, after rejecting required InitVars.
+
+    An ``InitVar`` is not a field: its value is not stored on the instance, so
+    one without a default could never be rebuilt by ``deserialize``. Failing
+    here keeps the error at publish time instead of in another process.
+    """
+    for pseudo in type(obj).__dataclass_fields__.values():
+        if (
+            pseudo._field_type is dataclasses._FIELD_INITVAR  # type: ignore[attr-defined]
+            and pseudo.default is dataclasses.MISSING
+            and pseudo.default_factory is dataclasses.MISSING
+        ):
+            raise TypeError(
+                f"cannot JSON-serialize {type(obj).__name__}: InitVar field "
+                f"{pseudo.name!r} has no default, so its value is not stored and the "
+                "event could not be rebuilt on decode; give it a default or make it a "
+                "regular field"
+            )
+    return dataclasses.fields(obj)
+
+
+def _build(cls: Any, values: dict[str, Any]) -> Any:
+    """Construct ``cls`` from decoded fields, assigning ``init=False`` ones afterwards.
+
+    ``init=False`` fields are not ``__init__`` parameters; they are set on the
+    instance after construction (``object.__setattr__`` so a frozen dataclass
+    accepts them).
+    """
+    deferred = (
+        {f.name for f in dataclasses.fields(cls) if not f.init}
+        if dataclasses.is_dataclass(cls)
+        else set()
+    )
+    obj = cls(**{k: v for k, v in values.items() if k not in deferred})
+    for name in deferred & values.keys():
+        object.__setattr__(obj, name, values[name])
+    return obj
+
+
 def _to_jsonable(obj: Any) -> Any:
     """Recursively convert an event's value graph to JSON-encodable values.
 
@@ -79,7 +119,7 @@ def _to_jsonable(obj: Any) -> Any:
     # Nested dataclass: descend into its fields so a field typed as another
     # @dataclass event/value object round-trips instead of raising TypeError.
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        return {f.name: _to_jsonable(getattr(obj, f.name)) for f in dataclasses.fields(obj)}
+        return {f.name: _to_jsonable(getattr(obj, f.name)) for f in _stored_fields(obj)}
     if isinstance(obj, (list, tuple, set, frozenset)):
         return [_to_jsonable(v) for v in obj]
     if isinstance(obj, dict):
@@ -243,7 +283,7 @@ def _to_jsonable_typed(obj: Any, hint: Any) -> Any:
         hints = _safe_type_hints(type(obj))
         return {
             field.name: _to_jsonable_typed(getattr(obj, field.name), hints.get(field.name))
-            for field in dataclasses.fields(obj)
+            for field in _stored_fields(obj)
         }
     return _to_jsonable(obj)
 
@@ -468,7 +508,7 @@ def _coerce(value: Any, hint: Any) -> Any:
             _warn_unknown_subclass_tag(tag, _hint_tag(hint))
             return decoded
         sub_hints = _safe_type_hints(hint)
-        return hint(**{k: _coerce(v, sub_hints.get(k)) for k, v in value.items()})
+        return _build(hint, {k: _coerce(v, sub_hints.get(k)) for k, v in value.items()})
     return value
 
 
@@ -567,7 +607,7 @@ class JsonEventSerializer:
         Keys are sorted for stable, diffable output in the outbox table.
         """
         if dataclasses.is_dataclass(event) and not isinstance(event, type):
-            raw = {f.name: getattr(event, f.name) for f in dataclasses.fields(event)}
+            raw = {f.name: getattr(event, f.name) for f in _stored_fields(event)}
         else:
             raw = _instance_attrs(event)
         return json.dumps(
@@ -635,4 +675,4 @@ class JsonEventSerializer:
                 if hint is not None:
                     hints[key] = hint
         kwargs = {key: _coerce(val, hints.get(key)) for key, val in raw.items()}
-        return cls(**kwargs)
+        return _build(cls, kwargs)

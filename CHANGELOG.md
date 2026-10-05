@@ -114,6 +114,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - A listener registered after a process-per-module worker has built its broker consumer logs a WARNING that it receives only events published in that process, not broker deliveries; it used to be silently local-only
 - CI tests Python 3.14 too, fails when `uv.lock` is out of date, and runs weekly, so an upstream release that breaks the suite shows up without a push
 - `outbox.shutdown()` is final until the next `outbox.configure()`: a listener that publishes during `Runtime.shutdown`'s drain no longer restarts the outbox retry loop after shutdown stopped it, and `outbox.start()` after shutdown does nothing
+- `JsonEventSerializer` restores `field(init=False)` dataclass fields after construction, including on frozen and nested dataclasses, instead of failing to decode them, and `serialize` rejects an `InitVar` without a default with a `TypeError` naming the class and field instead of accepting an event the consumer cannot decode
 
 ### Security
 

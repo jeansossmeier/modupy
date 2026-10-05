@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import sys
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum, IntEnum
@@ -1125,3 +1125,88 @@ def test_container_wire_format_that_round_trips_today_is_unchanged() -> None:
         b'"labelled":[3,"x"],"order":["1.5"],"pair":[1,2]}'
     )
     assert serializer.deserialize(wire, _fqcn(WireStableEvent)) == original
+
+
+@dataclass
+class DerivedTotalEvent:
+    order_id: str
+    total: Decimal = field(init=False, default=Decimal(0))
+
+
+@dataclass(frozen=True)
+class FrozenDerivedItem:
+    label: str
+    made_at: datetime = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "made_at", datetime(2000, 1, 1, tzinfo=UTC))
+
+
+@dataclass(frozen=True)
+class DerivedItemEvent:
+    item: FrozenDerivedItem
+    items: list[FrozenDerivedItem]
+
+
+@dataclass
+class SeededEvent:
+    name: str
+    seed: InitVar[int]
+
+
+@dataclass
+class SeedWrapperEvent:
+    inner: SeededEvent
+
+
+@dataclass
+class DefaultedSeedEvent:
+    name: str
+    seed: InitVar[int] = 5
+
+
+def test_init_false_field_is_restored_after_construction() -> None:
+    serializer = JsonEventSerializer()
+    original = DerivedTotalEvent(order_id="o-1")
+    original.total = Decimal("9.50")
+
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(DerivedTotalEvent))
+
+    assert restored == original
+    assert restored.total == Decimal("9.50")
+    assert isinstance(restored.total, Decimal)
+
+
+def test_init_false_field_of_a_frozen_nested_dataclass_is_restored() -> None:
+    serializer = JsonEventSerializer()
+    first = FrozenDerivedItem(label="a")
+    object.__setattr__(first, "made_at", datetime(2026, 3, 4, tzinfo=UTC))
+    second = FrozenDerivedItem(label="b")
+    object.__setattr__(second, "made_at", datetime(2026, 5, 6, tzinfo=UTC))
+    original = DerivedItemEvent(item=first, items=[second])
+
+    restored = serializer.deserialize(serializer.serialize(original), _fqcn(DerivedItemEvent))
+
+    assert restored == original
+    assert restored.item.made_at == datetime(2026, 3, 4, tzinfo=UTC)
+    assert restored.items[0].made_at == datetime(2026, 5, 6, tzinfo=UTC)
+
+
+def test_serialize_rejects_an_initvar_without_a_default() -> None:
+    with pytest.raises(TypeError, match=r"SeededEvent.*'seed'|'seed'.*SeededEvent"):
+        JsonEventSerializer().serialize(SeededEvent("n", seed=1))
+
+
+def test_serialize_rejects_an_initvar_without_a_default_on_a_nested_dataclass() -> None:
+    with pytest.raises(TypeError, match=r"SeededEvent.*'seed'|'seed'.*SeededEvent"):
+        JsonEventSerializer().serialize(SeedWrapperEvent(SeededEvent("n", seed=1)))
+
+
+def test_initvar_with_a_default_round_trips() -> None:
+    serializer = JsonEventSerializer()
+    original = DefaultedSeedEvent("n", seed=9)
+
+    wire = serializer.serialize(original)
+
+    assert wire == b'{"name":"n"}'
+    assert serializer.deserialize(wire, _fqcn(DefaultedSeedEvent)) == DefaultedSeedEvent("n")

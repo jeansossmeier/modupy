@@ -248,6 +248,14 @@ Fields decode by their annotations:
   wherever the hint appears, for example as a `list` element, a `dict` value
   or an `Optional` member. Annotate the field with a non-generic dataclass to
   receive an instance.
+- A dataclass field declared `field(init=False)` is stored, and decode sets it
+  on the instance after `__init__` ran, coerced by its annotation (assigned
+  with `object.__setattr__`, so a frozen dataclass works too). An `InitVar`
+  is not a field and its value is not stored: `serialize` raises `TypeError`
+  naming the class and field for an `InitVar` without a default, so the
+  failure surfaces at publish time rather than in the consuming process. An
+  `InitVar` with a default is accepted and takes that default on decode. This
+  applies to nested dataclasses too.
 - Two field shapes carry a type tag,
   `{"__modulith_union_type__": "<module>.<qualname>", "value": ...}`: a
   multi-member union, and a nested dataclass holding an instance of a subclass
