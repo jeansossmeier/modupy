@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import json
 import logging
 import threading
@@ -38,6 +39,7 @@ from modulith.adapters.postgres_outbox import (
     unbind_session,
 )
 from modulith.builtin import outbox
+from modulith.config import ConfigurationError
 from modulith.runtime import _runtime
 from modulith.serializers import JsonEventSerializer
 
@@ -824,6 +826,35 @@ async def test_store_cross_loop_warning_fires_once_per_instance(engine: Any, cap
         await store.dispose()
 
 
+async def test_cross_loop_warning_survives_the_first_loop_being_collected(
+    engine: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The reference to the loop that first used the store dies with that
+    loop. A call from a new loop then still reaches the store's connections
+    from a loop that did not open them, so it warns, and the store tracks the
+    new loop from then on."""
+    store = PostgresPublicationStore(engine=engine)
+    try:
+        thread = threading.Thread(target=_run_on_new_loop, args=(store.count_open,))
+        thread.start()
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        gc.collect()
+        assert store._used_loop_ref is not None
+        assert store._used_loop_ref() is None
+
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.postgres"):
+            await store.count_open()
+            await store.count_open()
+
+        warnings = [r for r in caplog.records if _CROSS_LOOP_MSG in r.getMessage()]
+        assert len(warnings) == 1, f"expected exactly one cross-loop warning, got: {caplog.records}"
+        assert store._used_loop_ref is not None
+        assert store._used_loop_ref() is asyncio.get_running_loop()
+    finally:
+        await store.dispose()
+
+
 # ---------------------------------------------------------------------------
 # Lease claims stay exclusive under concurrent sweepers on every dialect
 # ---------------------------------------------------------------------------
@@ -1438,6 +1469,26 @@ async def test_advisory_lock_connection_is_invalidated_when_unlock_fails(
 
 
 @pytest.mark.integration
+async def test_advisory_unlock_of_a_lock_this_session_does_not_hold_warns(
+    pg_engine: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = PostgresPublicationStore(engine=pg_engine)
+    held_id, lost_id = uuid4(), uuid4()
+    try:
+        handle = await store.try_lock_publication(held_id)
+        assert handle is not None
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.postgres"):
+            await store.unlock_publication(handle, lost_id)
+    finally:
+        await store.dispose()
+
+    logged = _logged_at_warning_or_above(caplog)
+    assert [level for level, _, _ in logged] == ["WARNING"]
+    assert str(lost_id) in logged[0][1]
+    assert "lock lost during delivery" in logged[0][1]
+
+
+@pytest.mark.integration
 async def test_advisory_after_commit_delivers_a_burst_larger_than_the_pool(
     pg_engine: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1490,7 +1541,7 @@ async def test_advisory_after_commit_delivers_a_burst_larger_than_the_pool(
 
 
 async def _advisory_store_with_one_lock_connection(
-    tmp_path: Path,
+    tmp_path: Path, *, unlock_returns: int = 1
 ) -> tuple[Any, PostgresPublicationStore]:
     """A real store whose lock pool holds one connection and waits 0.2 s for it.
 
@@ -1508,7 +1559,7 @@ async def _advisory_store_with_one_lock_connection(
     @sa_event.listens_for(eng.sync_engine, "connect")
     def _advisory_stand_ins(dbapi_conn: Any, _record: Any) -> None:
         dbapi_conn.create_function("pg_try_advisory_lock", 1, lambda _key: 1)
-        dbapi_conn.create_function("pg_advisory_unlock", 1, lambda _key: 1)
+        dbapi_conn.create_function("pg_advisory_unlock", 1, lambda _key: unlock_returns)
 
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -1599,6 +1650,78 @@ async def test_advisory_sweep_without_a_lock_connection_leaves_its_batch_to_the_
     )
     assert sorted(received) == [1, 2]
     assert completed == 2
+
+
+async def test_disposed_store_does_not_rebuild_its_lock_engine(tmp_path: Path) -> None:
+    """A sweep that outlives ``dispose()`` must not open a fresh lock pool that
+    nothing will dispose: it fails, and the row is left to a later sweep."""
+    eng, store = await _advisory_store_with_one_lock_connection(tmp_path)
+    try:
+        first_id = uuid4()
+        first = await store.try_lock_publication(first_id)
+        assert first is not None
+        await store.unlock_publication(first, first_id)
+        await store.dispose()
+
+        with pytest.raises(ConfigurationError, match="store is disposed"):
+            await store.try_lock_publication(uuid4())
+        assert store._lock_engine is None
+    finally:
+        await eng.dispose()
+
+
+async def test_disposed_store_that_never_locked_does_not_build_a_lock_engine(
+    tmp_path: Path,
+) -> None:
+    eng, store = await _advisory_store_with_one_lock_connection(tmp_path)
+    try:
+        await store.dispose()
+
+        with pytest.raises(ConfigurationError, match="store is disposed"):
+            await store.try_lock_publication(uuid4())
+        assert store._lock_engine is None
+    finally:
+        await eng.dispose()
+
+
+async def test_unlock_that_finds_the_lock_gone_logs_a_warning_naming_the_publication(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``pg_advisory_unlock`` returning false means the session no longer held
+    the lock: a peer may have delivered the row too. That is logged once, at
+    WARNING, naming the publication."""
+    eng, store = await _advisory_store_with_one_lock_connection(tmp_path, unlock_returns=0)
+    pub_id = uuid4()
+    try:
+        handle = await store.try_lock_publication(pub_id)
+        assert handle is not None
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.postgres"):
+            await store.unlock_publication(handle, pub_id)
+    finally:
+        await store.dispose()
+        await eng.dispose()
+
+    logged = _logged_at_warning_or_above(caplog)
+    assert [(level, has_traceback) for level, _, has_traceback in logged] == [("WARNING", False)]
+    assert str(pub_id) in logged[0][1]
+    assert "lock lost during delivery; a peer may have delivered it too" in logged[0][1]
+
+
+async def test_unlock_that_releases_the_lock_logs_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    eng, store = await _advisory_store_with_one_lock_connection(tmp_path)
+    pub_id = uuid4()
+    try:
+        handle = await store.try_lock_publication(pub_id)
+        assert handle is not None
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.postgres"):
+            await store.unlock_publication(handle, pub_id)
+    finally:
+        await store.dispose()
+        await eng.dispose()
+
+    assert _logged_at_warning_or_above(caplog) == []
 
 
 @pytest.mark.parametrize("mode", ["delete", "archive"])

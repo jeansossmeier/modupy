@@ -485,6 +485,7 @@ class PostgresPublicationStore:
         # plugin from depending on dialect internals).
         self.supports_advisory_lock = engine.dialect.name == "postgresql"
         self._lock_engine: AsyncEngine | None = None
+        self._disposed = False
         # Push onto the live-store stack so dispose() can restore whichever
         # live store remains, rather than blanking dispatch routing — and warn
         # loudly instead of silently hijacking a still-live store's
@@ -524,10 +525,14 @@ class PostgresPublicationStore:
         if self._used_loop_ref is None:
             self._used_loop_ref = weakref.ref(loop)
             return
-        if self._cross_loop_warned:
-            return
         bound_loop = self._used_loop_ref()
-        if bound_loop is not None and bound_loop is not loop:
+        if bound_loop is loop:
+            return
+        if bound_loop is None:
+            # The first loop is gone, yet the pool's connections still belong
+            # to it: this is another loop, so track the new one.
+            self._used_loop_ref = weakref.ref(loop)
+        if not self._cross_loop_warned:
             logger.warning(
                 "PostgresPublicationStore engine first used on one event loop is "
                 "now used from another. Unlike the database broker, the store "
@@ -1192,7 +1197,12 @@ class PostgresPublicationStore:
 
     def _lock_connection_engine(self) -> AsyncEngine:
         """The engine advisory-lock connections come from: the store engine's
-        URL, dialect and connection factory over a separate pool."""
+        URL, dialect and connection factory over a separate pool.
+
+        Raises ``ConfigurationError`` once the store is disposed: a sweep that
+        outlives ``dispose()`` must not build a pool nothing will dispose."""
+        if self._disposed:
+            raise ConfigurationError("store is disposed")
         if self._lock_engine is None:
             sync_engine = self._engine.sync_engine
             self._lock_engine = AsyncEngine(
@@ -1205,7 +1215,9 @@ class PostgresPublicationStore:
 
         The connection returns to the lock pool when ``pg_advisory_unlock``
         confirms the release; when the unlock raises, is cancelled or returns
-        false, the session may still hold a lock, so it is invalidated."""
+        false, the session may still hold a lock, so it is invalidated. A
+        false return also means this session no longer held the lock, so a
+        peer may have delivered the row too; that is logged at WARNING."""
         lock_key = publication_id.int & 0x7FFFFFFFFFFFFFFF
         conn = cast(Any, handle)
         released = False
@@ -1220,6 +1232,13 @@ class PostgresPublicationStore:
                 await conn.close()
             else:
                 await _discard_connection(conn)
+        # Reached only when the unlock returned a value; an exception or a
+        # cancellation propagates past this point.
+        if not released:
+            logger.warning(
+                "publication %s: lock lost during delivery; a peer may have delivered it too",
+                publication_id,
+            )
 
     async def purge_completed(self, older_than: timedelta) -> int:
         """Delete completed publications older than ``older_than`` from BOTH
@@ -1269,8 +1288,9 @@ class PostgresPublicationStore:
         ``retry_interval_seconds`` of the crash. An advisory lock ends with
         its Postgres session: at once when the process dies on a live host,
         unless a descendant forked from it still holds the connection's
-        socket, but after a host loss or a network partition only when
-        Postgres drops the dead session through TCP keepalive.
+        socket (an orphaned ``ProcessPoolExecutor`` worker keeps the lock
+        until it is killed), but after a host loss or a network partition
+        only when Postgres drops the dead session through TCP keepalive.
 
         Under ``"advisory_lock"`` each delivery holds a lock-pool connection
         while its listener runs. A task that finds no free lock connection
@@ -1403,6 +1423,7 @@ class PostgresPublicationStore:
         """
         global _active_store, _hook_installed
         await self.wait_for_dispatch()
+        self._disposed = True
         if self._lock_engine is not None:
             await self._lock_engine.dispose()
             self._lock_engine = None
