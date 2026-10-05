@@ -87,6 +87,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - Database and SHM consumers: `/health` no longer degrades when a completion write (ack, fail, dead-letter or claim renewal) fails after a later write of the same kind for that target has already succeeded. Deliveries complete concurrently, so a slow failure used to re-degrade a consumer that had already recovered. A write that starts after the recovery and fails still degrades `/health`
 - `@listener` accepts an `async def` bound method, as in `listener(service.on_order)`, where it raised `AttributeError`. Its listener id carries the owning module package as a prefix, like other bound methods. `@externalized(target=...)` raises `ConfigurationError` naming the value when the target is not a `str`, instead of `AttributeError` or `TypeError`
 - `modulith openapi` prefixes `$ref`s under a schema or property named `example`, `examples` or `x-*`, so the merged document no longer has dangling references there. Only an actual `example`, `examples` or `x-*` keyword value is left as it is
+- A `@pytest.mark.modulith_isolated` test that monkeypatches `builtins.open` reports its real outcome instead of failing with a misleading "exited 0 before the test finished". A `--junitxml` or `--junit-xml` given to pytest no longer makes the isolated child write a second report under the rootdir
 
 ### Security
 

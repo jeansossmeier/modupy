@@ -569,9 +569,8 @@ def test_isolated_tests_run_when_the_plugin_is_loaded_explicitly(
 
 
 def test_isolated_outcomes_survive_a_user_junitxml(pytester) -> None:
-    """The parent's --junitxml is forwarded to the child, so the child's
-    outcome must travel on a channel of its own; the user's report must still
-    record the isolated skip and xfail."""
+    """The child's outcome travels on a channel of its own, not on a junit
+    report; the user's report must still record the isolated skip and xfail."""
     import xml.etree.ElementTree as ET
 
     pytester.makepyfile(
@@ -608,6 +607,65 @@ def test_isolated_outcomes_survive_a_user_junitxml(pytester) -> None:
         "test_xfail": "known bug",
     }
     assert set(cases) == {"test_passes", "test_imperative_skip", "test_xfail"}
+
+
+@pytest.mark.parametrize(
+    "junit_args",
+    [
+        pytest.param(["--junitxml=report.xml"], id="junitxml-equals"),
+        pytest.param(["--junit-xml=report.xml"], id="junit-xml-equals"),
+        pytest.param(["--junitxml", "report.xml"], id="junitxml-separate"),
+    ],
+)
+def test_isolated_child_writes_no_junit_report_under_the_rootdir(
+    pytester, monkeypatch, junit_args: list[str]
+) -> None:
+    """The child runs from the rootdir, so a relative --junitxml forwarded to it
+    would leave a stray report there while the parent writes its own relative to
+    the directory pytest was started in."""
+    import xml.etree.ElementTree as ET
+
+    pytester.makeini("[pytest]\n")
+    pytester.makepyfile(
+        test_junit_dir="""
+        import pytest
+
+        @pytest.mark.modulith_isolated
+        def test_isolated():
+            pass
+        """
+    )
+    sub = pytester.mkdir("sub")
+    monkeypatch.chdir(sub)
+
+    result = pytester.runpytest("../test_junit_dir.py", *junit_args)
+
+    result.assert_outcomes(passed=1)
+    assert not (pytester.path / "report.xml").exists()
+    cases = ET.parse(sub / "report.xml").getroot().iter("testcase")
+    assert [case.get("name") for case in cases] == ["test_isolated"]
+
+
+def test_isolated_result_survives_a_test_that_patches_builtins_open(pytester) -> None:
+    """The child writes its result while the test's own patches are still
+    active, so a test replacing ``builtins.open`` must not break that write."""
+    pytester.makepyfile(
+        test_patched_open="""
+        import builtins
+        import pytest
+
+        @pytest.mark.modulith_isolated
+        def test_patches_open(monkeypatch):
+            def boom(*args, **kwargs):
+                raise OSError("open is patched")
+
+            monkeypatch.setattr(builtins, "open", boom)
+        """
+    )
+
+    result = pytester.runpytest()
+
+    result.assert_outcomes(passed=1)
 
 
 _FLAKY_ISOLATED = """

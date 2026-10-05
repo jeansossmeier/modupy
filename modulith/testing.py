@@ -540,9 +540,12 @@ def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> 
 # Set in the child process so the re-run there executes the test inline
 # instead of recursing into another subprocess.
 _ISOLATION_GUARD = "MODULITH_ISOLATED_SUBPROCESS"
-# Path of a private JSON-lines file the child appends its test reports to. A
-# file of its own, because a user's --junitxml is forwarded to the child.
+# Path of a private JSON-lines file the child appends its test reports to; the
+# parent reads the outcome from it, never from a report the child writes.
 _RESULT_FILE_ENV = "MODULITH_ISOLATED_RESULT_FILE"
+# The writer runs while the test's own monkeypatches are still active, so it
+# must not look ``open`` up in ``builtins`` at write time.
+_open = open
 # Must match the ``pytest11`` entry-point name in pyproject.toml.
 _ENTRY_POINT_NAME = "modulith"
 
@@ -581,7 +584,7 @@ class _IsolatedResultWriter:
             else (None if longrepr is None else str(longrepr)),
             "wasxfail": getattr(report, "wasxfail", None),
         }
-        with open(self._path, "a", encoding="utf-8") as fh:
+        with _open(self._path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
 
 
@@ -606,8 +609,16 @@ _CHILD_UNSAFE_FLAGS = {
     "--sw-reset",
     "--sw-skip",
 }
-# Unsafe options that take a value (possibly as a separate argv token).
-_CHILD_UNSAFE_VALUE_OPTS = {"--basetemp", "--lfnf", "--last-failed-no-failures"}
+# Unsafe options that take a value (possibly as a separate argv token). The
+# child runs from the rootdir, so a relative junit path would leave a stray
+# report there; its outcomes reach the parent's report through the result file.
+_CHILD_UNSAFE_VALUE_OPTS = {
+    "--basetemp",
+    "--lfnf",
+    "--last-failed-no-failures",
+    "--junitxml",
+    "--junit-xml",
+}
 
 
 def _forwarded_parent_args(config: pytest.Config) -> list[str]:
