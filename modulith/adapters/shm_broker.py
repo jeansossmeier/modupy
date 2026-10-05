@@ -43,12 +43,12 @@ from ..config import (
     _SHM_MAX_DELIVERY_ATTEMPTS,
     _SHM_MAX_DISPATCH_CONCURRENCY,
     _SHM_MAX_HINT_CAPACITY,
+    _SHM_MAX_PAYLOAD_BYTES,
     _SHM_MAX_STORE_BYTES,
     DEFAULT_MAX_PAYLOAD_BYTES,
     DEFAULT_SHM_BROKER_DB_FILENAME,
     DEFAULT_SHM_MAX_STORE_BYTES,
     DEFAULT_SHM_ORPHAN_RETENTION_SECONDS,
-    MAX_PAYLOAD_BYTES,
     _validate_shm_broker_options,
 )
 from ._dead_letter import DeadLetter
@@ -188,7 +188,7 @@ class ShmBroker:
         max_payload_bytes = _bounded_positive_int(
             max_payload_bytes,
             "max_payload_bytes",
-            MAX_PAYLOAD_BYTES,
+            _SHM_MAX_PAYLOAD_BYTES,
         )
         max_store_bytes = _bounded_positive_int(
             max_store_bytes,
@@ -610,7 +610,7 @@ class ShmConsumer(PollingConsumer):
 
 def _broker_opt(opts: dict[str, Any], key: str, env_suffix: str) -> Any:
     env_value = os.environ.get(f"MODULITH_BROKER_{env_suffix}")
-    if env_value:
+    if env_value and env_value.strip():
         return env_value
     return opts.get(key)
 
@@ -737,6 +737,8 @@ def _opt_int(value: Any) -> int | None:
         return value
     if type(value) is not str:
         raise ConfigurationError(f"broker option expected an integer, got {value!r}")
+    if not value.strip():
+        return None
     try:
         return int(value)
     except ValueError as exc:
@@ -838,7 +840,7 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
             DEFAULT_MAX_PAYLOAD_BYTES,
         ),
         "max_payload_bytes",
-        MAX_PAYLOAD_BYTES,
+        _SHM_MAX_PAYLOAD_BYTES,
     )
     max_store_bytes = _bounded_positive_int(
         _option_or_default(

@@ -229,6 +229,49 @@ def test_resolve_max_payload_bytes_rejects_out_of_range(
         _resolve_max_payload_bytes({"max_payload_bytes": bad_value})
 
 
+@pytest.mark.parametrize("good_value", [1, MAX_PAYLOAD_BYTES])
+def test_resolve_max_payload_bytes_accepts_the_range_boundaries(
+    monkeypatch: pytest.MonkeyPatch, good_value: int
+) -> None:
+    monkeypatch.delenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", raising=False)
+    assert _resolve_max_payload_bytes({"max_payload_bytes": good_value}) == good_value
+
+
+@pytest.mark.parametrize("bad_value", [True, False, 2.9, 1.0, [5]], ids=repr)
+def test_resolve_max_payload_bytes_rejects_bool_and_float(
+    monkeypatch: pytest.MonkeyPatch, bad_value: object
+) -> None:
+    monkeypatch.delenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", raising=False)
+    with pytest.raises(ConfigurationError, match="max_payload_bytes must be an integer"):
+        _resolve_max_payload_bytes({"max_payload_bytes": bad_value})
+
+
+@pytest.mark.parametrize("bad_env", ["2.9", "True", "abc", "0", str(MAX_PAYLOAD_BYTES + 1)])
+def test_resolve_max_payload_bytes_rejects_a_bad_env_value_naming_the_variable(
+    monkeypatch: pytest.MonkeyPatch, bad_env: str
+) -> None:
+    monkeypatch.setenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", bad_env)
+    with pytest.raises(ConfigurationError, match="MODULITH_BROKER_MAX_PAYLOAD_BYTES"):
+        _resolve_max_payload_bytes({"max_payload_bytes": 33554432})
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t"], ids=repr)
+def test_resolve_max_payload_bytes_treats_a_blank_env_value_as_unset(
+    monkeypatch: pytest.MonkeyPatch, blank: str
+) -> None:
+    monkeypatch.setenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", blank)
+    assert _resolve_max_payload_bytes(None) == DEFAULT_MAX_PAYLOAD_BYTES
+    assert _resolve_max_payload_bytes({"max_payload_bytes": 33554432}) == 33554432
+
+
+@pytest.mark.parametrize("blank", ["", "   "], ids=repr)
+def test_resolve_max_payload_bytes_treats_a_blank_broker_option_as_unset(
+    monkeypatch: pytest.MonkeyPatch, blank: str
+) -> None:
+    monkeypatch.delenv("MODULITH_BROKER_MAX_PAYLOAD_BYTES", raising=False)
+    assert _resolve_max_payload_bytes({"max_payload_bytes": blank}) == DEFAULT_MAX_PAYLOAD_BYTES
+
+
 def test_default_serializer_resolves_cap_from_env_at_first_deserialize(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -536,7 +536,7 @@ max_store_bytes = 1073741824
 
 Defaults are absolute, package-namespaced paths in the platform's per-user
 state directory (`0700` directories and `0600` files on POSIX).
-`max_payload_bytes` defaults to 16 MiB (maximum 1 GiB) and rejects oversized
+`max_payload_bytes` defaults to 16 MiB (maximum 1,000,000,000 bytes) and rejects oversized
 messages before a publish transaction. `max_store_bytes` defaults to 1 GiB
 (maximum 1 TiB) and bounds what publishes add to `broker.db`: publishes are
 refused a small consumer reserve below it. Consumer writes can grow the file

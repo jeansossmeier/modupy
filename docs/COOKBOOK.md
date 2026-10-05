@@ -900,7 +900,7 @@ state_dir = "/private/app-state"
 sqlite_path = "broker.db"       # relative to state_dir
 hint_path = "broker.hints"      # advisory notifier, never payload storage
 sqlite_synchronous = "NORMAL"   # set "FULL" for power-loss durability
-max_payload_bytes = 16777216    # default 16 MiB; maximum 1 GiB
+max_payload_bytes = 16777216    # default 16 MiB; maximum 1,000,000,000 bytes
 max_store_bytes = 1073741824    # default 1 GiB; maximum 1 TiB
 ```
 

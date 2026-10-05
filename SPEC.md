@@ -973,8 +973,11 @@ durability.
 Two byte limits bound the authoritative store. Each has an environment
 override, `MODULITH_BROKER_MAX_PAYLOAD_BYTES` and `MODULITH_BROKER_MAX_STORE_BYTES`:
 
-- **`max_payload_bytes`** defaults to 16 MiB and cannot exceed 1 GiB. Payload
-  validation occurs before the publish transaction.
+- **`max_payload_bytes`** defaults to 16 MiB and cannot exceed 1,000,000,000
+  bytes, the largest blob SQLite stores. Payload validation occurs before the
+  publish transaction. `load_configuration` rejects a bool, a float, a value
+  below 1 or a value above that limit at start-up; a blank value counts as
+  unset.
 - **`max_store_bytes`** defaults to 1 GiB and cannot exceed 1 TiB. It is
   translated to SQLite `max_page_count` on the `sqlite_path` store
   (`.modulith-shm-broker.db` by default; the `-wal` file is not counted). It bounds what publishes add: a publish that would leave

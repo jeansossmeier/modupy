@@ -11,6 +11,7 @@ import pytest
 from typer.testing import CliRunner
 
 from modulith import ConfigurationError
+from modulith.adapters.shm_broker import ShmBroker, _effective_shm_options
 from modulith.cli import app
 from modulith.config import _redact_broker_url, load_configuration
 
@@ -591,12 +592,12 @@ def test_shm_storage_limits_accept_documented_safe_maxima() -> None:
         topology="processes",
         broker="shm",
         broker_options={
-            "max_payload_bytes": 1024**3,
+            "max_payload_bytes": 1_000_000_000,
             "max_store_bytes": 1024**4,
         },
     )
 
-    assert cfg.broker_options["max_payload_bytes"] == 1024**3
+    assert cfg.broker_options["max_payload_bytes"] == 1_000_000_000
     assert cfg.broker_options["max_store_bytes"] == 1024**4
 
 
@@ -1464,3 +1465,126 @@ def test_worker_port_base_rejects_a_non_port(tmp_path: Path, value: str, reason:
     (tmp_path / "pyproject.toml").write_text(f"[tool.modulith]\nworker_port_base = {value}\n")
     with pytest.raises(ConfigurationError, match=f"^worker_port_base must be {reason}"):
         load_configuration()
+
+
+# ----- max_payload_bytes ------------------------------------------------------
+
+_PAYLOAD_CAP_ENV = "MODULITH_BROKER_MAX_PAYLOAD_BYTES"
+# SQLite's default SQLITE_LIMIT_LENGTH: a larger blob raises a raw DataError.
+_SQLITE_BLOB_LIMIT = 1_000_000_000
+_EVERY_BROKER = ["memory", "database", "redis-streams", "shm", "custom-adapter"]
+
+
+@pytest.mark.parametrize("broker", _EVERY_BROKER)
+@pytest.mark.parametrize(
+    "value",
+    ["abc", "2.9", 0, -1, 1024**3 + 1, True, False, 2.9, 1.0, [5]],
+    ids=repr,
+)
+def test_broker_options_max_payload_bytes_is_validated_for_every_broker(
+    broker: str, value: object
+) -> None:
+    with pytest.raises(ConfigurationError, match="max_payload_bytes"):
+        load_configuration(broker=broker, broker_options={"max_payload_bytes": value})
+
+
+@pytest.mark.parametrize("broker", _EVERY_BROKER)
+@pytest.mark.parametrize("value", ["abc", "2.9", "True", "0", "-1", str(1024**3 + 1)], ids=repr)
+def test_env_max_payload_bytes_is_validated_for_every_broker(
+    monkeypatch: pytest.MonkeyPatch, broker: str, value: str
+) -> None:
+    monkeypatch.setenv(_PAYLOAD_CAP_ENV, value)
+    with pytest.raises(ConfigurationError, match=_PAYLOAD_CAP_ENV):
+        load_configuration(broker=broker)
+
+
+def test_memory_broker_with_a_durable_outbox_rejects_a_bad_payload_cap_at_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_PAYLOAD_CAP_ENV, "abc")
+    with pytest.raises(ConfigurationError, match="max_payload_bytes must be an integer"):
+        load_configuration(outbox="postgres", outbox_url="postgresql+asyncpg://u:p@h/db")
+
+
+def test_env_payload_cap_is_validated_even_when_broker_options_hold_a_valid_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_PAYLOAD_CAP_ENV, "abc")
+    with pytest.raises(ConfigurationError, match=_PAYLOAD_CAP_ENV):
+        load_configuration(broker="database", broker_options={"max_payload_bytes": 4096})
+
+
+@pytest.mark.parametrize("broker", _EVERY_BROKER)
+@pytest.mark.parametrize("value", [1, 16 * 1024**2, "16777216", " 16777216 "], ids=repr)
+def test_valid_max_payload_bytes_is_accepted_for_every_broker(
+    monkeypatch: pytest.MonkeyPatch, broker: str, value: object
+) -> None:
+    cfg = load_configuration(broker=broker, broker_options={"max_payload_bytes": value})
+    assert cfg.broker_options["max_payload_bytes"] == value
+    monkeypatch.setenv(_PAYLOAD_CAP_ENV, str(value))
+    assert load_configuration(broker=broker).broker == broker
+
+
+@pytest.mark.parametrize("broker", ["memory", "database", "redis-streams", "custom-adapter"])
+def test_non_shm_brokers_keep_the_one_gibibyte_payload_cap(broker: str) -> None:
+    cfg = load_configuration(broker=broker, broker_options={"max_payload_bytes": 1024**3})
+    assert cfg.broker_options["max_payload_bytes"] == 1024**3
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t"], ids=repr)
+@pytest.mark.parametrize("broker", _EVERY_BROKER)
+def test_blank_max_payload_bytes_counts_as_unset(
+    monkeypatch: pytest.MonkeyPatch, broker: str, blank: str
+) -> None:
+    monkeypatch.setenv(_PAYLOAD_CAP_ENV, blank)
+    cfg = load_configuration(broker=broker, broker_options={"max_payload_bytes": blank})
+    assert cfg.broker == broker
+
+
+def test_shm_payload_cap_accepts_the_sqlite_blob_limit() -> None:
+    cfg = load_configuration(broker="shm", broker_options={"max_payload_bytes": _SQLITE_BLOB_LIMIT})
+    assert cfg.broker_options["max_payload_bytes"] == _SQLITE_BLOB_LIMIT
+
+
+@pytest.mark.parametrize("value", [_SQLITE_BLOB_LIMIT + 1, 1024**3])
+def test_shm_payload_cap_above_the_sqlite_blob_limit_is_rejected(value: int) -> None:
+    with pytest.raises(
+        ConfigurationError,
+        match=f"max_payload_bytes must be an integer from 1 to {_SQLITE_BLOB_LIMIT}",
+    ):
+        load_configuration(broker="shm", broker_options={"max_payload_bytes": value})
+
+
+def test_inferred_shm_broker_applies_the_sqlite_blob_limit() -> None:
+    with pytest.raises(ConfigurationError, match=f"from 1 to {_SQLITE_BLOB_LIMIT}"):
+        load_configuration(topology="processes", broker_options={"max_payload_bytes": 1024**3})
+
+
+def test_shm_env_payload_cap_above_the_sqlite_blob_limit_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_PAYLOAD_CAP_ENV, str(_SQLITE_BLOB_LIMIT + 1))
+    with pytest.raises(ConfigurationError, match=f"from 1 to {_SQLITE_BLOB_LIMIT}"):
+        load_configuration(broker="shm")
+
+
+@pytest.mark.parametrize("value", [_SQLITE_BLOB_LIMIT + 1, 1024**3])
+def test_shm_broker_constructor_rejects_a_payload_cap_above_the_sqlite_blob_limit(
+    tmp_path: Path, value: int
+) -> None:
+    db_path = tmp_path / "cap.db"
+    with pytest.raises(
+        ConfigurationError, match=f"max_payload_bytes must be <= {_SQLITE_BLOB_LIMIT}"
+    ):
+        ShmBroker(
+            shm_name=str(tmp_path / "cap.hints"), db_path=str(db_path), max_payload_bytes=value
+        )
+    assert not db_path.exists()
+
+
+def test_shm_effective_options_treat_a_whitespace_env_payload_cap_as_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_PAYLOAD_CAP_ENV, "   ")
+    assert _effective_shm_options({"max_payload_bytes": 4})["max_payload_bytes"] == 4
+    assert "max_payload_bytes" not in _effective_shm_options({})

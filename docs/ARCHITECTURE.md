@@ -904,8 +904,9 @@ the same disk; set `sqlite_synchronous="FULL"` for the last commits to survive
 OS failure or power loss.
 
 Resource limits are enforced before and inside the authoritative store.
-`max_payload_bytes` defaults to 16 MiB (maximum 1 GiB) and `max_store_bytes` to
-1 GiB (maximum 1 TiB); both accept `MODULITH_BROKER_*` environment overrides.
+`max_payload_bytes` defaults to 16 MiB (maximum 1,000,000,000 bytes, the largest
+blob SQLite stores) and `max_store_bytes` to 1 GiB (maximum 1 TiB); both accept
+`MODULITH_BROKER_*` environment overrides.
 
 `max_payload_bytes` rejects oversized payloads before opening a publish
 transaction — but that is a write-side guard only.
@@ -913,7 +914,9 @@ transaction — but that is a write-side guard only.
 since it is the sole chokepoint where broker/outbox bytes become a Python
 object; an oversized row is dead-lettered instead of parsed. The consumer
 resolves its cap lazily on first deserialize, from the same env/`broker_options`
-precedence the broker uses.
+precedence the broker uses. `load_configuration` checks the value for every
+broker at start-up (a blank value counts as unset), so a bad cap fails there
+instead of on the first consume.
 
 `max_store_bytes` sets SQLite `max_page_count` on the SQLite file
 (`.modulith-shm-broker.db` by default; the `-wal` file is separate and

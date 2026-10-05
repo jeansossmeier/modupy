@@ -43,7 +43,11 @@ DEFAULT_SHM_MAX_STORE_BYTES = 1024**3
 # holds space in the max_store_bytes-bounded store for this long.
 DEFAULT_SHM_ORPHAN_RETENTION_SECONDS = 3600.0
 MAX_PAYLOAD_BYTES = 1024**3
+# SQLite rejects a blob over its default SQLITE_LIMIT_LENGTH with a raw
+# DataError, so the SHM store cannot hold a larger payload than this.
+_SHM_MAX_PAYLOAD_BYTES = 1_000_000_000
 _SHM_MAX_STORE_BYTES = 1024**4
+_MAX_PAYLOAD_BYTES_ENV = "MODULITH_BROKER_MAX_PAYLOAD_BYTES"
 
 
 class ConfigurationError(Exception):
@@ -329,11 +333,7 @@ def _validate_shm_broker_options(options: dict[str, Any]) -> None:
         "shm_capacity",
         maximum=_SHM_MAX_HINT_CAPACITY,
     )
-    _validate_shm_int_option(
-        options,
-        "max_payload_bytes",
-        maximum=MAX_PAYLOAD_BYTES,
-    )
+    _validate_max_payload_bytes(options.get("max_payload_bytes"), maximum=_SHM_MAX_PAYLOAD_BYTES)
     _validate_shm_int_option(
         options,
         "max_store_bytes",
@@ -376,6 +376,39 @@ def _validate_shm_broker_options(options: dict[str, Any]) -> None:
                 "broker_options.completion_mode must be one of "
                 f"{sorted(_SHM_COMPLETION_MODES)}, got {value!r}"
             )
+
+
+def _validate_max_payload_bytes(
+    value: object,
+    *,
+    source: str = "broker_options",
+    maximum: int = MAX_PAYLOAD_BYTES,
+) -> int | None:
+    """Return the payload cap held in ``value``, or None when it is unset or blank.
+
+    The one range check every reader of ``max_payload_bytes`` shares: the
+    config loader for every broker, the SHM adapter and the consume-side
+    resolver in ``serializers.py``. Only an int or a numeric string counts: a
+    bool or float would otherwise truncate (``True`` to 1, ``2.9`` to 2).
+    """
+    number: int | None = None
+    if type(value) is int:
+        number = value
+    elif type(value) is str:
+        if not value.strip():
+            return None
+        try:
+            number = int(value)
+        except ValueError:
+            pass
+    elif value is None:
+        return None
+    if number is None or not 1 <= number <= maximum:
+        raise ConfigurationError(
+            f"max_payload_bytes must be an integer from 1 to {maximum}, "
+            f"got {value!r} (set by {source})"
+        )
+    return number
 
 
 def _validate_shm_int_option(
@@ -948,6 +981,16 @@ def _validate(data: dict[str, Any]) -> None:
         _validate_shm_broker_options(broker_options or {})
     if selected_broker == "database" and broker_options is not None:
         _validate_database_broker_options(broker_options)
+    payload_cap_maximum = _SHM_MAX_PAYLOAD_BYTES if selected_broker == "shm" else MAX_PAYLOAD_BYTES
+    _validate_max_payload_bytes(
+        os.environ.get(_MAX_PAYLOAD_BYTES_ENV),
+        source=_MAX_PAYLOAD_BYTES_ENV,
+        maximum=payload_cap_maximum,
+    )
+    if broker_options is not None:
+        _validate_max_payload_bytes(
+            broker_options.get("max_payload_bytes"), maximum=payload_cap_maximum
+        )
 
     workers = data.get("workers")
     if workers is not None:

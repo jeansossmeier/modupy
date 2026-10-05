@@ -36,7 +36,12 @@ from enum import Enum
 from typing import Any, Union
 from uuid import UUID
 
-from .config import DEFAULT_MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES, ConfigurationError
+from .config import (
+    _MAX_PAYLOAD_BYTES_ENV,
+    DEFAULT_MAX_PAYLOAD_BYTES,
+    ConfigurationError,
+    _validate_max_payload_bytes,
+)
 
 __all__ = ["JsonEventSerializer"]
 
@@ -244,25 +249,17 @@ def _resolve_max_payload_bytes(broker_options: dict[str, Any] | None) -> int:
     A consumer resolving the cap any other way can dead-letter a payload the
     broker it reads from already accepted.
 
-    Also enforces the same ``1..MAX_PAYLOAD_BYTES`` range every broker adapter
-    validates its own cap against (db_broker.py's ``_positive_int`` plus its
-    ``> MAX_PAYLOAD_BYTES`` check, redis_broker.py's range check,
-    shm_broker.py's ``_bounded_positive_int``) — an unbounded resolver could
-    hand a consumer a cap no broker adapter would ever accept for itself.
+    A blank value counts as unset. The type and range checks live in
+    ``config._validate_max_payload_bytes``, which ``load_configuration`` also
+    applies, so a consumer never resolves a cap the configuration rejected.
     """
     opts = broker_options or {}
-    value = os.environ.get("MODULITH_BROKER_MAX_PAYLOAD_BYTES") or opts.get("max_payload_bytes")
-    if value is None:
-        return DEFAULT_MAX_PAYLOAD_BYTES
-    try:
-        resolved = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ConfigurationError(f"max_payload_bytes must be an integer, got {value!r}") from exc
-    if not 1 <= resolved <= MAX_PAYLOAD_BYTES:
-        raise ConfigurationError(
-            f"max_payload_bytes must be an integer from 1 to {MAX_PAYLOAD_BYTES}, got {value!r}"
-        )
-    return resolved
+    cap = _validate_max_payload_bytes(
+        os.environ.get(_MAX_PAYLOAD_BYTES_ENV), source=_MAX_PAYLOAD_BYTES_ENV
+    )
+    if cap is None:
+        cap = _validate_max_payload_bytes(opts.get("max_payload_bytes"))
+    return DEFAULT_MAX_PAYLOAD_BYTES if cap is None else cap
 
 
 def _resolve_class(fqcn: str) -> type:
