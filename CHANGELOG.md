@@ -147,6 +147,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - The default SHM broker refuses a state directory or state file that another user owns, and a parent directory that other users can write to without the sticky bit (a group-writable parent passes when it belongs to your own group, as with umask 002), and it no longer reads your home directory when `state_dir`, `MODULITH_BROKER_STATE_DIR` or an absolute `sqlite_path` is set
 - Outbox rows already at or over a lowered `dead_letter_after_attempts` are dead-lettered at the next sweep instead of being claimed again on every sweep
 - MySQL and MariaDB outbox timestamps keep microseconds: migration `0009_outbox_ts_microseconds` widens the outbox's timestamp columns to `DATETIME(6)`, so run `modulith migrate` after upgrading when the outbox tables already exist
+- A late consumer group's replay of a large retained SHM backlog no longer holds the SQLite write lock for the whole replay: it commits in batches of 5,000 publications with a short pause between them, so other processes sharing the store can publish during it, and the subscription is recorded only after the last batch
 
 ### Security
 

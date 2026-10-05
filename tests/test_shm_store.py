@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import threading
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
@@ -682,6 +683,137 @@ def test_the_cut_replay_recovery_delivers_every_publication_once(
     finally:
         store.close()
     assert delivered == [b'{"t":%d}' % index for index in range(3000)]
+
+
+def test_a_replay_frees_the_write_lock_between_batches_and_keeps_publication_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "batches.db"
+    subscriber = _bounded_store(path, 4 * 1024 * 1024)
+    sibling = _bounded_store(path, 4 * 1024 * 1024)
+    # A zero busy timeout makes the sibling's write fail the moment the subscriber holds the lock.
+    sibling._conn.execute("PRAGMA busy_timeout=0")
+    monkeypatch.setattr(_shm_publications, "REPLAY_BATCH_ROWS", 10)
+    monkeypatch.setattr(_shm_publications, "REPLAY_BATCH_PAUSE_SECONDS", 0)
+    subscribed_in_window: list[bool] = []
+    transactions = [0]
+
+    def transaction(conn: sqlite3.Connection) -> AbstractContextManager[None]:
+        if conn is subscriber._conn:
+            transactions[0] += 1
+            if transactions[0] > 1:  # the first transaction only reconciles subscriptions
+                subscribed_in_window.append(bool(sibling.get_subscriptions()))
+                sibling.publish("events.T", b"{}", None, f"live{transactions[0]:02d}")
+        return immediate_transaction(conn)
+
+    try:
+        for index in range(25):
+            sibling.publish("events.T", b"{}", None, f"p{index:02d}")
+        monkeypatch.setattr(_shm_publications, "immediate_transaction", transaction)
+
+        replayed = subscriber.subscribe(["events.T"], "g")
+
+        before_subscription = subscribed_in_window.count(False)
+        assert subscribed_in_window[:2] == [False, False], "a batch did not release the lock"
+        assert replayed == 25 + before_subscription
+        assert sibling.get_subscriptions() == {"events.T": ["g"]}
+        in_sequence = [
+            row["id"]
+            for row in sibling._conn.execute("SELECT id FROM shm_publication ORDER BY sequence")
+        ]
+        claimed = subscriber.claim("g", 100, _LONG_CONSUMER, 30.0)
+        assert [row["message_id"] for row in claimed] == in_sequence
+    finally:
+        subscriber.close()
+        sibling.close()
+
+
+def test_a_sibling_waiting_on_the_write_lock_gets_in_while_a_replay_is_still_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "contended.db"
+    subscriber = _bounded_store(path, 4 * 1024 * 1024)
+    for index in range(80):
+        subscriber.publish("events.T", b"{}", None, f"p{index:02d}")
+    monkeypatch.setattr(_shm_publications, "REPLAY_BATCH_ROWS", 20)
+    sibling_ready = threading.Event()
+    replay_holds_the_lock = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    def sibling_publishes() -> None:
+        sibling = _bounded_store(path, 4 * 1024 * 1024)  # opened on the thread that uses it
+        try:
+            sibling_ready.set()
+            replay_holds_the_lock.wait(10)
+            sibling.publish("events.T", b"{}", None, "sibling")
+            outcome["subscriptions_when_it_returned"] = sibling.get_subscriptions()
+        except sqlite3.Error as error:
+            outcome["error"] = error
+        finally:
+            sibling.close()
+
+    sibling_thread = threading.Thread(target=sibling_publishes)
+    real_insert_delivery = _shm_publications._insert_delivery
+    started = [False]
+
+    def insert_delivery_while_the_sibling_waits(*arguments: Any) -> int:
+        if not started[0]:
+            started[0] = True
+            replay_holds_the_lock.set()
+            time.sleep(0.05)  # the sibling's write now waits on the lock this batch holds
+        return real_insert_delivery(*arguments)
+
+    monkeypatch.setattr(
+        _shm_publications, "_insert_delivery", insert_delivery_while_the_sibling_waits
+    )
+    try:
+        sibling_thread.start()
+        assert sibling_ready.wait(10)
+        replayed = subscriber.subscribe(["events.T"], "g")
+        sibling_thread.join()
+    finally:
+        subscriber.close()
+
+    assert "error" not in outcome
+    assert outcome["subscriptions_when_it_returned"] == {}, "the sibling waited out the replay"
+    assert replayed == 81
+
+
+def test_a_replay_cut_after_several_batches_counts_every_skipped_publication(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    max_store_bytes = 2 * 1024 * 1024
+    store = _bounded_store(tmp_path / "cut-batches.db", max_store_bytes)
+    monkeypatch.setattr(_shm_publications, "REPLAY_BATCH_ROWS", 100)
+    monkeypatch.setattr(_shm_publications, "REPLAY_BATCH_PAUSE_SECONDS", 0)
+    try:
+        for index in range(3000):
+            store.publish("events.T", b'{"t":%d}' % index, None, None)
+        used, budget = _used_and_budget_pages(store, max_store_bytes)
+        index = 0
+        while used < budget - 40:
+            store.publish("events.U", b'{"u":%d}' % index, None, None)
+            index += 1
+            used, _ = _used_and_budget_pages(store, max_store_bytes)
+        # The earliest expiry belongs to the newest publication, far past the batch that is cut.
+        store._conn.execute(
+            "UPDATE shm_publication SET retained_until=? WHERE target='events.T' AND sequence="
+            "(SELECT MAX(sequence) FROM shm_publication WHERE target='events.T')",
+            (time.time() + 630,),
+        )
+        store._conn.commit()
+
+        with caplog.at_level(logging.WARNING, logger="modulith.adapters.shm"):
+            replayed = store.subscribe(["events.T"], "late")
+
+        [warning] = _warnings(caplog)
+        assert 100 < replayed < 3000
+        assert f"replayed {replayed} and skipped {3000 - replayed} " in warning
+        assert "expires in about 10 minutes" in warning
+        assert store.get_subscriptions()["events.T"] == ["late"]
+        assert store.group_backlog() == {"late": replayed}
+    finally:
+        store.close()
 
 
 def test_draining_a_cut_replay_in_mark_mode_keeps_room_for_a_publish_that_fit_before_it(

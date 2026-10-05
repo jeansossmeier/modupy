@@ -873,10 +873,11 @@ same way; publishes resume once the drained store is back under the limit, and
 an existing larger file keeps its size. Budget disk for the store's `-wal` file
 on top: it is not counted, grows to about 4 MiB (SQLite's 1000-page
 autocheckpoint) before checkpoints reuse it, grows further while a long read
-blocks a checkpoint, grows by about 115 bytes for every publication a subscribe
-replays (the replay is one transaction, so no checkpoint runs inside it: 5.4 MiB
-for 50,000 replayed publications, 22.3 MiB for 200,000), and keeps its largest
-size.
+blocks a checkpoint, and keeps its largest size. A subscribe's replay commits
+in batches of 5,000 publications, so checkpoints run between batches: the
+`-wal` file measured 4.1 MiB after replaying 50,000 publications and 4.6 MiB
+after 200,000. Other processes can publish between batches, so a large replay
+no longer holds the store's write lock until it finishes.
 
 ---
 

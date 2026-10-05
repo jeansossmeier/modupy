@@ -38,6 +38,17 @@ CONSUMER_RESERVE_PAGES = 32
 # shm_publication table and its three indexes) still fits after it.
 REPLAY_PUBLISH_HEADROOM_PAGES = 8
 
+# A subscribe replays at most this many publications per write transaction, so
+# a sibling connection's write waits for one batch (about 0.2 s) and never for
+# the whole retained backlog, which a 5 s busy timeout cannot outlast.
+REPLAY_BATCH_ROWS = 5000
+
+# SQLite has no lock queue: a connection waiting on a busy write lock polls at
+# intervals that grow to 100 ms, and a replay that began its next batch at once
+# would take the lock back before any poll saw it free. Pausing a little longer
+# than the longest poll interval after each batch lets a waiting sibling in.
+REPLAY_BATCH_PAUSE_SECONDS = 0.11
+
 
 # (deliveries replayed, [(target, replayed, skipped) for each replay cut short])
 _CutReplay = tuple[str, int, int, float]
@@ -293,37 +304,30 @@ def _subscribe(
             """,
             ((target, group) for target in sorted(current_targets - requested_targets)),
         )
-        for target in sorted(requested_targets):
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO shm_subscription
-                    (target, consumer_group) VALUES (?, ?)
-                """,
-                (target, group),
-            )
-        replayed_pages = 0
-        for target in sorted(requested_targets - current_targets):
-            used = _used_pages(conn)
-            page_limit = publish_limit
-            if completion_mode == "mark":
-                # Claiming and mark-acking a replayed row rewrites it wider in place,
-                # splitting the pages the replay packed full: draining a cut replay
-                # grew the store by about half the pages the replay added. Charging
-                # the replay as much again as it adds covers that growth for one
-                # group whose listeners succeed; error text, dead letters and other
-                # groups' undrained replays are not reserved for. The room is
-                # measured per target, without the pages earlier targets replayed,
-                # because the expiry below frees pages.
-                base = used - replayed_pages
-                if base < publish_limit:
-                    page_limit = base + (publish_limit - base) // 2
-            replayed, skipped, earliest_expiry = _replay(conn, target, group, now, page_limit)
-            replayed_pages += _used_pages(conn) - used
-            inserted += replayed
-            if skipped and earliest_expiry is not None:
-                cut_short.append((target, replayed, skipped, earliest_expiry))
-            # Expiry never removes pending or claimed work because only
-            # publications without delivery rows qualify.
+    replayed_pages = 0
+    for target in sorted(requested_targets - current_targets):
+        used = _used_pages(conn)
+        page_limit = publish_limit
+        if completion_mode == "mark":
+            # Claiming and mark-acking a replayed row rewrites it wider in place,
+            # splitting the pages the replay packed full: draining a cut replay
+            # grew the store by about half the pages the replay added. Charging
+            # the replay as much again as it adds covers that growth for one
+            # group whose listeners succeed; error text, dead letters and other
+            # groups' undrained replays are not reserved for. The room is
+            # measured per target, without the pages earlier targets replayed,
+            # because the expiry below frees pages.
+            base = used - replayed_pages
+            if base < publish_limit:
+                page_limit = base + (publish_limit - base) // 2
+        replayed, skipped, earliest_expiry = _replay(conn, target, group, now, page_limit)
+        replayed_pages += _used_pages(conn) - used
+        inserted += replayed
+        if skipped and earliest_expiry is not None:
+            cut_short.append((target, replayed, skipped, earliest_expiry))
+        # Expiry never removes pending or claimed work because only
+        # publications without delivery rows qualify.
+        with immediate_transaction(conn):
             conn.execute(
                 """
                 DELETE FROM shm_publication
@@ -338,6 +342,23 @@ def _subscribe(
     return inserted, cut_short
 
 
+# The unary plus keeps SQLite on the rowid range p.sequence>? in sequence order.
+# idx_shm_publication_retained would instead gather every retained publication
+# of the target and sort them again for each batch.
+_MISSING_PUBLICATIONS = """
+    FROM shm_publication AS p
+    WHERE +p.target=? AND +p.retained_until>? AND p.sequence>?
+      AND NOT EXISTS (
+        SELECT 1 FROM shm_delivery AS d
+        WHERE d.publication_id=p.id AND d.consumer_group=?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM shm_completion_tombstone AS t
+        WHERE t.publication_id=p.id AND t.consumer_group=?
+      )
+"""
+
+
 def _replay(
     conn: sqlite3.Connection, target: str, group: str, now: float, page_limit: int
 ) -> tuple[int, int, float | None]:
@@ -346,37 +367,46 @@ def _replay(
     A publication the group holds a delivery or completion tombstone for is not
     missing, so it neither counts as skipped nor takes pages. Oldest first keeps
     each group's deliveries in publication-sequence order, which the claim
-    queries in _shm_claims rely on. Returns (replayed, skipped, the earliest
-    retained_until among the skipped, None when none was skipped).
+    queries in _shm_claims rely on. Each batch of REPLAY_BATCH_ROWS commits in its
+    own write transaction, so a sibling connection waits for one batch at most.
+    The group's subscription row is inserted in the last batch only: until then a
+    publish writes no delivery for the group, and a later batch replays that
+    publication in sequence order instead. Returns (replayed, skipped, the
+    earliest retained_until among the skipped, None when none was skipped).
     """
-    missing = [
-        (str(row["id"]), float(row["retained_until"]))
-        for row in conn.execute(
-            """
-            SELECT p.id, p.retained_until FROM shm_publication AS p
-            WHERE p.target=? AND p.retained_until>?
-              AND NOT EXISTS (
-                SELECT 1 FROM shm_delivery AS d
-                WHERE d.publication_id=p.id AND d.consumer_group=?
-              )
-              AND NOT EXISTS (
-                SELECT 1 FROM shm_completion_tombstone AS t
-                WHERE t.publication_id=p.id AND t.consumer_group=?
-              )
-            ORDER BY p.sequence
-            """,
-            (target, now, group, group),
-        )
-    ]
-    for index, (publication_id, _) in enumerate(missing):
-        conn.execute("SAVEPOINT shm_replay")
-        _insert_delivery(conn, publication_id, group, now)
-        if _used_pages(conn) > page_limit:
-            conn.execute("ROLLBACK TO shm_replay")
-            conn.execute("RELEASE shm_replay")
-            return index, len(missing) - index, min(expiry for _, expiry in missing[index:])
-        conn.execute("RELEASE shm_replay")
-    return len(missing), 0, None
+    replayed = 0
+    after = 0
+    while True:
+        with immediate_transaction(conn):
+            batch = conn.execute(
+                f"SELECT p.sequence, p.id {_MISSING_PUBLICATIONS} ORDER BY p.sequence LIMIT ?",
+                (target, now, after, group, group, REPLAY_BATCH_ROWS),
+            ).fetchall()
+            skipped, earliest = 0, None
+            for row in batch:
+                conn.execute("SAVEPOINT shm_replay")
+                _insert_delivery(conn, str(row["id"]), group, now)
+                if _used_pages(conn) > page_limit:
+                    conn.execute("ROLLBACK TO shm_replay")
+                    conn.execute("RELEASE shm_replay")
+                    skipped, earliest = conn.execute(
+                        f"SELECT COUNT(*), MIN(p.retained_until) {_MISSING_PUBLICATIONS}",
+                        (target, now, after, group, group),
+                    ).fetchone()
+                    break
+                conn.execute("RELEASE shm_replay")
+                replayed += 1
+                after = int(row["sequence"])
+            if skipped or len(batch) < REPLAY_BATCH_ROWS:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO shm_subscription
+                        (target, consumer_group) VALUES (?, ?)
+                    """,
+                    (target, group),
+                )
+                return replayed, skipped, earliest
+        time.sleep(REPLAY_BATCH_PAUSE_SECONDS)
 
 
 def group_backlog(conn: sqlite3.Connection) -> dict[str, int]:
