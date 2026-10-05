@@ -90,7 +90,7 @@ except ImportError as exc:  # pragma: no cover — exercised in a subprocess tes
     ) from exc
 
 from modulith import EventPublication
-from modulith._claims import LockConnectionTimeout
+from modulith._claims import BROKER_ROUTE_LISTENER_PREFIX, LockConnectionTimeout
 from modulith.builtin import outbox
 from modulith.builtin.outbox import (
     _bound_session,
@@ -918,6 +918,7 @@ class PostgresPublicationStore:
         lease_seconds: float,
         older_than: timedelta,
         exclude_ids: Collection[UUID] = (),
+        listeners: Collection[str] | None = None,
     ) -> list[EventPublication]:
         """Atomically claim up to ``batch_size`` claimable rows and COMMIT
         before returning — the caller (the outbox retry loop) dispatches only
@@ -949,6 +950,11 @@ class PostgresPublicationStore:
 
         ``exclude_ids`` are rows the caller is delivering itself: the query
         skips them, so they are neither claimed nor charged.
+
+        ``listeners`` are the listener ids a process-per-module worker hosts:
+        only rows for those, and broker-route rows (any worker may send them),
+        are claimed, so a sibling worker's rows are left alone and never
+        occupy a batch slot. ``None`` claims every row.
         """
         now = datetime.now(UTC)
         cutoff = now - older_than
@@ -974,6 +980,15 @@ class PostgresPublicationStore:
         )
         if exclude_ids:
             stmt = stmt.where(EventPublicationRow.id.not_in(exclude_ids))
+        if listeners is not None:
+            stmt = stmt.where(
+                or_(
+                    EventPublicationRow.listener.in_(listeners),
+                    EventPublicationRow.listener.startswith(
+                        BROKER_ROUTE_LISTENER_PREFIX, autoescape=True
+                    ),
+                )
+            )
         if not self._supports_skip_locked:
             return await self._claim_unlocked_retrying(stmt, owner=owner, now=now, until=until)
         stmt = stmt.with_for_update(skip_locked=True)

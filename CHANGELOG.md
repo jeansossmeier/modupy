@@ -164,6 +164,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `modulith broker drop-group` states in its confirmation prompt how many pending and claimed deliveries the drop deletes, per target with `--target`, on the SHM and database brokers; `--yes` output is unchanged, and a broker without a backlog count still prompts without one
 - An outbox lease sweep no longer re-claims, or charges an interrupted attempt to, a publication this process is still delivering after its lease lapsed; a custom store whose `claim_batch` does not declare the new optional `exclude_ids` keyword is called as before
 - The database broker's hourly subscription touch no longer waits on rows a replica's subscribe holds locked: it skips them and stamps the rest; a group now counts as live by its recent subscription touch only, not by a recent claim, so the liveness query no longer scans `broker_message`
+- In a process-per-module deployment, a worker's outbox lease sweep claims only publications for listeners it hosts, plus broker-route rows, so it no longer claims and releases a sibling worker's rows or lets them crowd out its own batch; a custom store whose `claim_batch` does not declare the new optional `listeners` keyword is called as before
 
 ### Security
 

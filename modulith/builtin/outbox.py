@@ -91,6 +91,7 @@ from uuid import UUID, uuid4
 
 from modulith import EventPublication, PublicationStore, hookimpl
 from modulith._claims import (
+    BROKER_ROUTE_LISTENER_PREFIX,
     DEFAULT_CLAIM_BATCH_SIZE,
     DEFAULT_CLAIM_LEASE_SECONDS,
     DEFAULT_CLAIM_STRATEGY,
@@ -283,15 +284,16 @@ _swept_dead_letters: set[tuple[UUID, int]] = set()
 _inflight_lock = threading.Lock()
 
 # Listener-column sentinel marking a publication row as a *deferred broker
-# send* rather than a local listener delivery. The durable path must not hand
-# an event to the broker inside publish() — the business transaction hasn't
-# committed yet and a broker send cannot be un-sent on rollback — so the route
-# is persisted as its own row (enlisted in the bound session, atomic with the
-# business work) and dispatched to the broker after commit, with the same
-# at-least-once retry machinery local listeners get. The double-underscore
-# namespace can't collide with a real listener id (module-qualified qualnames
-# never start with it).
-_BROKER_ROUTE_LISTENER_PREFIX = "__modulith.broker_route__:"
+# send* rather than a local listener delivery (defined in ``_claims`` so a
+# store's ``listeners`` claim filter can keep these rows claimable). The
+# durable path must not hand an event to the broker inside publish() — the
+# business transaction hasn't committed yet and a broker send cannot be
+# un-sent on rollback — so the route is persisted as its own row (enlisted in
+# the bound session, atomic with the business work) and dispatched to the
+# broker after commit, with the same at-least-once retry machinery local
+# listeners get. The double-underscore namespace can't collide with a real
+# listener id (module-qualified qualnames never start with it).
+_BROKER_ROUTE_LISTENER_PREFIX = BROKER_ROUTE_LISTENER_PREFIX
 
 
 def _listener_id(handler: Any) -> str:
@@ -340,18 +342,25 @@ def _foreign_to_this_worker(publication: EventPublication) -> bool:
     """
     from .. import runtime as _rt
 
-    rt = _rt._runtime
     listener_id = publication.listener or ""
-    if rt._hosted_module is None or listener_id.startswith(_BROKER_ROUTE_LISTENER_PREFIX):
+    if _rt._runtime._hosted_module is None or listener_id.startswith(_BROKER_ROUTE_LISTENER_PREFIX):
         return False
+    return listener_id not in _local_listener_ids()
+
+
+def _local_listener_ids() -> frozenset[str]:
+    """The ids of the listeners this process runs: those registered on the
+    bus that the hosted module owns (every one when no module is hosted)."""
+    from .. import runtime as _rt
+
+    rt = _rt._runtime
     bus = rt.event_bus
     assert bus is not None  # sweeps dispatch nothing until bootstrap installs the bus
-    local_ids = {
+    return frozenset(
         _listener_id(handler)
         for event_type in bus.registered_event_types()
         for handler in rt.local_listeners(bus.listeners_for(event_type))
-    }
-    return listener_id not in local_ids
+    )
 
 
 def _require_distinct_listener_ids(event_type: type, handlers: list[Any]) -> None:
@@ -1254,12 +1263,14 @@ def _declared_parameters(func: Callable[..., Any]) -> frozenset[str]:
 def _optional_claim_batch_kwargs(**candidates: Any) -> dict[str, Any]:
     """The ``claim_batch`` keywords beyond the protocol's required four that
     the active store names as parameters (see ``ClaimingStore.claim_batch``).
-    A store's signature is read once per function, and a ``**kwargs`` store
-    receives none of them."""
+    A store's signature is read once per function, a ``**kwargs`` store
+    receives none of them, and a candidate of ``None`` is never passed."""
     assert _store is not None
     claim_batch = _store.claim_batch  # type: ignore[attr-defined]
     declared = _declared_parameters(getattr(claim_batch, "__func__", claim_batch))
-    return {name: value for name, value in candidates.items() if name in declared}
+    return {
+        name: value for name, value in candidates.items() if name in declared and value is not None
+    }
 
 
 async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
@@ -1269,12 +1280,20 @@ async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
     assert _store is not None
     with _inflight_lock:
         delivering = frozenset(_inflight_ids)
+    from .. import runtime as _rt
+
+    # A process-per-module worker claims only the rows its listeners deliver;
+    # one hosting every module (or not yet bootstrapped) claims them all.
+    hosted = runtime_ready and _rt._runtime._hosted_module is not None
     claimed = await _store.claim_batch(  # type: ignore[attr-defined]
         owner=_claim_owner,
         batch_size=_claim_batch_size,
         lease_seconds=_claim_lease_seconds,
         older_than=older_than,
-        **_optional_claim_batch_kwargs(exclude_ids=delivering),
+        **_optional_claim_batch_kwargs(
+            exclude_ids=delivering,
+            listeners=_local_listener_ids() if hosted else None,
+        ),
     )
     if claimed and not runtime_ready:
         logger.info(
@@ -1299,9 +1318,8 @@ async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
             # Release early: holding a full lease on a not-yet-due row, or on
             # a row only a sibling worker can deliver, would block every other
             # sweeper from picking it up sooner.
-            # foreign rows still occupy claim_batch slots, so a large
-            # sibling backlog can delay this worker's own rows; filter the
-            # claim query by local listener ids if that shows up.
+            # A store that declares ``listeners`` never hands a foreign row
+            # back; one that does not still can, and its claim slots go to them.
             if pub.claim_token:
                 await _renew_swept_claim(pub, 0.0)
             continue

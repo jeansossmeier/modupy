@@ -50,6 +50,10 @@ DEFAULT_CLAIM_STRATEGY = "lease"
 DEFAULT_CLAIM_LEASE_SECONDS = 60.0
 DEFAULT_CLAIM_BATCH_SIZE = 100
 
+# Listener-column prefix of a row that is a deferred broker send, not a local
+# listener delivery (see ``modulith.builtin.outbox``). Any worker may send one.
+BROKER_ROUTE_LISTENER_PREFIX = "__modulith.broker_route__:"
+
 
 @dataclass(frozen=True)
 class Claim:
@@ -89,6 +93,11 @@ class ClaimingStore(Protocol):
         * ``exclude_ids`` (a collection of publication ids) — rows this
           process is delivering right now. They are neither claimed nor
           charged, however long their lease has lapsed.
+        * ``listeners`` (a collection of listener ids) — the listeners this
+          worker hosts, passed only by a process-per-module worker. Only rows
+          whose listener is in it, plus broker-route rows (any worker may send
+          those), are claimed; a sibling worker's rows are left uncharged for
+          it. Omitted means every row is claimable.
         """
         ...
 

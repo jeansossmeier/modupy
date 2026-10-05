@@ -821,3 +821,80 @@ def test_the_claiming_store_protocol_documents_exclude_ids() -> None:
     from modulith import _claims
 
     assert "exclude_ids" in (_claims.ClaimingStore.claim_batch.__doc__ or "")
+
+
+class _ListeningStore(StubStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.claim_calls: list[dict[str, Any]] = []
+
+    async def claim_batch(
+        self,
+        *,
+        owner: str,
+        batch_size: int,
+        lease_seconds: float,
+        older_than: timedelta,
+        listeners: frozenset[str] | None = None,
+    ) -> list[EventPublication]:
+        self.claim_calls.append({"listeners": listeners})
+        return []
+
+
+async def _other_module_record(event: G03Event) -> None:
+    received.append(-event.value)
+
+
+def _host_with_a_sibling_listener() -> None:
+    """A worker hosting ``orders`` whose runtime also knows a ``billing``
+    listener, which only the billing worker runs."""
+    _bootstrap_with_listener(record)
+    assert _runtime.event_bus is not None
+    _runtime.event_bus.register(G03Event, _other_module_record)
+    _runtime._listener_owners[_other_module_record] = "outbox_claims_test.billing"
+    _runtime.host_module("outbox_claims_test.orders")
+
+
+async def test_a_hosted_worker_claims_only_rows_for_listeners_it_hosts() -> None:
+    """The sweep hands the store the ids of this worker's own listeners, so a
+    sibling worker's rows are never claimed here."""
+    store = _ListeningStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    _host_with_a_sibling_listener()
+
+    await outbox._sweep(timedelta(0))
+
+    assert store.claim_calls == [{"listeners": frozenset({outbox._listener_id(record)})}]
+
+
+@pytest.mark.parametrize("hosted", [None, "outbox_claims_test.orders"])
+async def test_a_worker_hosting_every_module_passes_no_listener_filter(hosted: str | None) -> None:
+    """Without a hosted module (single process) every row is this process's:
+    the store gets no filter and claims everything. A hosted worker that has
+    not bootstrapped has no listener set to filter by either."""
+    store = _ListeningStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    if hosted is None:
+        _bootstrap_with_listener(record)
+    else:
+        _runtime.host_module(hosted)
+
+    await outbox._sweep(timedelta(0))
+
+    assert store.claim_calls == [{"listeners": None}]
+
+
+async def test_a_hosted_lease_sweep_calls_a_store_without_listeners_as_before() -> None:
+    store = _LegacyClaimingStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+    _host_with_a_sibling_listener()
+
+    await outbox._sweep(timedelta(0))
+
+    assert store.claim_calls == 1
+
+
+def test_the_claiming_store_protocol_documents_listeners() -> None:
+    from modulith import _claims
+
+    assert "listeners" in (_claims.ClaimingStore.claim_batch.__doc__ or "")

@@ -2249,6 +2249,104 @@ async def test_claim_batch_skips_excluded_ids_uncharged_on_mysql(mysql_url: str)
         await _assert_claim_batch_skips_excluded_ids_uncharged(engine)
 
 
+async def _assert_claim_batch_claims_only_the_listeners_asked_for(engine: Any) -> None:
+    """Two workers' listener sets over one table. A broker-route row has no
+    listener of its own and any worker may claim it, so it stays claimable
+    through a filter; a listener id that merely resembles the route prefix
+    (the prefix's ``_`` and ``.`` are LIKE wildcards if left unescaped) does not."""
+    store = PostgresPublicationStore(engine=engine)
+    now = datetime.now(UTC)
+    orders, billing, route, lookalike = (
+        _pub(
+            i,
+            listener=listener,
+            published_at=now - timedelta(seconds=10 - i),
+        )
+        for i, listener in enumerate(
+            (
+                "shop.orders.on_placed",
+                "shop.billing.on_placed",
+                outbox._BROKER_ROUTE_LISTENER_PREFIX + "kafka:events",
+                "AAmodulith.broker_routeAA:kafka:events",
+            ),
+            start=1,
+        )
+    )
+    for pub in (orders, billing, route, lookalike):
+        await store.save(pub)
+
+    async def claim(listeners: set[str] | None) -> set[Any]:
+        kwargs: dict[str, Any] = {} if listeners is None else {"listeners": listeners}
+        claimed = await store.claim_batch(
+            owner="worker",
+            batch_size=10,
+            lease_seconds=60,
+            older_than=timedelta(0),
+            **kwargs,
+        )
+        return {p.id for p in claimed}
+
+    assert await claim({"shop.orders.on_placed"}) == {orders.id, route.id}
+    assert await claim({"shop.billing.on_placed"}) == {billing.id}
+    assert await claim(set()) == set()
+    assert await claim(None) == {lookalike.id}
+    assert (await _stored_row(engine, billing.id)).claim_token is not None
+
+
+async def test_claim_batch_claims_only_the_listeners_asked_for_on_sqlite(engine: Any) -> None:
+    await _assert_claim_batch_claims_only_the_listeners_asked_for(engine)
+
+
+@pytest.mark.integration
+async def test_claim_batch_claims_only_the_listeners_asked_for_on_postgres(pg_engine: Any) -> None:
+    await _assert_claim_batch_claims_only_the_listeners_asked_for(pg_engine)
+
+
+@pytest.mark.integration
+async def test_claim_batch_claims_only_the_listeners_asked_for_on_mysql(mysql_url: str) -> None:
+    async with _mysql_engine(mysql_url) as engine:
+        await _assert_claim_batch_claims_only_the_listeners_asked_for(engine)
+
+
+async def _billing_record(event: G04Event) -> None:
+    received.append(-event.value)
+
+
+async def test_a_hosted_workers_sweep_leaves_a_sibling_workers_rows_unclaimed(
+    engine: Any,
+) -> None:
+    """The orders worker's sweep reaches only its own listener's row even when
+    a billing row is older and the batch holds a single row: nothing of the
+    billing row is claimed, charged or leased here, and its owner still can."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        claim_batch_size=1,
+        start_loop=False,
+    )
+    _bootstrap_with_listener(record)
+    assert _runtime.event_bus is not None
+    _runtime.event_bus.register(G04Event, _billing_record)
+    _runtime._listener_owners[_billing_record] = "g04test.billing"
+    _runtime.host_module("g04test.orders")
+    now = datetime.now(UTC)
+    siblings = _pub(2, _billing_record, published_at=now - timedelta(seconds=20))
+    mine = _pub(1, published_at=now - timedelta(seconds=10))
+    await store.save(siblings)
+    await store.save(mine)
+
+    await outbox._sweep(timedelta(0))
+
+    assert received == [1]
+    left_alone = await _stored_row(engine, siblings.id)
+    assert (left_alone.claim_token, left_alone.attempt_count) == (None, 0)
+    _runtime._hosted_module = "g04test.billing"
+    await outbox._sweep(timedelta(0))
+    assert received == [1, -2]
+
+
 def _renew_claim_raising_for(
     store: PostgresPublicationStore,
     monkeypatch: pytest.MonkeyPatch,
