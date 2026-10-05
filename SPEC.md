@@ -1133,7 +1133,7 @@ modulith info  # show detected config, modules, plugins
 application modules to derive artifacts; they are build-time tools for trusted
 source. Extraction writes a wheel-buildable project through a staging
 directory and rejects output symlinks, output inside the source package,
-non-empty targets, and source symlinks that escape the package. Kubernetes
+non-empty targets, and any symlink in the copied source. Kubernetes
 names are RFC-1123 labels with stable hashes for long inputs, ports must be
 1–65535, only supported broker environment contracts are emitted, and the
 contracts module is passed explicitly. OpenAPI generation requires the
