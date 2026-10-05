@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import importlib.machinery
 import ntpath
 import os
+import py_compile
 import subprocess
 import sys
 import tomllib
@@ -1053,6 +1055,139 @@ def test_extract_module_importing_contracts_needs_no_force(make_fake_app, monkey
     assert (out_dir / "fakeapp" / "contracts" / "events.py").is_file()
     assert (out_dir / "fakeapp" / "contracts" / "base.py").is_file()
     assert "Extraction notes" not in (out_dir / "README.md").read_text()
+
+
+_HIDDEN_IMPORT = 'import importlib\nimportlib.import_module("fakeapp." + "hidden")\n'
+
+
+def test_extract_gate_imports_the_manifest_the_worker_imports(make_fake_app, monkeypatch, tmp_path):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": ""},
+        extra_files={
+            "orders/_manifest.py": _HIDDEN_IMPORT,
+            "hidden.py": "",
+            "contracts/__init__.py": "",
+        },
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 1, result.output
+    assert "No module named 'fakeapp.hidden'" in result.output
+    assert not out_dir.exists()
+
+
+def test_extract_gate_imports_the_contracts_the_worker_imports(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": ""},
+        extra_files={"contracts/__init__.py": _HIDDEN_IMPORT, "hidden.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 1, result.output
+    assert "No module named 'fakeapp.hidden'" in result.output
+    assert not out_dir.exists()
+
+
+def test_extract_gate_tolerates_an_app_without_contracts_or_manifest(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert not (out_dir / "fakeapp" / "contracts").exists()
+    assert not (out_dir / "fakeapp" / "orders" / "_manifest.py").exists()
+
+
+def test_extract_copies_a_sourceless_helper_the_module_imports(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "from fakeapp import compiled\nVALUE = compiled.VALUE\n"},
+        extra_files={"contracts/__init__.py": ""},
+    )
+    source = tmp_path / "compiled_source.py"
+    source.write_text("VALUE = 7\n")
+    py_compile.compile(str(source), cfile=str(tmp_path / "fakeapp" / "compiled.pyc"), doraise=True)
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "fakeapp" / "compiled.pyc").is_file()
+    assert "`fakeapp.compiled`" in (out_dir / "README.md").read_text()
+
+
+def test_extract_copies_an_extension_module_helper_the_module_imports(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "try:\n    from fakeapp import fast\nexcept ImportError:\n    fast = None\n"},
+        extra_files={"contracts/__init__.py": ""},
+    )
+    extension = f"fast{importlib.machinery.EXTENSION_SUFFIXES[0]}"
+    (tmp_path / "fakeapp" / extension).write_bytes(b"not a real extension module")
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert (out_dir / "fakeapp" / extension).read_bytes() == b"not a real extension module"
+    assert "`fakeapp.fast`" in (out_dir / "README.md").read_text()
+
+
+def test_extract_warns_about_imported_but_undeclared_distribution(
+    make_fake_app, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.chdir(tmp_path)
+    make_fake_app({"orders": "import pytest\n"}, extra_files={"contracts/__init__.py": ""})
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    notes = _readme_section((out_dir / "README.md").read_text(), "Extraction notes")
+    listed = [line for line in notes.splitlines() if line.startswith("- ")]
+    assert "- `pytest`" in listed, notes
+    assert "- `pluggy`" not in listed, notes  # a core modupy dependency
+    assert "pytest" in result.stderr
+    assert "Extraction notes" in result.stderr
+
+
+def test_extract_stays_quiet_about_distributions_the_dependencies_cover(
+    make_fake_app, monkeypatch, tmp_path
+):
+    pytest.importorskip("fastapi")
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "app"\nversion = "0"\ndependencies = ["pytest>=8"]\n'
+    )
+    make_fake_app(
+        {"orders": "import pytest\nfrom fastapi import FastAPI\n"},
+        extra_files={"contracts/__init__.py": ""},
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert "Extraction notes" not in (out_dir / "README.md").read_text()
+    assert result.stderr == ""
 
 
 def test_extract_copies_helper_file_beside_same_named_non_package_dir(

@@ -10,6 +10,8 @@ alongside a ``pyproject.toml``, ``Dockerfile``, ``README.md``, and
 from __future__ import annotations
 
 import ast
+import importlib.machinery
+import importlib.metadata
 import json
 import keyword
 import re
@@ -89,14 +91,23 @@ def extraction_blockers(rt: Runtime, module: str, violations: list[Violation]) -
 
 
 def _source_path(package_dir: Path, package: str, dotted: str) -> Path | None:
-    """The package directory or ``.py`` file *dotted* names under *package*, if any."""
+    """The package directory or module file *dotted* names under *package*, if any.
+
+    A module file is a ``.py`` source, a compiled extension module or a sourceless ``.pyc``.
+    """
     if not dotted.startswith(f"{package}."):
         return None
     rel = Path(*dotted.removeprefix(f"{package}.").split("."))
     if (package_dir / rel / "__init__.py").is_file():
         return package_dir / rel
-    if (package_dir / f"{rel}.py").is_file():
-        return package_dir / f"{rel}.py"
+    suffixes = (
+        ".py",
+        *importlib.machinery.EXTENSION_SUFFIXES,
+        *importlib.machinery.BYTECODE_SUFFIXES,
+    )
+    for suffix in suffixes:
+        if (package_dir / f"{rel}{suffix}").is_file():
+            return package_dir / f"{rel}{suffix}"
     return None
 
 
@@ -153,6 +164,8 @@ def import_closure(rt: Runtime, module: str) -> tuple[list[str], list[str]]:
         if source is None:
             continue
         for path in sorted(source.rglob("*.py")) if source.is_dir() else [source]:
+            if path.suffix != ".py":
+                continue  # a compiled module has no source to scan
             try:
                 tree = _parse_source(path)
             except SyntaxError:
@@ -195,12 +208,22 @@ def under(path, parent):
         return False
 """
 
+_DISTRIBUTIONS_MARKER = "modulith-gate-distributions:"
+
 _IMPORT_CHECK = (
     """
-import importlib, os, site, sys, sysconfig
+import importlib, importlib.metadata, json, os, site, sys, sysconfig
 root, dotted, source = sys.argv[1:4]
+loaded_before = set(sys.modules)
 sys.path.insert(0, root)
 importlib.import_module(dotted)
+# The worker imports these two at start-up and tolerates only their absence.
+for name in sys.argv[4:]:
+    try:
+        importlib.import_module(name)
+    except ModuleNotFoundError as exc:
+        if exc.name != name:
+            raise
 """
     + _IMPORT_CHECK_UNDER
     + """
@@ -231,12 +254,24 @@ if leaked:
         + ", outside the extracted service; move that code into the module or a helper "
         "under the package"
     )
+by_top_level = importlib.metadata.packages_distributions()
+new_top_levels = {n.split(".")[0] for n in sys.modules if n not in loaded_before}
+new_top_levels.discard(dotted.split(".")[0])
+distributions = sorted({d for top in new_top_levels for d in by_top_level.get(top, ())})
+print("""
+    + repr(_DISTRIBUTIONS_MARKER)
+    + """, json.dumps(distributions))
 """
 )
 
 
-def _check_imports(root: Path, dotted: str, source: Path) -> None:
+def _check_imports(root: Path, dotted: str, source: Path, also: Sequence[str] = ()) -> list[str]:
     """Import *dotted* in a fresh interpreter from the extracted tree at *root*; raise if it fails.
+
+    Each module of *also* is imported too, and only that exact module being
+    absent is tolerated, as ``_worker._import_contracts`` and
+    ``_import_manifest`` do. Returns the third-party distributions the imports
+    loaded, so the caller can compare them with what the service declares.
 
     *root* goes first on the child's ``sys.path`` explicitly, so neither
     ``PYTHONSAFEPATH`` nor an installed copy of the monolith can shadow it.
@@ -253,7 +288,7 @@ def _check_imports(root: Path, dotted: str, source: Path) -> None:
     """
     try:
         result = subprocess.run(
-            [sys.executable, "-B", "-c", _IMPORT_CHECK, str(root), dotted, str(source)],
+            [sys.executable, "-B", "-c", _IMPORT_CHECK, str(root), dotted, str(source), *also],
             cwd=root,
             capture_output=True,
             text=True,
@@ -265,6 +300,51 @@ def _check_imports(root: Path, dotted: str, source: Path) -> None:
         lines = result.stderr.strip().splitlines()
         reason = lines[-1] if lines else f"exit code {result.returncode}"
         raise ValueError(f"the extracted service cannot import {dotted}: {reason}")
+    for line in reversed(result.stdout.splitlines()):
+        if line.startswith(_DISTRIBUTIONS_MARKER):
+            distributions: list[str] = json.loads(line.removeprefix(_DISTRIBUTIONS_MARKER))
+            return distributions
+    return []
+
+
+def _canonical_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+_EXTRA_MARKER = re.compile(r"""extra\s*==\s*['"]([^'"]+)['"]""")
+
+
+def _declared_distributions(dependencies: list[str]) -> set[str]:
+    """Canonical names of the distributions installing *dependencies* brings in, transitively.
+
+    Reads the extracting environment's metadata. A requirement gated on an
+    extra counts only when that extra is requested; other environment
+    markers are ignored, so the result can overstate what a platform installs.
+    """
+    declared: set[str] = set()
+    seen: set[tuple[str, frozenset[str]]] = set()
+    pending = list(dependencies)
+    while pending:
+        match = _REQUIREMENT_HEAD.match(pending.pop())
+        if match is None:
+            continue
+        name = _canonical_name(match.group(1))
+        extras = frozenset(
+            _canonical_name(extra) for extra in (match.group(2) or "").split(",") if extra.strip()
+        )
+        if (name, extras) in seen:
+            continue
+        seen.add((name, extras))
+        declared.add(name)
+        try:
+            requires = importlib.metadata.requires(name) or []
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        for requirement in requires:
+            gates = {_canonical_name(extra) for extra in _EXTRA_MARKER.findall(requirement)}
+            if not gates or gates & extras:
+                pending.append(requirement)
+    return declared
 
 
 def _validate_module_name(value: str, *, what: str) -> None:
@@ -315,7 +395,7 @@ def _extract_modupy_extras(source_deps: list[str]) -> set[str]:
     return set()
 
 
-def _render_pyproject(*, cfg: Configuration, module: str, source_deps: list[str]) -> str:
+def _dependencies(cfg: Configuration, source_deps: list[str]) -> list[str]:
     extras = ["fastapi", "cli"]
     if cfg.broker == "redis-streams":
         extras.append("redis")
@@ -341,7 +421,11 @@ def _render_pyproject(*, cfg: Configuration, module: str, source_deps: list[str]
         and not any(dep.lower().startswith("psycopg") for dep in dependencies)
     ):
         dependencies.append("psycopg[binary]>=3.1,<4.0")
+    return dependencies
 
+
+def _render_pyproject(*, cfg: Configuration, module: str, source_deps: list[str]) -> str:
+    dependencies = _dependencies(cfg, source_deps)
     assert cfg.package is not None
     root_package = cfg.package.split(".", 1)[0]
     lines = [
@@ -445,6 +529,13 @@ def _unresolved_dynamic_imports(output: Path, dest_pkg: Path, package: str) -> l
     return entries
 
 
+_UNDECLARED_NOTE = (
+    "The import check loaded these third-party distributions, which the generated "
+    "`pyproject.toml` dependencies do not install (directly or through `modupy`'s own "
+    "requirements). Add the ones the service needs to `dependencies`:"
+)
+
+
 def _render_readme(
     *,
     cfg: Configuration,
@@ -453,6 +544,7 @@ def _render_readme(
     helpers: list[str],
     notes: list[str],
     dynamic_imports: Sequence[str] = (),
+    undeclared: Sequence[str] = (),
 ) -> str:
     lines = [
         f"# {module}-service",
@@ -542,7 +634,7 @@ def _render_readme(
         ]
         lines += [f"- `{helper}`" for helper in helpers]
 
-    if notes or dynamic_imports:
+    if notes or dynamic_imports or undeclared:
         lines += ["", "## Extraction notes"]
     if notes:
         lines += [
@@ -559,6 +651,9 @@ def _render_readme(
             "",
         ]
         lines += [f"- {entry}" for entry in dynamic_imports]
+    if undeclared:
+        lines += ["", _UNDECLARED_NOTE, ""]
+        lines += [f"- `{name}`" for name in undeclared]
 
     return "\n".join(lines) + "\n"
 
@@ -630,14 +725,12 @@ def _write_generated_files(
     helpers: list[str],
     notes: list[str],
     dynamic_imports: list[str],
+    source_deps: list[str],
+    undeclared: list[str],
 ) -> list[str]:
     assert cfg.package is not None
     generated = {
-        "pyproject.toml": _render_pyproject(
-            cfg=cfg,
-            module=module,
-            source_deps=_source_dependencies(),
-        ),
+        "pyproject.toml": _render_pyproject(cfg=cfg, module=module, source_deps=source_deps),
         "Dockerfile": _render_dockerfile(module=module, package=cfg.package),
         ".env.example": _render_env_example(cfg=cfg, module=module, package=cfg.package),
         "README.md": _render_readme(
@@ -647,6 +740,7 @@ def _write_generated_files(
             helpers=helpers,
             notes=notes,
             dynamic_imports=dynamic_imports,
+            undeclared=undeclared,
         ),
     }
     for name, content in generated.items():
@@ -701,12 +795,34 @@ def write_extraction(
             package_dir=source_root,
             output=staging,
             helpers=helpers,
-            notes=notes,
         )
-        _check_imports(
+        loaded = _check_imports(
             staging,
             f"{cfg.package}.{module}",
             source_root.parents[len(cfg.package.split(".")) - 1],
+            also=(f"{cfg.package}.{cfg.contracts_module}", f"{cfg.package}.{module}._manifest"),
+        )
+        source_deps = _source_dependencies()
+        covered = _declared_distributions(_dependencies(cfg, source_deps))
+        undeclared = sorted(name for name in loaded if _canonical_name(name) not in covered)
+        if undeclared:
+            print(
+                "warning: the import check loaded third-party distribution(s) the generated "
+                f"dependencies do not install: {', '.join(undeclared)}; see Extraction notes "
+                "in the README",
+                file=sys.stderr,
+            )
+        written += _write_generated_files(
+            output=staging,
+            cfg=cfg,
+            module=module,
+            helpers=helpers,
+            notes=notes,
+            dynamic_imports=_unresolved_dynamic_imports(
+                staging, staging.joinpath(*cfg.package.split(".")), cfg.package
+            ),
+            source_deps=source_deps,
+            undeclared=undeclared,
         )
         if output.is_symlink():
             raise FileExistsError(f"--output {output} appeared during extraction")
@@ -728,7 +844,6 @@ def _populate_extraction(
     package_dir: Path,
     output: Path,
     helpers: list[str],
-    notes: list[str],
 ) -> list[str]:
     assert cfg.package is not None
     dest_pkg = output.joinpath(*cfg.package.split("."))
@@ -811,16 +926,5 @@ def _populate_extraction(
     contracts_src = _contracts_source(package_dir, cfg.package, cfg.contracts_module)
     if contracts_src is not None and not inside_helper(contracts):
         copy_rel(contracts_src.relative_to(package_dir))
-
-    written.extend(
-        _write_generated_files(
-            output=output,
-            cfg=cfg,
-            module=module,
-            helpers=helpers,
-            notes=notes,
-            dynamic_imports=_unresolved_dynamic_imports(output, dest_pkg, cfg.package),
-        )
-    )
 
     return written
