@@ -100,11 +100,10 @@ class EventPublication:
 
     # Lease fencing token. Set only by a claim-aware store under
     # ``claim_strategy="lease"``: by claim_batch() for a sweep, and by
-    # claim_publication() for after-commit dispatch and for
+    # claim_publication() for after-commit dispatch, force_retry() and
     # retry_all_dead_lettered(). It fences the completion/failure write that
     # follows dispatch to this exact claim (see modulith._claims.ClaimingStore).
-    # None on every other path: force_retry, the "none"/"advisory_lock"
-    # strategies, and any store that predates the claim protocol — all of
+    # None on every other path: the "none"/"advisory_lock" strategies, and any store that predates the claim protocol — all of
     # those use the unfenced save()/mark_complete()/delete()/archive() calls.
     claim_token: str | None = None
 

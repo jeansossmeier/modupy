@@ -1834,6 +1834,42 @@ def test_outbox_retry_unknown_id_errors(make_fake_app, monkeypatch) -> None:
     assert "requested retry" not in result.stdout
 
 
+class PeerHoldsEveryClaimStore(CappedScanStore):
+    """``claim_publication`` finds every row claimed by a live peer."""
+
+    async def claim_publication(
+        self, publication_id: UUID, *, owner: str, lease_seconds: float
+    ) -> EventPublication | None:
+        return None
+
+
+def test_outbox_retry_of_a_row_a_peer_holds_exits_1_and_says_it_was_left_to_its_holder(
+    make_fake_app, monkeypatch
+) -> None:
+    """A row a live peer's claim holds is not delivered, so the command exits 1
+    like the not-found path: a script must not read it as a retry."""
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": ""})
+    store = PeerHoldsEveryClaimStore()
+    outbox.configure(store=store, serializer=JsonEventSerializer(), start_loop=False)
+    pub = EventPublication(
+        id=uuid4(),
+        payload=b"{}",
+        event_type="fakeapp.orders.Ping",
+        listener="handler",
+        published_at=datetime.now(UTC),
+    )
+    store.pubs[pub.id] = pub
+
+    result = runner.invoke(app, ["outbox", "retry", str(pub.id)])
+
+    assert result.exit_code == 1
+    assert "left to its holder" in result.stderr
+    assert str(pub.id) in result.stderr
+    assert "requested retry" not in result.stdout
+    assert store.pubs[pub.id].completed_at is None
+
+
 def test_dev_empty_app_module_is_clean_error(monkeypatch) -> None:
     """An empty app_module must be a clean CLI error, not an unhandled
     `ValueError: Empty module name` traceback."""

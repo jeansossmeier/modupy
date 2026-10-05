@@ -86,7 +86,7 @@ import time
 from collections.abc import Callable
 from contextvars import Context, ContextVar, Token
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from modulith import EventPublication, PublicationStore, hookimpl
@@ -270,6 +270,8 @@ _shutdown_grace_seconds: float = 10.0
 # committed row; this set makes a publication's delivery non-reentrant within a
 # process (the cross-process case is handled by the store's row-level claim).
 _inflight_ids: set[UUID] = set()
+
+ForceRetryOutcome = Literal["retried", "held", "not_found"]
 
 # (id, attempt_count) of rows a sweep already recorded as dead-lettered. Keyed
 # on the count so a row reopened with a fresh budget is not mistaken for one.
@@ -1390,9 +1392,12 @@ async def _sweep_advisory(older_than: timedelta, *, runtime_ready: bool) -> None
         logger.info("outbox sweep: skipped %d row(s) locked by another dispatcher", skipped)
 
 
-async def _dispatch_under_advisory_lock(publication: EventPublication) -> bool:
+async def _dispatch_under_advisory_lock(
+    publication: EventPublication, *, ignore_backoff: bool = False
+) -> bool:
     """Deliver ``publication`` while holding its advisory lock; skip it when
     another dispatcher (a peer's sweep or after-commit task) holds the lock.
+    ``ignore_backoff`` delivers a row still inside its retry backoff.
 
     Returns False when the lock was held elsewhere and the row was skipped,
     True when this call took the lock.
@@ -1423,7 +1428,7 @@ async def _dispatch_under_advisory_lock(publication: EventPublication) -> bool:
             current is not None
             and current.completed_at is None
             and current.attempt_count < _dead_letter_after_attempts
-            and _backoff_elapsed(current)
+            and (ignore_backoff or _backoff_elapsed(current))
         ):
             await _dispatch_publication(current)
             delivered = current.completed_at is not None
@@ -1773,8 +1778,15 @@ async def status() -> dict[str, int]:
     return {"incomplete": incomplete, "completed": completed, "dead_lettered": dead}
 
 
-async def force_retry(publication_id: UUID) -> None:
+async def force_retry(publication_id: UUID) -> ForceRetryOutcome:
     """Immediately retry a specific publication, bypassing backoff.
+
+    The row is delivered under the fence the configured claim strategy gives
+    ``retry_all_dead_lettered`` (``_dispatch_resubmitted``), and a dead-lettered
+    row first gets a fresh attempt budget. Returns ``"retried"`` once the row
+    was delivered here, ``"held"`` when another dispatcher holds its claim or
+    lock (or the lock pool had no free connection) and the row was left to it,
+    and ``"not_found"`` for an unknown or already completed id.
 
     Uses the store's ``find_by_id`` capability (a direct point lookup) when
     available: ``find_incomplete``/``find_dead_lettered`` are both capped
@@ -1784,23 +1796,22 @@ async def force_retry(publication_id: UUID) -> None:
     bounded scan.
     """
     assert _store is not None
+    pub: EventPublication | None = None
     finder = getattr(_store, "find_by_id", None)
     if finder is not None:
         pub = await finder(publication_id)
-        if pub is None or pub.completed_at is not None:
-            logger.warning(
-                "force_retry: publication %s not found or already complete", publication_id
-            )
-            return
-        await _dispatch_publication(pub)
-        return
-    candidates = list(await _store.find_incomplete(timedelta(0)))
-    candidates += await list_dead_lettered()
-    for pub in candidates:
-        if pub.id == publication_id:
-            await _dispatch_publication(pub)
-            return
-    logger.warning("force_retry: publication %s not found or already complete", publication_id)
+        if pub is not None and pub.completed_at is not None:
+            pub = None
+    else:
+        candidates = list(await _store.find_incomplete(timedelta(0)))
+        candidates += await list_dead_lettered()
+        pub = next((c for c in candidates if c.id == publication_id), None)
+    if pub is None:
+        logger.warning("force_retry: publication %s not found or already complete", publication_id)
+        return "not_found"
+    if pub.attempt_count >= _dead_letter_after_attempts:
+        await _reopen(pub)
+    return "retried" if await _dispatch_resubmitted(pub) else "held"
 
 
 async def purge_completed(older_than: timedelta) -> int:
@@ -1897,36 +1908,48 @@ async def retry_all_dead_lettered() -> int:
     assert _store is not None
     dead = await list_dead_lettered()
     for pub in dead:
-        pub.attempt_count = 0
-        pub.last_error = None
-        await _store.save(pub)
+        await _reopen(pub)
         await _dispatch_resubmitted(pub)
     return len(dead)
 
 
-async def _dispatch_resubmitted(publication: EventPublication) -> None:
+async def _reopen(publication: EventPublication) -> None:
+    """Give a dead-lettered row a fresh retry budget and save it."""
+    assert _store is not None
+    publication.attempt_count = 0
+    publication.last_error = None
+    await _store.save(publication)
+
+
+async def _dispatch_resubmitted(publication: EventPublication) -> bool:
     """Deliver a reopened row the way the configured claim strategy delivers a
-    swept one: under a lease, under its advisory lock, or unfenced."""
+    swept one: under a lease, under its advisory lock, or unfenced.
+
+    Returns False when the row was left undelivered: a peer holds its claim or
+    lock, or no lock connection was free. The retry backoff does not apply.
+    """
     assert _store is not None
     store_any: Any = _store
     if _claim_strategy == "lease" and hasattr(_store, "claim_publication"):
         claimed = await store_any.claim_publication(
             publication.id, owner=_claim_owner, lease_seconds=_claim_lease_seconds
         )
-        if claimed is not None:
-            await _dispatch_with_lease_renewal(claimed)
-        return
+        if claimed is None:
+            return False
+        await _dispatch_with_lease_renewal(claimed)
+        return True
     if _claim_strategy == "advisory_lock" and hasattr(_store, "try_lock_publication"):
         try:
-            await _dispatch_under_advisory_lock(publication)
+            return await _dispatch_under_advisory_lock(publication, ignore_backoff=True)
         except _LockConnectionTimeout:
             logger.warning(
                 "retry-all: no advisory-lock connection for publication %s within "
                 "the pool timeout; it stays reopened for the next sweep",
                 publication.id,
             )
-        return
+            return False
     await _dispatch_publication(publication)
+    return True
 
 
 # ---------------------------------------------------------------------------

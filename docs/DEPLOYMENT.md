@@ -310,6 +310,13 @@ modulith outbox failing             # events still being retried: attempts, last
 modulith outbox dead-letter         # inspect stuck events
 ```
 
+`retry` delivers the row at once, ignoring its backoff, under the same claim or
+advisory lock the sweep takes. A dead-lettered row first gets a fresh attempt
+budget. A row another dispatcher holds is left to its holder: the command
+prints that and exits 1, like an unknown id, and a row whose lease has lapsed
+is left to the next sweep. Run it again once the holder has finished or the
+sweep has taken the row.
+
 `failing` lists undelivered rows that have failed at least once and are not yet
 dead-lettered. Its next-retry time is the last attempt plus the retry backoff
 (doubling per attempt, capped by `max_retry_backoff_seconds`); a time in the

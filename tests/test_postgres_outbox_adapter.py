@@ -1381,6 +1381,103 @@ async def test_retry_all_under_advisory_lock_without_a_lock_connection_leaves_th
     assert completed == 1
 
 
+async def test_force_retry_leaves_a_row_a_peer_claimed_to_that_peer(engine: Any) -> None:
+    """A row a live peer's claim holds is the peer's to deliver: force_retry
+    reports it held and leaves the row, its claim and the listener untouched."""
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _pub(1)
+    await store.save(pub)
+    [held] = await store.claim_batch(
+        owner="peer", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+    )
+
+    outcome = await outbox.force_retry(pub.id)
+
+    row = await _stored_row(engine, pub.id)
+    assert outcome == "held"
+    assert received == []
+    assert (row.claim_owner, row.claim_token, row.completed_at) == ("peer", held.claim_token, None)
+
+
+async def test_force_retry_gives_a_dead_lettered_row_a_fresh_budget_and_delivers_it_once(
+    engine: Any,
+) -> None:
+    store = PostgresPublicationStore(engine=engine, dead_letter_after_attempts=2)
+    outbox.configure(store, JsonEventSerializer(), dead_letter_after_attempts=2, start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _pub(1, attempt_count=2, last_error="boom")
+    await store.save(pub)
+
+    outcome = await outbox.force_retry(pub.id)
+
+    row = await _stored_row(engine, pub.id)
+    assert outcome == "retried"
+    assert received == [1]
+    assert (row.attempt_count, row.last_error, row.completed_at is not None) == (0, None, True)
+
+
+async def test_force_retry_delivers_an_unclaimed_failed_row_inside_its_backoff(
+    engine: Any,
+) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _pub(1, attempt_count=1, last_error="boom", last_attempt_at=datetime.now(UTC))
+    await store.save(pub)
+    assert not outbox._backoff_elapsed(pub)
+
+    outcome = await outbox.force_retry(pub.id)
+
+    assert outcome == "retried"
+    assert received == [1]
+    assert await _completed_rows(engine) == 1
+
+
+async def test_force_retry_under_advisory_lock_delivers_a_row_inside_its_backoff(
+    tmp_path: Path,
+) -> None:
+    eng, store = await _advisory_store_with_one_lock_connection(tmp_path)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _pub(1, attempt_count=1, last_error="boom", last_attempt_at=datetime.now(UTC))
+    await store.save(pub)
+    assert not outbox._backoff_elapsed(pub)
+    try:
+        outcome = await outbox.force_retry(pub.id)
+        completed = await _completed_rows(eng)
+    finally:
+        await store.dispose()
+        await eng.dispose()
+
+    assert outcome == "retried"
+    assert received == [1]
+    assert completed == 1
+
+
+@pytest.mark.integration
+async def test_force_retry_under_advisory_lock_leaves_a_row_a_peer_has_locked(
+    pg_engine: Any,
+) -> None:
+    store = PostgresPublicationStore(engine=pg_engine)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+    _bootstrap_with_listener(record)
+    pub = _pub(1)
+    await store.save(pub)
+    peer_handle = await store.try_lock_publication(pub.id)
+    assert peer_handle is not None
+    try:
+        outcome = await outbox.force_retry(pub.id)
+        delivered_under_peer_lock = list(received)
+    finally:
+        await store.unlock_publication(peer_handle, pub.id)
+
+    assert outcome == "held"
+    assert delivered_under_peer_lock == []
+    assert await _completed_rows(pg_engine) == 0
+
+
 @pytest.mark.integration
 async def test_advisory_after_commit_holds_the_lock_for_its_delivery(pg_engine: Any) -> None:
     """Under ``advisory_lock`` the after-commit path delivers under the row's

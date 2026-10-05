@@ -647,7 +647,7 @@ Failed dispatches stay incomplete with `attempt_count` incremented and `last_err
 Exposed via the CLI and as plugin-callable APIs:
 
 - `modulith outbox status` — counts of incomplete, completed, dead-lettered
-- `modulith outbox retry <id>` — force retry of a specific publication
+- `modulith outbox retry <id>` — force retry of a specific publication, ignoring its backoff, under the same claim or advisory lock the sweep takes; a dead-lettered row gets a fresh attempt budget, and a row a live peer holds is left to it (exit code 1)
 - `modulith outbox purge --older-than=30d` — clean up completed records
 - `modulith outbox dead-letter` — list dead-lettered events for manual inspection; `--retry-all` resubmits them
 - `modulith outbox failing` — list publications that are failing but not yet dead-lettered, with attempts, last error and next retry time

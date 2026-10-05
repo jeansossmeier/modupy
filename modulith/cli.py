@@ -1925,42 +1925,17 @@ def outbox_status() -> None:
     typer.echo(f"dead-lettered: {counts['dead_lettered']}")
 
 
-async def _force_retry_known(pub_id: UUID) -> bool:
-    """Retry ``pub_id`` via the outbox; False when no such publication exists.
-
-    ``outbox.force_retry`` only *logs* a warning on the not-found path —
-    invisible whenever the application configures its own logging — so the
-    CLI checks existence itself and reports honestly. Mirrors ``force_retry``'s
-    own lookup strategy: prefer the store's ``find_by_id`` direct point lookup
-    when available, since ``find_incomplete``/``list_dead_lettered`` are both
-    capped windows (LIMIT 100) that can miss a targeted row sitting further
-    back in a large backlog. Stores without ``find_by_id`` fall back to the
-    bounded scan.
-    """
-    store = outbox._store
-    assert store is not None  # _require_outbox_store already ran
-    finder = getattr(store, "find_by_id", None)
-    if finder is not None:
-        pub = await finder(pub_id)
-        if pub is None or pub.completed_at is not None:
-            return False
-        await outbox.force_retry(pub_id)
-        return True
-    candidates = list(await store.find_incomplete(timedelta(0)))
-    candidates += await outbox.list_dead_lettered()
-    if not any(pub.id == pub_id for pub in candidates):
-        return False
-    await outbox.force_retry(pub_id)
-    return True
-
-
 @outbox_app.command("retry")
 def outbox_retry(publication_id: str) -> None:
     """Force retry of a specific publication, bypassing backoff.
 
-    Exit code 1 when the id is not a UUID or names no retryable publication
-    (unknown, or already complete) — success is only reported for ids that
-    were actually resubmitted.
+    A dead-lettered publication gets a fresh attempt budget. A publication
+    another dispatcher currently holds (a peer's claim or advisory lock) is
+    left to that holder and not delivered here.
+
+    Exit code 1 when the id is not a UUID, names no retryable publication
+    (unknown, or already complete), or names one left to its holder —
+    success is only reported for ids that were actually delivered.
     """
     # Argument validation precedes environment preconditions.
     try:
@@ -1970,9 +1945,17 @@ def outbox_retry(publication_id: str) -> None:
         raise typer.Exit(code=1) from None
     _bootstrap_or_exit()
     _require_outbox_store()
-    if not _run_outbox_command(_force_retry_known(pub_id)):
+    outcome = _run_outbox_command(outbox.force_retry(pub_id))
+    if outcome == "not_found":
         typer.echo(
             f"publication {pub_id} not found (or already complete) — nothing was retried",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    if outcome == "held":
+        typer.echo(
+            f"publication {pub_id} is held by another dispatcher — left to its holder, "
+            "nothing was retried",
             err=True,
         )
         raise typer.Exit(code=1)
