@@ -180,15 +180,17 @@ A committed `pyproject.toml` should carry no password. Put the full URL in
   later: under `"lease"` once its lease expires, under `"advisory_lock"` by a
   later sweep once its lock is released, at the latest when the dead
   process's lock connection closes, and under `"none"` by the next sweep.
-  Run one lifespan per process. `outbox.shutdown()` is final: the store it
-  disposes stays bound, and `modulith.bootstrap()` does nothing the second
-  time, so it never rebinds one. A second lifespan in the same process (a
-  second `asyncio.run()` over the same app, say) therefore reuses the disposed
-  store. Its after-commit hook is gone, so every row waits for the retry
-  loop's sweep, and nothing disposes the engine again at the second shutdown.
-  Restart the process instead. Tests that need a second lifespan reset the
-  runtime with `_reset_for_testing`, which the `modulith_app` fixture calls
-  for every test.
+  Run one lifespan per process. `outbox.shutdown()` is final until the next
+  `outbox.configure()`: a publish after it does not restart the retry loop,
+  and `outbox.start()` does nothing. The store it disposes stays bound, and
+  `modulith.bootstrap()` does nothing the second time, so nothing rebinds one
+  or calls `configure()` again. A second lifespan in the same process (a
+  second `asyncio.run()` over the same app, say) therefore finds shutdown
+  final and reuses the disposed store. Its after-commit hook is gone, no
+  retry loop starts to sweep its rows, and nothing disposes the engine again
+  at the second shutdown. Restart the process instead. Tests that need a
+  second lifespan reset the runtime with `_reset_for_testing`, which the
+  `modulith_app` fixture calls for every test.
 
 **Wiring the store yourself.** Bind the store in code, with your own engine,
 when `outbox_url` does not offer what you need: `connect_args` or a

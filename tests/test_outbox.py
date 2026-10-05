@@ -2638,6 +2638,83 @@ async def test_shutdown_cancels_a_sleeping_retry_loop_at_once(
     assert outbox._retry_task is None
 
 
+async def _publish_cascade(kind: str) -> None:
+    if kind == "persist":
+        await outbox.persist(OutboxEvent(value=1))
+    elif kind == "persist_broker_route":
+        await outbox.persist_broker_route(OutboxEvent(value=2), "test:events")
+    else:
+        outbox.start()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["persist", "persist_broker_route", "start"])
+async def test_publish_after_shutdown_does_not_restart_the_retry_loop(kind: str) -> None:
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
+    _bootstrap_with_listener(record)
+    task = outbox._retry_task
+    assert task is not None
+
+    await outbox.shutdown()
+    assert task.done()
+    await _publish_cascade(kind)
+
+    assert outbox._retry_task is None
+
+
+@pytest.mark.asyncio
+async def test_cascade_publish_during_runtime_shutdown_drain_does_not_restart_the_retry_loop() -> (
+    None
+):
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
+    _bootstrap_with_listener(record)
+    assert outbox._retry_task is not None
+
+    await _runtime.shutdown()
+    await outbox.persist(OutboxEvent(value=3))
+
+    assert outbox._retry_task is None
+
+
+@pytest.mark.asyncio
+async def test_configure_after_shutdown_starts_the_retry_loop_again() -> None:
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
+    await outbox.shutdown()
+
+    outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
+
+    assert outbox._retry_task is not None and not outbox._retry_task.done()
+
+
+def test_configure_after_shutdown_lets_a_later_publish_start_the_retry_loop() -> None:
+    store = StubStore()
+    outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
+    _bootstrap_with_listener(record)
+    asyncio.run(outbox.shutdown())
+
+    outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
+
+    async def persist_after_reconfigure() -> None:
+        await outbox.persist(OutboxEvent(value=4))
+        assert outbox._retry_task is not None and not outbox._retry_task.done()
+
+    asyncio.run(persist_after_reconfigure())
+
+
+@pytest.mark.asyncio
+async def test_reset_for_testing_after_shutdown_lets_the_retry_loop_start_again() -> None:
+    outbox.configure(StubStore(), JsonEventSerializer(), retry_interval_seconds=60)
+    await outbox.shutdown()
+
+    outbox._reset_for_testing()
+    outbox.configure(StubStore(), JsonEventSerializer(), retry_interval_seconds=60)
+
+    assert outbox._retry_task is not None and not outbox._retry_task.done()
+
+
 @pytest.mark.asyncio
 async def test_core_store_maintenance_fallbacks_report_public_state() -> None:
     store = CoreOnlyStore()

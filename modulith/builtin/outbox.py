@@ -238,6 +238,11 @@ _retry_task_lock = threading.Lock()
 # threading.Event, because shutdown() may run on another thread's loop.
 _stop_requested = threading.Event()
 
+# Set by shutdown() and read under ``_retry_task_lock``, so a cascading publish
+# during the runtime's drain cannot start a loop after it. Only configure() and
+# _reset_for_testing() clear it: shutdown is final until the next configure().
+_shut_down = False
+
 # Retry-loop tasks currently inside a sweep. Read and written only on each
 # task's own loop, so shutdown() decides "cancel at once" from there.
 _sweeping: set[asyncio.Task[Any]] = set()
@@ -447,6 +452,7 @@ def configure(
     global _dead_letter_after_attempts, _retry_interval_seconds
     global _max_retry_backoff_seconds, _retry_stale_seconds, _retry_loop_enabled
     global _claim_strategy, _claim_lease_seconds, _claim_batch_size, _claim_owner
+    global _shut_down
 
     if completion_mode not in ("update", "delete", "archive"):
         raise ValueError(
@@ -492,6 +498,8 @@ def configure(
 
     _cancel_retry_task()
 
+    with _retry_task_lock:
+        _shut_down = False
     _store = store
     _serializer = serializer
     _completion_mode = completion_mode
@@ -543,7 +551,7 @@ def _ensure_retry_loop() -> None:
     another step, so the ``not _retry_task.done()`` guard alone would block
     every future retry loop for the rest of the process.
 
-    A new loop starts with any earlier ``shutdown()`` stop request cleared.
+    Returns at once after ``shutdown()``, until the next ``configure()``.
     """
     global _retry_task
     try:
@@ -551,6 +559,8 @@ def _ensure_retry_loop() -> None:
     except RuntimeError:
         return
     with _retry_task_lock:
+        if _shut_down:
+            return
         if (
             _retry_task is not None
             and not _retry_task.done()
@@ -1442,7 +1452,8 @@ async def _retry_loop() -> None:
 async def shutdown() -> None:
     """Stop the retry loop, then close what modulith built from ``outbox_url``.
 
-    Idempotent. Once the loop has stopped, a store and engine that
+    Idempotent, and final until the next ``configure()``: a publish after it
+    does not restart the retry loop. Once the loop has stopped, a store and engine that
     ``Runtime.bind_configured_outbox`` created from ``outbox_url`` are
     disposed, closing the engine's pooled connections. A store the
     application passed to ``configure()`` is never disposed: its engine
@@ -1455,6 +1466,9 @@ async def shutdown() -> None:
 
     See ``_stop_retry_loop`` for how the loop is stopped.
     """
+    global _shut_down
+    with _retry_task_lock:
+        _shut_down = True
     task_loop = await _stop_retry_loop()
     await _dispose_owned_resources(task_loop)
 
@@ -1776,9 +1790,10 @@ def _reset_for_testing() -> None:
     global _dead_letter_after_attempts, _retry_interval_seconds
     global _max_retry_backoff_seconds, _retry_stale_seconds, _retry_loop_enabled
     global _claim_strategy, _claim_lease_seconds, _claim_batch_size, _claim_owner
-    global _owned_resources
+    global _owned_resources, _shut_down
     _cancel_retry_task()
     _stop_requested.clear()
+    _shut_down = False
     _owned_resources = None
     _store = None
     _serializer = None

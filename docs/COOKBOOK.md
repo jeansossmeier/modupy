@@ -448,9 +448,10 @@ process left undelivered are swept at startup instead of waiting for the first
 transactional publish. In a single-process app, call `outbox.shutdown()` in the
 lifespan's teardown: it stops the retry loop and closes the engine modulith
 created from `outbox_url`, but never a store or engine you configured
-yourself. Run one lifespan per process: `outbox.shutdown()` is final, so a
-second lifespan in the same process reuses the store it disposed, whose
-after-commit hook is gone and whose rows then wait for the retry loop's sweep.
+yourself. Run one lifespan per process: `outbox.shutdown()` is final until
+the next `outbox.configure()`, so a second lifespan in the same process reuses
+the store it disposed, whose after-commit hook is gone, and no retry loop
+starts to sweep its rows.
 Restart the process instead; tests reset the runtime with
 `_reset_for_testing`, which the `modulith_app` fixture calls for every test.
 The outbox table must live in the

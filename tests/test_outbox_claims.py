@@ -264,7 +264,7 @@ async def test_shutdown_from_another_loop_lets_the_in_flight_store_call_finish()
         foreign_loop.close()
 
 
-async def test_a_retry_loop_started_after_shutdown_dispatches_again() -> None:
+async def test_a_retry_loop_started_by_configure_after_shutdown_dispatches_again() -> None:
     store = StubStore()
     _bootstrap_with_listener(record)
     outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
@@ -272,7 +272,7 @@ async def test_a_retry_loop_started_after_shutdown_dispatches_again() -> None:
     pub = _make_pub(record, value=51)
     await store.save(pub)
 
-    outbox.start()
+    outbox.configure(store, JsonEventSerializer(), retry_interval_seconds=60)
     task = outbox._retry_task
     assert task is not None
     while not store.find_incomplete_calls:
