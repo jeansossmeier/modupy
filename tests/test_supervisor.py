@@ -1364,6 +1364,141 @@ async def test_stop_still_forwards_a_workers_final_lines(caplog) -> None:
     assert forwarded == [f"[orders] final-line-{i}" for i in range(500)]
 
 
+# A worker that hands its pipes to a helper which outlives it, then stays up.
+# argv: pid file, helper source.
+_PIPE_HOLDING_WORKER = """
+import subprocess, sys, time
+helper = subprocess.Popen([sys.executable, "-c", sys.argv[2]])
+with open(sys.argv[1], "a") as f:
+    f.write("%d\\n" % helper.pid)
+time.sleep(30)
+"""
+_CHATTY_HELPER = (
+    "import time\nfor _ in range(600):\n    print('chatter', flush=True)\n    time.sleep(0.05)"
+)
+_QUIET_HELPER = "import time; time.sleep(30)"
+
+
+@pytest.mark.real_process
+async def test_a_chatty_orphan_does_not_keep_a_quiet_workers_forwarders_alive(
+    tmp_path, caplog
+) -> None:
+    """Each forwarder is cancelled once its own pipe has been quiet; output on
+    another worker's pipe must not hold it open until the drain timeout."""
+    caplog.set_level(logging.INFO, logger="modulith.supervisor")
+    pid_file = tmp_path / "descendants"
+    helpers = {"chatty": _CHATTY_HELPER, "quiet": _QUIET_HELPER}
+    sup = Supervisor(
+        [WorkerSpec("chatty", "fakeapp", 9001), WorkerSpec("quiet", "fakeapp", 9002)],
+        command_builder=lambda spec, port: [
+            sys.executable,
+            "-c",
+            _PIPE_HOLDING_WORKER,
+            str(pid_file),
+            helpers[spec.module_name],
+        ],
+        shutdown_timeout=1.0,
+    )
+    await sup.start()
+    quiet = set(sup._instance_log_tasks["quiet"])
+    chatty = set(sup._instance_log_tasks["chatty"])
+    try:
+        deadline = time.monotonic() + 10.0
+        while not any("[chatty] chatter" in r.getMessage() for r in caplog.records):
+            assert time.monotonic() < deadline, "the orphan never started writing"
+            await asyncio.sleep(0.02)
+        while not (pid_file.exists() and len(pid_file.read_text().split()) == 2):
+            assert time.monotonic() < deadline, "the quiet worker never started its helper"
+            await asyncio.sleep(0.02)
+    except BaseException:
+        _kill_descendants(pid_file)
+        await sup.stop()
+        raise
+    stopping = asyncio.create_task(sup.stop())
+    try:
+        deadline = time.monotonic() + 3.0
+        while not all(t.done() for t in quiet) and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+
+        assert all(t.done() for t in quiet), "the quiet worker's forwarders were kept alive"
+        assert not stopping.done()
+        assert any(not t.done() for t in chatty), "the chatty orphan's pipe was cut off early"
+    finally:
+        _kill_descendants(pid_file)
+        await asyncio.wait_for(stopping, timeout=10.0)
+
+
+# A worker whose last output has no trailing newline; a helper holds the pipe.
+# argv: pid file.
+_PARTIAL_LINE_WORKER = """
+import subprocess, sys, time
+sys.stdout.write("last words")
+sys.stdout.flush()
+helper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+with open(sys.argv[1], "a") as f:
+    f.write("%d\\n" % helper.pid)
+time.sleep(30)
+"""
+
+
+@pytest.mark.real_process
+async def test_stop_forwards_a_last_line_without_a_newline_from_a_held_pipe(
+    tmp_path, caplog
+) -> None:
+    """stop() cancels a forwarder whose pipe a descendant holds; the partial
+    line it has read so far is still logged, once."""
+    caplog.set_level(logging.INFO, logger="modulith.supervisor")
+    pid_file = tmp_path / "descendants"
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", 9001)],
+        command_builder=lambda s, p: [sys.executable, "-c", _PARTIAL_LINE_WORKER, str(pid_file)],
+        shutdown_timeout=1.0,
+    )
+    await sup.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while not pid_file.exists() and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert pid_file.exists(), "the worker never started its helper"
+
+        await sup.stop()
+    finally:
+        _kill_descendants(pid_file)
+
+    forwarded = [r.getMessage() for r in caplog.records if "last words" in r.getMessage()]
+    assert forwarded == ["[orders] last words"]
+
+
+@pytest.mark.real_process
+async def test_a_last_line_without_a_newline_is_forwarded_at_eof(caplog) -> None:
+    """Lines split across reads stay whole, and the unterminated tail is
+    logged at the severity of the stream it came from."""
+    caplog.set_level(logging.INFO, logger="modulith.supervisor")
+    spec = WorkerSpec("orders", "fakeapp", 9001)
+    command = [
+        sys.executable,
+        "-c",
+        "import sys, time\n"
+        "sys.stderr.write('par'); sys.stderr.flush(); time.sleep(0.1)\n"
+        "sys.stderr.write('tial\\nnext\\ntail with no newline'); sys.stderr.flush()",
+    ]
+    sup = Supervisor([spec], command_builder=lambda s, p: command)
+
+    proc = await sup._spawn("orders", spec, 9001)
+    await proc.wait()
+    await asyncio.gather(*list(sup._log_tasks), return_exceptions=True)
+
+    forwarded = [
+        (r.levelno, r.getMessage()) for r in caplog.records if r.name.endswith("supervisor")
+    ]
+    assert [m for _, m in forwarded if m.startswith("[orders]")] == [
+        "[orders] partial",
+        "[orders] next",
+        "[orders] tail with no newline",
+    ]
+    assert {lvl for lvl, m in forwarded if m.startswith("[orders]")} == {logging.WARNING}
+
+
 @pytest.mark.real_process
 async def test_a_raising_listener_is_logged_and_the_worker_is_still_restarted(caplog) -> None:
     calls: list[int] = []

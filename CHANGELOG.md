@@ -118,6 +118,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - On the SHM broker, the stale-target warning at consumer start no longer claims that new publishes keep adding to the stale subscription, which SHM has already dropped
 - A consumer restart under `no_subscriber_policy="store"` writes the replay ledger with one query per page of retained messages instead of one per message
 - Redis Streams replicas no longer run a message's listeners twice when a peer's reclaim fires while a replica is still working through a read or reclaimed batch: each entry's claim is renewed before it is dispatched, and an entry a peer took is skipped. `reclaim_min_idle_ms` now only has to exceed one listener call, not a whole batch
+- A worker's last output line without a trailing newline reaches the supervisor log, also when `modulith run --topology processes` stops a worker whose child still holds its pipe, and a worker still writing no longer keeps the other workers' quiet log pipes open at stop or respawn
 
 ### Security
 

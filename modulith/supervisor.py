@@ -77,10 +77,14 @@ _MAX_LEVEL_TOKEN_LEN = max(len(name) for name in _LEVEL_TOKENS)
 # Draining is expected to be near-instant — this is a safety backstop, not a
 # tunable, so it isn't threaded through Supervisor.__init__.
 _LOG_DRAIN_TIMEOUT = 5.0
-# A forwarder that has received no line for this long after its process died
+# A forwarder that has received nothing for this long after its process died
 # is waiting on a pipe a surviving descendant holds open, not on unread output:
-# stop() cancels it then rather than waiting out _LOG_DRAIN_TIMEOUT.
+# it is cancelled then rather than waiting out _LOG_DRAIN_TIMEOUT.
 _LOG_QUIET_PERIOD = 0.5
+# Longest worker line forwarded whole, and the size of each pipe read. It
+# equals asyncio's default StreamReader limit, so the reader's own buffer
+# never overruns first.
+_LOG_LINE_LIMIT = 2**16
 # How often a waiter re-checks a worker's returncode (see _exited).
 _EXIT_POLL_INTERVAL = 0.05
 
@@ -397,8 +401,9 @@ class Supervisor:
         # The forwarders of each instance's current spawn, so a respawn can
         # settle the previous spawn's (see _release_spawn).
         self._instance_log_tasks: dict[str, set[asyncio.Task[None]]] = {}
-        # Monotonic time any forwarder last received a line; read by stop().
-        self._last_log_line = 0.0
+        # Monotonic time each live forwarder last read output; read by
+        # _drain_log_tasks to cancel a forwarder whose own pipe has gone quiet.
+        self._last_log_read: dict[asyncio.Task[Any] | None, float] = {}
         # Instances the breaker has given up on — surfaced for health reporting.
         self._failed_instances: set[str] = set()
         self._stopping = False
@@ -514,6 +519,7 @@ class Supervisor:
         for tasks in (self._log_tasks, instance_tasks):
             tasks.add(task)
             task.add_done_callback(tasks.discard)
+        task.add_done_callback(lambda done: self._last_log_read.pop(done, None))
 
     async def _drain_log_tasks(self, log_tasks: set[asyncio.Task[None]]) -> None:
         """Give the forwarders of dead processes a bounded grace period, then cancel.
@@ -521,21 +527,27 @@ class Supervisor:
         Every process is dead by now, so its last output already sits in the
         OS pipe buffer and the forwarders should reach EOF almost immediately.
         Cancelling them unconditionally could drop a crashing worker's last,
-        most diagnostically useful lines. A forwarder that stays quiet for
-        _LOG_QUIET_PERIOD is waiting on a pipe a surviving descendant holds
-        open, and is cancelled then.
+        most diagnostically useful lines. A forwarder whose own pipe stays quiet
+        for _LOG_QUIET_PERIOD is waiting on a pipe a surviving descendant holds
+        open, and is cancelled then, however much the others are still reading.
         """
         pending = set(log_tasks)  # done-callbacks discard from the original
-        drain_deadline = time.monotonic() + _LOG_DRAIN_TIMEOUT
+        started = time.monotonic()
         while pending:
             _, pending = await asyncio.wait(pending, timeout=_LOG_QUIET_PERIOD)
             now = time.monotonic()
-            quiet = now - self._last_log_line >= _LOG_QUIET_PERIOD
-            if pending and (quiet or now >= drain_deadline):
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-                break
+            if now - started >= _LOG_DRAIN_TIMEOUT:
+                stale = pending
+            else:
+                stale = {
+                    task
+                    for task in pending
+                    if now - max(started, self._last_log_read.get(task, 0.0)) >= _LOG_QUIET_PERIOD
+                }
+            for task in stale:
+                task.cancel()
+            await asyncio.gather(*stale, return_exceptions=True)
+            pending = pending - stale
 
     @staticmethod
     def _close_transport(proc: asyncio.subprocess.Process) -> None:
@@ -704,30 +716,50 @@ class Supervisor:
         what keeps a worker's routine INFO chatter out of an operator's
         warning-level view.
 
-        ``readline()`` raises ``ValueError`` when a single line exceeds the
-        stream's buffer limit (e.g. an unbounded stack trace or a bulk debug
-        dump) — it already discards the offending bytes from its internal
-        buffer before raising, so the next ``readline()`` call cleanly picks
-        up at the following line. Using ``async for line in stream`` instead
-        would let that ValueError escape the loop and permanently silence
-        this worker's log forwarding after just one oversized line.
+        The stream is read in chunks into a local buffer rather than with
+        ``readline()``, because ``readline()`` keeps a partial line inside the
+        reader: when stop() cancels a forwarder whose pipe a descendant holds
+        open, that unterminated last line would be lost. Whatever the buffer
+        holds is logged as one final line at EOF, on cancellation and on a
+        pipe error. A line longer than ``_LOG_LINE_LIMIT`` (an unbounded stack
+        trace or a bulk debug dump) is replaced by one truncation notice and
+        skipped up to its newline, so forwarding carries on after it.
         """
+        buffer = b""
+        skipping = False  # inside a line already reported as oversized
         try:
-            while True:
-                try:
-                    line = await stream.readline()
-                except ValueError:
-                    logger.warning("[%s] <log line exceeded the buffer limit; truncated>", prefix)
-                    continue
-                if not line:
-                    return  # EOF
-                self._last_log_line = time.monotonic()
-                text = line.decode(errors="replace").rstrip()
-                logger.log(_line_level(text, default_level), "[%s] %s", prefix, text)
+            while chunk := await stream.read(_LOG_LINE_LIMIT):
+                self._last_log_read[asyncio.current_task()] = time.monotonic()
+                *lines, buffer = (buffer + chunk).split(b"\n")
+                for raw in lines:
+                    if skipping:
+                        skipping = False
+                    elif len(raw) > _LOG_LINE_LIMIT:
+                        self._warn_line_truncated(prefix)
+                    else:
+                        self._log_worker_line(prefix, raw, default_level)
+                if skipping:
+                    buffer = b""
+                elif len(buffer) > _LOG_LINE_LIMIT:
+                    self._warn_line_truncated(prefix)
+                    skipping = True
+                    buffer = b""
         except asyncio.CancelledError:
             raise
         except Exception:  # a dead pipe must not crash the supervisor
             logger.debug("log forwarder for %s stopped", prefix, exc_info=True)
+        finally:
+            if buffer:
+                self._log_worker_line(prefix, buffer, default_level)
+
+    @staticmethod
+    def _warn_line_truncated(prefix: str) -> None:
+        logger.warning("[%s] <log line exceeded the buffer limit; truncated>", prefix)
+
+    @staticmethod
+    def _log_worker_line(prefix: str, raw: bytes, default_level: int) -> None:
+        text = raw.decode(errors="replace").rstrip()
+        logger.log(_line_level(text, default_level), "[%s] %s", prefix, text)
 
     async def stop(self) -> None:
         """Shut down every worker; graceful only where the platform allows it.
