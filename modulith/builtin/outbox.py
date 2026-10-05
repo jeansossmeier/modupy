@@ -1184,7 +1184,11 @@ async def _sweep_advisory(older_than: timedelta, *, runtime_ready: bool) -> None
     When the lock pool has no free connection within its timeout, the
     after-commit dispatches of a burst hold all of them. Waiting that timeout
     again for every remaining row would only stretch this sweep, so the
-    sweep stops and the next one resumes the batch."""
+    sweep stops and the next one resumes the batch.
+
+    A row another dispatcher holds the lock of is left to it. Each such row is
+    logged at DEBUG as it is skipped, and a sweep that skipped any ends with
+    one INFO line counting them."""
     assert _store is not None
     pending = await _store.find_incomplete(older_than)
     if pending and not runtime_ready:
@@ -1194,15 +1198,17 @@ async def _sweep_advisory(older_than: timedelta, *, runtime_ready: bool) -> None
             len(pending),
         )
         return
+    skipped = 0
     for pub in pending:
         if _stop_requested.is_set():
-            return
+            break
         if pub.attempt_count >= _dead_letter_after_attempts:
             continue
         if not _backoff_elapsed(pub) or _foreign_to_this_worker(pub):
             continue
         try:
-            await _dispatch_under_advisory_lock(pub)
+            if not await _dispatch_under_advisory_lock(pub):
+                skipped += 1
         except _LockConnectionTimeout:
             logger.warning(
                 "outbox sweep: no advisory-lock connection for publication %s "
@@ -1210,24 +1216,37 @@ async def _sweep_advisory(older_than: timedelta, *, runtime_ready: bool) -> None
                 "to the next sweep",
                 pub.id,
             )
-            return
+            break
+    if skipped:
+        logger.info("outbox sweep: skipped %d row(s) locked by another dispatcher", skipped)
 
 
-async def _dispatch_under_advisory_lock(publication: EventPublication) -> None:
+async def _dispatch_under_advisory_lock(publication: EventPublication) -> bool:
     """Deliver ``publication`` while holding its advisory lock; skip it when
     another dispatcher (a peer's sweep or after-commit task) holds the lock.
+
+    Returns False when the lock was held elsewhere and the row was skipped,
+    True when this call took the lock.
 
     ``publication`` may have been read before locking, and a peer may have
     delivered or failed the row and released its lock since, so it is re-read
     under the lock and delivered only if still pending and past its backoff.
     Both the advisory sweep and the Postgres adapter's after-commit dispatch
     route through here.
+
+    A release that raises is logged at WARNING and does not propagate: the
+    dispatch and its bookkeeping are done by then, the built-in store has
+    already invalidated the lock's connection, and an error from here would
+    replace the dispatch's own, record a failed dispatch and stop the sweep's
+    batch.
     """
     assert _store is not None
     store_any: Any = _store  # AdvisoryLockingStore capability
     handle = await store_any.try_lock_publication(publication.id)
     if handle is None:
-        return
+        logger.debug("publication %s is locked by another dispatcher; skipping it", publication.id)
+        return False
+    delivered = False
     try:
         finder = getattr(_store, "find_by_id", None)
         current = await finder(publication.id) if finder is not None else publication
@@ -1238,8 +1257,18 @@ async def _dispatch_under_advisory_lock(publication: EventPublication) -> None:
             and _backoff_elapsed(current)
         ):
             await _dispatch_publication(current)
+            delivered = current.completed_at is not None
     finally:
-        await store_any.unlock_publication(handle, publication.id)
+        try:
+            await store_any.unlock_publication(handle, publication.id)
+        except Exception:
+            logger.warning(
+                "publication %s: %s its advisory lock failed",
+                publication.id,
+                "delivered, but releasing" if delivered else "releasing",
+                exc_info=True,
+            )
+    return True
 
 
 async def _dispatch_with_lease_renewal(publication: EventPublication) -> None:

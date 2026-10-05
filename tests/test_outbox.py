@@ -1174,6 +1174,185 @@ async def test_advisory_sweep_dispatches_the_reread_row() -> None:
     assert store.locks == {}
 
 
+def _outbox_messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records if r.name == "modulith.outbox" and r.levelno == level
+    ]
+
+
+@pytest.mark.asyncio
+async def test_advisory_sweep_logs_rows_skipped_for_a_held_lock(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A row whose advisory lock a peer holds is skipped. Each skip leaves a
+    DEBUG line naming the row, and the sweep ends with one INFO line counting
+    them, so a lock that never frees shows in the sweep log."""
+    store = ClaimingStubStore(supports_advisory_lock=True)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+    _bootstrap_with_listener(record)
+    held_a, held_b, free = (_make_pub(record, value=n) for n in (1, 2, 3))
+    for pub in (held_a, held_b, free):
+        await store.save(pub)
+    store.locks[held_a.id] = object()
+    store.locks[held_b.id] = object()
+
+    with caplog.at_level(logging.DEBUG, logger="modulith.outbox"):
+        await outbox._sweep(timedelta(0))
+
+    skips = [
+        m for m in _outbox_messages(caplog, logging.DEBUG) if "locked by another dispatcher" in m
+    ]
+    summaries = _outbox_messages(caplog, logging.INFO)
+    assert len(skips) == 2
+    assert str(held_a.id) in skips[0]
+    assert str(held_b.id) in skips[1]
+    assert len(summaries) == 1
+    assert "skipped 2 row(s) locked by another dispatcher" in summaries[0]
+    assert received == [3]
+
+
+@pytest.mark.asyncio
+async def test_advisory_sweep_that_skips_nothing_logs_no_skip_summary(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = ClaimingStubStore(supports_advisory_lock=True)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+    _bootstrap_with_listener(record)
+    for n in (1, 2):
+        await store.save(_make_pub(record, value=n))
+
+    with caplog.at_level(logging.DEBUG, logger="modulith.outbox"):
+        await outbox._sweep(timedelta(0))
+
+    assert received == [1, 2]
+    assert [
+        m
+        for level in (logging.DEBUG, logging.INFO)
+        for m in _outbox_messages(caplog, level)
+        if "locked by another dispatcher" in m
+    ] == []
+
+
+class LockPoolExhaustedStore(ClaimingStubStore):
+    """Advisory-lock store that finds no free lock connection for one row."""
+
+    def __init__(self, exhausted_for: UUID) -> None:
+        super().__init__(supports_advisory_lock=True)
+        self.exhausted_for = exhausted_for
+
+    async def try_lock_publication(self, publication_id: UUID) -> object | None:
+        if publication_id == self.exhausted_for:
+            raise outbox._LockConnectionTimeout("no free lock connection")
+        return await super().try_lock_publication(publication_id)
+
+
+@pytest.mark.asyncio
+async def test_advisory_sweep_cut_short_by_a_lock_pool_timeout_still_counts_its_skips(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    held, exhausted, untouched = (_make_pub(record, value=n) for n in (1, 2, 3))
+    store = LockPoolExhaustedStore(exhausted.id)
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+    _bootstrap_with_listener(record)
+    for pub in (held, exhausted, untouched):
+        await store.save(pub)
+    store.locks[held.id] = object()
+
+    with caplog.at_level(logging.INFO, logger="modulith.outbox"):
+        await outbox._sweep(timedelta(0))
+
+    assert len(_outbox_messages(caplog, logging.WARNING)) == 1
+    summaries = _outbox_messages(caplog, logging.INFO)
+    assert len(summaries) == 1
+    assert "skipped 1 row(s) locked by another dispatcher" in summaries[0]
+    assert received == []
+
+
+class UnlockFailingStore(ClaimingStubStore):
+    """Advisory-lock store whose release raises. Like the real adapter, it has
+    already dropped the lock by the time it raises."""
+
+    def __init__(self) -> None:
+        super().__init__(supports_advisory_lock=True)
+
+    async def unlock_publication(self, handle: object, publication_id: UUID) -> None:
+        await super().unlock_publication(handle, publication_id)
+        raise ConnectionError("lock connection lost")
+
+
+@pytest.mark.asyncio
+async def test_unlock_failure_after_delivery_does_not_abort_the_sweep(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The row is delivered and completed before its lock is released, so a
+    release that raises is a WARNING. It is not a failed dispatch and it does
+    not stop the rows behind it."""
+    store = UnlockFailingStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+    _bootstrap_with_listener(record)
+    first, second = _make_pub(record, value=1), _make_pub(record, value=2)
+    await store.save(first)
+    await store.save(second)
+
+    with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
+        await outbox._sweep(timedelta(0))
+
+    warnings = [r for r in caplog.records if r.name == "modulith.outbox"]
+    assert received == [1, 2]
+    assert store.completed == [first.id, second.id]
+    assert [(p.attempt_count, p.last_error) for p in (first, second)] == [(0, None), (0, None)]
+    assert store.saved == [first.id, second.id]
+    assert [r.levelno for r in warnings] == [logging.WARNING, logging.WARNING]
+    assert "delivered, but releasing its advisory lock failed" in warnings[0].getMessage()
+    assert str(first.id) in warnings[0].getMessage()
+    assert str(second.id) in warnings[1].getMessage()
+    assert all(r.exc_info is not None for r in warnings)
+
+
+@pytest.mark.asyncio
+async def test_unlock_failure_after_a_failed_delivery_claims_no_delivery(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The listener failure is recorded once, by the dispatch. The release
+    that raises afterwards is logged without saying the row was delivered."""
+    store = UnlockFailingStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+    _bootstrap_with_listener(boom)
+    pub = _make_pub(boom, value=1)
+    await store.save(pub)
+
+    with caplog.at_level(logging.WARNING, logger="modulith.outbox"):
+        await outbox._sweep(timedelta(0))
+
+    warnings = _outbox_messages(caplog, logging.WARNING)
+    assert pub.attempt_count == 1
+    assert pub.completed_at is None
+    assert len(warnings) == 1
+    assert "releasing its advisory lock failed" in warnings[0]
+    assert str(pub.id) in warnings[0]
+    assert "delivered" not in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_unlock_failure_does_not_mask_the_dispatch_error() -> None:
+    """When the dispatch itself raises, that error reaches the caller, not the
+    one from releasing the lock afterwards."""
+
+    class SaveFailingStore(UnlockFailingStore):
+        async def save(self, publication: EventPublication) -> None:
+            if publication.attempt_count:
+                raise TimeoutError("store down while recording the failure")
+            await super().save(publication)
+
+    store = SaveFailingStore()
+    outbox.configure(store, JsonEventSerializer(), claim_strategy="advisory_lock", start_loop=False)
+    _bootstrap_with_listener(boom)
+    await store.save(_make_pub(boom, value=1))
+
+    with pytest.raises(TimeoutError, match="store down"):
+        await outbox._sweep(timedelta(0))
+
+
 @pytest.mark.asyncio
 async def test_legacy_store_falls_back_to_find_incomplete_under_default_lease() -> None:
     """Third-party stores without ClaimingStore keep the original path."""
