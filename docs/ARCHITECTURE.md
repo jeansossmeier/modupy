@@ -791,9 +791,12 @@ still queued behind the concurrency gate when the consumer died are reclaimed
 without losing an attempt. A consumer that stops gracefully hands such rows back
 itself (`release_claims`, owner-guarded and limited to rows whose dispatch never
 started), so a peer claims them on its next poll instead of after
-`reclaim_stale_seconds`. Rows already dispatching beside a crash-looping row are
-charged with it, so with `dispatch_concurrency` above 1 a crash loop can still
-dead-letter those.
+`reclaim_stale_seconds`. A stop that cancels a running listener also hands that
+row back uncharged (`release_interrupted_claims`, database and SHM brokers) when
+the listener ran for less than `reclaim_stale_seconds * 10`; past that the row
+stays claimed and the reclaim charges it. Rows already dispatching beside a
+crash-looping row are charged with it, so with `dispatch_concurrency` above 1 a
+crash loop can still dead-letter those.
 
 *Completions are owner-guarded.* `ack` / `fail` / `dead_letter` are each a
 compare-and-swap on `status='claimed' AND claimed_by=<this consumer>`: a late

@@ -28,7 +28,14 @@ class ConsumerEvent:
     name: str
 
 
+@event
+@dataclass(frozen=True)
+class SiblingEvent:
+    text: str
+
+
 EVENT_TYPE = f"{ConsumerEvent.__module__}.{ConsumerEvent.__qualname__}"
+SIBLING_EVENT_TYPE = f"{SiblingEvent.__module__}.{SiblingEvent.__qualname__}"
 TARGET = "orders-stream"
 GROUP = "inventory"
 
@@ -54,11 +61,12 @@ def _consumer(
     **options: Any,
 ) -> ShmConsumer:
     poll_interval_s = options.pop("poll_interval_s", 0.01)
+    consumer_name = options.pop("consumer_name", "worker-1")
     return ShmConsumer(
         broker=broker,
         bus=bus,
         serializer=serializer,
-        consumer_name="worker-1",
+        consumer_name=consumer_name,
         group=GROUP,
         targets=[TARGET],
         poll_interval_s=poll_interval_s,
@@ -515,6 +523,43 @@ async def test_delivers_real_event_when_target_differs_from_event_type(
         await consumer.stop()
 
 
+async def test_consumer_completes_a_foreign_type_on_a_target_it_consumes_without_dead_lettering(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    delivered: list[str] = []
+
+    async def handle(item: ConsumerEvent) -> None:
+        delivered.append(item.name)
+
+    bus = InMemoryEventBus()
+    bus.register(ConsumerEvent, handle)
+    serializer = JsonEventSerializer(allowed_event_types=[ConsumerEvent])
+    instance = ShmBroker(
+        shm_name="foreign-type-hints",
+        db_path=str(tmp_path / "consumer.db"),
+        completion_mode="mark",
+    )
+    consumer = _consumer(instance, bus, serializer)
+    caplog.set_level(logging.DEBUG, logger="modulith")
+    try:
+        await consumer.start()
+        try:
+            # An undecodable payload proves the foreign row is never deserialized.
+            await instance.publish(TARGET, b"not json", {"event_type": SIBLING_EVENT_TYPE})
+            await instance.publish(*_publication(serializer, "w1"))
+            await _until(lambda: _delivery_state(instance) == [("done", 0), ("done", 0)])
+        finally:
+            await consumer.stop()
+    finally:
+        await _close_test_broker(instance)
+
+    assert delivered == ["w1"]
+    assert [r.levelno for r in caplog.records if SIBLING_EVENT_TYPE in r.getMessage()] == [
+        logging.DEBUG
+    ]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 async def test_dispatch_batch_bounds_malformed_id_logs_and_delivers_valid_row(
     broker: ShmBroker,
     caplog: pytest.LogCaptureFixture,
@@ -650,6 +695,80 @@ async def test_stop_mid_batch_hands_the_deliveries_it_never_started_to_a_peer_at
     assert len(delivered) == 1
     assert sorted(delivered + released) == ["a", "b", "c"]
     assert [row["attempts"] for row in peer] == [0, 0]
+
+
+async def _stop_consumer_mid_listener(
+    broker: ShmBroker, *, consumer_name: str, reclaim_stale_seconds: float, run_s: float
+) -> None:
+    """Start a consumer whose listener never returns, let it run ``run_s``, then stop it."""
+    running = asyncio.Event()
+
+    async def handler(_item: ConsumerEvent) -> None:
+        running.set()
+        await asyncio.sleep(3600)
+
+    bus = InMemoryEventBus()
+    bus.register(ConsumerEvent, handler)
+    consumer = _consumer(
+        broker,
+        bus,
+        JsonEventSerializer(allowed_event_types=[ConsumerEvent]),
+        consumer_name=consumer_name,
+        batch_size=1,
+        max_attempts=3,
+        reclaim_stale_seconds=reclaim_stale_seconds,
+    )
+    await consumer.start()
+    try:
+        await asyncio.wait_for(running.wait(), timeout=5.0)
+        await asyncio.sleep(run_s)
+    finally:
+        await consumer.stop()
+
+
+async def _publish_one_event(broker: ShmBroker) -> None:
+    await broker.subscribe([TARGET], GROUP)
+    await broker.publish(*_publication(JsonEventSerializer(), "w1"))
+
+
+async def test_graceful_stops_of_a_running_listener_never_charge_its_row_an_attempt(
+    broker: ShmBroker,
+) -> None:
+    """A stop cancels a healthy listener; that is no listener failure. Three
+    restarts must not spend the row's three attempts, and a peer claims the row
+    at once instead of after ``reclaim_stale_seconds``."""
+    await _publish_one_event(broker)
+
+    for stop in range(1, 4):
+        await _stop_consumer_mid_listener(
+            broker, consumer_name=f"worker-{stop}", reclaim_stale_seconds=0.6, run_s=0.0
+        )
+        attempts = [attempts for _status, attempts in _delivery_state(broker)]
+        assert attempts == [0], f"stop {stop} charged an attempt"
+
+    peer = await broker.claim_batch(
+        GROUP, batch_size=10, consumer_name="peer", reclaim_stale_seconds=3600.0
+    )
+    assert [row["attempts"] for row in peer] == [0]
+
+
+async def test_graceful_stop_after_the_stuck_dispatch_threshold_still_charges_the_row(
+    broker: ShmBroker,
+) -> None:
+    """A listener that ran past ``reclaim_stale_seconds * 10`` is hung, not
+    healthy: its row stays claimed so the reclaim charges it, and a listener
+    that hangs on every delivery still ends dead-lettered."""
+    await _publish_one_event(broker)
+
+    await _stop_consumer_mid_listener(
+        broker, consumer_name="worker-1", reclaim_stale_seconds=0.05, run_s=0.6
+    )
+
+    assert _delivery_state(broker) == [("claimed", 0)]
+    peer = await broker.claim_batch(
+        GROUP, batch_size=10, consumer_name="peer", reclaim_stale_seconds=0.0
+    )
+    assert [row["attempts"] for row in peer] == [1]
 
 
 async def test_cancelling_guarded_renewal_propagates_and_releases_in_flight(

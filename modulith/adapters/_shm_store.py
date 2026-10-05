@@ -248,6 +248,13 @@ class SqliteQueueStore:
             lambda: _shm_claims.release_claims(self._conn, values, consumer_name)
         )
 
+    def release_interrupted_claims(self, values: list[ClaimToken | str], consumer_name: str) -> int:
+        return self._consumer_write(
+            lambda: _shm_claims.release_claims(
+                self._conn, values, consumer_name, include_started=True
+            )
+        )
+
     def ack(
         self,
         value: ClaimToken | str,

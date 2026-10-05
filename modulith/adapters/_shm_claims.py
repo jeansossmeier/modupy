@@ -255,28 +255,32 @@ def release_claims(
     conn: sqlite3.Connection,
     values: list[ClaimToken | str],
     consumer_name: str,
+    include_started: bool = False,
 ) -> int:
-    """Return the caller's claims it never started dispatching to pending.
+    """Return the caller's claims to pending, uncharged.
 
-    Only complete delivery-generation tokens the caller still owns, whose
-    ``dispatch_started`` is 0, are released: another consumer claims them at
-    once instead of after ``reclaim_stale_seconds``. Nothing is charged, so
-    attempts, ``available_at`` and ``last_error`` stay as they were.
-    ``claim_generation`` is left alone because ``claim`` bumps it on the next
-    claim, which fences every token from before the release.
+    Only complete delivery-generation tokens the caller still owns are
+    released: another consumer claims them at once instead of after
+    ``reclaim_stale_seconds``. A claim whose ``dispatch_started`` is 1 is
+    released only with ``include_started``, which is for a stop that cancelled
+    its listener. Nothing is charged, so attempts, ``available_at`` and
+    ``last_error`` stay as they were. ``claim_generation`` is left alone
+    because ``claim`` bumps it on the next claim, which fences every token
+    from before the release.
     """
     consumer_name = require_consumer_name(consumer_name)
     tokens = [ClaimToken.decode(value) for value in values]
     if not tokens:
         return 0
+    started_guard = "" if include_started else " AND dispatch_started=0"
     released = 0
     with immediate_transaction(conn):
         for token in tokens:
             cursor = conn.execute(
                 f"""
                 UPDATE shm_delivery
-                SET status='pending', claimed_at=NULL, claimed_by=NULL
-                WHERE {owned_predicate()} AND dispatch_started=0
+                SET status='pending', claimed_at=NULL, claimed_by=NULL, dispatch_started=0
+                WHERE {owned_predicate()}{started_guard}
                 """,
                 (token.delivery_id, consumer_name, token.generation),
             )

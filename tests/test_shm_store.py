@@ -1732,6 +1732,124 @@ def test_synchronous_release_claims_validates_owner_before_opening_transaction(
         store.release_claims([], "")
 
 
+async def test_release_interrupted_claims_hands_a_started_claim_back_without_a_charge(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "release-interrupted.db"
+    store = await _published_store(
+        path,
+        retry_backoff_base_seconds=0.03,
+        retry_backoff_cap_seconds=0.03,
+    )
+    columns = (
+        "status, attempts, available_at, last_error, claimed_at, claimed_by, "
+        "dispatch_started, completed_at"
+    )
+    try:
+        first = (await store.claim("g1", consumer_name="worker-1"))[0]
+        assert await store.fail(first["claim_token"], "temporary", 3, consumer_name="worker-1")
+        await asyncio.sleep(0.04)
+        retried = (await store.claim("g1", consumer_name="worker-1"))[0]
+        assert retried["attempts"] == 1
+        assert await store.renew_claims([retried["claim_token"]], "worker-1", start_dispatch=True)
+        claimed = _delivery_state(path, columns)
+        assert claimed[0]["dispatch_started"] == 1
+
+        assert await store.release_interrupted_claims([retried["claim_token"]], "worker-1") == 1
+
+        assert _delivery_state(path, columns) == [
+            {
+                **claimed[0],
+                "status": "pending",
+                "claimed_at": None,
+                "claimed_by": None,
+                "dispatch_started": 0,
+            }
+        ]
+        (peer,) = await store.claim("g1", consumer_name="worker-2", reclaim_stale_seconds=3600)
+        assert (peer["message_id"], peer["attempts"], peer["last_error"]) == (
+            "publication-1",
+            1,
+            "temporary",
+        )
+    finally:
+        await store.close()
+
+
+async def test_release_interrupted_claims_leaves_a_claim_another_consumer_owns(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "release-interrupted-owner.db"
+    store = await _published_store(path)
+    try:
+        row = (await store.claim("g1", consumer_name="worker-1"))[0]
+        assert await store.renew_claims([row["claim_token"]], "worker-1", start_dispatch=True)
+        before = _delivery_state(path)
+        assert (before[0]["status"], before[0]["claimed_by"], before[0]["dispatch_started"]) == (
+            "claimed",
+            "worker-1",
+            1,
+        )
+
+        assert await store.release_interrupted_claims([row["claim_token"]], "worker-2") == 0
+
+        assert _delivery_state(path) == before
+    finally:
+        await store.close()
+
+
+async def test_release_interrupted_claims_leaves_a_claim_a_stale_reclaim_replaced(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "release-interrupted-stale.db"
+    store = await _published_store(path)
+    try:
+        first = (await store.claim("g1", consumer_name="worker-1"))[0]
+        assert await store.renew_claims([first["claim_token"]], "worker-1", start_dispatch=True)
+        await asyncio.sleep(0.01)
+        second = (await store.claim("g1", consumer_name="worker-2", reclaim_stale_seconds=0))[0]
+        assert await store.renew_claims([second["claim_token"]], "worker-2", start_dispatch=True)
+        before = _delivery_state(path)
+        assert (before[0]["status"], before[0]["claimed_by"], before[0]["dispatch_started"]) == (
+            "claimed",
+            "worker-2",
+            1,
+        )
+
+        assert await store.release_interrupted_claims([first["claim_token"]], "worker-1") == 0
+        # The current owner presenting the replaced token differs only by generation.
+        assert await store.release_interrupted_claims([first["claim_token"]], "worker-2") == 0
+
+        assert _delivery_state(path) == before
+        assert await store.release_interrupted_claims([second["claim_token"]], "worker-2") == 1
+    finally:
+        await store.close()
+
+
+async def test_release_interrupted_claims_counts_only_the_deliveries_it_released(
+    tmp_path: Path,
+) -> None:
+    store = ShmColdStore(str(tmp_path / "release-interrupted-count.db"))
+    try:
+        await store.subscribe(["events.Created"], "g1")
+        for index in range(3):
+            await store.publish("events.Created", b"x", publication_id=f"publication-{index}")
+        tokens = [row["claim_token"] for row in await store.claim("g1", consumer_name="worker-1")]
+        assert await store.renew_claims([tokens[1]], "worker-1", start_dispatch=True) == 1
+        assert await store.release_claims([tokens[0]], "worker-1") == 1
+
+        assert await store.release_interrupted_claims(tokens, "worker-1") == 2
+
+        reclaimed = await store.claim("g1", consumer_name="worker-2", reclaim_stale_seconds=3600)
+        assert [(row["message_id"], row["attempts"]) for row in reclaimed] == [
+            ("publication-0", 0),
+            ("publication-1", 0),
+            ("publication-2", 0),
+        ]
+    finally:
+        await store.close()
+
+
 async def test_failure_applies_backoff_then_dead_letters_at_attempt_cap(
     tmp_path: Path,
 ) -> None:

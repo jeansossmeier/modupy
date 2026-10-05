@@ -451,6 +451,18 @@ class ShmBroker:
         claim_tokens: list[ClaimToken | str] = list(row_ids)
         return await self._cold.release_claims(claim_tokens, consumer_name)
 
+    async def release_interrupted_claims(self, row_ids: list[str], *, consumer_name: str) -> int:
+        """Return claims whose listener a stop cancelled to pending, uncharged.
+
+        Unlike ``release_claims`` this also releases claims whose dispatch
+        started, and clears that mark: a stop cancelling a healthy listener is
+        no listener failure. The consumer withholds claims whose listener ran
+        past the stuck-dispatch threshold, which a stale reclaim then charges.
+        Only claims whose owner and generation still match are released.
+        """
+        claim_tokens: list[ClaimToken | str] = list(row_ids)
+        return await self._cold.release_interrupted_claims(claim_tokens, consumer_name)
+
     async def ack(self, row_id: str, *, consumer_name: str) -> None:
         """Complete one currently owned claim using its fencing token."""
         await self._cold.ack(
