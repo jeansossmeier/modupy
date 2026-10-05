@@ -781,6 +781,13 @@ def _install_sqlite_pragmas(engine: Any, busy_timeout_ms: int, synchronous: str)
             cursor.execute(f"PRAGMA busy_timeout={timeout}")
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute(f"PRAGMA synchronous={sync_mode}")
+        except BaseException:
+            # A deadline cancelling this setup leaves the statement already
+            # handed to the aiosqlite worker thread running, on a connection the
+            # pool never sees. Closing waits for it, so nothing the caller's
+            # TimeoutError has already given up on takes the file lock late.
+            dbapi_connection.close()
+            raise
         finally:
             cursor.close()
 

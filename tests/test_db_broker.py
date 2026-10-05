@@ -4838,6 +4838,58 @@ async def test_real_sqlite_schema_lock_times_out_without_late_creation(
         await broker.close()
 
 
+async def test_schema_timeout_leaves_no_statement_running_on_the_worker_thread(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """A statement already handed to the aiosqlite worker thread when the schema
+    deadline fires must have finished before ``TimeoutError`` surfaces; otherwise
+    it runs after the caller released its lock and takes the file with it."""
+    import aiosqlite.core as aiosqlite_core
+
+    import modulith.adapters.db_broker as db_broker_module
+
+    monkeypatch.setattr(db_broker_module, "_SQLITE_SCHEMA_BUSY_BUDGET_S", 0.1)
+    original_execute = aiosqlite_core.Connection._execute
+    in_worker = threading.Event()
+    finished = threading.Event()
+
+    async def starved_execute(self: Any, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        sql = args[0] if args and isinstance(args[0], str) else ""
+
+        def run(*call_args: Any, **call_kwargs: Any) -> Any:
+            if not sql.startswith("PRAGMA journal_mode") or in_worker.is_set():
+                return fn(*call_args, **call_kwargs)
+            in_worker.set()
+            try:
+                time.sleep(0.25)
+                return fn(*call_args, **call_kwargs)
+            finally:
+                finished.set()
+
+        return await original_execute(self, run, *args, **kwargs)
+
+    monkeypatch.setattr(aiosqlite_core.Connection, "_execute", starved_execute)
+
+    db_path = tmp_path / "worker-thread-deadline.db"
+    lock = sqlite3.connect(db_path, timeout=0.1, isolation_level=None)
+    lock.execute("BEGIN IMMEDIATE")
+    broker = DatabaseBroker(
+        url=f"sqlite+aiosqlite:///{db_path}",
+        engine_options={"busy_timeout_ms": 10},
+    )
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(broker._ensure_schema(), timeout=1.0)
+        assert in_worker.is_set()
+        assert finished.is_set()
+    finally:
+        if lock.in_transaction:
+            lock.rollback()
+        lock.close()
+        await broker.close()
+
+
 @pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
 async def test_schema_creation_preserves_server_database_blocking_semantics(
     monkeypatch: Any,

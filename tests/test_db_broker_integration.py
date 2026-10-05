@@ -32,6 +32,7 @@ from modulith import event
 from modulith.adapters.db_broker import (
     DatabaseBroker,
     DatabaseConsumer,
+    _backoff_delay,
     _postgres_target_lock_key,
     broker_schema,
 )
@@ -813,9 +814,11 @@ async def test_fail_increments_attempts_backs_off_then_dead(broker_engine: Any) 
     rid = await _publish_and_claim(broker)
 
     # First failure: below the cap -> pending, attempts=1, redelivery delayed.
-    await broker.fail(rid, "boom", consumer_name="c1", max_attempts=2)
+    # The reference is read BEFORE fail(): the first backoff is only 50ms, so a
+    # reference read after it can pass available_at on a loaded host.
     async with broker_engine.connect() as conn:
         ref = await broker._now(conn)
+    await broker.fail(rid, "boom", consumer_name="c1", max_attempts=2)
     row = await _message_row(broker_engine, rid)
     assert row is not None and row.status == "pending" and row.attempts == 1
     avail = (
@@ -823,7 +826,8 @@ async def test_fail_increments_attempts_backs_off_then_dead(broker_engine: Any) 
         if row.available_at.tzinfo is not None
         else row.available_at.replace(tzinfo=UTC)
     )
-    assert avail > ref  # backoff (server-clock) pushed redelivery into the future
+    # fail() stamps available_at = server now + backoff, and server now >= ref.
+    assert avail >= ref + timedelta(seconds=_backoff_delay(1))
 
     # After the backoff window, reclaim and fail again -> hits the cap -> dead.
     await asyncio.sleep(0.2)
