@@ -602,25 +602,50 @@ def _group_ledger_broker(rt: Runtime, scheme: str) -> Any | None:
 _LIVE_GROUP_WINDOW_S = 24 * 60 * 60
 
 
+# Longest the start-up check waits on the broker store before it skips the check:
+# an unreachable database must not hold back every worker's start.
+_RETIRED_CHECK_TIMEOUT_S = 10.0
+
+
 async def _live_groups(broker: Any, derived: set[str]) -> set[str]:
     """Groups a module of this deployment derives or a consumer recently served."""
     active: set[str] = await broker.active_groups(within_seconds=_LIVE_GROUP_WINDOW_S)
     return derived | active
 
 
+async def _read_group_state(
+    broker: Any, derived: set[str]
+) -> tuple[dict[str, int], set[str], set[str]]:
+    """Each group's backlog, the groups that still subscribe, and the live groups."""
+    backlog: dict[str, int] = await broker.group_backlog()
+    subscribed: set[str] = await broker.subscribed_groups()
+    return backlog, subscribed, await _live_groups(broker, derived)
+
+
 async def _warn_about_retired_groups(rt: Runtime, scheme: str, derived: set[str]) -> None:
     """Log one warning per group that no module derives and no consumer served lately.
 
-    Every later publication to its targets is queued for it. Nothing is
-    deleted here: a module that is only disabled for this deploy gets its
-    backlog when it returns.
+    A group that still subscribes has every later publication to its targets
+    queued for it; one whose subscription is gone receives nothing new and
+    only its leftover backlog remains. Nothing is deleted here: a module that
+    is only disabled for this deploy gets its backlog when it returns. The
+    check gives up after ``_RETIRED_CHECK_TIMEOUT_S`` so an unreachable store
+    cannot hold back the workers.
     """
     broker = _group_ledger_broker(rt, scheme)
     if broker is None:
         return
     try:
-        backlog = await broker.group_backlog()
-        live = await _live_groups(broker, derived)
+        backlog, subscribed, live = await asyncio.wait_for(
+            _read_group_state(broker, derived), _RETIRED_CHECK_TIMEOUT_S
+        )
+    except TimeoutError:
+        logger.warning(
+            "the %s broker did not answer within %g s; skipping the retired-group check",
+            scheme,
+            _RETIRED_CHECK_TIMEOUT_S,
+        )
+        return
     except Exception:
         logger.warning("could not read the %s broker's subscribed groups", scheme, exc_info=True)
         return
@@ -637,14 +662,20 @@ async def _warn_about_retired_groups(rt: Runtime, scheme: str, derived: set[str]
             if scheme == "shm"
             else "and those rows pile up in broker_message"
         )
+        arrivals = (
+            "Every later publication to its targets is queued for it too"
+            if group in subscribed
+            else "It has no subscription, so no new publication reaches it and only "
+            "its leftover backlog remains"
+        )
         logger.warning(
             "broker group %r is not derived by any module of this deployment and no "
-            "consumer served it in the last %d h; %s. Every later publication to its "
-            "targets is queued for it too, %s. If the module is retired for good, run: "
-            "modulith broker drop-group %s",
+            "consumer served it in the last %d h; %s. %s, %s. If the module is retired "
+            "for good, run: modulith broker drop-group %s",
             group,
             hours,
             held,
+            arrivals,
             cost,
             group,
         )

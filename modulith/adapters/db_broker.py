@@ -2300,6 +2300,21 @@ class DatabaseBroker:
         return result
 
     @_on_owning_loop
+    async def subscribed_groups(self) -> set[str]:
+        """Groups that still hold at least one subscription row."""
+        await self._ensure_schema()
+        from sqlalchemy import select
+
+        _, subscription, _ = broker_schema()
+
+        async def op(conn: Any) -> set[str]:
+            rows = await conn.execute(select(subscription.c.consumer_group).distinct())
+            return {str(row[0]) for row in rows}
+
+        result: set[str] = await self._write(op)
+        return result
+
+    @_on_owning_loop
     async def active_groups(self, *, within_seconds: float) -> set[str]:
         """Groups a consumer refreshed or claimed for within ``within_seconds``.
 

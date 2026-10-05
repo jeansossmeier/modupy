@@ -342,6 +342,11 @@ class ShmBroker:
         """Map every subscribed group, or group with undelivered work, to its backlog."""
         return await self._cold.group_backlog()
 
+    async def subscribed_groups(self) -> set[str]:
+        """Groups that still hold at least one subscription."""
+        by_target = await self._cold.get_subscriptions()
+        return {group for groups in by_target.values() for group in groups}
+
     @property
     def store_location(self) -> str:
         """The SQLite file holding this broker's subscriptions and deliveries."""

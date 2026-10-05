@@ -2615,7 +2615,125 @@ def test_process_run_warns_about_subscribed_groups_no_module_derives(
     assert len(retired) == 1, warnings
     assert "3 pending" in retired[0]
     assert "modulith broker drop-group modulith-retired" in retired[0]
+    assert "Every later publication to its targets is queued for it too" in retired[0]
     assert not [m for m in warnings if "modulith-orders" in m]
+
+
+def _run_processes_warnings(monkeypatch, caplog) -> list[str]:
+    """Start ``modulith run --topology processes`` with a no-op supervisor; return its WARNINGs."""
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        return None
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+    with caplog.at_level(logging.WARNING, logger="modulith"):
+        result = runner.invoke(app, ["run", "fakeapp.main:app", "--topology", "processes"])
+    assert result.exit_code == 0, result.output
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+_FAKE_MAIN = {"main.py": "from fastapi import FastAPI\napp = FastAPI()\n"}
+
+
+def _assert_leftover_backlog_wording(message: str) -> None:
+    assert "3 pending" in message
+    assert "no subscription" in message
+    assert "no new publication reaches it" in message
+    assert "only its leftover backlog remains" in message
+    assert "queued for it" not in message
+    assert "modulith broker drop-group modulith-retired" in message
+
+
+def test_process_run_says_an_unsubscribed_shm_group_receives_no_new_publications(
+    make_fake_app, monkeypatch, tmp_path, caplog
+):
+    make_fake_app({"orders": ""}, extra_files=_FAKE_MAIN)
+    db_path = _seed_shm_groups(tmp_path, monkeypatch, {"modulith-orders": 2, "modulith-retired": 3})
+    conn = sqlite3.connect(db_path)
+    conn.execute("DELETE FROM shm_subscription WHERE consumer_group='modulith-retired'")
+    conn.commit()
+    conn.close()
+
+    warnings = _run_processes_warnings(monkeypatch, caplog)
+
+    retired = [m for m in warnings if "modulith-retired" in m]
+    assert len(retired) == 1, warnings
+    _assert_leftover_backlog_wording(retired[0])
+
+
+def _seed_database_groups(url: str, groups: dict[str, int]) -> None:
+    from modulith.adapters.db_broker import DatabaseBroker
+
+    async def seed() -> None:
+        broker = DatabaseBroker(url=url)
+        try:
+            for group, count in groups.items():
+                target = f"fakeapp.contracts.{group}"
+                await broker.subscribe([target], group)
+                for _ in range(count):
+                    await broker.publish(target, b"x", {"event_type": target})
+        finally:
+            await broker.close()
+
+    asyncio.run(seed())
+
+
+@pytest.mark.parametrize("subscribed", [True, False], ids=["subscribed", "unsubscribed"])
+def test_process_run_words_the_database_retired_group_warning_by_its_subscription(
+    make_fake_app, monkeypatch, tmp_path, caplog, subscribed
+):
+    make_fake_app({"orders": ""}, extra_files=_FAKE_MAIN)
+    db_file = tmp_path / "broker.db"
+    url = _database_project(tmp_path, monkeypatch, db_file)
+    _seed_database_groups(url, {"modulith-orders": 2, "modulith-retired": 3})
+    conn = sqlite3.connect(db_file)
+    conn.execute("UPDATE broker_subscription SET updated_at='2000-01-01 00:00:00.000000'")
+    if not subscribed:
+        conn.execute("DELETE FROM broker_subscription WHERE consumer_group='modulith-retired'")
+    conn.commit()
+    conn.close()
+
+    warnings = _run_processes_warnings(monkeypatch, caplog)
+
+    retired = [m for m in warnings if "modulith-retired" in m]
+    assert len(retired) == 1, warnings
+    if subscribed:
+        assert "Every later publication to its targets is queued for it too" in retired[0]
+        assert "leftover backlog" not in retired[0]
+    else:
+        _assert_leftover_backlog_wording(retired[0])
+
+
+@pytest.mark.timeout(30)
+def test_process_run_continues_when_the_broker_never_answers_the_retired_group_check(
+    make_fake_app, monkeypatch, tmp_path, caplog
+):
+    from modulith.adapters.shm_broker import ShmBroker
+
+    make_fake_app({"orders": ""}, extra_files=_FAKE_MAIN)
+    _seed_shm_groups(tmp_path, monkeypatch, {"modulith-orders": 2, "modulith-retired": 3})
+
+    async def never_returns(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(ShmBroker, "group_backlog", never_returns)
+    monkeypatch.setattr("modulith.cli._RETIRED_CHECK_TIMEOUT_S", 0.05)
+    started: list[bool] = []
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        started.append(True)
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+    with caplog.at_level(logging.WARNING, logger="modulith"):
+        result = runner.invoke(app, ["run", "fakeapp.main:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    assert started == [True]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    skipped = [m for m in warnings if "shm" in m and "retired" in m]
+    assert len(skipped) == 1, warnings
+    assert "within" in skipped[0]
 
 
 def test_broker_drop_group_removes_a_retired_groups_backlog(make_fake_app, monkeypatch, tmp_path):

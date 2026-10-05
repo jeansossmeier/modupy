@@ -1494,12 +1494,19 @@ Step 6 depends on the broker:
 - **SHM and database brokers:** every publication fans out one delivery per
   subscribed group, and prune never removes undelivered work, so a group
   that never consumes again gets a queued row for every later publication
-  to its targets. On SHM those rows also keep prune from reclaiming the
-  publications; on the database broker they pile up in `broker_message`.
+  to its targets, for as long as it still holds a subscription. On SHM those
+  rows also keep prune from reclaiming the publications; on the database
+  broker they pile up in `broker_message`. A group with rows but no
+  subscription receives no new publication: only the backlog it already
+  holds remains.
 
   `modulith run --topology processes` logs a warning at startup for each
   group that no current module derives and no consumer served in the last
-  24 hours, naming its backlog. A running consumer re-stamps its
+  24 hours, naming its backlog. For a group with no subscription the warning
+  says that no new publication reaches it and only its leftover backlog
+  remains. The check waits at most 10 seconds for the broker store; past
+  that it logs a warning and starts the workers without the check.
+  A running consumer re-stamps its
   subscriptions every hour even when idle, and every claim counts too, so
   a group that an extracted service or another host still consumes is not
   reported.
