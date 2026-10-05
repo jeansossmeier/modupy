@@ -225,3 +225,82 @@ def test_upgrade_from_0002_matches_upgrade_from_base_on_real_mysql(clean_mysql) 
         "upgrading from 0002 must land on the identical schema as upgrading "
         f"from base: {from_0002} != {from_base}"
     )
+
+
+_MICROSECOND_STAMP = "2026-01-01 12:00:00.600000"
+_TIMESTAMP_COLUMNS = {
+    "event_publications": ("published_at", "completed_at", "last_attempt_at", "claim_until"),
+    "event_publications_archive": ("published_at", "completed_at", "last_attempt_at"),
+}
+
+
+def _fsp(engine, table: str, column: str) -> int | None:
+    reflected = {c["name"]: c["type"] for c in inspect(engine).get_columns(table)}
+    return getattr(reflected[column], "fsp", None)
+
+
+def _round_trip_microseconds(engine) -> dict[str, int]:
+    """Write ``_MICROSECOND_STAMP`` into every outbox timestamp column and read it back."""
+    read_back = {}
+    with engine.begin() as conn:
+        for table, columns in _TIMESTAMP_COLUMNS.items():
+            conn.execute(text(f"DELETE FROM {table}"))
+            assignments = ", ".join(f"{column} = :ts" for column in columns[1:])
+            conn.execute(
+                text(
+                    f"INSERT INTO {table} (id, event_type, payload, listener, published_at) "
+                    "VALUES ('00000000000000000000000000000001', 'e', x'00', 'l', :ts)"
+                ),
+                {"ts": _MICROSECOND_STAMP},
+            )
+            conn.execute(text(f"UPDATE {table} SET {assignments}"), {"ts": _MICROSECOND_STAMP})
+            row = conn.execute(text(f"SELECT {', '.join(columns)} FROM {table}")).one()
+            read_back.update({f"{table}.{c}": row[i].microsecond for i, c in enumerate(columns)})
+    return read_back
+
+
+def test_outbox_timestamps_keep_microseconds_after_migrate_on_real_mysql(clean_mysql) -> None:
+    """A stamp written with microseconds reads back with them: a bare DATETIME
+    would round 12:00:00.600000 up to 12:00:01."""
+    url, engine = clean_mysql
+    command.upgrade(_cfg(url), "head")
+
+    assert set(_round_trip_microseconds(engine).values()) == {600000}
+
+
+def test_upgrade_from_0008_widens_existing_outbox_timestamps_on_real_mysql(clean_mysql) -> None:
+    """An install migrated before the widening gets it from ``modulith migrate``."""
+    url, engine = clean_mysql
+    cfg = _cfg(url)
+    command.upgrade(cfg, "0008_outbox_trace_context")
+    assert {
+        _fsp(engine, table, column)
+        for table, columns in _TIMESTAMP_COLUMNS.items()
+        for column in columns
+    } <= {None, 0}
+
+    command.upgrade(cfg, "head")
+
+    assert {
+        _fsp(engine, table, column)
+        for table, columns in _TIMESTAMP_COLUMNS.items()
+        for column in columns
+    } == {6}
+
+
+def test_downgrade_restores_whole_second_outbox_timestamps_on_real_mysql(clean_mysql) -> None:
+    url, engine = clean_mysql
+    cfg = _cfg(url)
+    command.upgrade(cfg, "head")
+
+    command.downgrade(cfg, "-1")
+
+    with engine.connect() as conn:
+        assert conn.execute(
+            text("SELECT version_num FROM modulith_alembic_version")
+        ).scalar_one() == ("0008_outbox_trace_context")
+    assert {
+        _fsp(engine, table, column)
+        for table, columns in _TIMESTAMP_COLUMNS.items()
+        for column in columns
+    } <= {None, 0}

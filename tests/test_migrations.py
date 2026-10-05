@@ -108,7 +108,7 @@ async def test_alembic_upgrade_head_after_broker_self_bootstrap(tmp_path: Path) 
         versions = {r[0] for r in conn.execute("SELECT version_num FROM modulith_alembic_version")}
     finally:
         conn.close()
-    assert versions == {"0008_outbox_trace_context"}
+    assert versions == {"0009_outbox_ts_microseconds"}
 
     tables = _objects(db, "table")
     assert "event_publications" in tables
@@ -470,7 +470,7 @@ def test_alembic_rejects_invalid_schema_before_opening_a_connection(
     assert not db.exists()
 
 
-HEAD = "0008_outbox_trace_context"
+HEAD = "0009_outbox_ts_microseconds"
 BUSINESS_REVISION = "business_rev_1"
 
 
@@ -574,6 +574,7 @@ def test_upgrade_moves_a_legacy_mid_chain_revision_then_continues_from_it(
         "0005_outbox_scan_indexes -> 0006_broker_dispatch_started",
         "0006_broker_dispatch_started -> 0007_outbox_dispatch_started",
         "0007_outbox_dispatch_started -> 0008_outbox_trace_context",
+        "0008_outbox_trace_context -> 0009_outbox_ts_microseconds",
     ]
     assert "alembic_version" not in _objects(db, "table")
     assert _versions(db, "modulith_alembic_version") == {HEAD}

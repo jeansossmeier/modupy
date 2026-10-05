@@ -75,6 +75,7 @@ try:
         update,
     )
     from sqlalchemy import event as sa_event
+    from sqlalchemy.dialects.mysql import DATETIME as MySQLDateTime
     from sqlalchemy.dialects.mysql import LONGBLOB as MySQLLongBlob
     from sqlalchemy.engine import Engine
     from sqlalchemy.exc import DBAPIError
@@ -119,6 +120,12 @@ class Base(DeclarativeBase):
 # variant is inert there. The migrations mirror this exactly.
 _PAYLOAD = LargeBinary().with_variant(MySQLLongBlob(), "mysql", "mariadb")
 
+# A bare MySQL/MariaDB DATETIME keeps whole seconds and rounds the fraction,
+# which shifts a lease or backoff stamp by up to half a second. The broker
+# tables use the same variant; migration 0009 alters outbox tables created
+# without it.
+_TIMESTAMP = DateTime(timezone=True).with_variant(MySQLDateTime(fsp=6), "mysql", "mariadb")
+
 
 class EventPublicationRow(Base):
     """The primary outbox table: one row per (event, listener) publication."""
@@ -135,13 +142,13 @@ class EventPublicationRow(Base):
     # BYTEA, not JSONB — payload is bytes (binary-serializer support).
     payload: Mapped[bytes] = mapped_column(_PAYLOAD, nullable=False)
     listener: Mapped[str] = mapped_column(Text, nullable=False)
-    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    published_at: Mapped[datetime] = mapped_column(_TIMESTAMP, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(_TIMESTAMP, nullable=True)
     attempt_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(_TIMESTAMP, nullable=True)
     is_dead_lettered: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
     )
@@ -150,7 +157,7 @@ class EventPublicationRow(Base):
     # ``in_process`` claim mode never writes them at all.
     claim_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
     claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    claim_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_until: Mapped[datetime | None] = mapped_column(_TIMESTAMP, nullable=True)
     # Keep in lockstep with migrations/versions/0007_outbox_dispatch_started.py.
     dispatch_started: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false()
@@ -181,15 +188,15 @@ class EventPublicationArchiveRow(Base):
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[bytes] = mapped_column(_PAYLOAD, nullable=False)
     listener: Mapped[str] = mapped_column(Text, nullable=False)
-    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    published_at: Mapped[datetime] = mapped_column(_TIMESTAMP, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(_TIMESTAMP, nullable=True)
     # server_default mirrors the migration and the primary table exactly so the
     # ORM and the DDL never diverge on the archive table either.
     attempt_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(_TIMESTAMP, nullable=True)
     trace_context: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (

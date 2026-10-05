@@ -294,6 +294,12 @@ outbox tables and also the `broker_*` tables of the database broker. The chain
 records its revision in its own `modulith_alembic_version` table, so it can
 share a database with your application's Alembic history in `alembic_version`.
 
+On MySQL and MariaDB, run `modulith migrate` again after upgrading modupy if
+you already have the outbox tables. Revision `0009` widens their timestamp
+columns from `DATETIME` to `DATETIME(6)`; before it, those servers stored the
+outbox timestamps in whole seconds and rounded a fraction up or down.
+Postgres and SQLite need no change.
+
 Bind your SQLAlchemy session to modupy around each transaction. The service
 function binds, publishes, commits and unbinds before the route returns:
 

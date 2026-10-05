@@ -146,6 +146,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - A Redis Streams consumer that stops gracefully deletes its own name from the consumer group with `XGROUP DELCONSUMER` when it has no pending entries, so worker restarts no longer pile up in `XINFO CONSUMERS`, and entries it still owns stay reclaimable; a failed delete is logged and does not fail the stop
 - The default SHM broker refuses a state directory or state file that another user owns, and a parent directory that other users can write to without the sticky bit (a group-writable parent passes when it belongs to your own group, as with umask 002), and it no longer reads your home directory when `state_dir`, `MODULITH_BROKER_STATE_DIR` or an absolute `sqlite_path` is set
 - Outbox rows already at or over a lowered `dead_letter_after_attempts` are dead-lettered at the next sweep instead of being claimed again on every sweep
+- MySQL and MariaDB outbox timestamps keep microseconds: migration `0009_outbox_ts_microseconds` widens the outbox's timestamp columns to `DATETIME(6)`, so run `modulith migrate` after upgrading when the outbox tables already exist
 
 ### Security
 

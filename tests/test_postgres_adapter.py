@@ -1029,3 +1029,80 @@ async def test_try_lock_publication_does_not_leave_an_open_transaction(
     assert handle.in_transaction() is False, (
         "advisory-lock connection left an open transaction across the dispatch it holds"
     )
+
+
+_OUTBOX_TIMESTAMP_COLUMNS = {
+    "event_publications": ("published_at", "completed_at", "last_attempt_at", "claim_until"),
+    "event_publications_archive": ("published_at", "completed_at", "last_attempt_at"),
+}
+
+
+def _outbox_timestamp_types(dialect: Any) -> dict[str, str]:
+    from sqlalchemy import DateTime
+
+    from modulith.adapters.postgres_outbox import EventPublicationArchiveRow, EventPublicationRow
+
+    compiled = {}
+    for model in (EventPublicationRow, EventPublicationArchiveRow):
+        table = model.__table__
+        datetime_columns = {c.name for c in table.columns if isinstance(c.type, DateTime)}
+        assert datetime_columns == set(_OUTBOX_TIMESTAMP_COLUMNS[table.name])
+        for name in datetime_columns:
+            compiled[f"{table.name}.{name}"] = table.c[name].type.compile(dialect=dialect)
+    return compiled
+
+
+def test_outbox_timestamp_columns_keep_microseconds_on_mysql_and_mariadb() -> None:
+    """MySQL's bare DATETIME rounds to whole seconds, so a lease or backoff
+    stamp would be stored up to half a second away from the value written."""
+    from sqlalchemy.dialects.mysql import dialect as mysql_dialect
+    from sqlalchemy.dialects.mysql import mariadb
+
+    for dialect in (mysql_dialect(), mariadb.MariaDBDialect()):
+        assert set(_outbox_timestamp_types(dialect).values()) == {"DATETIME(6)"}
+
+
+def test_outbox_timestamp_columns_are_unchanged_on_postgres_and_sqlite() -> None:
+    from sqlalchemy.dialects import sqlite
+
+    assert set(_outbox_timestamp_types(postgresql.dialect()).values()) == {
+        "TIMESTAMP WITH TIME ZONE"
+    }
+    assert set(_outbox_timestamp_types(sqlite.dialect()).values()) == {"DATETIME"}
+
+
+def _offline_ddl(url: str, capsys: pytest.CaptureFixture[str]) -> str:
+    """The SQL ``alembic upgrade 0008:head --sql`` renders for ``url`` (no connection)."""
+    from alembic import command
+    from alembic.config import Config
+
+    import modulith.adapters as adapters_pkg
+
+    cfg = Config()
+    cfg.set_main_option("script_location", str(Path(adapters_pkg.__file__).parent / "migrations"))
+    cfg.set_main_option("sqlalchemy.url", url)
+    command.upgrade(cfg, "0008_outbox_trace_context:head", sql=True)
+    return capsys.readouterr().out
+
+
+@pytest.mark.parametrize("scheme", ["mysql+pymysql", "mariadb+pymysql"])
+def test_migration_widens_outbox_timestamps_to_microseconds_on_mysql_and_mariadb(
+    scheme: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ddl = _offline_ddl(f"{scheme}://user:pass@offline-host-never-contacted/outbox", capsys)
+
+    for table, columns in _OUTBOX_TIMESTAMP_COLUMNS.items():
+        for column in columns:
+            nullability = "NOT NULL" if column == "published_at" else "NULL"
+            assert f"ALTER TABLE {table} CHANGE {column} {column} DATETIME(6) {nullability};" in ddl
+    assert ddl.count("DATETIME(6)") == 7
+
+
+@pytest.mark.parametrize("url", ["postgresql+psycopg://u:p@host/db", "sqlite:///offline.db"])
+def test_migration_leaves_outbox_timestamps_alone_off_mysql(
+    url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ddl = _offline_ddl(url, capsys)
+
+    assert "published_at" not in ddl
+    assert "claim_until" not in ddl
