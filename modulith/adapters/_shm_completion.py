@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 from ._dead_letter import DeadLetter
 from ._shm_claims import owned_claim, owned_predicate
+from ._shm_publications import prune_expired_empty_publications
 from ._shm_schema import immediate_transaction
 from ._shm_types import ClaimToken
 
@@ -250,30 +251,8 @@ def prune(
                 ids,
             )
         remaining = limit - len(ids)
-        empty_ids: list[str] = []
-        if remaining:
-            empty_ids = [
-                str(row["id"])
-                for row in conn.execute(
-                    """
-                    SELECT p.id FROM shm_publication AS p
-                    WHERE p.retained_until<=?
-                      AND NOT EXISTS (
-                        SELECT 1 FROM shm_delivery AS d
-                        WHERE d.publication_id=p.id
-                      )
-                    ORDER BY p.retained_until, p.sequence LIMIT ?
-                    """,
-                    (now, remaining),
-                )
-            ]
-            if empty_ids:
-                placeholders = ",".join("?" for _ in empty_ids)
-                conn.execute(
-                    f"DELETE FROM shm_publication WHERE id IN ({placeholders})",
-                    empty_ids,
-                )
-    return len(ids) + len(empty_ids)
+        empty = prune_expired_empty_publications(conn, now, remaining) if remaining else 0
+    return len(ids) + empty
 
 
 def _delete_expired_empty_publication(

@@ -1535,15 +1535,15 @@ def test_publish_prunes_on_a_bounded_cadence_not_every_call(
     cadence window, proven here by counting real invocations rather than
     timing them."""
     calls: list[float] = []
-    original_prune = _shm_publications._prune_expired_empty_publications
+    original_prune = _shm_publications.prune_expired_empty_publications
 
-    def _counting_prune(conn: sqlite3.Connection, now: float, limit: int) -> None:
+    def _counting_prune(conn: sqlite3.Connection, now: float, limit: int) -> int:
         calls.append(now)
-        original_prune(conn, now, limit)
+        return original_prune(conn, now, limit)
 
     monkeypatch.setattr(
         _shm_publications,
-        "_prune_expired_empty_publications",
+        "prune_expired_empty_publications",
         _counting_prune,
     )
 
@@ -2496,19 +2496,15 @@ def test_shm_store_missing_expiry_index_is_backfilled_on_next_open(tmp_path: Pat
 def test_prune_expired_publications_query_uses_expiry_index(tmp_path: Path) -> None:
     store = _new_store(tmp_path / "prune-plan.db")
     try:
-        statements: list[str] = []
-        store._conn.set_trace_callback(statements.append)
-        try:
-            _shm_publications._prune_expired_empty_publications(store._conn, time.time(), 100)
-        finally:
-            store._conn.set_trace_callback(None)
-        prune_sql = next(
-            statement for statement in statements if "DELETE FROM shm_publication" in statement
-        )
+        bounds = (time.time(), *_shm_publications._BEFORE_ALL, *_shm_publications._AFTER_ALL)
         plan = " | ".join(
-            str(row["detail"]) for row in store._conn.execute(f"EXPLAIN QUERY PLAN {prune_sql}")
+            str(row["detail"])
+            for row in store._conn.execute(
+                f"EXPLAIN QUERY PLAN {_shm_publications._EXPIRED_BETWEEN_SQL}", bounds
+            )
         )
         assert "idx_shm_publication_expiry" in plan
+        assert "TEMP B-TREE" not in plan
     finally:
         store.close()
 
@@ -2550,5 +2546,190 @@ def test_group_backlog_with_targets_counts_the_rows_drop_group_deletes(tmp_path:
 
         assert counted == 2
         assert store.drop_group("g", ["events.A"])[1] == counted
+    finally:
+        store.close()
+
+
+def _publication_count(path: Path) -> int:
+    return int(_rows(path, "SELECT count(*) AS n FROM shm_publication")[0]["n"])
+
+
+def _expired_full_store(path: Path) -> tuple[SqliteQueueStore, int]:
+    """A store that refuses publishes, holding only expired orphan publications."""
+    store = _bounded_store(path, 1024 * 1024)
+    published = 0
+    with pytest.raises(ConfigurationError, match="max_store_bytes"):
+        while True:
+            store.publish("events.Created", b"x" * 1000, None, None)
+            published += 1
+    assert published >= 100
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE shm_publication SET retained_until=0")
+    conn.commit()
+    conn.close()
+    store._publishes_since_prune = _shm_publications.PRUNE_EVERY_N_PUBLISHES - 1
+    return store, published
+
+
+def _headroom_pages(path: Path, max_store_bytes: int) -> int:
+    conn = sqlite3.connect(path)
+    try:
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        used = int(conn.execute("PRAGMA page_count").fetchone()[0]) - int(
+            conn.execute("PRAGMA freelist_count").fetchone()[0]
+        )
+    finally:
+        conn.close()
+    budget = max_store_bytes // page_size
+    return budget - min(_shm_publications.CONSUMER_RESERVE_PAGES, budget // 8) - used
+
+
+def test_a_publish_refused_for_a_full_store_keeps_the_prune_it_ran(tmp_path: Path) -> None:
+    path = tmp_path / "refused.db"
+    store, published = _expired_full_store(path)
+    try:
+        too_big = b"x" * (200 * 4096)
+
+        with pytest.raises(ConfigurationError, match="max_store_bytes"):
+            store.publish("events.Created", too_big, None, None)
+
+        assert _publication_count(path) == published - _shm_publications._PUBLISH_PRUNE_LIMIT
+        assert not store._conn.in_transaction
+    finally:
+        store.close()
+
+
+def test_a_publish_that_fits_once_its_due_prune_frees_pages_succeeds(tmp_path: Path) -> None:
+    path = tmp_path / "fits.db"
+    store, published = _expired_full_store(path)
+    try:
+        page_size = 4096
+        payload = b"x" * ((_headroom_pages(path, 1024 * 1024) + 10) * page_size)
+
+        result = store.publish("events.Created", payload, None, "fits-after-prune")
+
+        assert result.publication_id == "fits-after-prune"
+        assert _publication_count(path) == (published - _shm_publications._PUBLISH_PRUNE_LIMIT + 1)
+    finally:
+        store.close()
+
+
+def _insert_pinned_expired_publications(store: SqliteQueueStore, count: int) -> None:
+    """Expired publications that each still hold a pending delivery."""
+    conn = store._conn
+    conn.execute("BEGIN")
+    conn.executemany(
+        """
+        INSERT INTO shm_publication (id, target, event_type, payload, created_at, retained_until)
+        VALUES (?, 'events.Pinned', 'events.Pinned', x'00', 1.0, 1.0)
+        """,
+        ((f"pinned-{index}",) for index in range(count)),
+    )
+    conn.execute(
+        """
+        INSERT INTO shm_delivery (
+            publication_id, consumer_group, status, attempts,
+            available_at, claim_generation, created_at
+        )
+        SELECT id, 'g', 'pending', 0, 0, 0, 0 FROM shm_publication
+        """
+    )
+    conn.execute("COMMIT")
+
+
+def _insert_expired_orphans(
+    store: SqliteQueueStore, count: int, retained_until: float = 2.0
+) -> None:
+    conn = store._conn
+    conn.execute("BEGIN")
+    conn.executemany(
+        """
+        INSERT INTO shm_publication (id, target, event_type, payload, created_at, retained_until)
+        VALUES (?, 'events.Orphan', 'events.Orphan', x'00', 2.0, ?)
+        """,
+        ((f"orphan-{index}-{retained_until}", retained_until) for index in range(count)),
+    )
+    conn.execute("COMMIT")
+
+
+def _vm_steps(conn: sqlite3.Connection, operation: Callable[[], object]) -> int:
+    ticks = 0
+
+    def count() -> int:
+        nonlocal ticks
+        ticks += 1
+        return 0
+
+    conn.set_progress_handler(count, 10)
+    try:
+        operation()
+    finally:
+        conn.set_progress_handler(None, 0)
+    return ticks
+
+
+def test_a_publish_side_prune_walks_a_bounded_window_of_pinned_expired_publications(
+    tmp_path: Path,
+) -> None:
+    def due_publish_steps(pinned: int) -> int:
+        store = _new_store(tmp_path / f"pinned-{pinned}.db")
+        try:
+            _insert_pinned_expired_publications(store, pinned)
+            for _ in range(_shm_publications.PRUNE_EVERY_N_PUBLISHES - 1):
+                store.publish("events.Created", b"{}", None, None)
+            return _vm_steps(
+                store._conn, lambda: store.publish("events.Created", b"{}", None, None)
+            )
+        finally:
+            store.close()
+
+    assert due_publish_steps(8000) < 2 * due_publish_steps(1000)
+
+
+def test_a_prune_that_runs_out_of_rows_wraps_to_the_oldest_in_the_same_call(
+    tmp_path: Path,
+) -> None:
+    store = _new_store(tmp_path / "wrap.db")
+    try:
+        _insert_pinned_expired_publications(store, 1500)
+        assert store.prune(1e9, 1000) == 0, "the first window holds only pinned rows"
+        _insert_expired_orphans(store, 3, retained_until=0.5)
+
+        assert store.prune(1e9, 1000) == 3
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("side", ["publish", "consumer"])
+def test_repeated_prunes_reach_every_prunable_publication_behind_pinned_ones(
+    tmp_path: Path, side: str
+) -> None:
+    path = tmp_path / f"{side}.db"
+    store = _new_store(path)
+    try:
+        _insert_pinned_expired_publications(store, 3500)
+        _insert_expired_orphans(store, 7)
+
+        def prune_once() -> None:
+            if side == "consumer":
+                store.prune(1e9, 1000)
+                return
+            for _ in range(_shm_publications.PRUNE_EVERY_N_PUBLISHES):
+                store.publish("events.Created", b"{}", None, None)
+
+        orphans = "SELECT count(*) AS n FROM shm_publication WHERE target='events.Orphan'"
+        calls = 0
+        while _rows(path, orphans)[0]["n"]:
+            calls += 1
+            assert calls <= 6, "a prune never reached the orphans behind the pinned rows"
+            prune_once()
+
+        assert calls > 1, "one prune call walked all 3500 pinned rows"
+        assert (
+            _rows(path, "SELECT count(*) AS n FROM shm_publication WHERE id LIKE 'pinned-%'")[0][
+                "n"
+            ]
+            == 3500
+        )
     finally:
         store.close()

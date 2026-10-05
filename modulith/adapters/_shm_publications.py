@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import sqlite3
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
@@ -18,12 +20,13 @@ logger = logging.getLogger("modulith.adapters.shm")
 
 _PUBLISH_PRUNE_LIMIT = 100
 
-# idx_shm_publication_expiry backs the prune scan (see
-# _prune_expired_empty_publications), but it still touches every expired
-# orphan row up to its LIMIT on each run. Gating it to a cadence instead of
-# running it on every publish call bounds how often that cost is paid; the
-# caller (SqliteQueueStore) tracks the cadence and passes prune_due.
+# A publish runs the expired-publication prune only once per this many calls;
+# the caller (SqliteQueueStore) tracks the cadence and passes prune_due.
 PRUNE_EVERY_N_PUBLISHES = 100
+
+# One prune call examines at most this many expired publications, whether or
+# not a delivery still holds them (see prune_expired_empty_publications).
+PRUNE_EXAMINE_ROWS = 1000
 
 # Publishes stop this many pages below the page count max_store_bytes allows,
 # so a consumer pass usually commits inside the limit. A consumer write that
@@ -104,13 +107,18 @@ def publish(
     max_store_bytes: int,
     prune_due: bool = True,
 ) -> PublishResult:
-    """Atomically persist one replayable publication and current deliveries."""
+    """Atomically persist one replayable publication and current deliveries.
+
+    A due prune commits in its own transaction first, so the pages it frees stay
+    freed when the publish itself is then refused for lack of room.
+    """
     _ensure_payload_size(payload, max_payload_bytes)
     try:
+        if prune_due:
+            with immediate_transaction(conn):
+                prune_expired_empty_publications(conn, time.time(), _PUBLISH_PRUNE_LIMIT)
         with immediate_transaction(conn):
             now = time.time()
-            if prune_due:
-                _prune_expired_empty_publications(conn, now, _PUBLISH_PRUNE_LIMIT)
             publication, inserted = _insert_publication(
                 conn,
                 publication_id or str(uuid4()),
@@ -626,25 +634,77 @@ def _insert_delivery(
     return cursor.rowcount
 
 
-def _prune_expired_empty_publications(
+@dataclass
+class _PruneCursor:
+    """Where the next prune call resumes in expiry order; None starts over."""
+
+    after: tuple[float, int] | None = None
+
+
+# One cursor per database file, so the publish-side and consumer-side prunes of
+# every connection to it continue each other's walk. The position is only a
+# hint about where to look next; a racing update at worst repeats or skips a
+# window until the walk wraps.
+_PRUNE_CURSORS: dict[str, _PruneCursor] = {}
+
+
+_BEFORE_ALL = (float("-inf"), 0)
+_AFTER_ALL = (float("inf"), 0)
+
+# The row-value bounds are one range on idx_shm_publication_expiry, so a
+# caller that stops reading early pays only for the rows it read.
+_EXPIRED_BETWEEN_SQL = """
+    SELECT p.sequence, p.retained_until,
+           NOT EXISTS (
+             SELECT 1 FROM shm_delivery AS d WHERE d.publication_id=p.id
+           ) AS prunable
+    FROM shm_publication AS p
+    WHERE p.retained_until<=?
+      AND (p.retained_until, p.sequence) > (?, ?)
+      AND (p.retained_until, p.sequence) <= (?, ?)
+    ORDER BY p.retained_until, p.sequence
+    """
+
+
+def _expired_between(
+    conn: sqlite3.Connection,
+    now: float,
+    after: tuple[float, int],
+    through: tuple[float, int],
+) -> sqlite3.Cursor:
+    """Expired publications in (after, through] in expiry order, lazily."""
+    return conn.execute(_EXPIRED_BETWEEN_SQL, (now, *after, *through))
+
+
+def prune_expired_empty_publications(
     conn: sqlite3.Connection,
     now: float,
     limit: int,
-) -> None:
-    """Bound routine publish latency while removing expired orphan rows."""
-    conn.execute(
-        """
-        DELETE FROM shm_publication
-        WHERE id IN (
-            SELECT p.id FROM shm_publication AS p
-            WHERE p.retained_until<=?
-              AND NOT EXISTS (
-                SELECT 1 FROM shm_delivery AS d
-                WHERE d.publication_id=p.id
-              )
-            ORDER BY p.retained_until, p.sequence
-            LIMIT ?
-        )
-        """,
-        (now, limit),
+) -> int:
+    """Delete up to ``limit`` expired publications no delivery holds; return how many.
+
+    One call examines at most PRUNE_EXAMINE_ROWS expired publications, in expiry
+    order from where the previous call on this database stopped and wrapping around
+    to the oldest once, so expired publications that a pending delivery still
+    holds cannot make one call walk them all. Repeated calls cover every
+    expired publication. The caller owns the transaction.
+    """
+    database_file = str(conn.execute("PRAGMA database_list").fetchone()[2])
+    cursor = _PRUNE_CURSORS.setdefault(database_file, _PruneCursor())
+    resume = cursor.after
+    rows = itertools.chain(
+        _expired_between(conn, now, resume or _BEFORE_ALL, _AFTER_ALL),
+        _expired_between(conn, now, _BEFORE_ALL, resume) if resume else (),
     )
+    prunable: list[int] = []
+    cursor.after = None
+    for examined, row in enumerate(rows, 1):
+        if row["prunable"]:
+            prunable.append(row["sequence"])
+        if examined >= PRUNE_EXAMINE_ROWS or len(prunable) >= limit:
+            cursor.after = (row["retained_until"], row["sequence"])
+            break
+    if prunable:
+        placeholders = ",".join("?" for _ in prunable)
+        conn.execute(f"DELETE FROM shm_publication WHERE sequence IN ({placeholders})", prunable)
+    return len(prunable)
