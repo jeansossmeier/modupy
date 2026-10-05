@@ -139,6 +139,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `modulith broker drop-group` describes what actually happens: a publish to an `expected_consumer_groups` target with no entry raises `ConfigurationError`, the start-up warning comes only from `modulith run --topology processes`, it says to delete a target's key when the dropped group is its only entry, it prints retention in plain seconds instead of `2.592e+06`, and on SHM it says a group that subscribes again within `orphan_retention_seconds` is replayed the retained messages
 - Outbox: a publish rolled back with a SAVEPOINT (`session.begin_nested()`) is no longer dispatched after the outer commit, so the "found no row (deleted before delivery?)" warning no longer fires for it, and releasing a SAVEPOINT no longer dispatches its publishes before the outer transaction commits
 - A Redis Streams message whose listener kills the worker on every delivery is dead-lettered once its listener has had `max_delivery_attempts` deliveries, instead of being redelivered forever: the next reclaim dead-letters it before the listener runs again
+- The proxy's `/_modulith/health` readiness polls share one probe per worker, so a stalled worker holds one probe connection however often it is polled, and the worker probe pool grows to one connection per replica above 100, so a large fleet no longer reads `unreachable` behind a stalled worker
 
 ### Security
 

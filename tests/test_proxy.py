@@ -1462,10 +1462,15 @@ async def test_identity_probe_accepts_a_right_proof_in_a_bounded_unready_answer(
 
 
 async def _gated_worker(
-    token: str, gate: asyncio.Event, seen: list[str], module: str = "orders"
+    token: str,
+    gate: asyncio.Event,
+    seen: list[str],
+    module: str = "orders",
+    delay: float = 0.0,
 ) -> tuple[asyncio.Server, str]:
     """Loopback worker that accepts every connection but answers nothing until
-    ``gate`` is set, then answers any path with this deployment's ``/health``."""
+    ``gate`` is set and ``delay`` seconds have passed since the request was
+    read, then answers any path with this deployment's ``/health``."""
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -1486,6 +1491,7 @@ async def _gated_worker(
                 b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n"
                 b"content-length: %d\r\n\r\n%s" % (len(body), body)
             )
+            await asyncio.sleep(delay)
             await gate.wait()
             writer.write(answer)
             await writer.drain()
@@ -1566,7 +1572,7 @@ async def test_health_probe_pool_exhaustion_names_the_probe_pool_and_its_limit(
     monkeypatch, caplog
 ) -> None:
     caplog.set_level("WARNING", logger="modulith.proxy")
-    monkeypatch.setattr("modulith.proxy._PROBE_MAX_CONNECTIONS", 1)
+    monkeypatch.setattr("modulith.proxy._probe_pool_size", lambda rules: 1)
     stall, open_gate = asyncio.Event(), asyncio.Event()
     open_gate.set()
     a_seen: list[str] = []
@@ -1597,6 +1603,54 @@ async def test_health_probe_pool_exhaustion_names_the_probe_pool_and_its_limit(
     )
     assert "request pool" not in caplog.text
     assert (b_url in b_rule._down, held_resp.status_code) == (False, 200)
+
+
+async def test_concurrent_readiness_polls_share_one_probe_per_worker() -> None:
+    stall, open_gate = asyncio.Event(), asyncio.Event()
+    open_gate.set()
+    a_seen: list[str] = []
+    a_server, a_url = await _gated_worker("tok", stall, a_seen, "a")
+    b_server, b_url = await _gated_worker("tok", open_gate, [], "b")
+    proxy_app = create_proxy_app(
+        [RoutingRule("/a", a_url), RoutingRule("/b", b_url)], deployment_token="tok"
+    )
+    try:
+        async with proxy_app.router.lifespan_context(proxy_app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy", timeout=30
+            ) as c:
+                polls = await asyncio.gather(*(c.get("/_modulith/health") for _ in range(150)))
+                probes_for_first_batch = len(a_seen)
+                await c.get("/_modulith/health")
+    finally:
+        stall.set()
+        await _close_workers(a_server, b_server)
+
+    assert {(p.status_code, json.dumps(p.json()["backends"], sort_keys=True)) for p in polls} == {
+        (503, json.dumps({"/a": "unreachable", "/b": "ok"}, sort_keys=True))
+    }
+    assert probes_for_first_batch == 1
+    assert len(a_seen) == 2
+
+
+async def test_readiness_of_a_fleet_larger_than_the_probe_pool_is_not_queued() -> None:
+    gate, seen = asyncio.Event(), list[str]()
+    gate.set()
+    workers = [await _gated_worker("tok", gate, seen, delay=1.2) for _ in range(120)]
+    rule = RoutingRule("/orders", workers[0][1], backend_urls=tuple(url for _, url in workers))
+    proxy_app = create_proxy_app([rule], deployment_token="tok")
+    try:
+        async with proxy_app.router.lifespan_context(proxy_app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy", timeout=30
+            ) as c:
+                readiness = await c.get("/_modulith/health")
+    finally:
+        gate.set()
+        await _close_workers(*(server for server, _ in workers))
+
+    assert (readiness.status_code, readiness.json()["backends"]) == (200, {"/orders": "ok"})
+    assert rule._down == {}
 
 
 # ---------------------------------------------------------------------------

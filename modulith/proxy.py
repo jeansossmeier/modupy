@@ -26,11 +26,11 @@ import http.cookiejar
 import logging
 import secrets
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from itertools import cycle
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import quote, unquote, urlsplit
 
 # These are imported at module level (not lazily) so FastAPI's get_type_hints
@@ -53,6 +53,14 @@ _DOWN_RETRY_SECONDS = 5.0
 DEFAULT_IDENTITY_PROBE_TIMEOUT = 30.0
 _MAX_HEALTH_BODY_BYTES = 64 * 1024
 _PROBE_MAX_CONNECTIONS = 100
+_T = TypeVar("_T")
+
+
+def _probe_pool_size(rules: list[RoutingRule]) -> int:
+    """One readiness poll probes every replica at once, so the pool must hold
+    them all: a stalled replica would otherwise queue the rest behind it past
+    the poll's own deadline."""
+    return max(_PROBE_MAX_CONNECTIONS, sum(len(rule.backend_urls) for rule in rules))
 
 
 class _AnyCharPathConvertor(PathConvertor):
@@ -214,8 +222,11 @@ def create_proxy_app(
     worker ``/health`` probes included. When omitted, the app creates two
     clients and closes them with its lifespan: one for proxied requests,
     capped at ``max_connections`` concurrent upstream connections (each held
-    until its response finishes streaming), and a separate 100-connection one
-    for ``/health`` probes, so a saturated request pool cannot fail readiness.
+    until its response finishes streaming), and a separate one for ``/health``
+    probes, so a saturated request pool cannot fail readiness. The probe pool
+    holds 100 connections, or one per worker replica when there are more, so
+    one readiness poll never queues behind it. Concurrent readiness polls share
+    one in-flight check per worker.
     A request that finds either pool full for the pool timeout gets 503
     ``"proxy connection pool exhausted"``, logged with the pool's name; the
     backend is not marked down.
@@ -320,7 +331,7 @@ def create_proxy_app(
     )
     # Worker /health probes get their own pool so request traffic that fills
     # the main pool cannot fail readiness or identity checks.
-    probe_max_connections = _PROBE_MAX_CONNECTIONS
+    probe_max_connections = _probe_pool_size(rules)
     probe_client: Any = (
         client
         if client is not None
@@ -432,14 +443,32 @@ def create_proxy_app(
         return record_identity(rule, url, health, nonce, epoch)
 
     identity_probes: dict[tuple[str, str], asyncio.Task[bool]] = {}
+    health_checks: dict[tuple[str, str], asyncio.Task[str]] = {}
 
-    def forget_probe(key: tuple[str, str], probe: asyncio.Task[bool]) -> None:
-        if identity_probes.get(key) is probe:
-            del identity_probes[key]
-        if not probe.cancelled():
-            # Retrieved here so a probe whose every waiter was cancelled does
+    def single_flight(
+        flights: dict[tuple[str, str], asyncio.Task[_T]],
+        key: tuple[str, str],
+        start: Callable[[], Coroutine[Any, Any, _T]],
+    ) -> asyncio.Task[_T]:
+        """The task running for ``key``, started by ``start`` when none is."""
+        flight = flights.get(key)
+        if flight is None or flight.done():
+            flight = asyncio.create_task(start())
+            flights[key] = flight
+            flight.add_done_callback(lambda done: forget_flight(flights, key, done))
+        return flight
+
+    def forget_flight(
+        flights: dict[tuple[str, str], asyncio.Task[_T]],
+        key: tuple[str, str],
+        flight: asyncio.Task[_T],
+    ) -> None:
+        if flights.get(key) is flight:
+            del flights[key]
+        if not flight.cancelled():
+            # Retrieved here so a flight whose every waiter was cancelled does
             # not log "exception was never retrieved".
-            probe.exception()
+            flight.exception()
 
     async def confirm_identity(rule: RoutingRule, url: str) -> bool:
         """Probe an unverified backend before it is sent any request.
@@ -454,12 +483,9 @@ def create_proxy_app(
         """
         if deployment_token is None or rule.is_verified(url):
             return True
-        key = (rule.prefix, url)
-        probe = identity_probes.get(key)
-        if probe is None or probe.done():
-            probe = asyncio.create_task(probe_identity(rule, url))
-            identity_probes[key] = probe
-            probe.add_done_callback(lambda done: forget_probe(key, done))
+        probe = single_flight(
+            identity_probes, (rule.prefix, url), lambda: probe_identity(rule, url)
+        )
         return await asyncio.shield(probe)
 
     def pool_exhausted(pool: str, limit: int, upstream: str) -> JSONResponse:
@@ -539,24 +565,35 @@ def create_proxy_app(
             if denied is not None:
                 return denied
 
-            async def check_one(rule: RoutingRule) -> tuple[str, str]:
-                async def check_backend(url: str) -> str:
-                    nonce = new_challenge()
-                    epoch = rule.identity_epoch(url)
-                    try:
-                        resp = await asyncio.wait_for(read_health(url, nonce), 2.0)
-                    except Exception:
-                        rule.mark_down(url)
-                        return "unreachable"
-                    if not record_identity(rule, url, resp, nonce, epoch):
-                        return "foreign deployment"
-                    if resp.status_code == 200:
-                        rule.mark_up(url)
-                        return "ok"
+            async def check_backend(rule: RoutingRule, url: str) -> str:
+                nonce = new_challenge()
+                epoch = rule.identity_epoch(url)
+                try:
+                    resp = await asyncio.wait_for(read_health(url, nonce), 2.0)
+                except Exception:
                     rule.mark_down(url)
-                    return "unhealthy"
+                    return "unreachable"
+                if not record_identity(rule, url, resp, nonce, epoch):
+                    return "foreign deployment"
+                if resp.status_code == 200:
+                    rule.mark_up(url)
+                    return "ok"
+                rule.mark_down(url)
+                return "unhealthy"
 
-                statuses = await asyncio.gather(*(check_backend(url) for url in rule.backend_urls))
+            async def check_shared(rule: RoutingRule, url: str) -> str:
+                # Concurrent polls share one probe per worker, so a stalled
+                # worker holds one probe connection however many polls arrive;
+                # a cancelled poll leaves the probe running for the others.
+                check = single_flight(
+                    health_checks, (rule.prefix, url), lambda: check_backend(rule, url)
+                )
+                return await asyncio.shield(check)
+
+            async def check_one(rule: RoutingRule) -> tuple[str, str]:
+                statuses = await asyncio.gather(
+                    *(check_shared(rule, url) for url in rule.backend_urls)
+                )
                 if "ok" in statuses:
                     return rule.prefix, "ok"
                 if "foreign deployment" in statuses:
