@@ -71,10 +71,14 @@ def externalized(cls: type[T] | None = None, *, target: str | None = None) -> An
       3. the default scheme ``{broker}:{fully-qualified-event-name}``.
 
     An explicit ``target`` is stored with the whitespace around its scheme and
-    destination stripped. One whose scheme or destination is empty raises
-    ``ConfigurationError`` here, at decoration time.
+    destination stripped. One that is not a ``str``, or whose scheme or
+    destination is empty, raises ``ConfigurationError`` here, at decoration time.
     """
     if target is not None:
+        if not isinstance(target, str):
+            raise ConfigurationError(
+                f"invalid @externalized target {target!r}; expected a 'scheme:destination' string"
+            )
         scheme, destination = _split_broker_target(target)
         if not scheme or not destination:
             raise ConfigurationError(
@@ -240,7 +244,13 @@ def listener(
         event_type = _resolve_event_type(handler, resolve_target)
         registered: Callable[..., Any]
 
-        if target_is_async and inspect.iscoroutinefunction(handler):
+        # A bound method rejects attribute assignment, so it registers through
+        # the adapter, which carries the broker targets and listener markers.
+        if (
+            target_is_async
+            and inspect.iscoroutinefunction(handler)
+            and not inspect.ismethod(handler)
+        ):
             registered = handler
         elif target_is_async:
 
@@ -252,6 +262,10 @@ def listener(
                 return result
 
             async_adapter.__modulith_sync_wrapped__ = handler  # type: ignore[attr-defined]
+            if inspect.ismethod(handler):
+                # outbox._listener_id adds the owning module package to a bound
+                # method's id only when it sees a method or this marker.
+                async_adapter.__modulith_instance_listener__ = True  # type: ignore[attr-defined]
             registered = async_adapter
         else:
             from .sync import wrap_sync_listener

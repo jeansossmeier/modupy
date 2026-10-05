@@ -237,6 +237,65 @@ async def test_listener_accepts_async_callable_class_instance() -> None:
     assert received == [event_instance]
 
 
+@pytest.mark.asyncio
+async def test_listener_accepts_async_bound_method() -> None:
+    calls: list[tuple[object, E]] = []
+
+    class Service:
+        async def on_order(self, evt: E) -> None:
+            calls.append((self, evt))
+
+    service = Service()
+    bound = service.on_order
+
+    returned = listener(broker_targets=("redis-streams:orders",))(bound)
+
+    assert returned == bound
+    registered = _runtime._pending_listeners[0][1]
+    assert inspect.iscoroutinefunction(registered)
+    assert registered.__modulith_broker_targets__ == ("redis-streams:orders",)
+    event_instance = E()
+    await registered(event_instance)
+    assert calls == [(service, event_instance)]
+    manifest = Manifest(package="not.importable", listeners=(bound,))
+    assert verify_manifest(manifest, {registered}) == []
+
+
+def test_async_bound_method_listener_id_is_prefixed_with_its_module_package(
+    make_fake_app,
+) -> None:
+    """A bound method is named ``owner:module.Class.method``, however it registers."""
+    make_fake_app(
+        {
+            "orders": """
+                from dataclasses import dataclass
+
+                from modulith import event, listener
+
+                @event
+                @dataclass(frozen=True)
+                class Placed:
+                    order_id: str
+
+                class Notifier:
+                    async def on_placed(self, evt: Placed) -> None: ...
+
+                listener(Notifier().on_placed)
+            """
+        }
+    )
+    _runtime.configure(package="fakeapp")
+    import fakeapp.orders as orders
+
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.event_bus is not None
+    handlers = _runtime.event_bus.listeners_for(orders.Placed)
+    assert [outbox._listener_id(h) for h in handlers] == [
+        "fakeapp.orders:fakeapp.orders.Notifier.on_placed"
+    ]
+
+
 class AsyncEmailSender:
     async def __call__(self, evt: E) -> None:
         pass
@@ -440,3 +499,17 @@ def test_externalized_rejects_target_without_scheme_or_destination(target: str) 
         @dataclass(frozen=True)
         class Placed:
             order_id: str
+
+
+@pytest.mark.parametrize(
+    "target",
+    [123, ["redis-streams:orders"], b"redis-streams:orders", object()],
+    ids=["int", "list", "bytes", "object"],
+)
+def test_externalized_rejects_non_string_target(target: object) -> None:
+    with pytest.raises(ConfigurationError) as excinfo:
+        externalized(target=target)  # type: ignore[arg-type]
+
+    message = str(excinfo.value)
+    assert repr(target) in message
+    assert "scheme:destination" in message
