@@ -107,6 +107,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - Postgres outbox store: a sweep that outlives `dispose()` fails with `ConfigurationError("store is disposed")` instead of opening an advisory-lock pool nothing disposes. The cross-loop warning still fires after the first event loop has been garbage-collected, and an advisory unlock that finds the lock already gone logs a WARNING naming the publication, which a peer may have delivered too
 - SHM broker: a delivery dead-lettered when it is reclaimed past `max_delivery_attempts` is pruned once its retention passes, like other dead letters; it used to stay in the store forever
 - `modulith run --topology processes`: the start-up warning about a retired consumer group says, for a database or SHM group that no longer has a subscription, that no new publication reaches it and only its leftover backlog remains. The check gives up after 10 seconds on a broker store that does not answer and starts the workers, instead of waiting forever
+- Reverse proxy: a request to a module with several replicas is served by a healthy replica when the one it picked first is down, answers for another deployment, or misses its identity-check deadline; it answers 502, 503 or 504 only after every replica was tried. A request that may already have reached a replica is never sent to another
 
 ### Security
 

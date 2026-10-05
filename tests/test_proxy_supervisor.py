@@ -26,6 +26,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
+from modulith._worker import NONCE_HEADER, identity_proof
 from modulith.proxy import RoutingRule, create_proxy_app
 from modulith.supervisor import (
     Supervisor,
@@ -1370,3 +1371,183 @@ async def test_proxy_routes_only_to_its_own_replica_when_one_port_is_foreign() -
     assert health.json()["backends"] == {"/orders": "ok"}
     # Identity is checked once per backend, not once per request.
     assert identity_probes == 1
+
+
+# ---------------------------------------------------------------------------
+# Replica failover: a bad replica never fails a request another one can serve
+# ---------------------------------------------------------------------------
+
+_REPLICA_A = "http://orders-a"
+_REPLICA_B = "http://orders-b"
+_Hit = tuple[str, str, str]
+
+
+def _replica_fleet(
+    behaviours: dict[str, str], on_request: Exception | None = None
+) -> tuple[httpx.AsyncClient, list[_Hit]]:
+    """One injected client in front of fake replicas, keyed by URL in ``behaviours``.
+
+    ``dead`` refuses connections, ``foreign`` answers /health without the
+    proof, ``stalled`` never answers /health, ``garbage`` breaks the HTTP
+    framing of /health, ``resets`` verifies and then fails the request itself
+    with ``on_request``; anything else is a healthy worker. ``behaviours`` is
+    read per call, so a test can change a replica mid-request.
+    """
+    hits: list[_Hit] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        host, path = request.url.host, request.url.path
+        kind = behaviours[f"http://{host}"]
+        hits.append((host, request.method, path))
+        if kind == "dead":
+            raise httpx.ConnectError("refused", request=request)
+        if path == "/health":
+            if kind == "foreign":
+                return httpx.Response(200, json={"status": "ok", "module": "orders"})
+            if kind == "stalled":
+                await asyncio.sleep(30)
+            if kind == "garbage":
+                raise httpx.RemoteProtocolError("illegal status line", request=request)
+            proof = identity_proof("tok", request.headers[NONCE_HEADER], "orders", 80)
+            return httpx.Response(200, json={"status": "ok", "proof": proof})
+        if kind == "resets":
+            assert on_request is not None
+            raise on_request
+        return httpx.Response(
+            200, stream=httpx.ByteStream(json.dumps({"served_by": host}).encode())
+        )
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler)), hits
+
+
+def _failover_proxy(client: httpx.AsyncClient, rule: RoutingRule) -> httpx.AsyncClient:
+    app = create_proxy_app(
+        [rule],
+        client=client,
+        deployment_token="tok",
+        identity_probe_timeout=0.2,
+        connect_retry_attempts=2,
+        connect_retry_backoff=0.0,
+    )
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy")
+
+
+def _two_replicas() -> RoutingRule:
+    return RoutingRule("/orders", _REPLICA_A, (_REPLICA_A, _REPLICA_B))
+
+
+@pytest.mark.parametrize(
+    ("bad", "marked_down", "marked_foreign"),
+    [
+        ("dead", True, False),
+        ("foreign", False, True),
+        ("garbage", True, False),
+        ("stalled", False, False),
+    ],
+)
+async def test_a_request_is_served_by_the_healthy_replica_when_the_first_is_bad(
+    bad: str, marked_down: bool, marked_foreign: bool
+) -> None:
+    client, hits = _replica_fleet({_REPLICA_A: bad, _REPLICA_B: "healthy"})
+    rule = _two_replicas()
+    async with _failover_proxy(client, rule) as proxy_client:
+        first = await proxy_client.get("/orders/ping")
+        hits_on_a_after_first = [h for h in hits if h[0] == "orders-a"]
+        second = await proxy_client.get("/orders/ping")
+
+    assert (first.status_code, first.json().get("served_by")) == (200, "orders-b")
+    assert (second.status_code, second.json().get("served_by")) == (200, "orders-b")
+    assert (_REPLICA_A in rule._down, _REPLICA_A in rule._foreign) == (marked_down, marked_foreign)
+    assert not rule.is_verified(_REPLICA_A)
+    assert ("orders-a", "GET", "/orders/ping") not in hits
+    if bad != "stalled":
+        # A marked replica is skipped by later requests, as before failover existed.
+        assert [h for h in hits if h[0] == "orders-a"] == hits_on_a_after_first
+
+
+@pytest.mark.parametrize(
+    ("bad", "status", "detail"),
+    [
+        ("dead", 502, "backend unreachable"),
+        ("garbage", 502, "backend unreachable"),
+        ("foreign", 503, "no worker of this deployment serves /orders"),
+        ("stalled", 504, "worker identity check timed out"),
+    ],
+)
+async def test_a_request_keeps_its_status_when_every_replica_is_bad(
+    bad: str, status: int, detail: str
+) -> None:
+    client, hits = _replica_fleet({_REPLICA_A: bad, _REPLICA_B: bad})
+    async with _failover_proxy(client, _two_replicas()) as proxy_client:
+        resp = await proxy_client.get("/orders/ping")
+
+    assert (resp.status_code, resp.json()) == (status, {"detail": detail})
+    assert {h[0] for h in hits} == {"orders-a", "orders-b"}
+
+
+async def test_a_replica_turning_foreign_between_the_two_checks_does_not_fail_the_request() -> None:
+    behaviours = {_REPLICA_A: "healthy", _REPLICA_B: "healthy"}
+
+    class _TurnsForeignAfterItsFirstCheck(RoutingRule):
+        """A respawn forgets the verified replica; another process takes its port."""
+
+        def mark_verified(self, url: str) -> None:
+            super().mark_verified(url)
+            if url == _REPLICA_A:
+                behaviours[url] = "foreign"
+                self.forget_identity(url)
+
+    client, hits = _replica_fleet(behaviours)
+    rule = _TurnsForeignAfterItsFirstCheck("/orders", _REPLICA_A, (_REPLICA_A, _REPLICA_B))
+    async with _failover_proxy(client, rule) as proxy_client:
+        resp = await proxy_client.get("/orders/ping")
+
+    assert (resp.status_code, resp.json().get("served_by")) == (200, "orders-b")
+    assert ("orders-a", "GET", "/orders/ping") not in hits
+
+
+@pytest.mark.parametrize("failure", [httpx.ConnectError("refused"), httpx.ConnectTimeout("slow")])
+async def test_a_post_that_never_connected_moves_to_the_next_replica_intact(
+    failure: httpx.TransportError,
+) -> None:
+    sent: list[tuple[str, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            proof = identity_proof("tok", request.headers[NONCE_HEADER], "orders", 80)
+            return httpx.Response(200, json={"proof": proof})
+        sent.append((request.url.host, request.content.decode()))
+        if request.url.host == "orders-a":
+            raise failure
+        return httpx.Response(
+            200, stream=httpx.ByteStream(json.dumps({"served_by": request.url.host}).encode())
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    async with _failover_proxy(client, _two_replicas()) as proxy_client:
+        resp = await proxy_client.post("/orders/pay", content=b"amount=5")
+
+    assert (resp.status_code, resp.json().get("served_by")) == (200, "orders-b")
+    assert sent[-1] == ("orders-b", "amount=5")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.ReadTimeout("no answer"),
+        httpx.ReadError("reset"),
+        httpx.RemoteProtocolError("closed mid-response"),
+        httpx.WriteError("broken pipe"),
+    ],
+)
+async def test_a_post_that_may_have_reached_a_replica_is_never_sent_to_another(
+    failure: httpx.TransportError,
+) -> None:
+    client, hits = _replica_fleet({_REPLICA_A: "resets", _REPLICA_B: "healthy"}, failure)
+    rule = _two_replicas()
+    async with _failover_proxy(client, rule) as proxy_client:
+        resp = await proxy_client.post("/orders/pay", content=b"amount=5")
+
+    assert (resp.status_code, resp.json()) == (502, {"detail": "backend unreachable"})
+    assert [h for h in hits if h[1] == "POST"] == [("orders-a", "POST", "/orders/pay")]
+    assert _REPLICA_A in rule._down

@@ -147,6 +147,18 @@ class RoutingRule:
         return url in self._verified
 
 
+def _next_untried(rule: RoutingRule, tried: set[str]) -> str | None:
+    """The next round-robin replica not in ``tried``, or ``None`` when the
+    replicas ``next_backend()`` still offers have all been tried."""
+    for _ in rule.backend_urls:
+        candidate = rule.next_backend()
+        if candidate is None:
+            return None
+        if candidate not in tried:
+            return candidate
+    return None
+
+
 def _match_rule(path: str, rules: list[RoutingRule]) -> RoutingRule | None:
     """Find the rule whose prefix matches the path (longest prefix wins).
 
@@ -202,10 +214,26 @@ def create_proxy_app(
     retry on ``httpx.ConnectError`` (worker port not yet bound during startup/
     respawn). Total worst-case added latency before a truly-dead backend returns
     502 ≈ ``connect_retry_backoff * (connect_retry_attempts - 1)`` ≈ 0.8s with
-    defaults. Retries ONLY ConnectError (TCP connection never completed, safe
-    to retry any HTTP method); other TransportError types (ConnectTimeout,
-    ReadError, etc.) are not retried. Heavy/slow-starting apps can raise the
-    budget.
+    defaults, per replica. Retries ONLY ConnectError (TCP connection never
+    completed, safe to retry any HTTP method); other TransportError types
+    (ConnectTimeout, ReadError, etc.) are not retried against the same replica.
+    Heavy/slow-starting apps can raise the budget.
+
+    A request tries each replica of its module at most once, so one bad replica
+    does not fail a request another can serve. It moves on to the next replica
+    when this one is refused as another deployment's, does not answer its
+    identity probe in time (the replica stays unmarked), or fails before it can
+    have received the request: its identity probe failed, its connection was
+    refused (after the connect retries above) or timed out. Those replicas are
+    marked as before, so later requests skip them; any HTTP method may move on
+    because none of the request was sent. A failure after the request was sent
+    (ReadError, ReadTimeout, WriteError, RemoteProtocolError) answers 502
+    straight away, whatever the method: the replica may have acted on the
+    request, so it is never repeated on another. Only when every replica was
+    tried does the request fail, with the status of the last failure: 502
+    ``"backend unreachable"`` (down), 503 ``"no worker of this deployment
+    serves ..."`` (another deployment's port) or 504 (identity check timed out).
+    With several replicas down, the connect retries add up per replica.
 
     ``actuator_enabled=False`` (``actuator_mode="disabled"``, resolved by
     ``run_supervised``) unmounts ``/_modulith/*`` entirely — those paths fall
@@ -410,6 +438,11 @@ def create_proxy_app(
         )
         return JSONResponse({"detail": "worker identity check timed out"}, status_code=504)
 
+    def no_worker(rule: RoutingRule) -> JSONResponse:
+        return JSONResponse(
+            {"detail": f"no worker of this deployment serves {rule.prefix}"}, status_code=503
+        )
+
     # Actuator routes are registered before the catch-all so they win for
     # /_modulith/* paths. Skipped entirely when disabled — see docstring.
     if actuator_enabled:
@@ -530,37 +563,34 @@ def create_proxy_app(
         if rule is None:
             return JSONResponse({"detail": f"no worker route for {target!r}"}, status_code=404)
 
-        # One backend per request, round-robin across every replica of this
-        # module (skipping any marked down by a failed health check or a
-        # prior connect failure) — see RoutingRule.next_backend().
-        backend = rule.next_backend()
-        # Skip past replicas whose port answers for another deployment before
-        # any request bytes (cookies, auth headers) reach them. An unreachable
-        # probe leaves the backend unverified; the send loop re-probes it.
-        for _ in range(len(rule.backend_urls)):
-            if backend is None:
-                break
+        # Replicas are taken round-robin (skipping any marked down by a failed
+        # health check or a prior connect failure — see
+        # RoutingRule.next_backend()), each at most once per request.
+        tried: set[str] = set()
+        backend = _next_untried(rule, tried)
+        # Skip past replicas whose port answers for another deployment, or
+        # does not answer in time, before any request bytes (cookies, auth
+        # headers) reach them. An unreachable probe leaves the backend
+        # unverified; the send loop re-probes it.
+        refusal: JSONResponse | None = None
+        while backend is not None:
             try:
                 if await confirm_identity(rule, backend):
                     break
+                refusal = no_worker(rule)
             except TimeoutError:
-                return identity_timed_out(backend)
+                refusal = identity_timed_out(backend)
             except httpx.PoolTimeout:
                 return pool_exhausted(
                     "health-probe", probe_max_connections, backend + raw_path.decode("latin-1")
                 )
             except httpx.HTTPError:
                 break
-            backend = rule.next_backend()
+            tried.add(backend)
+            backend = _next_untried(rule, tried)
         if backend is None:
-            return JSONResponse(
-                {"detail": f"no worker of this deployment serves {rule.prefix}"},
-                status_code=503,
-            )
+            return refusal or no_worker(rule)
         query_string = request.scope.get("query_string", b"")
-        # Log-only rendering; never parsed. The request itself is built from
-        # components by _upstream_url.
-        upstream = backend + raw_path.decode("latin-1")
 
         too_large = _body_too_large(request, max_request_body_bytes)
         if too_large is not None:
@@ -608,109 +638,127 @@ def create_proxy_app(
                 ("x-forwarded-port", str(_listening_port(request.scope))),
             ]
         )
-        try:
-            upstream_req = http_client.build_request(
-                method=request.method,
-                url=_upstream_url(backend, raw_path, query_string),
-                headers=fwd_headers,
-                content=body,
-            )
-        except Exception as exc:
-            # build_request failures share no httpx base class the send()
-            # guard below could catch: httpx.InvalidURL (percent-encoded
-            # non-printable ASCII in the path) subclasses Exception directly,
-            # and a header carrying a raw non-ASCII octet raises
-            # UnicodeEncodeError. Both mean the *client's* request cannot be
-            # forwarded — answer 400, honoring the "never an uncaught 500"
-            # contract documented on the TransportError handler.
-            logger.warning(
-                "cannot build upstream request for %s: %s",
-                upstream,
-                exc,
-            )
-            return JSONResponse({"detail": "invalid request"}, status_code=400)
         attempts = max(1, connect_retry_attempts)
-        for attempt in range(attempts):
-            probing = True
+        while True:
+            # Log-only rendering; never parsed. The request itself is built from
+            # components by _upstream_url.
+            upstream = backend + raw_path.decode("latin-1")
             try:
-                if not await confirm_identity(rule, backend):
-                    return JSONResponse(
-                        {"detail": f"no worker of this deployment serves {rule.prefix}"},
-                        status_code=503,
-                    )
-                probing = False
-                upstream_resp = await http_client.send(upstream_req, stream=True)
-            except TimeoutError:
-                return identity_timed_out(backend)
-            except httpx.ConnectError as exc:
-                # Worker port not bound yet (initial start or crash-respawn
-                # window). The TCP connection never completed, so no request
-                # bytes were sent — safe to retry any method. Bounded budget,
-                # then fall through to 502.
-                if attempt + 1 >= attempts:
+                upstream_req = http_client.build_request(
+                    method=request.method,
+                    url=_upstream_url(backend, raw_path, query_string),
+                    headers=fwd_headers,
+                    content=body,
+                )
+            except Exception as exc:
+                # build_request failures share no httpx base class the send()
+                # guard below could catch: httpx.InvalidURL (percent-encoded
+                # non-printable ASCII in the path) subclasses Exception directly,
+                # and a header carrying a raw non-ASCII octet raises
+                # UnicodeEncodeError. Both mean the *client's* request cannot be
+                # forwarded — answer 400, honoring the "never an uncaught 500"
+                # contract documented on the TransportError handler.
+                logger.warning(
+                    "cannot build upstream request for %s: %s",
+                    upstream,
+                    exc,
+                )
+                return JSONResponse({"detail": "invalid request"}, status_code=400)
+            # Answer given when this replica fails before it can have received
+            # the request and no other replica is left.
+            failover = JSONResponse({"detail": "backend unreachable"}, status_code=502)
+            for attempt in range(attempts):
+                probing = True
+                try:
+                    if not await confirm_identity(rule, backend):
+                        failover = no_worker(rule)
+                        break
+                    probing = False
+                    upstream_resp = await http_client.send(upstream_req, stream=True)
+                except TimeoutError:
+                    failover = identity_timed_out(backend)
+                    break
+                except httpx.ConnectError as exc:
+                    # Worker port not bound yet (initial start or crash-respawn
+                    # window). The TCP connection never completed, so no request
+                    # bytes were sent — safe to retry any method. Bounded budget,
+                    # then the next replica, then 502.
+                    if attempt + 1 >= attempts:
+                        rule.mark_down(backend)
+                        logger.warning(
+                            "backend %s unreachable after %d connect attempts for %s: %s",
+                            backend,
+                            attempts,
+                            upstream,
+                            exc,
+                        )
+                        break
+                    await asyncio.sleep(connect_retry_backoff)
+                    continue
+                except httpx.PoolTimeout:
+                    if probing:
+                        return pool_exhausted("health-probe", probe_max_connections, upstream)
+                    return pool_exhausted("request", max_connections, upstream)
+                except httpx.ConnectTimeout as exc:
+                    # The connection was never established, so no request bytes
+                    # were sent: another replica may take any method.
+                    rule.mark_down(backend)
+                    logger.warning("backend %s unreachable for %s: %s", backend, upstream, exc)
+                    break
+                except httpx.TransportError as exc:
+                    # The rest of the transport tree — ReadError/ReadTimeout/
+                    # WriteError/RemoteProtocolError (worker died mid-request or
+                    # mid-handshake) — all mean "backend unavailable" → 502,
+                    # never an uncaught 500. Once the request itself was sent the
+                    # replica may have acted on it, so it is not repeated
+                    # elsewhere; a failed identity probe sent none of it.
                     rule.mark_down(backend)
                     logger.warning(
-                        "backend %s unreachable after %d connect attempts for %s: %s",
+                        "backend %s unreachable for %s: %s",
                         backend,
-                        attempts,
                         upstream,
                         exc,
                     )
+                    if probing:
+                        break
                     return JSONResponse({"detail": "backend unreachable"}, status_code=502)
-                await asyncio.sleep(connect_retry_backoff)
-                continue
-            except httpx.PoolTimeout:
-                if probing:
-                    return pool_exhausted("health-probe", probe_max_connections, upstream)
-                return pool_exhausted("request", max_connections, upstream)
-            except httpx.TransportError as exc:
-                # TransportError covers the whole connect/read failure tree —
-                # ConnectError (refused/DNS), ConnectTimeout (reachable but
-                # unresponsive), ReadError/ReadTimeout/RemoteProtocolError (worker
-                # died mid-handshake). All mean "backend unavailable" → 502, never
-                # an uncaught 500.
-                rule.mark_down(backend)
-                logger.warning(
-                    "backend %s unreachable for %s: %s",
-                    backend,
-                    upstream,
-                    exc,
+                except httpx.RequestError as exc:
+                    # RequestError siblings outside the TransportError subtree —
+                    # httpx.TooManyRedirects (a redirect-looping backend behind an
+                    # injected follow_redirects=True client) and
+                    # httpx.DecodingError. Both mean "no valid response could be
+                    # obtained from the backend" → 502, honoring the
+                    # never-an-uncaught-500 contract documented above.
+                    logger.warning(
+                        "backend %s returned no usable response for %s: %s",
+                        backend,
+                        upstream,
+                        exc,
+                    )
+                    return JSONResponse({"detail": "backend error"}, status_code=502)
+                # success: this backend answered — clear any prior down-marking.
+                rule.mark_up(backend)
+                response = StreamingResponse(
+                    _safe_stream(upstream_resp, upstream),
+                    status_code=upstream_resp.status_code,
                 )
-                return JSONResponse({"detail": "backend unreachable"}, status_code=502)
-            except httpx.RequestError as exc:
-                # RequestError siblings outside the TransportError subtree —
-                # httpx.TooManyRedirects (a redirect-looping backend behind an
-                # injected follow_redirects=True client) and
-                # httpx.DecodingError. Both mean "no valid response could be
-                # obtained from the backend" → 502, honoring the
-                # never-an-uncaught-500 contract documented above.
-                logger.warning(
-                    "backend %s returned no usable response for %s: %s",
-                    backend,
-                    upstream,
-                    exc,
-                )
-                return JSONResponse({"detail": "backend error"}, status_code=502)
-            # success: this backend answered — clear any prior down-marking.
-            rule.mark_up(backend)
-            response = StreamingResponse(
-                _safe_stream(upstream_resp, upstream),
-                status_code=upstream_resp.status_code,
-            )
-            # Passing headers= to StreamingResponse builds a plain dict internally
-            # (Response.init_headers), which loses duplicates the same way as on
-            # the request side (e.g. multiple Set-Cookie). Setting raw_headers
-            # directly after construction preserves every occurrence.
-            response.raw_headers = [
-                (k.lower().encode("latin-1"), v.encode("latin-1"))
-                for k, v in _relativize_location(
-                    _filter_headers(_header_pairs(upstream_resp.headers.raw)),
-                    backend,
-                )
-            ]
-            return response
-        # Loop always returns above; satisfies the type checker.
-        return JSONResponse({"detail": "backend unreachable"}, status_code=502)
+                # Passing headers= to StreamingResponse builds a plain dict internally
+                # (Response.init_headers), which loses duplicates the same way as on
+                # the request side (e.g. multiple Set-Cookie). Setting raw_headers
+                # directly after construction preserves every occurrence.
+                response.raw_headers = [
+                    (k.lower().encode("latin-1"), v.encode("latin-1"))
+                    for k, v in _relativize_location(
+                        _filter_headers(_header_pairs(upstream_resp.headers.raw)),
+                        backend,
+                    )
+                ]
+                return response
+            tried.add(backend)
+            following = _next_untried(rule, tried)
+            if following is None:
+                return failover
+            backend = following
 
     return app
 
