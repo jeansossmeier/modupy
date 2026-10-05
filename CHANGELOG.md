@@ -129,6 +129,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `JsonEventSerializer` refuses at serialize time a value that is only a virtual subclass (ABC `register` or an `__instancecheck__` override) of its field's type, instead of writing a tag no consumer can decode; decoding a subclass tag that more than one class carries raises `ValueError`; and a payload repeating an unknown tag no longer walks the subclass tree once per value (6.2 s down to 1.1 s for 50,000 values over 200 subclasses)
 - `modulith run` refuses at start-up a module whose replica ports run past 65535 and two replicas assigned the same port, and `WorkerSpec` rejects a non-integer port when it is built
 - The proxy's worker identity check no longer trusts a port again when a probe sent before a respawn answers late, asks for an uncompressed `/health` and treats a compressed one as foreign instead of decoding it past its 64 KiB cap, and treats a deeply nested JSON `/health` body as foreign instead of failing the request with a 500
+- Pushing a release tag creates a GitHub Release once the PyPI upload succeeds, with generated notes, a link to the changelog and the built wheel and sdist attached; only that job is granted `contents: write`
 
 ### Security
 

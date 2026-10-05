@@ -1011,6 +1011,76 @@ def test_release_publish_has_no_unconditional_success_override() -> None:
     )
 
 
+def _release_creating_jobs() -> dict[str, dict[str, Any]]:
+    """Release-workflow jobs with a step that runs ``gh release create``."""
+    return {
+        name: job
+        for name, job in _jobs(_release_text()).items()
+        if any(
+            isinstance(step.get("run"), str)
+            and _has_shell_command(step["run"], ["gh", "release", "create"])
+            for step in job.get("steps", [])
+        )
+    }
+
+
+def test_release_creates_a_github_release_for_the_tag_after_publish() -> None:
+    """SECURITY.md tells users to watch for releases, so a published tag needs a
+    GitHub Release, and only once PyPI has accepted the upload."""
+    jobs = _release_creating_jobs()
+    assert len(jobs) == 1, f"exactly one job must run `gh release create`, got {sorted(jobs)}"
+    job = next(iter(jobs.values()))
+    needs = job.get("needs")
+    assert needs == "publish" or (isinstance(needs, list) and "publish" in needs), (
+        f"the release job must wait for publish, got needs={needs!r}"
+    )
+    assert job.get("if") is None, "no `if:` may let the release job run after a failed publish"
+    command = next(
+        tokens
+        for step in job["steps"]
+        if isinstance(step.get("run"), str)
+        for tokens in _shell_commands(step["run"])
+        if tokens[:3] == ["gh", "release", "create"]
+    )
+    assert command[3] == "$GITHUB_REF_NAME", (
+        f"release must be created for the pushed tag: {command}"
+    )
+    assert "--generate-notes" in command, f"release needs notes: {command}"
+
+
+def test_release_workflow_grants_contents_write_only_to_the_release_job() -> None:
+    """Creating a release needs ``contents: write``; a job-level block replaces
+    the workflow default, so every other job keeps its narrower grant."""
+    workflow = _release_workflow()
+    assert workflow["permissions"] == {"contents": "read"}
+    jobs = _jobs(_release_text())
+    writers = sorted(
+        name for name, job in jobs.items() if job.get("permissions", {}).get("contents") == "write"
+    )
+    assert writers == sorted(_release_creating_jobs()) and len(writers) == 1, writers
+    assert jobs["publish"]["permissions"] == {"id-token": "write"}
+    assert jobs[writers[0]]["permissions"] == {"contents": "write"}
+
+
+def test_release_job_pins_every_action_to_a_commit() -> None:
+    """The release job holds a write token, so a movable action tag there could
+    push to the repository."""
+    text = _release_text()
+    (job,) = _release_creating_jobs().values()
+    unpinned = [
+        step["uses"]
+        for step in job["steps"]
+        if "uses" in step
+        and not (
+            re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", step["uses"])
+            and re.search(
+                rf"\buses: {re.escape(step['uses'])} # v\d+\.\d+\.\d+[ \t]*$", text, re.MULTILINE
+            )
+        )
+    ]
+    assert unpinned == [], f"release job actions not pinned to a commit: {unpinned}"
+
+
 def _credential_markers(publish: dict[str, Any]) -> list[str]:
     """Credential-shaped strings found anywhere in the publish job.
 
