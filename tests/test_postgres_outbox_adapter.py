@@ -2168,6 +2168,39 @@ async def test_a_sweep_skipping_a_row_this_process_is_delivering_charges_nothing
     assert (again.attempt_count, again.last_error) == (1, "boom")
 
 
+async def test_lowered_threshold_dead_letters_rows_over_it_and_delivers_the_rest(
+    engine: Any,
+) -> None:
+    """Rows saved under a higher ``dead_letter_after_attempts`` carry
+    ``is_dead_lettered = false``. Once the value is lowered, the sweep must
+    dead-letter the rows already over it, or ``claim_batch`` hands them back
+    every sweep and they fill its batch ahead of the healthy row."""
+    store = PostgresPublicationStore(engine=engine)
+    long_ago = datetime.now(UTC) - timedelta(hours=1)
+    over = [_pub(n, attempt_count=5, published_at=long_ago) for n in (1, 2, 3)]
+    healthy = _pub(4, published_at=long_ago + timedelta(minutes=1))
+    for pub in [*over, healthy]:
+        await store.save(pub)
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        dead_letter_after_attempts=3,
+        claim_strategy="lease",
+        claim_batch_size=3,
+        start_loop=False,
+    )
+    _bootstrap_with_listener(record)
+
+    await outbox._sweep(timedelta(0))
+    await outbox._sweep(timedelta(0))
+
+    assert received == [4]
+    assert await store.count_dead_lettered() == 3
+    for pub in over:
+        row = await _stored_row(engine, pub.id)
+        assert (row.is_dead_lettered, row.attempt_count, row.claim_token) == (True, 5, None)
+
+
 async def test_a_dead_letter_reopened_for_retry_is_not_charged_an_earlier_interruption(
     engine: Any,
 ) -> None:

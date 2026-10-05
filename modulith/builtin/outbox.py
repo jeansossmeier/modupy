@@ -269,6 +269,10 @@ _shutdown_grace_seconds: float = 10.0
 # process (the cross-process case is handled by the store's row-level claim).
 _inflight_ids: set[UUID] = set()
 
+# (id, attempt_count) of rows a sweep already recorded as dead-lettered. Keyed
+# on the count so a row reopened with a fresh budget is not mistaken for one.
+_swept_dead_letters: set[tuple[UUID, int]] = set()
+
 # Guards the check-then-add on ``_inflight_ids``. The non-reentrancy guarantee
 # is documented at *process* granularity, but a bare set is only safe against
 # interleaving on a single event loop — two loops on two OS threads (main loop
@@ -825,29 +829,63 @@ async def _record_failure(publication: EventPublication, exc: Exception) -> None
     publication.last_error = str(exc)[:500]
     publication.last_attempt_at = datetime.now(UTC)
 
+    if not await _persist_failure(publication):
+        # Revert optimistic bump — the failure was not persisted.
+        publication.attempt_count -= 1
+        logger.warning(
+            "stale claim token on fail for publication %s — abandoning "
+            "(another sweeper owns this row)",
+            publication.id,
+        )
+        return
+
+    if publication.attempt_count >= _dead_letter_after_attempts:
+        _log_dead_lettered(publication)
+
+
+async def _persist_failure(publication: EventPublication) -> bool:
+    """Write the publication's attempt state; False when a held claim was lost.
+
+    A claimed row goes through the token-fenced ``fail_claim`` (which also
+    releases the claim); an unclaimed one through ``save``.
+    """
+    assert _store is not None
     token = publication.claim_token
     fail_claim = getattr(_store, "fail_claim", None) if token else None
     if token is not None and fail_claim is not None:
-        ok = await fail_claim(publication, token)
-        if not ok:
-            # Revert optimistic bump — the failure was not persisted.
-            publication.attempt_count -= 1
-            logger.warning(
-                "stale claim token on fail for publication %s — abandoning "
-                "(another sweeper owns this row)",
-                publication.id,
-            )
-            return
-    else:
-        await _store.save(publication)
+        return bool(await fail_claim(publication, token))
+    await _store.save(publication)
+    return True
 
-    if publication.attempt_count >= _dead_letter_after_attempts:
-        logger.error(
-            "publication %s dead-lettered after %d attempt(s): %s",
-            publication.id,
-            publication.attempt_count,
-            publication.last_error,
-        )
+
+def _log_dead_lettered(publication: EventPublication) -> None:
+    logger.error(
+        "publication %s dead-lettered after %d attempt(s): %s",
+        publication.id,
+        publication.attempt_count,
+        publication.last_error,
+    )
+
+
+async def _dead_letter_swept(publication: EventPublication) -> None:
+    """Record a swept row already at or over the threshold as dead-lettered.
+
+    Lowering ``dead_letter_after_attempts`` leaves rows over the new value
+    stored as live, and a sweep that merely skipped them would see them again
+    every cycle (``claim_batch`` keeps handing them back and filling its
+    batch). The write lets the store flag them. A store that keeps returning
+    dead-lettered rows gets one write and one error per row: a held claim is
+    then just released.
+    """
+    assert _store is not None
+    key = (publication.id, publication.attempt_count)
+    if key in _swept_dead_letters:
+        if publication.claim_token:
+            await _store.renew_claim(publication.id, publication.claim_token, 0.0)  # type: ignore[attr-defined]
+        return
+    if await _persist_failure(publication):
+        _swept_dead_letters.add(key)
+        _log_dead_lettered(publication)
 
 
 async def _dispatch_publication(publication: EventPublication) -> None:
@@ -1146,7 +1184,8 @@ async def _sweep_unclaimed(older_than: timedelta, *, runtime_ready: bool) -> Non
         if _stop_requested.is_set():
             return
         if pub.attempt_count >= _dead_letter_after_attempts:
-            continue  # dead-lettered — no further retries
+            await _dead_letter_swept(pub)
+            continue
         if not _backoff_elapsed(pub) or _foreign_to_this_worker(pub):
             continue
         await _dispatch_publication(pub)
@@ -1188,8 +1227,7 @@ async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
             await _release_claims(undelivered)
             return
         if pub.attempt_count >= _dead_letter_after_attempts:
-            if pub.claim_token:
-                await _store.renew_claim(pub.id, pub.claim_token, 0.0)  # type: ignore[attr-defined]
+            await _dead_letter_swept(pub)
             continue
         if not _backoff_elapsed(pub) or _foreign_to_this_worker(pub):
             # Release early: holding a full lease on a not-yet-due row, or on
@@ -1254,6 +1292,7 @@ async def _sweep_advisory(older_than: timedelta, *, runtime_ready: bool) -> None
         if _stop_requested.is_set():
             break
         if pub.attempt_count >= _dead_letter_after_attempts:
+            await _dead_letter_swept(pub)
             continue
         if not _backoff_elapsed(pub) or _foreign_to_this_worker(pub):
             continue
@@ -1829,6 +1868,7 @@ def _reset_for_testing() -> None:
     _claim_owner = ""
     with _inflight_lock:
         _inflight_ids.clear()
+    _swept_dead_letters.clear()
 
 
 __all__ = [

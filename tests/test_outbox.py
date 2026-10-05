@@ -1221,6 +1221,29 @@ async def test_advisory_sweep_dispatches_the_reread_row() -> None:
     assert store.locks == {}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("attempts", "delivered"), [(3, []), (2, [15])])
+async def test_advisory_dispatch_under_lock_stops_at_the_threshold(
+    attempts: int, delivered: list[int]
+) -> None:
+    """Past its backoff, a row at the threshold is left alone once locked and
+    the row one attempt below it is delivered."""
+    store = ClaimingStubStore()
+    _configure_for_sweep(store, "advisory_lock")
+    pub = _make_pub(
+        record,
+        value=15,
+        attempt_count=attempts,
+        published_at=datetime.now(UTC) - timedelta(hours=1),
+    )
+    await store.save(pub)
+
+    assert await outbox._dispatch_under_advisory_lock(pub) is True
+
+    assert received == delivered
+    assert store.locks == {}
+
+
 def _outbox_messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
     return [
         r.getMessage() for r in caplog.records if r.name == "modulith.outbox" and r.levelno == level
@@ -2202,7 +2225,10 @@ async def test_malformed_tokenless_claims_are_safe_during_runtime_outage() -> No
 
 
 @pytest.mark.asyncio
-async def test_lease_sweep_releases_dead_lettered_claim() -> None:
+async def test_lease_sweep_dead_lettered_claim_is_failed_not_released() -> None:
+    """A claimed row at the threshold is written as dead-lettered under its
+    claim token (``fail_claim`` also frees the claim), not just handed back
+    with ``renew_claim(..., 0)``, which would leave it claimable every sweep."""
     store = ClaimingStubStore()
     outbox.configure(
         store,
@@ -2218,8 +2244,109 @@ async def test_lease_sweep_releases_dead_lettered_claim() -> None:
     await outbox._sweep(timedelta(0))
 
     assert received == []
-    assert any(call[0] == publication.id and call[2] == 0 for call in store.renew_calls)
+    assert [call[0] for call in store.fail_claim_calls] == [publication.id]
+    assert store.renew_calls == []
     assert publication.completed_at is None
+
+
+_SWEEP_STRATEGIES = ["none", "lease", "advisory_lock"]
+
+
+def _dead_letter_errors(caplog: pytest.LogCaptureFixture, pub: EventPublication) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.ERROR
+        and "dead-lettered" in r.getMessage()
+        and str(pub.id) in r.getMessage()
+    ]
+
+
+def _configure_for_sweep(store: ClaimingStubStore, strategy: str) -> None:
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy=strategy,  # type: ignore[arg-type]
+        dead_letter_after_attempts=3,
+        start_loop=False,
+    )
+    _bootstrap_with_listener(record)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", _SWEEP_STRATEGIES)
+async def test_sweep_dead_letters_a_row_at_the_threshold_and_delivers_the_one_below(
+    strategy: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The threshold row (the state a lowered ``dead_letter_after_attempts``
+    leaves behind) is persisted as dead-lettered, logged once and never
+    dispatched; the row one attempt below it still delivers."""
+    store = ClaimingStubStore()
+    _configure_for_sweep(store, strategy)
+    long_ago = datetime.now(UTC) - timedelta(hours=1)
+    at_threshold = _make_pub(record, value=1, attempt_count=3, published_at=long_ago)
+    below = _make_pub(record, value=2, attempt_count=2, published_at=long_ago)
+    await store.save(at_threshold)
+    await store.save(below)
+    store.saved.clear()
+
+    with caplog.at_level(logging.ERROR, logger="modulith.outbox"):
+        await outbox._sweep(timedelta(0))
+
+    assert received == [2]
+    assert at_threshold.attempt_count == 3
+    assert store.saved == [at_threshold.id]
+    assert len(_dead_letter_errors(caplog, at_threshold)) == 1
+    assert _dead_letter_errors(caplog, below) == []
+    if strategy == "lease":
+        assert [call[0] for call in store.fail_claim_calls] == [at_threshold.id]
+        assert all(call[0] != at_threshold.id for call in store.renew_calls if call[2] == 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", _SWEEP_STRATEGIES)
+async def test_sweep_does_not_dead_letter_a_row_again_when_the_store_keeps_returning_it(
+    strategy: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A store that does not hide dead-lettered rows from its sweep queries
+    hands the same row back each cycle: one write and one error in all."""
+    store = ClaimingStubStore()
+    _configure_for_sweep(store, strategy)
+    dead = _make_pub(record, attempt_count=5, published_at=datetime.now(UTC) - timedelta(hours=1))
+    await store.save(dead)
+    store.saved.clear()
+
+    with caplog.at_level(logging.ERROR, logger="modulith.outbox"):
+        await outbox._sweep(timedelta(0))
+        await outbox._sweep(timedelta(0))
+
+    assert received == []
+    assert store.saved == [dead.id]
+    assert len(_dead_letter_errors(caplog, dead)) == 1
+
+
+@pytest.mark.asyncio
+async def test_lease_sweep_losing_the_claim_on_a_dead_letter_logs_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the fenced write is refused the row now belongs to a peer, so
+    this sweep neither reports it dead-lettered nor charges it."""
+
+    class PeerTookTheClaim(ClaimingStubStore):
+        async def fail_claim(self, publication: EventPublication, token: str) -> bool:
+            return False
+
+    store = PeerTookTheClaim()
+    _configure_for_sweep(store, "lease")
+    dead = _make_pub(record, attempt_count=3, published_at=datetime.now(UTC) - timedelta(hours=1))
+    await store.save(dead)
+
+    with caplog.at_level(logging.ERROR, logger="modulith.outbox"):
+        await outbox._sweep(timedelta(0))
+
+    assert received == []
+    assert _dead_letter_errors(caplog, dead) == []
+    assert dead.attempt_count == 3
 
 
 @pytest.mark.asyncio

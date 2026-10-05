@@ -553,6 +553,8 @@ A background retry loop drives redelivery:
   off instead of being retried every sweep.
 - After **10 attempts** a publication is **dead-lettered** (surfaced via
   `modulith outbox status` and the doctor command) instead of retrying forever.
+  Rows already over a lowered `dead_letter_after_attempts` are dead-lettered at
+  the next sweep.
 - The retry loop is exception-shielded end to end: an ack/observe/error-hook
   failure is logged, never allowed to kill the loop.
 
