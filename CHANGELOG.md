@@ -159,6 +159,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - A SHM broker publish refused because the store is full keeps the headroom its due prune freed, and one prune examines at most 1,000 expired publications, resuming where the last one stopped, so a large set of expired publications still held by pending deliveries no longer makes every 100th publish walk all of them
 - `modulith extract` prints the source package directory first and warns when it is an installed copy in site-packages; the import-check error and the sibling-import blocker name the file and line to fix, and an application package spread over several directories is refused before the blocker list instead of after `--force`
 - The outbox lease sweep no longer abandons the rest of a claimed batch when re-arming or releasing one row's lease fails (it logs a WARNING naming the publication and leaves that row to its lease), and a lease renewal that lands just after the row was completed no longer logs a spurious "lost lease" warning
+- A database broker used from a second event loop drops the stopped owner loop's connection pool when it takes over, so later calls succeed; owner election is thread-safe, and a cross-loop call fails with `RuntimeError` when the owner loop has stopped and with `TimeoutError` after 30 seconds when a running owner never serves it
 
 ### Security
 

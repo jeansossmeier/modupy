@@ -923,6 +923,27 @@ async def test_publish_from_the_sync_api_loop_uses_the_engine_owning_loop(
         assert [row["payload"] for row in rows] == [payload]
 
 
+async def test_calls_succeed_after_the_owning_loop_closed_and_this_loop_took_over(
+    broker_engine: Any,
+) -> None:
+    """The first loop's pooled connections are bound to it; once it has closed,
+    the loop that takes over must not check one of them out."""
+    await broker_engine.dispose()
+    broker = DatabaseBroker(engine=broker_engine)
+    payload = JsonEventSerializer().serialize(WidgetCreated(name="w"))
+
+    async def first_owner() -> None:
+        await broker.subscribe([_TARGET], "g")
+        await broker.publish(_TARGET, payload, {"event_type": _EVENT_TYPE})
+
+    await asyncio.to_thread(asyncio.run, first_owner())
+
+    for _ in range(2):
+        await broker.publish(_TARGET, payload, {"event_type": _EVENT_TYPE})
+    rows = await broker.claim_batch("g", batch_size=10, consumer_name="taker")
+    assert [row["payload"] for row in rows] == [payload] * 3
+
+
 @pytest.mark.parametrize("broker_engine", ["mysql"], indirect=True)
 @pytest.mark.parametrize(
     ("reported", "version", "minimum"),

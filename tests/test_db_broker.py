@@ -29,6 +29,7 @@ import logging
 import re
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -5378,6 +5379,210 @@ async def test_close_from_another_loop_disposes_on_the_owning_loop(
     await asyncio.to_thread(_run_on_new_loop, broker.close)
 
     assert disposed_on == [threading.get_ident()]
+
+
+async def test_takeover_drops_the_stopped_owners_pool_without_closing_it(
+    engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broker = DatabaseBroker(engine=engine)
+    disposals: list[bool] = []
+    real_dispose = engine.sync_engine.dispose
+
+    def dispose(close: bool = True) -> None:
+        disposals.append(close)
+        real_dispose(close=close)
+
+    monkeypatch.setattr(engine.sync_engine, "dispose", dispose)
+
+    async def two_calls(tag: str) -> None:
+        await broker.subscribe([f"{tag}1"], f"{tag}1")
+        await broker.subscribe([f"{tag}2"], f"{tag}2")
+
+    await asyncio.to_thread(_run_on_new_loop, lambda: two_calls("a"))
+    assert disposals == []
+    await asyncio.to_thread(_run_on_new_loop, lambda: two_calls("b"))
+    assert disposals == [False]
+
+
+class _SlowElectionBroker(DatabaseBroker):
+    """Widens the window between reading and assigning the owner loop, and
+    records what the first election on each thread returned."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self._stored_ref: Any = None
+        self.first_election: dict[int, asyncio.AbstractEventLoop | None] = {}
+        super().__init__(**kwargs)
+
+    @property
+    def _used_loop_ref(self) -> Any:  # type: ignore[override]
+        ref = self._stored_ref
+        time.sleep(0.02)
+        return ref
+
+    @_used_loop_ref.setter
+    def _used_loop_ref(self, value: Any) -> None:
+        self._stored_ref = value
+
+    def _check_cross_loop_usage(self) -> asyncio.AbstractEventLoop | None:
+        owner = super()._check_cross_loop_usage()
+        self.first_election.setdefault(threading.get_ident(), owner)
+        return owner
+
+
+async def test_concurrent_first_calls_from_two_loops_elect_exactly_one_owner(engine: Any) -> None:
+    from sqlalchemy import select
+
+    def one_round(round_no: int) -> tuple[_SlowElectionBroker, list[BaseException]]:
+        broker = _SlowElectionBroker(engine=engine)
+        start = threading.Barrier(2, timeout=10)
+        end = threading.Barrier(2, timeout=10)
+        errors: list[BaseException] = []
+
+        def worker(n: int) -> None:
+            async def call() -> None:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, start.wait)
+                await broker.subscribe([f"t{round_no}.{n}"], f"g{round_no}.{n}")
+                await loop.run_in_executor(None, end.wait)
+
+            try:
+                _run_on_new_loop(call)
+            except BaseException as exc:
+                errors.append(exc)
+                end.abort()
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return broker, errors
+
+    _, subscription, _ = broker_schema()
+    for round_no in range(3):
+        broker, errors = await asyncio.to_thread(one_round, round_no)
+        elected = list(broker.first_election.values())
+        assert len(elected) == 2
+        assert elected.count(None) == 1, "both loops ran their first call as the owner"
+        assert errors == []
+
+    async with engine.connect() as conn:
+        groups = {row[0] for row in await conn.execute(select(subscription.c.consumer_group))}
+    assert groups == {f"g{r}.{n}" for r in range(3) for n in range(2)}
+
+
+def _start_owner_loop(
+    broker: DatabaseBroker, linger: threading.Event | None = None
+) -> tuple[asyncio.AbstractEventLoop, threading.Thread]:
+    """A thread whose loop uses the broker first (so it owns the engine), then
+    runs until stopped. A stopped loop stays open, with its pending tasks
+    uncancelled, until ``linger`` is set."""
+    ready = threading.Event()
+    box: list[asyncio.AbstractEventLoop] = []
+
+    def run() -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(broker.subscribe(["t"], "g"))
+            box.append(loop)
+            ready.set()
+            loop.run_forever()
+            if linger is not None:
+                linger.wait(10)
+            leftover = asyncio.all_tasks(loop)
+            for task in leftover:
+                task.cancel()
+            if leftover:
+                loop.run_until_complete(asyncio.gather(*leftover, return_exceptions=True))
+        finally:
+            ready.set()
+            loop.close()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert ready.wait(10) and box
+    return box[0], thread
+
+
+@pytest.mark.parametrize("owner_lingers", [False, True])
+async def test_call_to_an_owner_that_stops_before_serving_it_fails_fast(
+    engine: Any, monkeypatch: pytest.MonkeyPatch, owner_lingers: bool
+) -> None:
+    broker = DatabaseBroker(engine=engine)
+    linger = threading.Event()
+    if not owner_lingers:
+        linger.set()
+    owner, thread = _start_owner_loop(broker, linger)
+    blocked, release = threading.Event(), threading.Event()
+
+    def block() -> None:
+        blocked.set()
+        release.wait(10)
+
+    owner.call_soon_threadsafe(block)
+    assert await asyncio.to_thread(blocked.wait, 10)
+    owner.call_soon_threadsafe(owner.stop)
+    submit = owner.call_soon_threadsafe
+
+    def submit_then_release(callback: Any, *args: Any, **kwargs: Any) -> Any:
+        handle = submit(callback, *args, **kwargs)
+        release.set()
+        return handle
+
+    monkeypatch.setattr(owner, "call_soon_threadsafe", submit_then_release)
+    try:
+        with pytest.raises(RuntimeError, match="stopped"):
+            await asyncio.wait_for(broker.publish("t", b"p", {"event_type": "t"}), timeout=5)
+    finally:
+        release.set()
+        linger.set()
+        await asyncio.to_thread(thread.join, 10)
+
+
+async def test_call_to_an_owner_that_closed_before_the_submit_fails_fast(
+    engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broker = DatabaseBroker(engine=engine)
+    owner, thread = _start_owner_loop(broker)
+
+    def closed_loop(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("Event loop is closed")
+
+    monkeypatch.setattr(owner, "call_soon_threadsafe", closed_loop)
+    try:
+        with pytest.raises(RuntimeError, match="stopped"):
+            await broker.publish("t", b"p", {"event_type": "t"})
+    finally:
+        monkeypatch.undo()
+        owner.call_soon_threadsafe(owner.stop)
+        await asyncio.to_thread(thread.join, 10)
+
+
+async def test_call_to_a_running_owner_that_never_serves_it_times_out_and_is_cancelled(
+    engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import modulith.adapters.db_broker as db_broker_module
+
+    monkeypatch.setattr(db_broker_module, "_CROSS_LOOP_WAIT_SECONDS", 0.3)
+    broker = DatabaseBroker(engine=engine)
+    owner, thread = _start_owner_loop(broker)
+    blocked, release = threading.Event(), threading.Event()
+
+    def block() -> None:
+        blocked.set()
+        release.wait(10)
+
+    owner.call_soon_threadsafe(block)
+    assert await asyncio.to_thread(blocked.wait, 10)
+    try:
+        with pytest.raises(TimeoutError, match="did not serve"):
+            await asyncio.wait_for(broker.publish("t", b"p", {"event_type": "t"}), timeout=5)
+    finally:
+        release.set()
+        owner.call_soon_threadsafe(owner.stop)
+        await asyncio.to_thread(thread.join, 10)
+
+    assert await _row_count(engine) == 0
 
 
 async def test_broker_used_twice_same_loop_logs_nothing(engine: Any, caplog: Any) -> None:

@@ -139,6 +139,7 @@ import math
 import os
 import random
 import re
+import threading
 import weakref
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import AsyncExitStack
@@ -634,8 +635,10 @@ def _on_owning_loop(
     awaited from here. A call already on the owning loop runs directly.
 
     The owning loop must stay running and unblocked: a submitted call waits on
-    it, and an owner blocked in synchronous code hangs the caller until it
-    unblocks.
+    it. An owner that stops before serving the call fails the caller with a
+    ``RuntimeError``; an owner that stays running but does not serve it within
+    ``_CROSS_LOOP_WAIT_SECONDS`` fails it with a ``TimeoutError``. Either way
+    the submitted call is cancelled.
     """
 
     @functools.wraps(method)
@@ -643,13 +646,55 @@ def _on_owning_loop(
         owner = self._check_cross_loop_usage()
         if owner is None:
             return await method(self, *args, **kwargs)
-        # an owner that stops between the is_running() check and
-        # running this task leaves the call waiting forever; bound the wait if
-        # an owner loop ever stops while other loops are still publishing.
-        future = asyncio.run_coroutine_threadsafe(method(self, *args, **kwargs), owner)
-        return await asyncio.wrap_future(future)
+        return await _run_on_loop(owner, method(self, *args, **kwargs), method.__qualname__)
 
     return run
+
+
+# Longest a call waits for the loop that owns the engine before failing; far
+# above any legitimate call, since a stopped owner never resumes.
+_CROSS_LOOP_WAIT_SECONDS = 30.0
+# How often a waiting call re-checks that the owning loop still runs.
+_OWNER_POLL_SECONDS = 0.1
+
+
+async def _run_on_loop(
+    owner: asyncio.AbstractEventLoop, coro: Coroutine[Any, Any, _R], name: str
+) -> _R:
+    """Run ``coro`` on ``owner`` and await its result from the running loop."""
+    stopped = RuntimeError(
+        f"The event loop that owns the DatabaseBroker engine stopped before it served {name}."
+    )
+    try:
+        future = asyncio.run_coroutine_threadsafe(coro, owner)
+    except RuntimeError:
+        coro.close()
+        raise stopped from None
+    wrapped = asyncio.wrap_future(future)
+    clock = asyncio.get_running_loop()
+    deadline = clock.time() + _CROSS_LOOP_WAIT_SECONDS
+    try:
+        while True:
+            remaining = deadline - clock.time()
+            done, _ = await asyncio.wait(
+                {wrapped}, timeout=max(0.0, min(_OWNER_POLL_SECONDS, remaining))
+            )
+            if done:
+                # an owner shutting down cancels the call it never ran
+                if wrapped.cancelled():
+                    raise stopped
+                return wrapped.result()
+            if not owner.is_running():
+                raise stopped
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"The event loop that owns the DatabaseBroker engine did not serve "
+                    f"{name} within {_CROSS_LOOP_WAIT_SECONDS:g} s; it must stay running "
+                    "and unblocked."
+                )
+    finally:
+        if not future.done() and not owner.is_closed():
+            future.cancel()
 
 
 def _is_sqlite_url(url: Any) -> bool:
@@ -1134,6 +1179,8 @@ class DatabaseBroker:
         # weakref.ref to the first loop seen, same eviction rationale as
         # _schema_locks above.
         self._used_loop_ref: weakref.ReferenceType[asyncio.AbstractEventLoop] | None = None
+        # Loops on different threads elect the owner concurrently.
+        self._owner_lock = threading.Lock()
         self._cross_loop_warned = False
         self._server_version: str | None = None
 
@@ -1175,15 +1222,19 @@ class DatabaseBroker:
         The first loop to use the broker owns the engine. A later call from
         another loop goes to the owner while the owner is running, and warns
         once. When the owner has stopped or closed, the running loop takes
-        ownership instead: nothing is left to run the call, and the pooled
-        connections opened on the old loop are only as usable as their driver
-        allows off it.
+        ownership instead: nothing is left to run the call, and the pool is
+        dropped without touching its connections, which are bound to the old
+        loop and cannot be reused or closed from this one.
         """
         loop = asyncio.get_running_loop()
-        owner = None if self._used_loop_ref is None else self._used_loop_ref()
-        if owner is None or owner is loop or owner.is_closed() or not owner.is_running():
-            self._used_loop_ref = weakref.ref(loop)
-            return None
+        with self._owner_lock:
+            ref = self._used_loop_ref
+            owner = None if ref is None else ref()
+            if owner is None or owner is loop or owner.is_closed() or not owner.is_running():
+                if ref is not None and owner is not loop:
+                    self._engine.sync_engine.dispose(close=False)
+                self._used_loop_ref = weakref.ref(loop)
+                return None
         if not self._cross_loop_warned:
             logger.warning(
                 "DatabaseBroker engine is owned by the event loop that first used "

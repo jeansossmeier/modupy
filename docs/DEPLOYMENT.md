@@ -612,8 +612,11 @@ This has two consequences:
   loops until it unblocks. `publish_sync()` already refuses to run on a thread
   whose loop is running.
 - When the owning loop has stopped or closed, the next calling loop takes
-  ownership. A call that is submitted in the instant the owner stops can wait
-  indefinitely, because no loop is left to run it.
+  ownership and drops the old connection pool without closing its connections,
+  which belong to the stopped loop. A call submitted to a running owner that
+  stops before serving it fails with a `RuntimeError`. A call to an owner that
+  keeps running but does not serve it within 30 seconds fails with a
+  `TimeoutError`. Neither wait is configurable.
 
 modupy logs one warning the first time a call arrives from a second loop.
 
