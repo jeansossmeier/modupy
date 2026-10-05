@@ -31,8 +31,11 @@ Configuration resolves env > [tool.modulith.broker] subtable > default:
                                             (default 5)
 
 An environment variable that is empty or whitespace-only counts as unset.
-MODULITH_BROKER_MAX_STREAM_LEN, which the supervisor forwards to workers as
-MODULITH_STREAM_MAXLEN, is validated here too, so a bad value stops the parent.
+MODULITH_BROKER_MAX_STREAM_LEN is the fallback for MODULITH_STREAM_MAXLEN, the
+way the supervisor copies it onto workers: it applies when MODULITH_STREAM_MAXLEN
+is not set at all (a whitespace-only MODULITH_STREAM_MAXLEN is set, so it falls
+through to max_stream_len instead). Its value is validated even when
+MODULITH_STREAM_MAXLEN wins, so a bad value stops the parent.
 
 Selected with (broker *name* as a scalar, options in the subtable — TOML
 forbids one key being both, so set the name via ``MODULITH_BROKER`` /
@@ -686,18 +689,25 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
 
     opts = cfg.broker_options or {}
     # The supervisor copies MODULITH_BROKER_MAX_STREAM_LEN onto each worker's
-    # MODULITH_STREAM_MAXLEN (_REDIS_BROKER_ENV_ALIASES in supervisor.py), where
-    # a bad value crash-loops the worker under that other name.
-    if (forwarded_maxlen := _env("MODULITH_BROKER_MAX_STREAM_LEN")) is not None:
+    # MODULITH_STREAM_MAXLEN (_REDIS_BROKER_ENV_ALIASES in supervisor.py) only
+    # when that variable is not set at all, even to whitespace; resolve the
+    # same way so the parent and its workers trim at the same length. A bad
+    # value is rejected under its own name before the alias hides it.
+    forwarded_maxlen = _env("MODULITH_BROKER_MAX_STREAM_LEN")
+    if forwarded_maxlen is not None:
         _positive_int(forwarded_maxlen, "MODULITH_BROKER_MAX_STREAM_LEN", _DEFAULT_MAXLEN)
+    maxlen_env = (
+        _env("MODULITH_STREAM_MAXLEN")
+        if "MODULITH_STREAM_MAXLEN" in os.environ
+        else forwarded_maxlen
+    )
     dlq_maxlen = _env("MODULITH_BROKER_DLQ_MAX_STREAM_LEN") or opts.get("dlq_max_stream_len")
     broker = RedisStreamsBroker(
         url=_env("REDIS_URL") or opts.get("url") or _DEFAULT_URL,
         stream_prefix=_env("MODULITH_STREAM_PREFIX")
         or opts.get("stream_prefix")
         or _DEFAULT_PREFIX,
-        max_stream_len=_env("MODULITH_STREAM_MAXLEN")
-        or opts.get("max_stream_len", _DEFAULT_MAXLEN),
+        max_stream_len=maxlen_env or opts.get("max_stream_len", _DEFAULT_MAXLEN),
         dlq_max_stream_len=dlq_maxlen,
         max_payload_bytes=_resolve_max_payload_bytes(opts),
         poll_block_ms=opts.get("poll_block_ms", 1000),

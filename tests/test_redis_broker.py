@@ -1433,6 +1433,85 @@ def test_register_hook_stream_caps_from_env_and_default(make_fake_app, monkeypat
     assert (broker._max_stream_len, broker._dlq_max_stream_len) == (2500, 25000)
 
 
+_MAXLEN_VARS = ("MODULITH_STREAM_MAXLEN", "MODULITH_BROKER_MAX_STREAM_LEN")
+
+
+def _register_with_maxlen_env(
+    monkeypatch: pytest.MonkeyPatch,
+    maxlen: str | None,
+    generic: str | None,
+    option: int | None,
+) -> RedisStreamsBroker:
+    """Build the parent's broker through the registration hook from this env."""
+    from modulith.config import Configuration
+    from modulith.runtime import _runtime
+
+    for name, value in zip(_MAXLEN_VARS, (maxlen, generic), strict=True):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    monkeypatch.delenv("MODULITH_BROKER_DLQ_MAX_STREAM_LEN", raising=False)
+    options = {} if option is None else {"max_stream_len": option}
+    monkeypatch.setattr(
+        _runtime,
+        "_config",
+        Configuration(package="fakeapp", broker="redis-streams", broker_options=options),
+    )
+    registry = BrokerRegistry()
+    modulith_register_brokers(registry=registry)
+    broker = registry.get("redis-streams")
+    assert isinstance(broker, RedisStreamsBroker)
+    return broker
+
+
+def test_register_hook_uses_broker_max_stream_len_env_as_the_stream_cap(monkeypatch) -> None:
+    """Only ``MODULITH_BROKER_MAX_STREAM_LEN`` set: the workers get it as
+    ``MODULITH_STREAM_MAXLEN`` from the supervisor, so the parent must trim at it too."""
+    broker = _register_with_maxlen_env(monkeypatch, None, "3000", None)
+
+    assert (broker._max_stream_len, broker._dlq_max_stream_len) == (3000, 30000)
+
+
+@pytest.mark.parametrize(
+    ("maxlen", "generic", "option", "expected"),
+    [
+        (None, None, None, 10000),
+        (None, None, 500, 500),
+        (None, "3000", None, 3000),
+        (None, "3000", 500, 3000),
+        (None, " ", 500, 500),
+        ("2500", None, 500, 2500),
+        ("2500", "3000", 500, 2500),
+        ("2500", " ", None, 2500),
+        (" ", None, 500, 500),
+        (" ", "3000", 500, 500),
+        (" ", "3000", None, 10000),
+    ],
+)
+def test_register_hook_stream_cap_matches_what_the_worker_resolves(
+    monkeypatch: pytest.MonkeyPatch,
+    maxlen: str | None,
+    generic: str | None,
+    option: int | None,
+    expected: int,
+) -> None:
+    """The parent and a worker started by the supervisor trim streams at the same
+    length. The worker side runs the real ``_build_worker_env`` and the same hook."""
+    from modulith.supervisor import WorkerSpec, _build_worker_env
+
+    monkeypatch.setenv("MODULITH_BROKER", "redis-streams")
+    parent = _register_with_maxlen_env(monkeypatch, maxlen, generic, option)
+
+    worker_env = _build_worker_env(WorkerSpec(module_name="orders", package="fakeapp", port=9000))
+    worker = _register_with_maxlen_env(
+        monkeypatch, worker_env.get(_MAXLEN_VARS[0]), worker_env.get(_MAXLEN_VARS[1]), option
+    )
+
+    assert parent._max_stream_len == expected
+    assert worker._max_stream_len == expected
+
+
 @pytest.mark.parametrize(
     "env_var",
     [

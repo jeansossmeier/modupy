@@ -170,6 +170,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - A SQLite database broker whose schema setup times out no longer leaves a connection-setup statement running in the background that could lock the database file after the error was raised
 - `modulith doctor` names the exception type when a check fails with an exception that carries no message, instead of an empty `check raised:` summary
 - `modulith audit` no longer overwrites a report file that appears while the audit runs unless `--force` is passed, and relative sqlite URLs keep their `///` form when the CLI prints them masked
+- The Redis Streams broker in the parent process trims streams at `MODULITH_BROKER_MAX_STREAM_LEN` when `MODULITH_STREAM_MAXLEN` is not set, the cap the supervisor gives workers; the parent used to keep the 10000 default
 
 ### Security
 
