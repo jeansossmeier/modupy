@@ -30,6 +30,7 @@ import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -96,8 +97,11 @@ class HealthReport:
 # ---------------------------------------------------------------------------
 
 
-def run_doctor() -> HealthReport:
+def run_doctor(baseline_path: Path = _BASELINE_PATH) -> HealthReport:
     """Bootstrap, run every health check, and return the aggregated report.
+
+    ``baseline_path`` is the ratchet baseline file the boundary-health check
+    compares violations against: the one ``modulith verify --baseline`` names.
 
     Each check runs independently — an exception in one is captured as an
     error HealthCheck so the others still run.
@@ -107,7 +111,7 @@ def run_doctor() -> HealthReport:
     _runtime.ensure_bootstrapped()
 
     checks_spec: list[tuple[str, Callable[[Runtime], HealthCheck]]] = [
-        ("boundary health", _check_boundary_health),
+        ("boundary health", partial(_check_boundary_health, baseline_path=baseline_path)),
         ("process-split readiness", _check_split_readiness),
         ("schema drift", _check_schema_drift),
         ("outbox health", _check_outbox_health),
@@ -148,8 +152,8 @@ def _parse_file(path: Path) -> ast.Module | None:
 # ---------------------------------------------------------------------------
 
 
-def _check_boundary_health(rt: Runtime) -> HealthCheck:
-    """Run the verifier; report violation count and baseline drift."""
+def _check_boundary_health(rt: Runtime, baseline_path: Path) -> HealthCheck:
+    """Run the verifier; report violation count and drift from ``baseline_path``."""
     from .builtin.verifier import collect_violations, filter_against_baseline, load_baseline
     from .types import ViolationSeverity
 
@@ -170,8 +174,8 @@ def _check_boundary_health(rt: Runtime) -> HealthCheck:
             )
         return HealthCheck("boundary health", "ok", "0 violation(s)")
 
-    if _BASELINE_PATH.exists():
-        baseline = load_baseline(_BASELINE_PATH)
+    if baseline_path.exists():
+        baseline = load_baseline(baseline_path)
         new = filter_against_baseline(errors, baseline)
         if new:
             return HealthCheck(
@@ -767,7 +771,7 @@ def _check_redis_retention(rt: Runtime) -> HealthCheck:
                 asyncio.wait_for(_redis_backlog(client, prefix), timeout=_REDIS_BACKLOG_TIMEOUT)
             )
         except Exception as exc:
-            details.append(f"live backlog check skipped: {exc}")
+            details.append(f"live backlog check skipped: {str(exc) or type(exc).__name__}")
         else:
             ratio = backlog / maxlen if maxlen else 0.0
             if ratio >= _REDIS_BACKLOG_ERROR_RATIO:

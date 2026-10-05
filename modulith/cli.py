@@ -1342,19 +1342,25 @@ def k8s_manifest(
 
 
 @app.command()
-def doctor() -> None:
+def doctor(
+    baseline: Path = typer.Option(
+        Path(".modulith-baseline.json"),
+        help="Ratchet baseline file that boundary health compares violations against.",
+    ),
+) -> None:
     """Report architectural and operational health.
 
     Runs nine checks — boundary health, process-split readiness, schema
     drift, outbox health, listener registration, the SHM notifier, actuator
     token, single-host broker, and redis retention — and prints a report.
+    Boundary health reads the baseline file `verify --baseline` writes.
     Exits 1 if any check reports an error, so it doubles as a CI gate
     (warnings are reported but pass); 2 on unexpected internal errors.
     """
     from .doctor import render_report, run_doctor
 
     _bootstrap_or_exit(inspection=True)
-    report = run_doctor()
+    report = run_doctor(baseline)
     typer.echo(render_report(report))
     if report.overall_status == "error":
         raise typer.Exit(code=1)

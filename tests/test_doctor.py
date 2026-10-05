@@ -704,6 +704,64 @@ def test_doctor_cli_under_strict_boundaries_reports_its_own_verdict(
     assert "boundary violations detected with strict_boundaries" not in result.output
 
 
+def _make_app_with_a_boundary_violation(make_fake_app, monkeypatch) -> None:
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app(
+        {"orders": "from fakeapp.inventory._internal import secret\n", "inventory": ""},
+        extra_files={"inventory/_internal.py": "secret = 1\n"},
+    )
+
+
+def _record_baseline(path: str) -> None:
+    """Accept today's violations the way a project does, through ``verify``."""
+    seed = runner.invoke(app, ["verify", "--baseline", path, "--update-baseline"])
+    assert seed.exit_code == 0, seed.output
+
+
+def test_doctor_reads_the_default_baseline_file(make_fake_app, monkeypatch) -> None:
+    """Pins the default that the ``--baseline`` option leaves unchanged."""
+    _make_app_with_a_boundary_violation(make_fake_app, monkeypatch)
+    _record_baseline(".modulith-baseline.json")
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 0, result.output
+    assert "⚠ boundary health — 1 violation(s), all baselined" in result.output
+
+
+def test_doctor_honors_a_custom_baseline_path(make_fake_app, monkeypatch) -> None:
+    """``verify --baseline`` accepts any path, so a project that keeps its
+    baseline elsewhere must be judged against that file by ``doctor`` too."""
+    _make_app_with_a_boundary_violation(make_fake_app, monkeypatch)
+    _record_baseline("custom-baseline.json")
+
+    result = runner.invoke(app, ["doctor", "--baseline", "custom-baseline.json"])
+
+    assert result.exit_code == 0, result.output
+    assert "⚠ boundary health — 1 violation(s), all baselined" in result.output
+
+
+def test_doctor_with_another_baseline_ignores_the_default_file(make_fake_app, monkeypatch) -> None:
+    _make_app_with_a_boundary_violation(make_fake_app, monkeypatch)
+    _record_baseline(".modulith-baseline.json")
+
+    result = runner.invoke(app, ["doctor", "--baseline", "missing-baseline.json"])
+
+    assert result.exit_code == 1, result.output
+    assert "✗ boundary health — 1 violation(s)" in result.output
+    assert "all baselined" not in result.output
+
+
+def test_doctor_names_an_unreadable_custom_baseline(make_fake_app, monkeypatch) -> None:
+    _make_app_with_a_boundary_violation(make_fake_app, monkeypatch)
+    Path("custom-baseline.json").write_text("not json", encoding="utf-8")
+
+    result = runner.invoke(app, ["doctor", "--baseline", "custom-baseline.json"])
+
+    assert result.exit_code == 1, result.output
+    assert "custom-baseline.json is not valid JSON" in result.output
+
+
 # ---------------------------------------------------------------------------
 # regression: audit findings
 # ---------------------------------------------------------------------------
@@ -1366,6 +1424,17 @@ class _RaisingRedisClient:
         pass
 
 
+class _HangingRedisClient:
+    """Never answers: the first SCAN waits until the doctor's timeout cancels it."""
+
+    async def scan_iter(self, *, match: str, _type: str = "STREAM"):
+        await asyncio.sleep(10)
+        yield  # pragma: no cover - unreachable; keeps this an async generator
+
+    async def aclose(self) -> None:  # pragma: no cover - broker teardown only
+        pass
+
+
 def _register_fake_redis_broker(
     client, *, max_stream_len: int, stream_prefix: str = "modulith.events"
 ):
@@ -1429,6 +1498,34 @@ def test_redis_retention_live_ok_when_query_fails(make_fake_app) -> None:
     check = _check(report, "redis retention")
     assert check.status == "ok"
     assert any("skipped" in d for d in check.details)
+
+
+def test_redis_retention_live_keeps_the_error_text_when_the_query_fails(make_fake_app) -> None:
+    """Pins that a non-empty reason is printed as it is; only an empty one is
+    replaced by the exception's name."""
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", topology="processes", broker="redis-streams")
+    _register_fake_redis_broker(_RaisingRedisClient(), max_stream_len=10_000)
+
+    check = _check(run_doctor(), "redis retention")
+
+    assert check.details == ["live backlog check skipped: connection refused"]
+
+
+def test_redis_retention_live_names_the_timeout_when_the_query_hangs(
+    make_fake_app, monkeypatch
+) -> None:
+    """A timeout exception stringifies to nothing, which left the reason after
+    the colon empty."""
+    monkeypatch.setattr("modulith.doctor._REDIS_BACKLOG_TIMEOUT", 0.05)
+    make_fake_app({"orders": ""})
+    configure(package="fakeapp", topology="processes", broker="redis-streams")
+    _register_fake_redis_broker(_HangingRedisClient(), max_stream_len=10_000)
+
+    check = _check(run_doctor(), "redis retention")
+
+    assert check.status == "ok"
+    assert check.details == ["live backlog check skipped: TimeoutError"]
 
 
 def test_redis_retention_live_ignores_dead_letter_stream(make_fake_app) -> None:

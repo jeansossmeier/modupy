@@ -703,7 +703,7 @@ Output is Markdown, written to `MIGRATION.md` or the file `--output` names. An e
 
 `modulith doctor` reports operational and architectural health:
 
-- **Boundary health**: violation count, baseline drift
+- **Boundary health**: violation count, and drift from the ratchet baseline file that `--baseline=PATH` names (default `.modulith-baseline.json`, the same option and default as `modulith verify`): violations the baseline lists only warn, a violation it does not list is an error, and a missing file counts as an empty baseline
 - **Process-split readiness**: percentage of cross-module interactions that are events vs direct calls (the "are you ready to split this module?" metric), plus per-module counts of cross-module table references and of tables not prefixed with the module's name — table-only coupling reports a warning even when there are no import/event interactions, and the "microservice-ready" tier requires zero cross-module table references
 - **Schema drift**: events whose field definitions (name, annotation, default — fingerprinted via AST) changed since the last doctor run. The check is an unconditional fingerprint diff against a cache file (`.modulith-schemas.json`): it flags *every* definition change as the cue to version consciously — it does not read or compare any `schema_version` attribute
 - **Outbox health**: incomplete, completed, and dead-lettered counts
@@ -1120,7 +1120,7 @@ modulith audit [PATH] [--output=FILE] [--force]
 modulith extract MODULE [--output=DIR] [--force]
 modulith k8s-manifest [--output=FILE] [--image=IMAGE] [--namespace=NAME] [--port=PORT] [--host=HOST]
 modulith openapi [--output=FILE] [--title=TITLE] [--api-version=VERSION]
-modulith doctor
+modulith doctor [--baseline=PATH]
 modulith migrate [REVISION] [--url=URL] [--schema=SCHEMA]
 modulith outbox status
 modulith outbox retry <id>
