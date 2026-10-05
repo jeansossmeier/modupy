@@ -1120,3 +1120,35 @@ def test_readme_names_every_python_in_the_unit_matrix() -> None:
 def test_contributing_explains_how_to_refresh_the_lockfile() -> None:
     text = (REPO_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
     assert "uv lock" in text and "uv lock --check" in text
+
+
+def test_sdist_excludes_the_untracked_worktree_include_file() -> None:
+    """A local build from a dirty tree must not ship ``.worktreeinclude``."""
+    tool = _pyproject()["tool"]
+    assert isinstance(tool, dict)
+    exclude = tool["hatch"]["build"]["targets"]["sdist"]["exclude"]
+    assert "/.worktreeinclude" in exclude
+
+
+def test_pytest_config_does_not_claim_the_suite_is_deterministic_under_w_error() -> None:
+    """The suite does not pass under ``-W error`` and no lane runs it, so the
+    ``filterwarnings`` comment must not promise it."""
+    lines = PYPROJECT.read_text(encoding="utf-8").splitlines()
+    comments = [line for line in lines if line.lstrip().startswith("#") and "-W error" in line]
+    assert comments == []
+
+
+def test_test_suite_extra_declares_typing_extensions() -> None:
+    """tests/test_serializers.py imports ``typing_extensions`` (3.11 has no
+    ``typing.TypeAliasType``); it must not rely on a transitive install."""
+    names = {Requirement(req).name for req in _optional_dependencies()["test-suite"]}
+    assert "typing-extensions" in names
+
+
+def test_classifiers_name_every_python_in_the_unit_matrix() -> None:
+    project = _pyproject()["project"]
+    assert isinstance(project, dict)
+    classifiers = set(project["classifiers"])
+    matrix = _jobs()["test"]["strategy"]["matrix"]["python-version"]
+    missing = [v for v in matrix if f"Programming Language :: Python :: {v}" not in classifiers]
+    assert not missing, f"classifiers omit tested Python versions {missing!r}"

@@ -56,6 +56,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Framework :: FastAPI",
 ]
@@ -186,6 +187,9 @@ test-suite = [
     # (yaml.safe_load) to execute the integration lane's guard logic against
     # synthetic pytest summaries — the CI-drift guards run in the default lane.
     "pyyaml>=6.0,<7.0",
+    # tests/test_serializers.py imports typing_extensions.TypeAliasType (3.11 has
+    # no typing.TypeAliasType); declared rather than left to arrive transitively.
+    "typing-extensions>=4.6,<5.0",
     # fastapi.testclient (Starlette's TestClient) imports httpx2 first and falls back
     # to httpx with a StarletteDeprecationWarning. 2.0 is the floor Starlette's own
     # `full` extra declares; the `fastapi` extra keeps httpx for modulith/proxy.py.
@@ -294,6 +298,7 @@ exclude = [
     "/.claude/**",
     "/.opencode/**",
     "/graphify-out/**",
+    "/.worktreeinclude",
     "**/.modulith-*.db*",
     "**/.modulith-*.hints",
     "**/*.db-wal",
@@ -345,9 +350,8 @@ filterwarnings = [
     # back AFTER that loop has already closed, so the worker thread raises
     # "Event loop is closed". It is a benign teardown race — every assertion has
     # already passed — that lives upstream in aiosqlite, not in modulith. Ignore
-    # ONLY this exact artifact (scoped to _connection_worker_thread) so the
-    # default suite stays deterministic under `-W error` without masking other
-    # thread exceptions or warnings.
+    # ONLY this exact artifact (scoped to _connection_worker_thread) so it does
+    # not mask other thread exceptions or warnings.
     "ignore:Exception in thread .*_connection_worker_thread:pytest.PytestUnhandledThreadExceptionWarning",
 ]
 

@@ -1013,6 +1013,7 @@ dev = [
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "testcontainers" },
     { name = "typer" },
+    { name = "typing-extensions" },
     { name = "uvicorn" },
 ]
 fastapi = [
@@ -1045,6 +1046,7 @@ integration = [
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "testcontainers" },
     { name = "typer" },
+    { name = "typing-extensions" },
     { name = "uvicorn" },
 ]
 otel = [
@@ -1083,6 +1085,7 @@ test-suite = [
     { name = "rich" },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "typer" },
+    { name = "typing-extensions" },
     { name = "uvicorn" },
 ]
 
@@ -1133,6 +1136,7 @@ requires-dist = [
     { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'test-suite'", specifier = ">=2.0,<3.0" },
     { name = "testcontainers", marker = "extra == 'integration'", specifier = ">=4.0,<5.0" },
     { name = "typer", marker = "extra == 'cli'", specifier = ">=0.12,<1.0" },
+    { name = "typing-extensions", marker = "extra == 'test-suite'", specifier = ">=4.6,<5.0" },
     { name = "uvicorn", marker = "extra == 'fastapi'", specifier = ">=0.27,<1.0" },
 ]
 provides-extras = ["postgres", "redis", "database", "otel", "fastapi", "cli", "test", "test-suite", "integration", "all", "dev"]

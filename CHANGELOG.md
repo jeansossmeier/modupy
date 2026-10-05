@@ -124,6 +124,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - `modulith extract` fails when the extracted service's contracts module or `_manifest` cannot be imported, copies top-level helpers that are compiled extension modules or sourceless `.pyc` files, and warns, on stderr and under "Extraction notes" in the generated README, about third-party distributions the import check loaded that the generated dependencies do not cover
 - Outbox on MySQL at SERIALIZABLE: concurrent sweepers no longer lose a sweep to a deadlock (error 1213), because the claim transaction is retried up to twice
 - With `auto_discover` off, the `modulith outbox` no-store message says bootstrap itself imports none of your modules and names both routes: `MODULITH_AUTO_DISCOVER=true`, or binding the store from an entry-point plugin's import, which bootstrap loads
+- Packaging: the sdist no longer ships a local `.worktreeinclude`, the `test-suite` extra declares `typing-extensions`, which the tests import, and the classifiers list Python 3.14
 
 ### Security
 
