@@ -786,7 +786,9 @@ dependency (`dependencies = ["modupy[fastapi,cli,postgres]"]`, or
 modupy, not to your project, so `pip install '.[fastapi,cli,postgres]'` finds
 none. Copy the source before installing, because `pip install .` builds
 your package. The Dockerfile `modulith extract` generates follows the same
-order.
+order. These images run as root, and so does the generated one.
+[Running as a Non-Root User](#running-as-a-non-root-user) adds the lines that
+drop privileges.
 
 ### Single-Process
 
@@ -858,6 +860,51 @@ volumes:
 ```
 
 The Postgres credentials are throwaway demo values, and this file publishes no Postgres port. Anywhere else, use a secret of your own.
+
+### Running as a Non-Root User
+
+To run as a non-root user, add these lines to any of the three Dockerfiles
+after `RUN pip install`. `COPY` leaves its files owned by root whatever `USER`
+says, so the `chown` follows it and gives the application directory to the new
+user:
+
+```dockerfile
+RUN useradd --create-home --uid 10001 app \
+ && chown -R app:app /app
+USER app
+```
+
+**SHM broker state directory.** The default `shm` broker keeps its SQLite store
+in a state directory, and the new user must own that directory. modupy creates
+a missing one with mode 0700 and refuses an existing one with wider
+permissions, so only its owner can use it. Neither Dockerfile above runs the
+broker: the first has none and the second selects the database broker. A
+container running `--topology processes` with no `MODULITH_BROKER` does.
+
+Unless `MODULITH_BROKER_STATE_DIR` (or `state_dir`) names it, the directory is
+`$XDG_STATE_HOME/modulith/<package>-<digest>`, or
+`~/.local/state/modulith/<package>-<digest>` when `XDG_STATE_HOME` is unset. A
+user whose home directory is missing or unwritable therefore fails at startup
+with a `ConfigurationError` ("could not create private broker state
+directory"); `--create-home` above prevents that. To keep the store on a
+volume, pin the directory and create it in the image, owned by the new user:
+
+```dockerfile
+RUN useradd --create-home --uid 10001 app \
+ && mkdir -p /var/lib/myapp/modulith \
+ && chown -R app:app /app /var/lib/myapp/modulith \
+ && chmod 700 /var/lib/myapp/modulith
+USER app
+ENV MODULITH_BROKER_STATE_DIR=/var/lib/myapp/modulith
+```
+
+Whatever you mount at that path must arrive owned by uid 10001 with mode 0700.
+A new named volume inherits both from the image's directory. A path the image
+lacks arrives owned by root with mode 0755, which modupy refuses. A bind mount
+keeps the host directory's owner and mode, and a volume that an earlier root
+container filled keeps its root ownership until you `chown -R` it to 10001.
+[Default Broker: `shm`](#default-broker-shm) has the rest of the state directory
+rules.
 
 ---
 
