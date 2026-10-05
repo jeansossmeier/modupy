@@ -66,8 +66,9 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - Database and SHM consumers: a graceful `stop()` hands the messages it claimed but never started delivering back to the group, uncharged, so another consumer takes them on its next poll. Before, every restart could leave up to a whole batch (100 by default) claimed for `reclaim_stale_seconds` (60 s by default). Messages whose listener is still running when the stop's grace ends still wait for that reclaim
 - `modulith outbox status`, `retry`, `purge`, `dead-letter` and `failing` close the database engine built from `outbox_url` before they exit, instead of leaving its connections to be dropped unclosed when the process ends
 - `modulith outbox dead-letter --retry-all` delivers each resubmitted publication under the claim or advisory lock a retry sweep takes, so a process sweeping at the same time can no longer deliver it as well. The command also waits until the events its listeners publish are delivered before it exits. Before, those events stayed claimed until the lease expired and another process's sweep delivered them
-- CLI help no longer shows raw double backticks, and `modulith migrate --help` prints `[tool.modulith]` instead of dropping it as markup
+- CLI help no longer shows raw double backticks or drops `[tool.modulith]` as markup. `modulith migrate --help`, and the `--topology` and `--worker-port-base` help of `modulith run` and `modulith dev`, name the key they default to
 - The startup log line under the memory outbox no longer suggests that `outbox = 'postgres'` alone turns on durable delivery. It also names `outbox_url`, `modulith migrate`, and the README section "Never lose an event" for the session and lifespan wiring
+- `modulith run` and `modulith dev` without `--topology` use `[tool.modulith] topology` or `MODULITH_TOPOLOGY` instead of always starting one process. The flag still wins, and an invalid configured value exits 1 with the error
 
 ### Security
 

@@ -2069,6 +2069,148 @@ def test_dev_processes_topology_strict_boundaries_still_raises(make_fake_app, mo
     assert "MODULITH_DEV_WARN_ONLY" not in os.environ
 
 
+def test_dev_resolves_topology_from_pyproject_toml(make_fake_app, tmp_path, monkeypatch) -> None:
+    """Without --topology flag, `modulith dev` uses topology from [tool.modulith]."""
+    make_fake_app({"orders": "", "inventory": ""})
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith]\npackage = "fakeapp"\ntopology = "processes"\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["dev", "fakeapp:app"])
+
+    assert result.exit_code == 0, result.output
+    assert "specs" in captured  # processes topology was used
+
+
+def test_dev_resolves_topology_from_env_var(make_fake_app, tmp_path, monkeypatch) -> None:
+    """Without --topology flag, `modulith dev` uses MODULITH_TOPOLOGY env var."""
+    make_fake_app({"orders": "", "inventory": ""})
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_TOPOLOGY", "processes")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["dev", "fakeapp:app"])
+
+    assert result.exit_code == 0, result.output
+    assert "specs" in captured  # processes topology was used
+
+
+def test_dev_flag_overrides_configured_topology(make_fake_app, tmp_path, monkeypatch) -> None:
+    """The --topology flag overrides [tool.modulith] topology setting."""
+    make_fake_app({"orders": "", "inventory": ""})
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith]\npackage = "fakeapp"\ntopology = "processes"\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setattr(os, "execvp", lambda file, args: None)
+
+    result = runner.invoke(app, ["dev", "fakeapp:app", "--topology", "single"])
+
+    assert result.exit_code == 0, result.output
+    # single-process dev shows the banner with reload status
+    assert "modulith dev →" in result.output and "reload=" in result.output
+
+
+def test_run_resolves_topology_from_pyproject_toml(make_fake_app, tmp_path, monkeypatch) -> None:
+    """Without --topology flag, `modulith run` uses topology from [tool.modulith]."""
+    make_fake_app({"orders": "", "inventory": ""})
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith]\npackage = "fakeapp"\ntopology = "processes"\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["run", "fakeapp:app"])
+
+    assert result.exit_code == 0, result.output
+    assert "specs" in captured  # processes topology was used
+
+
+def test_run_resolves_topology_from_env_var(make_fake_app, tmp_path, monkeypatch) -> None:
+    """Without --topology flag, `modulith run` uses MODULITH_TOPOLOGY env var."""
+    make_fake_app({"orders": "", "inventory": ""})
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_TOPOLOGY", "processes")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["run", "fakeapp:app"])
+
+    assert result.exit_code == 0, result.output
+    assert "specs" in captured  # processes topology was used
+
+
+@pytest.mark.parametrize("command", ["run", "dev"])
+def test_unflagged_topology_reports_an_invalid_configuration(
+    command: str, make_fake_app, tmp_path, monkeypatch
+) -> None:
+    """Without --topology the command reads the configuration to pick one, so
+    an invalid configuration is the documented one-line error and exit 1, not
+    a silent single-process launch."""
+    make_fake_app({"orders": ""})
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_TOPOLOGY", "procesess")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    result = runner.invoke(app, [command, "fakeapp:app"])
+
+    assert result.exit_code == 1, result.output
+    assert "procesess" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_run_flag_overrides_configured_topology(make_fake_app, tmp_path, monkeypatch) -> None:
+    """The --topology flag overrides [tool.modulith] topology setting for run."""
+    make_fake_app({"orders": "", "inventory": ""})
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith]\npackage = "fakeapp"\ntopology = "processes"\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setattr(os, "execvp", lambda file, args: None)
+
+    result = runner.invoke(app, ["run", "fakeapp:app", "--topology", "single"])
+
+    assert result.exit_code == 0, result.output
+    # single-process run shows the banner
+    assert "modulith run →" in result.output
+
+
 def test_app_bootstrap_still_raises_under_strict_boundaries_after_a_tool_command(
     make_fake_app, monkeypatch
 ) -> None:
@@ -3602,3 +3744,25 @@ def test_migrate_help_contains_literal_tool_modulith() -> None:
     assert "[tool.modulith]" in result.output, (
         "migrate --help must contain literal '[tool.modulith]' in the help text"
     )
+
+
+@pytest.mark.parametrize(
+    ("command", "default_note"),
+    [
+        ("run", "(default: [tool.modulith] topology, else single)"),
+        ("dev", "(default: [tool.modulith] topology, else single)"),
+        ("run", "(default: [tool.modulith] worker_port_base, else 9001)"),
+        ("dev", "(default: [tool.modulith] worker_port_base, else 9001)"),
+        ("migrate", "(default: [tool.modulith] outbox_url)"),
+    ],
+)
+def test_option_help_names_the_pyproject_key_it_defaults_to(
+    command: str, default_note: str
+) -> None:
+    """rich deletes a bare ``[tool.modulith]`` as a style tag, and a raw
+    ``\\[`` escapes the backslash rather than the bracket, so either spelling
+    drops the table name from the option's help."""
+    result = runner.invoke(app, [command, "--help"], env={"COLUMNS": "400"})
+
+    assert result.exit_code == 0, result.output
+    assert default_note in result.output

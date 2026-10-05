@@ -828,7 +828,9 @@ def _run_process_topology(
 @app.command()
 def dev(
     app_module: str = typer.Argument(..., help="ASGI app, e.g. 'myapp:app'"),
-    topology: str = typer.Option("single", help="single | processes"),
+    topology: str | None = typer.Option(
+        None, help=r"single | processes (default: \[tool.modulith] topology, else single)"
+    ),
     isolate: str | None = typer.Option(
         None, help="Restrict the deployment to only this module (all others are not started)"
     ),
@@ -842,7 +844,7 @@ def dev(
         None,
         min=1,
         max=65535,
-        help=r"First worker port under --topology processes (default: \\[tool.modulith] "
+        help=r"First worker port under --topology processes (default: \[tool.modulith] "
         "worker_port_base, else 9001); replicas take the following ports",
     ),
 ) -> None:
@@ -867,6 +869,12 @@ def dev(
     the command), 1 on invalid arguments or configuration errors, 2 on
     unexpected internal errors.
     """
+    if topology is None:
+        try:
+            topology = load_configuration().topology
+        except ConfigurationError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=1) from None
     _validate_topology(topology)
     _validate_app_module(app_module)
     level = _configure_cli_logging(log_level)
@@ -904,7 +912,9 @@ def dev(
 @app.command()
 def run(
     app_module: str = typer.Argument(...),
-    topology: str = typer.Option("single", help="single | processes"),
+    topology: str | None = typer.Option(
+        None, help=r"single | processes (default: \[tool.modulith] topology, else single)"
+    ),
     workers: str | None = typer.Option(
         None,
         # Square brackets are rich markup tags in typer's help renderer, so a
@@ -922,7 +932,7 @@ def run(
         None,
         min=1,
         max=65535,
-        help=r"First worker port under --topology processes (default: \\[tool.modulith] "
+        help=r"First worker port under --topology processes (default: \[tool.modulith] "
         "worker_port_base, else 9001); replicas take the following ports",
     ),
 ) -> None:
@@ -942,6 +952,12 @@ def run(
     Exit codes: 0 on a clean launch, 1 on invalid arguments or configuration
     errors, 2 on unexpected internal errors.
     """
+    if topology is None:
+        try:
+            topology = load_configuration().topology
+        except ConfigurationError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=1) from None
     _validate_topology(topology)
     _validate_app_module(app_module)
     level = _configure_cli_logging(log_level)
@@ -1985,7 +2001,7 @@ def migrate(
     url: str | None = typer.Option(
         None,
         "--url",
-        help=r"SQLAlchemy URL to migrate (default: \\[tool.modulith] outbox_url)",
+        help=r"SQLAlchemy URL to migrate (default: \[tool.modulith] outbox_url)",
     ),
     schema: str | None = typer.Option(None, "--schema", help="Target schema (PostgreSQL only)"),
 ) -> None:
