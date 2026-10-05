@@ -26,6 +26,7 @@ import pytest
 from fastapi import BackgroundTasks, Depends, FastAPI
 from sqlalchemy import event as sa_event
 from sqlalchemy import select, text, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool
 
@@ -932,6 +933,51 @@ async def test_concurrent_sweepers_claim_each_row_once_on_mysql(mysql_url: str) 
             await conn.run_sync(Base.metadata.drop_all)
         for eng in engines:
             await eng.dispose()
+
+
+@pytest.mark.integration
+async def test_concurrent_sweepers_survive_mysql_deadlocks_at_serializable(
+    mysql_url: str,
+) -> None:
+    """At SERIALIZABLE, InnoDB turns the claim's plain SELECT into a locking
+    read, so concurrent claimers deadlock (error 1213) on their UPDATEs. The
+    claim transaction is retried instead of costing the sweep."""
+    engines = [create_async_engine(mysql_url, isolation_level="SERIALIZABLE") for _ in range(4)]
+    async with engines[0].begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+    try:
+        await _assert_concurrent_sweepers_claim_each_row_once(engines, rounds=6, rows=40)
+    finally:
+        async with engines[0].begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+        for eng in engines:
+            await eng.dispose()
+
+
+@pytest.mark.parametrize(
+    ("error_code", "attempts"), [(1213, 3), (1205, 1)], ids=["deadlock", "lock-wait-timeout"]
+)
+async def test_claim_retries_only_a_deadlock_and_gives_up_after_three_attempts(
+    engine: Any, monkeypatch: pytest.MonkeyPatch, error_code: int, attempts: int
+) -> None:
+    store = PostgresPublicationStore(engine=engine)
+    calls = 0
+
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        raise OperationalError("UPDATE", {}, Exception(error_code, "mysql error"))
+
+    monkeypatch.setattr(store, "_claim_unlocked", fail)
+    try:
+        with pytest.raises(OperationalError):
+            await store.claim_batch(
+                owner="s", batch_size=10, lease_seconds=60, older_than=timedelta(0)
+            )
+    finally:
+        await store.dispose()
+    assert calls == attempts
 
 
 @pytest.mark.integration

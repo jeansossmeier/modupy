@@ -122,6 +122,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - The proxy forwards a request carrying both `Transfer-Encoding` and `Content-Length` instead of answering 500, routes a path containing `%0A` to its worker instead of answering 404, and hands backend redirects to the client instead of following them, so an injected redirect-following client no longer drops `Cookie` and `Set-Cookie`
 - The SHM store-full and cut-replay messages say what to do: the subscribe error names freeing disk space, lowering `max_store_bytes` to what the SQLite build can hold, or `modulith broker drop-group`; the publish error says when the retired-group warning appears and that groups are named `modulith-<module>`; the cut-replay warning states in minutes when the earliest skipped publication expires
 - `modulith extract` fails when the extracted service's contracts module or `_manifest` cannot be imported, copies top-level helpers that are compiled extension modules or sourceless `.pyc` files, and warns, on stderr and under "Extraction notes" in the generated README, about third-party distributions the import check loaded that the generated dependencies do not cover
+- Outbox on MySQL at SERIALIZABLE: concurrent sweepers no longer lose a sweep to a deadlock (error 1213), because the claim transaction is retried up to twice
 
 ### Security
 

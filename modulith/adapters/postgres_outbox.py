@@ -75,6 +75,7 @@ try:
     from sqlalchemy import event as sa_event
     from sqlalchemy.dialects.mysql import LONGBLOB as MySQLLongBlob
     from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import DBAPIError
     from sqlalchemy.exc import TimeoutError as PoolTimeoutError
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
     from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
@@ -368,6 +369,14 @@ def _row_to_pub(row: EventPublicationRow) -> EventPublication:
 
 
 _INTERRUPTED_DELIVERY = "delivery interrupted: its claim lapsed before the listener finished"
+
+# One try plus two retries of the claim transaction after a MySQL deadlock.
+_CLAIM_DEADLOCK_ATTEMPTS = 3
+_MYSQL_DEADLOCK_ERROR = 1213
+
+
+def _is_mysql_deadlock(exc: DBAPIError) -> bool:
+    return bool(exc.orig and exc.orig.args and exc.orig.args[0] == _MYSQL_DEADLOCK_ERROR)
 
 
 async def _try_claim_row(
@@ -870,31 +879,30 @@ class PostgresPublicationStore:
         now = datetime.now(UTC)
         cutoff = now - older_than
         until = now + timedelta(seconds=lease_seconds)
-        async with self._open_session() as s:
-            stmt = (
-                select(EventPublicationRow)
-                .where(
-                    EventPublicationRow.completed_at.is_(None),
-                    EventPublicationRow.is_dead_lettered.is_(False),
-                    EventPublicationRow.published_at <= cutoff,
-                    or_(
-                        EventPublicationRow.claim_until.is_(None),
-                        EventPublicationRow.claim_until <= now,
-                    ),
-                )
-                .order_by(
-                    func.coalesce(
-                        EventPublicationRow.last_attempt_at,
-                        EventPublicationRow.published_at,
-                    )
-                )
-                .limit(batch_size)
+        stmt = (
+            select(EventPublicationRow)
+            .where(
+                EventPublicationRow.completed_at.is_(None),
+                EventPublicationRow.is_dead_lettered.is_(False),
+                EventPublicationRow.published_at <= cutoff,
+                or_(
+                    EventPublicationRow.claim_until.is_(None),
+                    EventPublicationRow.claim_until <= now,
+                ),
             )
-            if self._supports_skip_locked:
-                stmt = stmt.with_for_update(skip_locked=True)
+            .order_by(
+                func.coalesce(
+                    EventPublicationRow.last_attempt_at,
+                    EventPublicationRow.published_at,
+                )
+            )
+            .limit(batch_size)
+        )
+        if not self._supports_skip_locked:
+            return await self._claim_unlocked_retrying(stmt, owner=owner, now=now, until=until)
+        stmt = stmt.with_for_update(skip_locked=True)
+        async with self._open_session() as s:
             rows = (await s.execute(stmt)).scalars().all()
-            if not self._supports_skip_locked:
-                return await self._claim_unlocked(s, rows, owner=owner, now=now, until=until)
             claimed: list[EventPublication] = []
             charged: list[tuple[UUID, int, bool]] = []
             for row in rows:
@@ -932,6 +940,31 @@ class PostgresPublicationStore:
             "dispatch_started": False,
         }
 
+    async def _claim_unlocked_retrying(
+        self,
+        stmt: Any,
+        *,
+        owner: str,
+        now: datetime,
+        until: datetime,
+    ) -> list[EventPublication]:
+        """Run the select and ``_claim_unlocked`` in one transaction, redoing
+        it from the select after MySQL picks it as a deadlock victim (error
+        1213; the server has already rolled it back). At SERIALIZABLE InnoDB
+        reads the select's rows under shared locks, so concurrent claimers
+        deadlock when they upgrade to their UPDATEs; at REPEATABLE READ or
+        lower they do not and this loop never retries."""
+        for attempt in range(1, _CLAIM_DEADLOCK_ATTEMPTS + 1):
+            try:
+                async with self._open_session() as s:
+                    rows = (await s.execute(stmt)).scalars().all()
+                    return await self._claim_unlocked(s, rows, owner=owner, now=now, until=until)
+            except DBAPIError as exc:
+                if attempt == _CLAIM_DEADLOCK_ATTEMPTS or not _is_mysql_deadlock(exc):
+                    raise
+                logger.debug("claim_batch deadlocked (attempt %d); retrying", attempt)
+        raise AssertionError("unreachable")  # pragma: no cover
+
     async def _claim_unlocked(
         self,
         s: AsyncSession,
@@ -947,7 +980,8 @@ class PostgresPublicationStore:
         our SELECT leaves ``claim_until`` in the future, so our UPDATE matches
         nothing and the row is dropped from the batch. Rows are updated in
         primary-key order so concurrent claimers take row locks in the same
-        order and cannot deadlock each other. The UPDATE also pins the token
+        order and cannot deadlock each other at REPEATABLE READ or lower
+        (SERIALIZABLE can; see ``_claim_unlocked_retrying``). The UPDATE also pins the token
         it read, so the charge for an interrupted delivery (see
         ``claim_batch``) is computed from the row state it replaces. A matched
         row is then refreshed inside the same transaction, so the claim carries
