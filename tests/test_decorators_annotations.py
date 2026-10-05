@@ -15,6 +15,7 @@ resolution behavior for both the async and sync listener paths.
 from __future__ import annotations
 
 import importlib
+import sys
 
 import pytest
 
@@ -171,6 +172,65 @@ async def test_type_checking_only_annotation_on_another_parameter_is_tolerated(
             "orders": """
                 from __future__ import annotations
 
+                from dataclasses import dataclass
+                from typing import TYPE_CHECKING
+
+                from modulith import event, listener, publish
+
+                if TYPE_CHECKING:
+                    from nowhere.at.all import Session
+
+                @event
+                @dataclass(frozen=True)
+                class Ping:
+                    n: int
+
+                seen: list[int] = []
+
+                @listener
+                async def on_ping(event: Ping, session: Session | None = None) -> None:
+                    seen.append(event.n)
+
+                async def ping(n: int) -> None:
+                    await publish(Ping(n=n))
+            """,
+        }
+    )
+
+    from modulith.runtime import _runtime
+
+    _runtime.configure(package="fakeapp")
+    _runtime.ensure_bootstrapped()
+
+    from fakeapp.orders import (  # type: ignore[import-not-found]
+        Ping,
+        on_ping,
+        ping,
+        seen,
+    )
+
+    assert _runtime.event_bus is not None
+    assert on_ping in _runtime.event_bus.listeners_for(Ping)
+
+    await ping(7)
+    assert seen == [7]
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="deferred annotations (PEP 649) need 3.14")
+@pytest.mark.asyncio
+async def test_lazily_annotated_listener_with_type_checking_only_parameter_registers(
+    make_fake_app,
+) -> None:
+    """On 3.14 annotations are deferred without any ``__future__`` import.
+
+    Reading the signature evaluates every annotation, so a ``TYPE_CHECKING``-only
+    name on a second parameter raised a bare NameError from ``@listener``. The
+    event parameter's annotation is a real class and the bus calls the handler
+    with the event alone, so the listener must register and run.
+    """
+    make_fake_app(
+        {
+            "orders": """
                 from dataclasses import dataclass
                 from typing import TYPE_CHECKING
 

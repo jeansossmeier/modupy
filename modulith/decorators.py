@@ -21,12 +21,16 @@ from __future__ import annotations
 
 import functools
 import inspect
+import sys
 from collections.abc import Callable
 from typing import Any, TypeVar, cast, overload
 
 from .brokers import _split_broker_target
 from .config import ConfigurationError
 from .runtime import _runtime
+
+if sys.version_info >= (3, 14):
+    import annotationlib
 
 T = TypeVar("T")
 F = TypeVar("F", bound=Callable[..., Any])
@@ -131,7 +135,12 @@ def _resolve_event_type(func: Callable[..., Any], target: Callable[..., Any]) ->
     handlers, so functools.wraps chains don't hide the parameter list).
     """
     name = getattr(func, "__qualname__", repr(func))
-    sig = inspect.signature(target)
+    if sys.version_info >= (3, 14):
+        # Annotations are deferred (PEP 649) and evaluated all at once; FORWARDREF
+        # keeps an unresolvable name on another parameter from raising NameError.
+        sig = inspect.signature(target, annotation_format=annotationlib.Format.FORWARDREF)
+    else:
+        sig = inspect.signature(target)
     params = list(sig.parameters.values())
     if not params:
         raise TypeError(f"@listener {name!r} must accept an event argument")
