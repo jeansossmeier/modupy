@@ -165,6 +165,7 @@ The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record b
 - An outbox lease sweep no longer re-claims, or charges an interrupted attempt to, a publication this process is still delivering after its lease lapsed; a custom store whose `claim_batch` does not declare the new optional `exclude_ids` keyword is called as before
 - The database broker's hourly subscription touch no longer waits on rows a replica's subscribe holds locked: it skips them and stamps the rest; a group now counts as live by its recent subscription touch only, not by a recent claim, so the liveness query no longer scans `broker_message`
 - In a process-per-module deployment, a worker's outbox lease sweep claims only publications for listeners it hosts, plus broker-route rows, so it no longer claims and releases a sibling worker's rows or lets them crowd out its own batch; a custom store whose `claim_batch` does not declare the new optional `listeners` keyword is called as before
+- The database broker's SKIP LOCKED refusal prints the server's own `VERSION()` string and both minimums (MySQL 8.0.1, MariaDB 10.6) instead of a mis-parsed version; an out-of-range or non-numeric option names the option, its `MODULITH_BROKER_*` variable and the value you gave; `expected_consumer_groups` keys are stripped and a leading `database:` is dropped, as consumer targets are; and a whitespace-only `MODULITH_BROKER_*` value counts as unset
 
 ### Security
 

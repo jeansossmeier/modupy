@@ -161,6 +161,7 @@ from ..config import (
     DEFAULT_BROKER_DB_FILENAME,
     DEFAULT_MAX_PAYLOAD_BYTES,
     MAX_PAYLOAD_BYTES,
+    _expected_groups_target,
     _validate_sql_schema,
 )
 from ._dead_letter import DeadLetter
@@ -305,7 +306,9 @@ def _validate_choice(value: Any, option_name: str, allowed: frozenset[str]) -> s
 
 def _positive_finite_float(value: Any, option_name: str) -> float:
     if isinstance(value, bool):
-        raise ConfigurationError(f"{option_name} must be a finite number greater than 0")
+        raise ConfigurationError(
+            f"{option_name} must be a finite number greater than 0, got {value!r}"
+        )
     try:
         number = float(value)
     except (TypeError, ValueError) as exc:
@@ -322,7 +325,7 @@ def _positive_finite_float(value: Any, option_name: str) -> float:
 def _non_negative_finite_float(value: Any, option_name: str) -> float:
     if isinstance(value, bool):
         raise ConfigurationError(
-            f"{option_name} must be a finite number greater than or equal to 0"
+            f"{option_name} must be a finite number greater than or equal to 0, got {value!r}"
         )
     try:
         number = float(value)
@@ -363,7 +366,7 @@ def _validate_expected_consumer_groups(value: Any) -> dict[str, list[str]]:
     for target, groups in value.items():
         if (
             type(target) is not str
-            or not target.strip()
+            or not _expected_groups_target(target)
             or type(groups) is not list
             or not groups
             or any(type(group) is not str or not group.strip() for group in groups)
@@ -372,7 +375,8 @@ def _validate_expected_consumer_groups(value: Any) -> dict[str, list[str]]:
                 "expected_consumer_groups must map non-empty targets to non-empty lists "
                 f"of group strings, got {target!r}: {groups!r}"
             )
-        normalized[target] = list(groups)
+        merged = normalized.setdefault(_expected_groups_target(target), [])
+        merged.extend(group for group in groups if group not in merged)
     return normalized
 
 
@@ -609,14 +613,13 @@ def _require_skip_locked(engine: Any, reported: str | None) -> None:
     dialect = engine.dialect
     if dialect.name not in _MYSQL_FAMILY_DIALECTS or _supports_skip_locked(engine, reported):
         return
-    mariadb, release = _mysql_family_release(dialect, reported)
-    server = "MariaDB" if mariadb else "MySQL"
-    shown = "unknown" if release is None else ".".join(map(str, release))
-    minimum = ".".join(map(str, _skip_locked_minimum(mariadb)))
+    detail = "its version is unknown" if reported is None else f"VERSION() reports {reported!r}"
+    mysql = ".".join(map(str, _MYSQL_SKIP_LOCKED_MINIMUM))
+    mariadb = ".".join(map(str, _MARIADB_SKIP_LOCKED_MINIMUM))
     raise ConfigurationError(
-        f"The database broker claims messages with FOR UPDATE SKIP LOCKED, which the "
-        f"connected {server} server {shown} does not support; {server} {minimum} or "
-        "newer is required."
+        "The database broker claims messages with FOR UPDATE SKIP LOCKED, which the "
+        f"connected server does not support ({detail}); MySQL {mysql} or newer, or "
+        f"MariaDB {mariadb} or newer, is required."
     )
 
 
@@ -815,7 +818,9 @@ def _create_engine(url: Any, opts: dict[str, Any]) -> Any:
     sqlite = _is_sqlite_url(url)
     busy_timeout_ms: int | None = None
     if sqlite:
-        configured_timeout = _opt_int(_broker_opt(opts, "busy_timeout_ms", "BUSY_TIMEOUT_MS"))
+        configured_timeout = _opt_int(
+            _broker_opt(opts, "busy_timeout_ms", "BUSY_TIMEOUT_MS"), "busy_timeout_ms"
+        )
         busy_timeout_ms = (
             _DEFAULT_SQLITE_BUSY_TIMEOUT_MS if configured_timeout is None else configured_timeout
         )
@@ -837,15 +842,15 @@ def _create_engine(url: Any, opts: dict[str, Any]) -> Any:
     if sqlite and not _is_sqlite_memory_url(url):
         # File-backed SQLite has one writer. SQLAlchemy's default QueuePool
         # (5+10) only multiplies SQLITE_BUSY under concurrent dispatch.
-        pool_size = _opt_int(_broker_opt(opts, "pool_size", "POOL_SIZE"))
+        pool_size = _opt_int(_broker_opt(opts, "pool_size", "POOL_SIZE"), "pool_size")
         kwargs["pool_size"] = 1 if pool_size is None else pool_size
-        max_overflow = _opt_int(_broker_opt(opts, "max_overflow", "MAX_OVERFLOW"))
+        max_overflow = _opt_int(_broker_opt(opts, "max_overflow", "MAX_OVERFLOW"), "max_overflow")
         kwargs["max_overflow"] = 0 if max_overflow is None else max_overflow
     elif not sqlite:
-        pool_size = _opt_int(_broker_opt(opts, "pool_size", "POOL_SIZE"))
+        pool_size = _opt_int(_broker_opt(opts, "pool_size", "POOL_SIZE"), "pool_size")
         if pool_size is not None:
             kwargs["pool_size"] = pool_size
-        max_overflow = _opt_int(_broker_opt(opts, "max_overflow", "MAX_OVERFLOW"))
+        max_overflow = _opt_int(_broker_opt(opts, "max_overflow", "MAX_OVERFLOW"), "max_overflow")
         if max_overflow is not None:
             kwargs["max_overflow"] = max_overflow
     else:
@@ -2562,6 +2567,11 @@ class DatabaseBroker:
         """How long a stored publish is kept for a group that subscribes later."""
         return float(self._orphan_retention_seconds)
 
+    @property
+    def expected_consumer_groups(self) -> dict[str, list[str]]:
+        """A copy of the configured ``expected_consumer_groups``, keyed by normalized target."""
+        return {target: list(groups) for target, groups in self._expected_consumer_groups.items()}
+
     def expected_targets(self, group: str) -> list[str]:
         """Targets whose every publish is queued for ``group`` by configuration alone.
 
@@ -2937,7 +2947,9 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
         ),
         expected_consumer_groups=expected_consumer_groups,
         max_payload_bytes=_option_or_default(
-            _opt_int(_broker_opt(opts, "max_payload_bytes", "MAX_PAYLOAD_BYTES")),
+            _opt_int(
+                _broker_opt(opts, "max_payload_bytes", "MAX_PAYLOAD_BYTES"), "max_payload_bytes"
+            ),
             DEFAULT_MAX_PAYLOAD_BYTES,
         ),
     )
@@ -2948,10 +2960,10 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
 def _broker_opt(opts: dict[str, Any], key: str, env_suffix: str) -> Any:
     """Resolve one broker setting: ``MODULITH_BROKER_<ENV_SUFFIX>`` env var
     (highest priority — for deployment-time values like the URL/DSN) else the
-    ``broker_options`` subtable value else None. A blank env var ('') counts as
-    unset (templated deployments commonly render ``MODULITH_X=``)."""
+    ``broker_options`` subtable value else None. A blank or whitespace-only env var
+    counts as unset (templated deployments commonly render ``MODULITH_X=``)."""
     env_value = os.environ.get(f"MODULITH_BROKER_{env_suffix}")
-    if env_value:
+    if env_value and env_value.strip():
         return env_value
     return opts.get(key)
 
@@ -2992,35 +3004,40 @@ def _parse_expected_consumer_groups(value: Any) -> dict[str, list[str]]:
     return _validate_expected_consumer_groups(value)
 
 
-def _opt_float(value: Any) -> float | None:
-    """Coerce a broker-option value (typed ``Any`` from TOML/env) to a float,
-    or None when absent. A non-numeric value (e.g. a typo'd env var) raises
-    ``ConfigurationError`` rather than a bare ``ValueError`` so the operator
-    sees a broker-config error, not an opaque traceback."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise ConfigurationError(f"broker option expected a number, got {value!r}")
-    try:
-        return float(value)
-    except (TypeError, ValueError) as exc:
-        raise ConfigurationError(f"broker option expected a number, got {value!r}") from exc
+def _option_label(key: str) -> str:
+    """``key`` with the environment variable that overrides it, for an error message."""
+    return f"{key} (MODULITH_BROKER_{key.upper()})"
 
 
-def _opt_int(value: Any) -> int | None:
-    """Coerce a broker-option value to an int, or None when absent. Same
-    ``ConfigurationError``-on-bad-value contract as ``_opt_float`` (note
-    ``'10.0'`` is rejected — use a bare integer)."""
+def _opt_int(value: Any, key: str) -> int | None:
+    """Coerce the broker option ``key``'s value (typed ``Any`` from TOML/env) to an
+    int, or None when absent. A bad value (e.g. a typo'd env var) raises
+    ``ConfigurationError`` naming the option, rather than a bare ``ValueError``
+    (note ``'10.0'`` is rejected — use a bare integer)."""
     if value is None:
         return None
     if type(value) is int:
         return value
     if type(value) is not str:
-        raise ConfigurationError(f"broker option expected an integer, got {value!r}")
+        raise ConfigurationError(f"{_option_label(key)} must be an integer, got {value!r}")
     try:
         return int(value)
     except ValueError as exc:
-        raise ConfigurationError(f"broker option expected an integer, got {value!r}") from exc
+        raise ConfigurationError(f"{_option_label(key)} must be an integer, got {value!r}") from exc
+
+
+def _consumer_option(
+    opts: dict[str, Any], key: str, check: Callable[[Any, str], Any], *, integer: bool = False
+) -> Any:
+    """The consumer option ``key`` after ``check`` accepted it in the unit the user
+    wrote, or None when unset. ``check`` runs before any unit conversion, so a
+    rejection names the option and the user's number, not a derived argument."""
+    value = _broker_opt(opts, key, key.upper())
+    if value is None:
+        return None
+    if integer:
+        value = _opt_int(value, key)
+    return check(value, _option_label(key))
 
 
 def _make_db_consumer(spec: ConsumerSpec) -> Consumer:
@@ -3041,20 +3058,20 @@ def _make_db_consumer(spec: ConsumerSpec) -> Consumer:
     broker = cast(DatabaseBroker, spec.broker_registry.get(spec.scheme))
     cfg = _runtime.config
     opts = (cfg.broker_options if cfg is not None else None) or {}
-    poll_interval_ms = _opt_float(_broker_opt(opts, "poll_interval_ms", "POLL_INTERVAL_MS"))
-    batch_size = _opt_int(_broker_opt(opts, "batch_size", "BATCH_SIZE"))
-    dispatch_concurrency = _opt_int(
-        _broker_opt(opts, "dispatch_concurrency", "DISPATCH_CONCURRENCY")
+    poll_interval_ms = _consumer_option(opts, "poll_interval_ms", _positive_finite_float)
+    batch_size = _consumer_option(opts, "batch_size", _positive_int, integer=True)
+    dispatch_concurrency = _consumer_option(
+        opts, "dispatch_concurrency", _positive_int, integer=True
     )
-    reclaim_stale_seconds = _opt_float(
-        _broker_opt(opts, "reclaim_stale_seconds", "RECLAIM_STALE_SECONDS")
+    reclaim_stale_seconds = _consumer_option(opts, "reclaim_stale_seconds", _positive_finite_float)
+    max_delivery_attempts = _consumer_option(
+        opts, "max_delivery_attempts", _positive_int, integer=True
     )
-    max_delivery_attempts = _opt_int(
-        _broker_opt(opts, "max_delivery_attempts", "MAX_DELIVERY_ATTEMPTS")
+    retention_age_seconds = _consumer_option(opts, "retention_age_seconds", _positive_finite_float)
+    prune_interval_seconds = _consumer_option(
+        opts, "prune_interval_seconds", _non_negative_finite_float
     )
-    retention_age_seconds = _opt_float(
-        _broker_opt(opts, "retention_age_seconds", "RETENTION_AGE_SECONDS")
-    )
+    retention_count = _consumer_option(opts, "retention_count", _non_negative_int, integer=True)
     return DatabaseConsumer(
         broker=broker,
         bus=spec.bus,
@@ -3077,13 +3094,11 @@ def _make_db_consumer(spec: ConsumerSpec) -> Consumer:
         max_attempts=(
             max_delivery_attempts if max_delivery_attempts is not None else _MAX_DELIVERY_ATTEMPTS
         ),
-        prune_interval_s=_opt_float(
-            _broker_opt(opts, "prune_interval_seconds", "PRUNE_INTERVAL_SECONDS")
-        ),
+        prune_interval_s=prune_interval_seconds,
         retention_age_seconds=(
             retention_age_seconds if retention_age_seconds is not None else _DEFAULT_RETENTION_AGE_S
         ),
-        retention_count=_opt_int(_broker_opt(opts, "retention_count", "RETENTION_COUNT")),
+        retention_count=retention_count,
     )
 
 

@@ -1797,8 +1797,7 @@ def broker_drop_group(
         if sole:
             typer.echo(_sole_subscriber_warning(group, sole, broker, cfg.broker))
         if expected:
-            # No public accessor: the broker exposes only the targets that list the group.
-            listed: dict[str, list[str]] = broker._expected_consumer_groups
+            listed: dict[str, list[str]] = broker.expected_consumer_groups
             sole_keys = [t for t in expected if set(listed[t]) == {group}]
             typer.echo(_expected_targets_warning(group, expected, sole_keys))
         if not yes:

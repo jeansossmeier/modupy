@@ -868,6 +868,16 @@ def _validate_sql_schema(value: object, *, option_name: str) -> str:
     return value
 
 
+def _expected_groups_target(target: str) -> str:
+    """The target an ``expected_consumer_groups`` key names, as a database consumer's
+    target is normalized: whitespace stripped and a leading ``database:`` scheme dropped.
+
+    Empty when nothing is left, which both validators reject.
+    """
+    scheme, destination = _split_broker_target(target)
+    return destination if scheme == "database" else target.strip()
+
+
 def _validate_database_broker_options(options: dict[str, Any]) -> None:
     """Validate the 'database' broker's options at config-load time.
 
@@ -923,7 +933,7 @@ def _validate_database_broker_options(options: dict[str, Any]) -> None:
         value = options["expected_consumer_groups"]
         valid = type(value) is dict and all(
             type(target) is str
-            and target.strip()
+            and _expected_groups_target(target)
             and type(groups) is list
             and groups
             and all(type(group) is str and group.strip() for group in groups)

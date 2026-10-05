@@ -622,8 +622,11 @@ modupy logs one warning the first time a call arrives from a second loop.
 
 The database broker needs `FOR UPDATE SKIP LOCKED` to claim messages: MySQL
 8.0.1 or newer, or MariaDB 10.6 or newer. A consumer connected to an older
-server fails at startup with a `ConfigurationError` that names the server
-version and the minimum. There is no unlocked fallback, because under InnoDB's
+server fails at startup with a `ConfigurationError` that prints the server's
+`SELECT VERSION()` string unchanged, with both minimums. The gate trusts
+that string alone and has no override: a fork or vendor build whose string
+the check cannot read as a supported release is refused even when the server
+supports the clause. There is no unlocked fallback, because under InnoDB's
 REPEATABLE READ two consumers would claim the same rows.
 
 **Configuration:**
@@ -1589,7 +1592,9 @@ Step 6 depends on the broker:
   `orphan_replay_policy = "expected_groups"`, a group named in
   `expected_consumer_groups` gets a pending message for every later publish
   to those targets whether or not it subscribes, so dropping it has no
-  lasting effect. `drop-group` says so. Delete the target's key from
+  lasting effect. `drop-group` says so. Keys of `expected_consumer_groups`
+  are normalized like consumer targets (surrounding whitespace stripped, a
+  leading `database:` dropped). Delete the target's key from
   `expected_consumer_groups` when the group is the only one listed for it (an
   empty list is rejected), and otherwise remove the group from that key's
   list. The `modulith run --topology processes` startup warning for a retired

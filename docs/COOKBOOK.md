@@ -1020,7 +1020,10 @@ group that registers before expiry gets a copy), `first_groups` (fan out to
 the first registration set then delete), or `expected_groups` (pre-create
 delivery rows for configured groups). A group listed in
 `expected_consumer_groups` keeps receiving rows even after `modulith broker
-drop-group` removes its subscription. When you retire its module, delete the
+drop-group` removes its subscription. Keys are normalized like consumer
+targets: surrounding whitespace is stripped and a leading `database:` is
+dropped, so `"database:orders.Placed"` and `"orders.Placed"` name the same
+target. When you retire its module, delete the
 target's key if the group is the only one listed for it (an empty list is
 rejected) and otherwise remove the group from that key's list; a publish to a
 target with no key raises `ConfigurationError`.

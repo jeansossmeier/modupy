@@ -26,7 +26,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import sqlite3
 import threading
 import time
@@ -66,8 +65,8 @@ from modulith.adapters.db_broker import (
     _is_sqlite_locked,
     _is_sqlite_url,
     _make_db_consumer,
-    _opt_float,
     _opt_int,
+    _parse_expected_consumer_groups,
     _require_skip_locked,
     _supports_skip_locked,
     broker_schema,
@@ -888,6 +887,77 @@ def test_broker_rejects_invalid_expected_consumer_groups(expected_groups: Any) -
 
     with pytest.raises(ConfigurationError, match="expected_consumer_groups"):
         DatabaseBroker(engine=object(), expected_consumer_groups=expected_groups)
+
+
+@pytest.mark.parametrize("key", ["", "  ", "database:", " database:  ", "database: "])
+def test_broker_rejects_an_expected_consumer_groups_key_with_no_target(key: str) -> None:
+    from modulith import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="expected_consumer_groups"):
+        DatabaseBroker(engine=object(), expected_consumer_groups={key: ["group-a"]})
+
+
+def test_broker_normalizes_expected_consumer_groups_keys_like_consumer_targets() -> None:
+    broker = DatabaseBroker(
+        engine=object(),
+        expected_consumer_groups={
+            " orders.Placed ": ["billing"],
+            "database:orders.Shipped": ["billing"],
+            " database: orders.Paid ": ["billing"],
+            "other:orders.Kept": ["billing"],
+        },
+    )
+
+    assert broker.expected_consumer_groups == {
+        "orders.Placed": ["billing"],
+        "orders.Shipped": ["billing"],
+        "orders.Paid": ["billing"],
+        "other:orders.Kept": ["billing"],
+    }
+
+
+def test_broker_merges_expected_consumer_groups_keys_that_normalize_alike() -> None:
+    broker = DatabaseBroker(
+        engine=object(),
+        expected_consumer_groups={
+            "orders.Placed": ["billing", "audit"],
+            "database:orders.Placed": ["audit", "shipping"],
+        },
+    )
+
+    assert broker.expected_consumer_groups == {"orders.Placed": ["billing", "audit", "shipping"]}
+
+
+def test_expected_consumer_groups_env_json_keys_are_normalized() -> None:
+    parsed = _parse_expected_consumer_groups('{" database:orders.Placed ": ["billing"]}')
+
+    assert parsed == {"orders.Placed": ["billing"]}
+
+
+def test_expected_consumer_groups_accessor_is_a_read_only_copy() -> None:
+    broker = DatabaseBroker(engine=object(), expected_consumer_groups={"orders.Placed": ["a"]})
+
+    view = broker.expected_consumer_groups
+    view["orders.Placed"].append("b")
+    view["other"] = ["c"]
+
+    assert broker.expected_consumer_groups == {"orders.Placed": ["a"]}
+
+
+async def test_store_expected_groups_publish_matches_a_padded_or_scheme_qualified_key(
+    engine: Any,
+) -> None:
+    target = "fakeapp.orders.WidgetCreated"
+    broker = DatabaseBroker(
+        engine=engine,
+        no_subscriber_policy="store",
+        orphan_replay_policy="expected_groups",
+        expected_consumer_groups={f" database:{target} ": ["inventory"]},
+    )
+
+    await broker.publish(target, b"payload", {"event_type": target})
+
+    assert len(await broker.claim_batch("inventory", batch_size=10, consumer_name="c1")) == 1
 
 
 def _consumer_with_options(**options: Any) -> DatabaseConsumer:
@@ -3329,24 +3399,22 @@ _SKIP_LOCKED_SERVERS = [
     (_MARIADB_URL, "11.4.2-1-MariaDB-enterprise"),
 ]
 
-_MARIADB_TOO_OLD = "does not support; MariaDB 10.6 or newer"
-_MYSQL_TOO_OLD = "does not support; MySQL 8.0.1 or newer"
 _PRE_SKIP_LOCKED_SERVERS = [
-    (_MYSQL_URL, "10.5.23-MariaDB-1:10.5.23+maria~ubu2004", "MariaDB server 10.5.23"),
-    (_MARIADB_URL, "10.5.23-MariaDB-1:10.5.23+maria~ubu2004", "MariaDB server 10.5.23"),
-    (_MYSQL_URL, "10.3.39-MariaDB-0+deb10u1", "MariaDB server 10.3.39"),
-    (_MYSQL_URL, "5.7.44-log", "MySQL server 5.7.44"),
-    (_MYSQL_URL, "5.7.42-0ubuntu0.18.04.1", "MySQL server 5.7.42"),
-    (_MYSQL_URL, "8.0.0-dmr", "MySQL server 8.0.0"),
-    (_MARIADB_URL, "10.5.27-MariaDB", "MariaDB server 10.5.27"),
-    (_MARIADB_URL, "10.5.23-17-MariaDB-enterprise", "MariaDB server 10.5.23"),
-    (_MYSQL_URL, "5.5.5-10.5.23-17-MariaDB-enterprise-log", "MariaDB server 10.5.23"),
+    (_MYSQL_URL, "10.5.23-MariaDB-1:10.5.23+maria~ubu2004"),
+    (_MARIADB_URL, "10.5.23-MariaDB-1:10.5.23+maria~ubu2004"),
+    (_MYSQL_URL, "10.3.39-MariaDB-0+deb10u1"),
+    (_MYSQL_URL, "5.7.44-log"),
+    (_MYSQL_URL, "5.7.42-0ubuntu0.18.04.1"),
+    (_MYSQL_URL, "8.0.0-dmr"),
+    (_MARIADB_URL, "10.5.27-MariaDB"),
+    (_MARIADB_URL, "10.5.23-17-MariaDB-enterprise"),
+    (_MYSQL_URL, "5.5.5-10.5.23-17-MariaDB-enterprise-log"),
+    # Aurora MySQL 2 and TiDB strings, which the numeric parse reads as 5.7.2 and 5.7.25.
+    (_MYSQL_URL, "5.7.mysql_aurora.2.11.2"),
+    (_MYSQL_URL, "5.7.25-TiDB-v6.1.0"),
+    # No version precedes the MariaDB token, so the server's version is unreadable.
+    (_MYSQL_URL, "MariaDB-10.6.12"),
 ]
-
-
-def _expected_refusal(server: str) -> str:
-    too_old = _MARIADB_TOO_OLD if server.startswith("MariaDB") else _MYSQL_TOO_OLD
-    return f"{server} {too_old}"
 
 
 @pytest.mark.parametrize(("url", "version"), _SKIP_LOCKED_SERVERS)
@@ -3358,25 +3426,24 @@ def test_skip_locked_gate_accepts_servers_that_support_the_clause(url: str, vers
     _require_skip_locked(engine, version)
 
 
-@pytest.mark.parametrize(
-    ("url", "version", "server"),
-    [
-        *_PRE_SKIP_LOCKED_SERVERS,
-        # No version precedes the MariaDB token, so the server's version is unreadable.
-        (_MYSQL_URL, "MariaDB-10.6.12", "MariaDB server unknown"),
-    ],
-)
-def test_skip_locked_gate_refuses_servers_older_than_the_clause(
-    url: str, version: str, server: str
-) -> None:
+@pytest.mark.parametrize(("url", "version"), _PRE_SKIP_LOCKED_SERVERS)
+def test_skip_locked_gate_refuses_servers_older_than_the_clause(url: str, version: str) -> None:
+    """The refusal prints the server's own ``VERSION()`` and both families' minimums
+    and names no family for the server: one string fits MySQL, MariaDB, Aurora and TiDB."""
     pytest.importorskip("aiomysql", reason="needs the modupy[database] extra (aiomysql)")
     from modulith import ConfigurationError
 
     engine = create_async_engine(url)
 
     assert _supports_skip_locked(engine, version) is False
-    with pytest.raises(ConfigurationError, match=re.escape(_expected_refusal(server))):
+    with pytest.raises(ConfigurationError) as refusal:
         _require_skip_locked(engine, version)
+    message = str(refusal.value)
+    assert repr(version) in message
+    assert "MySQL 8.0.1 or newer" in message
+    assert "MariaDB 10.6 or newer" in message
+    assert "MySQL server" not in message
+    assert "MariaDB server" not in message
 
 
 @pytest.mark.parametrize(
@@ -3406,8 +3473,10 @@ def test_skip_locked_gate_refuses_a_mysql_server_whose_version_is_not_yet_known(
     engine = create_async_engine(_MYSQL_URL)
 
     assert _supports_skip_locked(engine, None) is False
-    with pytest.raises(ConfigurationError, match="MySQL server unknown does not support"):
+    with pytest.raises(ConfigurationError, match="version is unknown") as refusal:
         _require_skip_locked(engine, None)
+    assert "MySQL 8.0.1 or newer" in str(refusal.value)
+    assert "MariaDB 10.6 or newer" in str(refusal.value)
 
 
 def test_skip_locked_gate_selects_lockable_dialects_only() -> None:
@@ -3716,6 +3785,65 @@ def test_make_db_consumer_rejects_invalid_numeric_config(
         _make_db_consumer(spec)
 
 
+@pytest.mark.parametrize(
+    ("key", "value", "written"),
+    [
+        ("poll_interval_ms", -250, "-250"),
+        ("poll_interval_ms", "-250", "'-250'"),
+        ("poll_interval_ms", "abc", "'abc'"),
+        ("reclaim_stale_seconds", -5, "-5"),
+        ("prune_interval_seconds", -1, "-1"),
+        ("retention_age_seconds", 0, "0"),
+        ("batch_size", 0, "0"),
+        ("batch_size", "abc", "'abc'"),
+        ("dispatch_concurrency", -2, "-2"),
+        ("max_delivery_attempts", 0, "0"),
+        ("retention_count", -3, "-3"),
+    ],
+)
+@pytest.mark.parametrize("from_env", [False, True])
+def test_make_db_consumer_names_the_option_variable_and_value_it_rejects(
+    make_fake_app: Any,
+    monkeypatch: Any,
+    key: str,
+    value: Any,
+    written: str,
+    from_env: bool,
+) -> None:
+    """A bad value fails in the user's own unit, naming the option and its variable,
+    not the seconds-based argument the consumer converts it into."""
+    make_fake_app({"orders": ""})
+    from modulith import ConfigurationError, configure
+
+    options: dict[str, Any] = {"url": "sqlite+aiosqlite:///:memory:"}
+    if from_env:
+        monkeypatch.setenv(f"MODULITH_BROKER_{key.upper()}", str(value))
+    else:
+        options[key] = value
+    configure(package="fakeapp", broker="database", broker_options=options)
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.broker_registry is not None
+    spec = ConsumerSpec(
+        scheme="database",
+        module_name="inventory",
+        group="modulith-inventory",
+        consumer_name="inventory:1",
+        targets=("fakeapp.orders.WidgetCreated",),
+        bus=InMemoryEventBus(),
+        serializer=JsonEventSerializer(),
+        broker_registry=_runtime.broker_registry,
+    )
+
+    with pytest.raises(ConfigurationError) as rejected:
+        _make_db_consumer(spec)
+
+    message = str(rejected.value)
+    assert f"{key} (MODULITH_BROKER_{key.upper()})" in message
+    if not from_env:
+        assert f"got {written}" in message
+
+
 # ---------------------------------------------------------------------------
 # I5a: engine factory — pooling (pg/mysql) + SQLite WAL/busy_timeout
 # ---------------------------------------------------------------------------
@@ -3801,6 +3929,12 @@ def test_broker_opt_prefers_env_over_options(monkeypatch: Any) -> None:
 
 def test_broker_opt_blank_env_is_treated_as_unset(monkeypatch: Any) -> None:
     monkeypatch.setenv("MODULITH_BROKER_URL", "")
+    assert _broker_opt({"url": "from-options"}, "url", "URL") == "from-options"
+
+
+@pytest.mark.parametrize("blank", [" ", "   ", "\t", " \n "])
+def test_broker_opt_whitespace_only_env_is_treated_as_unset(monkeypatch: Any, blank: str) -> None:
+    monkeypatch.setenv("MODULITH_BROKER_URL", blank)
     assert _broker_opt({"url": "from-options"}, "url", "URL") == "from-options"
 
 
@@ -5104,24 +5238,17 @@ async def test_postgres_non_owner_role_gets_a_configuration_error_naming_the_mig
 # ---------------------------------------------------------------------------
 
 
-def test_opt_float_rejects_non_numeric() -> None:
+def test_opt_int_rejects_non_integer_naming_the_option() -> None:
     from modulith import ConfigurationError
 
-    assert _opt_float(None) is None
-    assert _opt_float("2.5") == 2.5
-    with pytest.raises(ConfigurationError):
-        _opt_float("not-a-number")
-
-
-def test_opt_int_rejects_non_integer() -> None:
-    from modulith import ConfigurationError
-
-    assert _opt_int(None) is None
-    assert _opt_int("7") == 7
-    with pytest.raises(ConfigurationError):
-        _opt_int("10.0")  # a float string is not a valid int — loud, not silent
-    with pytest.raises(ConfigurationError):
-        _opt_int("abc")
+    assert _opt_int(None, "pool_size") is None
+    assert _opt_int("7", "pool_size") == 7
+    with pytest.raises(ConfigurationError, match=r"pool_size \(MODULITH_BROKER_POOL_SIZE\)"):
+        _opt_int("10.0", "pool_size")  # a float string is not a valid int — loud, not silent
+    with pytest.raises(ConfigurationError, match=r"pool_size \(MODULITH_BROKER_POOL_SIZE\)"):
+        _opt_int("abc", "pool_size")
+    with pytest.raises(ConfigurationError, match=r"pool_size \(MODULITH_BROKER_POOL_SIZE\)"):
+        _opt_int(1.5, "pool_size")
 
 
 # ---------------------------------------------------------------------------

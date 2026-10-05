@@ -1905,3 +1905,16 @@ async def test_group_backlog_with_targets_reports_one_groups_pending_rows_per_ta
         assert await broker.group_backlog(targets=["t.none"]) == {}
     finally:
         await broker.close()
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\t", " \n "])
+def test_broker_opt_treats_a_blank_env_value_as_unset(
+    monkeypatch: pytest.MonkeyPatch, blank: str
+) -> None:
+    monkeypatch.setenv("MODULITH_BROKER_STATE_DIR", blank)
+
+    resolved = shm_broker_module._broker_opt(
+        {"state_dir": "/from/options"}, "state_dir", "STATE_DIR"
+    )
+
+    assert resolved == "/from/options"

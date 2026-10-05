@@ -1011,6 +1011,8 @@ def test_redis_stream_caps_are_bounded_by_redis_integer_range(option: str) -> No
         ("expected_consumer_groups", ["not", "a", "dict"]),
         ("expected_consumer_groups", {"orders": []}),
         ("expected_consumer_groups", {"": ["group-a"]}),
+        ("expected_consumer_groups", {"database:": ["group-a"]}),
+        ("expected_consumer_groups", {" database: ": ["group-a"]}),
         ("schema", "bad-name"),
         ("schema", "1leading_digit"),
         ("schema", ""),
@@ -1046,6 +1048,19 @@ def test_database_broker_options_accept_documented_valid_values() -> None:
     assert cfg.broker == "database"
     assert cfg.broker_options["completion_mode"] == "mark"
     assert cfg.broker_options["schema"] == "mod_test"
+
+
+@pytest.mark.parametrize("key", [" orders.Placed ", "database:orders.Placed", " database: orders "])
+def test_database_broker_accepts_expected_consumer_groups_keys_a_target_could_carry(
+    key: str,
+) -> None:
+    """The broker strips a key and drops a leading ``database:`` as consumer targets are
+    normalized, so config load must not reject what the broker accepts."""
+    cfg = load_configuration(
+        broker="database", broker_options={"expected_consumer_groups": {key: ["billing"]}}
+    )
+
+    assert cfg.broker == "database"
 
 
 # ----- env var handling -------------------------------------------------------
