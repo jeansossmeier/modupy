@@ -342,9 +342,10 @@ Return the manifest for a module, or None if none was declared.
 
 A frozen snapshot of one module's declared contract.
 
-Created by declare_module() and stored on the module's package
-object as `__modulith_manifest__`. The framework reads this during
-bootstrap to validate against observed reality.
+Created by ``declare_module()`` and kept in the module-level registry,
+keyed by package name, that ``get_manifest()`` reads
+(``all_manifests()`` returns a copy of it). The framework reads that
+registry during bootstrap to validate against observed reality.
 
 **Fields:**
 
@@ -693,13 +694,15 @@ The marker plugin authors use to implement hooks.
 
 ### `hookimpl`
 
-*Instance of `pluggy._hooks.HookimplMarker`.*
+*Instance of `modulith.markers._HookimplMarker`.*
 
-Decorator for marking functions as hook implementations.
+Mark a function as a modulith hook implementation.
 
-Instantiate it with a ``project_name`` to get a decorator.
-Calling :meth:`PluginManager.register` later will discover all marked
-functions if the :class:`PluginManager` uses the same project name.
+``hookimpl`` is already an instance bound to the ``modulith`` project
+name, so use it directly as ``@hookimpl`` or with pluggy's options as
+``@hookimpl(tryfirst=True)``; there is nothing to instantiate. Name the
+function after the hook it implements (see ``modulith.hooks``) and give
+it only arguments that hook declares.
 
 ## Plugin manager (advanced)
 

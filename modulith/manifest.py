@@ -103,9 +103,10 @@ def _normalize_broker_targets(targets: object) -> tuple[str, ...]:
 class Manifest:
     """A frozen snapshot of one module's declared contract.
 
-    Created by declare_module() and stored on the module's package
-    object as `__modulith_manifest__`. The framework reads this during
-    bootstrap to validate against observed reality.
+    Created by ``declare_module()`` and kept in the module-level registry,
+    keyed by package name, that ``get_manifest()`` reads
+    (``all_manifests()`` returns a copy of it). The framework reads that
+    registry during bootstrap to validate against observed reality.
     """
 
     # Module's own package name, derived from the calling frame.

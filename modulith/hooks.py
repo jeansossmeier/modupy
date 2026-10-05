@@ -116,11 +116,13 @@ def modulith_after_event_published(
 ) -> None:
     """Run after an event has been persisted to the outbox.
 
-    The event is durably recorded at this point. Failures in listeners
-    will not undo the publication — they trigger retries via
-    modulith_on_listener_error. This is the right hook for metrics
-    counting events produced, distributed tracing of publish spans,
-    and structured audit logs.
+    On the durable outbox path the row is persisted in the bound session
+    and not yet committed: the caller's transaction can still roll it
+    back, and listeners run only after that commit. A listener failure
+    then never undoes the publication — the outbox retries it, and each
+    failure is reported through modulith_on_listener_error. This is the
+    right hook for metrics counting events produced, distributed tracing
+    of publish spans, and structured audit logs.
 
     ``publication`` is an ``EventPublication`` on the in-memory dispatch
     path (no persistence happened; it carries the event's real serialized
