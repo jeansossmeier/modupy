@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 from .config import _configured_broker_url, _find_pyproject
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
 
     from .config import Configuration
     from .runtime import Runtime
@@ -202,6 +202,7 @@ def import_closure(rt: Runtime, module: str) -> tuple[list[str], list[str]]:
 
 _IMPORT_CHECK_UNDER = """
 def under(path, parent):
+    path, parent = os.path.normcase(path), os.path.normcase(parent)
     try:
         return os.path.commonpath([path, parent]) == parent
     except ValueError:  # different drives on Windows
@@ -212,13 +213,14 @@ _DISTRIBUTIONS_MARKER = "modulith-gate-distributions:"
 
 _IMPORT_CHECK = (
     """
-import importlib, importlib.metadata, json, os, site, sys, sysconfig
+import importlib, importlib.metadata, json, os, re, site, sys, sysconfig
 root, dotted, source = sys.argv[1:4]
+declared = set(json.loads(sys.argv[4]))
 loaded_before = set(sys.modules)
 sys.path.insert(0, root)
 importlib.import_module(dotted)
 # The worker imports these two at start-up and tolerates only their absence.
-for name in sys.argv[4:]:
+for name in sys.argv[5:]:
     try:
         importlib.import_module(name)
     except ModuleNotFoundError as exc:
@@ -235,11 +237,23 @@ prefixes = {os.path.realpath(p) for p in (sys.prefix, sys.base_prefix, sys.exec_
 libraries = [sysconfig.get_path(n) for n in ("stdlib", "platstdlib", "purelib", "platlib")]
 libraries += site.getsitepackages() + [site.getusersitepackages()]
 libraries = {os.path.realpath(p) for p in libraries} - prefixes
+# Extension modules (Windows DLLs) and pip VCS checkouts sit beside a prefix's
+# library directories. They stay exempt, but unlike a library directory they do
+# not narrow an app installed there to its top-level package.
+extras = {os.path.join(p, sub) for p in prefixes for sub in ("DLLs", "src")}
 # An installed copy of the app shares its library directory with every other
 # distribution, so only the app's own top-level package counts as first-party.
 if any(under(source, p) for p in libraries):
     source = os.path.join(source, dotted.split(".")[0])
-exempt = {p for p in prefixes | libraries if not under(source, p)}
+exempt = {p for p in prefixes | libraries | extras if not under(source, p)}
+by_top_level = importlib.metadata.packages_distributions()
+
+
+def is_declared(name):
+    owners = by_top_level.get(name.split(".")[0], ())
+    return any(re.sub(r"[-_.]+", "-", d).lower() in declared for d in owners)
+
+
 leaked = sorted(
     name
     for name, mod in list(sys.modules.items())
@@ -247,14 +261,14 @@ leaked = sorted(
     and under(os.path.realpath(mod.__file__), source)
     and not under(os.path.realpath(mod.__file__), root)
     and not any(under(os.path.realpath(mod.__file__), p) for p in exempt)
+    and not is_declared(name)
 )
 if leaked:
     sys.exit(
         "ImportError: imported " + ", ".join(leaked) + " from the source tree " + source
         + ", outside the extracted service; move that code into the module or a helper "
-        "under the package"
+        "under the package, or declare it as a dependency"
     )
-by_top_level = importlib.metadata.packages_distributions()
 new_top_levels = {n.split(".")[0] for n in sys.modules if n not in loaded_before}
 new_top_levels.discard(dotted.split(".")[0])
 distributions = sorted({d for top in new_top_levels for d in by_top_level.get(top, ())})
@@ -267,7 +281,13 @@ print("""
 _IMPORT_CHECK_TIMEOUT = 120
 
 
-def _check_imports(root: Path, dotted: str, source: Path, also: Sequence[str] = ()) -> list[str]:
+def _check_imports(
+    root: Path,
+    dotted: str,
+    source: Path,
+    also: Sequence[str] = (),
+    declared: Collection[str] = (),
+) -> list[str]:
     """Import *dotted* in a fresh interpreter from the extracted tree at *root*; raise if it fails.
 
     Each module of *also* is imported too, and only that exact module being
@@ -282,6 +302,10 @@ def _check_imports(root: Path, dotted: str, source: Path, also: Sequence[str] = 
     failure: the deployed service will not have it. When *source* lies in a
     library directory (the app is an installed copy), only the app's top-level
     package counts, so other installed distributions stay exempt.
+
+    A leaked module whose top-level package belongs to an installed
+    distribution named in *declared* (canonical names) is exempt: the service
+    installs that distribution instead of carrying a copy.
 
     Runs the extracted module's code, which is acceptable because extract is
     a trusted-source tool that already imports the app to discover modules.
@@ -304,6 +328,7 @@ def _check_imports(root: Path, dotted: str, source: Path, also: Sequence[str] = 
                         str(gate_root),
                         dotted,
                         str(source),
+                        json.dumps(sorted(declared)),
                         *also,
                     ],
                     cwd=gate_root,
@@ -814,13 +839,14 @@ def write_extraction(
             output=staging,
             helpers=helpers,
         )
+        source_deps = _source_dependencies()
         loaded = _check_imports(
             staging,
             f"{cfg.package}.{module}",
             source_root.parents[len(cfg.package.split(".")) - 1],
             also=(f"{cfg.package}.{cfg.contracts_module}", f"{cfg.package}.{module}._manifest"),
+            declared=_declared_distributions(source_deps),
         )
-        source_deps = _source_dependencies()
         covered = _declared_distributions(_dependencies(cfg, source_deps))
         undeclared = sorted(name for name in loaded if _canonical_name(name) not in covered)
         if undeclared:

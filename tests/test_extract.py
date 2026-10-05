@@ -1445,7 +1445,81 @@ def test_extract_import_gate_refuses_first_party_code_from_the_source_tree(
     assert result.exit_code == 1, result.output
     assert "common.money" in result.output
     assert "outside the extracted service" in result.output
+    assert "or declare it as a dependency" in result.output
     assert not out_dir.exists()
+
+
+def _installed_sibling(tree: Path, package: str, distribution: str) -> None:
+    """Lay out *package* beside the app with the dist-info of an installed *distribution*."""
+    (tree / package).mkdir()
+    (tree / package / "__init__.py").write_text("")
+    dist_info = tree / f"{distribution.replace('-', '_')}-1.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: {distribution}\nVersion: 1.0\n"
+    )
+    (dist_info / "top_level.txt").write_text(f"{package}\n")
+
+
+@pytest.mark.parametrize(
+    ("declared", "expect_refused"),
+    [(["Common_Lib>=1"], False), ([], True), (["other-lib"], True)],
+    ids=["declared", "not-declared", "other-distribution-declared"],
+)
+def test_extract_import_gate_exempts_a_distribution_declared_as_a_dependency(
+    make_fake_app, monkeypatch, tmp_path, declared, expect_refused
+):
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    make_fake_app({"orders": "import common_lib\n"}, extra_files={"contracts/__init__.py": ""})
+    _installed_sibling(tmp_path, "common_lib", "common-lib")
+    (tmp_path / "pyproject.toml").write_text(
+        f'[project]\nname = "app"\nversion = "0"\ndependencies = {declared!r}\n'.replace("'", '"')
+    )
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join(filter(None, [str(tmp_path), os.environ.get("PYTHONPATH")]))
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    if expect_refused:
+        assert result.exit_code == 1, result.output
+        assert "imported common_lib from the source tree" in result.output
+        assert not out_dir.exists()
+    else:
+        assert result.exit_code == 0, result.output
+        assert (out_dir / "fakeapp" / "orders" / "__init__.py").is_file()
+        assert not (out_dir / "common_lib").exists()
+        assert "Common_Lib>=1" in (out_dir / "pyproject.toml").read_text()
+
+
+def test_import_gate_path_check_ignores_case_on_windows_paths():
+    namespace: dict[str, object] = {"os": SimpleNamespace(path=ntpath)}
+    exec(extract._IMPORT_CHECK_UNDER, namespace)
+    under = namespace["under"]
+    assert callable(under)
+
+    assert under(r"C:\Src\app\mod.py", r"c:\src\app") is True
+    assert under(r"c:/src/app/mod.py", r"C:\SRC\App") is True
+    assert under(r"C:\Src\apple\mod.py", r"c:\src\app") is False
+
+
+def test_import_gate_path_check_uses_the_platform_normcase(monkeypatch):
+    seen: list[str] = []
+
+    def upper(path: str) -> str:
+        seen.append(path)
+        return path.upper()
+
+    namespace: dict[str, object] = {
+        "os": SimpleNamespace(path=SimpleNamespace(commonpath=os.path.commonpath, normcase=upper))
+    }
+    exec(extract._IMPORT_CHECK_UNDER, namespace)
+    under = namespace["under"]
+    assert callable(under)
+
+    assert under("/Src/App/mod.py", "/src/app") is True
+    assert sorted(seen) == ["/Src/App/mod.py", "/src/app"]
 
 
 def test_import_gate_path_check_treats_another_drive_as_outside():
@@ -1519,6 +1593,53 @@ def test_import_gate_reports_a_leak_when_the_project_root_is_the_virtualenv(monk
     ) in message
     assert "thirdparty" not in message
     assert "json" not in message
+
+
+@pytest.mark.parametrize(
+    ("directory", "module"),
+    [("DLLs", "_fakeext"), ("src", "vcslib")],
+    ids=["extension-modules", "pip-vcs-checkouts"],
+)
+def test_import_gate_exempts_interpreter_library_directories_when_the_project_root_is_the_environment(
+    monkeypatch, tmp_path, directory, module
+):
+    project = tmp_path / "proj"
+    python = _venv_python(project)
+    service = _leaking_service(project, tmp_path, python)
+    (project / directory).mkdir()
+    (project / directory / f"{module}.py").write_text("VALUE = 1\n")
+    for tree in (project, service):
+        (tree / "shop" / "orders.py").write_text(
+            f"import {module}\nfrom common.money import cents\n"
+        )
+    monkeypatch.setattr(sys, "executable", str(python))
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(project), str(project / directory)]))
+
+    with pytest.raises(ValueError) as excinfo:
+        extract._check_imports(service, "shop.orders", project)
+
+    message = str(excinfo.value)
+    assert (
+        f"cannot import shop.orders: ImportError: imported common, common.money from the "
+        f"source tree {os.path.realpath(project)}, outside the extracted service"
+    ) in message
+    assert module not in message
+
+
+def test_import_gate_keeps_checking_an_app_checked_out_under_the_environment_src(
+    monkeypatch, tmp_path
+):
+    venv = tmp_path / "venv"
+    python = _venv_python(venv)
+    checkout = venv / "src" / "shopproject"
+    service = _leaking_service(checkout, tmp_path, python)
+    monkeypatch.setattr(sys, "executable", str(python))
+    monkeypatch.setenv("PYTHONPATH", str(checkout))
+
+    with pytest.raises(ValueError) as excinfo:
+        extract._check_imports(service, "shop.orders", checkout)
+
+    assert "imported common, common.money from the source tree" in str(excinfo.value)
 
 
 def test_import_gate_exempts_a_virtualenv_inside_the_project(monkeypatch, tmp_path):
