@@ -1434,6 +1434,10 @@ the publish span. A third-party broker adapter that drops message headers loses
 that link: its consumers' dispatch spans have no parent. A message without the
 headers behaves the same way.
 
+While a listener runs, its dispatch span is the current span. A span your listener starts (a database or HTTP client span, or your own) is therefore a child of the dispatch span, in the same trace.
+
+A failure inside OpenTelemetry never fails `publish()`. If a span processor, exporter or sampler raises while modupy starts or ends the publish span, modupy logs a WARNING on the `modulith.observability` logger, drops the span and carries on, so the listeners still run and the event is still delivered.
+
 modupy configures no exporter. Set up an OpenTelemetry tracer provider in your application and send the spans to a tracing backend, such as Jaeger, Tempo or any OTLP collector.
 
 ---

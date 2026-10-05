@@ -14,6 +14,7 @@ the ContextVar on the failure path.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,9 +22,10 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.sdk.trace.sampling import Sampler
 from opentelemetry.trace import StatusCode
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -449,3 +451,74 @@ async def test_garbage_trace_context_dispatches_with_a_parentless_span(
     finally:
         await store.dispose()
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# A failing OpenTelemetry SDK component never fails publish().
+# ---------------------------------------------------------------------------
+
+
+class _RaisingProcessor(SpanProcessor):
+    """A span processor whose ``on_end`` raises, as a broken exporter would."""
+
+    def on_end(self, span: Any) -> None:
+        raise RuntimeError("processor down")
+
+
+class _RaisingSampler(Sampler):
+    def should_sample(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("sampler down")
+
+    def get_description(self) -> str:
+        return "raising"
+
+
+async def _publish_with_listener(calls: list[int]) -> None:
+    async def listener(evt: DurableEvt) -> None:
+        calls.append(evt.x)
+
+    configure(package="modulith_w3r4obs_metatest", auto_discover=False)
+    _runtime.ensure_bootstrapped()
+    assert _runtime.event_bus is not None
+    _runtime.event_bus.register(DurableEvt, listener)
+    await _runtime.publish(DurableEvt(x=7))
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == "modulith.observability"
+    ]
+
+
+async def test_raising_span_processor_does_not_fail_publish_after_delivery(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    provider = TracerProvider()
+    provider.add_span_processor(_RaisingProcessor())
+    monkeypatch.setattr(observability, "_tracer", provider.get_tracer("test"))
+    monkeypatch.setattr(observability, "_OTEL_AVAILABLE", True)
+    calls: list[int] = []
+
+    with caplog.at_level(logging.WARNING, logger="modulith.observability"):
+        await _publish_with_listener(calls)
+
+    assert calls == [7]
+    assert _warnings(caplog)
+    assert observability._publish_span.get() is None
+
+
+async def test_raising_sampler_does_not_fail_publish_before_delivery(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    provider = TracerProvider(sampler=_RaisingSampler())
+    monkeypatch.setattr(observability, "_tracer", provider.get_tracer("test"))
+    monkeypatch.setattr(observability, "_OTEL_AVAILABLE", True)
+    calls: list[int] = []
+
+    with caplog.at_level(logging.WARNING, logger="modulith.observability"):
+        await _publish_with_listener(calls)
+
+    assert calls == [7]
+    assert _warnings(caplog)

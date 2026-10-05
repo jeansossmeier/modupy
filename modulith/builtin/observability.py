@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import logging
 import time
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from typing import Any
 
 from modulith import EventPublication, __version__, hookimpl
@@ -70,6 +70,7 @@ logger = logging.getLogger("modulith.observability")
 # ---------------------------------------------------------------------------
 
 try:
+    from opentelemetry import context as otel_context
     from opentelemetry import trace
     from opentelemetry.trace import Status, StatusCode
     from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
@@ -98,6 +99,11 @@ except ImportError:
 _publish_span: ContextVar[Any] = ContextVar("_modulith_publish_span", default=None)
 _publish_start: ContextVar[float] = ContextVar("_modulith_publish_start", default=0.0)
 _dispatch_span: ContextVar[Any] = ContextVar("_modulith_dispatch_span", default=None)
+# Token of the OTel context that makes the dispatch span current while the
+# listener runs, so a span the listener starts is a child of it.
+_dispatch_token: ContextVar[Token[Any] | None] = ContextVar(
+    "_modulith_dispatch_token", default=None
+)
 
 
 # ---------------------------------------------------------------------------
@@ -116,13 +122,17 @@ def modulith_before_event_published(event: Any) -> None:
     """
     if not _OTEL_AVAILABLE:
         return
-    span = _tracer.start_span(
-        "modulith.event.publish",
-        attributes={
-            "event.type": _event_type(event),
-            "event.module": _detect_calling_module(),
-        },
-    )
+    try:
+        span = _tracer.start_span(
+            "modulith.event.publish",
+            attributes={
+                "event.type": _event_type(event),
+                "event.module": _detect_calling_module(),
+            },
+        )
+    except Exception:
+        logger.warning("could not start the publish span", exc_info=True)
+        return
     _publish_span.set(span)
     _publish_start.set(time.monotonic())
 
@@ -136,16 +146,22 @@ def modulith_after_event_published(
     ``publication`` may be an ``EventPublication`` (in-memory path) or an
     ``EventPublishReceipt`` (durable path) — this hookimpl never reads
     either's fields; it only ends the span held in the ContextVar.
+
+    A failing span processor must not fail a publish whose delivery already
+    happened, so an exception from the OTel calls is logged and dropped.
     """
     if not _OTEL_AVAILABLE:
         return
     span = _publish_span.get()
     if span is None:
         return
-    duration_ms = (time.monotonic() - _publish_start.get()) * 1000
-    span.set_attribute("modulith.duration_ms", duration_ms)
-    span.end()
     _publish_span.set(None)
+    try:
+        duration_ms = (time.monotonic() - _publish_start.get()) * 1000
+        span.set_attribute("modulith.duration_ms", duration_ms)
+        span.end()
+    except Exception:
+        logger.warning("could not end the publish span", exc_info=True)
 
 
 @hookimpl
@@ -188,7 +204,9 @@ def modulith_on_listener_dispatch(
 
     An outbox row's stored ``trace_context`` names the publish span that created
     it, which is the only link left after commit or on a retry; without one, the
-    live publish span of this context is the parent.
+    live publish span of this context is the parent. The span is made current
+    until ``modulith_on_listener_complete``, so a span the listener starts is
+    its child.
     """
     if not _OTEL_AVAILABLE:
         return
@@ -207,6 +225,7 @@ def modulith_on_listener_dispatch(
         },
     )
     _dispatch_span.set(span)
+    _dispatch_token.set(otel_context.attach(trace.set_span_in_context(span)))
 
 
 @hookimpl
@@ -216,17 +235,25 @@ def modulith_on_listener_complete(
     publication: EventPublication,
     exception: BaseException | None,
 ) -> None:
-    """End the listener-dispatch span; mark it errored if the listener raised."""
+    """End the listener-dispatch span; mark it errored if the listener raised.
+
+    Detaches the context ``modulith_on_listener_dispatch`` attached, whether
+    the listener returned or raised.
+    """
     if not _OTEL_AVAILABLE:
         return
+    token = _dispatch_token.get()
+    _dispatch_token.set(None)
+    if token is not None:
+        otel_context.detach(token)
     span = _dispatch_span.get()
     if span is None:
         return
+    _dispatch_span.set(None)
     if exception is not None:
         span.record_exception(exception)
         span.set_status(Status(StatusCode.ERROR, str(exception)))
     span.end()
-    _dispatch_span.set(None)
 
 
 # ---------------------------------------------------------------------------

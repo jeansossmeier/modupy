@@ -16,14 +16,17 @@ warning). The OTel-absent path is verified by flipping ``_OTEL_AVAILABLE``.
 from __future__ import annotations
 
 import importlib
+from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
+from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
 
-from modulith import configure
+from modulith import EventPublication, configure
 from modulith.builtin import observability, outbox
 from modulith.serializers import JsonEventSerializer
 
@@ -181,6 +184,96 @@ async def test_listener_error_marks_dispatch_span_error(make_fake_app, span_expo
     assert span.status.status_code is StatusCode.ERROR
     # the exception was recorded as a span event
     assert any(e.name == "exception" for e in span.events)
+
+
+# ---------------------------------------------------------------------------
+# A span started inside a listener belongs to that listener's dispatch span
+# ---------------------------------------------------------------------------
+
+_WORK_APP = {
+    "orders": """
+        from dataclasses import dataclass
+        from modulith import event, publish
+
+        @event
+        @dataclass(frozen=True)
+        class Work:
+            fail: bool
+
+        async def go(fail: bool = False) -> None:
+            await publish(Work(fail=fail))
+    """,
+    "inventory": """
+        from modulith import listener
+        from modulith.builtin import observability
+        from fakeapp.orders import Work
+
+        @listener
+        async def do_work(evt: Work) -> None:
+            with observability._tracer.start_as_current_span("app.work"):
+                if evt.fail:
+                    raise ValueError("kaboom")
+    """,
+}
+
+
+async def test_span_started_in_listener_is_a_child_of_its_dispatch_span(
+    make_fake_app, span_exporter
+) -> None:
+    make_fake_app(_WORK_APP)
+    configure(package="fakeapp")
+    import fakeapp.orders as orders
+
+    await orders.go()
+
+    (work,) = _spans_by_name(span_exporter, "app.work")
+    (dispatch,) = _spans_by_name(span_exporter, "modulith.event.dispatch")
+    assert work.parent is not None
+    assert work.parent.span_id == dispatch.context.span_id
+    assert work.context.trace_id == dispatch.context.trace_id
+
+
+async def test_span_started_in_a_raising_listener_is_a_child_of_its_dispatch_span(
+    make_fake_app, span_exporter
+) -> None:
+    make_fake_app(_WORK_APP)
+    configure(package="fakeapp")
+    import fakeapp.orders as orders
+
+    with pytest.raises(ValueError, match="kaboom"):
+        await orders.go(fail=True)
+
+    (work,) = _spans_by_name(span_exporter, "app.work")
+    (dispatch,) = _spans_by_name(span_exporter, "modulith.event.dispatch")
+    assert work.parent is not None
+    assert work.parent.span_id == dispatch.context.span_id
+
+
+@pytest.mark.parametrize("exception", [None, ValueError("kaboom")], ids=["returned", "raised"])
+def test_dispatch_span_is_current_until_the_listener_completes(
+    span_exporter, exception: BaseException | None
+) -> None:
+    event = object()
+    publication = EventPublication(
+        id=uuid4(),
+        payload=b"",
+        event_type="x.Y",
+        listener="x.listener",
+        published_at=datetime.now(UTC),
+    )
+
+    observability.modulith_on_listener_dispatch(
+        event=event, listener_name="x.listener", publication=publication
+    )
+    current = trace.get_current_span()
+    observability.modulith_on_listener_complete(
+        event=event, listener_name="x.listener", publication=publication, exception=exception
+    )
+
+    (dispatch,) = _spans_by_name(span_exporter, "modulith.event.dispatch")
+    assert current.get_span_context().span_id == dispatch.context.span_id
+    assert not trace.get_current_span().get_span_context().is_valid
+    assert observability._dispatch_token.get() is None
 
 
 # ---------------------------------------------------------------------------
