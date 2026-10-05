@@ -9,12 +9,17 @@ behind the SHM and database brokers) share one rule, documented in DEPLOYMENT
   the redelivery window has passed. By then the affected message has been
   reclaimed and retried by this or another replica; if the write still fails,
   the retry records a fresh failure, so a persistent failure stays visible.
+- A failure whose write started before the last recovery for the same key is
+  dropped when its caller passes ``started_at`` to ``record``: concurrent
+  writes finish out of order, and a slow write that fails after a later one
+  succeeded says nothing new about the broker.
 - The Redis consumer additionally drops a completion-write failure as soon as
   its message is no longer pending in the consumer group.
 """
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -37,17 +42,36 @@ class HealthFailures:
     def __init__(self, completion_expiry_s: float) -> None:
         self._completion_expiry_s = completion_expiry_s
         self._failures: dict[tuple[str, str], _Failure] = {}
+        self._recovered_at: dict[tuple[str, str], float] = {}
 
     def record(
-        self, operation: str, target: str, exc: Exception, message_id: str | None = None
+        self,
+        operation: str,
+        target: str,
+        exc: Exception,
+        message_id: str | None = None,
+        *,
+        started_at: float | None = None,
     ) -> None:
-        self._failures[(operation, target)] = _Failure(str(exc), time.monotonic(), message_id)
+        """Hold ``exc`` against ``(operation, target)`` until it recovers or expires.
+
+        ``started_at`` is the ``time.monotonic()`` reading taken before the failed
+        write began. A write that began before the key's last recovery is dropped:
+        the recovery shows the operation working after that write started.
+        """
+        key = (operation, target)
+        if started_at is not None and started_at < self._recovered_at.get(key, -math.inf):
+            return
+        self._failures[key] = _Failure(str(exc), time.monotonic(), message_id)
 
     def recover(self, operation: str, target: str) -> None:
-        self._failures.pop((operation, target), None)
+        key = (operation, target)
+        self._recovered_at[key] = time.monotonic()
+        self._failures.pop(key, None)
 
     def clear(self) -> None:
         self._failures.clear()
+        self._recovered_at.clear()
 
     def pending_messages(self) -> Iterator[tuple[str, str, str]]:
         """Yield ``(operation, target, message_id)`` for message-scoped failures."""

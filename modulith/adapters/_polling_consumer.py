@@ -211,8 +211,10 @@ class PollingConsumer(DeliveryDispatch):
                 exc_info=(type(error), error, error.__traceback__),
             )
 
-    def _mark_broker_failure(self, operation: str, target: str, exc: Exception) -> None:
-        self._health_failures.record(operation, target, exc)
+    def _mark_broker_failure(
+        self, operation: str, target: str, exc: Exception, started_at: float | None = None
+    ) -> None:
+        self._health_failures.record(operation, target, exc, started_at=started_at)
 
     def _mark_broker_recovered(self, operation: str, target: str) -> None:
         self._health_failures.recover(operation, target)

@@ -91,7 +91,9 @@ class DeliveryDispatch:
     async def _cancel(self, task: asyncio.Task[None] | None, label: str) -> None:
         raise NotImplementedError
 
-    def _mark_broker_failure(self, operation: str, target: str, exc: Exception) -> None:
+    def _mark_broker_failure(
+        self, operation: str, target: str, exc: Exception, started_at: float | None = None
+    ) -> None:
         raise NotImplementedError
 
     def _mark_broker_recovered(self, operation: str, target: str) -> None:
@@ -203,6 +205,7 @@ class DeliveryDispatch:
             async with semaphore:
                 if self._should_stop():
                     return True
+                started_at = time.monotonic()
                 try:
                     renewed = await self._broker.renew_claims(
                         [row_id],
@@ -212,7 +215,7 @@ class DeliveryDispatch:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    self._mark_broker_failure("renew", target, exc)
+                    self._mark_broker_failure("renew", target, exc, started_at)
                     raise
                 self._mark_broker_recovered("renew", target)
                 if renewed == 0:
@@ -342,17 +345,19 @@ class DeliveryDispatch:
         await self._ack(row_id, target)
 
     async def _ack(self, row_id: str, target: str) -> None:
+        started_at = time.monotonic()
         try:
             await self._broker.ack(row_id, consumer_name=self._consumer_name)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._mark_broker_failure("ack", target, exc)
+            self._mark_broker_failure("ack", target, exc, started_at)
             self._logger.exception("ack failed for %s -- message stays claimed", row_id)
         else:
             self._mark_broker_recovered("ack", target)
 
     async def _fail(self, row_id: str, error: str, target: str) -> None:
+        started_at = time.monotonic()
         try:
             await self._broker.fail(
                 row_id,
@@ -363,11 +368,12 @@ class DeliveryDispatch:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._mark_broker_failure("fail", target, exc)
+            self._mark_broker_failure("fail", target, exc, started_at)
             raise
         self._mark_broker_recovered("fail", target)
 
     async def _dead_letter(self, row_id: str, reason: str, target: str) -> None:
+        started_at = time.monotonic()
         try:
             await self._broker.dead_letter(
                 row_id,
@@ -377,6 +383,6 @@ class DeliveryDispatch:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._mark_broker_failure("dead_letter", target, exc)
+            self._mark_broker_failure("dead_letter", target, exc, started_at)
             raise
         self._mark_broker_recovered("dead_letter", target)

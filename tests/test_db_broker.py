@@ -2486,6 +2486,143 @@ async def test_database_consumer_completion_failure_clears_after_reclaim_window(
         await consumer.stop()
 
 
+@pytest.mark.parametrize("watched", ["ack", "fail", "dead_letter", "renew"])
+async def test_database_consumer_late_completion_failure_does_not_degrade_recovered_health(
+    engine: Any, watched: str
+) -> None:
+    """Two rows complete concurrently: the first write blocks, the second
+    succeeds, then the first fails. That write started before the recovery, so
+    the consumer that already recovered stays ready."""
+
+    class ObservedConsumer(DatabaseConsumer):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.recovered = asyncio.Event()
+            self.failure_handled = asyncio.Event()
+
+        def _mark_broker_recovered(self, operation: str, target: str) -> None:
+            super()._mark_broker_recovered(operation, target)
+            if operation == watched:
+                self.recovered.set()
+
+        def _mark_broker_failure(self, operation: str, *args: Any, **kwargs: Any) -> None:
+            super()._mark_broker_failure(operation, *args, **kwargs)
+            if operation == watched:
+                self.failure_handled.set()
+
+    method = "renew_claims" if watched == "renew" else watched
+    broker = DatabaseBroker(engine=engine)
+    real_write = getattr(broker, method)
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def first_call_blocks_then_fails(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return await real_write(*args, **kwargs)
+        entered.set()
+        await release.wait()
+        raise RuntimeError(f"{watched} unavailable")
+
+    setattr(broker, method, first_call_blocks_then_fails)
+
+    async def handler(_event: WidgetCreated) -> None:
+        if watched == "fail":
+            raise RuntimeError("listener unavailable")
+
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+    target = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    consumer = ObservedConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=[target],
+        poll_interval_s=0.01,
+        dispatch_concurrency=2,
+    )
+    await broker.subscribe([target], "modulith-inventory")
+    for name in ("first", "second"):
+        payload = (
+            b"not json"
+            if watched == "dead_letter"
+            else serializer.serialize(WidgetCreated(name=name))
+        )
+        await broker.publish(target, payload, {"event_type": target})
+
+    await consumer.start()
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+        await asyncio.wait_for(consumer.recovered.wait(), timeout=5.0)
+        release.set()
+        await asyncio.wait_for(consumer.failure_handled.wait(), timeout=5.0)
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+    finally:
+        release.set()
+        await consumer.stop()
+
+
+async def test_database_consumer_completion_failure_after_a_recovery_still_degrades(
+    engine: Any,
+) -> None:
+    """A write that starts after the last success of its operation and fails
+    degrades health: only a failure older than the recovery is dropped."""
+
+    class AckDownBroker(DatabaseBroker):
+        ack_down = False
+
+        async def ack(self, row_id: str, *, consumer_name: str) -> None:
+            if self.ack_down:
+                raise RuntimeError("ack unavailable")
+            await super().ack(row_id, consumer_name=consumer_name)
+
+    async def handler(_event: WidgetCreated) -> None:
+        return None
+
+    broker = AckDownBroker(engine=engine)
+    bus = InMemoryEventBus()
+    bus.register(WidgetCreated, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[WidgetCreated])
+    target = f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"
+    consumer = DatabaseConsumer(
+        broker=broker,
+        bus=bus,
+        serializer=serializer,
+        consumer_name="inventory:1",
+        group="modulith-inventory",
+        targets=[target],
+    )
+
+    async def blocked_run() -> None:
+        await asyncio.Event().wait()
+
+    consumer._run = blocked_run  # type: ignore[method-assign]
+    row = {
+        "id": "ack-row",
+        "target": target,
+        "event_type": target,
+        "payload": serializer.serialize(WidgetCreated(name="w1")),
+        "attempts": 0,
+    }
+
+    await consumer.start()
+    try:
+        await consumer._dispatch_one(row)
+        assert consumer.health() == ConsumerHealth(ready=True, status="ready")
+
+        broker.ack_down = True
+        await consumer._dispatch_one({**row, "id": "ack-after-recovery"})
+        assert consumer.health() == ConsumerHealth(
+            ready=False, status="degraded", detail="ack unavailable"
+        )
+    finally:
+        await consumer.stop()
+
+
 async def test_database_consumer_dispatch_fires_the_per_listener_lifecycle_hooks(
     engine: Any,
 ) -> None:
