@@ -1477,32 +1477,49 @@ broker_app = typer.Typer(help="Broker operational commands.")
 app.add_typer(broker_app, name="broker")
 
 
-def _exit_unless_shm_store_exists(outcome: str = "nothing was removed") -> None:
-    """Exit 1 when the shm store a broker command would act on does not exist.
+def _exit_unless_local_store_exists(outcome: str = "nothing was removed") -> None:
+    """Exit 1 when the SQLite file a broker command would act on does not exist.
 
-    Bootstrapping the shm broker creates its state directory and SQLite
-    file, so the check has to run first, from configuration alone.
+    Bootstrapping the shm broker, or the database broker without a URL,
+    creates its state directory and SQLite file, so the check has to run
+    first, from configuration alone. A database broker with a URL is not
+    checked here: its command reports a missing schema without creating one.
     """
-    from .adapters.shm_broker import shm_store_path
-
     try:
         resolved = load_configuration(**_runtime._config_overrides)
     except ConfigurationError:
         return  # _bootstrap_or_exit reports it
-    if resolved.broker != "shm":
+    if resolved.broker not in ("shm", "database"):
         return
     package = resolved.package or _detect_from_pyproject_name()
+    options = dict(resolved.broker_options or {})
     try:
-        path = shm_store_path(package, dict(resolved.broker_options or {}))
+        if resolved.broker == "shm":
+            from .adapters.shm_broker import shm_store_path
+
+            path: Path | None = shm_store_path(package, options)
+            hint = "state_dir or MODULITH_BROKER_STATE_DIR"
+        else:
+            from .adapters.db_broker import embedded_database_path
+
+            path = embedded_database_path(package, options)
+            hint = "url or MODULITH_BROKER_URL, or state_dir or MODULITH_BROKER_STATE_DIR"
     except ConfigurationError:
         return
-    if not path.is_file():
-        typer.echo(
-            f"error: no shm broker store at {path}; {outcome}. Run this with "
-            "the service's broker configuration (state_dir or MODULITH_BROKER_STATE_DIR).",
-            err=True,
-        )
-        raise typer.Exit(code=1)
+    if path is None or path.is_file():
+        return
+    typer.echo(
+        f"error: no {resolved.broker} broker store at {path}; {outcome}. Run this with "
+        f"the service's broker configuration ({hint}).",
+        err=True,
+    )
+    raise typer.Exit(code=1)
+
+
+def _store_location(broker: Any, scheme: str) -> str:
+    """Where a broker command says its store is; a database URL has its secrets masked."""
+    location: str = broker.store_location
+    return _masked_url(location) if scheme == "database" else location
 
 
 def _sole_subscriber_warning(group: str, sole: list[str], broker: Any, scheme: str) -> str:
@@ -1583,7 +1600,7 @@ def broker_drop_group(
     then needs no `--force`.
     """
     _runtime.configure(topology="processes")
-    _exit_unless_shm_store_exists()
+    _exit_unless_local_store_exists()
     rt = _bootstrap_or_exit()
     cfg = rt.config
     assert cfg is not None
@@ -1602,10 +1619,11 @@ def broker_drop_group(
     async def drop() -> tuple[int, int]:
         # One event loop for every call: the database broker binds its engine
         # to the loop that first used it.
-        typer.echo(f"{cfg.broker} broker store: {broker.store_location}")
+        store = _store_location(broker, cfg.broker)
+        typer.echo(f"{cfg.broker} broker store: {store}")
         if cfg.broker == "database" and not await broker.has_schema():
             typer.echo(
-                f"error: no database broker tables at {broker.store_location}; "
+                f"error: no database broker tables at {store}; "
                 "nothing was removed. Run this with the service's broker configuration.",
                 err=True,
             )
@@ -1700,7 +1718,7 @@ def broker_dead_letter(
         raise typer.Exit(code=1)
 
     _runtime.configure(topology="processes")
-    _exit_unless_shm_store_exists("nothing was listed or resubmitted")
+    _exit_unless_local_store_exists("nothing was listed or resubmitted")
     rt = _bootstrap_or_exit()
     cfg = rt.config
     assert cfg is not None
@@ -1716,7 +1734,7 @@ def broker_dead_letter(
         # to the loop that first used it.
         if cfg.broker == "database" and not await broker.has_schema():
             typer.echo(
-                f"error: no database broker tables at {broker.store_location}; "
+                f"error: no database broker tables at {_store_location(broker, cfg.broker)}; "
                 "nothing was listed or resubmitted. Run this with the service's "
                 "broker configuration.",
                 err=True,

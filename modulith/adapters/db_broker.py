@@ -142,6 +142,7 @@ import weakref
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Concatenate, ParamSpec, TypeVar, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -162,7 +163,7 @@ from ..config import (
 )
 from ._dead_letter import DeadLetter
 from ._polling_consumer import PollingConsumer
-from ._state_path import resolve_state_file
+from ._state_path import default_state_directory, resolve_state_file
 
 logger = logging.getLogger("modulith.adapters.db")
 
@@ -2784,6 +2785,24 @@ def _broker_opt(opts: dict[str, Any], key: str, env_suffix: str) -> Any:
     if env_value:
         return env_value
     return opts.get(key)
+
+
+def embedded_database_path(package: str | None, broker_options: dict[str, Any]) -> Path | None:
+    """The embedded SQLite file a broker with these options falls back to, creating nothing.
+
+    None when a url or dsn is configured. Mirrors the path
+    ``modulith_register_brokers`` resolves (and creates) through
+    ``resolve_state_file`` in _state_path.py.
+    """
+    if _broker_opt(broker_options, "url", "URL") or _broker_opt(broker_options, "dsn", "DSN"):
+        return None
+    state_dir = _broker_opt(broker_options, "state_dir", "STATE_DIR")
+    directory = (
+        Path(os.path.abspath(os.path.expanduser(str(state_dir))))
+        if state_dir is not None
+        else default_state_directory(package)
+    )
+    return directory / DEFAULT_BROKER_DB_FILENAME
 
 
 def _option_or_default(value: Any, default: Any) -> Any:

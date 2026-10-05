@@ -3057,6 +3057,104 @@ def test_broker_drop_group_does_not_create_a_missing_database_store(
     assert not db_file.exists()
 
 
+def _embedded_database_project(monkeypatch, tmp_path: Path) -> Path:
+    """A database broker with no URL; returns the empty state home its SQLite file would go in."""
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "database")
+    state_home = tmp_path / "empty-state-home"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    monkeypatch.setenv("LOCALAPPDATA", str(state_home))
+    return state_home
+
+
+@pytest.mark.parametrize(
+    ("args", "outcome"),
+    [
+        (["drop-group", "modulith-retired", "--yes"], "nothing was removed"),
+        (["dead-letter"], "nothing was listed or resubmitted"),
+    ],
+    ids=["drop-group", "dead-letter"],
+)
+def test_broker_commands_do_not_create_the_embedded_database_file(
+    make_fake_app, monkeypatch, tmp_path, args, outcome
+):
+    from modulith.adapters._state_path import default_state_directory
+    from modulith.config import DEFAULT_BROKER_DB_FILENAME
+
+    make_fake_app({"orders": ""})
+    state_home = _embedded_database_project(monkeypatch, tmp_path)
+    db_file = default_state_directory("fakeapp") / DEFAULT_BROKER_DB_FILENAME
+
+    result = runner.invoke(app, ["broker", *args])
+
+    assert result.exit_code == 1, result.output
+    assert not state_home.exists()
+    assert f"error: no database broker store at {db_file}; {outcome}." in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (
+            ["drop-group", "modulith-retired", "--yes"],
+            "dropped group 'modulith-retired': 1 subscription(s)",
+        ),
+        (["dead-letter"], "no dead-lettered messages"),
+    ],
+    ids=["drop-group", "dead-letter"],
+)
+@pytest.mark.parametrize("state_dir", [None, "custom-state"], ids=["default-dir", "state_dir"])
+def test_broker_commands_use_the_embedded_database_file_the_service_creates(
+    make_fake_app, monkeypatch, tmp_path, args, expected, state_dir
+):
+    from modulith.adapters._state_path import default_state_directory
+    from modulith.config import DEFAULT_BROKER_DB_FILENAME
+
+    make_fake_app({"orders": ""})
+    _embedded_database_project(monkeypatch, tmp_path)
+    if state_dir is None:
+        directory = default_state_directory("fakeapp")
+    else:
+        directory = tmp_path / state_dir
+        monkeypatch.setenv("MODULITH_BROKER_STATE_DIR", str(directory))
+    directory.mkdir(parents=True, mode=0o700)
+    db_file = directory / DEFAULT_BROKER_DB_FILENAME
+    _seed_database_subscriptions(
+        f"sqlite+aiosqlite:///{db_file}",
+        db_file,
+        {"modulith-retired": ["t.Order"]},
+        served_recently=False,
+    )
+
+    result = runner.invoke(app, ["broker", *args])
+
+    assert result.exit_code == 0, result.output
+    assert expected in result.output
+
+
+@pytest.mark.filterwarnings("ignore:Query string argument:sqlalchemy.exc.SAWarning")
+@pytest.mark.parametrize(
+    "args",
+    [["drop-group", "modulith-retired", "--yes"], ["dead-letter"]],
+    ids=["drop-group", "dead-letter"],
+)
+def test_broker_commands_mask_query_string_secrets_in_the_store_they_name(
+    make_fake_app, monkeypatch, tmp_path, args
+):
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "database")
+    db_file = tmp_path / "absent.db"
+    monkeypatch.setenv("MODULITH_BROKER_URL", f"sqlite+aiosqlite:///{db_file}?password=hunter2")
+
+    result = runner.invoke(app, ["broker", *args])
+
+    assert result.exit_code == 1, result.output
+    assert "no database broker tables" in result.output
+    assert "hunter2" not in result.output
+    assert f"{db_file}?password=***" in result.output
+
+
 def _seed_dead_delivery(url: str) -> str:
     """One message fanned out to two groups: orders dead-letters it, billing completes it."""
     from modulith.adapters.db_broker import DatabaseBroker
