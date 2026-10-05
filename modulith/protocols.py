@@ -72,11 +72,19 @@ class PublicationStore(Protocol):
     """
 
     async def save(self, publication: EventPublication) -> None:
-        """Persist a new publication record.
+        """Insert or update a publication record, keyed by its id.
 
-        Called inside the business transaction. The store must use the
-        same connection/session as the surrounding work so a rollback
-        of the business transaction also rolls back this record.
+        A new record is saved inside the business transaction. The store
+        must use the same connection/session as the surrounding work so a
+        rollback of the business transaction also rolls back this record.
+
+        The outbox calls ``save`` again, outside the business transaction,
+        for an id the store already holds: to record a failed attempt
+        (``attempt_count``, ``last_error``, ``last_attempt_at``) or to reopen
+        a dead-lettered record for a fresh retry. That call updates the
+        stored record. It never reopens a completed record: a stale failed
+        re-save racing a successful delivery must leave the record
+        completed.
         """
         ...
 

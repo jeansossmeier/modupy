@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import inspect
 import logging
 import sqlite3
 import threading
@@ -39,7 +40,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from modulith import EventPublication, event, listener, publish
+from modulith import EventPublication, PublicationStore, bootstrap, event, listener, publish
 from modulith.adapters.postgres_outbox import (
     Base,
     EventPublicationRow,
@@ -3462,3 +3463,23 @@ def test_start_without_a_bound_store_starts_nothing() -> None:
         return outbox._retry_task
 
     assert asyncio.run(scenario()) is None
+
+
+def _normalized_doc(obj: Any) -> str:
+    return " ".join((inspect.getdoc(obj) or "").lower().split())
+
+
+def test_publication_store_save_documents_the_resave_contract() -> None:
+    doc = _normalized_doc(PublicationStore.save)
+
+    assert "insert or update" in doc
+    assert "failed attempt" in doc
+    assert "never reopens a completed" in doc
+
+
+def test_bootstrap_and_retry_loop_docstrings_mention_lease_expiry() -> None:
+    for documented in (bootstrap, outbox._retry_loop):
+        doc = _normalized_doc(documented)
+
+        assert "lease expires" in doc, documented.__qualname__
+        assert "advisory lock" in doc, documented.__qualname__

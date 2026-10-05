@@ -10,7 +10,8 @@ Critical correctness properties:
      ``_store.save`` adds the row to the *bound* session, so a rollback of
      the business transaction also discards the publication.
   2. Crash-safe — process death before delivery leaves the record
-     incomplete; the retry loop picks it up on restart (crash sweep). A row
+     incomplete, and the retry loop picks it up once nothing holds it (the
+     crash sweep on restart, then the periodic sweeps). A row
      the dead process was delivering under a lease (``claim_strategy=
      "lease"``) stays claimed until that lease expires, so it is recovered by
      the first sweep after expiry, normally within ``claim_lease_seconds``
@@ -22,9 +23,11 @@ Critical correctness properties:
      descendant forked from the process, such as a fork-started
      ``multiprocessing`` or ``ProcessPoolExecutor`` child: it keeps a copy
      of the lock connection's socket, so the session and its locks outlive
-     the process until that descendant exits, and every sweep skips the
-     row meanwhile. Start such children with the ``spawn`` or
-     ``forkserver`` method, which does not inherit the connection. After a
+     the process for as long as that descendant lives, and every sweep skips
+     the row meanwhile. An orphaned ``ProcessPoolExecutor`` worker does not
+     exit on its own, so it must be killed to free the locks. Start such
+     children with the ``spawn`` or ``forkserver`` method, which does not
+     inherit the connection. After a
      host loss or a network partition the lock ends only when Postgres
      drops the dead session through TCP keepalive (``tcp_keepalives_*``,
      about 2 h with stock Linux defaults).
@@ -400,7 +403,8 @@ def configure(
 
     Binds the store/serializer and (when a loop is running and ``start_loop``
     is true) kicks off the background retry loop plus a one-shot crash sweep
-    that re-dispatches anything left incomplete by a previous process.
+    that retries what a previous process left incomplete, once nothing holds
+    the row (see the module docstring).
 
     ``completion_mode`` is one of ``"update"`` (set ``completed_at``),
     ``"delete"`` (remove the row), or ``"archive"`` (move to archive). A
@@ -1350,8 +1354,11 @@ async def _guarded_sweep(older_than: timedelta) -> None:
 async def _retry_loop() -> None:
     """Background task: poll for incomplete publications and retry them.
 
-    On entry, runs a crash-recovery sweep (``older_than=0``) to catch records
-    left in flight by a previous process. Then polls on the configured
+    On entry, runs a crash-recovery sweep (``older_than=0``) over the records
+    a previous process left incomplete. A row the dead process still holds,
+    under a lease (``claim_strategy="lease"``) or an advisory lock, waits:
+    the first sweep that runs after the lease expires or the lock's session
+    ends retries it. Then polls on the configured
     interval with a staleness threshold so freshly-published-but-not-yet-
     committed-dispatched events aren't thrashed. Returns after the sweep in
     progress once ``shutdown()`` requests a stop; ``shutdown()`` cancels it

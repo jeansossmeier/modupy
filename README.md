@@ -487,7 +487,7 @@ from modulith.builtin import outbox
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     bootstrap()
-    outbox.start()  # also redelivers what a crashed process left undelivered
+    outbox.start()  # also retries what a crash left behind, once the dead process's lease ends
     yield
     await outbox.shutdown()
 

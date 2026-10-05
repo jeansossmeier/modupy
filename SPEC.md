@@ -209,6 +209,8 @@ async archive(publication_id: UUID) -> None
 async delete(publication_id: UUID) -> None
 ```
 
+`save` inserts or updates by id. It saves a new record inside the business transaction. The outbox calls it again, outside that transaction, to record a failed attempt (`attempt_count`, `last_error`, `last_attempt_at`) or to reopen a dead-lettered record. A re-save never reopens a completed record.
+
 **`EventSerializer`** — event encoding:
 ```
 serialize(event: Any) -> bytes

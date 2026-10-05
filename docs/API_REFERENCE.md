@@ -113,11 +113,24 @@ async def publish(event: Any) -> None:
 
 Publish an event to all registered listeners.
 
-In single-process mode this dispatches in-memory via the event bus.
-With outbox or process-per-module mode enabled (via configuration),
-this writes to a durable log first and dispatches asynchronously.
+The call is the same on every path. What differs is whether a durable
+store is configured and a session is bound.
 
-The user's code is identical in both modes — only configuration changes.
+With a configured outbox store (bound from ``outbox_url``, or passed to
+``modulith.builtin.outbox.configure()``) and a session bound with
+``modulith.builtin.outbox.bind_session()``, publish() writes one
+publication row per listener in this process into that session. The
+business transaction commits the rows, and the listeners run
+asynchronously after the commit.
+
+With no store, or no bound session, publish() dispatches in-memory via
+the event bus and saves nothing, even when ``outbox`` is set in
+configuration.
+
+An event that routes to a cross-process broker (the process-per-module
+topology) follows the same rule. With a store and a bound session its
+route is saved as a row and sent after the commit. Otherwise it is sent
+inline, and a broker failure propagates to the caller.
 
 ### `publish_sync`
 
@@ -240,12 +253,15 @@ bootstrap having already happened before the first publish — most
 notably the outbox's crash-recovery sweep, which skips every pending
 row for the cycle while ``event_bus`` is still ``None`` (an
 un-bootstrapped runtime has no bus to resolve listeners against). An
-embedding app that configures a durable outbox and wants stranded
-publications from a previous crash retried immediately at startup,
+embedding app that configures a durable outbox and wants the startup
+sweep to retry the publications a previous process left incomplete,
 rather than waiting for the first publish(), should call
 ``bootstrap()`` right after ``configure()`` and then
 ``modulith.builtin.outbox.start()`` from its running event loop (an ASGI
-lifespan's startup half). ``bootstrap()`` starts the retry loop itself
+lifespan's startup half). A row the dead process still holds, under a
+lease or an advisory lock, waits: the first sweep that runs after that
+lease expires or that lock's session ends retries it.
+``bootstrap()`` starts the retry loop itself
 only when it binds the store from ``outbox_url`` inside a running event
 loop; ``start()`` is idempotent, so calling both is safe.
 
@@ -483,7 +499,7 @@ Implementations may use any async DB driver (asyncpg, motor, aioredis).
 **Methods:**
 
 - `async def save(self, publication: EventPublication) -> None:`
-  — Persist a new publication record.
+  — Insert or update a publication record, keyed by its id.
 - `async def mark_complete(self, publication_id: UUID) -> None:`
   — Mark a publication as successfully delivered.
 - `async def find_incomplete(self, older_than: timedelta) -> list[EventPublication]:`
