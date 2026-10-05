@@ -354,6 +354,32 @@ def test_run_refuses_a_proxy_port_inside_the_worker_range(make_fake_app, monkeyp
     assert "orders" in result.output
 
 
+def test_run_refuses_a_proxy_port_another_process_listens_on(make_fake_app, monkeypatch):
+    """Exit 1 naming the port, not uvicorn's bare exit 3 after workers spawned."""
+    import socket
+
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    monkeypatch.setattr(
+        "modulith.supervisor.Supervisor.start",
+        lambda self: pytest.fail("no worker may be spawned"),
+    )
+
+    with socket.socket() as holder:
+        holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        holder.bind(("127.0.0.1", 0))
+        holder.listen()
+        port = holder.getsockname()[1]
+
+        argv = ["run", "fakeapp:app", "--topology", "processes", "--host", "127.0.0.1"]
+        result = runner.invoke(app, [*argv, "--port", str(port)])
+
+    assert result.exit_code == 1, result.output
+    assert f"port {port} is already in use; choose another --port" in result.output
+
+
 def test_dev_port_collision_names_only_remedies_dev_accepts(make_fake_app, monkeypatch):
     make_fake_app({"orders": "", "inventory": ""})
     monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")

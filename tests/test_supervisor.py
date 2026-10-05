@@ -239,6 +239,66 @@ async def test_run_supervised_refuses_a_proxy_port_inside_the_worker_range(
     assert sup.events == []  # no worker was spawned
 
 
+@contextlib.contextmanager
+def _listening_port() -> Iterator[int]:
+    """A loopback port some other process is listening on."""
+    with socket.socket() as holder:
+        holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        holder.bind(("127.0.0.1", 0))
+        holder.listen()
+        yield holder.getsockname()[1]
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+async def test_run_supervised_refuses_a_proxy_port_another_process_listens_on(host: str) -> None:
+    """Exit 3 from uvicorn, after the workers were already spawned, told the
+    operator nothing; the busy port is named before any worker starts."""
+    from modulith import ConfigurationError
+
+    sup = _FakeSupervisor()
+    specs = [WorkerSpec("orders", "app", _free_port())]
+
+    with _listening_port() as port:
+        with pytest.raises(
+            ConfigurationError, match=rf"port {port} is already in use; choose another --port"
+        ):
+            await run_supervised(specs, host, port, supervisor=sup)
+
+    assert sup.events == []  # no worker was spawned
+
+
+async def _asgi_app_failing_its_startup(scope: Any, receive: Any, send: Any) -> None:
+    assert scope["type"] == "lifespan"
+    await receive()
+    await send({"type": "lifespan.startup.failed", "message": "boom"})
+
+
+async def _asgi_app_that_never_runs(scope: Any, receive: Any, send: Any) -> None:
+    raise AssertionError("no request reaches this app")
+
+
+async def test_serve_uvicorn_names_a_port_taken_between_the_pre_check_and_the_bind() -> None:
+    from modulith import ConfigurationError
+    from modulith.supervisor import _serve_uvicorn
+
+    with _listening_port() as port:
+        with pytest.raises(
+            ConfigurationError, match=rf"port {port} is already in use; choose another --port"
+        ):
+            await _serve_uvicorn(_asgi_app_that_never_runs, "127.0.0.1", port)
+
+
+async def test_serve_uvicorn_leaves_other_startup_failures_alone() -> None:
+    """uvicorn also exits 3 when the app's lifespan startup fails. With the
+    port free that is not a port problem, and must not be reported as one."""
+    from modulith.supervisor import _serve_uvicorn
+
+    with pytest.raises(SystemExit) as exc_info:
+        await _serve_uvicorn(_asgi_app_failing_its_startup, "127.0.0.1", _free_port())
+
+    assert exc_info.value.code == 3
+
+
 async def test_supervisor_tells_spawn_listeners_about_every_spawn_and_restart() -> None:
     spawned: list[int] = []
 
@@ -1340,8 +1400,37 @@ async def test_a_port_held_past_the_wait_still_ends_in_the_crash_loop_give_up(
         assert len(_messages(caplog, f"port {port}", logging.WARNING)) == 1
         assert len(_messages(caplog, "bind failed", logging.WARNING)) == 1
         assert len(_messages(caplog, "giving up", logging.ERROR)) == 1
+        (give_up,) = _messages(caplog, "giving up", logging.ERROR)
+        assert f"Port {port} was still held by another process" in give_up
+        assert "Fix the module" not in give_up
     finally:
         _kill_descendants(pid_file)
+        await sup.stop()
+
+
+@pytest.mark.real_process
+async def test_a_crash_loop_with_a_free_port_still_tells_the_operator_to_fix_the_module(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="modulith.supervisor")
+    sup = Supervisor(
+        [WorkerSpec("orders", "fakeapp", _free_port())],
+        command_builder=lambda spec, port: _CRASH,
+        restart_initial_delay=0.01,
+        restart_max_delay=0.01,
+        max_restarts=1,
+        restart_healthy_uptime=30.0,
+    )
+    try:
+        await sup.start()
+        deadline = time.monotonic() + 10.0
+        while not sup.failed_instances() and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+
+        (give_up,) = _messages(caplog, "giving up", logging.ERROR)
+        assert "Fix the module" in give_up
+        assert "still held" not in give_up
+    finally:
         await sup.stop()
 
 
@@ -1419,6 +1508,27 @@ async def test_a_port_probe_that_cannot_open_a_socket_keeps_the_worker_supervise
 
 def test_a_port_the_probe_cannot_bind_at_all_reads_as_free() -> None:
     assert _port_held(65536) is False
+
+
+def test_a_port_probe_that_cannot_run_logs_one_warning(monkeypatch, caplog) -> None:
+    caplog.set_level(logging.WARNING, logger="modulith.supervisor")
+    monkeypatch.setattr("modulith.supervisor.socket", _SocketModuleOutOfDescriptors())
+
+    assert _port_held(9001) is False
+
+    (warning,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+    message = warning.getMessage()
+    assert "cannot probe port 9001" in message
+    assert "Too many open files" in message
+
+
+def test_a_port_probe_that_finds_the_port_free_or_held_logs_nothing(caplog) -> None:
+    caplog.set_level(logging.WARNING, logger="modulith.supervisor")
+    with _listening_port() as held:
+        assert _port_held(held) is True
+    assert _port_held(_free_port()) is False
+
+    assert caplog.records == []
 
 
 @pytest.mark.real_process

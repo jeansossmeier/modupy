@@ -135,8 +135,9 @@ def _port_held(port: int) -> bool:
     """Whether a worker's bind to ``port`` would fail because it is in use.
 
     Any other failure to probe (no descriptor left, a port out of range) reads
-    as free: the respawn then goes ahead, and its own error handling and the
-    crash-loop breaker report the problem instead of the monitor task dying.
+    as free, with one warning: the respawn then goes ahead, and its own error
+    handling and the crash-loop breaker report the problem instead of the
+    monitor task dying.
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -144,10 +145,45 @@ def _port_held(port: int) -> bool:
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind((_WORKER_HOST, port))
     except OSError as exc:
-        return exc.errno == errno.EADDRINUSE
-    except OverflowError:
+        if exc.errno == errno.EADDRINUSE:
+            return True
+        failure: Exception = exc
+    except OverflowError as exc:
+        failure = exc
+    else:
         return False
+    logger.warning("cannot probe port %d: %s; not waiting for it to be released", port, failure)
     return False
+
+
+def _proxy_port_in_use(host: str, port: int) -> bool:
+    """Whether binding the proxy to ``(host, port)`` would fail with EADDRINUSE.
+
+    Every address ``host`` resolves to is tried, as asyncio's ``create_server``
+    binds them all (``localhost`` is both ``::1`` and ``127.0.0.1``). A probe
+    that fails any other way (an unresolvable host, an address family this
+    machine lacks) reads as free and is left for the real bind to report.
+    """
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
+    except (OSError, OverflowError):
+        return False
+    for family, kind, proto, _, address in addresses:
+        try:
+            with socket.socket(family, kind, proto) as probe:
+                if _REUSE_ADDRESS:
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                probe.bind(address)
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                return True
+    return False
+
+
+def _port_in_use_error(port: int) -> Exception:
+    from .config import ConfigurationError
+
+    return ConfigurationError(f"port {port} is already in use; choose another --port")
 
 
 # Parent-death signal support (Linux only). libc is resolved in the *parent*
@@ -599,6 +635,7 @@ class Supervisor:
             healthy_uptime=self._restart_healthy_uptime,
             max_restarts=self._max_restarts,
         )
+        port_still_held = False
         while True:
             started = time.monotonic()
             return_code = await _exited(proc)
@@ -609,13 +646,22 @@ class Supervisor:
             uptime = time.monotonic() - started
             delay = policy.on_crash(uptime=uptime, now=time.monotonic())
             if delay is None:
+                if port_still_held:
+                    advice = (
+                        f"Port {port} was still held by another process, probably one "
+                        "the dead worker started, when it was last respawned: stop that "
+                        "process or move the workers with --worker-port-base, then "
+                        "restart the supervisor."
+                    )
+                else:
+                    advice = "Fix the module and restart the supervisor."
                 logger.error(
                     "worker %s crashed %d times in a row with no healthy run in "
-                    "between (last exit code %s) — giving up; not respawning. "
-                    "Fix the module and restart the supervisor.",
+                    "between (last exit code %s) — giving up; not respawning. %s",
                     name,
                     self._max_restarts + 1,
                     return_code,
+                    advice,
                 )
                 self._failed_instances.add(name)
                 return
@@ -637,7 +683,7 @@ class Supervisor:
                 pass
             else:
                 return  # stop() interrupted the backoff; do not respawn
-            await self._await_port_release(name, port)
+            port_still_held = await self._await_port_release(name, port)
             if self._stopping:
                 # Reachable: stop() may flip _stopping during the sleep above.
                 # mypy narrows it to False from the earlier check and can't
@@ -666,8 +712,11 @@ class Supervisor:
             if self._stopping and proc.returncode is None:  # type: ignore[unreachable]
                 proc.terminate()  # type: ignore[unreachable]
 
-    async def _await_port_release(self, name: str, port: int) -> None:
+    async def _await_port_release(self, name: str, port: int) -> bool:
         """Wait, up to ``restart_max_delay`` seconds, for ``port`` to be free.
+
+        Returns whether the port was still held when the wait ended, so that a
+        respawn which then fails to bind can be blamed on the holder.
 
         A process the dead worker started (a fork-started pool child, say)
         inherits its listening socket and can outlive it. Every respawn
@@ -679,7 +728,7 @@ class Supervisor:
         left alone.
         """
         if not _port_held(port):
-            return
+            return False
         bound = self._restart_max_delay
         logger.warning(
             "worker %s: port %d is still in use, probably by a process the dead "
@@ -696,9 +745,10 @@ class Supervisor:
                 )
             except TimeoutError:
                 if not _port_held(port):
-                    return
+                    return False
             else:
-                return
+                return False
+        return _port_held(port)
 
     async def _forward_logs(
         self, prefix: str, stream: asyncio.StreamReader, default_level: int
@@ -896,7 +946,14 @@ async def _serve_uvicorn(app: Any, host: str, port: int) -> None:
     )
     install_access_log_filter()
     install_filter_once("httpx", LogTargetQueryFilter(_HTTPX_REQUEST_LINE, 1))
-    await uvicorn.Server(config).serve()
+    try:
+        await uvicorn.Server(config).serve()
+    except SystemExit as exc:
+        # uvicorn exits 3 for a failed bind and for a failed app startup alike;
+        # a port still in use afterwards says which one it was.
+        if exc.code == 3 and _proxy_port_in_use(host, port):
+            raise _port_in_use_error(port) from None
+        raise
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -1064,8 +1121,9 @@ async def run_supervised(
     ``"foreign deployment"`` rather than healthy.
 
     Raises ``ConfigurationError`` before spawning anything when ``proxy_port``
-    equals any worker replica's port (see ``_check_proxy_port``), or when two
-    replicas share a port.
+    equals any worker replica's port (see ``_check_proxy_port``), when two
+    replicas share a port, or, with the default server, when another process
+    already listens on ``(proxy_host, proxy_port)``.
 
     ``supervisor`` and ``serve`` are injection seams for testing; production
     callers pass neither and get a real Supervisor plus a uvicorn server.
@@ -1085,6 +1143,11 @@ async def run_supervised(
 
     _check_proxy_port(specs, proxy_port)
     _check_replica_overlap(specs)
+    # The default server binds the proxy after the workers are spawned, so a
+    # busy port would otherwise surface as uvicorn's exit 3 with workers running.
+    # An injected ``serve`` binds nothing of ours, so there is nothing to probe.
+    if serve is None and _proxy_port_in_use(proxy_host, proxy_port):
+        raise _port_in_use_error(proxy_port)
 
     deployment_token = secrets.token_hex(16)
     for spec in specs:

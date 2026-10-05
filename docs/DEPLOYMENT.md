@@ -1834,6 +1834,8 @@ stateDiagram-v2
     end note
 ```
 
+A process a dead worker started (a fork-started pool child, say) can outlive it and keep the worker's port. The supervisor never kills it: it kills no process group, so a dead worker's descendants keep running. If the port is still held after the wait, the respawn fails to bind and the give-up message says that port was still held by another process instead of telling you to fix the module. Stop that process, or move the workers with `--worker-port-base`, then restart the supervisor.
+
 1. Read the supervisor's output (the terminal running `modulith run`, or the container logs): it prefixes every worker line with the worker's name, such as `[orders]`
 2. Test the broker itself: connect to its URL with `psql` (without the `+asyncpg` driver suffix) or `redis-cli`, or read a worker's `/health`, which answers 503 while its broker consumer is not ready. `modulith doctor` does not do this: it reports on configuration, module boundaries and the outbox, and its Redis check skips the live query without failing when no server answers
 3. Check disk space (SQLite needs it)
