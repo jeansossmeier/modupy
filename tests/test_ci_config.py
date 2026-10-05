@@ -116,6 +116,8 @@ def test_test_suite_extra_layers_on_the_test_extra() -> None:
     names = {Requirement(req).name for req in reqs}
     assert {"pytest-timeout", "build", "hatchling", "sqlalchemy", "alembic", "aiosqlite"} <= names
     assert {"pyyaml", "httpx2", "modupy"} <= names
+    # tests/test_testing_plugin.py importorskips it; absent, that test skips in CI.
+    assert "pytest-rerunfailures" in names
 
 
 def test_integration_extra_requires_the_suite_extra() -> None:

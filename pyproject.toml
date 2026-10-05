@@ -178,6 +178,9 @@ test-suite = [
     "modupy[test]",
     "pytest-timeout>=2.1,<3.0",
     "pytest-cov>=4.1,<8.0",
+    # tests/test_testing_plugin.py checks the isolated marker's reported outcome
+    # under pytest-rerunfailures, whose per-attempt state changed in 14.0.
+    "pytest-rerunfailures>=14.0,<17.0",
     "build>=1.2,<2.0",
     "hatchling>=1.27",
     "sqlalchemy[asyncio]>=2.0,<3.0",
