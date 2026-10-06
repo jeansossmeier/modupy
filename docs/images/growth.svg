@@ -1,114 +1,213 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="420" viewBox="0 0 880 420" role="img" aria-labelledby="growth-title growth-desc">
-<title id="growth-title">The same modupy code in three shapes</title>
-<desc id="growth-desc">Day one: the orders, payments and inventory modules run in one process, and an OrderCreated event fans out from orders to payments and inventory. When a feature gets busy: one process per module on one machine, behind a proxy on port 8000, with two inventory processes and a built-in broker carrying events between them. When a module becomes a service: modulith extract payments moves payments onto its own machine, and a Redis, database or other broker carries the same events between the app and the new service. In every shape, modulith verify keeps the modules apart and the outbox keeps their events safe.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="512" viewBox="0 0 880 512" role="img" aria-labelledby="growth-title growth-desc" xmlns:c2pa="http://c2pa.org/manifest"><metadata><c2pa:manifest>AAAWgmp1bWIAAAAeanVtZGMycGEAEQAQgAAAqgA4m3EDYzJwYQAAABZcanVtYgAAAEdqdW1kYzJtYQARABCAAACqADibcQN1cm46YzJwYTowOGExOWE3Yy04OTRmLTQ0YmMtOTA4MS1hMmFlMTMxY2MzZjAAAAADl2p1bWIAAAApanVtZGMyYXMAEQAQgAAAqgA4m3EDYzJwYS5hc3NlcnRpb25zAAAAALxqdW1iAAAARGp1bWRjYm9yABEAEIAAAKoAOJtxE2MycGEuaW5ncmVkaWVudC52MwAAAAAYYzJzaAP3oeMyoTKg3JbSXxMZ6TcAAABwY2JvcqNpZGM6Zm9ybWF0bWltYWdlL3N2Zyt4bWxqaW5zdGFuY2VJRHgseG1wOmlpZDoyMjA2YTgzMi01OGEzLTRiMjItYWJjMi1mYjk5YzM5OGM0Y2FscmVsYXRpb25zaGlwaHBhcmVudE9mAAAB4mp1bWIAAABBanVtZGNib3IAEQAQgAAAqgA4m3ETYzJwYS5hY3Rpb25zLnYyAAAAABhjMnNoZQd2ZZmid6C4GqFIs4rcYwAAAZljYm9yomdhY3Rpb25zgqJmYWN0aW9ua2MycGEub3BlbmVkanBhcmFtZXRlcnOha2luZ3JlZGllbnRzgaJjdXJseC1zZWxmI2p1bWJmPWMycGEuYXNzZXJ0aW9ucy9jMnBhLmluZ3JlZGllbnQudjNkaGFzaFggbp7kPcC2oCw348RTQiZvpUpr9dlChPRI/3UexiBjn+CkZmFjdGlvbngdY29tLmFudGhyb3BpYy5jbGF1ZGUucHJvdmlkZWRqcGFyYW1ldGVyc6F4H2NvbS5hbnRocm9waWMub3JpZ2luLWNvbmZpZGVuY2VndW5rbm93bmtkZXNjcmlwdGlvbnhmQ2xhdWRlIHByb3ZpZGVkIHRoaXMgZmlsZSBhdCB0aGUgcmVxdWVzdCBvZiBhIHVzZXIgYW5kIG1heSBoYXZlIGNyZWF0ZWQgb3IgbW9kaWZpZWQgdGhlIGZpbGUgY29udGVudHMubXNvZnR3YXJlQWdlbnShZG5hbWVmQ2xhdWRlcmFsbEFjdGlvbnNJbmNsdWRlZPUAAADIanVtYgAAAEBqdW1kY2JvcgARABCAAACqADibcRNjMnBhLmhhc2guZGF0YQAAAAAYYzJzaAnXgEnvWbQYx5ZJTpbYzfMAAACAY2JvcqVjYWxnZnNoYTI1NmNwYWRNAAAAAAAAAAAAAAAAAGRoYXNoWCD2wBIayemqPs9T7G0LO6AfBuSdPbJKK9xYHkQf/nSJ62RuYW1lbmp1bWJmIG1hbmlmZXN0amV4Y2x1c2lvbnOBomVzdGFydBjMZmxlbmd0aBkeBAAAAj5qdW1iAAAAJ2p1bWRjMmNsABEAEIAAAKoAOJtxA2MycGEuY2xhaW0udjIAAAACD2Nib3KlY2FsZ2ZzaGEyNTZpc2lnbmF0dXJleE1zZWxmI2p1bWJmPS9jMnBhL3VybjpjMnBhOjA4YTE5YTdjLTg5NGYtNDRiYy05MDgxLWEyYWUxMzFjYzNmMC9jMnBhLnNpZ25hdHVyZWppbnN0YW5jZUlEeCx4bXA6aWlkOmZlZGVjNjUzLTU2YWMtNDNlZC05ZjBiLWVkYWE4ODAyMDBiOHJjcmVhdGVkX2Fzc2VydGlvbnODomN1cmx4LXNlbGYjanVtYmY9YzJwYS5hc3NlcnRpb25zL2MycGEuaW5ncmVkaWVudC52M2RoYXNoWCBunuQ9wLagLDfjxFNCJm+lSmv12UKE9Ej/dR7GIGOf4KJjdXJseCpzZWxmI2p1bWJmPWMycGEuYXNzZXJ0aW9ucy9jMnBhLmFjdGlvbnMudjJkaGFzaFgghi8QrV3XCcZSjOsxfwIBAIzQIxBQ+A9Wj9Vg6zZU7nOiY3VybHgpc2VsZiNqdW1iZj1jMnBhLmFzc2VydGlvbnMvYzJwYS5oYXNoLmRhdGFkaGFzaFggfNbuzF4VNZ1wij6NHd9aoxSB6RcQ9bww1WdM5c52nCh0Y2xhaW1fZ2VuZXJhdG9yX2luZm+jZG5hbWVvQW50aHJvcGljIEZpbGVzZ3ZlcnNpb25lMS4wLjBrc3BlY1ZlcnNpb25lMi40LjAAABA4anVtYgAAAChqdW1kYzJjcwARABCAAACqADibcQNjMnBhLnNpZ25hdHVyZQAAABAIY2JvctKEWQISogEmGCFZAgowggIGMIIBjaADAgECAhRA5aAK7sI50L64g/oGQgU9Z1UTADAKBggqhkjOPQQDAzBJMRcwFQYDVQQKEw5BbnRocm9waWMsIFBCQzEuMCwGA1UEAxMlQW50aHJvcGljIENvbnRlbnQgQ3JlZGVudGlhbHMgUm9vdCBDQTAeFw0yNjA4MDcxODQzNTZaFw0yODA4MDYxOTQzNTZaMEQxFzAVBgNVBAoTDkFudGhyb3BpYywgUEJDMSkwJwYDVQQDEyBBbnRocm9waWMgQ2xhdWRlIENvbnRlbnQgU2lnbmluZzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJh6CmvLUBgFFNU0vUKlOVtE6djd17L5SuwX0LemFisBM3dkd/3cyjxFA3Qo5S46fX0/ihY0VZ7mfb9KF703t5OjWDBWMA4GA1UdDwEB/wQEAwIHgDAVBgNVHSUEDjAMBgorBgEEAYPoXgIBMAwGA1UdEwEB/wQCMAAwHwYDVR0jBBgwFoAUzlHiBIFOZFsj+OPEz5o+nMHXXMIwCgYIKoZIzj0EAwMDZwAwZAIwMXMdFJ4BetLLVY7ORuE9noqbbAZOZn/aArXyTwFAZfKrPzxF2vPoJNf1+UCdg1XGAjBwX1zd9WGqYkqmL5SFqw1QySjr1zJfpJM9+1rdDwSPLMOPOjKuiXjoU/pUUeG9RwmhY3BhZFkNngAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPZYQLAt8MJpjEny/gFn4MnFQtdayHlXyTIBKcU6W5I7FTIE47ijSNyJKIZeNIy25UY3nakAwTVIQpl/2KG5KEhuS2I=</c2pa:manifest></metadata>
+<title id="growth-title">modupy: the same code in three shapes</title>
+<desc id="growth-desc">modupy lives at github.com/jeansossmeier/modupy. Day one: the orders, payments and inventory modules run in one process, and an OrderCreated event fans out from orders to payments and inventory. When a feature gets busy: one process per module on one machine, behind a proxy on port 8000, with two inventory processes and a built-in broker carrying events between them. When a module becomes a service: modulith extract payments moves payments onto its own machine, and a Redis, database or other broker carries the same events between the app and the new service. In every shape, modulith verify keeps the modules apart and the outbox keeps their events safe.</desc>
+
 <style>
-.card{fill:#f6f8fa;stroke:#d0d7de}
-.box{fill:#ffffff;stroke:#d0d7de;stroke-width:1.5}
-.machine{fill:none;stroke:#8c959f;stroke-width:1.5;stroke-dasharray:6 5}
-.h{font:600 15px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328}
-.t{font:500 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328}
-.s{font:400 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#59636e}
-.c{font:500 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#59636e}
-.m{font:600 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif}
-.orders{fill:#ddf4ff;stroke:#0969da;stroke-width:1.5}.orders-t{fill:#0550ae}
-.payments{fill:#dafbe1;stroke:#1a7f37;stroke-width:1.5}.payments-t{fill:#116329}
-.inventory{fill:#fff8c5;stroke:#9a6700;stroke-width:1.5}.inventory-t{fill:#7d4e00}
-.bus{fill:#ffeff7;stroke:#bf3989;stroke-width:1.5}
-.bus-t{font:600 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#99286e}
-.ev-t{font:600 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#99286e}
-.ev{fill:none;stroke:#bf3989;stroke-width:1.5;stroke-dasharray:4 3}
-.evhead{fill:#bf3989}
-.wire{fill:none;stroke:#8c959f;stroke-width:1.5}
-.head{fill:#8c959f}
-.band{fill:#ffffff;stroke:#d0d7de}
-@media (prefers-color-scheme:dark){
-.card{fill:#161b22;stroke:#30363d}
-.box,.band{fill:#0d1117;stroke:#3d444d}
-.machine{stroke:#656c76}
-.h,.t{fill:#e6edf3}
-.s,.c{fill:#9198a1}
-.orders{fill:#172b45;stroke:#4493f8}.orders-t{fill:#79c0ff}
-.payments{fill:#17311f;stroke:#3fb950}.payments-t{fill:#7ee787}
-.inventory{fill:#33290f;stroke:#d29922}.inventory-t{fill:#e3b341}
-.bus{fill:#36192b;stroke:#db61a2}.bus-t,.ev-t{fill:#ff9bce}
-.ev{stroke:#db61a2}.evhead{fill:#db61a2}
-.wire{stroke:#656c76}.head{fill:#656c76}
+/* ---------- Colour tokens (light) ---------- */
+svg{
+  --bg-a:#ffffff; --bg-b:#f2f5f9;
+  --stroke:#d0d7de; --stroke-soft:#e3e8ee;
+  --ink:#1f2328; --muted:#59636e; --wire:#8c959f;
+  --panel:#ffffff; --machine-fill:#ffffff; --machine-op:.35;
+  --orders-a:#eef8ff; --orders-b:#cfe8ff; --orders-s:#0969da; --orders-t:#0550ae;
+  --payments-a:#eafcee; --payments-b:#c6f2d2; --payments-s:#1a7f37; --payments-t:#116329;
+  --inventory-a:#fffbe3; --inventory-b:#ffefa6; --inventory-s:#9a6700; --inventory-t:#7d4e00;
+  --bus-a:#fff5fa; --bus-b:#ffdcee; --bus-s:#bf3989; --bus-t:#99286e;
+  --shadow:#1f2328;
 }
+/* ---------- Colour tokens (dark) ---------- */
+@media (prefers-color-scheme:dark){
+  svg{
+    --bg-a:#161b22; --bg-b:#0d1117;
+    --stroke:#30363d; --stroke-soft:#262c34;
+    --ink:#e6edf3; --muted:#9198a1; --wire:#656c76;
+    --panel:#0d1117; --machine-fill:#ffffff; --machine-op:.04;
+    --orders-a:#1d3a5c; --orders-b:#132740; --orders-s:#4493f8; --orders-t:#79c0ff;
+    --payments-a:#1d4229; --payments-b:#122b1b; --payments-s:#3fb950; --payments-t:#7ee787;
+    --inventory-a:#403313; --inventory-b:#2b220b; --inventory-s:#d29922; --inventory-t:#e3b341;
+    --bus-a:#47203b; --bus-b:#2c1425; --bus-s:#db61a2; --bus-t:#ff9bce;
+    --shadow:#000000;
+  }
+}
+
+/* ---------- Gradient stops ---------- */
+.o-a{stop-color:var(--orders-a)}    .o-b{stop-color:var(--orders-b)}
+.p-a{stop-color:var(--payments-a)}  .p-b{stop-color:var(--payments-b)}
+.i-a{stop-color:var(--inventory-a)} .i-b{stop-color:var(--inventory-b)}
+.b-a{stop-color:var(--bus-a)}       .b-b{stop-color:var(--bus-b)}
+.g-a{stop-color:var(--bg-a)}        .g-b{stop-color:var(--bg-b)}
+
+/* ---------- Surfaces ---------- */
+.card{fill:url(#growth-bg);stroke:var(--stroke)}
+.rule{stroke:var(--stroke);opacity:.8}
+.panel{fill:var(--panel);stroke:var(--stroke);stroke-width:1.5}
+.machine{fill:var(--machine-fill);fill-opacity:var(--machine-op);stroke:var(--wire);stroke-width:1.5;stroke-dasharray:6 5}
+.band{fill:var(--panel);stroke:var(--stroke)}
+.proxy{fill:var(--panel);stroke:var(--stroke);stroke-width:1.5}
+.pill{fill:var(--panel);stroke:var(--stroke)}
+.code-pill{fill:var(--bg-b);stroke:var(--stroke-soft)}
+
+/* ---------- Modules ---------- */
+.orders{fill:url(#growth-g-orders);stroke:var(--orders-s);stroke-width:1.5}
+.payments{fill:url(#growth-g-payments);stroke:var(--payments-s);stroke-width:1.5}
+.inventory{fill:url(#growth-g-inventory);stroke:var(--inventory-s);stroke-width:1.5}
+.bus{fill:url(#growth-g-bus);stroke:var(--bus-s);stroke-width:1.5}
+.orders-t{fill:var(--orders-t)} .payments-t{fill:var(--payments-t)} .inventory-t{fill:var(--inventory-t)}
+
+/* ---------- Type ---------- */
+.sans{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif}
+.mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
+.brand{font:700 30px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:var(--ink);letter-spacing:-.6px}
+.brand-accent{fill:var(--orders-s)}
+.url{font:500 13px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:var(--muted)}
+.url-strong{fill:var(--ink);font-weight:600}
+.h{font:600 15px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:var(--ink)}
+.t{font:500 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:var(--ink)}
+.s{font:400 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:var(--muted)}
+.c{font:500 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:var(--muted)}
+.m{font:600 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif}
+.bus-t{font:600 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:var(--bus-t)}
+.ev-t{font:600 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:var(--bus-t)}
+.badge{fill:var(--ink)}
+.badge-t{font:700 11px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:var(--panel)}
+
+/* ---------- Lines ---------- */
+.ev{fill:none;stroke:var(--bus-s);stroke-width:1.5;stroke-dasharray:4 3;stroke-linecap:round;animation:flow 1.1s linear infinite}
+.evhead{fill:var(--bus-s)}
+.wire{fill:none;stroke:var(--wire);stroke-width:1.5;stroke-linecap:round}
+.head{fill:var(--wire)}
+.step{fill:var(--panel);stroke:var(--stroke);stroke-width:1.5}
+.step-chev{fill:none;stroke:var(--muted);stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+
+/* Event lines gently flow toward their arrowheads. */
+@keyframes flow{to{stroke-dashoffset:-7}}
+@media (prefers-reduced-motion:reduce){.ev{animation:none}}
 </style>
+
 <defs>
+<!-- Gradients -->
+<linearGradient id="growth-bg" x1="0" y1="0" x2="0" y2="1"><stop class="g-a" offset="0"/><stop class="g-b" offset="1"/></linearGradient>
+<linearGradient id="growth-g-orders" x1="0" y1="0" x2="0" y2="1"><stop class="o-a" offset="0"/><stop class="o-b" offset="1"/></linearGradient>
+<linearGradient id="growth-g-payments" x1="0" y1="0" x2="0" y2="1"><stop class="p-a" offset="0"/><stop class="p-b" offset="1"/></linearGradient>
+<linearGradient id="growth-g-inventory" x1="0" y1="0" x2="0" y2="1"><stop class="i-a" offset="0"/><stop class="i-b" offset="1"/></linearGradient>
+<linearGradient id="growth-g-bus" x1="0" y1="0" x2="0" y2="1"><stop class="b-a" offset="0"/><stop class="b-b" offset="1"/></linearGradient>
+<!-- Palette strip across the top of the card -->
+<linearGradient id="growth-strip" x1="0" y1="0" x2="1" y2="0">
+<stop offset="0" stop-color="#0969da"/><stop offset=".38" stop-color="#1a7f37"/><stop offset=".68" stop-color="#d4a72c"/><stop offset="1" stop-color="#bf3989"/>
+</linearGradient>
+<!-- Soft shadows -->
+<filter id="growth-sh" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-color="#1f2328" flood-opacity=".12"/></filter>
+<filter id="growth-sh-lg" x="-10%" y="-10%" width="120%" height="125%"><feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#1f2328" flood-opacity=".08"/></filter>
+<clipPath id="growth-clip"><rect x="0.5" y="0.5" width="879" height="511" rx="14"/></clipPath>
+<!-- Arrowheads -->
 <marker id="growth-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker>
 <marker id="growth-evhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="evhead" d="M0,0 L10,5 L0,10 z"/></marker>
 </defs>
-<rect class="card" x="0.5" y="0.5" width="879" height="419" rx="12"/>
+
+<!-- Card + palette strip -->
+<rect class="card" x="0.5" y="0.5" width="879" height="511" rx="14"/>
+<rect x="0" y="0" width="880" height="4" fill="url(#growth-strip)" clip-path="url(#growth-clip)"/>
+
+<!-- ===== Header: logo, name, repo ===== -->
+<g>
+<!-- Logo mark: one tile per module, plus the event bus -->
+<rect class="orders" x="32" y="24" width="16" height="16" rx="4.5"/>
+<rect class="payments" x="52" y="24" width="16" height="16" rx="4.5"/>
+<rect class="inventory" x="32" y="44" width="16" height="16" rx="4.5"/>
+<rect class="bus" x="52" y="44" width="16" height="16" rx="4.5"/>
+<text class="brand" x="84" y="52">modu<tspan class="brand-accent">py</tspan></text>
+
+<!-- Repo link pill -->
+<rect class="pill" x="568" y="25" width="280" height="34" rx="17" filter="url(#growth-sh)"/>
+<text class="url" x="708" y="46.5" text-anchor="middle">github.com/<tspan class="url-strong">jeansossmeier/modupy</tspan></text>
+</g>
+<path class="rule" d="M32 82 H848" stroke-width="1"/>
+
+<!-- ===== Diagram (shifted down to make room for the header) ===== -->
+<g transform="translate(0 92)">
 
 <!-- Day one: one process -->
 <text class="h" x="136" y="40" text-anchor="middle">Day one</text>
 <text class="s" x="136" y="60" text-anchor="middle">one app, one process</text>
-<rect class="box" x="32" y="80" width="208" height="216" rx="10"/>
-<rect class="orders" x="88" y="104" width="96" height="38" rx="8"/>
+<rect class="panel" x="32" y="80" width="208" height="216" rx="12" filter="url(#growth-sh-lg)"/>
+<circle class="badge" cx="32" cy="80" r="10"/>
+<text class="badge-t" x="32" y="84" text-anchor="middle">1</text>
+<rect class="orders" x="88" y="104" width="96" height="38" rx="9" filter="url(#growth-sh)"/>
 <text class="m orders-t" x="136" y="128" text-anchor="middle">orders</text>
 <path class="ev" d="M136 142 V164"/>
-<rect class="bus" x="84" y="164" width="104" height="22" rx="11"/>
+<rect class="bus" x="84" y="164" width="104" height="22" rx="11" filter="url(#growth-sh)"/>
 <text class="ev-t" x="136" y="179" text-anchor="middle">OrderCreated</text>
 <path class="ev" d="M126 186 C126 208 86 206 86 230" marker-end="url(#growth-evhead)"/>
 <path class="ev" d="M146 186 C146 208 186 206 186 230" marker-end="url(#growth-evhead)"/>
-<rect class="payments" x="40" y="232" width="92" height="38" rx="8"/>
+<rect class="payments" x="40" y="232" width="92" height="38" rx="9" filter="url(#growth-sh)"/>
 <text class="m payments-t" x="86" y="256" text-anchor="middle">payments</text>
-<rect class="inventory" x="140" y="232" width="92" height="38" rx="8"/>
+<rect class="inventory" x="140" y="232" width="92" height="38" rx="9" filter="url(#growth-sh)"/>
 <text class="m inventory-t" x="186" y="256" text-anchor="middle">inventory</text>
+<rect class="code-pill" x="45" y="310" width="182" height="24" rx="12"/>
 <text class="c" x="136" y="326" text-anchor="middle">uvicorn myapp.main:app</text>
 
-<path class="wire" d="M256 188 H278" marker-end="url(#growth-head)"/>
+<!-- Step arrow 1 -> 2 -->
+<circle class="step" cx="266" cy="188" r="13" filter="url(#growth-sh)"/>
+<path class="step-chev" d="M263 183 L269 188 L263 193"/>
 
 <!-- A feature gets busy: one process per module -->
 <text class="h" x="432" y="40" text-anchor="middle">A feature gets busy</text>
 <text class="s" x="432" y="60" text-anchor="middle">one process per module</text>
-<rect class="machine" x="292" y="80" width="280" height="216" rx="10"/>
-<text class="s" x="304" y="98">one machine</text>
-<rect class="box" x="306" y="108" width="252" height="30" rx="8"/>
+<rect class="machine" x="292" y="80" width="280" height="216" rx="12"/>
+<circle class="badge" cx="292" cy="80" r="10"/>
+<text class="badge-t" x="292" y="84" text-anchor="middle">2</text>
+<text class="s" x="312" y="99">one machine</text>
+<rect class="proxy" x="306" y="108" width="252" height="30" rx="9" filter="url(#growth-sh)"/>
 <text class="t" x="432" y="128" text-anchor="middle">proxy <tspan class="c">:8000</tspan></text>
 <path class="wire" d="M345 138 V164" marker-end="url(#growth-head)"/>
 <path class="wire" d="M519 138 V158" marker-end="url(#growth-head)"/>
-<rect class="orders" x="306" y="166" width="78" height="38" rx="8"/>
+<rect class="orders" x="306" y="166" width="78" height="38" rx="9" filter="url(#growth-sh)"/>
 <text class="m orders-t" x="345" y="190" text-anchor="middle">orders</text>
-<rect class="payments" x="393" y="166" width="78" height="38" rx="8"/>
+<rect class="payments" x="393" y="166" width="78" height="38" rx="9" filter="url(#growth-sh)"/>
 <text class="m payments-t" x="432" y="190" text-anchor="middle">payments</text>
-<rect class="inventory" x="486" y="160" width="78" height="38" rx="8"/>
-<rect class="inventory" x="480" y="166" width="78" height="38" rx="8"/>
+<rect class="inventory" x="486" y="160" width="78" height="38" rx="9"/>
+<rect class="inventory" x="480" y="166" width="78" height="38" rx="9" filter="url(#growth-sh)"/>
 <text class="m inventory-t" x="519" y="190" text-anchor="middle">inventory</text>
 <circle class="inventory" cx="562" cy="160" r="11"/>
 <text class="m inventory-t" x="562" y="164.5" text-anchor="middle" style="font-size:11px">×2</text>
 <path class="ev" d="M345 204 V232"/>
 <path class="ev" d="M432 204 V232"/>
 <path class="ev" d="M519 204 V232"/>
-<rect class="bus" x="306" y="232" width="252" height="30" rx="8"/>
+<rect class="bus" x="306" y="232" width="252" height="30" rx="9" filter="url(#growth-sh)"/>
 <text class="bus-t" x="432" y="252" text-anchor="middle">events · built-in broker</text>
+<rect class="code-pill" x="348" y="310" width="168" height="24" rx="12"/>
 <text class="c" x="432" y="326" text-anchor="middle">--topology processes</text>
 
-<path class="wire" d="M584 188 H606" marker-end="url(#growth-head)"/>
+<!-- Step arrow 2 -> 3 -->
+<circle class="step" cx="596" cy="188" r="13" filter="url(#growth-sh)"/>
+<path class="step-chev" d="M593 183 L599 188 L593 193"/>
 
 <!-- A module becomes a service -->
 <text class="h" x="736" y="40" text-anchor="middle">A module becomes a service</text>
 <text class="s" x="736" y="60" text-anchor="middle">same events, across machines</text>
-<rect class="machine" x="620" y="80" width="232" height="84" rx="10"/>
-<text class="s" x="632" y="98">app</text>
-<rect class="orders" x="640" y="108" width="90" height="38" rx="8"/>
+<rect class="machine" x="620" y="80" width="232" height="84" rx="12"/>
+<circle class="badge" cx="620" cy="80" r="10"/>
+<text class="badge-t" x="620" y="84" text-anchor="middle">3</text>
+<text class="s" x="640" y="99">app</text>
+<rect class="orders" x="640" y="108" width="90" height="38" rx="9" filter="url(#growth-sh)"/>
 <text class="m orders-t" x="685" y="132" text-anchor="middle">orders</text>
-<rect class="inventory" x="742" y="108" width="90" height="38" rx="8"/>
+<rect class="inventory" x="742" y="108" width="90" height="38" rx="9" filter="url(#growth-sh)"/>
 <text class="m inventory-t" x="787" y="132" text-anchor="middle">inventory</text>
 <path class="ev" d="M685 164 V180"/>
 <path class="ev" d="M787 164 V180"/>
-<rect class="bus" x="620" y="180" width="232" height="28" rx="8"/>
+<rect class="bus" x="620" y="180" width="232" height="28" rx="9" filter="url(#growth-sh)"/>
 <text class="bus-t" x="736" y="199" text-anchor="middle">Redis / database / other broker</text>
 <path class="ev" d="M736 208 V224"/>
-<rect class="machine" x="620" y="224" width="232" height="72" rx="10"/>
-<text class="c" x="632" y="242">payments-service</text>
-<rect class="payments" x="691" y="250" width="90" height="38" rx="8"/>
+<rect class="machine" x="620" y="224" width="232" height="72" rx="12"/>
+<text class="c" x="636" y="242">payments-service</text>
+<rect class="payments" x="691" y="250" width="90" height="38" rx="9" filter="url(#growth-sh)"/>
 <text class="m payments-t" x="736" y="274" text-anchor="middle">payments</text>
+<rect class="code-pill" x="634" y="310" width="204" height="24" rx="12"/>
 <text class="c" x="736" y="326" text-anchor="middle">modulith extract payments</text>
 
 <!-- What stays the same -->
-<rect class="band" x="20" y="344" width="840" height="60" rx="10"/>
-<text class="h" x="440" y="369" text-anchor="middle">Same modules, same events, same code: configuration picks the shape.</text>
-<text class="s" x="440" y="390" text-anchor="middle">In every shape, modulith verify keeps the modules apart and the outbox keeps their events safe.</text>
+<rect class="band" x="20" y="352" width="840" height="60" rx="12" filter="url(#growth-sh-lg)"/>
+<text class="h" x="440" y="377" text-anchor="middle">Same modules, same events, same code: configuration picks the shape.</text>
+<text class="s" x="440" y="398" text-anchor="middle">In every shape, modulith verify keeps the modules apart and the outbox keeps their events safe.</text>
+</g>
 </svg>
