@@ -769,6 +769,11 @@ _POSITIVE_SECONDS_KEYS = (
     "max_retry_backoff_seconds",
 )
 _POSITIVE_INTEGER_KEYS = ("claim_batch_size", "dead_letter_after_attempts")
+_OUTBOX_OPTION_KEYS = frozenset(
+    {"claim_strategy", "completion_mode", "sqlite_wal"}
+    | set(_POSITIVE_SECONDS_KEYS)
+    | set(_POSITIVE_INTEGER_KEYS)
+)
 
 
 def _validate_outbox_options(options: dict[str, Any]) -> None:
@@ -778,10 +783,14 @@ def _validate_outbox_options(options: dict[str, Any]) -> None:
     ``sqlite_wal`` flag it applies to a SQLite engine, when present.
     ``sqlite_wal`` is not checked against ``outbox_url``: any other database
     ignores it, so one pyproject can serve a SQLite development setup and a
-    Postgres deployment. Other keys in that table are intentionally NOT
-    validated here — outbox_options is a forward-compatible passthrough (see
-    _read_pyproject).
+    Postgres deployment. Any other key is rejected with a "did you mean" hint:
+    a misspelled or obsolete tuning key would otherwise be dropped silently.
     """
+    unknown = {str(key) for key in options} - _OUTBOX_OPTION_KEYS
+    if unknown:
+        raise ConfigurationError(
+            _unknown_keys_message("outbox_options keys", unknown, _OUTBOX_OPTION_KEYS)
+        )
     if "claim_strategy" in options and options["claim_strategy"] not in VALID_CLAIM_STRATEGIES:
         raise ConfigurationError(
             "outbox_options.claim_strategy must be one of "
@@ -946,21 +955,23 @@ def _validate_database_broker_options(options: dict[str, Any]) -> None:
             )
 
 
+def _unknown_keys_message(label: str, unknown: set[str], known: set[str] | frozenset[str]) -> str:
+    suggestions = []
+    for key in sorted(unknown):
+        close = difflib.get_close_matches(key, sorted(known), n=1)
+        if close:
+            suggestions.append(f"{key!r} -> {close[0]!r}")
+    guidance = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+    return f"Unknown {label}: {sorted(unknown)}. Valid keys: {sorted(known)}.{guidance}"
+
+
 def _validate(data: dict[str, Any]) -> None:
     """Validate config values, raising ConfigurationError with guidance."""
     # Catch typos — unknown keys would silently fail otherwise.
     known = {f.name for f in fields(Configuration)} - {"explicit_keys"}
     unknown = set(data.keys()) - known
     if unknown:
-        suggestions = []
-        for key in sorted(unknown):
-            close = difflib.get_close_matches(key, sorted(known), n=1)
-            if close:
-                suggestions.append(f"{key!r} -> {close[0]!r}")
-        guidance = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
-        raise ConfigurationError(
-            f"Unknown config keys: {sorted(unknown)}. Valid keys: {sorted(known)}.{guidance}"
-        )
+        raise ConfigurationError(_unknown_keys_message("config keys", unknown, known))
 
     scalar_types: dict[str, tuple[type, ...]] = {
         "package": (str, type(None)),

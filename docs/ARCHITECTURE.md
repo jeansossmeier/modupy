@@ -165,8 +165,9 @@ asked). It applies to SQLite only and is ignored for other databases, so one
 pyproject can serve a SQLite development setup and a Postgres deployment.
 DEPLOYMENT.md covers what WAL changes on disk.
 
-Any other key in the table is accepted and ignored, so a `pyproject.toml`
-written for a newer release still loads. An application that calls
+Any other key in the table is rejected with a `ConfigurationError` that lists
+the valid keys and suggests the closest one, so a misspelled or obsolete key
+fails at startup instead of being dropped silently. An application that calls
 `outbox.configure()` before bootstrap keeps its own store and settings:
 `outbox_url` and these keys are then not applied, and bootstrap logs a WARNING
 naming the tuning keys it ignored.

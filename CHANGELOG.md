@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `[tool.modulith.outbox_options]` now rejects a key outside the nine it validates (`claim_strategy`, `claim_lease_seconds`, `claim_batch_size`, `dead_letter_after_attempts`, `retry_interval_seconds`, `retry_stale_seconds`, `max_retry_backoff_seconds`, `completion_mode`, `sqlite_wal`) with a `ConfigurationError` that lists the valid keys and suggests the closest one, as an unknown `[tool.modulith]` key already did. A `pyproject.toml` with a misspelled or obsolete `outbox_options` key, such as `claim_lease_secnds`, used to load with the key ignored and now fails at startup; the same holds for `modulith.configure(outbox_options=...)`
+
 ## [0.11.0] — 2026-10-05
 
 The first release published to PyPI. The 0.10.0 and 0.9.0 entries below record builds that were never published.

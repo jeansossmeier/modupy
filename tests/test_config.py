@@ -1153,7 +1153,7 @@ def test_reads_subscription_and_actuator_configuration(tmp_path: Path) -> None:
         "[tool.modulith.broker_options]\n"
         'future_broker_key = "preserved"\n'
         "[tool.modulith.outbox_options]\n"
-        "future_outbox_key = 42\n"
+        "dead_letter_after_attempts = 42\n"
     )
 
     cfg = load_configuration()
@@ -1162,7 +1162,7 @@ def test_reads_subscription_and_actuator_configuration(tmp_path: Path) -> None:
     assert cfg.subscriptions == {"orders": ["redis-streams:orders", "amqp:events:orders"]}
     assert cfg.actuator_mode == "token"
     assert cfg.broker_options == {"future_broker_key": "preserved"}
-    assert cfg.outbox_options == {"future_outbox_key": 42}
+    assert cfg.outbox_options == {"dead_letter_after_attempts": 42}
 
 
 def test_subscription_and_actuator_environment_variables(monkeypatch) -> None:
@@ -1424,9 +1424,46 @@ def test_outbox_options_accept_valid_completion_mode(mode: str) -> None:
     assert cfg.outbox_options == {"completion_mode": mode}
 
 
-def test_outbox_options_keep_unknown_keys_next_to_validated_ones() -> None:
-    options = {"dead_letter_after_attempts": 3, "completion_mode": "delete", "future_key": [1]}
-    assert load_configuration(outbox_options=options).outbox_options == options
+_ALL_OUTBOX_OPTIONS = {
+    "claim_strategy": "lease",
+    "claim_lease_seconds": 45.5,
+    "claim_batch_size": 250,
+    "dead_letter_after_attempts": 3,
+    "retry_interval_seconds": 2,
+    "retry_stale_seconds": 2,
+    "max_retry_backoff_seconds": 4,
+    "completion_mode": "delete",
+    "sqlite_wal": True,
+}
+
+
+def test_outbox_options_accept_every_valid_key_unchanged() -> None:
+    cfg = load_configuration(outbox_options=dict(_ALL_OUTBOX_OPTIONS))
+    assert cfg.outbox_options == _ALL_OUTBOX_OPTIONS
+
+
+def test_pyproject_outbox_options_rejects_a_misspelled_key_with_a_suggestion(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.modulith.outbox_options]\nclaim_lease_secnds = 4\n"
+    )
+    with pytest.raises(ConfigurationError) as excinfo:
+        load_configuration()
+    message = str(excinfo.value)
+    assert "Unknown outbox_options keys: ['claim_lease_secnds']." in message
+    assert f"Valid keys: {sorted(_ALL_OUTBOX_OPTIONS)}." in message
+    assert "Did you mean: 'claim_lease_secnds' -> 'claim_lease_seconds'?" in message
+
+
+def test_outbox_options_keyword_rejects_an_unknown_key_without_a_suggestion() -> None:
+    options = {"dead_letter_after_attempts": 3, "zzz_obsolete_key": [1]}
+    with pytest.raises(ConfigurationError) as excinfo:
+        load_configuration(outbox_options=options)
+    message = str(excinfo.value)
+    assert "Unknown outbox_options keys: ['zzz_obsolete_key']." in message
+    assert f"Valid keys: {sorted(_ALL_OUTBOX_OPTIONS)}." in message
+    assert "Did you mean" not in message
 
 
 # ----- outbox_options sqlite_wal validation -----------------------------------

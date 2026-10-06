@@ -420,7 +420,8 @@ def configure(**overrides: Any) -> None:
     ``retry_stale_seconds``, ``max_retry_backoff_seconds`` and
     ``completion_mode``) and ``sqlite_wal`` are validated, and the runtime
     applies them only when it binds the outbox store from ``outbox_url``.
-    Any other key in ``outbox_options`` is accepted and ignored. An
+    Any other key in ``outbox_options`` is rejected with a
+    ``ConfigurationError`` that suggests the closest valid key. An
     application that binds its own store passes the outbox settings to
     ``modulith.builtin.outbox.configure()`` as keyword arguments, and sets
     the journal mode on its own engine.

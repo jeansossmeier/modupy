@@ -752,7 +752,8 @@ def enable_wal(dbapi_connection, _record):
     cursor.close()
 ```
 
-A key outside these eight and `sqlite_wal` is accepted and ignored. A store you
+A key outside these eight and `sqlite_wal` is rejected with a
+`ConfigurationError` that suggests the closest valid key. A store you
 bind yourself with `outbox.configure()` takes the eight settings as keyword
 arguments instead.
 
