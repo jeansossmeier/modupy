@@ -166,7 +166,7 @@ Default of 30s matches typical HTTP timeouts; tune via configuration.
 On timeout, the submitted dispatch is cancelled (best-effort: the
 cancellation lands at the coroutine's next await point, so a sync
 listener already blocking inside an executor thread still runs to
-completion there, but the abandoned dispatch no longer accumulates on
+completion there, but the abandoned dispatch does not accumulate on
 the shared persistent loop).
 
 The first call also bootstraps modulith, lazily, as the first
@@ -196,10 +196,10 @@ within ``timeout`` seconds and was cancelled.
 Distinct by type from a TimeoutError raised BY application code (a
 listener), which propagates out of publish_sync unchanged — on Python
 3.11+ ``concurrent.futures.TimeoutError`` IS ``TimeoutError``, so
-without the dedicated type the two were indistinguishable and the
-testing plugin's scenario runner swallowed real application failures
-as budget overruns. Subclasses TimeoutError, so existing
-``except TimeoutError`` handlers keep working.
+without the dedicated type the two are indistinguishable and the
+testing plugin's scenario runner would swallow real application failures
+as budget overruns. Subclasses TimeoutError, so
+``except TimeoutError`` handlers also catch it.
 
 ### `configure`
 
@@ -233,7 +233,8 @@ retry, dead-letter and completion keys (``claim_strategy``,
 ``retry_stale_seconds``, ``max_retry_backoff_seconds`` and
 ``completion_mode``) and ``sqlite_wal`` are validated, and the runtime
 applies them only when it binds the outbox store from ``outbox_url``.
-Any other key in ``outbox_options`` is accepted and ignored. An
+Any other key in ``outbox_options`` is rejected with a
+``ConfigurationError`` that suggests the closest valid key. An
 application that binds its own store passes the outbox settings to
 ``modulith.builtin.outbox.configure()`` as keyword arguments, and sets
 the journal mode on its own engine.
