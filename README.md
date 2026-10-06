@@ -9,10 +9,11 @@
 
 ![The same three modules in three shapes: one process on day one, one process per module when a feature gets busy, and payments split off into its own service](https://github.com/jeansossmeier/modupy/raw/main/docs/images/growth.svg)
 
-modupy helps you build a Python backend as a **modular monolith**: one codebase, split into modules that talk through events and can't reach into each other's code.
+modupy helps you build a Python backend as a **modular monolith**: one codebase, split into modules that talk through events and public functions, never through each other's private code.
 On day one it is a plain FastAPI app.
 As your company grows, the same code runs one process per module, scales the busy parts, keeps events safe in your database, and splits a module off into its own service.
-Each step is a config change, a command or a few lines of wiring, never a rewrite.
+Your events, listeners and module structure stay the same at every step.
+The outbox needs a few lines of session wiring, and splitting what modules share, such as tables, in-memory state and direct calls into another module, is your job.
 
 ```bash
 pip install 'modupy[fastapi,cli]'
@@ -35,7 +36,7 @@ Most backends end up in one of two painful places:
 modupy is the path in between:
 
 - **Modules with walls.** Each module is a Python package with a public API. Names that start with `_` are private, and `modulith verify` fails your build when another module imports them.
-- **Events instead of calls.** A module publishes `OrderCreated`, and every module that cares reacts to it. The publisher never needs to know who is listening.
+- **Events between modules.** A module publishes `OrderCreated`, and every module that cares reacts to it. The publisher never needs to know who is listening.
 - **One codebase, any shape.** The same modules run in one process, in one process per module, or as separate services. Config picks the shape.
 - **No lost events.** With the outbox on, an event published inside your database transaction is saved with your data, then retried until it is delivered or set aside as a *dead letter* you can replay.
 
@@ -50,15 +51,14 @@ modupy is the path in between:
 | outgrows one server | [`broker = "redis-streams"`](#4-spread-across-machines) | events that travel between machines |
 | gives a team its own service | [`modulith extract <module>`](#5-split-off-a-service) | a standalone service built from one module |
 
-Your events and listeners never change.
-The only code you add is a few lines of session wiring for the outbox, and your URLs stay the same as long as `main.py` mounts each module's `router` at `/<module>`, as the quickstart does.
+Your events and listeners never change, and your URLs stay the same as long as `main.py` mounts each module's `router` at `/<module>`, as the quickstart does.
 
 ## Ready for AI
 
-### Call an LLM without slowing down your API
+### Take LLM calls off the request path
 
 Model calls are slow, rate-limited and sometimes fail.
-Give them their own module and trigger them with an event:
+Put them in a listener in their own module, then turn on the outbox or give the module its own processes, so the call runs after the request has returned:
 
 ```python
 # myapp/assistant/__init__.py, a new module that nothing else imports
@@ -75,13 +75,13 @@ async def write_thank_you_note(event: OrderCreated) -> None:
 
 ![In one process the customer waits for the LLM call; with the outbox or a worker process the request returns at once, and the call runs and retries in the background](https://github.com/jeansossmeier/modupy/raw/main/docs/images/ai-listener.svg)
 
-Then choose how it runs. The listener does not change:
+The listener does not change in any of these setups:
 
 - **With the outbox on** and the order published inside its database session ([step 2](#2-never-lose-an-event)), the note is written after the order commits, in the background, so placing an order stays fast. A failed model call is retried with backoff, up to 10 attempts by default, then kept as a dead letter. `modulith outbox dead-letter --retry-all` replays it by running the listener inside that command, so run it where your model credentials are.
 - **In its own processes** ([step 3](#3-give-busy-modules-their-own-processes)), a slow model cannot hold up your API, and `assistant = 4` under `[tool.modulith.workers]` gives the assistant four of them. There the broker retries a failed call instead, 5 times by default, and keeps its dead letters itself.
 - **As its own service** ([step 5](#5-split-off-a-service)), `modulith extract assistant` gives it its own deploys, scaling and model API keys, or hands it to another team, while the rest of the app keeps publishing the same events.
 
-In the default single process, `publish()` waits for every listener and re-raises the first error, so a slow or failing model call slows down or fails the order request.
+In the default single process, with neither, `publish()` waits for every listener and re-raises the first error, so a slow or failing model call slows down or fails the order request.
 With the outbox or a broker, events are delivered at least once, so make listeners safe to run twice, for example by skipping an order that already has a note.
 
 ### Keep AI coding assistants inside the lines
@@ -657,7 +657,11 @@ If that is not you, it may not be the right fit; [SPEC.md](https://github.com/je
 | One process per module | ✓ one flag | ✗ | ✗ Celery workers split by task queue, not by module | n/a, already separate |
 | Split a module into a service | ✓ `modulith extract` | ✗ by hand | ✗ by hand | n/a, already separate |
 | Adopting on an existing codebase | ✓ baseline and ratchet | n/a | ✓ | ✗ a rewrite |
-| Operational complexity | low | lowest | medium | highest |
+| Operational complexity | low in one process; process mode adds a supervisor and a reverse proxy | lowest | medium | highest |
+
+[tach](https://github.com/gauge-sh/tach) and [import-linter](https://github.com/seddonym/import-linter) enforce import boundaries as a lint step or in CI (`tach check`, `lint-imports`), with no events, outbox, runtime or extraction.
+Pick one of them when import rules are all you need.
+`modulith verify` covers boundaries too, and modupy adds the runtime pieces: events, the outbox, one process per module and `modulith extract`.
 
 modupy is inspired by [Spring Modulith](https://spring.io/projects/spring-modulith).
 
