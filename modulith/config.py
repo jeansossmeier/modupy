@@ -1096,7 +1096,8 @@ def _validate(data: dict[str, Any]) -> None:
         )
 
     # Cross-field: a multi-process topology needs a real cross-process broker.
-    # An absent broker is fine — load_configuration will default it to "shm".
+    # An absent broker is fine — load_configuration defaults it to "database"
+    # when _configured_broker_url finds a URL or DSN, and to "shm" otherwise.
     # An *explicit* memory broker is always wrong for cross-process topologies.
     effective_topology = data.get("topology", "single")
     if effective_topology in ("processes", "subinterpreters") and data.get("broker") == "memory":
