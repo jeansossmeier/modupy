@@ -235,8 +235,8 @@ _BACKOFF_MAX_EXPONENT = 7
 # Dialects that support ``FOR UPDATE SKIP LOCKED``. SQLite has no row
 # locking and rejects the clause outright, so it must never be issued there.
 # MariaDB reports its own dialect name ("mariadb", not "mysql") and has
-# supported SKIP LOCKED since 10.6 (2021) — without it here a ``mariadb://``
-# URL silently degraded to the SQLite-style plain claim, losing the
+# supported SKIP LOCKED since 10.6 (2021) — it must be listed here or a
+# ``mariadb://`` URL falls back to the SQLite-style plain claim and loses the
 # competing-consumer partitioning it is fully capable of. A MariaDB server
 # reached through ``mysql+aiomysql://`` reports ``mysql`` with
 # ``dialect.is_mariadb`` set, so the MySQL-family gate reads the server version.
@@ -248,8 +248,9 @@ _MARIADB_SKIP_LOCKED_MINIMUM = (10, 6)
 # SQLite ``busy_timeout`` (ms) applied to every connection when none is
 # configured: how long a blocked writer waits for the lock before raising
 # SQLITE_BUSY. Kept short (250ms) so app-level retries stay in control of the
-# total budget — a 5s timeout per attempt made ``_SQLITE_BUSY_MAX_RETRIES``
-# stretch toward tens of seconds under multi-worker startup contention.
+# total budget — a 5s timeout per attempt would stretch
+# ``_SQLITE_BUSY_MAX_RETRIES`` toward tens of seconds under multi-worker
+# startup contention.
 _DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 250
 
 # App-level retry budget for a transient SQLite "database is locked" error.
@@ -271,7 +272,7 @@ _SQLITE_SCHEMA_BUSY_MAX_RETRIES = 32
 # Total wall budget for winning every named lock a target-locked write needs.
 _TARGET_LOCK_TIMEOUT_S = 30
 # How long ONE attempt waits inside GET_LOCK before giving its pooled
-# connection back and retrying. Waiting the whole budget in a single call kept
+# connection back and retrying. Waiting the whole budget in a single call keeps
 # the connection checked out for the entire wait, so a handful of publishers
 # contending for one target could occupy every slot in the pool and make
 # unrelated claims, acks and prunes fail with a QueuePool timeout against a
@@ -397,9 +398,9 @@ def _sqlite_busy_delay(attempt: int) -> float:
 
     Deliberately NOT ``_backoff_delay``: that scale (50ms..5s) is sized for
     backend outages, while a busy collision on a local SQLite file usually
-    clears in single-digit milliseconds. Sleeping 50ms+ per collision was
-    measured to push steady-state delivery p50 from ~20ms to ~200ms under
-    concurrent publish + claim traffic (the claim's read->write lock upgrade
+    clears in single-digit milliseconds. Sleeping 50ms+ per collision pushes
+    steady-state delivery p50 from ~20ms to ~200ms under concurrent publish
+    + claim traffic (the claim's read->write lock upgrade
     raises SQLITE_BUSY immediately, so collisions are routine, not
     exceptional). Early attempts stay in the 2-11ms range for the common
     fast-clear case; the geometric growth (capped at 50ms) restores a ~170ms
@@ -475,9 +476,9 @@ def _is_already_exists(exc: BaseException) -> bool:
 def _add_missing_message_columns(connection: Any, schema: str | None) -> None:
     """Add ``broker_message`` columns newer than a self-bootstrapped table.
 
-    ``metadata.create_all`` skips a table that already exists, so a database
-    the broker bootstrapped before ``dispatch_started`` existed would never
-    gain it. Migration 0006 adds the same column for alembic-managed
+    ``metadata.create_all`` skips a table that already exists, so a
+    self-bootstrapped table lacking ``dispatch_started`` would never gain it.
+    Migration 0006 adds the same column for alembic-managed
     databases and skips it when this backfill already ran.
     """
     from sqlalchemy import inspect
@@ -993,9 +994,8 @@ def broker_schema() -> tuple[Any, Any, Any]:
         Index("ix_broker_message_target", "target"),
     )
 
-    # These auxiliary tables intentionally stay outside broker_schema()'s
-    # return tuple. Existing callers continue to receive the original
-    # (metadata, subscription, message) public shape.
+    # These auxiliary tables stay outside broker_schema()'s return tuple so
+    # it keeps its (metadata, subscription, message) public shape.
     retained_message = Table(
         "broker_retained_message",
         metadata,
@@ -1146,7 +1146,7 @@ class DatabaseBroker:
                 f"max_payload_bytes must be <= {MAX_PAYLOAD_BYTES}, got {max_payload_bytes!r}"
             )
         # Real SQLAlchemy engines always expose a dialect. Minimal injected
-        # engines without one retain the adapter's historical SQLite behavior.
+        # engines without one are treated as SQLite.
         dialect_name = getattr(getattr(self._engine, "dialect", None), "name", "sqlite")
         self._is_sqlite = dialect_name == "sqlite"
         # Falling back to the migrations' own knob keeps the runtime pointed at
@@ -1396,9 +1396,9 @@ class DatabaseBroker:
         The wall budget covers waiting — acquiring the connection/transaction
         and the geometric backoff sleeps — but NOT ``operation`` itself. An
         attempt that has started doing work runs to completion: capping the
-        work aborted legitimately long writes (a bulk ``prune`` delete over a
-        few hundred thousand rows) with a ``TimeoutError`` that
-        ``_is_sqlite_locked`` cannot match, so it never retried, and could
+        work would abort legitimately long writes (a bulk ``prune`` delete over
+        a few hundred thousand rows) with a ``TimeoutError`` that
+        ``_is_sqlite_locked`` cannot match, so it would never retry, and could
         abandon a transaction the database had already committed.
 
         Exhausting that budget always surfaces as ``TimeoutError``, whether the
@@ -1452,8 +1452,8 @@ class DatabaseBroker:
         if not ordered_targets:
             return await self._write(operation)
         # Same defensive read as __init__'s _is_sqlite: a minimal injected
-        # engine without a dialect keeps the adapter's historical SQLite
-        # behavior instead of raising AttributeError on this path alone.
+        # engine without a dialect is treated as SQLite instead of raising
+        # AttributeError on this path alone.
         dialect = getattr(getattr(self._engine, "dialect", None), "name", "sqlite")
         if dialect in {"mysql", "mariadb"}:
             return await self._write_mysql_target_locked(ordered_targets, operation)
@@ -1571,7 +1571,7 @@ class DatabaseBroker:
         if dialect in {"mysql", "mariadb"}:
             # UTC_TIMESTAMP(6) (not NOW(), which is session-timezone dependent)
             # returns microsecond-precision naive UTC; tag it UTC so it
-            # round-trips like the app-clock path did (columns are tz-aware).
+            # round-trips like an app-clock timestamp (columns are tz-aware).
             result = await conn.execute(text("SELECT UTC_TIMESTAMP(6)"))
             return cast(datetime, result.scalar_one()).replace(tzinfo=UTC)
         if dialect == "sqlite":

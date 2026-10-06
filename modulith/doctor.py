@@ -167,8 +167,8 @@ def _check_boundary_health(rt: Runtime, baseline_path: Path) -> HealthCheck:
     warnings = [v for v in violations if v.severity is ViolationSeverity.WARNING]
     if not errors:
         # Warning-only violations (e.g. data-ownership) must not read as "ok" —
-        # they're the framework's best-effort signal and were previously
-        # invisible in the overall status. Surface them as a distinct warn.
+        # they're the framework's best-effort signal and the overall status has
+        # to show them. Surface them as a distinct warn.
         if warnings:
             return HealthCheck(
                 "boundary health",
@@ -446,9 +446,9 @@ def _check_outbox_health(rt: Runtime) -> HealthCheck:
             f"outbox configured as {cfg.outbox!r} but no store is wired",
         )
 
-    # status() now reports UNBOUNDED counts (via the store's count_open /
+    # status() reports UNBOUNDED counts (via the store's count_open /
     # count_dead_lettered), not a sample capped at find_incomplete's LIMIT 100 —
-    # so a real backlog (50k stuck rows) is visible here instead of reading 100.
+    # so a real backlog (50k stuck rows) shows its true size here.
     # Bounded by a timeout: an unresponsive store (network partition, stalled
     # connection pool) must not hang `doctor` forever.
     try:

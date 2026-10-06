@@ -495,7 +495,7 @@ class RedisStreamsBroker:
         stream = self._stream_name(target)
         group_name = group or self._consumer_group
         # The append and ACK must be atomic: a client timeout between XADD and
-        # XACK used to produce a duplicate DLQ record on retry. The dedup key
+        # XACK would make the retry write a duplicate DLQ record. The dedup key
         # uses the original stream/group/message identity and expires with the
         # bounded forensic retention window. It is written only AFTER the XADD
         # it guards succeeds — Lua's redis.call() aborts the script without
@@ -570,7 +570,7 @@ class RedisStreamsBroker:
             consumer_group=group.decode() if group is not None else self._consumer_group,
             event_type=event_type.decode() if event_type is not None else None,
             # dead_letter copies the PEL delivery count into h:attempts. A dead
-            # letter written before it did has none; 1 is a lower bound for it.
+            # letter without that field has no recorded count; 1 is a lower bound.
             attempts=int(attempts) if attempts is not None else 1,
             last_error=None,
             created_at=_EPOCH + timedelta(milliseconds=int(ms)),

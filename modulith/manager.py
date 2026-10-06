@@ -159,10 +159,10 @@ def _load_entrypoint_plugins(
     pluggy handles the importlib.metadata machinery and reports the count
     for diagnostics. Disabled names are blocked FIRST so pluggy's own
     is_blocked() check skips them inside load_setuptools_entrypoints —
-    before their modules are imported. Unregistering after loading (the
-    old approach) removed the hookimpls but only after the module's
-    import-time side effects had run, breaking the "skip during loading"
-    promise in create_plugin_manager's docstring. The names are unblocked
+    before their modules are imported. Unregistering after loading would
+    remove the hookimpls only after the module's import-time side effects
+    had run, breaking the "skip during loading" promise in
+    create_plugin_manager's docstring. The names are unblocked
     afterwards so an explicitly-passed extra plugin can still register
     under the same canonical name — extras are intentional and take final
     precedence.

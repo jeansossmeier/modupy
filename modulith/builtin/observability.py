@@ -172,8 +172,8 @@ def modulith_on_publish_error(event: Any, exception: BaseException) -> None:
     persistence/dispatch, so when ``Runtime.publish`` fails between the
     paired hooks (outbox persist/serialize/broker-route raised) no hook
     fires and the span started in
-    ``modulith_before_event_published`` leaked: never ended (so never
-    exported — tracing went blind exactly during the outages the outbox
+    ``modulith_before_event_published`` would leak: never ended (so never
+    exported — tracing would go blind exactly during the outages the outbox
     exists for) and left stale in the ContextVar, mis-parenting the next
     dispatch span in the same context. This observe-only hook is the runtime's
     paired signal for that failure; records the exception, sets ERROR status,

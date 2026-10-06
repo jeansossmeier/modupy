@@ -248,13 +248,12 @@ def _replica_ports(spec: WorkerSpec) -> list[int]:
 # trivial processes instead of a full uvicorn worker.
 CommandBuilder = Callable[[WorkerSpec, int], list[str]]
 
-# redis_broker.py predates the generic MODULITH_BROKER_<KEY> convention that
-# cli.py uses to forward a resolved broker_options table (matching
-# db_broker.py's _broker_opt) — it only reads these specific historical
-# names. Mirror the generic form onto them so a broker_options.url etc.
-# resolved by the parent and forwarded as MODULITH_BROKER_URL actually
-# reaches a re-bootstrapping redis-streams worker, instead of silently never
-# arriving because the adapter looks for a different env var name.
+# redis_broker.py reads only these specific env names, not the generic
+# MODULITH_BROKER_<KEY> convention cli.py uses to forward a resolved
+# broker_options table (matching db_broker.py's _broker_opt). Mirror the
+# generic form onto them so a broker_options.url etc. resolved by the parent
+# and forwarded as MODULITH_BROKER_URL reaches a re-bootstrapping
+# redis-streams worker.
 _REDIS_BROKER_ENV_ALIASES = {
     "MODULITH_BROKER_URL": "REDIS_URL",
     "MODULITH_BROKER_STREAM_PREFIX": "MODULITH_STREAM_PREFIX",
@@ -347,8 +346,8 @@ class _RestartPolicy:
         crashes (rather than crashes inside a rolling time window) is
         deliberate: a module crashing at a steady interval slower than
         roughly max_restarts/window would keep a window's in-window count at
-        or below max_restarts forever, so it was respawned indefinitely
-        instead of ever tripping. Consecutive counting catches any steady
+        or below max_restarts forever, so it would be respawned indefinitely
+        without ever tripping. Consecutive counting catches any steady
         crash loop regardless of how far apart the crashes are.
     """
 
@@ -528,7 +527,7 @@ class Supervisor:
         # module-name prefix would make all replicas' interleaved output
         # indistinguishable and unattributable to the crash/restart messages,
         # which are keyed by instance. Single-replica instances are named
-        # after their module, so their output is unchanged.
+        # after their module.
         logger.info("spawned worker %r on port %d (pid %s)", name, port, proc.pid)
         if proc.stdout is not None:
             self._track_log_task(
@@ -721,7 +720,7 @@ class Supervisor:
         A process the dead worker started (a fork-started pool child, say)
         inherits its listening socket and can outlive it. Every respawn
         would then fail to bind, and each failure would count as a crash,
-        so a hold of a few tens of seconds made the breaker abandon the
+        so a hold of a few tens of seconds would make the breaker abandon the
         module for good. Waiting here costs no crash. Past the bound the
         respawn goes ahead, and the breaker handles a port that stays held.
         ``stop()`` ends the wait at once. The processes holding the port are
@@ -756,15 +755,15 @@ class Supervisor:
         """Read a worker's output line-by-line and re-log it with its name.
 
         Each line is re-emitted at the severity the WORKER gave it, never at a
-        fixed level: re-logging everything at INFO put the supervisor's own
-        level filter in charge of what an operator sees, and since nothing
-        configures the root logger in a plain deployment, that silently
-        swallowed every warning a worker emitted — including the one saying a
+        fixed level: re-logging everything at INFO would put the supervisor's
+        own level filter in charge of what an operator sees, and since nothing
+        configures the root logger in a plain deployment, that would silently
+        swallow every warning a worker emits — including the one saying a
         module exposes no ``router`` and therefore 404s every request.
 
         ``default_level`` is the severity for a line that carries no level
         token, and differs by stream because the two streams mean different
-        things. On stderr an untagged line came either through
+        things. On stderr an untagged line comes either through
         ``logging.lastResort`` (nothing configures logging in a worker
         process, and lastResort only emits WARNING and above) or from an
         interpreter-level traceback, so WARNING is its floor. stdout is not a
@@ -966,10 +965,10 @@ def _env_flag(name: str) -> bool:
 
     Delegates to ``config._env_bool`` so the supervisor and the application
     configuration parse the same spellings and reject the same garbage. A
-    lenient parser here was a safety downgrade: ``MODULITH_PRODUCTION=ture``
-    raised in ``load_configuration()`` but silently resolved to False in this
-    process, quietly turning production hardening (the actuator's token
-    requirement) back off.
+    lenient parser here would be a safety downgrade: ``MODULITH_PRODUCTION=ture``
+    raises in ``load_configuration()`` but would silently resolve to False in
+    this process, quietly turning production hardening (the actuator's token
+    requirement) off.
     """
     from .config import _env_bool
 
@@ -1216,8 +1215,8 @@ async def run_supervised(
         try:
             loop.add_signal_handler(sig, _handle_shutdown_signal, sig)
         except (NotImplementedError, RuntimeError):
-            # No signal support (Windows) or not the main thread — the
-            # pre-existing orphan risk on those platforms is unchanged.
+            # No signal support (Windows) or not the main thread: a signal in
+            # the spawn window can still orphan the workers there.
             continue
         installed_signals.append(sig)
         own_dispositions[sig] = signal.getsignal(sig)

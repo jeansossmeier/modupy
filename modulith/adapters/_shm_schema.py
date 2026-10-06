@@ -181,8 +181,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 _migrate_v2(conn)
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         # Idempotent and run on every open (not gated on a version bump) so a
-        # store already at SCHEMA_VERSION from before this index existed gets
-        # it backfilled without a schema-version migration path.
+        # store already at SCHEMA_VERSION that lacks this index gets it
+        # backfilled without a schema-version migration path.
         conn.execute(_PUBLICATION_EXPIRY_INDEX_SCHEMA)
         _add_dispatch_started_column(conn)
         _add_subscription_updated_at_column(conn)

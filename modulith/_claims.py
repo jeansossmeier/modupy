@@ -27,7 +27,7 @@ imported cheaply from both the config-validation path and any adapter.
 the ``ClaimingStore``/``AdvisoryLockingStore`` capability via
 ``isinstance``/``getattr`` duck typing before using any of this — third-party
 stores (or the in-memory test double) that omit these methods simply keep
-the original non-claiming dispatch path.
+the non-claiming dispatch path.
 """
 
 from __future__ import annotations
@@ -74,8 +74,8 @@ class Claim:
 class ClaimingStore(Protocol):
     """Optional lease-mode capability a PublicationStore may implement.
 
-    Stores without this get the outbox plugin's original non-claiming
-    dispatch path (``find_incomplete`` + direct dispatch).
+    Stores without this get the outbox plugin's non-claiming dispatch path
+    (``find_incomplete`` + direct dispatch).
     """
 
     async def claim_batch(

@@ -2,9 +2,9 @@
 
 The *producer* half lives in ``runtime._maybe_route_to_broker``: a cross-module
 event is serialized and XADD'd to the broker under its fully-qualified name.
-This module is the *consumer* half — without it, events were durably written to
-the broker and **never delivered**, silently dropping every cross-process event
-(the headline feature of ``topology='processes'``).
+This module is the *consumer* half — without it, events durably written to
+the broker would **never be delivered**, silently dropping every cross-process
+event (the headline feature of ``topology='processes'``).
 
 Each worker hosts one module. ``BrokerConsumer`` subscribes to the broker
 streams for exactly the event types that module's local listeners consume
@@ -68,10 +68,10 @@ logger = logging.getLogger("modulith.consumer")
 _MAX_DELIVERY_ATTEMPTS = 5
 
 # Capped exponential backoff for consecutive broker read()/reclaim() failures.
-# Without it, a downed Redis triggered an unbounded busy-retry loop (~281
-# failures/sec measured) that — when the broker raised
-# synchronously — never even yielded to the event loop, starving every other
-# coroutine in the process. 0.05s, 0.1s, 0.2s, … capped at 5s.
+# Without it, a downed Redis would trigger an unbounded busy-retry loop that —
+# when the broker raised synchronously — never even yields to the event loop,
+# starving every other coroutine in the process. 0.05s, 0.1s, 0.2s, … capped
+# at 5s.
 _BACKOFF_BASE_S = 0.05
 _BACKOFF_CAP_S = 5.0
 # 0.05 * 2**7 = 6.4s already exceeds the cap — bound the exponent so the
@@ -148,9 +148,8 @@ class BrokerConsumer:
         self._group = group
         self._targets = list(targets)
         # Real Redis treats XREADGROUP BLOCK 0 as "block forever awaiting new
-        # entries" (the opposite of the immediate-return some test fakes
-        # modeled) — a non-positive value would hang a worker
-        # indefinitely, so it never reaches the broker.
+        # entries" — a non-positive value would hang a worker indefinitely, so
+        # it never reaches the broker.
         if poll_block_ms <= 0:
             logger.warning(
                 "poll_block_ms=%d is unsafe (Redis BLOCK 0 blocks forever) — clamped to 1ms",
@@ -360,9 +359,9 @@ class BrokerConsumer:
                 await self._reclaim(target)
             # Read every subscribed stream CONCURRENTLY. Each read blocks
             # server-side for up to poll_block_ms, so awaiting them one after
-            # another made an idle worker's delivery latency scale with its
-            # stream count — an event landing just after its own stream was
-            # polled waited (N-1) * poll_block_ms for the cycle to come back
+            # another would make an idle worker's delivery latency scale with
+            # its stream count — an event landing just after its own stream was
+            # polled would wait (N-1) * poll_block_ms for the cycle to come back
             # around (~9s for a module listening to 10 event types on the 1s
             # default). Concurrently, idle latency is one poll_block_ms no
             # matter how many streams there are, at the cost of holding one
@@ -509,11 +508,11 @@ class BrokerConsumer:
         """Backoff + NOGROUP recovery after a failed broker ``read``/``reclaim``.
 
         * NOGROUP means the broker lost the stream/consumer-group state (e.g.
-          Redis restarted without a snapshot). ``ensure_group`` was previously
-          issued exactly once at ``start()``, so a recovered-but-empty Redis
-          stalled consumption permanently and silently —
-          re-issue it here so the next read()/reclaim() can succeed. A failure
-          to re-create (broker still down) is logged and retried next cycle.
+          Redis restarted without a snapshot). ``ensure_group`` at ``start()``
+          alone would leave a recovered-but-empty Redis stalling consumption
+          permanently and silently — re-issue it here so the next
+          read()/reclaim() can succeed. A failure to re-create (broker still
+          down) is logged and retried next cycle.
         * Sleep with capped exponential backoff so an outage degrades to
           periodic retries instead of a CPU-bound spin. The
           sleep also guarantees the loop yields control even when the broker
@@ -566,7 +565,7 @@ class BrokerConsumer:
         after the first, a broker offering ``renew_claim`` confirms this
         consumer still owns it and restarts its idle clock; an entry it no
         longer owns is skipped, not acknowledged, since the peer now
-        owns its outcome. A broker without ``renew_claim`` is trusted as before.
+        owns its outcome. A broker without ``renew_claim`` is trusted unchecked.
         If the check itself fails the entry stays pending for a later reclaim.
 
         A reclaimed entry that has already had ``max_delivery_attempts``
@@ -762,8 +761,8 @@ class BrokerConsumer:
     async def _dead_letter(self, target: str, mid: str, fields: dict[bytes, bytes]) -> None:
         """dead_letter via the broker, never letting a broker blip escape.
 
-        A raise from broker.dead_letter() previously propagated out of the
-        consumer task and killed the whole loop permanently.
+        A raise from broker.dead_letter() would propagate out of the
+        consumer task and kill the whole loop permanently.
         On failure the message stays pending (dead_letter ACKs only on
         success), so reclaim redelivers it and dead-lettering is retried; the
         attempt counter is only cleared on success so the retry dead-letters

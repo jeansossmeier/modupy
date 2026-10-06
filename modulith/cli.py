@@ -142,7 +142,7 @@ def _bootstrap_or_exit(*, inspection: bool = False) -> Runtime:
     every frame above a CLI command belongs to typer/click, so the stack walk
     would "detect" the CLI framework itself as the application package and
     the command would silently run against the wrong package — ``verify``
-    exited 0 without ever scanning the real app. Resolve the package up
+    would exit 0 without ever scanning the real app. Resolve the package up
     front instead: explicit configuration wins, then pyproject
     ``[project].name``, otherwise exit 1 with actionable guidance.
     """
@@ -200,7 +200,7 @@ def _configure_process_runtime(app_module: str) -> None:
     The package comes from explicit configuration when present; otherwise it
     is derived from ``app_module``. When both exist and disagree, warn loudly:
     the process topology runs the *configured* package's modules and never
-    reads ``app_module`` again, so silence here launched a different app's
+    reads ``app_module`` again, so silence here would launch a different app's
     workers on a typo'd argument.
     """
     try:
@@ -282,9 +282,8 @@ _T = TypeVar("_T")
 def _validate_topology(topology: str) -> None:
     """Reject anything outside the two supported topologies.
 
-    Anything unrecognized used to route to the process-per-module supervisor
-    (the branch was ``!= "single"``), silently launching the wrong
-    architecture on a typo.
+    Anything unrecognized exits 1: routing it to the process-per-module
+    supervisor would silently launch the wrong architecture on a typo.
     """
     if topology not in _TOPOLOGIES:
         typer.echo(
@@ -540,9 +539,9 @@ def _run_outbox_command(coro: Coroutine[Any, Any, _T]) -> _T:
 def _parse_workers_json(workers_json: str) -> dict[str, Any]:
     """Parse ``--workers`` into a dict, exiting 1 on anything else.
 
-    JSON that parses but isn't an object (a list, number, string…) used to
-    crash the supervisor with an AttributeError traceback — the option's
-    contract is an object like ``{"reports": 4}``.
+    JSON that parses but isn't an object (a list, number, string…) exits 1
+    rather than crashing the supervisor with an AttributeError traceback — the
+    option's contract is an object like ``{"reports": 4}``.
 
     Values are validated exactly as the ``[tool.modulith.workers]`` table is
     (``config._validate``): a positive ``int``, never a bool or a numeric
@@ -793,8 +792,8 @@ def _run_process_topology(
                 worker_env[env_key] = str(path)
 
     # Workers are `python -m uvicorn` subprocesses, so their sys.path starts
-    # from the inherited working directory. _add_project_root_to_syspath fixed
-    # the application package's importability for THIS process only; launched
+    # from the inherited working directory. _add_project_root_to_syspath makes
+    # the application package importable in THIS process only; launched
     # from a subdirectory of the project, every worker dies importing the very
     # package the parent just discovered, and the restart loop hides behind a
     # proxy that stays up and answers 502. Forward the same root, prepended so
@@ -1048,8 +1047,8 @@ def verify(
     errors. Designed to drop into CI as a single line. `--update-baseline`
     records the current violation set as the accepted baseline and exits 0.
     """
-    # Argument validation precedes bootstrap: a typo'd mode used to fall
-    # through to strict semantics, ignoring the baseline.
+    # Argument validation precedes bootstrap: a typo'd mode would otherwise
+    # fall through to strict semantics, ignoring the baseline.
     if mode not in ("strict", "ratchet"):
         typer.echo(f"invalid --mode {mode!r}: expected 'strict' or 'ratchet'", err=True)
         raise typer.Exit(code=1)
@@ -2012,7 +2011,7 @@ def outbox_dead_letter(
 
     Listing is the default; `--list` makes it explicit. `--list` and
     `--retry-all` are mutually exclusive — passing both is an error rather
-    than silently doing one (the previously-inert `--list` masked this).
+    than silently doing one.
     """
     # Argument validation precedes environment preconditions: the flag
     # conflict must be reported even when no store is configured.

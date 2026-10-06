@@ -222,9 +222,9 @@ _hook_installed = False
 # Every live (constructed, not-yet-disposed) store, in creation order; the
 # active store is always the top. An explicit stack — not a per-store
 # back-pointer — so dispose() can remove a store from *anywhere* in it:
-# a single ``_prev_store`` link only unwound correctly in strict LIFO order
-# and would resurrect an already-disposed (possibly engine-closed) store as
-# the dispatch target when stores were disposed in creation order.
+# a back-pointer chain unwinds correctly only in strict LIFO order, and
+# creation-order disposal would resurrect an already-disposed (possibly
+# engine-closed) store as the dispatch target.
 _store_stack: list[PostgresPublicationStore] = []
 
 
@@ -1517,8 +1517,8 @@ class PostgresPublicationStore:
         A finished task is dropped here instead of waiting for the done
         callback that removes it, which its loop runs one step later: on
         Python 3.12+ ``asyncio.gather()`` over finished tasks completes
-        without yielding, so waiting for that callback spun forever without
-        letting the loop run it. A task on a closed loop never finishes; it is
+        without yielding, so waiting for that callback would spin forever
+        without letting the loop run it. A task on a closed loop never finishes; it is
         dropped with a WARNING, as ``outbox.shutdown()`` drops a stranded
         retry task, and the retry sweep delivers its publication.
         """

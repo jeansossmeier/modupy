@@ -150,8 +150,8 @@ class Runtime:
         # race. After bootstrap, the flag is read without locking.
         # REENTRANT: bootstrap imports application code (discovery) and runs
         # plugin hooks while holding it; a module-level @listener decorator or
-        # a plugin calling back into the runtime on the same thread must not
-        # self-deadlock (a plain Lock froze the process forever here).
+        # a plugin calling back into the runtime on the same thread re-enters
+        # it, which a plain Lock would turn into a self-deadlock.
         self._lock = threading.RLock()
         # The thread currently running _bootstrap(), or None. Lets re-entrant
         # calls (configure()/ensure_bootstrapped()/publish_sync() reached from
@@ -313,7 +313,7 @@ class Runtime:
 
         The check-then-act runs under the runtime lock, so a registration
         racing _bootstrap()'s flush can never land in a pending list that
-        has already been consumed (which silently lost the listener
+        has already been consumed (which would silently lose the listener
         forever): another thread's registration either arrives before the
         flush, or blocks until bootstrap finishes and registers directly.
         The lock is reentrant, so module-level @listener decorators firing
@@ -485,7 +485,7 @@ class Runtime:
             outbox.configure(store, JsonEventSerializer(allowed_event_types=event_types), **tuning)
         except BaseException:
             # A refused configure() must not strand the store on the live-store
-            # stack or the engine's pool: each retried bootstrap leaked both.
+            # stack or the engine's pool: each retried bootstrap would leak both.
             store._deactivate()
             engine.sync_engine.dispose()
             raise
@@ -521,9 +521,7 @@ class Runtime:
         remote consumer with zero trace. Callers that need publish() to be
         decoupled from broker availability should use the transactional
         outbox path (bind a session + durable store), where the send
-        happens after commit with retry/dead-letter handling. Pinned by
-        tests/test_cross_process.py::
-        test_broker_publish_failure_propagates_to_publisher.
+        happens after commit with retry/dead-letter handling.
         """
         self.ensure_bootstrapped()
         assert self._plugin_manager is not None  # for type-checker
@@ -538,8 +536,8 @@ class Runtime:
             # local listeners and run them before the business commit).
             # Broker routing is commit-gated the same way: the route is
             # persisted as its own publication row in the bound session and
-            # sent after commit. Sending synchronously here handed the event
-            # to remote consumers *before* the business transaction committed
+            # sent after commit. Sending synchronously here would hand the event
+            # to remote consumers *before* the business transaction commits
             # — a rollback could not un-send it, the exact inconsistency the
             # outbox exists to prevent.
             from .builtin import outbox
@@ -564,11 +562,11 @@ class Runtime:
             # Fire the post-publish hook on the durable path too: the event is
             # now persisted, which is exactly what the hookspec documents
             # ("after an event has been persisted to the outbox"). Omitting it
-            # here made metrics/tracing plugins miss every transactional
+            # here would make metrics/tracing plugins miss every transactional
             # publish — the production path the outbox exists for. Hand hook
-            # consumers the records actually saved (EventPublishReceipt)
-            # instead of a fabricated EventPublication matching neither the
-            # persisted id nor the configured storage serializer's bytes.
+            # consumers the records actually saved (EventPublishReceipt): a
+            # fabricated EventPublication would match neither the persisted id
+            # nor the configured storage serializer's bytes.
             receipt = EventPublishReceipt(records=tuple(records))
             pm.hook.modulith_after_event_published(event=event, publication=receipt)
             return
@@ -638,7 +636,7 @@ class Runtime:
         broker route) fires no further hook — the hookspec scopes the after
         hook to success — so any cleanup a plugin started in the before hook
         (the built-in observability plugin's publish span, most notably)
-        leaked: never ended, with a stale ContextVar mis-parenting the next
+        would leak: never ended, with a stale ContextVar mis-parenting the next
         dispatch span in the same context. Purely observational
         — the ``_ObserveContractShield`` in ``manager.py`` guarantees a
         raising hookimpl is logged and swallowed rather than masking the
@@ -669,10 +667,11 @@ class Runtime:
         """Best-effort serialized bytes for hook-facing EventPublications.
 
         The lifecycle/observability hooks (dead-letter handlers, audit logs)
-        receive real payload bytes on the durable outbox path; the in-memory
-        path used to hand them a hardcoded ``b""``, silently defeating those
-        use cases. In-memory dispatch must not *require* serializability
-        (only the durable outbox does), so failures degrade back to ``b""``
+        receive real payload bytes on the durable outbox path and, through
+        this helper, on the in-memory path: a hardcoded ``b""`` would silently
+        defeat those use cases. In-memory dispatch must not *require*
+        serializability (only the durable outbox does), so failures degrade
+        back to ``b""``
         with a debug log instead of failing the publish. Serialization uses
         the default JSON serializer; these publications are observational
         only — they are never persisted or redelivered.
@@ -718,8 +717,7 @@ class Runtime:
 
         event_type = f"{type(event).__module__}.{type(event).__qualname__}"
         # Serialize once per publish; every hook-facing publication below
-        # shares the same bytes (real data for dead-letter/audit hooks, not
-        # the hardcoded b"" they used to receive on this path).
+        # shares the same bytes (real data for dead-letter/audit hooks).
         payload = self._serialized_payload(event)
         publish_pub = EventPublication(
             id=uuid4(), payload=payload, event_type=event_type, published_at=datetime.now(UTC)
@@ -943,10 +941,7 @@ class Runtime:
         whose scheme or destination is empty (a hook returning ``"scheme:"``),
         or whose scheme has no registered broker, raises
         ConfigurationError — uniformly for the default scheme and for
-        explicit ``@externalized(target=...)`` overrides. (The old behavior
-        was the worst of both worlds: the default-scheme case silently
-        dropped the event forever, while an explicit target crashed with an
-        undocumented UnknownBrokerError.)
+        explicit ``@externalized(target=...)`` overrides.
         """
         cfg = self._config
         if cfg is None or cfg.topology == "single":
@@ -1061,9 +1056,9 @@ class Runtime:
         installed on ``self`` only after all steps succeed. An exception at
         any step — a discovery import error, a failed manifest verification —
         leaves the runtime exactly as it was, so ensure_bootstrapped() can
-        genuinely be retried. The previous in-place version left a half-built
-        bus behind and cleared the pending-listener queue, so a retry
-        "succeeded" with every already-imported module's listeners silently
+        genuinely be retried. Building in place would leave a half-built
+        bus behind and clear the pending-listener queue, so a retry would
+        "succeed" with every already-imported module's listeners silently
         gone (imports are cached; their @listener decorators never re-fire).
 
         One deliberate exception: the resolved configuration is installed
@@ -1116,7 +1111,7 @@ class Runtime:
         # The resolved configuration is installed on ``self`` HERE, before the
         # hook fires: adapter hookimpls (the redis-streams broker) and module
         # code imported by discovery read it lazily via ``_runtime.config``,
-        # so keeping it local until the commit point silently turned broker
+        # so keeping it local until the commit point would silently turn broker
         # registration into a no-op. It is the ONE piece of state exposed
         # early; the except-block rolls it back so a failed bootstrap still
         # leaves the runtime pristine for a clean retry.
@@ -1214,9 +1209,7 @@ class Runtime:
             # 6.6. Notify plugins that each module is loaded. Fires AFTER
             # discovery (modules imported, @listener decorators run) and
             # manifest verification so the hookspec's "after all listeners and
-            # event types are wired" contract holds. Previously declared but
-            # never invoked — plugins that implement it (startup metrics,
-            # module-scoped resources, doc canvases) silently never ran.
+            # event types are wired" contract holds.
             for module in modules:
                 plugin_manager.hook.modulith_after_module_load(module=module)
 
@@ -1246,7 +1239,7 @@ class Runtime:
             # that registered into it during step 4.5 (e.g. a redis client)
             # is live and must still be closed — otherwise a LATER step
             # failing (discovery, manifests, modulith_after_module_load)
-            # leaked it for the process lifetime.
+            # would leak it for the process lifetime.
             self._config = None
             self._drop_listeners_of_unloaded_modules()
             self._close_provisional_brokers(broker_registry)
@@ -1371,8 +1364,8 @@ class Runtime:
         """Release runtime-owned resources — closes every registered broker.
 
         Fulfils the Broker.close() / BrokerRegistry.close_all() contract
-        ("called once on application shutdown"), which previously had no caller:
-        a redis-streams client's connection leaked for the process lifetime.
+        ("called once on application shutdown"): without this call a
+        redis-streams client's connection leaks for the process lifetime.
         Also stops the first-party outbox retry loop when the runtime owns the
         process lifecycle. Idempotent and safe to call when no broker/outbox was
         ever registered. Invoke from a worker's ASGI lifespan teardown and the
@@ -1394,13 +1387,13 @@ class Runtime:
         ``_reset_for_testing`` instead).
 
         The local step (outbox stop + store drain) and the broker step
-        (``registry.close_all()``) run INDEPENDENTLY: a failure in one no
-        longer skips the other — a store whose ``wait_for_dispatch()`` raises
-        used to abort before brokers ever got a chance to close, leaking
-        their connections on every failed drain. When only one step fails,
-        that single exception propagates unchanged (no behavior change for
-        the common case); when BOTH fail, they're combined into an
-        ``ExceptionGroup`` so neither failure silently displaces the other.
+        (``registry.close_all()``) run INDEPENDENTLY: a failure in one does
+        not skip the other — a store whose ``wait_for_dispatch()`` raises
+        must not stop brokers from closing, which would leak their
+        connections on every failed drain. When only one step fails,
+        that single exception propagates unchanged; when BOTH fail, they're
+        combined into an ``ExceptionGroup`` so neither failure silently
+        displaces the other.
         """
         from .builtin import outbox
 
@@ -1443,7 +1436,7 @@ class Runtime:
         """Reset to uninitialized state. ONLY for tests.
 
         Beyond nulling the runtime's own fields, this tears down the
-        cross-cutting machinery the old implementation leaked between
+        cross-cutting machinery that would otherwise leak between
         tests: registered brokers are closed (their connections otherwise
         outlive the "fresh runtime") and the outbox plugin's module state —
         store, serializer, retry task — is cleared, so a store configured by

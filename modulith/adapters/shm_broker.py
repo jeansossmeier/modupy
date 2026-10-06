@@ -185,8 +185,8 @@ class ShmBroker:
 
     Satisfies the ``modulith.protocols.Broker`` protocol and provides
     consumer-side methods driven by ``ShmConsumer``. The ``slot_size`` keyword
-    is retained as an ignored compatibility argument because hints now store
-    fixed-size sequence numbers.
+    is an ignored compatibility argument because hints store fixed-size
+    sequence numbers.
     """
 
     # ``subscribe`` replaces the group's subscriptions, so a stale target stops

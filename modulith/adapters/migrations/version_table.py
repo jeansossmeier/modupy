@@ -2,9 +2,9 @@
 
 The chain tracks itself in ``modulith_alembic_version`` so a database with its
 own Alembic history in the default ``alembic_version`` table can run it.
-Installs migrated before that kept modulith's revision in ``alembic_version``;
-``move_legacy_revision`` moves it over on the next migration run and never
-touches a revision outside the packaged chain.
+A modulith revision still held in ``alembic_version`` is moved over on the next
+migration run by ``move_legacy_revision``, which never touches a revision
+outside the packaged chain.
 """
 
 from __future__ import annotations

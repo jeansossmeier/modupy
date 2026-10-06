@@ -139,12 +139,11 @@ def modulith_on_publish_error(event: Any, exception: BaseException) -> None:
     ``modulith_after_event_published`` is contractually scoped to a
     successful publish — persisted on the durable path, dispatched
     in-memory otherwise — so it never fires when persistence, event
-    serialization, or an inline broker route raises. Without a dedicated
-    failure signal, any cleanup a plugin started in
-    ``modulith_before_event_published`` (the built-in observability
-    plugin's publish span, most notably) had no paired hook to run in —
-    leaking whatever it was holding open until the next lucky GC pass or
-    process exit.
+    serialization, or an inline broker route raises. This is the paired hook
+    for any cleanup a plugin started in ``modulith_before_event_published``
+    (the built-in observability plugin's publish span, most notably):
+    without a failure signal, a failed publish would leave whatever that
+    cleanup holds open until the next lucky GC pass or process exit.
 
     Purely observational, like the listener lifecycle's error hook: it does
     not gate, and exceptions raised by implementations are logged and

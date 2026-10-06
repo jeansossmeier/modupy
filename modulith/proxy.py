@@ -64,8 +64,8 @@ def _probe_pool_size(rules: list[RoutingRule]) -> int:
 
 
 class _AnyCharPathConvertor(PathConvertor):
-    """Starlette's ``path`` convertor (``.*``) stops at a newline, so a path
-    holding ``%0A`` fell through to Starlette's 404 instead of reaching the worker."""
+    """Starlette's ``path`` convertor (``.*``) does not match a newline, so a path
+    holding ``%0A`` would 404 in Starlette instead of reaching the worker."""
 
     regex = "(?s:.*)"
 
@@ -90,9 +90,9 @@ def _empty_backend_cycle() -> Iterator[str]:
 class RoutingRule:
     """One URL-prefix → backend-port mapping, one entry per module replica.
 
-    ``backend_url`` is always the first replica — kept so single-replica
-    construction (``RoutingRule(prefix, backend_url)``) and the
-    ``/_modulith/topology`` listing are unaffected. ``backend_urls`` holds
+    ``backend_url`` is always the first replica: single-replica construction
+    (``RoutingRule(prefix, backend_url)``) and the
+    ``/_modulith/topology`` listing use it. ``backend_urls`` holds
     every replica (defaults to just ``backend_url`` when omitted);
     ``next_backend()`` round-robins across whichever of them aren't
     currently marked down — no weights, no stickiness.
@@ -254,8 +254,9 @@ def create_proxy_app(
     when this one is refused as another deployment's, does not answer its
     identity probe in time (the replica stays unmarked), or fails before it can
     have received the request: its identity probe failed, its connection was
-    refused (after the connect retries above) or timed out. Those replicas are
-    marked as before, so later requests skip them; any HTTP method may move on
+    refused (after the connect retries above) or timed out. Replicas refused or
+    failed this way are marked foreign or down (not the one whose identity probe
+    timed out), so later requests skip them; any HTTP method may move on
     because none of the request was sent. A failure after the request was sent
     (ReadError, ReadTimeout, WriteError, RemoteProtocolError) answers 502
     straight away, whatever the method: the replica may have acted on the
@@ -384,15 +385,15 @@ def create_proxy_app(
     # ``openapi_url=None`` unregisters FastAPI's own /openapi.json, /docs,
     # /docs/oauth2-redirect and /redoc. A reverse proxy must not claim paths it
     # cannot answer for the application: those routes are registered ahead of
-    # the catch-all below, so /openapi.json served a schema holding only this
-    # proxy's actuator routes (never the application's), /docs rendered a
-    # Swagger UI over that empty schema, and a module actually named ``docs``
-    # had its own routes shadowed outright. Unregistered, the four paths fall
-    # through to the catch-all and behave like any other path — proxied when a
-    # rule matches, 404 otherwise. Each worker still serves its own schema on
-    # its internal port; the proxy publishes no aggregate one. ``app.openapi()``
-    # remains callable, so a caller that wants the proxy's own schema can build
-    # it in-process.
+    # the catch-all below, so /openapi.json would serve a schema holding only
+    # this proxy's actuator routes (never the application's), /docs would render
+    # a Swagger UI over that empty schema, and a module actually named ``docs``
+    # would have its own routes shadowed outright. Unregistered, the four paths
+    # fall through to the catch-all and behave like any other path — proxied
+    # when a rule matches, 404 otherwise. Each worker serves its own schema on
+    # its internal port; the proxy publishes no aggregate one. A caller that
+    # wants the proxy's own schema can build it in-process with
+    # ``app.openapi()``.
     app = FastAPI(title="modulith-proxy", lifespan=lifespan, openapi_url=None)
     app.add_middleware(_RejectUnsafeTargets)
     app.add_middleware(_RejectMalformedHost)

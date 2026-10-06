@@ -125,7 +125,7 @@ class Configuration:
     # Default broker for cross-process events. "memory" only valid when
     # topology == "single". When topology == "processes" and this is absent,
     # load_configuration defaults to durable local SHM, or to database when
-    # an effective URL/DSN preserves a legacy database-broker configuration.
+    # an effective URL/DSN is configured (the shm broker accepts neither).
     broker: str = "memory"
 
     # Source used to resolve cross-process listener subscriptions.
@@ -169,10 +169,8 @@ class Configuration:
     # the application starts.
     strict_boundaries: bool = False
 
-    # Rule names skipped by the built-in verifier, from
-    # [tool.modulith.verify].disabled_rules. Read via getattr with a default
-    # by modulith/builtin/verifier.py, so consumers written before this field
-    # existed keep working unchanged.
+    # Rule names skipped by the built-in verifier (modulith/builtin/verifier.py),
+    # from [tool.modulith.verify].disabled_rules.
     verify_disabled_rules: tuple[str, ...] = ()
 
     # Tracks which keys were explicitly set vs got their default value.
@@ -190,9 +188,9 @@ class Configuration:
 # Broker defaults already announced in this process. One boot resolves the
 # same configuration more than once — the CLI resolves it to place the topology
 # and Runtime.ensure_bootstrapped() resolves it again — so announcing on every
-# call printed one decision repeatedly before the first worker started.
-# The key is the decision, not the call, so a reload that lands somewhere
-# different is still announced.
+# call would repeat one decision before the first worker starts. The key is the
+# decision, not the call, so a reload that lands somewhere different is still
+# announced.
 _announced_broker_defaults: set[str] = set()
 
 
@@ -486,8 +484,8 @@ _DICT_FIELDS = frozenset({"outbox_options", "broker_options", "workers", "subscr
 # spellings are the field names themselves; "broker" is kept as an alias for
 # broker_options because TOML forbids the scalar broker *name* and a broker
 # subtable sharing one key, so a file using only the subtable form is
-# unambiguous. The legacy "outbox" subtable is NOT an alias — it is rejected
-# loudly (see _read_pyproject).
+# unambiguous. An "outbox" subtable is NOT an alias — it is rejected loudly
+# (see _read_pyproject).
 _SUBTABLE_FIELD = {
     "outbox_options": "outbox_options",
     "broker": "broker_options",
@@ -526,8 +524,8 @@ def _read_pyproject() -> dict[str, Any]:
         discard the entire [tool.modulith] table, reverting every setting
         (including ``production = true``) to defaults with zero warning.
       * ``[tool.modulith.outbox_options]`` is the ONLY outbox options
-        subtable. The legacy ``[tool.modulith.outbox]`` subtable raises,
-        pointing at the new spelling ("outbox" is the scalar adapter name).
+        subtable. A ``[tool.modulith.outbox]`` subtable raises, pointing at
+        ``outbox_options`` ("outbox" is the scalar adapter name).
       * Two subtables configuring the same field (``broker`` and
         ``broker_options``) raise instead of silently overwriting.
       * A subtable spelled close to a real one (e.g. ``worker`` for
@@ -595,7 +593,7 @@ def _resolve_subtable(key: str, *, already_mapped: set[str]) -> str | None:
     Returns the dict-typed field name to assign, None for the documented
     silent drops (reserved + genuinely unknown subtables), and raises
     ConfigurationError for everything a user plausibly meant but got wrong
-    (legacy ``outbox`` spelling, colliding spellings, a scalar option
+    (an ``outbox`` subtable, colliding spellings, a scalar option
     written as a table, a typo of a real subtable).
     """
     if key == "outbox":
@@ -679,7 +677,7 @@ def _env_str(name: str) -> str | None:
     ${DEPLOY_ENV_IS_PROD}`` with the interpolation variable unset), and
     honoring "" as an explicit value would inject nonsense config such as
     ``package=""``. Whitespace-only values (``MODULITH_X="   "``) get the
-    same treatment, matching ``_env_bool``'s existing stripped comparison —
+    same treatment, matching ``_env_bool``'s stripped comparison —
     a value is never returned verbatim without first checking it holds
     something other than whitespace.
     """
@@ -1131,7 +1129,7 @@ def _validate(data: dict[str, Any]) -> None:
     # ROADMAP Phase 4). Accepting it would route the app through the real
     # multi-process supervisor as if it were "processes" — silently the
     # wrong isolation model. Checked AFTER the cross-process-broker guard so
-    # the broker misconfiguration keeps its established error message.
+    # a broker misconfiguration reports its own error first.
     if effective_topology == "subinterpreters":
         raise ConfigurationError(
             "topology='subinterpreters' is not yet implemented (reserved for "

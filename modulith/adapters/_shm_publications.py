@@ -319,7 +319,7 @@ def _subscribe(
         if completion_mode == "mark":
             # Claiming and mark-acking a replayed row rewrites it wider in place,
             # splitting the pages the replay packed full: draining a cut replay
-            # grew the store by about half the pages the replay added. Charging
+            # grows the store by about half the pages the replay added. Charging
             # the replay as much again as it adds covers that growth for one
             # group whose listeners succeed; error text, dead letters and other
             # groups' undrained replays are not reserved for. The room is

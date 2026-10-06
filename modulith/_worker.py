@@ -209,9 +209,10 @@ def create_app() -> FastAPI:
     # auto_discover=False means the bootstrap loop above never populates a
     # module list, so it never fires modulith_after_module_load for the
     # module THIS worker imports — plugins that rely on it (startup metrics,
-    # module-scoped resources) silently never ran for any process-topology
-    # worker. Fire it here, after import + manifest so the hookspec's
-    # "after all listeners and event types are wired" contract still holds.
+    # module-scoped resources) would silently never run for any
+    # process-topology worker. Fire it here, after import + manifest so the
+    # hookspec's "after all listeners and event types are wired" contract
+    # still holds.
     if _runtime.plugin_manager is not None:
         _runtime.plugin_manager.hook.modulith_after_module_load(
             module=ModuleInfo(name=module_name, package=module_package)
@@ -245,8 +246,8 @@ def create_app() -> FastAPI:
             yield
         finally:
             # consumer.stop() and _runtime.shutdown() must both be attempted
-            # regardless of each other's outcome — a stop() failure used to
-            # skip shutdown() entirely, leaking every broker connection the
+            # regardless of each other's outcome — otherwise a stop() failure
+            # skips shutdown() entirely, leaking every broker connection the
             # runtime registered on every ordinary stop-time error.
             consumer_error: BaseException | None = None
             if consumer is not None:

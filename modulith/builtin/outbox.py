@@ -230,7 +230,7 @@ _owned_resources: tuple[Any, Any] | None = None
 
 # Claim coordination (see modulith._claims). Bound in configure().
 # Default ``"lease"``; third-party stores without ClaimingStore fall back to
-# the original find_incomplete path at sweep time (capability duck-typing).
+# the unclaimed find_incomplete path at sweep time (capability duck-typing).
 _claim_strategy: str = DEFAULT_CLAIM_STRATEGY
 _claim_lease_seconds: float = DEFAULT_CLAIM_LEASE_SECONDS
 _claim_batch_size: int = DEFAULT_CLAIM_BATCH_SIZE
@@ -399,7 +399,7 @@ def _resolve_dead_letter_threshold(store: Any, configured: int | None) -> int:
     OWN threshold at ``save()`` time) plus a ``dead_letter_after_attempts_
     explicit`` marker. Stores without either attribute (the in-memory test
     double, third-party stores with no threshold of their own) simply defer
-    entirely to this plugin's value — unchanged behavior for them.
+    entirely to this plugin's value.
 
     Precedence: if BOTH sides were explicitly set and disagree, that is a
     genuine misconfiguration — fail loudly here rather than silently picking
@@ -463,7 +463,7 @@ def configure(
     ``claim_strategy`` coordinates concurrent sweepers (see
     ``modulith._claims``): ``"lease"`` (default), ``"advisory_lock"``, or
     ``"none"``. Stores without the matching capability fall back to the
-    original unclaimed ``find_incomplete`` path at sweep time. ``"advisory_lock"``
+    unclaimed ``find_incomplete`` path at sweep time. ``"advisory_lock"``
     is the exception: it raises ``ConfigurationError`` for a store without
     ``supports_advisory_lock``, without ``find_by_id``, or whose own
     ``check_advisory_lock_config()`` rejects its engine.
@@ -474,7 +474,7 @@ def configure(
 
     ``configure()`` and ``shutdown()`` are a paired lifecycle. Re-configuring
     while a previous retry loop is still alive cancels that stale task first:
-    letting it live meant it silently kept polling the NEW store without ever
+    left alive, it would silently keep polling the NEW store without ever
     running the new configuration's one-shot crash sweep.
     """
     global _store, _serializer, _completion_mode
@@ -812,11 +812,11 @@ async def _complete(publication: EventPublication) -> None:
 
     ``completed_at`` is stamped only AFTER the store call returns — not
     before. Setting it optimistically first (then having the store call
-    fail) left the in-memory record looking completed while _record_failure
-    went on to persist attempt_count/last_error on it: an inconsistent row
-    that is simultaneously "completed" and "failed". If the store call below
-    raises, the caller (_dispatch_publication) routes to _record_failure,
-    which must see completed_at still None.
+    fail) would leave the in-memory record looking completed while
+    _record_failure went on to persist attempt_count/last_error on it: an
+    inconsistent row that is simultaneously "completed" and "failed". If the
+    store call below raises, the caller (_dispatch_publication) routes to
+    _record_failure, which must see completed_at still None.
 
     Lease mode: when ``publication.claim_token`` is set and the store
     exposes ``complete_claim``, fence the write by token. A stale token
@@ -1185,7 +1185,7 @@ async def _sweep(older_than: timedelta) -> None:
     The configured claim strategy selects the concurrency path:
       * lease + ClaimingStore → claim_batch, renew during dispatch, fence
       * advisory_lock + AdvisoryLockingStore → try_lock around dispatch
-      * none, or missing capability → original find_incomplete path
+      * none, or missing capability → unclaimed find_incomplete path
     """
     from .. import runtime as _rt
 
@@ -1201,7 +1201,7 @@ async def _sweep(older_than: timedelta) -> None:
 
 
 async def _sweep_unclaimed(older_than: timedelta, *, runtime_ready: bool) -> None:
-    """Original find_incomplete path (claim_strategy=none or no capability)."""
+    """Unclaimed find_incomplete path (claim_strategy=none or no capability)."""
     assert _store is not None
     pending = await _store.find_incomplete(older_than)
     if pending and not runtime_ready:
@@ -1345,7 +1345,7 @@ async def _sweep_lease(older_than: timedelta, *, runtime_ready: bool) -> None:
             await _dispatch_with_lease_renewal(pub)
 
 
-_LockConnectionTimeout = LockConnectionTimeout  # the name callers imported before the move
+_LockConnectionTimeout = LockConnectionTimeout  # keeps the name importable from this module
 
 
 async def _sweep_advisory(older_than: timedelta, *, runtime_ready: bool) -> None:
@@ -1560,7 +1560,7 @@ async def _guarded_sweep(older_than: timedelta) -> None:
     """Run one sweep, containing failures so the retry loop survives them.
 
     A transient store error (connection blip, failover) must only cost the
-    one sweep it hit — without this containment it killed the retry-loop
+    one sweep it hit — without this containment it would kill the retry-loop
     task outright, permanently stalling retries for EVERY pending
     publication until the next transactional publish happened to restart it.
     ``asyncio.CancelledError`` (a BaseException) still propagates for clean
@@ -1683,10 +1683,10 @@ async def _stop_retry_loop() -> asyncio.AbstractEventLoop | None:
     cancelled anyway, which re-delivers its in-flight row later.
 
     The module slot keeps pointing at the task until cancellation has
-    actually completed: nulling it up front opened a window (cancel() only
+    actually completed: nulling it up front would open a window (cancel() only
     *requests*; the task needs another loop turn to unwind) where a
-    concurrent transactional publish's ``_ensure_retry_loop()`` saw "no
-    loop" and spawned a second retry task that survived shutdown entirely.
+    concurrent transactional publish's ``_ensure_retry_loop()`` sees "no
+    loop" and spawns a second retry task that survives shutdown entirely.
 
     Cross-loop safe: the retry task may live on a DIFFERENT event loop than
     the one ``shutdown()`` is awaited from — sync.py's persistent
@@ -1961,9 +1961,9 @@ def _reset_for_testing() -> None:
     """Reset module state to uninitialized. ONLY for tests.
 
     Cancels any live retry task (best-effort, like ``shutdown()`` but
-    synchronous): merely dropping the reference leaked ghost retry loops
-    that kept polling — and dispatching against — whatever store a later
-    ``configure()`` bound.
+    synchronous): merely dropping the reference would leak ghost retry loops
+    that keep polling — and dispatching against — whatever store a later
+    ``configure()`` binds.
     """
     global _store, _serializer, _completion_mode
     global _dead_letter_after_attempts, _retry_interval_seconds

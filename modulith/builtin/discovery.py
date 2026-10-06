@@ -26,7 +26,7 @@ logger = logging.getLogger("modulith.discovery")
 # whose own code or _manifest.py raised during the most recent discovery
 # walk. Discovery itself must not raise for these (one broken module must
 # not abort discovery of its siblings — see the loop below), but swallowing
-# them entirely used to exempt exactly those modules from manifest
+# them entirely would exempt exactly those modules from manifest
 # verification: a module that never imports never registers a manifest, so
 # the "module silently failed to import" safety net could not fire for the
 # very failure mode it documents. The runtime calls
@@ -67,7 +67,7 @@ def modulith_discover_modules(app_package: str) -> list[ModuleInfo]:
     except Exception as exc:
         # Deliberately broad: a NameError inside the app's __init__ must fail
         # exactly like a missing package (ImportError) — but LOUDLY.
-        # Returning [] here made `modulith verify`
+        # Returning [] here would make `modulith verify`
         # print "✓ no boundary violations" and exit 0 on an unimportable
         # application package.
         logger.exception("could not import application package %r: %s", app_package, exc)
@@ -148,9 +148,9 @@ def modulith_after_module_load(module: ModuleInfo) -> None:
     or its ``_manifest.py`` raised), the module's listeners and manifest
     never registered — events it should handle would be dropped with no
     trace beyond a log line. Raising here turns that into the same loud
-    startup failure that manifest verification produces, closing the gap
-    where the exact bug the manifest check documents ("module silently
-    failed to import") also prevented the check from running. All recorded
+    startup failure that manifest verification produces, so the very bug
+    the manifest check documents ("module silently failed to import")
+    cannot also stop the check from running. All recorded
     failures are aggregated into one message so a
     multi-module breakage surfaces in a single startup error.
     """

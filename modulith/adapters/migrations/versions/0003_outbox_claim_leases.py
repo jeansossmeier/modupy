@@ -25,12 +25,11 @@ depends_on: str | Sequence[str] | None = None
 # rejects a moderately large event. Inert on Postgres/SQLite.
 _PAYLOAD = sa.LargeBinary().with_variant(MySQLLongBlob(), "mysql", "mariadb")
 
-# Both tables' columns that 0001 originally created as an unbounded
-# String — MySQL's VARCHAR requires an explicit length, so that type never
-# even compiled a CREATE TABLE on that dialect. 0001 now creates these as
-# Text directly, so this list only matters for a deployment that already
-# ran 0001/0002 before that fix: this alter converges it onto the exact
-# same Text schema a fresh install gets, so "upgrade from base" and
+# Both tables' columns that a deployment whose 0001 created them as an
+# unbounded String needs converted — MySQL's VARCHAR requires an explicit
+# length, so that type never compiled a CREATE TABLE on that dialect. A
+# fresh install gets Text from 0001 directly; this alter converges the
+# older deployment onto the same Text schema, so "upgrade from base" and
 # "upgrade from 0002" land on identical columns (enforced by the migration
 # drift tests).
 # nullable=True only for last_error; event_type/listener are NOT NULL in
@@ -90,9 +89,9 @@ def upgrade() -> None:
                     existing_nullable=nullable,
                 )
             # Same converge-onto-a-fresh-install motive as the Text columns:
-            # an install that ran 0001 while it still emitted a plain
-            # LargeBinary has a MySQL BLOB payload capped at 65,535 bytes,
-            # where a fresh install gets LONGBLOB. Widening is lossless, and on
+            # an install whose 0001 created payload as a plain LargeBinary has
+            # a MySQL BLOB payload capped at 65,535 bytes, where a fresh
+            # install gets LONGBLOB. Widening is lossless, and on
             # Postgres/SQLite the variant resolves to the type already there.
             batch_op.alter_column(
                 "payload",
@@ -130,6 +129,5 @@ def downgrade() -> None:
     # ``ALTER ... TYPE VARCHAR(255)`` over an existing longer value aborts the
     # rollback on Postgres and truncates it on non-strict MySQL. On the one
     # deployment shape this revision's upgrade actually converts (a Postgres
-    # install that ran 0001 back when it emitted an unbounded String), leaving
-    # Text behind is a no-op: Postgres treats unbounded varchar and text
-    # identically.
+    # install whose 0001 created an unbounded String), leaving Text behind is
+    # a no-op: Postgres treats unbounded varchar and text identically.

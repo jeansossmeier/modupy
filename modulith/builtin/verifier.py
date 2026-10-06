@@ -716,7 +716,7 @@ class _NameUsageCollector(ast.NodeVisitor):
 
     def visit_If(self, node: ast.If) -> None:
         # Code inside ``if TYPE_CHECKING:`` never executes, so names
-        # referenced there are NOT runtime uses — counting them let an
+        # referenced there are NOT runtime uses — counting them would let an
         # unrelated guarded reference exempt a real annotation-only import
         # from rule 4. The else-branch is runtime code.
         if _is_type_checking(node.test, self._tc_aliases):
@@ -755,7 +755,7 @@ def _runtime_loaded_names_by_file(module: ModuleInfo) -> dict[Path, set[str]]:
     positions — keyed per file, not aggregated across the whole module.
 
     Rule 4 must check a candidate import against runtime usage in the *same
-    file* that imports it. Aggregating across the module let an unrelated
+    file* that imports it. Aggregating across the module would let an unrelated
     file's runtime use of a same-named local binding falsely exempt a real
     annotation-only import elsewhere in the module.
     """
@@ -1145,7 +1145,7 @@ def _check_contracts_is_sink(
     may not import from any module. None of rules 1/3/4 covers the reverse
     direction (their heuristics gate on privacy, manifests, and type-shaped
     names), so an ordinary runtime import from e.g. ``orders`` into
-    contracts sailed through undetected. This rule flags ANY
+    contracts would go undetected. This rule flags ANY
     import — runtime or type-only — whose owner is another application
     module when the module under check IS the contracts module.
     """

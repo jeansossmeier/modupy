@@ -132,8 +132,8 @@ def _resolve_event_type(func: Callable[..., Any], target: Callable[..., Any]) ->
         already the class object — returned as-is.
       * Stringized (PEP 563, the modern default used across this project and
         the SPEC/README examples): the annotation is a *string* like
-        ``'OrderCreated'``. It is resolved against the function's own module
-        globals via ``inspect.get_annotations(eval_str=True)``.
+        ``'OrderCreated'``. It is evaluated against the function's own module
+        globals.
 
     ``func`` is used only for error messages; ``target`` is the object whose
     signature and ``__globals__`` we read (the unwrapped function for sync
@@ -166,13 +166,13 @@ def _resolve_event_type(func: Callable[..., Any], target: Callable[..., Any]) ->
         # is an inherent PEP 563 limitation, surfaced as a clear TypeError
         # rather than a downstream ``str has no attribute __name__`` crash.
         #
-        # ONLY this annotation is evaluated. inspect.get_annotations(eval_str=True)
+        # Evaluate ONLY this annotation. inspect.get_annotations(eval_str=True)
         # evaluates the whole dict — return type and every other parameter — so
         # a TYPE_CHECKING-only import on a second parameter (the sanctioned way
-        # to break a runtime import cycle; see builtin.verifier) raised NameError
-        # here and got reported as an unresolvable *event* annotation, blaming
-        # the wrong parameter and rejecting a listener the bus would have called
-        # perfectly well (it invokes handlers with the event alone).
+        # to break a runtime import cycle; see builtin.verifier) would raise
+        # NameError and be reported as an unresolvable *event* annotation,
+        # blaming the wrong parameter and rejecting a listener the bus can call
+        # (it invokes handlers with the event alone).
         try:
             annotation = eval(annotation, _annotation_globals(target))
         except (NameError, AttributeError, SyntaxError) as exc:
@@ -219,9 +219,9 @@ def _normalize_listener_targets(targets: object) -> tuple[str, ...]:
 
 # Both call forms are overloaded so a decorated function keeps its own
 # signature downstream. With only the ``-> Any`` implementation signature,
-# type checkers erased every ``@listener`` function to ``Any`` — silently
+# type checkers erase every ``@listener`` function to ``Any`` — silently
 # disabling all checking on calls to it despite the shipped ``py.typed`` — and
-# the parameterized form tripped ``untyped-decorator`` under ``mypy --strict``.
+# the parameterized form trips ``untyped-decorator`` under ``mypy --strict``.
 # ``register`` returns the original undecorated ``handler``, so ``F -> F`` is
 # exact rather than a convenient lie.
 @overload

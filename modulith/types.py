@@ -93,9 +93,9 @@ class EventPublication:
 
     # When the most recent delivery attempt ran. None until the first
     # *retry* (the after-commit/crash-sweep first delivery leaves it None).
-    # Retry backoff is measured from this, not from ``published_at`` — so a
-    # persistently-failing listener actually backs off instead of being
-    # retried on every sweep once the record ages past the (capped) backoff.
+    # Retry backoff is measured from this, not from ``published_at``, so a
+    # persistently failing listener backs off between attempts rather than
+    # being retried on every sweep once the record ages past the capped backoff.
     last_attempt_at: datetime | None = None
 
     # Lease fencing token. Set only by a claim-aware store under
@@ -103,8 +103,9 @@ class EventPublication:
     # claim_publication() for after-commit dispatch, force_retry() and
     # retry_all_dead_lettered(). It fences the completion/failure write that
     # follows dispatch to this exact claim (see modulith._claims.ClaimingStore).
-    # None on every other path: the "none"/"advisory_lock" strategies, and any store that predates the claim protocol — all of
-    # those use the unfenced save()/mark_complete()/delete()/archive() calls.
+    # None on every other path: the "none"/"advisory_lock" strategies, and any
+    # store without the claim protocol — all of those use the unfenced
+    # save()/mark_complete()/delete()/archive() calls.
     claim_token: str | None = None
 
     # W3C trace context (``traceparent`` and, when present, ``tracestate``) of
@@ -118,17 +119,15 @@ class EventPublication:
 class EventPublishReceipt:
     """The real outcome of a durable (outbox) publish.
 
-    Handed to ``modulith_after_event_published`` on the durable path INSTEAD
-    of a fabricated ``EventPublication``. The runtime used to synthesize a
-    brand-new record — a random ``uuid4()`` id, a payload re-serialized with
-    the default JSON serializer — that matched neither the row(s) actually
-    persisted nor the configured storage serializer's bytes. ``records``
-    holds every ``EventPublication`` this publish actually saved: one per
-    registered listener, plus one more when the event also routes to a
-    broker (see ``modulith.builtin.outbox.persist`` /
-    ``persist_broker_route``). Empty when the event has neither a local
-    listener nor a broker route — nothing was persisted, so the receipt
-    carries nothing rather than a placeholder standing in for it.
+    Handed to ``modulith_after_event_published`` on the durable path in place
+    of an ``EventPublication``. ``records`` holds every ``EventPublication``
+    this publish actually saved, with the ids and the payload bytes of the
+    configured storage serializer exactly as persisted: one per registered
+    listener, plus one more when the event also routes to a broker (see
+    ``modulith.builtin.outbox.persist`` / ``persist_broker_route``). Empty when
+    the event has neither a local listener nor a broker route — nothing was
+    persisted, so the receipt carries nothing rather than a placeholder
+    standing in for it.
 
     Not part of the top-level ``modulith`` package's public API — plugin
     authors reach it via ``isinstance(publication, EventPublishReceipt)``

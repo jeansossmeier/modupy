@@ -398,8 +398,8 @@ class Scenario:
         loop, which checks whatever was captured before the overrun and
         raises the documented AssertionError on a miss. A TimeoutError
         raised BY the application — the trigger coroutine itself, or a
-        listener — is a real failure and propagates; swallowing it produced
-        false-green tests.
+        listener — is a real failure and propagates; swallowing it would
+        produce false-green tests.
         """
         from .sync import PublishSyncTimeout, publish_sync
 
@@ -426,7 +426,7 @@ class Scenario:
 
         # A plain synchronous trigger runs on a background thread so it is
         # bounded by the shared budget like every other trigger kind — called
-        # directly on this thread, a stalled trigger hung within() forever.
+        # directly on this thread, a stalled trigger would hang within() forever.
         # Python threads can't be force-killed, so an overrun is swallowed
         # (best-effort, matching the coroutine trigger's cancellation) and the
         # thread is left to finish in the background as a daemon.
@@ -627,7 +627,7 @@ def _forwarded_parent_args(config: pytest.Config) -> list[str]:
 
     The child re-runs a single nodeid, so everything else about the parent
     invocation — custom ``pytest_addoption`` flags, ``-m``/``-k`` filters,
-    verbosity — must carry over; dropping them silently reverted isolated
+    verbosity — must carry over; dropping them would silently revert isolated
     tests to option defaults. ``--cov*`` options are forwarded verbatim too
     but neutralized by the trailing ``--no-cov`` the caller appends: they
     cannot be filtered out here because ``--cov`` takes an optional value

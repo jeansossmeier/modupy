@@ -102,9 +102,9 @@ def _to_jsonable(obj: Any) -> Any:
     value, nested dataclasses → dicts of their fields, ``set``/
     ``frozenset`` → list (decode coerces back). Dict *keys* are encoded
     here too, via :func:`_encode_dict_key` — ``json.dumps`` never routes
-    keys through its ``default=`` hook, so a ``dict[UUID, X]`` field used
-    to crash with the json module's own opaque TypeError instead of being
-    handled. Anything unsupported raises ``TypeError`` — better a loud
+    keys through its ``default=`` hook, so a ``dict[UUID, X]`` field would
+    otherwise fail with the json module's own opaque TypeError. Anything
+    unsupported raises ``TypeError`` — better a loud
     failure at publish time than silent data corruption in the outbox.
     """
     if obj is None or isinstance(obj, (bool, int, float, str)):
@@ -431,8 +431,8 @@ def _safe_type_hints(obj: Any) -> dict[str, Any]:
 
     ``typing.get_type_hints`` resolves EVERY annotation eagerly, so a single
     ``TYPE_CHECKING``-only forward reference (a name importable only for the
-    type checker) raised ``NameError`` and blocked reconstruction of the whole
-    event — even when the offending field's value needed no coercion. When
+    type checker) raises ``NameError`` and would block reconstruction of the
+    whole event — even when the offending field's value needs no coercion. When
     the eager pass fails, fall back to resolving each annotation on its own
     (the same eval-against-module-globals mechanism ``get_type_hints`` uses);
     names that don't resolve simply yield no coercion for that field.
@@ -539,8 +539,8 @@ def _coerce(value: Any, hint: Any) -> Any:
 
     # Parameterized containers: recurse into element/value types so rich inner
     # types survive the round-trip (list[datetime], dict[str, Decimal],
-    # set[UUID], tuple[date, ...]). Without this, decode left inner elements as
-    # the raw JSON strings, silently breaking equality.
+    # set[UUID], tuple[date, ...]). Without this, decoded inner elements would
+    # stay raw JSON strings, silently breaking equality.
     if origin is list:
         args = typing.get_args(hint)
         return [_coerce(v, args[0]) for v in value] if args and isinstance(value, list) else value
@@ -617,9 +617,9 @@ def _instance_attrs(event: Any) -> dict[str, Any]:
     """Read a non-dataclass event's instance attributes.
 
     Prefers ``__dict__`` (the documented ``vars(event)`` fallback), but also
-    supports ``__slots__``-based classes — a bare ``vars()`` call crashed on
-    those with the raw "vars() argument must have __dict__ attribute"
-    TypeError even though slotted events serialize perfectly well.
+    supports ``__slots__``-based classes — a bare ``vars()`` call raises the
+    raw "vars() argument must have __dict__ attribute" TypeError on those,
+    even though slotted events serialize perfectly well.
     """
     attrs = getattr(event, "__dict__", None)
     if attrs is not None:
@@ -749,8 +749,7 @@ class JsonEventSerializer:
         then reconstructs it, coercing each field back to its annotated
         type so a round-trip is equality-preserving. Non-dataclass events
         are coerced too, using the class-level annotations merged with
-        ``__init__``'s parameter annotations — previously this path
-        silently left datetime/UUID/Decimal fields as raw strings.
+        ``__init__``'s parameter annotations.
 
         ``data`` is untrusted at this boundary (see the class docstring's
         ``max_payload_bytes``): its size is checked before ``decode``/

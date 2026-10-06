@@ -5,10 +5,6 @@ broker adapter (``modulith.adapters.db_broker``). Mirrors the SQLAlchemy Core
 tables built by ``db_broker.broker_schema()`` — keep the two in lockstep (the
 migration tests diff the migrated schema against that metadata).
 
-The second link in the migration chain (0001 -> 0002): the first revision that
-actually exercises a multi-revision ``upgrade head`` / ``downgrade base`` on the
-packaged migrations.
-
 Revision ID: 0002_broker_message
 Revises: 0001_initial
 Create Date: 2026-07-14
