@@ -3,85 +3,105 @@
 <desc id="growth-desc">modupy lives at github.com/jeansossmeier/modupy. Day one: the orders, payments and inventory modules run in one process, and an OrderCreated event fans out from orders to payments and inventory. When a feature gets busy: one process per module on one machine, behind a proxy on port 8000, with two inventory processes and a built-in broker carrying events between them. When a module becomes a service: modulith extract payments moves payments onto its own machine, and a Redis, database or other broker carries the same events between the app and the new service. In every shape, modulith verify keeps the modules apart and the outbox keeps their events safe.</desc>
 
 <style>
-/* ---------- Colour tokens (light) ---------- */
-svg{
-  --bg-a:#ffffff; --bg-b:#f2f5f9;
-  --stroke:#d0d7de; --stroke-soft:#e3e8ee;
-  --ink:#1f2328; --muted:#59636e; --wire:#8c959f;
-  --panel:#ffffff; --machine-fill:#ffffff; --machine-op:.35;
-  --orders-a:#eef8ff; --orders-b:#cfe8ff; --orders-s:#0969da; --orders-t:#0550ae;
-  --payments-a:#eafcee; --payments-b:#c6f2d2; --payments-s:#1a7f37; --payments-t:#116329;
-  --inventory-a:#fffbe3; --inventory-b:#ffefa6; --inventory-s:#9a6700; --inventory-t:#7d4e00;
-  --bus-a:#fff5fa; --bus-b:#ffdcee; --bus-s:#bf3989; --bus-t:#99286e;
-  --shadow:#1f2328;
-}
-/* ---------- Colour tokens (dark) ---------- */
-@media (prefers-color-scheme:dark){
-  svg{
-    --bg-a:#161b22; --bg-b:#0d1117;
-    --stroke:#30363d; --stroke-soft:#262c34;
-    --ink:#e6edf3; --muted:#9198a1; --wire:#656c76;
-    --panel:#0d1117; --machine-fill:#ffffff; --machine-op:.04;
-    --orders-a:#1d3a5c; --orders-b:#132740; --orders-s:#4493f8; --orders-t:#79c0ff;
-    --payments-a:#1d4229; --payments-b:#122b1b; --payments-s:#3fb950; --payments-t:#7ee787;
-    --inventory-a:#403313; --inventory-b:#2b220b; --inventory-s:#d29922; --inventory-t:#e3b341;
-    --bus-a:#47203b; --bus-b:#2c1425; --bus-s:#db61a2; --bus-t:#ff9bce;
-    --shadow:#000000;
-  }
-}
-
 /* ---------- Gradient stops ---------- */
-.o-a{stop-color:var(--orders-a)}    .o-b{stop-color:var(--orders-b)}
-.p-a{stop-color:var(--payments-a)}  .p-b{stop-color:var(--payments-b)}
-.i-a{stop-color:var(--inventory-a)} .i-b{stop-color:var(--inventory-b)}
-.b-a{stop-color:var(--bus-a)}       .b-b{stop-color:var(--bus-b)}
-.g-a{stop-color:var(--bg-a)}        .g-b{stop-color:var(--bg-b)}
+.o-a{stop-color:#eef8ff}    .o-b{stop-color:#cfe8ff}
+.p-a{stop-color:#eafcee}  .p-b{stop-color:#c6f2d2}
+.i-a{stop-color:#fffbe3} .i-b{stop-color:#ffefa6}
+.b-a{stop-color:#fff5fa}       .b-b{stop-color:#ffdcee}
+.g-a{stop-color:#ffffff}        .g-b{stop-color:#f2f5f9}
 
 /* ---------- Surfaces ---------- */
-.card{fill:url(#growth-bg);stroke:var(--stroke)}
-.rule{stroke:var(--stroke);opacity:.8}
-.panel{fill:var(--panel);stroke:var(--stroke);stroke-width:1.5}
-.machine{fill:var(--machine-fill);fill-opacity:var(--machine-op);stroke:var(--wire);stroke-width:1.5;stroke-dasharray:6 5}
-.band{fill:var(--panel);stroke:var(--stroke)}
-.proxy{fill:var(--panel);stroke:var(--stroke);stroke-width:1.5}
-.pill{fill:var(--panel);stroke:var(--stroke)}
-.code-pill{fill:var(--bg-b);stroke:var(--stroke-soft)}
+.card{fill:url(#growth-bg);stroke:#d0d7de}
+.rule{stroke:#d0d7de;opacity:.8}
+.panel{fill:#ffffff;stroke:#d0d7de;stroke-width:1.5}
+.machine{fill:#ffffff;fill-opacity:.35;stroke:#8c959f;stroke-width:1.5;stroke-dasharray:6 5}
+.band{fill:#ffffff;stroke:#d0d7de}
+.proxy{fill:#ffffff;stroke:#d0d7de;stroke-width:1.5}
+.pill{fill:#ffffff;stroke:#d0d7de}
+.code-pill{fill:#f2f5f9;stroke:#e3e8ee}
 
 /* ---------- Modules ---------- */
-.orders{fill:url(#growth-g-orders);stroke:var(--orders-s);stroke-width:1.5}
-.payments{fill:url(#growth-g-payments);stroke:var(--payments-s);stroke-width:1.5}
-.inventory{fill:url(#growth-g-inventory);stroke:var(--inventory-s);stroke-width:1.5}
-.bus{fill:url(#growth-g-bus);stroke:var(--bus-s);stroke-width:1.5}
-.orders-t{fill:var(--orders-t)} .payments-t{fill:var(--payments-t)} .inventory-t{fill:var(--inventory-t)}
+.orders{fill:url(#growth-g-orders);stroke:#0969da;stroke-width:1.5}
+.payments{fill:url(#growth-g-payments);stroke:#1a7f37;stroke-width:1.5}
+.inventory{fill:url(#growth-g-inventory);stroke:#9a6700;stroke-width:1.5}
+.bus{fill:url(#growth-g-bus);stroke:#bf3989;stroke-width:1.5}
+.orders-t{fill:#0550ae} .payments-t{fill:#116329} .inventory-t{fill:#7d4e00}
 
 /* ---------- Type ---------- */
 .sans{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif}
 .mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
-.brand{font:700 30px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:var(--ink);letter-spacing:-.6px}
-.brand-accent{fill:var(--orders-s)}
-.url{font:500 13px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:var(--muted)}
-.url-strong{fill:var(--ink);font-weight:600}
-.h{font:600 15px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:var(--ink)}
-.t{font:500 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:var(--ink)}
-.s{font:400 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:var(--muted)}
-.c{font:500 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:var(--muted)}
+.brand{font:700 30px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328;letter-spacing:-.6px}
+.brand-accent{fill:#0969da}
+.url{font:500 13px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#59636e}
+.url-strong{fill:#1f2328;font-weight:600}
+.h{font:600 15px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328}
+.t{font:500 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#1f2328}
+.s{font:400 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#59636e}
+.c{font:500 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#59636e}
 .m{font:600 13px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif}
-.bus-t{font:600 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:var(--bus-t)}
-.ev-t{font:600 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:var(--bus-t)}
-.badge{fill:var(--ink)}
-.badge-t{font:700 11px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:var(--panel)}
+.bus-t{font:600 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#99286e}
+.ev-t{font:600 12px ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;fill:#99286e}
+.badge{fill:#1f2328}
+.badge-t{font:700 11px -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;fill:#ffffff}
 
 /* ---------- Lines ---------- */
-.ev{fill:none;stroke:var(--bus-s);stroke-width:1.5;stroke-dasharray:4 3;stroke-linecap:round;animation:flow 1.1s linear infinite}
-.evhead{fill:var(--bus-s)}
-.wire{fill:none;stroke:var(--wire);stroke-width:1.5;stroke-linecap:round}
-.head{fill:var(--wire)}
-.step{fill:var(--panel);stroke:var(--stroke);stroke-width:1.5}
-.step-chev{fill:none;stroke:var(--muted);stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.ev{fill:none;stroke:#bf3989;stroke-width:1.5;stroke-dasharray:4 3;stroke-linecap:round;animation:flow 1.1s linear infinite}
+.evhead{fill:#bf3989}
+.wire{fill:none;stroke:#8c959f;stroke-width:1.5;stroke-linecap:round}
+.head{fill:#8c959f}
+.step{fill:#ffffff;stroke:#d0d7de;stroke-width:1.5}
+.step-chev{fill:none;stroke:#59636e;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 
 /* Event lines gently flow toward their arrowheads. */
 @keyframes flow{to{stroke-dashoffset:-7}}
 @media (prefers-reduced-motion:reduce){.ev{animation:none}}
+
+/* Dark palette */
+@media (prefers-color-scheme:dark){
+  .o-a{stop-color:#1d3a5c}
+  .o-b{stop-color:#132740}
+  .p-a{stop-color:#1d4229}
+  .p-b{stop-color:#122b1b}
+  .i-a{stop-color:#403313}
+  .i-b{stop-color:#2b220b}
+  .b-a{stop-color:#47203b}
+  .b-b{stop-color:#2c1425}
+  .g-a{stop-color:#161b22}
+  .g-b{stop-color:#0d1117}
+  .card{stroke:#30363d}
+  .rule{stroke:#30363d}
+  .panel{fill:#0d1117;stroke:#30363d}
+  .machine{fill:#ffffff;fill-opacity:.04;stroke:#656c76}
+  .band{fill:#0d1117;stroke:#30363d}
+  .proxy{fill:#0d1117;stroke:#30363d}
+  .pill{fill:#0d1117;stroke:#30363d}
+  .code-pill{fill:#0d1117;stroke:#262c34}
+  .orders{stroke:#4493f8}
+  .payments{stroke:#3fb950}
+  .inventory{stroke:#d29922}
+  .bus{stroke:#db61a2}
+  .orders-t{fill:#79c0ff}
+  .payments-t{fill:#7ee787}
+  .inventory-t{fill:#e3b341}
+  .brand{fill:#e6edf3}
+  .brand-accent{fill:#4493f8}
+  .url{fill:#9198a1}
+  .url-strong{fill:#e6edf3}
+  .h{fill:#e6edf3}
+  .t{fill:#e6edf3}
+  .s{fill:#9198a1}
+  .c{fill:#9198a1}
+  .bus-t{fill:#ff9bce}
+  .ev-t{fill:#ff9bce}
+  .badge{fill:#e6edf3}
+  .badge-t{fill:#0d1117}
+  .ev{stroke:#db61a2}
+  .evhead{fill:#db61a2}
+  .wire{stroke:#656c76}
+  .head{fill:#656c76}
+  .step{fill:#0d1117;stroke:#30363d}
+  .step-chev{stroke:#9198a1}
+}
 </style>
 
 <defs>
@@ -96,8 +116,8 @@ svg{
 <stop offset="0" stop-color="#0969da"/><stop offset=".38" stop-color="#1a7f37"/><stop offset=".68" stop-color="#d4a72c"/><stop offset="1" stop-color="#bf3989"/>
 </linearGradient>
 <!-- Soft shadows -->
-<filter id="growth-sh" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-color="#1f2328" flood-opacity=".12"/></filter>
-<filter id="growth-sh-lg" x="-10%" y="-10%" width="120%" height="125%"><feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#1f2328" flood-opacity=".08"/></filter>
+<filter id="growth-sh" x="-20%" y="-20%" width="140%" height="150%"><feGaussianBlur in="SourceAlpha" stdDeviation="2"/><feOffset dx="0" dy="1.5" result="shadow-offset"/><feFlood flood-color="#1f2328" flood-opacity=".12"/><feComposite in2="shadow-offset" operator="in"/><feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+<filter id="growth-sh-lg" x="-10%" y="-10%" width="120%" height="125%"><feGaussianBlur in="SourceAlpha" stdDeviation="6"/><feOffset dx="0" dy="4" result="shadow-offset"/><feFlood flood-color="#1f2328" flood-opacity=".08"/><feComposite in2="shadow-offset" operator="in"/><feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge></filter>
 <clipPath id="growth-clip"><rect x="0.5" y="0.5" width="879" height="511" rx="14"/></clipPath>
 <!-- Arrowheads -->
 <marker id="growth-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker>
