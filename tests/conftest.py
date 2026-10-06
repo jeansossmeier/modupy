@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import os
+import random
 import re
 import socket
 import sys
@@ -136,19 +137,19 @@ def _free_port() -> int:
 
 
 def _free_port_block(size: int) -> int:
-    """The first of ``size`` consecutive free TCP ports.
+    """The first of ``size`` consecutive free TCP ports, all below 32768.
 
-    ``_free_port`` picks the first port; the rest are probed the same way, by
-    binding and releasing. A proxy plus its workers need adjacent ports, which
-    ``size`` calls to ``_free_port`` would not give.
+    A proxy plus its workers need adjacent ports, and the server binds them
+    seconds after this probe releases them. ``_free_port`` would land in the
+    ephemeral range (Linux 32768+, macOS and Windows 49152+), where any
+    outgoing connection in that window can take a worker's port, so the block
+    is drawn from below it.
     """
     while True:
-        base = _free_port()
-        if base + size > 65535:
-            continue
+        base = random.randrange(20000, 32768 - size)
         held: list[socket.socket] = []
         try:
-            for port in range(base + 1, base + size):
+            for port in range(base, base + size):
                 held.append(socket.socket())
                 held[-1].bind(("127.0.0.1", port))
         except OSError:

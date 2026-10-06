@@ -1742,6 +1742,15 @@ def test_a_free_port_block_is_bindable_all_at_once() -> None:
     assert len(held) == PORT_BLOCK
 
 
+def test_a_free_port_block_lies_below_every_default_ephemeral_range() -> None:
+    # Linux hands out client source ports from 32768 up, macOS and Windows from
+    # 49152, so a block below 32768 cannot be taken by an outgoing connection
+    # between the probe and the server binding it.
+    base = _free_port_block(PORT_BLOCK)
+
+    assert base + PORT_BLOCK <= 32768
+
+
 SERVER = """
 import os
 import signal
