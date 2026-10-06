@@ -7,7 +7,7 @@
 
 **Start as one app. Grow into processes and services without re-architecting.**
 
-![The same three modules in three shapes: one process on day one, one process per module when a feature gets busy, and payments split off into its own service](https://raw.githubusercontent.com/jeansossmeier/modupy/main/docs/images/growth.svg)
+![The same three modules in three shapes: one process on day one, one process per module when a feature gets busy, and payments split off into its own service](https://github.com/jeansossmeier/modupy/raw/main/docs/images/growth.svg)
 
 modupy helps you build a Python backend as a **modular monolith**: one codebase, split into modules that talk through events and can't reach into each other's code.
 On day one it is a plain FastAPI app.
@@ -73,7 +73,7 @@ async def write_thank_you_note(event: OrderCreated) -> None:
     await notes.save(event.order_id, note)  # llm and notes: your model client and your storage
 ```
 
-![In one process the customer waits for the LLM call; with the outbox or a worker process the request returns at once, and the call runs and retries in the background](https://raw.githubusercontent.com/jeansossmeier/modupy/main/docs/images/ai-listener.svg)
+![In one process the customer waits for the LLM call; with the outbox or a worker process the request returns at once, and the call runs and retries in the background](https://github.com/jeansossmeier/modupy/raw/main/docs/images/ai-listener.svg)
 
 Then choose how it runs. The listener does not change:
 
@@ -108,7 +108,7 @@ Three modules and one shared contract.
 `orders` publishes an event, `payments` and `inventory` react to it, and no module imports another.
 An event is any class marked `@event`; a frozen dataclass is the recommended shape.
 
-![orders publishes OrderCreated, which payments and inventory receive; payments publishes PaymentReceived, which orders receives; both events live in contracts](https://raw.githubusercontent.com/jeansossmeier/modupy/main/docs/images/event-flow.svg)
+![orders publishes OrderCreated, which payments and inventory receive; payments publishes PaymentReceived, which orders receives; both events live in contracts](https://github.com/jeansossmeier/modupy/raw/main/docs/images/event-flow.svg)
 
 Every package also needs an `__init__.py`: the three modules below show theirs, and `myapp/__init__.py` and `myapp/contracts/__init__.py` are empty.
 
@@ -348,7 +348,7 @@ $ modulith run myapp.main:app --topology=processes
 modulith → process-per-module: 3 worker(s) [inventory:9001, orders:9002, payments:9003], reverse proxy on http://0.0.0.0:8000
 ```
 
-![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](https://raw.githubusercontent.com/jeansossmeier/modupy/main/docs/images/processes.svg)
+![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](https://github.com/jeansossmeier/modupy/raw/main/docs/images/processes.svg)
 
 Each module now runs in its own process behind one public port, so the URLs do not change:
 
@@ -400,7 +400,7 @@ pytest
 
 A module may call another module's public functions and use the events in `contracts`; `modulith verify` refuses the rest:
 
-![payments may import the public API of orders and the events in contracts, but modulith verify refuses an import of a private name such as _orders](https://raw.githubusercontent.com/jeansossmeier/modupy/main/docs/images/boundaries.svg)
+![payments may import the public API of orders and the events in contracts, but modulith verify refuses an import of a private name such as _orders](https://github.com/jeansossmeier/modupy/raw/main/docs/images/boundaries.svg)
 
 Put the boundary check in CI, so nobody, human or AI, quietly couples two modules:
 
@@ -435,7 +435,7 @@ If the transaction rolls back, the event is gone too; if the process crashes aft
 A `publish()` outside a session is delivered directly and saves nothing, so the session wiring below is required.
 With `auto_discover = false` the store is not bound at bootstrap: call `outbox.configure()` yourself, or a publish inside a session is also delivered directly, with one logged WARNING per process.
 
-![One commit saves the order and one event_publications row per listener; after the commit each listener runs in the background, and a failing one is retried, then dead-lettered](https://raw.githubusercontent.com/jeansossmeier/modupy/main/docs/images/outbox.svg)
+![One commit saves the order and one event_publications row per listener; after the commit each listener runs in the background, and a failing one is retried, then dead-lettered](https://github.com/jeansossmeier/modupy/raw/main/docs/images/outbox.svg)
 
 ```bash
 pip install 'modupy[postgres]'   # for MySQL or SQLite, use 'modupy[database]'
