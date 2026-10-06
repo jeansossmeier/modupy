@@ -983,7 +983,10 @@ async def test_wedging_row_does_not_dead_letter_the_rows_claimed_behind_it(
             batch_size=10,
             dispatch_concurrency=1,
             max_attempts=max_attempts,
-            reclaim_stale_seconds=0.1,
+            # The 10 x 0.05s renew deadline must stay well under
+            # PollingConsumer._stop_drain_grace_s, so every stop charges the
+            # wedged row; asyncio may end that grace one clock tick early.
+            reclaim_stale_seconds=0.05,
         )
 
     for _ in range(max_attempts):
