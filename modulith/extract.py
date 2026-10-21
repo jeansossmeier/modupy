@@ -228,19 +228,45 @@ _DISTRIBUTIONS_MARKER = "modulith-gate-distributions:"
 
 _IMPORT_CHECK = (
     """
-import importlib, importlib.metadata, json, os, re, site, sys, sysconfig
+import builtins, importlib, importlib.metadata, json, os, re, site, sys, sysconfig
 root, dotted, source = sys.argv[1:4]
-declared = set(json.loads(sys.argv[4]))
+declared, covered = (set(json.loads(arg)) for arg in sys.argv[4:6])
 loaded_before = set(sys.modules)
+# Top-level packages each top-level package imports, recorded also when the
+# imported module is already loaded. An import neither hook sees, such as one
+# through a reference to import_module taken before this script ran, is not.
+imports = {}
+real_import, real_import_module = builtins.__import__, importlib.import_module
+
+
+def record(importer_globals, name):
+    importer = str((importer_globals or {}).get("__name__") or "").split(".")[0]
+    imports.setdefault(importer, set()).add(name.split(".")[0])
+
+
+def recording_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if level == 0:
+        record(globals, name)
+    return real_import(name, globals, locals, fromlist, level)
+
+
+def recording_import_module(name, package=None):
+    if not name.startswith("."):
+        record(sys._getframe(1).f_globals, name)
+    return real_import_module(name, package)
+
+
+builtins.__import__, importlib.import_module = recording_import, recording_import_module
 sys.path.insert(0, root)
 importlib.import_module(dotted)
 # The worker imports these two at start-up and tolerates only their absence.
-for name in sys.argv[5:]:
+for name in sys.argv[6:]:
     try:
         importlib.import_module(name)
     except ModuleNotFoundError as exc:
         if exc.name != name:
             raise
+builtins.__import__, importlib.import_module = real_import, real_import_module
 """
     + _IMPORT_CHECK_UNDER
     + """
@@ -309,7 +335,26 @@ def loaded_owners(top):
     return shipped or (set(owners) if paths else set())
 
 
-distributions = sorted({d for top in new_top_levels for d in loaded_owners(top)})
+def is_covered(top):
+    owners = loaded_owners(top)
+    return bool(owners) and all(re.sub(r"[-_.]+", "-", d).lower() in covered for d in owners)
+
+
+# A distribution the service installs brings what it imports, optional imports
+# included, so only what the service's code reaches without passing through one
+# counts. An importer no distribution owns (the standard library, or unknown) and
+# a package no import statement named stand for the service's code.
+pending = [dotted.split(".")[0], *(i for i in imports if not by_top_level.get(i))]
+pending += new_top_levels - set().union(*imports.values())
+seen, reached = set(), set()
+while pending:
+    top = pending.pop()
+    if top not in seen:
+        seen.add(top)
+        if not is_covered(top):
+            reached.add(top)
+            pending += imports.get(top, ())
+distributions = sorted({d for top in new_top_levels & reached for d in loaded_owners(top)})
 print("""
     + repr(_DISTRIBUTIONS_MARKER)
     + """, json.dumps(distributions), file=sys.stderr)
@@ -344,13 +389,17 @@ def _check_imports(
     source: Path,
     also: Sequence[str] = (),
     declared: Collection[str] = (),
+    covered: Collection[str] = (),
 ) -> list[str]:
     """Import *dotted* in a fresh interpreter from the extracted tree at *root*; raise if it fails.
 
     Each module of *also* is imported too, and only that exact module being
     absent is tolerated, as ``_worker._import_contracts`` and
     ``_import_manifest`` do. Returns the third-party distributions the imports
-    loaded, so the caller can compare them with what the service declares.
+    loaded, so the caller can compare them with what the service declares. What a
+    distribution named in *covered* (canonical names: what the service installs)
+    imports itself is left out, such as an optional import of another package
+    that happens to be installed.
 
     *root* goes first on the child's ``sys.path`` explicitly, so neither
     ``PYTHONSAFEPATH`` nor an installed copy of the monolith can shadow it.
@@ -386,6 +435,7 @@ def _check_imports(
                         dotted,
                         str(source),
                         json.dumps(sorted(declared)),
+                        json.dumps(sorted(covered)),
                         *also,
                     ],
                     cwd=gate_root,
@@ -955,14 +1005,15 @@ def write_extraction(
             helpers=helpers,
         )
         source_deps, dependencies_outside_project = _source_dependencies()
+        covered = _declared_distributions(_dependencies(cfg, source_deps))
         loaded = _check_imports(
             staging,
             f"{cfg.package}.{module}",
             source_root.parents[len(cfg.package.split(".")) - 1],
             also=(f"{cfg.package}.{cfg.contracts_module}", f"{cfg.package}.{module}._manifest"),
             declared=_declared_distributions(source_deps),
+            covered=covered,
         )
-        covered = _declared_distributions(_dependencies(cfg, source_deps))
         undeclared = sorted(name for name in loaded if _canonical_name(name) not in covered)
         if undeclared:
             print(

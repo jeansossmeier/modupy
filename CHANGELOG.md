@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `modulith extract` no longer lists under "Extraction notes" a distribution that only a dependency the generated `pyproject.toml` installs imported, such as `sniffio`, which `anyio` imports when it is installed, or `orjson`, which FastAPI imports the same way. The import check now records which package each import came from, and reports what the module's own code loads, or loads through a distribution the service does not install
+
 ## [0.12.0] — 2026-10-06
 
 ### Changed
