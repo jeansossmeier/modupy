@@ -49,6 +49,7 @@ SECTIONS: list[tuple[str, str, list[str]]] = [
             "publish",
             "publish_sync",
             "PublishSyncTimeout",
+            "ListenerTimeoutError",
             "configure",
             "bootstrap",
             "externalized",

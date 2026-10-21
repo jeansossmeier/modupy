@@ -26,6 +26,7 @@ The public API is defined by exports in `modulith/__init__.py`:
 - `bootstrap`, `configure` — initialization and runtime config
 - `Configuration`, `ConfigurationError` — config contract and errors
 - `PublishSyncTimeout` — raised by `publish_sync()` when its timeout elapses
+- `ListenerTimeoutError` — the failure of a listener that ran past its `@listener(timeout=...)`
 
 **Plugin authors** (extending modupy):
 - `hookimpl` — hook-implementation marker (plugins implement hookspecs in `modulith.hooks`)

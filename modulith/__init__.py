@@ -39,7 +39,15 @@ from .brokers import (
 
 # ----- Configuration ------------------------------------------------------
 from .config import Configuration, ConfigurationError
-from .decorators import bootstrap, configure, event, externalized, listener, publish
+from .decorators import (
+    ListenerTimeoutError,
+    bootstrap,
+    configure,
+    event,
+    externalized,
+    listener,
+    publish,
+)
 
 # ----- Plugin manager (advanced — most users don't need this) -------------
 from .manager import create_plugin_manager
@@ -86,6 +94,7 @@ __all__ = [
     # Contract types
     "EventPublication",
     "EventSerializer",
+    "ListenerTimeoutError",
     "Manifest",
     "ModuleInfo",
     "PublicationStore",

@@ -88,6 +88,31 @@ sequenceDiagram
     B--xP: re-raises the first failure in registration order
 ```
 
+A listener that calls something slow (a model, a remote API) can bound each
+call with a budget in seconds:
+
+```python
+@listener(timeout=30)
+async def summarize(evt: OrderPlaced) -> None:
+    await llm.summarize(evt.order_id)
+```
+
+Past the budget the listener is cancelled and fails with
+`ListenerTimeoutError`, which every path handles as any other listener failure:
+an in-memory `publish()` raises it, the outbox records a failed attempt and
+retries it with backoff, and a cross-process consumer fails the delivery so the
+broker redelivers it. Cancellation is cooperative: it lands at the listener's
+next `await`. A listener whose `except` or `finally` block awaits more work
+fails once that work is done, and one that catches `CancelledError` and carries
+on completes normally, with a warning that it ran past its budget. Work the
+listener hands to a thread (`run_in_executor`, `asyncio.to_thread`, a library's
+sync fallback) fails on time but keeps running on that thread, so the retry can
+run alongside it. Only an `async def` listener takes a timeout: a plain `def`
+listener with one raises `TypeError` at registration, because Python cannot
+stop the thread it runs on. Contain blocking code by giving its module a process
+of its own (recipe 8), which can be killed and restarted. Without `timeout` a
+listener is never interrupted.
+
 Dispatch is by exact type: a listener receives only events whose class is the
 annotated one. A listener annotated with a base class does not receive its
 subclasses' events, so give each event type its own listener.
