@@ -1626,7 +1626,7 @@ def test_shm_worker_without_listeners_reconciles_previous_deployment(
     # Starting the listener-free redeployment must reconcile the stale set.
     # It needs no poll task because there are no current delivery targets.
     with TestClient(app):
-        consumer = app.state.consumer
+        (consumer,) = app.state.consumers
         assert isinstance(consumer, ShmConsumer)
         assert consumer._task is None
         connection = sqlite3.connect(database_path)
@@ -1670,7 +1670,7 @@ def test_database_worker_without_listeners_warns_about_its_previous_subscription
 
     app = create_app()
     with TestClient(app):
-        assert isinstance(app.state.consumer, DatabaseConsumer)
+        assert [type(c) for c in app.state.consumers] == [DatabaseConsumer]
 
     warnings = [
         r.getMessage()
@@ -1743,7 +1743,7 @@ def test_upgraded_database_worker_leaves_a_siblings_stale_target_to_explicit_cle
     contracts = sys.modules["fakeapp.contracts"]
     serializer = JsonEventSerializer()
     with TestClient(app):
-        assert isinstance(app.state.consumer, DatabaseConsumer)
+        assert [type(c) for c in app.state.consumers] == [DatabaseConsumer]
         assert _runtime.broker_registry is not None
         broker = _runtime.broker_registry.get("database")
 
@@ -2409,3 +2409,264 @@ def test_listener_registered_after_the_consumer_is_built_still_runs_locally(
         asyncio.run(_runtime.dispatch_local(orders.Late("o1"), _runtime.event_bus))
 
     assert ran == ["o1"]
+
+
+# ---------------------------------------------------------------------------
+# a worker several modules share (own_process)
+# ---------------------------------------------------------------------------
+
+_SHARED_WORKER_APP = {
+    "contracts": """
+        from dataclasses import dataclass
+        from modulith import event
+
+        @event
+        @dataclass(frozen=True)
+        class OrderPlaced:
+            order_id: str
+
+        @event
+        @dataclass(frozen=True)
+        class Triaged:
+            order_id: str
+    """,
+    "orders": """
+        from fastapi import APIRouter
+        from modulith import listener
+        from fakeapp.contracts import Triaged
+
+        router = APIRouter()
+
+        @router.get("/ping")
+        async def ping() -> dict[str, str]:
+            return {"from": "orders"}
+
+        @listener
+        async def on_triaged(event: Triaged) -> None:
+            pass
+    """,
+    "billing": """
+        from fastapi import APIRouter
+        from modulith import listener
+        from fakeapp.contracts import OrderPlaced
+
+        router = APIRouter()
+
+        @router.get("/ping")
+        async def ping() -> dict[str, str]:
+            return {"from": "billing"}
+
+        @listener
+        async def bill(event: OrderPlaced) -> None:
+            pass
+    """,
+    "agent": """
+        from modulith import listener
+        from fakeapp.contracts import OrderPlaced
+
+        @listener
+        async def triage(event: OrderPlaced) -> None:
+            pass
+    """,
+}
+
+
+def _register_noop_transport(build: Any = lambda _spec: _NoopConsumer()) -> None:
+    assert _runtime.broker_registry is not None and _runtime.consumer_registry is not None
+    _runtime.broker_registry.register("test-noop-broker", _NoopBroker())
+    _runtime.consumer_registry.register("test-noop-broker", build)
+
+
+def test_shared_worker_imports_and_mounts_every_module_it_hosts(make_fake_app, monkeypatch) -> None:
+    make_fake_app(_SHARED_WORKER_APP)
+    _set_worker_env(monkeypatch, "billing,orders")
+
+    app = create_app()
+    _register_noop_transport()
+    with TestClient(app) as client:
+        assert client.get("/billing/ping").json() == {"from": "billing"}
+        assert client.get("/orders/ping").json() == {"from": "orders"}
+        assert client.get("/health").json()["module"] == "billing,orders"
+        assert client.get("/orders/docs").status_code == 404
+        paths = client.get("/billing/openapi.json").json()["paths"]
+
+    assert "fakeapp.agent" not in sys.modules
+    assert sorted(paths) == ["/billing/ping", "/health", "/orders/ping"]
+
+
+def test_shared_worker_consumes_each_module_in_its_own_group(make_fake_app, monkeypatch) -> None:
+    make_fake_app(_SHARED_WORKER_APP)
+    _set_worker_env(monkeypatch, "billing,orders")
+    app = create_app()
+    specs: list[ConsumerSpec] = []
+
+    def _capture(spec: ConsumerSpec) -> _NoopConsumer:
+        specs.append(spec)
+        return _NoopConsumer()
+
+    _register_noop_transport(_capture)
+
+    with TestClient(app):
+        assert len(app.state.consumers) == 2
+
+    assert [(s.module_name, s.group, s.targets) for s in specs] == [
+        ("billing", "modulith-billing", ("fakeapp.contracts.OrderPlaced",)),
+        ("orders", "modulith-orders", ("fakeapp.contracts.Triaged",)),
+    ]
+    assert [s.consumer_name.partition(":")[0] for s in specs] == ["billing", "orders"]
+    assert [sorted(s.serializer._allowed_event_types) for s in specs] == [
+        ["fakeapp.contracts.OrderPlaced"],
+        ["fakeapp.contracts.Triaged"],
+    ]
+
+
+def test_shared_worker_is_not_ready_while_any_of_its_consumers_is_not(
+    make_fake_app, monkeypatch
+) -> None:
+    ready = _FixedHealthConsumer(ConsumerHealth(ready=True, status="ready"))
+    starting = _FixedHealthConsumer(
+        ConsumerHealth(ready=False, status="starting", detail="orders is catching up")
+    )
+    make_fake_app(_SHARED_WORKER_APP)
+    _set_worker_env(monkeypatch, "billing,orders")
+    monkeypatch.setattr(
+        worker_module,
+        "_build_consumer",
+        lambda module, _name: ready if module == "billing" else starting,
+    )
+
+    app = create_app()
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "starting",
+        "module": "billing,orders",
+        "ready": False,
+        "detail": "orders: orders is catching up",
+    }
+
+
+@pytest.mark.parametrize(
+    ("billing", "orders", "code", "expected"),
+    [
+        (
+            ConsumerHealth(ready=True, status="ready"),
+            ConsumerHealth(ready=True, status="degraded", detail="lagging"),
+            200,
+            {"status": "degraded", "ready": True, "detail": "orders: lagging"},
+        ),
+        (
+            ConsumerHealth(ready=False, status="starting"),
+            ConsumerHealth(ready=False, status="failed", detail="group denied"),
+            503,
+            {"status": "failed", "ready": False, "detail": "orders: group denied"},
+        ),
+        (
+            ConsumerHealth(ready=True, status="ready"),
+            ConsumerHealth(ready=False, status="stopped"),
+            503,
+            {"status": "stopped", "ready": False, "detail": "orders: stopped"},
+        ),
+    ],
+)
+def test_shared_worker_reports_its_worst_consumer_and_names_its_module(
+    make_fake_app, monkeypatch, billing, orders, code, expected
+) -> None:
+    consumers = {"billing": _FixedHealthConsumer(billing), "orders": _FixedHealthConsumer(orders)}
+    make_fake_app(_SHARED_WORKER_APP)
+    _set_worker_env(monkeypatch, "billing,orders")
+    monkeypatch.setattr(worker_module, "_build_consumer", lambda module, _name: consumers[module])
+
+    app = create_app()
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == code
+    assert response.json() == {"module": "billing,orders", **expected}
+
+
+def test_shared_worker_readiness_is_unknown_while_any_consumer_lacks_health(
+    make_fake_app, monkeypatch
+) -> None:
+    ready = _FixedHealthConsumer(ConsumerHealth(ready=True, status="ready"))
+    make_fake_app(_SHARED_WORKER_APP)
+    _set_worker_env(monkeypatch, "billing,orders")
+    monkeypatch.setattr(
+        worker_module,
+        "_build_consumer",
+        lambda module, _name: ready if module == "billing" else _NoopConsumer(),
+    )
+
+    app = create_app()
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "unknown"
+
+
+def test_shared_worker_stops_every_consumer_it_started(make_fake_app, monkeypatch) -> None:
+    stopped: list[str] = []
+
+    class _Recording(_NoopConsumer):
+        def __init__(self, module: str) -> None:
+            self.module = module
+
+        async def stop(self) -> None:
+            stopped.append(self.module)
+
+    make_fake_app(_SHARED_WORKER_APP)
+    _set_worker_env(monkeypatch, "billing,orders")
+    monkeypatch.setattr(worker_module, "_build_consumer", lambda module, _name: _Recording(module))
+
+    with TestClient(create_app()):
+        pass
+
+    assert stopped == ["billing", "orders"]
+
+
+def test_shared_worker_loads_the_manifest_and_fires_the_hook_for_every_module(
+    make_fake_app, monkeypatch
+) -> None:
+    from modulith import ModuleInfo, hookimpl
+
+    seen: list[str] = []
+
+    class _Recorder:
+        @hookimpl
+        def modulith_after_module_load(self, module: ModuleInfo) -> None:
+            seen.append(module.package)
+
+    make_fake_app(
+        _SHARED_WORKER_APP,
+        extra_files={"billing/_manifest.py": "", "orders/_manifest.py": ""},
+    )
+    _set_worker_env(monkeypatch, "billing,orders")
+    _runtime._extra_plugins.append(_Recorder())
+
+    create_app()
+
+    assert seen == ["fakeapp.billing", "fakeapp.orders"]
+    assert {"fakeapp.billing._manifest", "fakeapp.orders._manifest"} <= set(sys.modules)
+
+
+def test_worker_strips_and_deduplicates_the_modules_it_hosts(make_fake_app, monkeypatch) -> None:
+    make_fake_app(_SHARED_WORKER_APP)
+    _set_worker_env(monkeypatch, " billing , orders,billing")
+    app = create_app()
+    _register_noop_transport()
+
+    with TestClient(app) as client:
+        assert client.get("/health").json()["module"] == "billing,orders"
+        assert client.get("/orders/ping").json() == {"from": "orders"}
+
+
+@pytest.mark.parametrize("value", ["billing,,orders", "billing,", " "])
+def test_worker_refuses_an_empty_module_name(make_fake_app, monkeypatch, value: str) -> None:
+    make_fake_app(_SHARED_WORKER_APP)
+    _set_worker_env(monkeypatch, value)
+
+    with pytest.raises(RuntimeError, match="names an empty module"):
+        create_app()

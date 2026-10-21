@@ -666,6 +666,7 @@ The built-in verifier in `modulith/builtin/verifier.py` ships these rules:
 4. **Events flow through contracts module** — cross-module type imports must come from `myapp.contracts.*`, not from another module's package
 5. **Module data ownership** — when manifests declare `owns_tables=[...]`, a `Table(...)` definition, a `__tablename__` assignment or a `ForeignKey("table.col")` string literal that names a table another module owns is flagged, as is a table that two manifests both claim; a module with a non-empty `owns_tables` also gets a warning for any table it defines but omits from that list, so the manifest stays a complete inventory. The check is best-effort and reports warnings only ([§8.2](#82-the-ast-based-verifier))
 6. **Contracts is a sink** — every module may import from the contracts module, and the contracts module may not import any application module
+7. **No import of an `own_process` module** (`own-process-import`, a warning) — a module that imports, outside `if TYPE_CHECKING:`, a module `[tool.modulith] own_process` names loads that module's code into its own process too, which is what `own_process` keeps apart
 
 ![payments may import the public API of orders and the events in contracts, but modulith verify refuses an import of a private name such as _orders](docs/images/boundaries.svg)
 
@@ -762,8 +763,11 @@ The supervisor ([§9.3](#93-the-supervisor)) sets both variables for every worke
   imports during bootstrap. Two shapes are not owned by a single module:
   - Listeners registered outside any module import (plugins, hooks) are
     untagged. They are local in every worker, so a non-externalized event
-    they handle is never routed to the broker, and a listener for that
-    event in another worker does not receive it.
+    they handle is never routed to the broker by a one-module worker, and a
+    listener for that event in another worker does not receive it. A worker
+    that several modules share (`own_process`) routes every event it
+    publishes, and counts an untagged listener as its first module's, so
+    only that module's consumer group subscribes to the event.
   - A listener in a plain, non-package file (`app/shared.py`) or in a
     namespace folder without `__init__.py` (`app/common/audit.py`) belongs
     to the module package whose import first loads that file in each
@@ -1369,6 +1373,7 @@ What each file is. [ROADMAP.md](ROADMAP.md) holds the live delivery status, and 
 | `_worker.py` | ✅ | Per-module FastAPI app generator (Phase 3) |
 | `_consumer.py` | ✅ | BrokerConsumer: per-worker stream subscription + dispatch (Phase 3) |
 | `supervisor.py` | ✅ | Process orchestration (Phase 3) |
+| `_inspect.py` | ✅ | The subprocess `modulith run` bootstraps the application in under the process topology, so the supervisor imports no application module |
 | `proxy.py` | ✅ | Reverse proxy (Phase 3) |
 | `testing.py` | ✅ | pytest plugin entry points (Phase 2) |
 | `__main__.py` | ✅ | `python -m modulith`, the same entry point as the `modulith` command |

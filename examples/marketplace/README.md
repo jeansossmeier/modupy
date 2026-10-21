@@ -188,7 +188,7 @@ microservice-ready.
 $ modulith run marketplace.main:app --topology processes
 INFO:  discovered 8 module(s): catalog, contracts, inventory, notifications, orders, payments, reporting, shipping
 INFO:  outbox=postgres, broker=database, topology=processes
-modulith → process-per-module: 7 worker(s) [catalog:9001, inventory:9002, notifications:9003, orders:9004, payments:9005, reporting:9006, shipping:9008], reverse proxy on http://0.0.0.0:8000
+modulith → process topology: 7 worker(s) [catalog:9001, inventory:9002, notifications:9003, orders:9004, payments:9005, reporting:9006, shipping:9008], reverse proxy on http://0.0.0.0:8000
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
 ```
 
@@ -378,7 +378,7 @@ the order the exporter writes them.
 ```bash
 $ cd build/notifications-service && OTEL_TRACES_EXPORTER=console modulith run marketplace:app --topology processes --port 8100 --worker-port-base 9101
 INFO:  discovered 2 module(s): contracts, notifications
-modulith → process-per-module: 1 worker(s) [notifications:9101], reverse proxy on http://0.0.0.0:8100
+modulith → process topology: 1 worker(s) [notifications:9101], reverse proxy on http://0.0.0.0:8100
 INFO:  [notifications]     "name": "modulith.event.dispatch",
 INFO:  [notifications]             "service.name": "marketplace-notifications"
 ```
@@ -393,7 +393,7 @@ own, with every other module left out. It takes over port 8000:
 ```bash
 $ modulith dev marketplace.main:app --isolate orders
 modulith: --isolate='orders' restricts this deployment to that module only — every other discovered module is not started and its routes 404
-modulith → process-per-module: 1 worker(s) [orders:9001], reverse proxy on http://127.0.0.1:8000
+modulith → process topology: 1 worker(s) [orders:9001], reverse proxy on http://127.0.0.1:8000
 ```
 
 This is what runs now, and the path the event takes:

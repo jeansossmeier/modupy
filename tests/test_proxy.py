@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient
 
 from modulith._worker import NONCE_HEADER, identity_proof
 from modulith.proxy import RoutingRule, _match_rule, create_proxy_app
+from modulith.supervisor import WorkerSpec, _rules_from_specs
 
 from conftest import _free_port, _health_answer, _held_backend, _serve, _wait_for
 
@@ -1972,3 +1973,109 @@ async def test_a_proxy_without_a_token_sends_no_challenge_and_serves_any_listene
     assert (served.status_code, readiness) == (200, "ok")
     assert health_headers == [None]
     assert hits == ["ping"]
+
+
+# ---------------------------------------------------------------------------
+# own_process: a shared worker behind several prefixes, readiness per module
+# ---------------------------------------------------------------------------
+
+_AGENT = "http://127.0.0.1:9001"
+_SHARED = "http://127.0.0.1:9002"
+
+
+def _shared_worker_app() -> FastAPI:
+    """The worker ``billing`` and ``orders`` share, holding the deployment token ``tok``."""
+    up = FastAPI()
+
+    @up.get("/{module}/ping")
+    async def ping(module: str) -> dict[str, str]:
+        return {"served_by": module}
+
+    @up.get("/health")
+    async def health(request: Request) -> dict[str, str]:
+        return _health_answer(request, "tok", "billing,orders")
+
+    return up
+
+
+def _desk_proxy(*, down: str | None = None, failed: frozenset[str] = frozenset()) -> FastAPI:
+    """The proxy for ``agent`` in a worker of its own and ``billing,orders`` sharing
+    one, as ``run_supervised`` builds it; the backend at ``down`` refuses connections."""
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    specs = [
+        WorkerSpec("agent", "app", 9001, own_process=True),
+        WorkerSpec("billing,orders", "app", 9002),
+    ]
+    apps = {_AGENT: _worker_app("tok", "agent"), _SHARED: _shared_worker_app()}
+    client = httpx.AsyncClient(
+        mounts={
+            url: httpx.MockTransport(refuse) if url == down else httpx.ASGITransport(app=app)
+            for url, app in apps.items()
+        }
+    )
+    return create_proxy_app(
+        _rules_from_specs(specs),
+        client=client,
+        deployment_token="tok",
+        failed_instances=lambda: failed,
+    )
+
+
+async def _get_all(proxy_app: FastAPI, *paths: str) -> list[httpx.Response]:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy"
+    ) as c:
+        return [await c.get(path) for path in paths]
+
+
+async def test_a_shared_worker_is_verified_under_its_own_name_behind_each_prefix() -> None:
+    billing, orders, readiness = await _get_all(
+        _desk_proxy(), "/billing/ping", "/orders/ping", "/_modulith/health"
+    )
+
+    assert (billing.status_code, billing.json()) == (200, {"served_by": "billing"})
+    assert (orders.status_code, orders.json()) == (200, {"served_by": "orders"})
+    assert (readiness.status_code, readiness.json()["backends"]) == (
+        200,
+        {"/agent": "ok", "/billing": "ok", "/orders": "ok"},
+    )
+
+
+async def test_readiness_reports_a_given_up_shared_worker_under_each_of_its_prefixes() -> None:
+    proxy_app = _desk_proxy(down=_SHARED, failed=frozenset({"billing,orders"}))
+
+    (readiness,) = await _get_all(proxy_app, "/_modulith/health")
+
+    assert (readiness.status_code, readiness.json()) == (
+        503,
+        {
+            "status": "degraded",
+            "backends": {
+                "/agent": "ok",
+                "/billing": "failed (given up)",
+                "/orders": "failed (given up)",
+            },
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("failed", "state"),
+    [(frozenset(), "unreachable"), (frozenset({"agent"}), "failed (given up)")],
+    ids=["restarting", "given-up"],
+)
+async def test_readiness_stays_200_while_only_an_own_process_module_is_down(
+    failed: frozenset[str], state: str
+) -> None:
+    readiness, orders = await _get_all(
+        _desk_proxy(down=_AGENT, failed=failed), "/_modulith/health", "/orders/ping"
+    )
+
+    assert (readiness.status_code, readiness.json()) == (
+        200,
+        {"status": "degraded", "backends": {"/agent": state, "/billing": "ok", "/orders": "ok"}},
+    )
+    assert orders.status_code == 200

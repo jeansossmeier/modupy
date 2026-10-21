@@ -237,7 +237,7 @@ export MODULITH_OUTBOX=postgres MODULITH_OUTBOX_URL=sqlite+aiosqlite:///shop.db
 
 ```bash
 $ modulith run shop.main:app --topology processes --host 127.0.0.1
-modulith → process-per-module: 3 worker(s) [inventory:9001, notifications:9003, orders:9004], reverse proxy on http://127.0.0.1:8000
+modulith → process topology: 3 worker(s) [inventory:9001, notifications:9003, orders:9004], reverse proxy on http://127.0.0.1:8000
 ```
 
 ```bash
@@ -336,7 +336,7 @@ export MODULITH_OUTBOX=postgres MODULITH_OUTBOX_URL=sqlite+aiosqlite:///shop.db 
 
 ```bash
 $ modulith run shop.main:app --topology processes --host 127.0.0.1
-modulith → process-per-module: 3 worker(s) [inventory:9001, notifications:9003, orders:9004], reverse proxy on http://127.0.0.1:8000
+modulith → process topology: 3 worker(s) [inventory:9001, notifications:9003, orders:9004], reverse proxy on http://127.0.0.1:8000
 ```
 
 ```bash

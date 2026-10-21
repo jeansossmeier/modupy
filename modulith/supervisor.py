@@ -269,6 +269,9 @@ class WorkerSpec:
     port: int  # uvicorn binds here (first replica; +1 per extra replica)
     worker_count: int = 1  # multiple processes per module if needed
     env: dict[str, str] | None = None  # additional env vars
+    # Split out of the shared worker by ``own_process``: readiness tolerates it
+    # being down (see ``RoutingRule.own_process``).
+    own_process: bool = False
 
     def __post_init__(self) -> None:
         # bool is an int subclass, so it needs its own check.
@@ -1006,16 +1009,24 @@ def _rules_from_specs(specs: list[WorkerSpec]) -> list[RoutingRule]:
     replica is — the broker already load-shares event consumption across
     replicas via the shared consumer group; this is what makes HTTP traffic
     and health checks reach every replica too, not just the first.
+
+    A worker that several modules share (``own_process``) gets one rule per
+    module, all naming that worker, so each prefix reaches it and its identity
+    is checked under the worker's own name. A module ``own_process`` gave a
+    worker of its own keeps that mark on its rule, for readiness.
     """
     from .proxy import RoutingRule
 
     return [
         RoutingRule(
-            prefix=f"/{spec.module_name}",
+            prefix=f"/{module}",
             backend_url=f"http://127.0.0.1:{spec.port}",
             backend_urls=tuple(f"http://127.0.0.1:{port}" for port in _replica_ports(spec)),
+            worker=spec.module_name,
+            own_process=spec.own_process,
         )
         for spec in specs
+        for module in spec.module_name.split(",")
     ]
 
 
@@ -1429,11 +1440,19 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
 
     ``config`` is a ``[tool.modulith]``-shaped dict:
       - ``package``  — application root package (required)
+      - ``modules``  — the module names, already discovered by the caller
+        (optional; without it this process discovers them, importing every
+        module, which ``modulith run`` avoids by inspecting the application
+        in a subprocess, see ``modulith._inspect``)
       - ``workers``  — ``{module_name: count}`` plus optional ``default``
       - ``isolate``  — restrict to this subset of modules (optional)
+      - ``own_process`` — the modules that get a worker of their own; every
+        other module then shares one worker, named by its modules joined
+        with commas and run with the largest replica count among them
+        (optional; without it each module gets its own worker)
 
-    Every ``workers`` key other than ``default`` and every ``isolate`` entry
-    must name a discovered, non-contract module; anything else raises
+    Every ``workers`` key other than ``default`` and every ``isolate`` and
+    ``own_process`` entry must name a discovered, non-contract module; anything else raises
     ``ConfigurationError`` listing the valid names rather than being ignored.
       - ``contracts_module`` — the shared-types package (default
         ``"contracts"``), which discovery lists as a module but which gets no
@@ -1445,9 +1464,16 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
     by each module's worker_count so replicas never collide; a module whose
     last replica port would pass 65535 raises ``ConfigurationError``.
 
-    Also reports the resulting HTTP surface (see ``_log_http_surface``): this
-    is the only process that sees every module, so it is where "nothing in
-    this deployment exposes a router" can be said at all.
+    A module ``own_process`` splits out of the shared worker gets
+    ``WorkerSpec.own_process``, so readiness stays 200 while only such modules
+    are down. When ``own_process`` names every module there is no shared
+    worker, and no spec is marked.
+
+    When it discovers the modules itself, it also reports the resulting HTTP
+    surface (see ``_log_http_surface``): this is then the only process that
+    sees every module, so it is where "nothing in this deployment exposes a
+    router" can be said at all. Given ``modules``, the process that discovered
+    them reports it instead.
     """
     package = config.get("package")
     if not package:
@@ -1456,13 +1482,20 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
             "(set [tool.modulith].package or pass it explicitly)"
         )
 
-    names = discover_module_names(package, config.get("contracts_module") or "contracts")
+    given_names = config.get("modules")
+    names = (
+        list(given_names)
+        if given_names is not None
+        else discover_module_names(package, config.get("contracts_module") or "contracts")
+    )
     workers = config.get("workers") or {}
     isolate = config.get("isolate")
+    own_process = config.get("own_process")
 
     for option, given in (
         ("workers", [k for k in workers if k != "default"]),
         ("isolate", list(isolate or ())),
+        ("own_process", list(own_process or ())),
     ):
         unknown = [n for n in given if n not in names]
         if unknown:
@@ -1478,25 +1511,39 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
         wanted = set(isolate)
         names = [n for n in names if n in wanted]
 
-    _log_http_surface(package, names)
+    if given_names is None:
+        _log_http_surface(package, names)
 
     default_count = int(workers.get("default", 1))
     if default_count < 1:
         raise ValueError(f"[tool.modulith.workers] default must be >= 1, got {default_count}")
     worker_env = dict(config.get("env") or {})
 
+    groups: list[list[str]] = []
+    shared: list[str] = []
+    for name in names:
+        if not own_process or name in own_process:
+            groups.append([name])
+        else:
+            if not shared:
+                groups.append(shared)
+            shared.append(name)
+
     specs: list[WorkerSpec] = []
     port = int(config.get("worker_port_base") or 9001)
-    for name in names:
-        count = int(workers.get(name, default_count))
-        if count < 1:
-            # Loud-config-error contract: the port counter advances by each
-            # module's count, so a 0/negative entry would silently assign a
-            # later module the same (or an earlier) port as this one.
-            raise ValueError(
-                f"[tool.modulith.workers] {name} must be >= 1, got {count} — "
-                "a module cannot run zero worker processes"
-            )
+    for group in groups:
+        counts = [int(workers.get(member, default_count)) for member in group]
+        for member, count in zip(group, counts, strict=True):
+            if count < 1:
+                # Loud-config-error contract: the port counter advances by each
+                # module's count, so a 0/negative entry would silently assign a
+                # later module the same (or an earlier) port as this one.
+                raise ValueError(
+                    f"[tool.modulith.workers] {member} must be >= 1, got {count} — "
+                    "a module cannot run zero worker processes"
+                )
+        name = ",".join(group)
+        count = max(counts)
         if port + count - 1 > 65535:
             from .config import ConfigurationError
 
@@ -1511,6 +1558,9 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
                 port=port,
                 worker_count=count,
                 env=worker_env.copy() or None,
+                # Naming every module leaves no shared worker, which is the
+                # layout without own_process, readiness included.
+                own_process=bool(shared) and group is not shared,
             )
         )
         port += count

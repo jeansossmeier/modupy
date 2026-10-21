@@ -872,6 +872,86 @@ def test_run_processes_topology_uses_pyproject_worker_counts(make_fake_app, monk
     assert by_name["inventory"].worker_count == 1
 
 
+def test_run_processes_topology_honors_own_process(make_fake_app, monkeypatch, tmp_path):
+    make_fake_app({"orders": "", "inventory": "", "payments": ""})
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith]\npackage = "fakeapp"\nbroker = "testbroker"\nown_process = ["orders"]\n'
+    )
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["run", "fakeapp:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    assert [s.module_name for s in captured["specs"]] == ["inventory,payments", "orders"]
+
+
+def test_run_processes_topology_passes_the_worker_liveness_timeout(
+    make_fake_app, monkeypatch, tmp_path
+):
+    make_fake_app({"orders": ""})
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith]\npackage = "fakeapp"\nbroker = "testbroker"\n'
+        "worker_liveness_timeout_seconds = 7\n"
+    )
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["run", "fakeapp:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["liveness_timeout"] == 7
+
+
+def test_the_supervisor_process_imports_no_application_module(make_fake_app, monkeypatch):
+    """A subprocess discovers the modules, so an own_process module's import-time
+    memory, threads or crash never reach the process serving the proxy."""
+    make_fake_app({"orders": "", "inventory": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["run", "fakeapp:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    assert {s.module_name for s in captured["specs"]} == {"orders", "inventory"}
+    assert "fakeapp.orders" not in sys.modules
+    assert "fakeapp.inventory" not in sys.modules
+
+
+def test_run_processes_topology_fails_on_a_module_that_cannot_import(make_fake_app, monkeypatch):
+    make_fake_app({"orders": "raise RuntimeError('orders is broken at import')", "inventory": ""})
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.setenv("MODULITH_BROKER", "testbroker")
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    async def must_not_supervise(specs, host, port, **kwargs):
+        pytest.fail("no worker may start for an application that fails to bootstrap")
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", must_not_supervise)
+
+    result = runner.invoke(app, ["run", "fakeapp:app", "--topology", "processes"])
+
+    assert result.exit_code == 1, result.output
+    assert "orders is broken at import" in result.stderr
+
+
 # ---------------------------------------------------------------------------
 # modulith verify
 # ---------------------------------------------------------------------------

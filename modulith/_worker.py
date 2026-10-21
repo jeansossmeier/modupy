@@ -1,7 +1,9 @@
 """Per-module worker: a FastAPI app containing only one module's surface.
 
 Used by uvicorn in process-per-module mode. The supervisor spawns one
-of these per module; uvicorn calls create_app() to get the ASGI app.
+of these per module; uvicorn calls create_app() to get the ASGI app. With
+``own_process`` configured, the modules it does not name share one worker,
+which hosts each of them the way a one-module worker hosts its module.
 
 Invoked as:
     uvicorn modulith._worker:create_app --factory \
@@ -9,25 +11,26 @@ Invoked as:
 
 with MODULITH_MODULE / MODULITH_APP_PACKAGE in the worker's environment.
 
-Critical correctness: the worker imports the configured module (plus the
+Critical correctness: the worker imports the modules it hosts (plus the
 contracts module) and never walks the other modules. This is what gives each
 worker its own GIL — it has its own process, its own import graph, its own
-event loop, its own memory. A sibling module the configured module imports
-through its public API is imported too, but the listeners registered while
-importing it are ignored here (``Runtime.host_module``): the worker subscribes
-to, dispatches and persists outbox records only for its own module's
-listeners and for listeners registered outside any module import, such as
-plugins'. Each sibling listener runs in its owner's worker.
+event loop, its own memory. A sibling module a hosted module imports through
+its public API is imported too, but the listeners registered while importing
+it are ignored here (``Runtime.host_module``): the worker subscribes to,
+dispatches and persists outbox records only for its hosted modules' listeners
+and for listeners registered outside any module import, such as plugins'.
+Each sibling listener runs in its owner's worker.
 
 Cross-module events flow through the broker, not in-memory dispatch. This
 factory wires BOTH halves: the runtime routes cross-module *publishes* to the
 broker, and the worker's lifespan starts a ``BrokerConsumer`` (see
-``modulith._consumer``) that *subscribes* to this module's consumed-event
-streams, deserializes each message via its ``event_type`` header, and
-dispatches it to the local listeners. The consumer is skipped (HTTP-only
-worker) in single topology, when no broker is registered, or when the module
-consumes nothing. SHM is the exception: it starts a task-free consumer once
-to remove subscriptions left by an earlier deployment.
+``modulith._consumer``) per hosted module that *subscribes* to that module's
+consumed-event streams, deserializes each message via its ``event_type``
+header, and dispatches it to that module's local listeners. A module's
+consumer is skipped in single topology, when no broker is registered, or when
+the module consumes nothing; a worker with no consumer serves HTTP only. SHM
+is the exception: it starts a task-free consumer once to remove subscriptions
+left by an earlier deployment.
 """
 
 from __future__ import annotations
@@ -53,6 +56,12 @@ NONCE_HEADER = "x-modulith-nonce"
 # worker's /health answer and takes a longer one for another deployment's, so a
 # consumer's error text must not be able to push the body past that.
 MAX_HEALTH_DETAIL_CHARS = 1024
+
+# Worst first; a status a consumer invents counts as the worst.
+_HEALTH_SEVERITY = {
+    status: rank
+    for rank, status in enumerate(("failed", "stopped", "starting", "unknown", "degraded", "ready"))
+}
 
 
 def identity_proof(token: str, nonce: str, module: str, port: int) -> str:
@@ -207,7 +216,8 @@ def create_app() -> FastAPI:
     Called by uvicorn via ``--factory``. Reads configuration from env vars so
     each worker process has its own context:
 
-      * ``MODULITH_MODULE``       — the single module this worker hosts (required)
+      * ``MODULITH_MODULE``       — the module this worker hosts, or the
+        modules it hosts together, comma-separated (required)
       * ``MODULITH_APP_PACKAGE``  — the application package (required)
 
     Configures modulith with ``auto_discover=False`` so bootstrap imports no
@@ -222,6 +232,10 @@ def create_app() -> FastAPI:
     The OpenAPI schema and doc UIs are served under the module prefix too
     (``/<module>/openapi.json``, ``/<module>/docs``, ``/<module>/redoc``), which
     is what makes them reachable through the reverse proxy on the public port.
+    A worker hosting several modules mounts each one's ``router`` under its own
+    prefix and serves one schema for all of them under the first module's
+    prefix. It runs one consumer per module, in that module's own consumer
+    group, and its ``/health`` is ready only while every consumer is.
 
     It also calls ``install_access_log_filter``, so a worker's access lines and
     WebSocket handshake lines never carry a query string, whoever launched
@@ -235,6 +249,13 @@ def create_app() -> FastAPI:
             "process-per-module worker requires the MODULITH_MODULE and "
             "MODULITH_APP_PACKAGE environment variables to be set"
         )
+    names = list(dict.fromkeys(name.strip() for name in module_name.split(",")))
+    if not all(names):
+        raise RuntimeError(
+            f"MODULITH_MODULE={module_name!r} names an empty module: expected a "
+            "module name, or module names separated by commas"
+        )
+    module_name = ",".join(names)
 
     install_access_log_filter()
     _start_parent_watchdog()
@@ -255,24 +276,26 @@ def create_app() -> FastAPI:
 
     contracts_module = _runtime.config.contracts_module if _runtime.config else "contracts"
     _import_contracts(app_package, contracts_module)
-    module_package = f"{app_package}.{module_name}"
-    _runtime.host_module(module_package)
-    module = importlib.import_module(module_package)
-    _import_manifest(module_package)
+    packages = [f"{app_package}.{name}" for name in names]
+    _runtime.host_module(*packages)
+    modules = [importlib.import_module(package) for package in packages]
+    for package in packages:
+        _import_manifest(package)
     # auto_discover=False means the bootstrap loop above never populates a
     # module list, so it never fires modulith_after_module_load for the
-    # module THIS worker imports — plugins that rely on it (startup metrics,
+    # modules THIS worker imports — plugins that rely on it (startup metrics,
     # module-scoped resources) would silently never run for any
     # process-topology worker. Fire it here, after import + manifest so the
     # hookspec's "after all listeners and event types are wired" contract
     # still holds.
     if _runtime.plugin_manager is not None:
-        _runtime.plugin_manager.hook.modulith_after_module_load(
-            module=ModuleInfo(name=module_name, package=module_package)
-        )
+        for name, package in zip(names, packages, strict=True):
+            _runtime.plugin_manager.hook.modulith_after_module_load(
+                module=ModuleInfo(name=name, package=package)
+            )
     _runtime.bind_configured_outbox()
     _require_outbox_store()
-    consumer_name = f"{module_name}:{uuid4().hex}"
+    instance = uuid4().hex
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -286,15 +309,19 @@ def create_app() -> FastAPI:
         # credentials), and outside the try that failure would skip the
         # finally, leaking every broker client the runtime already registered.
         # stop() before a successful start() is safe by the Consumer protocol.
-        consumer: Any = None
-        _app.state.consumer = None
+        consumers: list[Any] = []
+        owners: list[str] = []
+        _app.state.consumers = consumers
+        _app.state.consumer_modules = owners
         _app.state.legacy_health_warning_emitted = False
         _app.state.logged_cut_detail = None
         try:
-            consumer = _build_consumer(module_name, consumer_name)
-            _app.state.consumer = consumer
-            if consumer is not None:
-                await consumer.start()
+            for name in names:
+                consumer = _build_consumer(name, f"{name}:{instance}")
+                if consumer is not None:
+                    consumers.append(consumer)
+                    owners.append(name)
+                    await consumer.start()
             outbox.start()
             yield
         finally:
@@ -303,12 +330,13 @@ def create_app() -> FastAPI:
             # skips shutdown() entirely, leaking every broker connection the
             # runtime registered on every ordinary stop-time error.
             consumer_error: BaseException | None = None
-            if consumer is not None:
+            for consumer in consumers:
                 try:
                     await consumer.stop()
                 except BaseException as exc:
-                    consumer_error = exc
-            _app.state.consumer = None
+                    consumer_error = consumer_error or exc
+            _app.state.consumers = []
+            _app.state.consumer_modules = []
             try:
                 await _runtime.shutdown()
             except BaseException as shutdown_error:
@@ -355,23 +383,29 @@ def create_app() -> FastAPI:
             request.headers.get(NONCE_HEADER),
             request.scope.get("server"),
         )
-        consumer = getattr(app.state, "consumer", None)
-        if consumer is None:
+        consumers = getattr(app.state, "consumers", [])
+        if not consumers:
             return {"status": "ok", **identity}
-        if not isinstance(consumer, HealthAwareConsumer):
+        if not all(isinstance(consumer, HealthAwareConsumer) for consumer in consumers):
             warning = "consumer does not expose health"
             if not app.state.legacy_health_warning_emitted:
                 logger.warning("worker %r readiness is unknown: %s", module_name, warning)
                 app.state.legacy_health_warning_emitted = True
             return {"status": "unknown", **identity, "warning": warning}
 
-        snapshot = consumer.health()
+        # A shared worker reports its worst consumer and names that module.
+        owner, snapshot = min(
+            zip(app.state.consumer_modules, (c.health() for c in consumers), strict=True),
+            key=lambda pair: (pair[1].ready, _HEALTH_SEVERITY.get(pair[1].status, -1)),
+        )
         response: dict[str, Any] = {
             "status": snapshot.status,
             **identity,
             "ready": snapshot.ready,
         }
         detail = snapshot.detail
+        if len(consumers) > 1 and (detail is not None or snapshot.status != "ready"):
+            detail = f"{owner}: {detail or snapshot.status}"
         if detail is not None:
             if len(detail) > MAX_HEALTH_DETAIL_CHARS:
                 # A failed consumer reports the same text on every poll.
@@ -414,13 +448,18 @@ def create_app() -> FastAPI:
     # registers its doc routes from setup(), which __init__ already called
     # while all three URLs were None — a no-op then, so this call registers
     # each of them exactly once.
-    router = getattr(module, "router", None)
-    app.openapi_url = f"/{module_name}/openapi.json"
-    app.docs_url = f"/{module_name}/docs"
-    app.redoc_url = f"/{module_name}/redoc"
-    app.swagger_ui_oauth2_redirect_url = f"/{module_name}/docs/oauth2-redirect"
+    routers = [getattr(module, "router", None) for module in modules]
+    docs_prefix = names[0]
+    app.openapi_url = f"/{docs_prefix}/openapi.json"
+    app.docs_url = f"/{docs_prefix}/docs"
+    app.redoc_url = f"/{docs_prefix}/redoc"
+    app.swagger_ui_oauth2_redirect_url = f"/{docs_prefix}/docs/oauth2-redirect"
     app.setup()
-    module_owned = {f"/{module_name}{route.path}" for route in getattr(router, "routes", ())}
+    module_owned = {
+        f"/{name}{route.path}"
+        for name, router in zip(names, routers, strict=True)
+        for route in getattr(router, "routes", ())
+    }
     doc_paths = {
         app.openapi_url,
         app.docs_url,
@@ -432,52 +471,54 @@ def create_app() -> FastAPI:
         route for route in app.router.routes if getattr(route, "path", None) not in superseded
     ]
 
-    if router is not None:
-        app.include_router(router, prefix=f"/{module_name}")
-        logger.info("mounted router for module %r under /%s", module_name, module_name)
-        # Asks each route whether it would answer GET /health, because FastAPI
-        # may keep an included router as one wrapper route rather than
-        # flattening its routes into app.routes.
-        probe_scope = {
-            "type": "http",
-            "path": "/health",
-            "root_path": "",
-            "method": "GET",
-            "headers": [],
-            "query_string": b"",
-        }
-        for route in app.router.routes:
-            if getattr(route, "endpoint", None) is health:
-                continue
-            if route.matches(probe_scope)[0] is Match.FULL:
-                logger.warning(
-                    "module %r route GET /health is unreachable: the worker's own "
-                    "/health answers that path first. Serve it from another path, "
-                    "such as /health/.",
-                    module_name,
-                )
-    else:
-        # A worker mounts exactly one thing: the module package's `router`.
-        # Without it the worker still boots and still reports healthy, so an
-        # APIRouter defined in a submodule (orders/api.py) and never
-        # re-exported turns into a 404 on every path under /<module> with
-        # nothing to explain it.
-        #
-        # WARNING rather than INFO because uvicorn configures only its own
-        # loggers and leaves the root logger without a handler: INFO from this
-        # logger is dropped in any deployment that doesn't set logging up
-        # itself, and the one line explaining a dark worker has to survive the
-        # default configuration. It costs a listener-only module one line per
-        # process start, which the message names as the expected case.
-        logger.warning(
-            "module %r exposes no 'router' attribute — this worker serves no "
-            "HTTP routes, so every request to /%s/... returns 404. Expected "
-            "for a listener-only module; otherwise re-export the APIRouter "
-            "from %s (e.g. 'from .api import router' in its __init__.py).",
-            module_name,
-            module_name,
-            module_package,
-        )
+    for name, package, router in zip(names, packages, routers, strict=True):
+        if router is not None:
+            mounted = len(app.router.routes)
+            app.include_router(router, prefix=f"/{name}")
+            logger.info("mounted router for module %r under /%s", name, name)
+            # Asks each route whether it would answer GET /health, because FastAPI
+            # may keep an included router as one wrapper route rather than
+            # flattening its routes into app.routes.
+            probe_scope = {
+                "type": "http",
+                "path": "/health",
+                "root_path": "",
+                "method": "GET",
+                "headers": [],
+                "query_string": b"",
+            }
+            for route in app.router.routes[mounted:]:
+                if getattr(route, "endpoint", None) is health:
+                    continue
+                if route.matches(probe_scope)[0] is Match.FULL:
+                    logger.warning(
+                        "module %r route GET /health is unreachable: the worker's own "
+                        "/health answers that path first. Serve it from another path, "
+                        "such as /health/.",
+                        name,
+                    )
+        else:
+            # A worker mounts nothing but each module package's `router`.
+            # Without it the worker still boots and still reports healthy, so an
+            # APIRouter defined in a submodule (orders/api.py) and never
+            # re-exported turns into a 404 on every path under /<module> with
+            # nothing to explain it.
+            #
+            # WARNING rather than INFO because uvicorn configures only its own
+            # loggers and leaves the root logger without a handler: INFO from this
+            # logger is dropped in any deployment that doesn't set logging up
+            # itself, and the one line explaining a dark worker has to survive the
+            # default configuration. It costs a listener-only module one line per
+            # process start, which the message names as the expected case.
+            logger.warning(
+                "module %r exposes no 'router' attribute — this worker serves no "
+                "HTTP routes, so every request to /%s/... returns 404. Expected "
+                "for a listener-only module; otherwise re-export the APIRouter "
+                "from %s (e.g. 'from .api import router' in its __init__.py).",
+                name,
+                name,
+                package,
+            )
 
     logger.info("worker app built for module %r (package %r)", module_name, app_package)
     return app
@@ -518,6 +559,8 @@ def _build_consumer(module_name: str, consumer_name: str | None = None) -> Any:
         return None
     if cfg.topology == "single":
         return None
+    if _runtime._cohosted_modules:
+        bus = _runtime.module_bus(bus, f"{cfg.package}.{module_name}")
 
     targets = consumer_targets(bus, cfg, module_name)
     _runtime.mark_consumer_built()

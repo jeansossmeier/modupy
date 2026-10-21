@@ -145,6 +145,86 @@ def test_derive_specs_accepts_the_default_key_and_known_module_names(make_fake_a
     assert [(s.module_name, s.worker_count) for s in specs] == [("orders", 3)]
 
 
+def test_derive_specs_own_process_puts_every_other_module_in_one_worker(make_fake_app) -> None:
+    make_fake_app({"agent": "", "billing": "", "orders": "", "contracts": ""})
+
+    specs = derive_specs_from_config({"package": "fakeapp", "own_process": ["agent"]})
+
+    assert [(s.module_name, s.port) for s in specs] == [("agent", 9001), ("billing,orders", 9002)]
+
+
+def test_derive_specs_shared_worker_runs_its_largest_replica_count(make_fake_app) -> None:
+    make_fake_app({"agent": "", "billing": "", "orders": ""})
+
+    specs = derive_specs_from_config(
+        {"package": "fakeapp", "own_process": ["agent"], "workers": {"orders": 3, "agent": 2}}
+    )
+
+    assert [(s.module_name, s.port, s.worker_count) for s in specs] == [
+        ("agent", 9001, 2),
+        ("billing,orders", 9003, 3),
+    ]
+
+
+def test_derive_specs_own_process_naming_every_module_changes_nothing(make_fake_app) -> None:
+    make_fake_app({"orders": "", "inventory": ""})
+
+    specs = derive_specs_from_config({"package": "fakeapp", "own_process": ["orders", "inventory"]})
+
+    assert [s.module_name for s in specs] == ["inventory", "orders"]
+
+
+def test_derive_specs_own_process_rejects_an_unknown_module(make_fake_app) -> None:
+    from modulith import ConfigurationError
+
+    make_fake_app({"orders": "", "inventory": ""})
+
+    with pytest.raises(ConfigurationError, match="own_process names 'agnt'"):
+        derive_specs_from_config({"package": "fakeapp", "own_process": ["agnt"]})
+
+
+def test_rules_from_specs_routes_each_module_of_a_shared_worker_to_it() -> None:
+    specs = [WorkerSpec("agent", "app", 9001), WorkerSpec("billing,orders", "app", 9002)]
+
+    rules = _rules_from_specs(specs)
+
+    assert [(r.prefix, r.backend_url, r.worker_name) for r in rules] == [
+        ("/agent", "http://127.0.0.1:9001", "agent"),
+        ("/billing", "http://127.0.0.1:9002", "billing,orders"),
+        ("/orders", "http://127.0.0.1:9002", "billing,orders"),
+    ]
+
+
+def test_derive_specs_marks_only_the_modules_own_process_splits_out(make_fake_app) -> None:
+    make_fake_app({"agent": "", "billing": "", "orders": ""})
+
+    split = derive_specs_from_config({"package": "fakeapp", "own_process": ["agent"]})
+    every = derive_specs_from_config(
+        {"package": "fakeapp", "own_process": ["agent", "billing", "orders"]}
+    )
+    unset = derive_specs_from_config({"package": "fakeapp"})
+
+    assert [(s.module_name, s.own_process) for s in split] == [
+        ("agent", True),
+        ("billing,orders", False),
+    ]
+    assert [s.own_process for s in every] == [False, False, False]
+    assert [s.own_process for s in unset] == [False, False, False]
+
+
+def test_rules_from_specs_carry_the_own_process_mark_to_each_prefix() -> None:
+    specs = [
+        WorkerSpec("agent", "app", 9001, own_process=True),
+        WorkerSpec("billing,orders", "app", 9002),
+    ]
+
+    assert [(r.prefix, r.own_process) for r in _rules_from_specs(specs)] == [
+        ("/agent", True),
+        ("/billing", False),
+        ("/orders", False),
+    ]
+
+
 def test_derive_specs_requires_package() -> None:
     with pytest.raises(ValueError, match="package"):
         derive_specs_from_config({})

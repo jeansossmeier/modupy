@@ -35,7 +35,9 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
+import tempfile
 import tomllib
 import traceback
 from collections import defaultdict
@@ -194,8 +196,8 @@ def _package_from_app_module(app_module: str) -> str:
     return module_path.split(".", 1)[0]
 
 
-def _configure_process_runtime(app_module: str) -> None:
-    """Apply process-topology CLI intent before bootstrapping the runtime.
+def _configure_process_runtime(app_module: str) -> str:
+    """Apply process-topology CLI intent before bootstrapping; return the package.
 
     The package comes from explicit configuration when present; otherwise it
     is derived from ``app_module``. When both exist and disagree, warn loudly:
@@ -227,6 +229,56 @@ def _configure_process_runtime(app_module: str) -> None:
             err=True,
         )
     _runtime.configure(**overrides)
+    return resolved.package or implied
+
+
+def _inspect_application(
+    package: str, *, log_level: str, verify_warn: bool, isolate: str | None
+) -> list[str]:
+    """Bootstrap the application in a subprocess and return its module names.
+
+    The supervisor never imports an application module (see
+    ``modulith._inspect``), so the import-time checks that used to fail its own
+    bootstrap run in this child, before any worker starts. The child's stderr
+    is relayed line by line as it arrives, so a slow import shows its progress
+    and a failure keeps its message. It gets this process's ``sys.path``,
+    which is how it finds the package the CLI made importable. A failed
+    bootstrap exits with the child's code.
+    """
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(entry for entry in sys.path if entry)}
+    with tempfile.TemporaryDirectory() as scratch:
+        out = Path(scratch) / "modules.json"
+        command = [
+            sys.executable,
+            "-m",
+            "modulith._inspect",
+            package,
+            log_level,
+            "1" if verify_warn else "0",
+            isolate or "",
+            str(out),
+        ]
+        child = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env
+        )
+        try:
+            assert child.stderr is not None  # stderr=PIPE
+            for line in child.stderr:
+                typer.echo(line, err=True, nl=False)
+            code = child.wait()
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+        if code != 0:
+            if code < 0:
+                typer.echo(
+                    f"error: inspecting package {package!r} died with signal {-code}",
+                    err=True,
+                )
+            raise typer.Exit(code=code if code > 0 else 1)
+        names: list[str] = json.loads(out.read_text(encoding="utf-8"))
+    return names
 
 
 def _prefer_sibling_uvicorn() -> None:
@@ -695,13 +747,16 @@ def _run_process_topology(
     warn_default_state_dir: bool = False,
     worker_port_base: int | None = None,
 ) -> None:
-    """Spin up the process-per-module runtime: one worker per module + proxy.
+    """Spin up the process topology: the workers + the supervisor and proxy.
 
-    Bootstraps to resolve the application package, derives a ``WorkerSpec``
-    per discovered module (honoring ``--workers`` counts and ``--isolate``),
-    then runs the supervisor and reverse proxy on ``(host, port)``. Blocks
-    until a shutdown signal arrives. With ``verify_warn`` (``modulith dev``),
-    boundary violations are echoed as non-fatal warnings after bootstrap.
+    Inspects the application in a subprocess (``_inspect_application``) that
+    discovers its modules and runs the checks that need them imported, then
+    derives a ``WorkerSpec`` per worker (honoring ``--workers`` counts,
+    ``--isolate`` and ``own_process``) and runs the supervisor and reverse
+    proxy on ``(host, port)``. This process itself imports no application
+    module. Blocks until a shutdown signal arrives. With ``verify_warn``
+    (``modulith dev``), the subprocess echoes boundary violations as non-fatal
+    warnings.
 
     ``log_level`` is both this process's root log level (already installed by
     the caller) and the level forwarded to every worker subprocess, so one
@@ -718,13 +773,23 @@ def _run_process_topology(
     # guaranteed a package (explicit, or derived from app_module), so the
     # package-detection probe in _bootstrap_or_exit would re-read pyproject
     # and re-sweep the environment only to reach the same answer.
-    _configure_process_runtime(app_module)
-    rt = _ensure_bootstrapped_or_exit()
-    if verify_warn:
-        try:
-            _echo_violation_warnings(_collect_violations(rt))
-        except Exception as exc:  # dev-time signal only — never fatal
-            typer.echo(f"modulith: boundary check skipped ({exc})", err=True)
+    #
+    # The subprocess logs this configuration and its bootstrap, so below ERROR
+    # this process would only repeat those lines.
+    modulith_logger = logging.getLogger("modulith")
+    previous_level = modulith_logger.level
+    modulith_logger.setLevel(logging.ERROR)
+    try:
+        package = _configure_process_runtime(app_module)
+        names = _inspect_application(
+            package, log_level=log_level, verify_warn=verify_warn, isolate=isolate
+        )
+        # This process resolves configuration and brokers only: discovery
+        # would import every module into the process that outlives them all.
+        _runtime.configure(auto_discover=False)
+        rt = _ensure_bootstrapped_or_exit()
+    finally:
+        modulith_logger.setLevel(previous_level)
     cfg = rt.config
     assert cfg is not None  # ensure_bootstrapped guarantees this
 
@@ -807,11 +872,13 @@ def _run_process_topology(
 
     config: dict[str, Any] = {
         "package": cfg.package,
+        "modules": names,
         # --workers replaces the pyproject [tool.modulith.workers] table
         # entirely — a full override, not a per-module patch.
         "workers": workers_map if workers_map is not None else dict(cfg.workers),
         "env": worker_env,
         "contracts_module": cfg.contracts_module,
+        "own_process": list(cfg.own_process),
         "worker_port_base": (
             worker_port_base if worker_port_base is not None else cfg.worker_port_base
         ),
@@ -835,10 +902,14 @@ def _run_process_topology(
 
     layout = ", ".join(f"{s.module_name}:{s.port}" for s in specs)
     typer.echo(
-        f"modulith → process-per-module: {len(specs)} worker(s) [{layout}], "
+        f"modulith → process topology: {len(specs)} worker(s) [{layout}], "
         f"reverse proxy on http://{host}:{port}"
     )
-    derived = _derived_consumer_groups(cfg.package, cfg.contracts_module)
+    from ._worker import consumer_group
+
+    # Every discovered module counts, including ones --isolate leaves out of
+    # this run (see _derived_consumer_groups).
+    derived = {consumer_group(name) for name in names}
 
     async def supervise() -> None:
         await _warn_about_retired_groups(rt, cfg.broker, derived)
