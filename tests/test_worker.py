@@ -194,6 +194,35 @@ def test_installing_the_access_log_filter_twice_keeps_one_filter_per_logger(
     assert [type(f) for f in logging.getLogger("uvicorn.error").filters] == [LogTargetQueryFilter]
 
 
+async def test_the_supervisors_liveness_poll_leaves_no_access_line(
+    make_fake_app, monkeypatch, access_log: _Lines
+) -> None:
+    import uvicorn
+
+    from modulith.supervisor import _health_answer
+
+    make_fake_app({"orders": ""})
+    _set_worker_env(monkeypatch, "orders")
+    port = _free_port()
+    server = uvicorn.Server(
+        uvicorn.Config(create_app(), host="127.0.0.1", port=port, log_config=None, log_level="info")
+    )
+    serving = asyncio.create_task(server.serve())
+    try:
+        while not server.started:
+            assert not serving.done(), serving.exception()
+            await asyncio.sleep(0.02)
+
+        assert await _health_answer("127.0.0.1", port, 5.0) is True
+        async with httpx.AsyncClient() as client:
+            await client.get(f"http://127.0.0.1:{port}/health")
+    finally:
+        server.should_exit = True
+        await serving
+
+    assert [line.split(" - ", 1)[1] for line in access_log.lines] == ['"GET /health HTTP/1.1" 200']
+
+
 def test_create_app_hides_query_strings_in_the_access_log(
     make_fake_app, monkeypatch, access_log: _Lines
 ) -> None:

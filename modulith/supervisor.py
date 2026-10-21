@@ -52,7 +52,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from ._worker import LogTargetQueryFilter, install_access_log_filter, install_filter_once
+from ._worker import (
+    LIVENESS_PROBE_TARGET,
+    LogTargetQueryFilter,
+    install_access_log_filter,
+    install_filter_once,
+)
 
 if TYPE_CHECKING:
     from .proxy import RoutingRule
@@ -87,6 +92,41 @@ _LOG_QUIET_PERIOD = 0.5
 _LOG_LINE_LIMIT = 2**16
 # How often a waiter re-checks a worker's returncode (see _exited).
 _EXIT_POLL_INTERVAL = 0.05
+# How long stop() lets workers exit after SIGTERM before it SIGKILLs them, by
+# default, and how long the proxy lets in-flight requests finish after a
+# shutdown signal before it cancels them: a request to a worker that never
+# answers would otherwise keep the proxy, and so the workers, up for good.
+_SHUTDOWN_TIMEOUT = 30
+# Longest gap between two liveness polls of one worker (see _watch_liveness):
+# each poll is a line in that worker's access log.
+_LIVENESS_POLL_INTERVAL = 10.0
+
+
+async def _health_answer(host: str, port: int, timeout: float) -> bool | None:
+    """Whether ``GET /health`` on ``host:port`` gets any HTTP answer within ``timeout``.
+
+    ``False`` when the port is open but nothing answered, ``None`` when
+    nothing listens on it. A bare socket rather than httpx, which would log
+    every poll at INFO, and the worker leaves the poll out of its access log.
+    """
+
+    async def status_line() -> bytes:
+        reader, writer = await asyncio.open_connection(host, port)
+        try:
+            writer.write(
+                b"GET %b HTTP/1.1\r\nHost: %b\r\nConnection: close\r\n\r\n"
+                % (LIVENESS_PROBE_TARGET.encode(), host.encode())
+            )
+            return await reader.readline()
+        finally:
+            writer.close()
+
+    try:
+        return (await asyncio.wait_for(status_line(), timeout)).startswith(b"HTTP/")
+    except TimeoutError:  # an OSError too, so caught first
+        return False
+    except OSError:
+        return None
 
 
 async def _exited(proc: asyncio.subprocess.Process) -> int:
@@ -266,9 +306,11 @@ def _build_worker_env(spec: WorkerSpec) -> dict[str, str]:
 
     Precedence (lowest to highest): the supervisor's own inherited
     ``os.environ``, then the module's configured ``spec.env`` (e.g. broker
-    settings forwarded by the CLI), then the three reserved identity vars —
+    settings forwarded by the CLI), then the reserved identity vars —
     so nothing in ``spec.env`` can ever misroute a worker to the wrong
-    module/package/topology.
+    module/package/topology. ``MODULITH_SUPERVISOR_PID`` is one of them: the
+    worker exits once this process is no longer its parent (see
+    ``modulith._worker._start_parent_watchdog``).
 
     Exception: non-empty inherited ``MODULITH_BROKER*`` values beat
     ``spec.env`` for the same key. That matches the adapter's documented
@@ -288,6 +330,7 @@ def _build_worker_env(spec: WorkerSpec) -> dict[str, str]:
     env["MODULITH_MODULE"] = spec.module_name
     env["MODULITH_APP_PACKAGE"] = spec.package
     env["MODULITH_TOPOLOGY"] = "processes"
+    env["MODULITH_SUPERVISOR_PID"] = str(os.getpid())
 
     if env.get("MODULITH_BROKER") == "redis-streams":
         for generic, specific in _REDIS_BROKER_ENV_ALIASES.items():
@@ -401,7 +444,8 @@ class Supervisor:
 
     Lifecycle:
       1. start() — spawn all configured workers
-      2. monitor — watch for crashes, restart with exponential backoff
+      2. monitor — watch for crashes, restart with exponential backoff; with
+         ``liveness_timeout``, also kill a worker that stops answering /health
       3. stop() — graceful SIGTERM cascade, SIGKILL stragglers on timeout
     """
 
@@ -411,12 +455,16 @@ class Supervisor:
         *,
         restart_initial_delay: float = 1.0,
         restart_max_delay: float = 60.0,
-        shutdown_timeout: float = 30.0,
+        shutdown_timeout: float = _SHUTDOWN_TIMEOUT,
         command_builder: CommandBuilder | None = None,
         max_restarts: int = 5,
         restart_healthy_uptime: float | None = None,
+        liveness_timeout: float | None = None,
     ) -> None:
         self._specs = specs
+        # Seconds a worker may leave its /health unanswered, once it is
+        # listening, before it is killed (see _watch_liveness); None is off.
+        self._liveness_timeout = liveness_timeout
         self._restart_initial_delay = restart_initial_delay
         self._restart_max_delay = restart_max_delay
         self._shutdown_timeout = shutdown_timeout
@@ -510,6 +558,9 @@ class Supervisor:
         (SIGKILL, OOM, hard crash) instead of lingering as orphans that hold
         their statically-assigned ports. On other platforms no equivalent
         exists — there, a hard-killed supervisor can still orphan workers.
+        A worker that cannot act on the SIGTERM, its event loop blocked, exits
+        through its parent watchdog instead (``MODULITH_SUPERVISOR_PID``, see
+        ``_build_worker_env``), wherever the platform reparents orphans.
         """
         cmd = self._command_builder(spec, port)
         env = _build_worker_env(spec)
@@ -627,6 +678,9 @@ class Supervisor:
 
         Before each respawn the worker's port must be free (see
         ``_await_port_release``): time spent waiting for it is not a crash.
+
+        A worker the liveness watchdog kills (see ``_watch_liveness``) exits
+        like a crashed one and goes through the same policy.
         """
         policy = _RestartPolicy(
             initial_delay=self._restart_initial_delay,
@@ -637,7 +691,7 @@ class Supervisor:
         port_still_held = False
         while True:
             started = time.monotonic()
-            return_code = await _exited(proc)
+            return_code = await self._exited_or_killed(name, port, proc)
             self._notify_listeners(port)
             if self._stopping:
                 return
@@ -710,6 +764,60 @@ class Supervisor:
             # The loop's _exited(proc) + _stopping check handle the rest.
             if self._stopping and proc.returncode is None:  # type: ignore[unreachable]
                 proc.terminate()  # type: ignore[unreachable]
+
+    async def _exited_or_killed(
+        self, name: str, port: int, proc: asyncio.subprocess.Process
+    ) -> int:
+        """``proc``'s exit code, with its liveness watchdog running until then."""
+        if self._liveness_timeout is None:
+            return await _exited(proc)
+        watchdog = asyncio.create_task(self._watch_liveness(name, port, proc))
+        try:
+            return await _exited(proc)
+        finally:
+            watchdog.cancel()
+            await asyncio.gather(watchdog, return_exceptions=True)
+
+    async def _watch_liveness(self, name: str, port: int, proc: asyncio.subprocess.Process) -> None:
+        """SIGKILL ``proc`` once its ``/health`` has gone unanswered for ``liveness_timeout``.
+
+        A worker whose event loop is blocked or spinning never exits, and its
+        port still accepts connections, so nothing else here notices it. The
+        watchdog polls the worker's loopback ``/health`` every third of the
+        timeout, 10 s apart at most, so it kills a hung worker within a third
+        more than the timeout after its last answer. It counts any HTTP
+        answer, a 503 included, as alive: an unready consumer is not a hang.
+        It is armed once the worker's port first accepts a connection, which
+        uvicorn does only after the app's startup, so a slow start is never
+        taken for a hang while a worker that blocks before it ever answers is
+        still caught. It never kills during ``stop()``, which gives workers
+        their own time to exit.
+        """
+        timeout = self._liveness_timeout
+        assert timeout is not None
+        interval = min(_LIVENESS_POLL_INTERVAL, timeout / 3)
+        # When the worker last answered, or first accepted a connection.
+        answered_at: float | None = None
+        while True:
+            polled_at = time.monotonic()
+            answer = await _health_answer(_WORKER_HOST, port, timeout)
+            if answer:
+                answered_at = time.monotonic()
+            else:
+                if answer is False and answered_at is None:
+                    answered_at = polled_at
+                silent = answered_at is not None and time.monotonic() - answered_at >= timeout
+                if silent and not self._stopping and proc.returncode is None:
+                    logger.error(
+                        "worker %s has not answered /health for %gs (pid %s); killing "
+                        "it, and restarting it as after a crash",
+                        name,
+                        timeout,
+                        proc.pid,
+                    )
+                    proc.kill()
+                    return
+            await asyncio.sleep(interval)
 
     async def _await_port_release(self, name: str, port: int) -> bool:
         """Wait, up to ``restart_max_delay`` seconds, for ``port`` to be free.
@@ -937,11 +1045,20 @@ async def _serve_uvicorn(app: Any, host: str, port: int) -> None:
     rather than a higher level for the ``httpx`` logger, because that line is
     this process's only record of which worker answered a forwarded request or
     a readiness probe.
+
+    After a shutdown signal, requests still in flight get ``_SHUTDOWN_TIMEOUT``
+    seconds to finish, the time ``stop()`` then gives the workers, before
+    uvicorn cancels them; one waiting on a worker that never answers would
+    otherwise hold the proxy, and every worker behind it, up for good.
     """
     import uvicorn
 
     config = uvicorn.Config(
-        app, host=host, port=port, log_level=logging.getLogger().getEffectiveLevel()
+        app,
+        host=host,
+        port=port,
+        log_level=logging.getLogger().getEffectiveLevel(),
+        timeout_graceful_shutdown=_SHUTDOWN_TIMEOUT,
     )
     install_access_log_filter()
     install_filter_once("httpx", LogTargetQueryFilter(_HTTPX_REQUEST_LINE, 1))
@@ -1086,6 +1203,7 @@ async def run_supervised(
     actuator_token: str | None = None,
     actuator_mode: str | None = None,
     production: bool | None = None,
+    liveness_timeout: float | None = None,
 ) -> None:
     """Run the supervisor + reverse proxy together.
 
@@ -1110,8 +1228,15 @@ async def run_supervised(
     from ``modulith run``.
 
     ``MODULITH_PROXY_MAX_CONNECTIONS`` bounds the proxy's concurrent upstream
-    connections (1000 by default). Each in-flight proxied request, including
-    a long-poll or streaming response, holds one until it finishes.
+    connections to each worker replica (1000 by default). Each in-flight
+    proxied request, including a long-poll or streaming response, holds one
+    until it finishes or its client disconnects.
+
+    ``liveness_timeout`` (``[tool.modulith] worker_liveness_timeout_seconds``)
+    turns on the default supervisor's liveness watchdog: a worker whose
+    ``/health`` stays unanswered that long, once it is listening, is killed
+    and restarted (see ``Supervisor._watch_liveness``). An injected
+    ``supervisor`` keeps its own setting.
 
     Each call generates a random deployment token and adds it to every spec's
     ``env`` as ``MODULITH_DEPLOYMENT_TOKEN`` (mutating the specs, so an injected
@@ -1152,7 +1277,11 @@ async def run_supervised(
     for spec in specs:
         spec.env = {**(spec.env or {}), "MODULITH_DEPLOYMENT_TOKEN": deployment_token}
 
-    sup = supervisor if supervisor is not None else Supervisor(specs)
+    sup = (
+        supervisor
+        if supervisor is not None
+        else Supervisor(specs, liveness_timeout=liveness_timeout)
+    )
     rules = _rules_from_specs(specs)
 
     # Once a worker exits, its port may be bound by another process, so the

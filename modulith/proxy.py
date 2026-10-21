@@ -220,9 +220,11 @@ def create_proxy_app(
     ``client`` (an ``httpx.AsyncClient``) may be injected — for tests, or to
     share a connection pool — and is then used for every upstream call,
     worker ``/health`` probes included. When omitted, the app creates two
-    clients and closes them with its lifespan: one for proxied requests,
-    capped at ``max_connections`` concurrent upstream connections (each held
-    until its response finishes streaming), and a separate one for ``/health``
+    clients and closes them with its lifespan: one for proxied requests, with
+    a pool of its own per backend URL, each capped at ``max_connections``
+    concurrent upstream connections (each held until its response finishes
+    streaming), so a backend that stops answering can fill only its own pool
+    and never delays a request to another; and a separate one for ``/health``
     probes, so a saturated request pool cannot fail readiness. The probe pool
     holds 100 connections, or one per worker replica when there are more, so
     one readiness poll never queues behind it. Concurrent readiness polls share
@@ -238,7 +240,9 @@ def create_proxy_app(
     prevent hanging on unreachable backends, while ``read=None`` disables the
     read timeout to support long-polling, streaming responses, and slow
     upstreams. Ignored if ``client`` is injected (the caller owns the client's
-    configuration).
+    configuration). Without a read timeout a request waits on its backend for
+    as long as its client does: a client that disconnects before the response
+    starts cancels the upstream request, which frees its connection.
 
     ``connect_retry_attempts`` and ``connect_retry_backoff`` configure bounded
     retry on ``httpx.ConnectError`` (worker port not yet bound during startup/
@@ -326,7 +330,7 @@ def create_proxy_app(
         if client is not None
         else httpx.AsyncClient(
             timeout=timeout,
-            limits=httpx.Limits(max_connections=max_connections),
+            mounts=_backend_pools(rules, max_connections),
             trust_env=False,
         )
     )
@@ -762,9 +766,12 @@ def create_proxy_app(
                         failover = no_worker(rule)
                         break
                     probing = False
-                    upstream_resp = await http_client.send(
-                        upstream_req, stream=True, follow_redirects=False
+                    upstream_resp = await _send_unless_disconnected(
+                        http_client, upstream_req, request.receive
                     )
+                    if upstream_resp is None:
+                        # Never sent: the client that would read it is gone.
+                        return Response(status_code=499)
                 except TimeoutError:
                     failover = identity_timed_out(backend)
                     break
@@ -1052,6 +1059,57 @@ def _upstream_url(backend: str, raw_path: bytes, query: bytes) -> httpx.URL:
 def _port(url: str) -> int:
     base = httpx.URL(url)
     return base.port or (443 if base.scheme == "https" else 80)
+
+
+def _backend_pools(rules: list[RoutingRule], limit: int) -> dict[str, httpx.AsyncHTTPTransport]:
+    """One transport, and so one connection pool of ``limit``, per backend URL.
+
+    Every pool shares one TLS context: building one per transport loads the CA
+    bundle each time, about 0.1 s per backend.
+    """
+    tls = httpx.create_ssl_context()
+    return {
+        url: httpx.AsyncHTTPTransport(verify=tls, limits=httpx.Limits(max_connections=limit))
+        for url in {url for rule in rules for url in rule.backend_urls}
+    }
+
+
+async def _until_disconnected(receive: Receive) -> None:
+    while (await receive())["type"] != "http.disconnect":
+        pass
+
+
+async def _send_unless_disconnected(
+    client: Any, request: httpx.Request, receive: Receive
+) -> httpx.Response | None:
+    """Send ``request`` upstream, or give it up once the proxy's own client leaves.
+
+    Returns ``None`` when the client disconnected first. The upstream request
+    is cancelled then, which closes its connection and returns it to the pool:
+    otherwise every client that gave up on a backend that never answers would
+    leave a connection held for as long as that backend stays silent. Called
+    only once the request body has been read, so ``receive`` has nothing left
+    to deliver but the disconnect.
+    """
+    sending = asyncio.ensure_future(client.send(request, stream=True, follow_redirects=False))
+    leaving = asyncio.ensure_future(_until_disconnected(receive))
+    try:
+        done, _ = await asyncio.wait((sending, leaving), return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:
+        sending.cancel()
+        leaving.cancel()
+        raise
+    leaving.cancel()
+    if sending in done:
+        response: httpx.Response = sending.result()
+        return response
+    sending.cancel()
+    # The cancelled send closes its connection before this request ends.
+    await asyncio.wait((sending,))
+    if not sending.cancelled() and sending.exception() is None:
+        # It answered just as the client left.
+        await sending.result().aclose()
+    return None
 
 
 def _answers_for(

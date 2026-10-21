@@ -80,6 +80,11 @@ def health_identity(
     return identity
 
 
+# The request target of the supervisor's liveness poll, which polls every few
+# seconds, so its access lines are dropped rather than logged.
+LIVENESS_PROBE_TARGET = "/health?liveness"
+
+
 class AccessLogQueryFilter(logging.Filter):
     """Cut the query string out of the request target in uvicorn's access lines.
 
@@ -87,12 +92,15 @@ class AccessLogQueryFilter(logging.Filter):
     target, HTTP version and status as arguments, and its ``AccessFormatter``
     unpacks all five, so only the target is replaced and the tuple keeps its
     shape. The target is percent-encoded, which makes the first ``?`` in it the
-    start of the query. A record of any other shape passes through untouched.
+    start of the query. The line of a ``LIVENESS_PROBE_TARGET`` request is
+    dropped. A record of any other shape passes through untouched.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
         if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+            if args[2] == LIVENESS_PROBE_TARGET:
+                return False
             record.args = (*args[:2], args[2].partition("?")[0], *args[3:])
         return True
 
@@ -149,6 +157,50 @@ def install_access_log_filter() -> None:
     install_filter_once("uvicorn.error", LogTargetQueryFilter(_WEBSOCKET_LINE, 1))
 
 
+# How long a worker whose supervisor died gets to finish the shutdown the
+# parent-death SIGTERM started before it exits hard: what the supervisor's own
+# stop() waits by default before it SIGKILLs a worker.
+_ORPHAN_GRACE_SECONDS = 30.0
+_PARENT_POLL_SECONDS = 1.0
+
+
+def _start_parent_watchdog() -> None:
+    """Exit this worker once the supervisor that spawned it has died.
+
+    On Linux the supervisor's death sends the worker a SIGTERM, but a worker
+    whose event loop is blocked never acts on it, and other platforms send
+    nothing; the orphan would keep its port, so the next supervisor's worker
+    could not bind it. A daemon thread watches ``os.getppid()`` instead: once
+    it no longer names the supervisor, the thread waits
+    ``_ORPHAN_GRACE_SECONDS`` for the worker to exit on its own, then ends the
+    process with ``os._exit``. It works wherever an orphan is reparented
+    (Linux, macOS), not on Windows. It starts only in the supervisor's own
+    child, the process ``MODULITH_SUPERVISOR_PID`` names as parent, so a worker
+    that a Kubernetes manifest, a Dockerfile or a test starts never watches
+    its parent.
+    """
+    import threading
+    import time
+
+    supervisor_pid = os.environ.get("MODULITH_SUPERVISOR_PID", "")
+    if not supervisor_pid.isdigit() or int(supervisor_pid) != os.getppid():
+        return
+
+    def watch() -> None:
+        while os.getppid() == int(supervisor_pid):
+            time.sleep(_PARENT_POLL_SECONDS)
+        time.sleep(_ORPHAN_GRACE_SECONDS)
+        logger.error(
+            "worker %s outlived its supervisor (pid %s) by %gs; exiting",
+            os.environ.get("MODULITH_MODULE"),
+            supervisor_pid,
+            _ORPHAN_GRACE_SECONDS,
+        )
+        os._exit(1)
+
+    threading.Thread(target=watch, name="modulith-parent-watchdog", daemon=True).start()
+
+
 def create_app() -> FastAPI:
     """Build a FastAPI app exposing only this worker's module.
 
@@ -185,6 +237,7 @@ def create_app() -> FastAPI:
         )
 
     install_access_log_filter()
+    _start_parent_watchdog()
 
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse

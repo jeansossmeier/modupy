@@ -1323,6 +1323,62 @@ async def test_proxy_answers_503_on_pool_exhaustion_without_marking_backend_down
     assert (after.status_code, after.json()) == (200, {"ok": "fast"})
 
 
+async def test_a_backend_that_never_answers_fills_only_its_own_pool() -> None:
+    stall, open_gate = asyncio.Event(), asyncio.Event()
+    open_gate.set()
+    a_seen: list[str] = []
+    a_server, a_url = await _gated_worker("tok", stall, a_seen, "a")
+    b_server, b_url = await _gated_worker("tok", open_gate, [], "b")
+    proxy_app = create_proxy_app(
+        [RoutingRule("/a", a_url), RoutingRule("/b", b_url)],
+        max_connections=2,
+        timeout=httpx.Timeout(5.0, read=None, pool=0.5),
+    )
+    try:
+        async with proxy_app.router.lifespan_context(proxy_app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=proxy_app), base_url="http://proxy", timeout=30
+            ) as c:
+                stalled = [asyncio.create_task(c.get("/a/x")) for _ in range(2)]
+                await _wait_for(lambda: len(a_seen) >= 2, 10.0)
+                b_resp = await c.get("/b/x")
+                stall.set()
+                a_codes = [r.status_code for r in await asyncio.gather(*stalled)]
+    finally:
+        stall.set()
+        await _close_workers(a_server, b_server)
+
+    assert (b_resp.status_code, b_resp.json()["status"]) == (200, "ok")
+    assert a_codes == [200, 200]
+
+
+@pytest.mark.real_process
+async def test_a_client_that_gives_up_frees_its_upstream_connection() -> None:
+    backend_port, proxy_port = _free_port(), _free_port()
+    release, in_flight = asyncio.Event(), [0]
+    rule = RoutingRule("/orders", f"http://127.0.0.1:{backend_port}")
+    proxy = create_proxy_app(
+        [rule], max_connections=1, timeout=httpx.Timeout(5.0, read=None, pool=2.0)
+    )
+    servers = [
+        await _serve(_held_backend(release, in_flight), backend_port, "h11"),
+        await _serve(proxy, proxy_port, "h11"),
+    ]
+    try:
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{proxy_port}", timeout=30) as c:
+            with pytest.raises(httpx.ReadTimeout):
+                await c.get("/orders/slow", timeout=0.5)
+            fast = await c.get("/orders/fast")
+    finally:
+        release.set()
+        for server, _ in servers:
+            server.should_exit = True
+        await asyncio.gather(*(task for _, task in servers))
+
+    assert in_flight[0] == 1
+    assert (fast.status_code, fast.json()) == (200, {"ok": "fast"})
+
+
 @pytest.mark.real_process
 async def test_proxy_ignores_environment_proxy_settings(monkeypatch) -> None:
     """With HTTP_PROXY set and NO_PROXY=localhost (which does not cover

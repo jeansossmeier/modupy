@@ -138,6 +138,11 @@ class Configuration:
     # as many consecutive ports as it has replicas.
     worker_port_base: int = 9001
 
+    # Seconds a process-topology worker may leave its loopback /health
+    # unanswered, once it is listening, before the supervisor kills it and the
+    # restart policy respawns it. None leaves workers that stop answering alone.
+    worker_liveness_timeout_seconds: float | None = None
+
     # Whether to walk subpackages on bootstrap to discover modules.
     # Disable only if you want to register modules programmatically.
     auto_discover: bool = True
@@ -756,6 +761,14 @@ def _read_env_vars() -> dict[str, Any]:
                 f"MODULITH_WORKER_PORT_BASE must be an integer (worker_port_base), "
                 f"got {port_base!r}"
             ) from None
+    if (liveness := _env_str("MODULITH_WORKER_LIVENESS_TIMEOUT_SECONDS")) is not None:
+        try:
+            result["worker_liveness_timeout_seconds"] = float(liveness)
+        except ValueError:
+            raise ConfigurationError(
+                "MODULITH_WORKER_LIVENESS_TIMEOUT_SECONDS must be a number of seconds "
+                f"(worker_liveness_timeout_seconds), got {liveness!r}"
+            ) from None
     return result
 
 
@@ -981,6 +994,7 @@ def _validate(data: dict[str, Any]) -> None:
         "subscription_source": (str,),
         "actuator_mode": (str,),
         "worker_port_base": (int,),
+        "worker_liveness_timeout_seconds": (int, float, type(None)),
         "auto_discover": (bool,),
         "production": (bool,),
         "observability": (bool, type(None)),
@@ -999,6 +1013,12 @@ def _validate(data: dict[str, Any]) -> None:
     if "worker_port_base" in data and not 1 <= data["worker_port_base"] <= 65535:
         raise ConfigurationError(
             f"worker_port_base must be a TCP port (1-65535), got {data['worker_port_base']}"
+        )
+    liveness = data.get("worker_liveness_timeout_seconds")
+    if liveness is not None and not 0 < liveness < float("inf"):
+        raise ConfigurationError(
+            "worker_liveness_timeout_seconds must be a finite number of seconds greater "
+            f"than 0, got {liveness!r}"
         )
 
     # Dict-typed fields must actually be tables. A scalar here is a natural
