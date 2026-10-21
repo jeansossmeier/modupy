@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from ..config import ConfigurationError
 from ._shm_schema import immediate_transaction
-from ._shm_types import PublishResult
+from ._shm_types import PublishResult, ShmStoreFullError
 
 logger = logging.getLogger("modulith.adapters.shm")
 
@@ -148,7 +148,7 @@ def publish(
             _ensure_consumer_reserve(conn, max_store_bytes)
     except (sqlite3.Error, _PublishReserveReached) as error:
         if isinstance(error, _PublishReserveReached) or _is_store_full(error):
-            raise ConfigurationError(
+            raise ShmStoreFullError(
                 "SHM SQLite store is full while publishing. A publication stays in "
                 "the store while any subscribed group has not consumed it (an "
                 "undelivered backlog, including a retired group that never consumes "

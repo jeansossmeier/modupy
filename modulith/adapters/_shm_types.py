@@ -4,6 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..config import ConfigurationError
+
+
+class ShmStoreFullError(ConfigurationError):
+    """The SHM store has no room for a publication until its consumers drain it.
+
+    Backpressure, not misconfiguration: the same publish succeeds once acked
+    publications age out. A ConfigurationError subclass, as publish raised
+    that before.
+    """
+
 
 @dataclass(frozen=True, slots=True)
 class PublishResult:

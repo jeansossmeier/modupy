@@ -4389,3 +4389,186 @@ def test_publish_with_a_bound_session_and_the_memory_outbox_does_not_warn(
         asyncio.run(scenario())
 
     assert _modulith_warnings(caplog) == []
+
+
+async def _full_shm_broker(tmp_path: Path) -> ShmBroker:
+    """A real SHM broker whose store has no room for another publication."""
+    broker = ShmBroker(
+        shm_name="outbox-full-hints",
+        db_path=str(tmp_path / "full.db"),
+        max_payload_bytes=1024,
+        max_store_bytes=64 * 1024,
+    )
+    await broker.subscribe(["events"], "workers")
+    size = 1024
+    for _ in range(10_000):
+        try:
+            await broker.publish("events", b"x" * size)
+        except ConfigurationError as error:
+            assert "store is full" in str(error)
+            if size == 1:
+                return broker
+            size //= 2
+    raise AssertionError("the SHM store never filled")
+
+
+@pytest.mark.asyncio
+async def test_a_full_shm_store_holds_a_broker_route_pending_without_spending_attempts(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A full store is backpressure: the route row keeps its retry budget and
+    stays pending for a later sweep, and the warning is not repeated per send."""
+    shm = await _full_shm_broker(tmp_path)
+    try:
+        _runtime.configure(package="outboxtest", auto_discover=False)
+        _runtime.ensure_bootstrapped()
+        assert _runtime.broker_registry is not None
+        _runtime.broker_registry.register("test", shm)
+        store = StubStore()
+        outbox.configure(store, JsonEventSerializer(), start_loop=False)
+        publication = EventPublication(
+            id=uuid4(),
+            payload=b'{"value": 7}',
+            event_type=f"{OutboxEvent.__module__}.{OutboxEvent.__qualname__}",
+            listener=outbox._BROKER_ROUTE_LISTENER_PREFIX + "test:events",
+            published_at=datetime.now(UTC),
+        )
+        await store.save(publication)
+        caplog.set_level(logging.WARNING, logger="modulith.outbox")
+
+        for _ in range(outbox._dead_letter_after_attempts + 1):
+            await outbox._dispatch_publication(publication)
+
+        assert (publication.attempt_count, publication.last_error) == (0, None)
+        assert publication.completed_at is None
+        assert [p.id for p in await store.find_incomplete(timedelta(0))] == [publication.id]
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "store is full" in warnings[0]
+    finally:
+        await shm.close()
+        shm._ring.unlink()
+
+
+@pytest.mark.asyncio
+async def test_a_full_shm_store_hands_a_swept_route_claim_back_uncharged(tmp_path: Path) -> None:
+    shm = await _full_shm_broker(tmp_path)
+    try:
+        _runtime.configure(package="outboxtest", auto_discover=False)
+        _runtime.ensure_bootstrapped()
+        assert _runtime.broker_registry is not None
+        _runtime.broker_registry.register("test", shm)
+        store = ClaimingStubStore()
+        outbox.configure(store, JsonEventSerializer(), claim_strategy="lease", start_loop=False)
+        publication = EventPublication(
+            id=uuid4(),
+            payload=b'{"value": 7}',
+            event_type=f"{OutboxEvent.__module__}.{OutboxEvent.__qualname__}",
+            listener=outbox._BROKER_ROUTE_LISTENER_PREFIX + "test:events",
+            published_at=datetime.now(UTC),
+        )
+        await store.save(publication)
+
+        await outbox._sweep(timedelta(0))
+
+        assert publication.id not in store.claims
+        assert store.rows[publication.id].attempt_count == 0
+    finally:
+        await shm.close()
+        shm._ring.unlink()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("strategy", "held_back"), [("lease", 2), ("none", 100)])
+async def test_routes_a_full_shm_store_holds_back_do_not_starve_newer_rows(
+    tmp_path: Path, strategy: str, held_back: int
+) -> None:
+    """A held-back route moves behind newer rows in the sweep order, so a full
+    page of them cannot keep every sweep from reaching the rest."""
+    shm = await _full_shm_broker(tmp_path)
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'outbox.db'}", poolclass=NullPool
+    )
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        store = PostgresPublicationStore(engine=engine)
+        outbox.configure(
+            store,
+            JsonEventSerializer(),
+            claim_strategy=strategy,  # type: ignore[arg-type]
+            claim_batch_size=2,
+            start_loop=False,
+        )
+        _bootstrap_with_listener(record)
+        assert _runtime.broker_registry is not None
+        _runtime.broker_registry.register("test", shm)
+        earlier = datetime.now(UTC) - timedelta(minutes=1)
+        routes = [
+            _make_pub(
+                record,
+                listener=outbox._BROKER_ROUTE_LISTENER_PREFIX + "test:events",
+                published_at=earlier,
+            )
+            for _ in range(held_back)
+        ]
+        for route in routes:
+            await store.save(route)
+        await store.save(_make_pub(record, value=9))
+
+        for _ in range(2):
+            await outbox._sweep(timedelta(0))
+
+        assert received == [9]
+        pending = await store.find_incomplete(timedelta(0))
+        assert sorted(str(p.id) for p in pending) == sorted(str(r.id) for r in routes)
+        assert {p.attempt_count for p in pending} == {0}
+    finally:
+        await engine.dispose()
+        await shm.close()
+        shm._ring.unlink()
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_stops_at_the_cap_for_a_listener_that_does_not_return(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Renewal is bounded like the brokers' claim renewal, so the lease of a
+    listener that never returns lapses for a peer's sweep to reclaim."""
+    lease_s = 0.05
+    renewed_at: list[float] = []
+
+    class TimedRenewals(ClaimingStubStore):
+        async def renew_claim(self, publication_id: UUID, token: str, lease_seconds: float) -> bool:
+            if lease_seconds > 0:
+                renewed_at.append(asyncio.get_running_loop().time())
+            return await super().renew_claim(publication_id, token, lease_seconds)
+
+    store = TimedRenewals()
+    outbox.configure(
+        store,
+        JsonEventSerializer(),
+        claim_strategy="lease",
+        claim_lease_seconds=lease_s,
+        start_loop=False,
+    )
+    cap_s = lease_s * outbox._MAX_LEASE_RENEWAL_FACTOR
+    started_at: list[float] = []
+
+    async def hangs_past_the_cap(event: OutboxEvent) -> None:
+        started_at.append(asyncio.get_running_loop().time())
+        await asyncio.sleep(cap_s * 2)
+        received.append(event.value)
+
+    _bootstrap_with_listener(hangs_past_the_cap)
+    await store.save(_make_pub(hangs_past_the_cap, value=5))
+    caplog.set_level(logging.ERROR, logger="modulith.outbox")
+
+    await outbox._sweep(timedelta(0))
+
+    assert received == [5]
+    assert len(renewed_at) > 2, "the lease is renewed while the listener runs"
+    assert max(renewed_at) <= started_at[0] + cap_s + lease_s
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "lease renewal" in errors[0] and "stopped" in errors[0]
