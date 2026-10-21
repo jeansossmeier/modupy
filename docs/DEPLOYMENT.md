@@ -533,7 +533,7 @@ on every path, the actuator included, and no worker sees the request.
 
 **Query strings in logs.** The `modulith.proxy` logger never logs query strings, and neither do the other lines that name a request target. On the proxy and on every worker, each uvicorn access line (`INFO`) keeps the client, method, path, HTTP version and status and drops the request target from its first `?` on, so a token passed as a query parameter does not reach the logs. A WebSocket handshake line (`"WebSocket …" [accepted]`, `403` or a rejection status) loses its query string the same way. The proxy forwards through httpx, whose `HTTP Request: GET <url> "HTTP/1.1 200 OK"` line (`INFO`, one per forwarded request and per readiness probe) also loses its query string, in the process that runs the proxy. A worker the generated Kubernetes manifests or the Dockerfile from `modulith extract` start gets the same filters, because the worker app installs them itself. Without `--topology processes`, `modulith run` and `modulith dev` start plain uvicorn on your own application and leave its logs as they are. `modulith run --log-level warning` switches all of these lines off, together with every other `INFO` line.
 
-**Connection pool.** The proxy holds one upstream connection per in-flight request until the response has finished streaming, so long-polls, server-sent events and slow downloads each occupy one for their whole duration. `MODULITH_PROXY_MAX_CONNECTIONS` (default `1000`) bounds them. A request that finds every connection busy for 5 seconds gets `503` `{"detail": "proxy connection pool exhausted"}`; the worker is not marked down, and `/_modulith/health` and identity probes use a separate pool, so a full request pool cannot fail readiness. That probe pool holds 100 connections, or one per worker replica when the deployment runs more than 100, so a readiness poll never queues behind it; polls that overlap share one probe per worker, so a stalled worker holds one probe connection however often the orchestrator polls. The warning it logs names the pool that ran out, `request` or `health-probe`. Raise the bound for many concurrent long-lived requests, keeping the proxy's open-file limit (`ulimit -n`) above it.
+**Connection pool.** The proxy holds one upstream connection per in-flight request until the response has finished streaming, so long-polls, server-sent events and slow downloads each occupy one for their whole duration. Each worker replica has a pool of its own, bounded by `MODULITH_PROXY_MAX_CONNECTIONS` (default `1000`), so a worker that stops answering fills only its own pool and requests to the other workers still go through. A client that disconnects before the response starts frees its connection at once, without waiting for the worker. A request that finds every connection to its worker busy for 5 seconds gets `503` `{"detail": "proxy connection pool exhausted"}`; the worker is not marked down, and `/_modulith/health` and identity probes use a separate pool, so a full request pool cannot fail readiness. That probe pool holds 100 connections, or one per worker replica when the deployment runs more than 100, so a readiness poll never queues behind it; polls that overlap share one probe per worker, so a stalled worker holds one probe connection however often the orchestrator polls. The warning it logs names the pool that ran out, `request` or `health-probe`. Raise the bound for many concurrent long-lived requests to one worker, keeping the proxy's open-file limit (`ulimit -n`) above it times the number of worker replicas.
 
 ### Default Broker: `shm`
 
@@ -1383,6 +1383,8 @@ curl -H "Authorization: Bearer $MODULITH_ACTUATOR_TOKEN" http://localhost:8000/_
 # health, so a degraded worker never gets the healthy proxy restarted.
 ```
 
+Under `modulith run`, the workers listen on 127.0.0.1 inside the container, so no probe reaches one of them, and a failed container liveness probe restarts all of them with the proxy. Set `worker_liveness_timeout_seconds` to have the supervisor restart a worker that stops answering its `/health`. The supervisor polls each worker every third of that timeout, 10 s apart at most, with a `GET /health?liveness` that the worker leaves out of its access log. Any HTTP answer, a 503 included, counts as alive. A worker that has answered nothing for that many seconds since it last answered, or since its port first accepted a connection, is killed with an ERROR log, within a third more than the timeout, and the crash backoff and crash-loop breaker then apply. A worker still starting is left alone, because uvicorn opens its port only once the app's startup has finished. It is off by default.
+
 ### Readiness Probe (Are the Workers Up?)
 
 ```bash
@@ -1756,7 +1758,7 @@ sequenceDiagram
     participant S as Supervisor and proxy
     participant W as Worker
     O->>S: SIGTERM
-    Note over S: proxy stops accepting,<br>in-flight requests finish
+    Note over S: proxy stops accepting,<br>in-flight requests finish<br>or are cancelled after 30 s
     S->>W: SIGTERM to every worker
     Note over W: in-flight requests finish, then<br>1 broker consumer stops<br>2 outbox retry loop stops<br>3 outbox deliveries finish<br>4 store and engine disposed<br>5 brokers closed
     alt worker exits within 30 s
@@ -1767,7 +1769,7 @@ sequenceDiagram
     S-->>O: exit
 ```
 
-The supervisor sends SIGTERM to every worker at once, and SIGKILL to any still running 30 s later.
+The proxy gives its in-flight requests 30 s to finish and then cancels the rest, so a request waiting on a worker that never answers cannot hold up the stop. The supervisor then sends SIGTERM to every worker at once, and SIGKILL to any still running 30 s later.
 Within that window, in-flight requests and after-commit outbox deliveries run to completion, but a listener that a broker consumer is running when its worker stops is cancelled, and its message is delivered again later. A plain `def` listener is the exception: it runs on an executor thread, so the stop cancels only the wait for it, the thread keeps running until the listener returns, and the worker does not exit before then unless SIGKILL ends it. Its message is delivered again later as well.
 A pod from the generated Kubernetes manifests runs a worker alone, so it gets SIGTERM directly and skips the supervisor's steps.
 
@@ -1778,7 +1780,10 @@ In Kubernetes the pod's `terminationGracePeriodSeconds` takes the place of the s
 Windows has no signal delivery on `subprocess.Popen` (`terminate()`
 is an immediate `TerminateProcess`, with no softer step for a worker's
 lifespan to trap), and the `PDEATHSIG` orphan protection that stops a
-hard-killed supervisor from leaving workers behind is Linux-only.
+hard-killed supervisor from leaving workers behind is Linux-only. A worker
+that outlives its supervisor by 30 s, on Linux because its event loop is
+blocked and cannot act on that signal, or on macOS, exits on its own; on
+Windows it keeps running until it is killed.
 
 ---
 
@@ -1895,7 +1900,8 @@ sync-driver URL the raw Alembic command reads, and `modulith migrate` reads
 | `MODULITH_ACTUATOR_TOKEN` | unset | Bearer token for `/_modulith/*`. Required to mount the actuator under `auto` on a non-loopback bind or in production. |
 | `MODULITH_PRODUCTION` | unset (false) | `1`/`true`/`yes`, case-insensitive. Treats the deployment as production: the actuator's `auto` mode requires a token even on loopback, and the boundary gate below is never disarmed. |
 | `MODULITH_PROXY_MAX_BODY_BYTES` | `10485760` (10 MiB) | Per-request body cap for the reverse proxy in `--topology processes`. The proxy buffers each request body in memory, which is why the cap exists; raise it for large uploads. Must be a positive integer — anything else fails startup with a `ConfigurationError`, rather than silently reverting to the default. |
-| `MODULITH_PROXY_MAX_CONNECTIONS` | `1000` | Most upstream connections the reverse proxy in `--topology processes` holds open at once. Each in-flight request, including a long-poll or streaming response, uses one until it finishes; a request that finds none free for 5 seconds gets `503`. Must be a positive integer — anything else fails startup with a `ConfigurationError`. See [Connection pool](#process-per-module-topology). |
+| `MODULITH_PROXY_MAX_CONNECTIONS` | `1000` | Most upstream connections the reverse proxy in `--topology processes` holds open at once to each worker replica. Each in-flight request, including a long-poll or streaming response, uses one until it finishes or its client disconnects; a request that finds none free to its worker for 5 seconds gets `503`. Must be a positive integer — anything else fails startup with a `ConfigurationError`. See [Connection pool](#process-per-module-topology). |
+| `MODULITH_WORKER_LIVENESS_TIMEOUT_SECONDS` | unset (off) | `[tool.modulith] worker_liveness_timeout_seconds`. Seconds a worker under `modulith run` may leave its `/health` unanswered, once its port accepts connections, before the supervisor kills it and restarts it as after a crash. Any HTTP answer, a 503 included, counts. Must be a finite number greater than 0. See [Liveness Probe](#liveness-probe-is-the-proxy-running). |
 | `MODULITH_DEV_WARN_ONLY` | unset | Set to `1` by single-process `modulith dev` only. Under `strict_boundaries = true`, boundary violations then log a warning instead of aborting the boot, keeping interactive development usable. Process topology and `modulith run` ignore the marker. It is an environment variable rather than an in-process flag because it has to survive uvicorn's `--reload` fork. Do not set it in a deployment. |
 
 ---

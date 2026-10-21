@@ -1891,6 +1891,67 @@ async def test_run_supervised_default_serve_binds_real_uvicorn() -> None:
             await task
 
 
+_PROXY_WITH_A_SILENT_WORKER = """
+import asyncio, sys
+
+import modulith.supervisor as supervisor
+from modulith.proxy import RoutingRule, create_proxy_app
+
+supervisor._SHUTDOWN_TIMEOUT = 1
+
+
+async def main():
+    async def silent(reader, writer):  # accepts, never answers, like a blocked worker
+        print("held", flush=True)
+        await asyncio.Event().wait()
+
+    backend = await asyncio.start_server(silent, "127.0.0.1", 0)
+    url = f"http://127.0.0.1:{backend.sockets[0].getsockname()[1]}"
+    await supervisor._serve_uvicorn(create_proxy_app([RoutingRule("/a", url)]), "127.0.0.1", int(sys.argv[1]))
+
+
+asyncio.run(main())
+"""
+
+
+@pytest.mark.real_process
+@pytest.mark.skipif(sys.platform == "win32", reason="sends SIGTERM")
+async def test_proxy_stops_on_sigterm_with_a_request_pending_to_a_silent_worker(tmp_path) -> None:
+    """Shutdown waits for in-flight requests only up to the graceful timeout; one
+    waiting on a worker that never answers used to keep the proxy up for good."""
+    import httpx
+
+    script = tmp_path / "proxy.py"
+    script.write_text(_PROXY_WITH_A_SILENT_WORKER)
+    port = _free_port()
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(script), str(port), stdout=asyncio.subprocess.PIPE
+    )
+    try:
+        assert proc.stdout is not None
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=60) as client:
+            deadline = time.monotonic() + 15.0
+            while True:
+                try:
+                    await client.get("/_modulith/live")
+                    break
+                except httpx.TransportError:
+                    assert proc.returncode is None, "the proxy died during startup"
+                    assert time.monotonic() < deadline, "the proxy never became reachable"
+                    await asyncio.sleep(0.05)
+            pending = asyncio.create_task(client.get("/a/x"))
+            assert await asyncio.wait_for(proc.stdout.readline(), 10.0) == b"held\n"
+            proc.send_signal(signal.SIGTERM)
+            await asyncio.wait_for(proc.wait(), 15.0)
+            pending.cancel()
+            with contextlib.suppress(asyncio.CancelledError, httpx.HTTPError):
+                await pending
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+
+
 class _LogLines(logging.Handler):
     def __init__(self) -> None:
         super().__init__()

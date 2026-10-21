@@ -9,8 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `[tool.modulith] worker_liveness_timeout_seconds` (`MODULITH_WORKER_LIVENESS_TIMEOUT_SECONDS`), off by default, has the supervisor under `modulith run` poll each worker's `/health` and kill, with an ERROR log, a worker that has answered nothing for that many seconds since it last answered or, if it never has, since its port first accepted a connection, which uvicorn does only after the app's startup; the crash backoff and crash-loop breaker then restart it. Any HTTP answer, a 503 included, counts as alive. It catches a worker whose event loop is blocked, which never exits and which no container probe can reach, since the workers listen on 127.0.0.1
+
+### Changed
+
+- The process-topology proxy keeps one upstream connection pool per worker replica, each bounded by `MODULITH_PROXY_MAX_CONNECTIONS`, instead of one pool for every worker. A worker that stops answering used to fill the shared pool with requests that waited on it for good, until requests to every other module got `503` `proxy connection pool exhausted`. The proxy can now hold that many connections to each replica, so keep its open-file limit above the bound times the number of replicas
+
 ### Fixed
 
+- A request to the process-topology proxy whose client disconnects before the response starts no longer keeps its upstream connection until the worker answers; the proxy cancels it at once
+- The process-topology proxy's shutdown waits at most 30 s for in-flight requests and then cancels them, so a request waiting on a worker that never answers no longer keeps `modulith run` from stopping
+- A worker whose supervisor has been gone for 30 s exits on its own, outside Windows. On Linux a worker whose event loop was blocked could not act on the parent-death SIGTERM and kept running, with its port bound, after its supervisor was SIGKILLed; on macOS, which has no parent-death signal, every worker could
 - `modulith extract` no longer lists under "Extraction notes" a distribution that only a dependency the generated `pyproject.toml` installs imported, such as `sniffio`, which `anyio` imports when it is installed, or `orjson`, which FastAPI imports the same way. The import check now records which package each import came from, and reports what the module's own code loads, or loads through a distribution the service does not install
 
 ## [0.12.0] — 2026-10-06

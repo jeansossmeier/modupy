@@ -843,7 +843,12 @@ def _run_process_topology(
     async def supervise() -> None:
         await _warn_about_retired_groups(rt, cfg.broker, derived)
         await run_supervised(
-            specs, host, port, actuator_mode=cfg.actuator_mode, production=cfg.production
+            specs,
+            host,
+            port,
+            actuator_mode=cfg.actuator_mode,
+            production=cfg.production,
+            liveness_timeout=cfg.worker_liveness_timeout_seconds,
         )
 
     try:

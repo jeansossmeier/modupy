@@ -1058,7 +1058,12 @@ split-readiness) with 80%/95% thresholds.
   workers die with a SIGKILL'd/crashed supervisor) is Linux-only; on any other
   platform a hard-killed supervisor can orphan workers holding their
   statically-assigned ports, and the supervisor logs a warning once at startup
-  when that protection is unavailable.
+  when that protection is unavailable. A worker whose supervisor has been gone
+  for 30 s exits on its own wherever orphans are reparented (not Windows),
+  which also covers a Linux worker whose blocked event loop cannot act on the
+  parent-death signal. With `worker_liveness_timeout_seconds` set, the
+  supervisor polls each worker's `/health` and kills a worker that stops
+  answering, which the crash recovery then restarts.
 - **The reverse proxy** (`modulith/proxy.py`): a FastAPI ASGI app that routes
   each request to the right worker by **URL prefix** (longest prefix wins),
   strips hop-by-hop headers before forwarding, keeps query strings out of its
@@ -1066,8 +1071,9 @@ split-readiness) with 80%/95% thresholds.
   request lines (each worker filters its uvicorn lines the same way) so
   credentials aren't persisted, bounds request bodies
   (no response-body cap exists — the response streams through unbounded),
-  aggregates worker `/health` into a single readiness signal, and supports an
-  optional bearer token on its actuator surface.
+  aggregates worker `/health` into a single readiness signal, keeps one
+  connection pool per worker replica so a stalled worker cannot starve the
+  others, and supports an optional bearer token on its actuator surface.
 
 Cross-module events between workers travel through the broker (§8); local
 listeners within a worker still dispatch in-process. Event code — `@event`,
