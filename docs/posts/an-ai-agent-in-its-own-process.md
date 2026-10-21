@@ -1,7 +1,6 @@
 # An AI agent in its own process
 
-*October 2026. The features measured here are on modupy's main branch, after
-0.12.0.*
+*October 2026. The features measured here shipped in modupy 0.13.0.*
 
 An AI agent in a web application fails in ways a database query rarely does. A
 model provider accepts a request and never answers. An SDK without async
@@ -205,8 +204,8 @@ its own process and restart it when it is stuck.
 
 ## Run it
 
-`own_process`, listener timeouts and the liveness timeout are not in 0.12.0 on
-PyPI yet, so this installs modupy from a clone:
+The example and its benchmark live in modupy's repository, so this runs them
+from a clone:
 
 ```bash
 git clone https://github.com/jeansossmeier/modupy

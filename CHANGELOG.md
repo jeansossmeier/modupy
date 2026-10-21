@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-10-21
+
 ### Added
 
 - `@listener(timeout=seconds)` bounds each invocation of an `async def` listener. Past the budget the listener is cancelled and fails with the new `ListenerTimeoutError` (a `TimeoutError`), which every dispatch path handles as a listener failure: an in-memory `publish()` raises it, the outbox records a failed attempt and retries it with backoff, and a cross-process consumer fails the delivery for redelivery. Cancellation is cooperative: a listener that catches it and returns completes, with a warning that it ran past its budget, and work it handed to a thread keeps running there. A plain `def` listener refuses a timeout with `TypeError`, because Python cannot stop the thread it runs on; hung blocking code needs a process of its own (`own_process`). Without `timeout` nothing changes: a listener is never interrupted

@@ -42,10 +42,6 @@ steps share one `desk.db`, so each one opens a ticket with an id of its own.
 pip install 'modupy[fastapi,cli,postgres]' aiosqlite 'langgraph>=1.2,<2'
 ```
 
-modupy 0.12.0, the release on PyPI, has neither `own_process` nor listener
-timeouts. Until the next release, install modupy from this clone instead:
-`pip install '../..[fastapi,cli,postgres]' aiosqlite 'langgraph>=1.2,<2'`.
-
 The project is not installed: `uvicorn` and `modulith` both put the current
 directory on the import path, and `pyproject.toml` names the package (`desk`).
 It also sets `outbox = "postgres"`, the SQL outbox, here on the SQLite file
