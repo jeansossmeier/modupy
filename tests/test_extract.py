@@ -1422,6 +1422,65 @@ def test_extract_notes_only_the_distribution_owning_a_shared_namespace_module(
     assert listed == ["- `nsdemo-alpha`"], notes
 
 
+def _dependency_with_an_optional_import(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, libs: Path, optional_import: str
+) -> None:
+    """Install ``hostlib``, which imports ``optlib`` when present, and declare only hostlib."""
+    _installed_sibling(libs, "hostlib", "hostlib")
+    _installed_sibling(libs, "optlib", "optlib")
+    (libs / "hostlib" / "__init__.py").write_text(
+        f"import importlib\n\ntry:\n    {optional_import}\nexcept ModuleNotFoundError:\n    pass\n"
+    )
+    monkeypatch.syspath_prepend(str(libs))
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join(filter(None, [str(libs), os.environ.get("PYTHONPATH")]))
+    )
+    monkeypatch.setenv("MODULITH_PACKAGE", "fakeapp")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "app"\nversion = "0"\ndependencies = ["hostlib"]\n'
+    )
+
+
+@pytest.mark.parametrize(
+    "optional_import",
+    ["import optlib", "importlib.import_module('optlib')"],
+    ids=["import-statement", "import-module"],
+)
+def test_extract_stays_quiet_about_what_a_declared_dependency_imports_itself(
+    make_fake_app, monkeypatch, tmp_path, tmp_path_factory, optional_import
+):
+    libs = tmp_path_factory.mktemp("libs")
+    _dependency_with_an_optional_import(monkeypatch, tmp_path, libs, optional_import)
+    make_fake_app({"orders": "import hostlib\n"}, extra_files={"contracts/__init__.py": ""})
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert "Extraction notes" not in (out_dir / "README.md").read_text()
+    assert result.stderr == ""
+
+
+def test_extract_notes_a_distribution_the_module_imports_after_a_dependency_loaded_it(
+    make_fake_app, monkeypatch, tmp_path, tmp_path_factory
+):
+    libs = tmp_path_factory.mktemp("libs")
+    _dependency_with_an_optional_import(monkeypatch, tmp_path, libs, "import optlib")
+    make_fake_app(
+        {"orders": "import hostlib\nimport optlib\n"}, extra_files={"contracts/__init__.py": ""}
+    )
+    out_dir = tmp_path / "orders-service"
+
+    result = runner.invoke(app, ["extract", "orders", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, result.output
+    notes = _readme_section((out_dir / "README.md").read_text(), "Extraction notes")
+    listed = [line for line in notes.splitlines() if line.startswith("- ")]
+    assert listed == ["- `optlib`"], notes
+    assert "optlib" in result.stderr
+
+
 def test_extract_copies_helper_file_beside_same_named_non_package_dir(
     make_fake_app, monkeypatch, tmp_path
 ):
