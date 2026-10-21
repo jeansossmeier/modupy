@@ -6,13 +6,12 @@ import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
 
+from ..config import retry_backoff_s
 from ._dead_letter import DeadLetter
 from ._shm_claims import owned_claim, owned_predicate
 from ._shm_publications import prune_expired_empty_publications
 from ._shm_schema import immediate_transaction
 from ._shm_types import ClaimToken
-
-_MAX_RETRY_EXPONENT = 1023
 
 
 def ack(
@@ -97,8 +96,7 @@ def fail(
             return False
         attempts = int(row["attempts"]) + 1
         dead = attempts >= max_attempts
-        retry_exponent = min(attempts - 1, _MAX_RETRY_EXPONENT)
-        available_at = now if dead else now + min(backoff_base * (2.0**retry_exponent), backoff_cap)
+        available_at = now if dead else now + retry_backoff_s(attempts, backoff_base, backoff_cap)
         cursor = conn.execute(
             f"""
             UPDATE shm_delivery

@@ -214,6 +214,7 @@ class SqliteQueueStore:
         reclaim_stale_seconds: float,
         max_attempts: int | None = None,
         targets: list[str] | None = None,
+        exclude: list[ClaimToken | str] | None = None,
     ) -> list[dict[str, Any]]:
         return self._consumer_write(
             lambda: _shm_claims.claim(
@@ -225,6 +226,9 @@ class SqliteQueueStore:
                 self._max_payload_bytes,
                 max_attempts,
                 targets,
+                self._retry_backoff_base_seconds,
+                self._retry_backoff_cap_seconds,
+                exclude or (),
             )
         )
 

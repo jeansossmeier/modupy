@@ -18,6 +18,7 @@ import pytest
 from modulith import ConfigurationError, configure
 from modulith.adapters import _shm_claims
 from modulith.adapters import shm_broker as shm_broker_module
+from modulith.adapters._consumer_protocol import RECLAIMED_MID_DISPATCH
 from modulith.adapters._shm_coldstore import ShmColdStore
 from modulith.adapters._shm_ring import _HEADER_SIZE, _SLOT_SIZE, _SLOT_STRUCT, ShmRing
 from modulith.adapters._shm_schema import open_database
@@ -1028,6 +1029,70 @@ async def test_runtime_registration_honors_shm_options_and_environment(
         instance._ring.unlink()
 
 
+async def test_runtime_registration_threads_the_retry_backoff_options(
+    make_fake_app: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    make_fake_app({"orders": ""})
+    monkeypatch.setenv("MODULITH_BROKER_RETRY_BACKOFF_CAP_SECONDS", "40")
+    configure(
+        package="fakeapp",
+        topology="processes",
+        broker="shm",
+        broker_options={
+            "state_dir": str(tmp_path),
+            "sqlite_path": "backoff.db",
+            "hint_path": "backoff.hints",
+            "retry_backoff_base_seconds": 25,
+        },
+    )
+    _runtime.ensure_bootstrapped()
+    assert _runtime.broker_registry is not None
+    instance = cast(ShmBroker, _runtime.broker_registry.get("shm"))
+    try:
+        await instance.subscribe(["events"], "workers")
+        await instance.publish("events", b"payload")
+        for attempt in (1, 2):
+            if attempt == 2:
+                _make_due(tmp_path / "backoff.db")
+            (row,) = await instance.claim_batch("workers", batch_size=1, consumer_name="w")
+            await instance.fail(row["id"], "boom", consumer_name="w", max_attempts=5)
+            assert _retry_delay_s(tmp_path / "backoff.db") == pytest.approx(
+                min(25 * 2 ** (attempt - 1), 40), abs=1.0
+            )
+    finally:
+        await instance.close()
+        instance._ring.unlink()
+
+
+def test_shm_broker_rejects_a_retry_backoff_base_above_its_cap(tmp_path: Path) -> None:
+    with pytest.raises(ConfigurationError, match="must not exceed"):
+        ShmBroker(
+            shm_name="bad-backoff-hints",
+            db_path=str(tmp_path / "bad-backoff.db"),
+            retry_backoff_base_seconds=10,
+        )
+
+
+def _retry_delay_s(path: Path) -> float:
+    connection = sqlite3.connect(path)
+    try:
+        (delay,) = connection.execute(
+            "SELECT available_at - ? FROM shm_delivery", (time.time(),)
+        ).fetchone()
+        return float(delay)
+    finally:
+        connection.close()
+
+
+def _make_due(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("UPDATE shm_delivery SET available_at=0")
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def test_registration_hooks_ignore_non_shm_configuration(make_fake_app: Any) -> None:
     make_fake_app({"orders": ""})
     configure(package="fakeapp", broker="memory")
@@ -1153,7 +1218,8 @@ def test_reclaim_of_a_never_started_delivery_keeps_its_retry_budget(tmp_path: Pa
         conn.close()
 
 
-def test_reclaim_below_cap_bumps_attempts_and_redelivers(tmp_path: Path) -> None:
+def test_reclaim_below_cap_bumps_attempts_and_backs_off(tmp_path: Path) -> None:
+    """A charged reclaim below the cap redelivers only after the failure backoff."""
     conn = _open_claims_db(tmp_path / "claims.db")
     try:
         _seed_claimed_delivery(
@@ -1172,12 +1238,19 @@ def test_reclaim_below_cap_bumps_attempts_and_redelivers(tmp_path: Path) -> None
             reclaim_stale_seconds=60.0,
             max_claim_bytes=1_000_000,
             max_attempts=3,
+            backoff_base=30.0,
+            backoff_cap=60.0,
         )
 
-        assert len(claimed) == 1
-        assert claimed[0]["attempts"] == 1
-        row = conn.execute("SELECT status, attempts, claimed_by FROM shm_delivery").fetchone()
-        assert (row["status"], row["attempts"], row["claimed_by"]) == ("claimed", 1, "worker-2")
+        assert claimed == []
+        row = conn.execute(
+            "SELECT status, attempts, claimed_by, available_at - ? AS delay, last_error "
+            "FROM shm_delivery",
+            (time.time(),),
+        ).fetchone()
+        assert (row["status"], row["attempts"], row["claimed_by"]) == ("pending", 1, None)
+        assert 29.0 < row["delay"] <= 30.0
+        assert row["last_error"] == RECLAIMED_MID_DISPATCH
     finally:
         conn.close()
 
@@ -1216,12 +1289,17 @@ async def test_public_claim_batch_dead_letters_after_max_attempts_stale_reclaims
     assert first[0]["attempts"] == 0
     await broker.renew_claims([first[0]["id"]], consumer_name="worker-1", start_dispatch=True)
 
-    below_cap = await broker.claim_batch(
+    charged = await broker.claim_batch(
         "workers",
         batch_size=1,
         consumer_name="worker-2",
         reclaim_stale_seconds=0,
         max_attempts=2,
+    )
+    assert charged == [], "a charged reclaim waits out the failure backoff"
+    await asyncio.sleep(0.1)
+    below_cap = await broker.claim_batch(
+        "workers", batch_size=1, consumer_name="worker-2", max_attempts=2
     )
     assert len(below_cap) == 1
     assert below_cap[0]["attempts"] == 1

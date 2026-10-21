@@ -341,6 +341,21 @@ def test_render_manifests_broker_options_json_encodes_structured_values() -> Non
     }
 
 
+@pytest.mark.parametrize("broker", ["database", "redis-streams"])
+def test_render_manifests_forwards_the_retry_backoff(broker: str) -> None:
+    cfg = _cfg(
+        broker=broker,
+        broker_options={"retry_backoff_base_seconds": 0.5, "retry_backoff_cap_seconds": 30},
+    )
+    text = render_manifests(cfg, [WorkerSpec("orders", "fakeapp", 9001)], image="shop:dev")
+
+    container = _docs_by_kind(text)["Deployment"][0]["spec"]["template"]["spec"]["containers"][0]
+    env_by_name = {e["name"]: e["value"] for e in container["env"] if "value" in e}
+
+    assert env_by_name["MODULITH_BROKER_RETRY_BACKOFF_BASE_SECONDS"] == "0.5"
+    assert env_by_name["MODULITH_BROKER_RETRY_BACKOFF_CAP_SECONDS"] == "30"
+
+
 def test_render_manifests_drops_unknown_and_credential_like_broker_options() -> None:
     cfg = _cfg(
         broker_options={

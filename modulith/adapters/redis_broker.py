@@ -29,6 +29,11 @@ Configuration resolves env > [tool.modulith.broker] subtable > default:
                                             (default 60000)
   max_delivery_attempts                    consumer delivery attempts before dead-lettering
                                             (default 5)
+  MODULITH_BROKER_RETRY_BACKOFF_BASE_SECONDS /
+  retry_backoff_base_seconds               failure backoff a reclaim also waits out:
+  MODULITH_BROKER_RETRY_BACKOFF_CAP_SECONDS /
+  retry_backoff_cap_seconds                base * 2^(n-1) after n deliveries, capped
+                                            (defaults 0.05 s and 5 s)
 
 An environment variable that is empty or whitespace-only counts as unset.
 MODULITH_BROKER_URL, MODULITH_BROKER_STREAM_PREFIX and
@@ -72,7 +77,10 @@ Production hardening over the bare example (examples/redis_streams_broker.py):
     latency + reclaim_min_idle_ms).
   - Pending-entry recovery via XAUTOCLAIM, run at startup and periodically
     from the consumer poll loop (reclaims messages a crashed or stalled
-    worker never ACK'd) — subject to the retention caveat above.
+    worker never ACK'd) — subject to the retention caveat above. The
+    consumer claims one entry at a time, just before dispatching it, and
+    only after the failure backoff for its delivery count
+    (``pending_entries`` / ``claim_pending``).
   - Explicit dead-letter routing to a ``<stream>.dead`` stream for poison
     messages (itself MAXLEN-bounded — see ``dead_letter``).
   - Structured logging on every operation.
@@ -95,7 +103,14 @@ from modulith import (
     hookimpl,
 )
 
-from ..config import DEFAULT_MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES, MAX_REDIS_STREAM_LEN
+from ..config import (
+    DEFAULT_MAX_PAYLOAD_BYTES,
+    DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+    DEFAULT_RETRY_BACKOFF_CAP_SECONDS,
+    MAX_PAYLOAD_BYTES,
+    MAX_REDIS_STREAM_LEN,
+    _validate_retry_backoff,
+)
 from ._dead_letter import DeadLetter, DeadLetterRetryRefused
 
 logger = logging.getLogger("modulith.adapters.redis")
@@ -153,6 +168,19 @@ def _cursor_str(raw: Any) -> str:
     return raw.decode() if isinstance(raw, bytes) else str(raw)
 
 
+def _retry_backoff(opts: dict[str, Any]) -> tuple[float, float]:
+    """The consumer's failure backoff (base, cap) in seconds: env > broker_options > default.
+
+    The same variables and options as the SHM and database brokers' backoff.
+    """
+    return _validate_retry_backoff(
+        _env("MODULITH_BROKER_RETRY_BACKOFF_BASE_SECONDS")
+        or opts.get("retry_backoff_base_seconds", DEFAULT_RETRY_BACKOFF_BASE_SECONDS),
+        _env("MODULITH_BROKER_RETRY_BACKOFF_CAP_SECONDS")
+        or opts.get("retry_backoff_cap_seconds", DEFAULT_RETRY_BACKOFF_CAP_SECONDS),
+    )
+
+
 def _glob_escape(text: str) -> str:
     """Escape SCAN MATCH glob metacharacters so ``text`` matches literally."""
     return re.sub(r"([\\*?\[\]])", r"\\\1", text)
@@ -167,9 +195,9 @@ class RedisStreamsBroker:
     """Broker using Redis Streams (XADD / XREADGROUP / XAUTOCLAIM).
 
     Conforms structurally to ``modulith.Broker`` (publish + close); the extra
-    consumer-side methods (``ensure_group``, ``read``, ``ack``, ``reclaim``,
-    ``dead_letter``) are what the process-per-module worker drives. Duck-typed
-    — no inheritance.
+    consumer-side methods (``ensure_group``, ``read``, ``ack``,
+    ``pending_entries``, ``claim_pending``, ``dead_letter``) are what the
+    process-per-module worker drives. Duck-typed — no inheritance.
 
     A pre-built ``client`` may be injected (tests, or callers that manage their
     own connection pool); otherwise one is created lazily from ``url`` so redis
@@ -302,12 +330,52 @@ class RedisStreamsBroker:
         count: int = 10,
         block_ms: int = 1000,
     ) -> Any:
-        """XREADGROUP new (never-delivered) messages for this consumer."""
+        """XREADGROUP new (never-delivered) messages for this consumer.
+
+        XREADGROUP counts a delivery for every entry it returns, but the
+        consumer runs them one at a time, so every entry after the first has
+        its delivery count set back to 0 until ``renew_claim`` marks it
+        started. A worker killed by one entry then leaves the entries it never
+        reached uncharged: the reclaim that hands one over is its first
+        delivery. A crash between the two calls, or a reset that fails (logged),
+        leaves them charged one delivery each.
+        """
         stream = self._stream_name(target)
         group_name = group or self._consumer_group
-        return await self._client.xreadgroup(
+        messages = await self._client.xreadgroup(
             group_name, consumer, {stream: ">"}, count=count, block=block_ms
         )
+        for _stream, entries in messages or ():
+            if len(entries) < 2:
+                continue
+            try:
+                # The ownership check keeps a peer's claim, as in renew_claim.
+                await self._client.eval(
+                    """
+                    for i = 3, #ARGV do
+                        if #redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[i], ARGV[i], 1,
+                                       ARGV[2]) > 0 then
+                            redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[2], 0, ARGV[i],
+                                       'RETRYCOUNT', 0, 'JUSTID')
+                        end
+                    end
+                    return 1
+                    """,
+                    1,
+                    stream,
+                    group_name,
+                    consumer,
+                    *(message_id for message_id, _fields in entries[1:]),
+                )
+            except Exception:
+                logger.warning(
+                    "could not mark %d entries read from %s as not started; a crash "
+                    "before they run charges each one delivery",
+                    len(entries) - 1,
+                    stream,
+                    exc_info=True,
+                )
+        return messages
 
     async def ack(self, target: str, message_id: str, group: str | None = None) -> None:
         """XACK a successfully-processed message so it stops being redelivered."""
@@ -326,16 +394,14 @@ class RedisStreamsBroker:
     ) -> Any:
         """XAUTOCLAIM pending entries idle longer than ``min_idle_ms``.
 
-        The at-least-once guarantee's recovery path. The consumer loop runs
-        this at worker startup AND periodically on every poll cycle — not only
-        after a crash. XAUTOCLAIM is purely idle-time based (it has no
+        Claims the whole idle backlog at once, raising the delivery count of
+        every entry in it. The consumer loop does not use it: it lists idle
+        entries with ``pending_entries`` and claims each with
+        ``claim_pending`` just before dispatching it, so a crash charges only
+        the entry that was running. XAUTOCLAIM is purely idle-time based (it has no
         crash/liveness detection), so a message a live, healthy peer is still
-        processing WILL be claimed away and re-dispatched once it has been
-        pending longer than ``min_idle_ms``. Keep ``min_idle_ms`` above the
-        worst-case latency of ONE handler call, and keep handlers idempotent
-        regardless (at-least-once delivery). Time spent on earlier entries of
-        the same batch does not count: the consumer calls ``renew_claim``
-        before each later entry.
+        processing WILL be claimed away once it has been pending longer than
+        ``min_idle_ms``.
 
         XAUTOCLAIM caps each call at ``count`` and returns a continuation
         cursor; a single call therefore drains at most ``count`` entries.
@@ -373,6 +439,87 @@ class RedisStreamsBroker:
             cursor = next_cursor
         return (b"0-0", claimed, deleted)
 
+    async def pending_entries(
+        self,
+        target: str,
+        *,
+        min_idle_ms: int,
+        group: str | None = None,
+        count: int = 100,
+    ) -> list[tuple[str, int, int]]:
+        """``(id, idle ms, delivery count)`` of each entry pending at least ``min_idle_ms``.
+
+        Oldest first, across every consumer of the group, claiming nothing.
+        XPENDING ... IDLE returns at most ``count`` entries a call; this
+        follows them to the end of the pending list, so one call lists the
+        whole idle backlog.
+        """
+        stream = self._stream_name(target)
+        group_name = group or self._consumer_group
+        listed: list[tuple[str, int, int]] = []
+        start = "-"
+        while True:
+            page = await self._client.xpending_range(
+                stream, group_name, min=start, max="+", count=count, idle=min_idle_ms
+            )
+            listed.extend(
+                (
+                    _cursor_str(entry["message_id"]),
+                    int(entry["time_since_delivered"]),
+                    int(entry["times_delivered"]),
+                )
+                for entry in page
+            )
+            if len(page) < count:
+                return listed
+            start = f"({listed[-1][0]}"
+
+    async def claim_pending(
+        self,
+        target: str,
+        message_id: str,
+        *,
+        consumer: str,
+        min_idle_ms: int,
+        group: str | None = None,
+    ) -> Any:
+        """Claim the one pending entry ``message_id`` for ``consumer`` if it has
+        been idle at least ``min_idle_ms``, raising its delivery count.
+
+        Returns XAUTOCLAIM's ``(cursor, claimed, deleted)`` reply for that entry
+        alone, as ``reclaim`` does for a backlog: a stream the entry was
+        trimmed from answers with its id in ``deleted`` on Redis 7, and with a
+        nil row in ``claimed`` on Redis 6.2. Both lists are empty when the
+        entry is no longer pending, or a peer claimed it first and so restarted
+        its idle time. One Lua script checks the idle time of exactly this
+        entry and claims it, so the claim can never move on to the entries
+        after it.
+        """
+        stream = self._stream_name(target)
+        group_name = group or self._consumer_group
+        cursor, rows, *deleted = await self._client.eval(
+            """
+            local idle = redis.call('XPENDING', KEYS[1], ARGV[1], 'IDLE', ARGV[3],
+                                    ARGV[4], ARGV[4], 1)
+            if #idle == 0 then return {'0-0', {}, {}} end
+            return redis.call('XAUTOCLAIM', KEYS[1], ARGV[1], ARGV[2], ARGV[3], ARGV[4],
+                              'COUNT', 1)
+            """,
+            1,
+            stream,
+            group_name,
+            consumer,
+            min_idle_ms,
+            message_id,
+        )
+        # A script's reply is not parsed like XAUTOCLAIM's: each row's fields
+        # come back as a flat [field, value, ...] list.
+        claimed = [
+            None if row is None else (row[0], dict(zip(row[1][::2], row[1][1::2], strict=True)))
+            for row in rows
+        ]
+        return (cursor, claimed, deleted[0] if deleted else [])
+
     async def renew_claim(
         self, target: str, message_id: str, *, consumer: str, group: str | None = None
     ) -> bool:
@@ -386,9 +533,10 @@ class RedisStreamsBroker:
         no longer pending (acknowledged or dead-lettered by the peer).
 
         One Lua script makes the ownership check and the XCLAIM atomic; a plain
-        XCLAIM would steal the entry from the peer that holds it. JUSTID
-        leaves the delivery count alone, so renewing never spends the
-        ``max_delivery_attempts`` budget.
+        XCLAIM would steal the entry from the peer that holds it. The renewal
+        also marks the entry started: one ``read`` left at a delivery count of
+        0 gets 1, its first delivery. Any other count stays as it is, so
+        renewing never spends the ``max_delivery_attempts`` budget.
         """
         stream = self._stream_name(target)
         group_name = group or self._consumer_group
@@ -396,7 +544,8 @@ class RedisStreamsBroker:
             """
             local owned = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[2], ARGV[2], 1, ARGV[3])
             if #owned == 0 then return 0 end
-            redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[3], 0, ARGV[2], 'JUSTID')
+            redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[3], 0, ARGV[2],
+                       'RETRYCOUNT', math.max(owned[1][4], 1), 'JUSTID')
             return 1
             """,
             1,
@@ -704,6 +853,8 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
         _positive_int(forwarded_maxlen, "MODULITH_BROKER_MAX_STREAM_LEN", _DEFAULT_MAXLEN)
     maxlen_env = as_worker_sees("MODULITH_STREAM_MAXLEN", "MODULITH_BROKER_MAX_STREAM_LEN")
     dlq_maxlen = _env("MODULITH_BROKER_DLQ_MAX_STREAM_LEN") or opts.get("dlq_max_stream_len")
+    # Only the workers' consumers use it; checked here so a bad value stops the parent.
+    _retry_backoff(opts)
     broker = RedisStreamsBroker(
         url=as_worker_sees("REDIS_URL", "MODULITH_BROKER_URL") or opts.get("url") or _DEFAULT_URL,
         stream_prefix=as_worker_sees("MODULITH_STREAM_PREFIX", "MODULITH_BROKER_STREAM_PREFIX")
@@ -729,7 +880,8 @@ def _make_redis_consumer(spec: ConsumerSpec) -> Consumer:
     Wraps the generic ``BrokerConsumer`` poll/claim/ack loop around the
     ``RedisStreamsBroker`` already registered on the producer side (pulled from
     ``spec.broker_registry`` by scheme), whose consumer-side methods
-    (ensure_group / read / ack / reclaim / dead_letter) the loop drives. One
+    (ensure_group / read / ack / pending_entries / claim_pending / dead_letter)
+    the loop drives. One
     Redis client serves both halves — no second connection is opened here.
     """
     from .._consumer import BrokerConsumer
@@ -737,6 +889,7 @@ def _make_redis_consumer(spec: ConsumerSpec) -> Consumer:
 
     broker = spec.broker_registry.get(spec.scheme)
     options = _runtime.config.broker_options if _runtime.config is not None else {}
+    retry_backoff_base_s, retry_backoff_cap_s = _retry_backoff(options)
     return BrokerConsumer(
         broker=broker,
         bus=spec.bus,
@@ -747,6 +900,8 @@ def _make_redis_consumer(spec: ConsumerSpec) -> Consumer:
         poll_block_ms=options.get("poll_block_ms", 1000),
         reclaim_min_idle_ms=options.get("reclaim_min_idle_ms", 60_000),
         max_delivery_attempts=options.get("max_delivery_attempts", 5),
+        retry_backoff_base_seconds=retry_backoff_base_s,
+        retry_backoff_cap_seconds=retry_backoff_cap_s,
     )
 
 

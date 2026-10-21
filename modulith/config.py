@@ -53,6 +53,19 @@ _MAX_PAYLOAD_BYTES_ENV = "MODULITH_BROKER_MAX_PAYLOAD_BYTES"
 # One day. claim_batch adds the lease to the clock, and a lease near the datetime
 # range raises OverflowError on every sweep. outbox.configure() applies the same bound.
 MAX_CLAIM_LEASE_SECONDS = 86_400
+# Every broker's failure backoff (retry_backoff_s): base * 2^(attempts-1), capped.
+# Capped at one day for the same overflow reason as MAX_CLAIM_LEASE_SECONDS.
+DEFAULT_RETRY_BACKOFF_BASE_SECONDS = 0.05
+DEFAULT_RETRY_BACKOFF_CAP_SECONDS = 5.0
+MAX_RETRY_BACKOFF_SECONDS = 86_400.0
+# Only keeps 2.0**exponent finite; the cap does the capping.
+_RETRY_BACKOFF_MAX_EXPONENT = 1023
+
+
+def retry_backoff_s(attempts: int, base: float, cap: float) -> float:
+    """The failure backoff after attempt ``attempts`` (1-indexed): base, 2*base,
+    4*base, ... capped at ``cap``. Every broker redelivers after it."""
+    return min(base * 2.0 ** min(attempts - 1, _RETRY_BACKOFF_MAX_EXPONENT), cap)
 
 
 class ConfigurationError(Exception):
@@ -385,6 +398,7 @@ def _validate_shm_broker_options(options: dict[str, Any]) -> None:
     ):
         _validate_shm_float_option(options, name, allow_zero=False)
     _validate_shm_float_option(options, "prune_interval_seconds", allow_zero=True)
+    _validate_retry_backoff_options(options)
 
     if "sqlite_synchronous" in options:
         value = options["sqlite_synchronous"]
@@ -460,6 +474,41 @@ def _validate_shm_int_option(
         raise ConfigurationError(
             f"broker_options.{name} must be an integer from 1 to {maximum}, got {value!r}"
         )
+
+
+def _validate_retry_backoff_options(options: dict[str, Any]) -> None:
+    # Each value alone: the environment can still set the other bound, so the
+    # brokers' constructors compare base and cap (_validate_retry_backoff).
+    for name in ("retry_backoff_base_seconds", "retry_backoff_cap_seconds"):
+        if name in options:
+            _retry_backoff_seconds(options[name], f"broker_options.{name}")
+
+
+def _retry_backoff_seconds(value: object, name: str) -> float:
+    number = math.nan
+    if isinstance(value, int | float | str) and not isinstance(value, bool):
+        try:
+            number = float(value)
+        except ValueError:
+            pass
+    if not (math.isfinite(number) and 0 < number <= MAX_RETRY_BACKOFF_SECONDS):
+        raise ConfigurationError(
+            f"{name} must be a positive number of seconds no greater than "
+            f"{MAX_RETRY_BACKOFF_SECONDS:g} (one day), got {value!r}"
+        )
+    return number
+
+
+def _validate_retry_backoff(base: object, cap: object) -> tuple[float, float]:
+    """Return a broker consumer's failure backoff as (base, cap) seconds."""
+    base_s = _retry_backoff_seconds(base, "retry_backoff_base_seconds")
+    cap_s = _retry_backoff_seconds(cap, "retry_backoff_cap_seconds")
+    if base_s > cap_s:
+        raise ConfigurationError(
+            f"retry_backoff_base_seconds ({base!r}) must not exceed "
+            f"retry_backoff_cap_seconds ({cap!r})"
+        )
+    return base_s, cap_s
 
 
 def _validate_shm_float_option(
@@ -873,6 +922,7 @@ def _validate_redis_broker_options(options: dict[str, Any]) -> None:
             raise ConfigurationError(
                 f"broker_options.{name} must be at most {MAX_REDIS_STREAM_LEN}, got {value!r}"
             )
+    _validate_retry_backoff_options(options)
 
 
 # Mirror modulith/adapters/db_broker.py's _COMPLETION_MODES /
@@ -955,6 +1005,7 @@ def _validate_database_broker_options(options: dict[str, Any]) -> None:
         "orphan_retention_seconds",
     ):
         _validate_shm_float_option(options, name, allow_zero=False)
+    _validate_retry_backoff_options(options)
     if "expected_consumer_groups" in options:
         value = options["expected_consumer_groups"]
         valid = type(value) is dict and all(

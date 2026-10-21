@@ -13,7 +13,7 @@ from .._health_failures import HealthFailures
 from .._shutdown import DEFAULT_STOP_TIMEOUT_S, cancel_and_wait
 from ..protocols import ConsumerHealth
 from ._consumer_protocol import PollingBroker
-from ._delivery_dispatch import DeliveryDispatch
+from ._delivery_dispatch import DeliveryDispatch, _DispatchGate
 
 _BACKOFF_BASE_S = 0.05
 _BACKOFF_CAP_S = 5.0
@@ -87,6 +87,8 @@ class PollingConsumer(DeliveryDispatch):
         self._health = ConsumerHealth(ready=False, status="stopped")
         self._health_failures = HealthFailures(completion_expiry_s=reclaim_stale_seconds)
         self._consecutive_failures = 0
+        self._gate = _DispatchGate(dispatch_concurrency, self._renew_deadline_s())
+        self._batches = set()
 
     async def start(self) -> None:
         """Subscribe once and launch the poll and optional prune loops."""
@@ -234,9 +236,10 @@ class PollingConsumer(DeliveryDispatch):
         A cancel that lands while SQLAlchemy runs a new connection's on-connect
         setup (``sqlalchemy.pool.base._ConnectionRecord.__connect``, outside its
         own cancellation guard) abandons the driver connection it just opened.
-        A poll sleeping between claims holds no connection and is cancelled at once.
+        A poll sleeping between claims holds no connection and is cancelled at
+        once, unless batches it started are still dispatching.
         """
-        if task is None or task.done() or self._sleeping:
+        if task is None or task.done() or (self._sleeping and not self._batches):
             return
         try:
             await asyncio.wait({task}, timeout=self._stop_drain_grace_s)
@@ -283,6 +286,19 @@ class PollingConsumer(DeliveryDispatch):
         return now
 
     async def _run(self) -> None:
+        try:
+            await self._poll()
+            # A stop lets the batches' listeners run on through its drain grace;
+            # their rows still queued see the stop and are handed back.
+            if self._batches:
+                await asyncio.wait(set(self._batches))
+        finally:
+            await self._cancel_batches()
+
+    async def _poll(self) -> None:
+        """Claim whenever a claimed row would start at once, without waiting for
+        the batches already dispatching, so one slow listener holds only its own
+        dispatch slot."""
         idle_empty_streak = 0
         loop = asyncio.get_running_loop()
         touched_at = -math.inf
@@ -290,6 +306,11 @@ class PollingConsumer(DeliveryDispatch):
             touched_at = await self._touch_subscriptions_if_due(loop.time(), touched_at)
             if self._should_stop():
                 return
+            if not self._gate.has_room():
+                await self._gate.changed(
+                    min(self._gate.room_wait_s(), self._subscription_refresh_s)
+                )
+                continue
             try:
                 rows = await self._broker.claim_batch(
                     self._group,
@@ -298,6 +319,9 @@ class PollingConsumer(DeliveryDispatch):
                     reclaim_stale_seconds=self._reclaim_stale_seconds,
                     max_attempts=self._max_attempts,
                     targets=self._targets,
+                    # A listener past its renew deadline holds a lapsed claim;
+                    # reclaiming it here would run it a second time beside itself.
+                    exclude_ids=[admission.row["id"] for admission in self._gate.running],
                 )
             except asyncio.CancelledError:
                 raise
@@ -312,7 +336,7 @@ class PollingConsumer(DeliveryDispatch):
             self._mark_broker_recovered("claim", self._group)
             if rows:
                 idle_empty_streak = 0
-                await self._dispatch_batch(rows)
+                self._start_batch(rows)
                 continue
             idle_empty_streak += 1
             delay = self._poll_interval_s
@@ -325,6 +349,13 @@ class PollingConsumer(DeliveryDispatch):
             if self._should_stop():
                 return
             await self._wait_when_idle(delay)
+
+    async def _cancel_batches(self) -> None:
+        """Cancel the batches still dispatching and wait for them to unwind."""
+        batches = set(self._batches)
+        for batch in batches:
+            batch.cancel()
+        await asyncio.gather(*batches, return_exceptions=True)
 
     async def _wait_when_idle(self, safety_timeout: float) -> None:
         """Wait for an optional latency hint without extending the safety poll."""

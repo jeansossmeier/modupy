@@ -438,6 +438,7 @@ class FakePollingBroker:
         reclaim_stale_seconds: float,
         max_attempts: int | None = None,
         targets: list[str] | tuple[str, ...] | None = None,
+        exclude_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         self.claim_batch_calls.append(
             {
@@ -458,8 +459,8 @@ class FakePollingBroker:
     async def ack(self, row_id: str, *, consumer_name: str) -> None:
         return None
 
-    async def fail(self, row_id: str, error: str, *, consumer_name: str, max_attempts: int) -> None:
-        return None
+    async def fail(self, row_id: str, error: str, *, consumer_name: str, max_attempts: int) -> bool:
+        return True
 
     async def dead_letter(self, row_id: str, error: str, *, consumer_name: str) -> None:
         return None

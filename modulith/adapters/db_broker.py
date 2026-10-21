@@ -50,6 +50,8 @@ Configuration resolves ``MODULITH_BROKER_<KEY>`` env var (blank == unset) >
                                and reclaimed by the next claim (default 60)
   max_delivery_attempts       a message that fails to dispatch this many times is
                                dead-lettered instead of retried forever (default 5)
+  retry_backoff_base_seconds  failure backoff before redelivery: base * 2^(n-1),
+  retry_backoff_cap_seconds    capped (defaults 0.05s and 5s)
   retention_age_seconds       prune deletes terminal ('done'/'dead') rows older
                                than this many seconds (default 259200 = 3 days,
                                so dead letters cannot grow unboundedly)
@@ -160,10 +162,15 @@ from modulith import (
 from ..config import (
     DEFAULT_BROKER_DB_FILENAME,
     DEFAULT_MAX_PAYLOAD_BYTES,
+    DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+    DEFAULT_RETRY_BACKOFF_CAP_SECONDS,
     MAX_PAYLOAD_BYTES,
     _expected_groups_target,
+    _validate_retry_backoff,
     _validate_sql_schema,
+    retry_backoff_s,
 )
+from ._consumer_protocol import RECLAIMED_MID_DISPATCH, log_charged_reclaim
 from ._dead_letter import DeadLetter
 from ._polling_consumer import PollingConsumer
 from ._state_path import default_state_directory, resolve_state_file
@@ -224,13 +231,6 @@ _DEFAULT_RECLAIM_STALE_S = 60.0
 # A message that fails to dispatch this many times is dead-lettered rather
 # than retried forever. Mirrors modulith._consumer._MAX_DELIVERY_ATTEMPTS.
 _MAX_DELIVERY_ATTEMPTS = 5
-
-# Capped exponential backoff — same shape as modulith._consumer's constants
-# (0.05s, 0.1s, 0.2s, ... capped at 5s) for both broker-error retries and
-# dispatch-failure redelivery delay.
-_BACKOFF_BASE_S = 0.05
-_BACKOFF_CAP_S = 5.0
-_BACKOFF_MAX_EXPONENT = 7
 
 # Dialects that support ``FOR UPDATE SKIP LOCKED``. SQLite has no row
 # locking and rejects the clause outright, so it must never be issued there.
@@ -381,22 +381,11 @@ def _validate_expected_consumer_groups(value: Any) -> dict[str, list[str]]:
     return normalized
 
 
-def _backoff_delay(attempt: int) -> float:
-    """Capped exponential backoff for the ``attempt``'th consecutive failure
-    (1-indexed): 0.05s, 0.1s, 0.2s, ... capped at 5s."""
-    exponent = min(attempt - 1, _BACKOFF_MAX_EXPONENT)
-    # ``2.0 ** exponent`` (float base), not ``2**exponent``: typeshed types
-    # ``int.__pow__`` as returning ``Any`` (a negative exponent would yield a
-    # float at runtime), which would otherwise leak Any through this
-    # function's declared ``-> float`` return.
-    return min(_BACKOFF_BASE_S * (2.0**exponent), _BACKOFF_CAP_S)
-
-
 def _sqlite_busy_delay(attempt: int) -> float:
     """Sleep before retrying a SQLITE_BUSY write: geometric from 2ms, capped
     at 50ms, plus 0-3ms jitter.
 
-    Deliberately NOT ``_backoff_delay``: that scale (50ms..5s) is sized for
+    Deliberately NOT ``retry_backoff_s``: that scale (50ms..5s) is sized for
     backend outages, while a busy collision on a local SQLite file usually
     clears in single-digit milliseconds. Sleeping 50ms+ per collision pushes
     steady-state delivery p50 from ~20ms to ~200ms under concurrent publish
@@ -1094,7 +1083,12 @@ class DatabaseBroker:
         orphan_retention_seconds: float = _DEFAULT_ORPHAN_RETENTION_S,
         expected_consumer_groups: dict[str, list[str]] | None = None,
         max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
+        retry_backoff_base_seconds: float = DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+        retry_backoff_cap_seconds: float = DEFAULT_RETRY_BACKOFF_CAP_SECONDS,
     ) -> None:
+        self._retry_backoff_base_s, self._retry_backoff_cap_s = _validate_retry_backoff(
+            retry_backoff_base_seconds, retry_backoff_cap_seconds
+        )
         if engine is not None:
             self._engine = engine
         else:
@@ -1970,6 +1964,7 @@ class DatabaseBroker:
         reclaim_stale_seconds: float = _DEFAULT_RECLAIM_STALE_S,
         max_attempts: int | None = None,
         targets: list[str] | tuple[str, ...] | None = None,
+        exclude_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Claim up to ``batch_size`` due rows for ``group``.
 
@@ -1984,7 +1979,8 @@ class DatabaseBroker:
         latter are orphans left by a consumer that crashed between claim and
         ack, so reclaiming them is what preserves at-least-once delivery across
         a consumer crash (the DB analogue of the Redis adapter's XAUTOCLAIM
-        reclaim). The order is dialect-specific. Postgres and SQLite run one
+        reclaim). A stale claim of a row in ``exclude_ids`` is left alone: the
+        caller is still running its listener. The order is dialect-specific. Postgres and SQLite run one
         select over both kinds, ordered by ``available_at``, so an orphaned
         claim is reclaimed ahead of newer pending rows. MySQL and MariaDB claim
         pending rows first and let stale claims fill only what is left of
@@ -2003,7 +1999,10 @@ class DatabaseBroker:
         row does not spend the retry budget of the rows queued behind it.
         When ``max_attempts`` is given, a charged reclaim that exhausts it
         moves the row straight to ``dead`` and withholds it from the batch,
-        because nothing on the crash path will run the cap in ``fail()``.
+        because nothing on the crash path will run the cap in ``fail()``. A
+        charged reclaim below the cap is withheld too: like ``fail()``, it
+        puts the row back to ``pending`` for the failure backoff, with
+        ``RECLAIMED_MID_DISPATCH`` as its ``last_error``.
 
         Postgres/MySQL: ``FOR UPDATE SKIP LOCKED`` lets concurrent consumers
         partition the backlog instead of blocking or double-claiming. SQLite
@@ -2018,8 +2017,10 @@ class DatabaseBroker:
 
         _, _, message = broker_schema()
         cap = None if max_attempts is None else _positive_int(max_attempts, "max_attempts")
+        charges: list[tuple[dict[str, Any], int, float | None]] = []
 
         async def op(conn: Any) -> list[dict[str, Any]]:
+            charges.clear()
             if self._is_sqlite:
                 # SQLite has no row locks: take the write reservation before
                 # the SELECT, as _write_target_locked does, so two consumers
@@ -2046,6 +2047,8 @@ class DatabaseBroker:
                 return [dict(row._mapping) for row in await conn.execute(stmt)]
 
             stale = and_(message.c.status == "claimed", message.c.claimed_at <= stale_cutoff)
+            if exclude_ids:
+                stale = and_(stale, message.c.id.not_in(exclude_ids))
             dialect = getattr(getattr(self._engine, "dialect", None), "name", "sqlite")
             if dialect in _MYSQL_FAMILY_DIALECTS:
                 # Two selects rather than one OR: InnoDB locks every row an
@@ -2065,7 +2068,6 @@ class DatabaseBroker:
                 if cap is None
                 else {row["id"] for row in charged if int(row["attempts"]) + 1 >= cap}
             )
-            charged_ids = [row["id"] for row in charged if row["id"] not in exhausted_ids]
             uncharged_ids = [
                 row["id"]
                 for row in rows
@@ -2083,18 +2085,26 @@ class DatabaseBroker:
                         dispatch_started=False,
                     )
                 )
-            if charged_ids:
+            for row in charged:
+                if row["id"] in exhausted_ids:
+                    charges.append((row, int(row["attempts"]) + 1, None))
+                    continue
+                attempts = int(row["attempts"]) + 1
+                retry_in_s = self._retry_delay(attempts)
                 await conn.execute(
                     update(message)
-                    .where(message.c.id.in_(charged_ids))
+                    .where(message.c.id == row["id"])
                     .values(
-                        status="claimed",
-                        claimed_at=now,
-                        claimed_by=consumer_name,
-                        attempts=message.c.attempts + 1,
+                        status="pending",
+                        attempts=attempts,
+                        available_at=now + timedelta(seconds=retry_in_s),
+                        claimed_at=None,
+                        claimed_by=None,
                         dispatch_started=False,
+                        last_error=RECLAIMED_MID_DISPATCH,
                     )
                 )
+                charges.append((row, attempts, retry_in_s))
             if exhausted_ids:
                 await conn.execute(
                     update(message)
@@ -2113,15 +2123,23 @@ class DatabaseBroker:
                     )
                 )
 
-            bumped = set(charged_ids)
-            claimed_rows = [row for row in rows if row["id"] not in exhausted_ids]
+            claimed_ids = set(uncharged_ids)
+            claimed_rows = [row for row in rows if row["id"] in claimed_ids]
             for row in claimed_rows:
-                if row["id"] in bumped:
-                    row["attempts"] = int(row["attempts"]) + 1
                 row["dispatch_started"] = False
             return claimed_rows
 
         rows: list[dict[str, Any]] = await self._write(op)
+        for row, attempts, retry_in_s in charges:
+            log_charged_reclaim(
+                logger,
+                group=group,
+                row_id=str(row["id"]),
+                event_type=str(row["event_type"]),
+                target=str(row["target"]),
+                attempts=attempts,
+                retry_in_s=retry_in_s,
+            )
         return rows
 
     @_on_owning_loop
@@ -2266,11 +2284,14 @@ class DatabaseBroker:
 
         await self._write(op)
 
+    def _retry_delay(self, attempts: int) -> float:
+        return retry_backoff_s(attempts, self._retry_backoff_base_s, self._retry_backoff_cap_s)
+
     @_on_owning_loop
-    async def fail(self, row_id: str, error: str, *, consumer_name: str, max_attempts: int) -> None:
+    async def fail(self, row_id: str, error: str, *, consumer_name: str, max_attempts: int) -> bool:
         """Record a dispatch failure for a row THIS consumer still owns:
         attempts++ with backoff, staying 'pending' until ``max_attempts`` is
-        reached, then 'dead'.
+        reached, then 'dead'. Returns False when it no longer owns the row.
 
         Guarded by ``status='claimed' AND claimed_by=:consumer_name`` and the
         attempt count is read from the row INSIDE the same transaction (not a
@@ -2283,14 +2304,14 @@ class DatabaseBroker:
 
         _, _, message = broker_schema()
 
-        async def op(conn: Any) -> None:
+        async def op(conn: Any) -> bool:
             current = (
                 await conn.execute(
                     select(message.c.attempts).where(*_owned(message, row_id, consumer_name))
                 )
             ).scalar_one_or_none()
             if current is None:
-                return  # reclaimed by a peer or already terminal — late write is a no-op
+                return False  # reclaimed by a peer or already terminal — late write is a no-op
             new_attempts = current + 1
             now = await self._now(conn)
             if new_attempts >= max_attempts:
@@ -2298,7 +2319,7 @@ class DatabaseBroker:
                 available_at = now
             else:
                 status = "pending"
-                available_at = now + timedelta(seconds=_backoff_delay(new_attempts))
+                available_at = now + timedelta(seconds=self._retry_delay(new_attempts))
             await conn.execute(
                 update(message)
                 .where(*_owned(message, row_id, consumer_name))
@@ -2311,8 +2332,9 @@ class DatabaseBroker:
                     claimed_by=None,
                 )
             )
+            return True
 
-        await self._write(op)
+        return bool(await self._write(op))
 
     @_on_owning_loop
     async def dead_letter(self, row_id: str, error: str, *, consumer_name: str) -> None:
@@ -2959,6 +2981,14 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
                 _broker_opt(opts, "max_payload_bytes", "MAX_PAYLOAD_BYTES"), "max_payload_bytes"
             ),
             DEFAULT_MAX_PAYLOAD_BYTES,
+        ),
+        retry_backoff_base_seconds=_option_or_default(
+            _broker_opt(opts, "retry_backoff_base_seconds", "RETRY_BACKOFF_BASE_SECONDS"),
+            DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+        ),
+        retry_backoff_cap_seconds=_option_or_default(
+            _broker_opt(opts, "retry_backoff_cap_seconds", "RETRY_BACKOFF_CAP_SECONDS"),
+            DEFAULT_RETRY_BACKOFF_CAP_SECONDS,
         ),
     )
     registry.register(_DB_SCHEME, broker)

@@ -711,13 +711,15 @@ export MODULITH_BROKER_DLQ_MAX_STREAM_LEN=1000000  # dead-letter stream cap (def
 export MODULITH_BROKER_MAX_PAYLOAD_BYTES=1048576   # producer-side payload cap (default 16 MiB)
 ```
 
-The consumer-loop settings have no environment variable — set them in `pyproject.toml`:
+The consumer-loop settings have no environment variable — set them in `pyproject.toml`. The two backoff values are the exception: `MODULITH_BROKER_RETRY_BACKOFF_BASE_SECONDS` and `MODULITH_BROKER_RETRY_BACKOFF_CAP_SECONDS` override them, as on the `shm` and `database` brokers.
 
 ```toml
 [tool.modulith.broker_options]
-poll_block_ms = 1000          # XREADGROUP block timeout
-reclaim_min_idle_ms = 60000   # idle threshold before a pending entry is claimed
-max_delivery_attempts = 5     # attempts before dead-lettering
+poll_block_ms = 1000               # XREADGROUP block timeout
+reclaim_min_idle_ms = 60000        # idle threshold before a pending entry is claimed
+max_delivery_attempts = 5          # attempts before dead-lettering
+retry_backoff_base_seconds = 0.05  # extra wait past the threshold after one delivery, doubling per delivery
+retry_backoff_cap_seconds = 5      # longest extra wait
 ```
 
 The Redis client gets `socket_timeout = poll_block_ms / 1000 + 5` seconds (6 s by default) and `socket_keepalive = true`. `XREADGROUP BLOCK` is only a server-side timeout, so without these a hung server or a half-open connection would stall reads forever. Query options in `REDIS_URL` win over these defaults, for example `redis://cache:6379?socket_timeout=30&socket_keepalive=false`. Keep any `socket_timeout` you set above the block time, or every idle poll times out. With the timeout, a slow direct `publish()` raises `TimeoutError` instead of hanging.
@@ -1443,7 +1445,7 @@ In single-process topology there is no proxy and no actuator: modupy adds no HTT
 
 **When a broker error degrades `/health`.** A failed broker call puts the consumer in `degraded` (503) until the same operation next succeeds for the same stream or target. Completion writes (ack, fail, dead-letter, claim renewal) can also clear in these ways:
 
-- On every consumer, the failure expires after the redelivery window: `reclaim_min_idle_ms` for Redis, `reclaim_stale_seconds` for the database and SHM brokers. By then the affected message is eligible for reclaim, here or on a peer replica. A write that fails again on the retry records a fresh failure, so a persistent failure shows up again, but `/health` can report ready between the expiry and that retry.
+- On every consumer, the failure expires after the redelivery window: `reclaim_min_idle_ms` for Redis, `reclaim_stale_seconds` for the database and SHM brokers. By then the affected message is eligible for reclaim, here or on a peer replica, on Redis once it has also sat out the failure backoff. A write that fails again on the retry records a fresh failure, so a persistent failure shows up again, but `/health` can report ready between the expiry and that retry.
 - On Redis only, the failure clears as soon as its message is no longer pending in the consumer group, for example because a peer replica reclaimed and acknowledged it.
 - On every consumer, a write that fails after a later write of the same kind has succeeded for the same target is never recorded if it started first. The database and SHM consumers complete up to `dispatch_concurrency` rows at once, so a slow failure can arrive after the broker has already proved healthy again; the Redis consumer applies the same rule to its ack and dead-letter writes.
 
@@ -1451,12 +1453,12 @@ A failure on one target never clears because another target succeeded. The excep
 
 **When a stalled consumer degrades `/health`.** A consumer that stops making progress reports `degraded` (503) even when no broker call has failed:
 
-- **A listener that never returns** (database and SHM brokers). The consumer claims nothing new until every row of its current batch has finished. Once a batch has run longer than `reclaim_stale_seconds * 10` (default 600 s), health reports `degraded` with the detail `listener has not returned after Ns for <event type> on <target> (row <id>); the consumer cannot poll until it returns`, naming the first five stuck rows and then `and N more`. The consumer also logs an ERROR line starting `claim renewal for group ... exceeded` that names the same rows. While the worker runs, modupy never cancels a listener, so this one keeps running; a stop of the worker cancels it after a 1 s grace, unless it is a plain `def` listener (see [Graceful Shutdown](#graceful-shutdown)). The consumer recovers only when the listener returns.
+- **A listener that never returns** (database and SHM brokers). The stuck listener holds one of the consumer's `dispatch_concurrency` slots, and the consumer keeps claiming and delivering other messages with the rest. A message's claim is renewed until `reclaim_stale_seconds * 10` (default 600 s) after its own listener started. Past that, health reports `degraded` with the detail `listener has not returned after Ns for <event type> on <target> (row <id>); its claim is no longer renewed and it holds a dispatch slot until it returns`, naming the first five stuck rows and then `and N more`. The consumer also logs an ERROR line starting `claim renewal for group ... stopped after` that names the same rows. Once the claim has been idle for `reclaim_stale_seconds`, a peer's next claim charges the message one attempt and delivers it again after the failure backoff while the first listener may still be running, and the first listener's result is discarded when it returns. This consumer's own claims leave the message to its listener, so without a peer it waits for the listener or a restart. Each reclaim, a peer's or a restarted consumer's, charges the message one attempt, so a listener that hangs on every delivery ends dead-lettered after `max_delivery_attempts` reclaims, each hung call holding its slot. Without restarts the reclaims stop once every consumer of the group runs a hung copy, so with one consumer the message stays with its first listener. A listener that is only slow is treated the same way, so keep `reclaim_stale_seconds * 10` above your slowest listener's run. While the worker runs, modupy never cancels a listener without a budget, so this one keeps running; a stop of the worker cancels it after a 1 s grace, unless it is a plain `def` listener (see [Graceful Shutdown](#graceful-shutdown)). The consumer's health recovers only when the listener returns. Give an async listener that calls something slow `@listener(timeout=seconds)`: past it the listener is cancelled, the delivery fails and is redelivered, and its slot is free again. Only an `async def` listener takes a timeout, and the cancellation lands at its next `await`. A plain `def` listener, or blocking work an async one hands to a thread, cannot be stopped, so give blocking code a worker process of its own (`own_process`) that can be restarted.
 - **A Redis server that stops answering.** Health reports `degraded` with the detail `no broker read completed in Ns` once a read has waited `5 * poll_block_ms + 1 s`. The consumer logs one WARNING per stall. The Redis client's socket timeout (see [Redis Streams Broker](#b-redis-streams-broker)) then fails the hung read. The consumer logs `broker read failed`, backs off and retries, and health stays `degraded` until a read succeeds.
 
 **How long a `detail` can be.** `/health` carries the consumer's `detail` text: the two strings above, and the error text of a failed consumer or broker call, which can be arbitrarily long. A text of up to 1,024 characters is returned unchanged. A longer one is cut to its first 1,021 characters followed by `...`, so the answer stays far below the 64 KiB of body the proxy reads when it checks a worker's identity; an answer over that limit would get the deployment's own worker marked foreign. The worker logs the full text once at WARNING (`worker 'orders' /health cut the consumer's detail from N to 1024 characters; full text: ...`) and again whenever a different long text replaces it, so read the full error from the worker's log.
 
-Restart a worker whose health stays `degraded` longer than you can tolerate; on a stuck listener a restart is the only remedy. The restarted consumer reclaims the stuck rows and charges each one a delivery attempt, so a listener that hangs on every delivery ends in the dead-letter state after `max_delivery_attempts`. The generated Kubernetes manifests do not do this for you: liveness is a `tcpSocket` check, so a degraded worker is only taken out of readiness. Add a liveness `httpGet /health` (with a generous `failureThreshold`) or an external watchdog if you want automatic restarts.
+Restart a worker whose health stays `degraded` longer than you can tolerate; a restart is the only way to free a stuck listener's slot. The restarted consumer reclaims the stuck rows and charges each one a delivery attempt, so a listener that hangs on every delivery ends in the dead-letter state after `max_delivery_attempts`. The generated Kubernetes manifests do not do this for you: liveness is a `tcpSocket` check, so a degraded worker is only taken out of readiness. Add a liveness `httpGet /health` (with a generous `failureThreshold`) or an external watchdog if you want automatic restarts. Under `modulith run` no probe reaches a worker, and `worker_liveness_timeout_seconds` counts a `degraded` 503 as alive, so a worker that is degraded but answering is restarted only by an operator.
 
 ### Tracing
 
@@ -1695,13 +1697,32 @@ modulith broker dead-letter --retry-all   # resubmit every one, with attempts re
 
 A delivery is dead-lettered after `max_delivery_attempts` failed dispatches or
 reclaims, or at once when its payload cannot be read. On Redis the count is
-Redis's own delivery count for the entry, which the first read and every reclaim
-raise by one. A message delivered `max_delivery_attempts` times without
+Redis's own delivery count for the entry, which is 1 once the consumer starts
+the entry and which every reclaim raises by one. A message delivered `max_delivery_attempts` times without
 completing is dead-lettered when it is next reclaimed, before its listener
 runs again, so a listener that kills the worker on every delivery stops after
 `max_delivery_attempts` deliveries instead of crash-looping. The dead letter of
 such a message lists one more attempt than that, because it records the reclaim
-that dead-lettered it. Several event types can
+that dead-lettered it. On the database and SHM brokers a reclaim charges a
+message only when its listener had started. The charged message waits out the
+failure backoff, then runs alone: the consumer starts it only when no other
+listener of its own is running and starts nothing beside it. So when a message
+kills the worker, the healthy messages that were running beside it are charged
+once, and each later crash charges only the message that caused it. A Redis
+read counts a delivery for every entry it returns, but the consumer runs one
+listener at a time, so it sets the count of every entry after the first back
+to 0 and raises it to 1 just before running that entry. A reclaim raises the
+count by one, so it hands over an entry whose listener never started as that
+entry's first delivery. The consumer claims one entry at a time, just before
+running it, once a charged entry has also sat out the failure backoff. So when
+a message kills the worker, the entries read with it are not charged, and each
+crash charges only the message that caused it. A crash in the moment between
+a read and that reset still charges the batch once. A charge logs a WARNING,
+and a dead letter, by reclaim or by a failed last attempt, logs an ERROR, both
+naming the message, event type, target and group.
+Messages of another module hosted in the
+same worker are not covered: a crash charges whatever that worker was running,
+so give a module whose events can kill the process `own_process`. Several event types can
 share one target (an explicit `@externalized(target=...)`), so a module can
 receive messages for types it has no listener for. Its consumer compares the
 message's `event_type` header with the types the module listens to before
@@ -1736,8 +1757,8 @@ other targets, then names the target and its groups in an error and exits 1.
 
 **Consuming (every broker):**
 - A failed broker call is logged and retried under capped exponential backoff, 0.05 s doubling up to 5 s. `/health` reports `degraded` until that call succeeds again
-- A message that a stopped or crashed consumer left claimed or pending is delivered again once it has sat idle for `reclaim_stale_seconds` (database and SHM) or `reclaim_min_idle_ms` (Redis). Consumers reclaim it themselves: the supervisor takes no part, and nothing rebalances
-- A database or SHM consumer that stops gracefully hands back the messages it claimed but never started delivering, uncharged, so a peer takes them on its next poll. If a listener is still running when the stop's 1 s grace ends, the stop cancels it (except a plain `def` listener; see [Graceful Shutdown](#graceful-shutdown)), and the messages of that batch wait for the reclaim above. A database or SHM consumer hands back the message whose listener the stop cancelled at once as well, without charging a delivery attempt, so restarts of a healthy worker never dead-letter it. That holds while the listener has run for less than `reclaim_stale_seconds * 10` (600 s by default), the point where `/health` reports it stuck. A listener past that keeps its message claimed, and the reclaim charges the message one attempt, so a listener that hangs on every delivery still ends dead-lettered after `max_delivery_attempts`
+- A message that a stopped or crashed consumer left claimed or pending is delivered again once it has sat idle for `reclaim_stale_seconds` (database and SHM) or `reclaim_min_idle_ms` plus the failure backoff (Redis). Consumers reclaim it themselves: the supervisor takes no part, and nothing rebalances
+- A database or SHM consumer that stops gracefully hands back the messages it claimed but never started delivering, uncharged, so a peer takes them on its next poll. If a listener is still running when the stop's 1 s grace ends, the stop cancels it (except a plain `def` listener; see [Graceful Shutdown](#graceful-shutdown)) and still hands back the messages queued behind it. A database or SHM consumer hands back the message whose listener the stop cancelled at once as well, without charging a delivery attempt, so restarts of a healthy worker never dead-letter it. That holds while the listener has run for less than `reclaim_stale_seconds * 10` (600 s by default), the point where `/health` reports it stuck. A listener past that keeps its message claimed, and the reclaim charges the message one attempt, so a listener that hangs on every delivery still ends dead-lettered after `max_delivery_attempts`
 
 **Redis broker:**
 - A consumer creates its group when it starts, from the beginning of the stream, and creates it again if Redis reports `NOGROUP`. Entries published while every consumer is down wait in the stream, until the `MODULITH_STREAM_MAXLEN` cap (10000 by default) trims the oldest, unacknowledged ones included (see the Redis durability caveat above)
