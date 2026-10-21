@@ -47,9 +47,12 @@ from ..config import (
     _SHM_MAX_PAYLOAD_BYTES,
     _SHM_MAX_STORE_BYTES,
     DEFAULT_MAX_PAYLOAD_BYTES,
+    DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+    DEFAULT_RETRY_BACKOFF_CAP_SECONDS,
     DEFAULT_SHM_BROKER_DB_FILENAME,
     DEFAULT_SHM_MAX_STORE_BYTES,
     DEFAULT_SHM_ORPHAN_RETENTION_SECONDS,
+    _validate_retry_backoff,
     _validate_shm_broker_options,
 )
 from ._dead_letter import DeadLetter
@@ -206,8 +209,13 @@ class ShmBroker:
         max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
         max_store_bytes: int = DEFAULT_SHM_MAX_STORE_BYTES,
         orphan_retention_seconds: float = DEFAULT_SHM_ORPHAN_RETENTION_SECONDS,
+        retry_backoff_base_seconds: float = DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+        retry_backoff_cap_seconds: float = DEFAULT_RETRY_BACKOFF_CAP_SECONDS,
     ) -> None:
         capacity = _validated_hint_capacity(capacity)
+        retry_backoff_base_seconds, retry_backoff_cap_seconds = _validate_retry_backoff(
+            retry_backoff_base_seconds, retry_backoff_cap_seconds
+        )
         orphan_retention_seconds = _positive_finite_float(
             orphan_retention_seconds,
             "orphan_retention_seconds",
@@ -317,6 +325,8 @@ class ShmBroker:
             max_payload_bytes=max_payload_bytes,
             max_store_bytes=max_store_bytes,
             orphan_retention_seconds=orphan_retention_seconds,
+            retry_backoff_base_seconds=retry_backoff_base_seconds,
+            retry_backoff_cap_seconds=retry_backoff_cap_seconds,
         )
         self._closed = False
 
@@ -461,11 +471,14 @@ class ShmBroker:
         reclaim_stale_seconds: float = _DEFAULT_RECLAIM_STALE_S,
         max_attempts: int | None = None,
         targets: list[str] | tuple[str, ...] | None = None,
+        exclude_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Atomically claim durable work, including abandoned stale claims.
 
         ``targets``, when given, restricts the claim to those targets, so
         deliveries for a target the consumer no longer consumes stay pending.
+        A stale claim of a delivery in ``exclude_ids`` is not reclaimed: the
+        caller is still running its listener.
 
         A stale-claim reclaim bumps ``attempts`` only for a row whose
         dispatch had started (``renew_claims(..., start_dispatch=True)``);
@@ -481,6 +494,7 @@ class ShmBroker:
             "batch_size",
             _SHM_MAX_CLAIM_BATCH_SIZE,
         )
+        running: list[ClaimToken | str] = list(exclude_ids or ())
         return await self._cold.claim(
             group,
             limit=batch_size,
@@ -488,6 +502,7 @@ class ShmBroker:
             reclaim_stale_seconds=reclaim_stale_seconds,
             max_attempts=max_attempts,
             targets=targets,
+            exclude=running,
         )
 
     async def renew_claims(
@@ -542,9 +557,9 @@ class ShmBroker:
         *,
         consumer_name: str,
         max_attempts: int,
-    ) -> None:
-        """Retry or dead-letter one currently owned claim."""
-        await self._cold.fail(
+    ) -> bool:
+        """Retry or dead-letter one currently owned claim; False when it is no longer owned."""
+        return await self._cold.fail(
             row_id,
             error,
             max_attempts,
@@ -710,6 +725,8 @@ _SHM_OPTION_ENV_SUFFIXES = {
     "max_delivery_attempts": "MAX_DELIVERY_ATTEMPTS",
     "retention_age_seconds": "RETENTION_AGE_SECONDS",
     "prune_interval_seconds": "PRUNE_INTERVAL_SECONDS",
+    "retry_backoff_base_seconds": "RETRY_BACKOFF_BASE_SECONDS",
+    "retry_backoff_cap_seconds": "RETRY_BACKOFF_CAP_SECONDS",
 }
 
 
@@ -956,6 +973,16 @@ def modulith_register_brokers(registry: BrokerRegistry) -> None:
         max_payload_bytes=max_payload_bytes,
         max_store_bytes=max_store_bytes,
         orphan_retention_seconds=orphan_retention_seconds,
+        retry_backoff_base_seconds=_option_or_default(
+            _opt_float(
+                _broker_opt(opts, "retry_backoff_base_seconds", "RETRY_BACKOFF_BASE_SECONDS")
+            ),
+            DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+        ),
+        retry_backoff_cap_seconds=_option_or_default(
+            _opt_float(_broker_opt(opts, "retry_backoff_cap_seconds", "RETRY_BACKOFF_CAP_SECONDS")),
+            DEFAULT_RETRY_BACKOFF_CAP_SECONDS,
+        ),
     )
     registry.register(_SHM_SCHEME, broker)
     logger.info(

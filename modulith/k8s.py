@@ -68,6 +68,8 @@ _DATABASE_BROKER_OPTION_KEYS = frozenset(
         "reclaim_stale_seconds",
         "retention_age_seconds",
         "retention_count",
+        "retry_backoff_base_seconds",
+        "retry_backoff_cap_seconds",
         "schema",
         "sqlite_synchronous",
         "state_dir",
@@ -78,6 +80,8 @@ _DATABASE_BROKER_OPTION_KEYS = frozenset(
 _REDIS_OPTION_ENV_NAMES = {
     "max_stream_len": _REDIS_BROKER_ENV_ALIASES["MODULITH_BROKER_MAX_STREAM_LEN"],
     "stream_prefix": _REDIS_BROKER_ENV_ALIASES["MODULITH_BROKER_STREAM_PREFIX"],
+    "retry_backoff_base_seconds": "MODULITH_BROKER_RETRY_BACKOFF_BASE_SECONDS",
+    "retry_backoff_cap_seconds": "MODULITH_BROKER_RETRY_BACKOFF_CAP_SECONDS",
 }
 
 _RFC1123_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")

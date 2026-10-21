@@ -5,12 +5,21 @@ from __future__ import annotations
 import heapq
 import itertools
 import json
+import logging
 import sqlite3
 import time
 from typing import Any
 
+from ..config import (
+    DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+    DEFAULT_RETRY_BACKOFF_CAP_SECONDS,
+    retry_backoff_s,
+)
+from ._consumer_protocol import RECLAIMED_MID_DISPATCH, log_charged_reclaim
 from ._shm_schema import immediate_transaction
 from ._shm_types import ClaimToken, require_consumer_name
+
+logger = logging.getLogger("modulith.adapters.shm")
 
 # Due pending work and reclaimable stale claims, oldest first within each
 # status branch. ``d.id`` makes each branch's ordering total (deliveries for
@@ -68,6 +77,17 @@ def _target_filter(
     return f" AND p.target IN ({','.join('?' * len(names))})", names
 
 
+def _stale_filter(
+    targets: list[str] | tuple[str, ...] | None,
+    excluded: tuple[int, ...],
+) -> tuple[str, tuple[str | int, ...]]:
+    """``_target_filter`` for the stale branch, also skipping the ``excluded`` deliveries."""
+    clause, names = _target_filter(targets)
+    if not excluded:
+        return clause, names
+    return f"{clause} AND d.id NOT IN ({','.join('?' * len(excluded))})", (*names, *excluded)
+
+
 def claim(
     conn: sqlite3.Connection,
     group: str,
@@ -77,11 +97,16 @@ def claim(
     max_claim_bytes: int,
     max_attempts: int | None = None,
     targets: list[str] | tuple[str, ...] | None = None,
+    backoff_base: float = DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+    backoff_cap: float = DEFAULT_RETRY_BACKOFF_CAP_SECONDS,
+    exclude: list[ClaimToken | str] | tuple[ClaimToken | str, ...] = (),
 ) -> list[dict[str, Any]]:
     """Atomically claim due pending work and abandoned stale claims.
 
     ``targets``, when given, restricts the claim to deliveries of
-    publications for those targets; the rest stay undelivered.
+    publications for those targets; the rest stay undelivered. The stale
+    claims of the deliveries named in ``exclude`` are not reclaimed: their
+    listener still runs in the caller.
 
     A stale-claim reclaim bumps ``attempts`` only when the abandoned claim
     had started dispatching the row (``renew_claims(..., start_dispatch=True)``
@@ -90,23 +115,40 @@ def claim(
     reclaim that meets or exceeds the cap dead-letters the row instead of
     redelivering it -- the same accounting ``db_broker.claim_batch`` applies,
     needed because a consumer that crashes mid-dispatch never reaches
-    ``fail()`` to run the cap itself.
+    ``fail()`` to run the cap itself. A charged reclaim below the cap is not
+    returned: like ``fail()``, it puts the row back to pending for the failure
+    backoff, with ``RECLAIMED_MID_DISPATCH`` as its ``last_error``.
     """
     consumer_name = require_consumer_name(consumer_name)
     now = time.time()
     cutoff = now - reclaim_stale_seconds
+    excluded = tuple(ClaimToken.decode(value).delivery_id for value in exclude)
     claimed: list[dict[str, Any]] = []
+    charged: list[tuple[sqlite3.Row, int, float | None]] = []
     with immediate_transaction(conn):
-        candidates = _merged_size_candidates(conn, group, now, cutoff, limit, targets)
+        candidates = _merged_size_candidates(conn, group, now, cutoff, limit, targets, excluded)
         affordable = _affordable_candidates(candidates, max_claim_bytes)
         if not affordable:
             return claimed
-        rows_by_id = _fetch_needed_rows(conn, group, now, cutoff, affordable, targets)
+        rows_by_id = _fetch_needed_rows(conn, group, now, cutoff, affordable, targets, excluded)
         for branch, delivery_id, _row_bytes in affordable:
             row = rows_by_id[delivery_id]
             charge = 1 if branch == "stale" and row["dispatch_started"] else 0
             attempts = int(row["attempts"]) + charge
-            if charge and max_attempts is not None and attempts >= max_attempts:
+            if charge and (max_attempts is None or attempts < max_attempts):
+                retry_in_s = retry_backoff_s(attempts, backoff_base, backoff_cap)
+                conn.execute(
+                    """
+                    UPDATE shm_delivery
+                    SET status='pending', attempts=?, available_at=?, claimed_at=NULL,
+                        claimed_by=NULL, dispatch_started=0, last_error=?
+                    WHERE id=?
+                    """,
+                    (attempts, now + retry_in_s, RECLAIMED_MID_DISPATCH, delivery_id),
+                )
+                charged.append((row, attempts, retry_in_s))
+                continue
+            if charge:
                 conn.execute(
                     """
                     UPDATE shm_delivery
@@ -123,6 +165,7 @@ def claim(
                         delivery_id,
                     ),
                 )
+                charged.append((row, attempts, None))
                 continue
             generation = int(row["claim_generation"]) + 1
             conn.execute(
@@ -135,6 +178,16 @@ def claim(
                 (now, consumer_name, generation, attempts, delivery_id),
             )
             claimed.append(_claimed_row(row, group, consumer_name, generation, attempts))
+    for charged_row, charged_attempts, retry_after_s in charged:
+        log_charged_reclaim(
+            logger,
+            group=group,
+            row_id=str(charged_row["id"]),
+            event_type=str(charged_row["event_type"]),
+            target=str(charged_row["target"]),
+            attempts=charged_attempts,
+            retry_in_s=retry_after_s,
+        )
     return claimed
 
 
@@ -145,6 +198,7 @@ def _merged_size_candidates(
     cutoff: float,
     limit: int,
     targets: list[str] | tuple[str, ...] | None = None,
+    excluded: tuple[int, ...] = (),
 ) -> list[tuple[str, int, int]]:
     """Merge each branch's own bounded, pre-sorted candidates into one list.
 
@@ -163,8 +217,12 @@ def _merged_size_candidates(
         conn.execute(_PENDING_SIZES_SQL.format(targets=clause), (group, now, *names, limit)),
         "pending",
     )
+    stale_clause, stale_names = _stale_filter(targets, excluded)
     stale = _entries(
-        conn.execute(_STALE_SIZES_SQL.format(targets=clause), (group, now, cutoff, *names, limit)),
+        conn.execute(
+            _STALE_SIZES_SQL.format(targets=stale_clause),
+            (group, now, cutoff, *stale_names, limit),
+        ),
         "stale",
     )
     merged = heapq.merge(pending, stale, key=lambda entry: (entry[0], entry[1]))
@@ -199,6 +257,7 @@ def _fetch_needed_rows(
     cutoff: float,
     affordable: list[tuple[str, int, int]],
     targets: list[str] | tuple[str, ...] | None = None,
+    excluded: tuple[int, ...] = (),
 ) -> dict[int, sqlite3.Row]:
     """Read full payload rows only for the exact ids the budget affords."""
     needed_pending = sum(1 for candidate in affordable if candidate[0] == "pending")
@@ -210,8 +269,9 @@ def _fetch_needed_rows(
         for row in conn.execute(pending_sql, (group, now, *names, needed_pending)):
             rows_by_id[int(row["delivery_id"])] = row
     if needed_stale:
-        stale_sql = _STALE_ROWS_SQL.format(targets=clause)
-        for row in conn.execute(stale_sql, (group, now, cutoff, *names, needed_stale)):
+        stale_clause, stale_names = _stale_filter(targets, excluded)
+        stale_sql = _STALE_ROWS_SQL.format(targets=stale_clause)
+        for row in conn.execute(stale_sql, (group, now, cutoff, *stale_names, needed_stale)):
             rows_by_id[int(row["delivery_id"])] = row
     return rows_by_id
 

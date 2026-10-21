@@ -1058,6 +1058,8 @@ pool_size = 10                                   # server connection pool
 poll_interval_ms = 250                           # consumer poll cadence
 reclaim_stale_seconds = 60                        # reclaim a crashed consumer's claim after 60s
 max_delivery_attempts = 5                         # dead-letter after 5 failed dispatches
+retry_backoff_base_seconds = 0.05                 # wait before the 2nd attempt, doubling per attempt
+retry_backoff_cap_seconds = 5                     # longest wait between attempts
 retention_age_seconds = 604800                   # prune terminal rows after 7 days
 ```
 

@@ -1329,6 +1329,9 @@ async def test_lease_cap_releases_rows_of_wedged_listener(engine: Any) -> None:
         targets=[target],
         poll_interval_s=0.01,
         reclaim_stale_seconds=0.1,  # cap = 10 x 0.1s = ~1s of renewal
+        # The wedged listener holds the only slot, so this consumer stops
+        # claiming and the reclaim is left to the peer.
+        dispatch_concurrency=1,
     )
     await consumer.start()
     try:
@@ -1505,6 +1508,9 @@ async def _stop_consumer_mid_listener(
         targets=[f"{WidgetCreated.__module__}.{WidgetCreated.__qualname__}"],
         poll_interval_s=0.01,
         batch_size=1,
+        # One slot, held by the hung listener, so the consumer claims nothing
+        # until the stop and never reclaims the row itself.
+        dispatch_concurrency=1,
         max_attempts=3,
         reclaim_stale_seconds=reclaim_stale_seconds,
     )
@@ -1563,7 +1569,8 @@ async def test_graceful_stop_after_the_stuck_dispatch_threshold_still_charges_th
     peer = await DatabaseBroker(engine=engine).claim_batch(
         "modulith-inventory", batch_size=10, consumer_name="peer", reclaim_stale_seconds=0.0
     )
-    assert [row["attempts"] for row in peer] == [1]
+    assert peer == []
+    assert tuple(await _fetch_row(engine, row_id)) == ("pending", 1, None)
 
 
 async def test_release_interrupted_claims_hands_back_started_claims_it_owns(engine: Any) -> None:
@@ -1730,8 +1737,9 @@ async def test_reclaim_of_a_started_dispatch_counts_as_a_delivery_attempt(engine
     """A consumer that dies (or wedges) after handing a row to its listener
     and before ack never reaches ``fail()``, so the reclaim itself has to burn
     an attempt — otherwise the row is handed out forever with ``attempts``
-    frozen at 0 and never reaches the dead-letter cap. The charge lands once
-    per started dispatch: reclaiming again without a new start is free."""
+    frozen at 0 and never reaches the dead-letter cap. The charged row waits
+    out the failure backoff, and the charge lands once per started dispatch:
+    reclaiming again without a new start is free."""
     broker = DatabaseBroker(engine=engine)
     await broker._ensure_schema()
     await _insert_ex(engine, id="r1", status="pending")
@@ -1741,12 +1749,15 @@ async def test_reclaim_of_a_started_dispatch_counts_as_a_delivery_attempt(engine
     reclaimed = await broker.claim_batch(
         "g", batch_size=10, consumer_name="c1", reclaim_stale_seconds=0.0
     )
+    assert reclaimed == []
+    assert await _fetch_row(engine, "r1") == ("pending", 1, None)
+    await asyncio.sleep(0.1)
+    retried = await broker.claim_batch("g", batch_size=10, consumer_name="c1")
     again = await broker.claim_batch(
         "g", batch_size=10, consumer_name="c2", reclaim_stale_seconds=0.0
     )
 
-    assert [row["id"] for row in reclaimed] == ["r1"]
-    assert reclaimed[0]["attempts"] == 1
+    assert [(row["id"], row["attempts"]) for row in retried] == [("r1", 1)]
     assert [row["attempts"] for row in again] == [1]
     assert await _fetch_row(engine, "r1") == ("claimed", 1, "c2")
 
@@ -1935,7 +1946,8 @@ async def test_bootstrap_adds_dispatch_started_to_an_older_message_table(engine:
     reclaimed = await broker.claim_batch(
         "g", batch_size=10, consumer_name="c2", reclaim_stale_seconds=0.0
     )
-    assert [row["attempts"] for row in reclaimed] == [1]
+    assert reclaimed == []
+    assert await _fetch_row(engine, "old") == ("pending", 1, None)
 
 
 async def _only_dead_row_left(engine: Any) -> bool:
@@ -2592,10 +2604,10 @@ async def test_database_consumer_write_failures_recover_independently(engine: An
             *,
             consumer_name: str,
             max_attempts: int,
-        ) -> None:
+        ) -> bool:
             if "fail" in self.failures:
                 raise RuntimeError("fail unavailable")
-            await super().fail(
+            return await super().fail(
                 row_id,
                 error,
                 consumer_name=consumer_name,
@@ -2708,7 +2720,7 @@ async def test_database_consumer_completion_failure_clears_after_reclaim_window(
             *,
             consumer_name: str,
             max_attempts: int,
-        ) -> None:
+        ) -> bool:
             raise RuntimeError("server closed the connection unexpectedly")
 
     async def handler(_event: WidgetCreated) -> None:
@@ -3190,6 +3202,39 @@ def test_register_broker_reads_policy_options(make_fake_app: Any) -> None:
     assert broker._orphan_replay_policy == "first_groups"
     assert broker._orphan_retention_seconds == 90.0
     assert broker._expected_consumer_groups == expected_groups
+
+
+def test_register_broker_reads_retry_backoff_options_and_environment(
+    make_fake_app: Any, monkeypatch: Any
+) -> None:
+    make_fake_app({"orders": ""})
+    from modulith import configure
+
+    monkeypatch.setenv("MODULITH_BROKER_RETRY_BACKOFF_CAP_SECONDS", "40")
+    configure(
+        package="fakeapp",
+        broker="database",
+        broker_options={
+            "url": "sqlite+aiosqlite:///:memory:",
+            "retry_backoff_base_seconds": 2.5,
+            "retry_backoff_cap_seconds": 30,
+        },
+    )
+    _runtime.ensure_bootstrapped()
+
+    assert _runtime.broker_registry is not None
+    broker = _runtime.broker_registry.get("database")
+    assert isinstance(broker, DatabaseBroker)
+    assert (broker._retry_backoff_base_s, broker._retry_backoff_cap_s) == (2.5, 40.0)
+
+
+def test_database_broker_rejects_a_retry_backoff_base_above_its_cap() -> None:
+    with pytest.raises(ConfigurationError, match="must not exceed"):
+        DatabaseBroker(
+            "sqlite+aiosqlite:///:memory:",
+            retry_backoff_base_seconds=10,
+            retry_backoff_cap_seconds=5,
+        )
 
 
 def test_policy_env_options_override_broker_options(make_fake_app: Any, monkeypatch: Any) -> None:
@@ -4465,7 +4510,7 @@ async def test_fail_on_terminal_dead_row_is_noop(engine: Any) -> None:
     await broker._ensure_schema()
     await _insert_ex(engine, id="r1", status="dead", attempts=5, claimed_by=None)
 
-    await broker.fail("r1", "late failure", consumer_name="c1", max_attempts=5)
+    assert await broker.fail("r1", "late failure", consumer_name="c1", max_attempts=5) is False
 
     assert await _fetch_row(engine, "r1") == ("dead", 5, None)  # unchanged
 
@@ -4477,7 +4522,7 @@ async def test_fail_on_row_owned_by_peer_is_noop(engine: Any) -> None:
     await broker._ensure_schema()
     await _insert_ex(engine, id="r1", status="claimed", attempts=0, claimed_by="c2")
 
-    await broker.fail("r1", "late failure", consumer_name="c1", max_attempts=5)
+    assert await broker.fail("r1", "late failure", consumer_name="c1", max_attempts=5) is False
 
     assert await _fetch_row(engine, "r1") == ("claimed", 0, "c2")  # still c2's
 
@@ -4490,13 +4535,29 @@ async def test_fail_derives_attempts_from_db_not_caller(engine: Any) -> None:
     await _insert_ex(engine, id="below", status="claimed", attempts=3, claimed_by="c1")
     await _insert_ex(engine, id="atcap", status="claimed", attempts=4, claimed_by="c1")
 
-    await broker.fail("below", "boom", consumer_name="c1", max_attempts=5)
-    await broker.fail("atcap", "boom", consumer_name="c1", max_attempts=5)
+    assert await broker.fail("below", "boom", consumer_name="c1", max_attempts=5) is True
+    assert await broker.fail("atcap", "boom", consumer_name="c1", max_attempts=5) is True
 
     below = await _fetch_row(engine, "below")
     atcap = await _fetch_row(engine, "atcap")
     assert below[0] == "pending" and below[1] == 4 and below[2] is None
     assert atcap[0] == "dead" and atcap[1] == 5 and atcap[2] is None  # 4+1 hits cap
+
+
+async def test_claim_leaves_the_stale_claims_of_rows_its_caller_still_runs(engine: Any) -> None:
+    """A consumer's claim skips the lapsed claim of a row its listener still runs,
+    so it never starts a second copy of it, and reclaims the other stale claims."""
+    broker = DatabaseBroker(engine=engine)
+    await broker._ensure_schema()
+    await _insert_ex(engine, id="running", status="claimed", claimed_by="c0", dispatch_started=True)
+    await _insert_ex(engine, id="orphan", status="claimed", claimed_by="c9")
+
+    rows = await broker.claim_batch(
+        "g", batch_size=10, consumer_name="c0", reclaim_stale_seconds=0.0, exclude_ids=["running"]
+    )
+
+    assert [row["id"] for row in rows] == ["orphan"]
+    assert await _fetch_row(engine, "running") == ("claimed", 0, "c0")
 
 
 async def test_ack_on_terminal_dead_row_is_noop_delete_mode(engine: Any) -> None:

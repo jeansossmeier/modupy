@@ -6,6 +6,7 @@ import asyncio
 import logging
 import sqlite3
 import struct
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Any, cast
 import pytest
 
 from modulith import ConfigurationError, ConsumerSpec, configure, event
+from modulith.adapters._delivery_dispatch import _Admission
 from modulith.adapters._shm_ring import _HEADER_SIZE, _SLOT_SIZE
 from modulith.adapters.shm_broker import ShmBroker, ShmConsumer
 from modulith.event_bus import InMemoryEventBus
@@ -127,10 +129,10 @@ class _CompletionFlakyBroker(ShmBroker):
         *,
         consumer_name: str,
         max_attempts: int,
-    ) -> None:
+    ) -> bool:
         if "fail" in self.failures:
             raise RuntimeError("fail unavailable")
-        await super().fail(
+        return await super().fail(
             row_id,
             error,
             consumer_name=consumer_name,
@@ -163,6 +165,14 @@ class _AckOnceBroker(ShmBroker):
             self.ack_failed.set()
             raise RuntimeError("ack temporarily unavailable")
         await super().ack(row_id, consumer_name=consumer_name)
+
+
+def _in_flight(*row_ids: str, started: bool = False) -> dict[str, _Admission]:
+    now = time.monotonic()
+    return {
+        row_id: _Admission({"id": row_id, "target": TARGET}, now, now if started else None)
+        for row_id in row_ids
+    }
 
 
 # Windows' default timer ticks every ~15.6 ms, so a 1-2 ms heartbeat sleep can
@@ -229,6 +239,7 @@ class _PublishAfterEmptyClaimBroker(ShmBroker):
         reclaim_stale_seconds: float = 60.0,
         max_attempts: int | None = None,
         targets: list[str] | tuple[str, ...] | None = None,
+        exclude_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         rows = await super().claim_batch(
             group,
@@ -237,6 +248,7 @@ class _PublishAfterEmptyClaimBroker(ShmBroker):
             reclaim_stale_seconds=reclaim_stale_seconds,
             max_attempts=max_attempts,
             targets=targets,
+            exclude_ids=exclude_ids,
         )
         if rows or not self._publications:
             return rows
@@ -595,7 +607,9 @@ async def test_dispatch_batch_bounds_malformed_id_logs_and_delivers_valid_row(
     assert 1 <= len(malformed_logs) < len(malformed_rows)
 
 
-async def test_listener_failure_retries_then_dead_letters(broker: ShmBroker) -> None:
+async def test_listener_failure_retries_then_dead_letters(
+    broker: ShmBroker, caplog: pytest.LogCaptureFixture
+) -> None:
     calls = 0
 
     async def fail(_item: ConsumerEvent) -> None:
@@ -619,6 +633,70 @@ async def test_listener_failure_retries_then_dead_letters(broker: ShmBroker) -> 
         assert calls == 2
     finally:
         await consumer.stop()
+
+    errors = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and "dead-lettered" in r.getMessage()
+    ]
+    assert len(errors) == 1
+    assert errors[0].endswith(
+        f"of {EVENT_TYPE} on {TARGET} for group {GROUP} dead-lettered after 2 attempt(s): "
+        "listener failed"
+    )
+
+
+async def test_a_cancelled_last_attempt_is_logged_as_a_dead_letter(
+    broker: ShmBroker, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def cancel(_item: ConsumerEvent) -> None:
+        raise asyncio.CancelledError
+
+    bus = InMemoryEventBus()
+    bus.register(ConsumerEvent, cancel)
+    serializer = JsonEventSerializer(allowed_event_types=[ConsumerEvent])
+    consumer = _consumer(broker, bus, serializer, max_attempts=1)
+    await broker.subscribe([TARGET], GROUP)
+    await broker.publish(
+        TARGET, serializer.serialize(ConsumerEvent("cancel")), {"event_type": EVENT_TYPE}
+    )
+    row = (await broker.claim_batch(GROUP, batch_size=1, consumer_name="worker-1"))[0]
+
+    await consumer._dispatch_one(row)
+
+    errors = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and "dead-lettered" in r.getMessage()
+    ]
+    assert _delivery_state(broker) == [("dead", 1)]
+    assert len(errors) == 1
+    assert errors[0].endswith("dead-lettered after 1 attempt(s): listener cancelled")
+
+
+async def test_a_last_attempt_failing_after_a_peer_reclaimed_it_logs_no_dead_letter(
+    broker: ShmBroker, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def boom(_item: ConsumerEvent) -> None:
+        raise RuntimeError("listener failed")
+
+    bus = InMemoryEventBus()
+    bus.register(ConsumerEvent, boom)
+    serializer = JsonEventSerializer(allowed_event_types=[ConsumerEvent])
+    consumer = _consumer(broker, bus, serializer, max_attempts=1)
+    await broker.subscribe([TARGET], GROUP)
+    await broker.publish(
+        TARGET, serializer.serialize(ConsumerEvent("late")), {"event_type": EVENT_TYPE}
+    )
+    row = (await broker.claim_batch(GROUP, batch_size=1, consumer_name="worker-1"))[0]
+    assert await broker.claim_batch(
+        GROUP, batch_size=1, consumer_name="worker-2", reclaim_stale_seconds=0.0
+    )
+
+    await consumer._dispatch_one(row)
+
+    assert _delivery_state(broker) == [("claimed", 0)]
+    assert not [r for r in caplog.records if "dead-lettered" in r.getMessage()]
 
 
 async def test_listener_cancelled_error_is_a_delivery_failure(broker: ShmBroker) -> None:
@@ -647,12 +725,14 @@ async def test_stopping_consumer_skips_claim_without_completing_it(broker: ShmBr
     await broker.subscribe([TARGET], GROUP)
     await broker.publish(TARGET, b"payload", {"event_type": EVENT_TYPE})
     row = (await broker.claim_batch(GROUP, batch_size=1, consumer_name="worker-1"))[0]
-    in_flight = {row["id"]}
+    admission = _Admission(row, time.monotonic())
+    in_flight = {row["id"]: admission}
     consumer._stopping = True
 
-    assert await consumer._dispatch_guarded(row, asyncio.Semaphore(1), in_flight) is True
+    await consumer._dispatch_guarded(admission, in_flight)
 
-    assert in_flight == set()
+    assert not admission.dispatch_started
+    assert in_flight == {}
     assert await broker.renew_claims([row["id"]], consumer_name="worker-1") == 1
 
 
@@ -697,6 +777,75 @@ async def test_stop_mid_batch_hands_the_deliveries_it_never_started_to_a_peer_at
     assert [row["attempts"] for row in peer] == [0, 0]
 
 
+async def test_a_listener_past_the_renew_deadline_is_not_reclaimed_by_its_own_consumer(
+    broker: ShmBroker,
+) -> None:
+    runs: list[str] = []
+
+    async def slow(item: ConsumerEvent) -> None:
+        runs.append(item.name)
+        await asyncio.sleep(1.5)
+
+    bus = InMemoryEventBus()
+    bus.register(ConsumerEvent, slow)
+    serializer = JsonEventSerializer(allowed_event_types=[ConsumerEvent])
+    # The renew deadline is 10 x 0.05 s, so the claim lapses while the listener
+    # runs; the free slot keeps the consumer claiming.
+    consumer = _consumer(
+        broker, bus, serializer, dispatch_concurrency=2, reclaim_stale_seconds=0.05
+    )
+    await broker.subscribe([TARGET], GROUP)
+    await broker.publish(
+        TARGET, serializer.serialize(ConsumerEvent("slow")), {"event_type": EVENT_TYPE}
+    )
+
+    await consumer.start()
+    try:
+        await _until(lambda: _delivery_state(broker) == [] or len(runs) > 1)
+    finally:
+        await consumer.stop()
+
+    assert runs == ["slow"]
+    assert _delivery_state(broker) == []
+
+
+async def test_stop_that_cancels_a_listener_hands_the_deliveries_queued_behind_it_to_a_peer(
+    broker: ShmBroker,
+) -> None:
+    running = asyncio.Event()
+    started: list[str] = []
+
+    async def handler(item: ConsumerEvent) -> None:
+        started.append(item.name)
+        running.set()
+        await asyncio.sleep(3600)
+
+    bus = InMemoryEventBus()
+    bus.register(ConsumerEvent, handler)
+    serializer = JsonEventSerializer(allowed_event_types=[ConsumerEvent])
+    consumer = _consumer(broker, bus, serializer, dispatch_concurrency=1)
+    consumer._stop_drain_grace_s = 0.05
+    await broker.subscribe([TARGET], GROUP)
+    for name in ("a", "b", "c"):
+        await broker.publish(
+            TARGET, serializer.serialize(ConsumerEvent(name)), {"event_type": EVENT_TYPE}
+        )
+
+    await consumer.start()
+    try:
+        await asyncio.wait_for(running.wait(), timeout=5.0)
+    finally:
+        await consumer.stop()
+
+    peer = await broker.claim_batch(
+        GROUP, batch_size=10, consumer_name="worker-2", reclaim_stale_seconds=3600.0
+    )
+    released = [serializer.deserialize(row["payload"], row["event_type"]).name for row in peer]
+    assert len(started) == 1
+    assert sorted(released) == ["a", "b", "c"]
+    assert [row["attempts"] for row in peer] == [0, 0, 0]
+
+
 async def _stop_consumer_mid_listener(
     broker: ShmBroker, *, consumer_name: str, reclaim_stale_seconds: float, run_s: float
 ) -> None:
@@ -715,6 +864,9 @@ async def _stop_consumer_mid_listener(
         JsonEventSerializer(allowed_event_types=[ConsumerEvent]),
         consumer_name=consumer_name,
         batch_size=1,
+        # One slot, held by the hung listener, so the consumer claims nothing
+        # until the stop and never reclaims the row itself.
+        dispatch_concurrency=1,
         max_attempts=3,
         reclaim_stale_seconds=reclaim_stale_seconds,
     )
@@ -768,7 +920,8 @@ async def test_graceful_stop_after_the_stuck_dispatch_threshold_still_charges_th
     peer = await broker.claim_batch(
         GROUP, batch_size=10, consumer_name="peer", reclaim_stale_seconds=0.0
     )
-    assert [row["attempts"] for row in peer] == [1]
+    assert peer == []
+    assert _delivery_state(broker) == [("pending", 1)]
 
 
 async def test_cancelling_guarded_renewal_propagates_and_releases_in_flight(
@@ -785,23 +938,18 @@ async def test_cancelling_guarded_renewal_propagates_and_releases_in_flight(
         JsonEventSerializer(),
         reclaim_stale_seconds=_RENEW_WINDOW_S,
     )
-    in_flight = {"row-1"}
-    task = asyncio.create_task(
-        consumer._dispatch_guarded(
-            {"id": "row-1", "target": TARGET},
-            asyncio.Semaphore(1),
-            in_flight,
-        )
-    )
+    in_flight = _in_flight("row-1")
+    task = asyncio.create_task(consumer._dispatch_guarded(in_flight["row-1"], in_flight))
     renew_loop: asyncio.Task[None] | None = None
     try:
         await asyncio.wait_for(instance.renew_started.wait(), timeout=1.0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert in_flight == set()
+        assert in_flight == {}
+        assert consumer._gate.running == set()
 
-        renew_loop = asyncio.create_task(consumer._renew_loop({"row-2"}))
+        renew_loop = asyncio.create_task(consumer._renew_loop(_in_flight("row-2")))
         await _until(lambda: instance.renew_calls >= 2, timeout=1.0)
         renew_loop.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -829,7 +977,7 @@ async def test_renew_loop_retries_exception_warns_on_partial_and_stops_when_empt
         JsonEventSerializer(),
         reclaim_stale_seconds=_RENEW_WINDOW_S,
     )
-    in_flight = {"row-1"}
+    in_flight = _in_flight("row-1")
     task = asyncio.create_task(consumer._renew_loop(in_flight))
     try:
         await _until(lambda: instance.renew_calls >= 2, timeout=1.0)
@@ -856,12 +1004,22 @@ async def test_renew_loop_stops_extending_a_claim_at_heartbeat_deadline(
         JsonEventSerializer(),
         reclaim_stale_seconds=_RENEW_WINDOW_S,
     )
-    in_flight = {"row-1"}
+    in_flight = _in_flight("row-1", started=True)
+    task = asyncio.create_task(consumer._renew_loop(in_flight))
     try:
-        await asyncio.wait_for(consumer._renew_loop(in_flight), timeout=1.0)
-        assert in_flight == {"row-1"}
-        assert instance.renew_calls > 0
+        # Past the 10 x _RENEW_WINDOW_S deadline, measured from the row's start.
+        await asyncio.sleep(_RENEW_WINDOW_S * 10 + 0.2)
+        calls = instance.renew_calls
+        assert calls > 0
+        await asyncio.sleep(_RENEW_WINDOW_S * 5)
+        assert instance.renew_calls == calls
+        assert not task.done(), "the loop runs until its rows leave in_flight"
+        in_flight.clear()
+        await asyncio.wait_for(task, timeout=1.0)
     finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await _close_test_broker(instance)
 
 
@@ -900,7 +1058,8 @@ async def test_row_reclaimed_while_waiting_on_semaphore_is_not_dispatched(
             consumer_name="worker-2",
             reclaim_stale_seconds=0,
         )
-        assert len(reclaimed) == 2
+        # The started first row is charged and waits out its failure backoff.
+        assert [row["message_id"] for row in reclaimed] == [rows[1]["message_id"]]
         release_first.set()
         await asyncio.wait_for(dispatch, timeout=1.0)
     finally:
@@ -1078,7 +1237,7 @@ async def test_background_renewal_failure_degrades_health_until_recovery(
         await consumer.start()
         await instance.publish(TARGET, b"{}", {"event_type": EVENT_TYPE})
         row = (await instance.claim_batch(GROUP, batch_size=1, consumer_name="worker-1"))[0]
-        in_flight = {row["id"]}
+        in_flight = {row["id"]: _Admission(row, time.monotonic())}
 
         instance.fail_renewals = True
         renew_task = asyncio.create_task(consumer._renew_loop(in_flight))

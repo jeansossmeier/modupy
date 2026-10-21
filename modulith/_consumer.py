@@ -16,7 +16,10 @@ streams for exactly the event types that module's local listeners consume
   * ``reclaim`` — runs at startup AND periodically on every poll cycle:
     XAUTOCLAIM redelivers messages left pending (claimed but never ACK'd)
     longer than ``reclaim_min_idle_ms``, whether the claiming peer crashed or
-    is merely slow. Reclaim is purely idle-time based — it has NO
+    is merely slow. A broker offering ``pending_entries`` and
+    ``claim_pending`` (Redis Streams) has each entry claimed just before it
+    is dispatched, once it has also sat out the failure backoff for its
+    delivery count (see ``_reclaim``). Reclaim is purely idle-time based — it has NO
     crash/liveness detection — so a healthy peer whose single listener call
     takes longer than ``reclaim_min_idle_ms`` has its in-flight message claimed
     away and double-dispatched. Keep ``reclaim_min_idle_ms`` (default 60s)
@@ -47,15 +50,24 @@ be an infinite loop.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import math
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ._health_failures import HealthFailures
 from ._shutdown import DEFAULT_STOP_TIMEOUT_S, cancel_and_wait
+from .adapters._consumer_protocol import log_dead_letter
 from .brokers import _split_broker_target
-from .config import ConfigurationError
+from .config import (
+    DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+    DEFAULT_RETRY_BACKOFF_CAP_SECONDS,
+    ConfigurationError,
+    retry_backoff_s,
+)
 from .manifest import get_manifest
 from .protocols import ConsumerHealth
 from .runtime import _PUBLISHER_MODULE_HEADER, _runtime
@@ -80,6 +92,13 @@ _BACKOFF_MAX_EXPONENT = 7
 # Health turns degraded when a read round stays pending this many block
 # intervals (plus one second of slack for round-trip time).
 _READ_STALL_POLL_INTERVALS = 5
+# 2.0**1024 overflows a float.
+# Redis cannot tell whether a pending entry's listener raised, crashed the
+# worker or never started, so the reclaim logs name every possibility.
+_RECLAIMED = (
+    "reclaimed without completing "
+    "(its listener failed, or its consumer crashed or wedged mid-dispatch)"
+)
 
 
 def _as_str(value: Any) -> str:
@@ -89,6 +108,13 @@ def _as_str(value: Any) -> str:
 
 def _optional_str(value: Any) -> str | None:
     return None if value is None else _as_str(value)
+
+
+def _event_type_label(fields: dict[bytes, bytes]) -> str:
+    raw = fields.get(b"h:event_type")
+    if raw is None:
+        return "<unknown event>"
+    return raw.decode(errors="replace") if isinstance(raw, bytes) else str(raw)
 
 
 def _loaded_class(name: str) -> type | None:
@@ -140,6 +166,8 @@ class BrokerConsumer:
         poll_block_ms: int = 1000,
         reclaim_min_idle_ms: int = 60_000,
         max_delivery_attempts: int = _MAX_DELIVERY_ATTEMPTS,
+        retry_backoff_base_seconds: float = DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+        retry_backoff_cap_seconds: float = DEFAULT_RETRY_BACKOFF_CAP_SECONDS,
     ) -> None:
         self._broker = broker
         self._bus = bus
@@ -159,6 +187,8 @@ class BrokerConsumer:
         self._poll_block_ms = poll_block_ms
         self._reclaim_min_idle_ms = reclaim_min_idle_ms
         self._max_delivery_attempts = max_delivery_attempts
+        self._retry_backoff_base_s = retry_backoff_base_seconds
+        self._retry_backoff_cap_s = retry_backoff_cap_seconds
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
         self._health = ConsumerHealth(ready=False, status="stopped")
@@ -413,32 +443,108 @@ class BrokerConsumer:
         return messages
 
     async def _reclaim(self, target: str) -> None:
-        """Recover and re-dispatch pending messages idle past the threshold."""
-        try:
-            result = await self._broker.reclaim(
-                target,
-                consumer=self._consumer_name,
-                group=self._group,
-                min_idle_ms=self._reclaim_min_idle_ms,
+        """Recover and re-dispatch pending messages idle past the threshold.
+
+        A broker offering ``pending_entries`` (Redis Streams) lists the idle
+        entries without claiming them. Each is claimed with ``claim_pending``
+        just before its dispatch, and only once it has been idle for
+        ``reclaim_min_idle_ms`` plus the failure backoff for its delivery
+        count. A claim raises that count, so when an entry's listener kills
+        the worker, the entries listed after it keep theirs, and each later
+        crash charges only the entry that causes it. A broker with only
+        ``reclaim`` hands over its whole idle backlog, and charges it, at once.
+        """
+        claims: list[Callable[[], Awaitable[Any]]] = []
+        pending_entries = getattr(self._broker, "pending_entries", None)
+        if not callable(pending_entries):
+            claims.append(
+                functools.partial(
+                    self._broker.reclaim,
+                    target,
+                    consumer=self._consumer_name,
+                    group=self._group,
+                    min_idle_ms=self._reclaim_min_idle_ms,
+                )
             )
+        else:
+            listed = await self._reclaim_call(
+                target,
+                functools.partial(
+                    pending_entries,
+                    target,
+                    group=self._group,
+                    min_idle_ms=self._reclaim_min_idle_ms,
+                ),
+            )
+            for message_id, idle_ms, deliveries in listed or ():
+                min_idle_ms = self._reclaim_min_idle_ms + self._retry_backoff_ms(deliveries)
+                if idle_ms >= min_idle_ms:
+                    claims.append(
+                        functools.partial(
+                            self._broker.claim_pending,
+                            target,
+                            message_id,
+                            consumer=self._consumer_name,
+                            group=self._group,
+                            min_idle_ms=min_idle_ms,
+                        )
+                    )
+        lost: list[str] = []
+        nil_entries = 0
+        try:
+            for claim in claims:
+                if self._stopping:
+                    break
+                result = await self._reclaim_call(target, claim)
+                if result is None:
+                    break
+                # XAUTOCLAIM returns (cursor, [(id, fields), ...], deleted_ids).
+                # ``deleted_ids`` are messages that were still pending (delivered
+                # but never ACK'd) yet no longer exist in the stream — MAXLEN
+                # trimmed them out from under the PEL. They are PERMANENTLY LOST
+                # (at-least-once is violated for them), so surface the loss loudly
+                # instead of silently discarding the tuple element.
+                claimed = result[1] if len(result) > 1 else []
+                lost.extend(_as_str(d) for d in (result[2] if len(result) > 2 else []))
+                nil_entries += await self._dispatch_claimed(target, claimed)
+        finally:
+            # Redis 7 has already dropped a deleted id from the pending list, so
+            # it is reported even when a dispatch takes the worker down.
+            if lost:
+                self._report_lost(target, lost)
+        if nil_entries:
+            await self._purge_trimmed_pending(target, nil_entries)
+
+    async def _reclaim_call(self, target: str, call: Callable[[], Awaitable[Any]]) -> Any:
+        """One broker call of a reclaim, or None when it failed (already handled)."""
+        try:
+            result = await call()
         except Exception as exc:
             self._mark_broker_failure("reclaim", target, exc)
             logger.exception("reclaim failed for %s", target)
             await self._recover_after_broker_failure(target, exc)
-            return
+            return None
         self._consecutive_failures = 0
         self._mark_broker_recovered("reclaim", target)
-        # XAUTOCLAIM returns (cursor, [(id, fields), ...], deleted_ids).
-        # ``deleted_ids`` are messages that were still pending (delivered but
-        # never ACK'd) yet no longer exist in the stream — MAXLEN trimmed them
-        # out from under the PEL. They are PERMANENTLY LOST (at-least-once is
-        # violated for them), so surface the loss loudly instead of silently
-        # discarding the tuple element.
-        claimed = result[1] if result and len(result) > 1 else []
-        deleted = result[2] if result and len(result) > 2 else []
-        if deleted:
-            self._report_lost(target, [_as_str(d) for d in deleted])
-        await self._dispatch_claimed(target, claimed)
+        return result
+
+    def _retry_backoff_ms(self, deliveries: int) -> int:
+        """The failure backoff an entry delivered ``deliveries`` times sits out
+        past ``reclaim_min_idle_ms``: ``retry_backoff_base_seconds`` x
+        2^(deliveries-1), capped by ``retry_backoff_cap_seconds``, as the polling
+        brokers wait before redelivering a failed delivery.
+
+        Zero for an entry its consumer read but never started (``read`` leaves
+        it at 0 deliveries), and once the entry has had
+        ``max_delivery_attempts`` deliveries: its reclaim dead-letters it
+        without running it.
+        """
+        if deliveries < 1 or deliveries >= self._max_delivery_attempts:
+            return 0
+        backoff_s = retry_backoff_s(
+            deliveries, self._retry_backoff_base_s, self._retry_backoff_cap_s
+        )
+        return math.ceil(backoff_s * 1000)
 
     def _report_lost(self, target: str, lost_ids: list[str]) -> None:
         logger.error(
@@ -452,16 +558,16 @@ class BrokerConsumer:
         for lost in lost_ids:
             self._attempts.pop((target, lost), None)
 
-    async def _dispatch_claimed(self, target: str, claimed: Any) -> None:
-        """Dispatch reclaimed entries, skipping nil rows.
+    async def _dispatch_claimed(self, target: str, claimed: Any) -> int:
+        """Dispatch reclaimed entries, skipping nil rows; return how many were nil.
 
         XAUTOCLAIM on Redis < 7.0 returns nil, without the id, for a pending
         entry that was deleted from the stream and leaves it pending (7.0+
         moves these to the ``deleted`` reply element and drops them). There is
         nothing to dispatch for a nil row, and it must not kill the consumer
-        task, so it is skipped and the broker is asked to acknowledge whatever
-        pending entry it can confirm is gone, which is then reported like a
-        Redis 7 deleted id.
+        task, so it is skipped; once the reclaim is done, the broker is asked
+        to acknowledge whatever pending entry it can confirm is gone, which is
+        then reported like a Redis 7 deleted id.
         """
         nil_entries = 0
         first = True
@@ -477,8 +583,7 @@ class BrokerConsumer:
                 target, message_id, fields, renew=not first, reclaimed=True
             )
             first = False
-        if nil_entries:
-            await self._purge_trimmed_pending(target, nil_entries)
+        return nil_entries
 
     async def _purge_trimmed_pending(self, target: str, nil_entries: int) -> None:
         purge = getattr(self._broker, "purge_trimmed_pending", None)
@@ -607,6 +712,11 @@ class BrokerConsumer:
         The durable count already includes the reclaim handing the entry over
         now, so a count above the cap means the listener has had
         ``max_delivery_attempts`` deliveries and this one would be an extra.
+        A count of 1 is an entry its consumer read but never started, now on
+        its first delivery, which logs nothing. Any other redelivery logs a
+        WARNING and a dead letter an ERROR, worded like the polling brokers'
+        charged reclaims (``log_charged_reclaim`` in
+        ``adapters/_consumer_protocol.py``).
 
         Also True when the durable count cannot be read or the entry has left
         the pending list: it then stays as it is, since dispatching an entry
@@ -618,13 +728,28 @@ class BrokerConsumer:
         attempts = await self._failed_delivery_attempts(target, mid, (target, mid))
         if attempts is None:
             return True
-        if attempts <= self._max_delivery_attempts:
+        if attempts == 1:
             return False
-        logger.error(
-            "message %s on %s was delivered %d times without completing — dead-lettering",
-            mid,
-            target,
-            self._max_delivery_attempts,
+        if attempts <= self._max_delivery_attempts:
+            logger.warning(
+                "delivery %s of %s on %s for group %s %s; redelivered alone as delivery %d of %d",
+                mid,
+                _event_type_label(fields),
+                target,
+                self._group,
+                _RECLAIMED,
+                attempts,
+                self._max_delivery_attempts,
+            )
+            return False
+        log_dead_letter(
+            logger,
+            row_id=mid,
+            event_type=_event_type_label(fields),
+            target=target,
+            group=self._group,
+            attempts=attempts - 1,
+            reason=_RECLAIMED,
         )
         await self._dead_letter(target, mid, fields)
         return True

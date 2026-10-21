@@ -621,6 +621,9 @@ class StatefulFakeRedis:
         RESETS the idle clock; pending ids no longer present in the stream
         (trimmed/XDEL'd while pending) are reported via the third (deleted)
         tuple element and purged from the PEL;
+      * XPENDING's range form takes ``(``-prefixed exclusive bounds and the
+        ``IDLE`` filter; ``eval`` runs ``claim_pending``'s script as well as
+        ``renew_claim``'s, replying with raw nested lists as Lua does;
       * a consumer exists in its group from the first XREADGROUP or XAUTOCLAIM
         naming it (even one that finds nothing) until XGROUP DELCONSUMER, which
         also drops that consumer's pending entries from the PEL — the data loss
@@ -763,14 +766,20 @@ class StatefulFakeRedis:
         max: str | bytes,
         count: int,
         consumername: str | None = None,
+        idle: int | None = None,
     ) -> list[dict[str, Any]]:
-        """XPENDING over ``min``..``max`` (ids or ``-``/``+``), oldest first, at most ``count``."""
+        """XPENDING over ``min``..``max`` (ids, ``(id`` exclusive, or ``-``/``+``),
+        oldest first, at most ``count``, only entries idle at least ``idle`` ms."""
 
         def seq(bound: str | bytes) -> int:
-            return int((bound.decode() if isinstance(bound, bytes) else bound).split("-")[0])
+            text = bound.decode() if isinstance(bound, bytes) else bound
+            return int(text.removeprefix("(").split("-")[0])
 
-        low = 0 if min in ("-", b"-") else seq(min)
-        high = float("inf") if max in ("+", b"+") else seq(max)
+        def exclusive(bound: str | bytes) -> int:
+            return int((bound.decode() if isinstance(bound, bytes) else bound).startswith("("))
+
+        low = 0 if min in ("-", b"-") else seq(min) + exclusive(min)
+        high = float("inf") if max in ("+", b"+") else seq(max) - exclusive(max)
         pel = self.groups[(name, groupname)]["pel"]
         return [
             {
@@ -782,6 +791,7 @@ class StatefulFakeRedis:
             for mid, entry in sorted(pel.items(), key=lambda item: seq(item[0]))
             if low <= seq(mid) <= high
             and (consumername is None or entry["consumer"] == consumername)
+            and (idle is None or self.now_ms - entry["delivered_ms"] >= idle)
         ][:count]
 
     async def xgroup_delconsumer(self, name: str, groupname: str, consumername: str) -> int:
@@ -793,21 +803,50 @@ class StatefulFakeRedis:
         self.consumers.get((name, groupname), set()).discard(consumername)
         return len(owned)
 
-    async def eval(self, script: str, numkeys: int, *keys_and_args: Any) -> int:
-        """Run the ownership-renewal script: the one Lua script this fake models.
+    async def eval(self, script: str, numkeys: int, *keys_and_args: Any) -> Any:
+        """Run the ownership-renewal, the read's reset or the single-entry claim script.
 
-        Returns 1 and resets the idle clock when the entry is pending for the
-        named consumer, else 0 (pending for a peer, or not pending at all).
+        Renewal returns 1, resets the idle clock and raises a delivery count of
+        0 to 1 when the entry is pending for the named consumer, else 0
+        (pending for a peer, or not pending at all). The reset sets the count
+        of each named entry the consumer owns to 0.
         """
+        if "XAUTOCLAIM" in script:
+            return await self._claim_one(*keys_and_args)
         assert "XCLAIM" in script and "XPENDING" in script, "fake only models renew_claim"
-        (stream, group, mid, consumer) = (
-            a.decode() if isinstance(a, bytes) else str(a) for a in keys_and_args
-        )
+        args = [a.decode() if isinstance(a, bytes) else str(a) for a in keys_and_args]
+        if "for i" in script:
+            stream, group, consumer, *mids = args
+            pel = self.groups[(stream, group)]["pel"]
+            for mid in mids:
+                entry = pel.get(mid.encode())
+                if entry is not None and entry["consumer"] == consumer:
+                    entry["delivered_ms"] = self.now_ms
+                    self.times_delivered[(stream, group, mid.encode())] = 0
+            return 1
+        stream, group, mid, consumer = args
         entry = self.groups[(stream, group)]["pel"].get(mid.encode())
         if entry is None or entry["consumer"] != consumer:
             return 0
         entry["delivered_ms"] = self.now_ms
+        key = (stream, group, mid.encode())
+        self.times_delivered[key] = max(self.times_delivered.get(key, 1), 1)
         return 1
+
+    async def _claim_one(self, *keys_and_args: Any) -> list[Any]:
+        """XPENDING IDLE on one id, then XAUTOCLAIM COUNT 1 from it, as raw Lua lists."""
+        stream, group, consumer, min_idle, mid = (
+            a.decode() if isinstance(a, bytes) else str(a) for a in keys_and_args
+        )
+        if not await self.xpending_range(stream, group, mid, mid, 1, idle=int(min_idle)):
+            return [b"0-0", [], []]
+        cursor, claimed, deleted = await self.xautoclaim(
+            stream, group, consumer, int(min_idle), start_id=mid, count=1
+        )
+        rows = [
+            [cid, [part for pair in fields.items() for part in pair]] for cid, fields in claimed
+        ]
+        return [cursor, rows, deleted]
 
     async def aclose(self) -> None:
         self.closed = True
@@ -1080,6 +1119,86 @@ async def test_renew_claim_resets_idle_for_the_owner_and_refuses_a_peer(
     assert await stateful_broker.renew_claim("orders", mid, consumer="a") is False
 
 
+async def test_pending_entries_lists_every_idle_entry_page_by_page(
+    stateful_broker, stateful_fake
+) -> None:
+    await stateful_broker.ensure_group("t")
+    for n in range(5):
+        await stateful_broker.publish("t", f"m{n}".encode())
+    await stateful_broker.read("t", consumer="crashed", count=4, block_ms=1)
+    stateful_fake.advance(500)
+    await stateful_broker.read("t", consumer="live", count=10, block_ms=1)
+
+    listed = await stateful_broker.pending_entries("t", min_idle_ms=500, count=2)
+
+    # The read counts a delivery only for the first entry; the rest never started.
+    assert listed == [("1-0", 500, 1)] + [(f"{n}-0", 500, 0) for n in range(2, 5)]
+
+
+async def test_read_returns_its_batch_when_marking_it_not_started_fails(caplog) -> None:
+    class ResetFails(FakeRedis):
+        async def xreadgroup(self, *args: Any, **kwargs: Any) -> list:
+            await super().xreadgroup(*args, **kwargs)
+            return [("stream", [(b"1-0", {b"data": b"{}"}), (b"2-0", {b"data": b"{}"})])]
+
+        async def eval(self, script: str, numkeys: int, *keys_and_args: Any) -> int:
+            raise ConnectionError("connection reset")
+
+    broker = RedisStreamsBroker(
+        client=ResetFails(), stream_prefix="modulith.events", consumer_group="g"
+    )
+
+    with caplog.at_level("WARNING", logger="modulith.adapters.redis"):
+        messages = await broker.read("t", consumer="c1")
+
+    assert [mid for mid, _fields in messages[0][1]] == [b"1-0", b"2-0"]
+    assert "could not mark 1 entries read from modulith.events.t as not started" in caplog.text
+
+
+async def test_claim_pending_claims_only_the_named_entry_once_it_has_been_idle_long_enough(
+    stateful_broker, stateful_fake
+) -> None:
+    await stateful_broker.ensure_group("t")
+    for n in range(2):
+        await stateful_broker.publish("t", f"m{n}".encode())
+    await stateful_broker.read("t", consumer="crashed", count=10, block_ms=1)
+    stateful_fake.advance(100)
+
+    assert await stateful_broker.claim_pending("t", "1-0", consumer="c2", min_idle_ms=101) == (
+        b"0-0",
+        [],
+        [],
+    )
+    _cursor, claimed, deleted = await stateful_broker.claim_pending(
+        "t", "1-0", consumer="c2", min_idle_ms=100
+    )
+
+    assert claimed == [(b"1-0", {b"data": b"m0"})]
+    assert deleted == []
+    pel = stateful_fake.groups[("modulith.events.t", "g")]["pel"]
+    assert {mid: entry["consumer"] for mid, entry in pel.items()} == {
+        b"1-0": "c2",
+        b"2-0": "crashed",
+    }
+    assert stateful_fake.times_delivered[("modulith.events.t", "g", b"1-0")] == 2
+    assert stateful_fake.times_delivered[("modulith.events.t", "g", b"2-0")] == 0
+
+
+async def test_claim_pending_reports_an_entry_trimmed_from_the_stream_as_deleted(
+    stateful_broker, stateful_fake
+) -> None:
+    await stateful_broker.ensure_group("t")
+    await stateful_broker.publish("t", b"m0")
+    await stateful_broker.read("t", consumer="crashed", count=10, block_ms=1)
+    stateful_fake.streams["modulith.events.t"].clear()
+
+    assert await stateful_broker.claim_pending("t", "1-0", consumer="c2", min_idle_ms=0) == (
+        b"0-0",
+        [],
+        [b"1-0"],
+    )
+
+
 @event
 @dataclass(frozen=True)
 class ReplicaWork:
@@ -1148,7 +1267,7 @@ async def test_peer_reclaim_mid_batch_does_not_double_dispatch(
         )
     else:
         await stateful_broker.read("t", consumer="crashed", count=10, block_ms=1)
-        stateful_fake.advance(1000)
+        stateful_fake.advance(1050)  # the threshold plus the 50 ms failure backoff
         await replica_a._reclaim("t")
 
     assert sorted(n for _who, n in calls) == [1, 2, 3]
@@ -1408,6 +1527,56 @@ def test_register_hook_rejects_non_numeric_max_payload_bytes_env(
     configure(package="fakeapp", broker="redis-streams")
 
     with pytest.raises(ConfigurationError, match="max_payload_bytes must be an integer"):
+        _runtime.ensure_bootstrapped()
+
+
+def test_consumer_factory_reads_the_retry_backoff_from_options_and_environment(
+    make_fake_app, monkeypatch
+) -> None:
+    make_fake_app({"orders": ""})
+    from modulith import ConsumerSpec, configure
+    from modulith.adapters.redis_broker import _make_redis_consumer
+    from modulith.runtime import _runtime
+
+    monkeypatch.setenv("MODULITH_BROKER_RETRY_BACKOFF_CAP_SECONDS", "40")
+    configure(
+        package="fakeapp",
+        broker="redis-streams",
+        broker_options={"retry_backoff_base_seconds": 2.5, "retry_backoff_cap_seconds": 30},
+    )
+    _runtime.ensure_bootstrapped()
+    registry = BrokerRegistry()
+    registry.register("redis-streams", object())  # type: ignore[arg-type]
+
+    consumer = _make_redis_consumer(
+        ConsumerSpec(
+            scheme="redis-streams",
+            module_name="orders",
+            group="modulith-orders",
+            consumer_name="orders:1",
+            targets=("t",),
+            bus=object(),
+            serializer=object(),
+            broker_registry=registry,
+        )
+    )
+
+    assert isinstance(consumer, BrokerConsumer)
+    assert (consumer._retry_backoff_base_s, consumer._retry_backoff_cap_s) == (2.5, 40.0)
+
+
+def test_register_hook_rejects_a_retry_backoff_base_above_its_cap(
+    make_fake_app, monkeypatch
+) -> None:
+    """Only the workers' consumers use the backoff; the parent still stops on it."""
+    make_fake_app({"orders": ""})
+    from modulith import configure
+    from modulith.runtime import _runtime
+
+    monkeypatch.setenv("MODULITH_BROKER_RETRY_BACKOFF_BASE_SECONDS", "10")
+    configure(package="fakeapp", broker="redis-streams")
+
+    with pytest.raises(ConfigurationError, match="must not exceed"):
         _runtime.ensure_bootstrapped()
 
 
@@ -1791,7 +1960,7 @@ async def test_integration_redis_6_2_trimmed_pending_entries_are_acked_and_repor
         read = await broker.read("t", consumer="crashed-peer", count=10, block_ms=100)
         ids = [mid for _stream, entries in read for mid, _fields in entries]
         await broker._client.xdel(stream, ids[0], ids[1])
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.1)  # past reclaim_min_idle_ms plus the 50 ms failure backoff
 
         with caplog.at_level("INFO", logger="modulith.consumer"):
             await consumer._reclaim("t")
@@ -1832,6 +2001,38 @@ async def test_integration_renew_claim_keeps_ownership_and_the_delivery_count(
 
         await broker.ack("t", mid)
         assert await broker.renew_claim("t", mid, consumer="a") is False
+    finally:
+        await redis_client.delete(stream)
+        await broker.close()
+
+
+@pytest.mark.integration
+async def test_integration_a_reclaim_charges_only_the_entries_their_consumer_started(
+    redis_url, redis_client, redis_key_prefix
+) -> None:
+    broker = RedisStreamsBroker(url=redis_url, stream_prefix=redis_key_prefix, consumer_group="g")
+    stream = f"{redis_key_prefix}.t"
+
+    async def counts() -> list[int]:
+        pending = await redis_client.xpending_range(stream, "g", min="-", max="+", count=10)
+        return [entry["times_delivered"] for entry in pending]
+
+    try:
+        await broker.ensure_group("t")
+        for n in range(3):
+            await broker.publish("t", f"m{n}".encode())
+        [(_s, entries)] = await broker.read("t", consumer="a", count=10, block_ms=1000)
+        ids = [raw_id.decode() for raw_id, _f in entries]
+        assert await counts() == [1, 0, 0]
+
+        assert await broker.renew_claim("t", ids[1], consumer="a") is True
+        assert await broker.renew_claim("t", ids[0], consumer="a") is True
+        assert await counts() == [1, 1, 0]
+
+        # "a" dies running ids[1]; a peer's reclaim hands ids[2] over as its first delivery.
+        for mid in ids:
+            await broker.claim_pending("t", mid, consumer="b", min_idle_ms=0)
+        assert await counts() == [2, 2, 1]
     finally:
         await redis_client.delete(stream)
         await broker.close()

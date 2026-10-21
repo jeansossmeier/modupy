@@ -32,9 +32,13 @@ from modulith import event
 from modulith.adapters.db_broker import (
     DatabaseBroker,
     DatabaseConsumer,
-    _backoff_delay,
     _postgres_target_lock_key,
     broker_schema,
+)
+from modulith.config import (
+    DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+    DEFAULT_RETRY_BACKOFF_CAP_SECONDS,
+    retry_backoff_s,
 )
 from modulith.event_bus import InMemoryEventBus
 from modulith.serializers import JsonEventSerializer
@@ -827,7 +831,11 @@ async def test_fail_increments_attempts_backs_off_then_dead(broker_engine: Any) 
         else row.available_at.replace(tzinfo=UTC)
     )
     # fail() stamps available_at = server now + backoff, and server now >= ref.
-    assert avail >= ref + timedelta(seconds=_backoff_delay(1))
+    assert avail >= ref + timedelta(
+        seconds=retry_backoff_s(
+            1, DEFAULT_RETRY_BACKOFF_BASE_SECONDS, DEFAULT_RETRY_BACKOFF_CAP_SECONDS
+        )
+    )
 
     # After the backoff window, reclaim and fail again -> hits the cap -> dead.
     await asyncio.sleep(0.2)

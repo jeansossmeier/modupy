@@ -735,16 +735,32 @@ with a bounded `MAXLEN`. Consuming side (`BrokerConsumer`, one per worker):
 creates the consumer group (`XGROUP CREATE`, idempotent), reads new messages
 with `XREADGROUP`, `XACK`s on success, and reclaims messages a crashed consumer
 left pending via `XAUTOCLAIM` past an idle threshold — the at-least-once
-recovery path. Messages lacking an `event_type` header, or that exhaust
+recovery path. A reclaim lists the idle entries with `XPENDING ... IDLE` and
+claims them one at a time, each just before its dispatch, with one Lua script
+that checks that entry's idle time and runs `XAUTOCLAIM ... COUNT 1` from its
+id. An entry is claimed only once it has been idle for `reclaim_min_idle_ms`
+plus the failure backoff for its delivery count (`retry_backoff_base_seconds`
+× 2^(n-1), capped by `retry_backoff_cap_seconds`, as on the polling brokers).
+A claim raises only the claimed entry's count. `XREADGROUP` counts a delivery
+for every entry it returns, but the consumer runs one listener at a time, so
+`read` sets the count of every entry after the first back to 0 (`XCLAIM ...
+RETRYCOUNT 0 JUSTID`, in a Lua script that skips an entry a peer has claimed),
+and `renew_claim`, just before the entry runs, raises a 0 to 1. So when an
+entry kills the worker, the entries read with it are reclaimed as their first
+delivery, uncharged and unlogged, and each crash charges only the entry that
+caused it. Each charged claim logs a WARNING and a dead letter by reclaim
+an ERROR, worded like the polling brokers' `log_charged_reclaim`. As there,
+this holds per consumer: another module's consumer in the same worker is
+still charged by its crashes. Messages lacking an `event_type` header, or that exhaust
 handling, go to a bounded dead-letter stream. Exhaustion is counted on Redis's
-own delivery count for the entry (`XPENDING`'s times-delivered, raised by the
-first read and by each `XAUTOCLAIM`). The consumer checks it before it
+own delivery count for the entry (`XPENDING`'s times-delivered: 1 once the
+consumer starts the entry, raised by each `XAUTOCLAIM`). The consumer checks it before it
 dispatches a reclaimed entry and dead-letters one that has already had
 `max_delivery_attempts` deliveries (a count above the cap, since it includes
 the reclaim in hand) without running its listener, since a listener that
 kills the worker never reports a failure. A listener that raises is still
 judged by the failure path after its `max_delivery_attempts`-th run. The ownership renewal before each
-later entry of a batch (`XCLAIM ... JUSTID`) leaves the count alone, so
+later entry of a read batch (`XCLAIM ... JUSTID`) leaves the count alone, so
 waiting behind slower siblings spends none of the budget. Three details carry the
 at-least-once guarantee here. A message is never `XACK`ed without a successful
 dispatch. `XAUTOCLAIM`'s third reply element lists pending ids a `MAXLEN` trim
@@ -804,7 +820,9 @@ marks it `done` (`"mark"`, leaving it for the prune job). Poison rows (missing
 `event_type` / undeserializable payload) are dead-lettered immediately, but a
 row of an event type the module has no listener for, which a target shared by
 several event types carries, is completed unread and logged at DEBUG;
-dispatch failures increment `attempts` with capped backoff and dead-letter after
+dispatch failures increment `attempts` with capped backoff
+(`retry_backoff_base_seconds` × 2^(n-1), default 0.05 s, capped by
+`retry_backoff_cap_seconds`, default 5 s) and dead-letter after
 `max_delivery_attempts` (default 5). Idle polling backoff never narrows below
 the configured `poll_interval_ms`: it grows exponentially while the queue is
 empty but is capped at `max(poll_interval, 0.5s)`.
@@ -827,9 +845,22 @@ started), so a peer claims them on its next poll instead of after
 `reclaim_stale_seconds`. A stop that cancels a running listener also hands that
 row back uncharged (`release_interrupted_claims`, database and SHM brokers) when
 the listener ran for less than `reclaim_stale_seconds * 10`; past that the row
-stays claimed and the reclaim charges it. Rows already dispatching beside a
-crash-looping row are charged with it, so with `dispatch_concurrency` above 1 a
-crash loop can still dead-letter those.
+stays claimed and the reclaim charges it.
+
+A charged reclaim does not hand the row out at once. Like `fail()`, it puts the
+row back to `pending` for the failure backoff, with the `last_error`
+`RECLAIMED_MID_DISPATCH` (`modulith/adapters/_consumer_protocol.py`), and logs a
+WARNING; the charge that reaches the cap dead-letters the row and logs an
+ERROR. The consumer runs a row claimed with that `last_error` alone: its
+dispatch gate (`_DispatchGate` in `modulith/adapters/_delivery_dispatch.py`)
+starts it only when no other listener of the consumer is live and starts
+nothing while it is. Rows dispatching beside a row that kills the process are
+charged with it once, and from then on each crash charges only the row that
+caused it, so a crash loop dead-letters the killer alone. A listener counts as
+live for `reclaim_stale_seconds * 10` after it starts; a hung one past that no
+longer holds a suspect row back. The gate is per consumer: rows of another
+module's consumer in the same process can still be charged by its crashes, and
+`own_process` isolates them.
 
 *Completions are owner-guarded.* `ack` / `fail` / `dead_letter` are each a
 compare-and-swap on `status='claimed' AND claimed_by=<this consumer>`: a late
@@ -838,24 +869,37 @@ write from a healthy-but-slow consumer whose row a peer has already reclaimed
 clobbering the row the peer now owns. `fail` also reads the attempt count from
 the row inside the same transaction rather than trusting a caller snapshot.
 
-*A listener that never returns.* The consumer dispatches a claimed batch as one
-unit and claims nothing new until every row in it has finished, so one listener
-call that never returns (an HTTP call with no timeout, say) stops the whole
-consumer. While the batch runs, the consumer renews its claims every
-`reclaim_stale_seconds / 3`. It stops renewing after
-`reclaim_stale_seconds * 10`, so a peer consumer of the same group can reclaim
-the stuck rows. With one worker per module, the default, no peer exists.
-Past that deadline the consumer's health reports `degraded`, naming the stuck
-event type, target and row. It also logs one ERROR line that names the same
-rows. While the worker runs, modupy never cancels the listener, because it
-cannot know whether its side effects are safe to interrupt. A worker stop does
+*A listener that never returns.* The consumer claims again whenever a row it
+claimed now would start at once: no claimed row is waiting and a dispatch slot
+is free. At most `dispatch_concurrency` listeners run, so one listener call
+that never returns (an HTTP call with no timeout, say) holds one slot and the
+consumer keeps delivering with the rest. The consumer renews each claim every
+`reclaim_stale_seconds / 3` until `reclaim_stale_seconds * 10` after that row's
+listener started; a row still waiting for a slot is renewed while the consumer
+keeps starting rows. Past the deadline the claim lapses, so a peer's claim
+reclaims the stuck row, charges it and, after the failure backoff, delivers it
+again while the first call may still be running; the first call's completion is
+then fenced off and its result discarded. The consumer's own claims skip the rows
+its listeners still run (`exclude_ids` on `claim_batch`), so it never runs a
+listener twice beside itself, and without a peer the row waits for its listener
+or a restart.
+The consumer's health reports `degraded`, naming the stuck event type, target
+and row, and it logs one ERROR line per stuck row. While the worker runs, modupy cancels a listener only when it declares a
+budget with `@listener(timeout=...)`: past it an async listener gets
+`CancelledError`, the delivery fails with `ListenerTimeoutError` like any
+listener error, its slot frees, and the broker redelivers the row. Only an
+async listener takes a budget, since a plain `def` one runs on a thread nothing
+can interrupt, and the cancellation is cooperative: blocking work the listener
+handed to a thread runs on there, so only a process restart frees it. Without a
+timeout modupy never cancels the listener, because it cannot know whether its
+side effects are safe to interrupt. A worker stop does
 cancel the delivery: `stop()` waits `PollingConsumer._stop_drain_grace_s` (1 s,
 in `modulith/adapters/_polling_consumer.py`) for the running batch to finish,
 then cancels it. An async listener gets `CancelledError`; a sync listener's
-thread cannot be interrupted and keeps running. The stuck row stays claimed
-either way. The remedy is a restart: an orchestrator that restarts a worker on
-degraded health (see DEPLOYMENT "Health Checks and Monitoring") frees it, and
-the restarted consumer reclaims the stuck rows. The SHM consumer (§8.5) shares
+thread cannot be interrupted and keeps running. A stuck row past the deadline
+stays claimed either way. Only a restart frees the slot: an orchestrator that
+restarts a worker on degraded health (see DEPLOYMENT "Health Checks and
+Monitoring") does, and the restarted consumer reclaims the stuck rows. The SHM consumer (§8.5) shares
 this dispatch code and behaves the same way.
 
 *Cross-host clock skew.* Every timing-sensitive value — a message's claim

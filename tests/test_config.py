@@ -638,6 +638,36 @@ def test_shm_storage_limits_accept_documented_safe_maxima() -> None:
     assert cfg.broker_options["max_store_bytes"] == 1024**4
 
 
+@pytest.mark.parametrize("broker", ["shm", "database", "redis-streams"])
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"retry_backoff_base_seconds": 0}, "retry_backoff_base_seconds"),
+        ({"retry_backoff_base_seconds": float("nan")}, "retry_backoff_base_seconds"),
+        ({"retry_backoff_base_seconds": True}, "retry_backoff_base_seconds"),
+        ({"retry_backoff_cap_seconds": "soon"}, "retry_backoff_cap_seconds"),
+        ({"retry_backoff_cap_seconds": 86_401}, "retry_backoff_cap_seconds.*one day"),
+    ],
+)
+def test_retry_backoff_options_are_validated_at_load(
+    broker: str, options: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ConfigurationError, match=message):
+        load_configuration(topology="processes", broker=broker, broker_options=options)
+
+
+@pytest.mark.parametrize("broker", ["shm", "database", "redis-streams"])
+def test_retry_backoff_options_leave_the_base_and_cap_comparison_to_the_broker(
+    broker: str,
+) -> None:
+    """MODULITH_BROKER_RETRY_BACKOFF_CAP_SECONDS can still raise the 5 s default
+    cap, so the loader does not reject a base above it."""
+    options = {"retry_backoff_base_seconds": 6}
+    cfg = load_configuration(topology="processes", broker=broker, broker_options=options)
+
+    assert cfg.broker_options == options
+
+
 def test_shm_slot_size_is_silently_ignored_as_unknown_option(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

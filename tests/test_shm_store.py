@@ -2074,7 +2074,10 @@ async def test_release_interrupted_claims_leaves_a_claim_a_stale_reclaim_replace
         first = (await store.claim("g1", consumer_name="worker-1"))[0]
         assert await store.renew_claims([first["claim_token"]], "worker-1", start_dispatch=True)
         await asyncio.sleep(0.01)
-        second = (await store.claim("g1", consumer_name="worker-2", reclaim_stale_seconds=0))[0]
+        # The reclaim charges the started claim and backs it off before worker-2 gets it.
+        assert await store.claim("g1", consumer_name="worker-2", reclaim_stale_seconds=0) == []
+        await asyncio.sleep(0.1)
+        second = (await store.claim("g1", consumer_name="worker-2"))[0]
         assert await store.renew_claims([second["claim_token"]], "worker-2", start_dispatch=True)
         before = _delivery_state(path)
         assert (before[0]["status"], before[0]["claimed_by"], before[0]["dispatch_started"]) == (
