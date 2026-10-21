@@ -641,6 +641,7 @@ CI runs every command in every example's README exactly as written, from a fresh
 | [`quickstart`](https://github.com/jeansossmeier/modupy/tree/main/examples/quickstart) | small: 3 modules | the code above, in one process and in one process per module |
 | [`demo_app`](https://github.com/jeansossmeier/modupy/tree/main/examples/demo_app) | mid: a shop with a database | the durable outbox on SQLite, `modulith migrate`, a scaled module, then Postgres and Redis |
 | [`marketplace`](https://github.com/jeansossmeier/modupy/tree/main/examples/marketplace) | large: 7 modules | a payment saga that undoes itself on failure, dead-letter recovery, a team boundary rule shipped as a plugin, tracing, Kubernetes and extracting a service |
+| [`agent_desk`](https://github.com/jeansossmeier/modupy/tree/main/examples/agent_desk) | mid: a help desk with a LangGraph agent | the agent in a process of its own while the rest share one, a listener timeout, and a benchmark of the API while the agent hangs, blocks or crashes |
 
 Single-file plugin examples: [a verifier rule](https://github.com/jeansossmeier/modupy/blob/main/examples/naming_convention_verifier.py), [a Redis Streams broker](https://github.com/jeansossmeier/modupy/blob/main/examples/redis_streams_broker.py) and [a storage serializer](https://github.com/jeansossmeier/modupy/blob/main/examples/versioned_json_serializer.py).
 

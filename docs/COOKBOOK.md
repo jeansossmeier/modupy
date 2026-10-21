@@ -924,7 +924,9 @@ module of the shared worker is down. A client that gives up on a blocked `agent`
 frees its connection, and each worker has its own connection pool in the proxy,
 so requests to the other modules are not held up. The proxy
 routes each module's prefix to the worker that hosts it, and the module code
-does not change.
+does not change. [`examples/agent_desk`](../examples/agent_desk/) runs a
+LangGraph agent this way and measures the API while the agent hangs, blocks or
+crashes.
 
 Each module keeps its own consumer group, `modulith-<module>`, wherever it runs,
 so moving a module in or out of `own_process` does not orphan its undelivered

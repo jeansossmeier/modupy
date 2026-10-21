@@ -84,8 +84,87 @@ CURL_POST = (
     "curl -sX POST localhost:8000/orders -H 'content-type: application/json' "
     '-d \'{"customer_id": "alice"}\''
 )
+OPEN_TICKET = "curl -sX POST localhost:8000/tickets -H 'content-type: application/json' -d "
 
 RUNBOOKS: dict[str, tuple[Section, ...]] = {
+    "agent_desk": (
+        # The repo environment has no LangGraph (see the mypy override in
+        # pyproject.toml), so this runbook runs from the built wheel only.
+        Section(
+            "Install and look around",
+            (
+                Step("pip install 'modupy[fastapi,cli,postgres]' aiosqlite 'langgraph>=1.2,<2'"),
+                Step("modulith info"),
+                Step("modulith verify"),
+            ),
+            repo_env=False,
+        ),
+        Section(
+            "Run its tests", (Step("pip install pytest pytest-timeout httpx2"), Step("pytest"))
+        ),
+        Section(
+            "Run it in one process",
+            (
+                Step("modulith migrate"),
+                Step("python -m desk.schema"),
+                Step("uvicorn desk.main:app", serve=True),
+                Step(
+                    OPEN_TICKET + '\'{"ticket_id": "t-1", "subject": "Refund please", '
+                    '"body": "I was charged twice."}\''
+                ),
+                Step("curl -s localhost:8000/tickets/t-1", eventually=True),
+                Step("curl -s localhost:8000/activity/t-1", eventually=True),
+            ),
+        ),
+        Section(
+            "Give the agent its own process",
+            (
+                Step(
+                    "modulith run desk.main:app --topology processes --host 127.0.0.1", serve=True
+                ),
+                Step(
+                    OPEN_TICKET + '\'{"ticket_id": "t-2", "subject": "Site is down", '
+                    '"body": "Every page returns a 500."}\''
+                ),
+                Step("curl -s localhost:8000/tickets/t-2", eventually=True),
+                Step("curl -s localhost:8000/activity/t-2", eventually=True),
+                Step("curl -s localhost:8000/_modulith/health", eventually=True),
+            ),
+        ),
+        Section(
+            "When the agent crashes",
+            (
+                Step("export DESK_AGENT_FAULT=crash"),
+                Step(
+                    "modulith run desk.main:app --topology processes --host 127.0.0.1", serve=True
+                ),
+                Step(
+                    OPEN_TICKET + '\'{"ticket_id": "t-3", "subject": "Invoice", '
+                    '"body": "Where is my invoice?"}\''
+                ),
+                Step("curl -s localhost:8000/activity/t-3", eventually=True),
+                Step("curl -s localhost:8000/tickets/t-3"),
+                Step("uvicorn desk.main:app", serve=True),
+                Step(
+                    OPEN_TICKET + '\'{"ticket_id": "t-4", "subject": "Login fails", '
+                    '"body": "Error on every login."}\''
+                ),
+                Step("curl -s localhost:8000/tickets/t-4", eventually=True, exit_code=7),
+            ),
+        ),
+        Section(
+            "Fix the agent",
+            (
+                Step("export DESK_AGENT_FAULT="),
+                Step(
+                    "modulith run desk.main:app --topology processes --host 127.0.0.1", serve=True
+                ),
+                Step("curl -s localhost:8000/tickets/t-3", eventually=True),
+                Step("curl -s localhost:8000/tickets/t-4", eventually=True),
+            ),
+        ),
+        Section("Measure it", (Step("python benchmark.py --seconds 5"),)),
+    ),
     "quickstart": (
         Section(
             "Install and look around",
