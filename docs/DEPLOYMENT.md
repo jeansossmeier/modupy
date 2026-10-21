@@ -791,7 +791,8 @@ A 1 KiB payload with two subscribed groups uses about 1.8 KB of store, so the
 defaults (delete mode, no dead letters) sustain roughly 165 publications/s; under
 `completion_mode = "mark"` the 3-day terminal retention cuts that below
 2.3 publications/s. Above that rate, every publish fails with "SHM SQLite store
-is full". Size `max_store_bytes` (or `MODULITH_BROKER_MAX_STORE_BYTES`) for the
+is full"; a send the outbox makes waits in the outbox without spending an
+attempt (see [Recovering from Broker Failure](#recovering-from-broker-failure)). Size `max_store_bytes` (or `MODULITH_BROKER_MAX_STORE_BYTES`) for the
 longest retention, or shorten `orphan_retention_seconds` before the store
 fills: each publication keeps the orphan retention stamped when it was
 written, so shortening it frees nothing in a store that is already full.
@@ -1687,6 +1688,17 @@ for a current module's group.
 **Publishing (every broker):**
 - A direct `publish()` raises the broker's error to its caller. modupy keeps no in-memory buffer of events it could not send
 - Inside a bound outbox session, the broker send is saved as an outbox row in your transaction and made after the commit. While the broker is down the row stays in the outbox and the retry loop sends it again, until `dead_letter_after_attempts` (10 by default) failed attempts dead-letter it. `modulith outbox dead-letter --retry-all` resubmits dead-lettered rows once the broker is back
+- A full SHM store (`max_store_bytes`) is backpressure, not a failed attempt: the outbox row stays pending with its attempts untouched and is sent again on a later sweep, once consumers have drained the store. Each such send moves the row behind newer rows in the sweep order, so held-back sends never keep the sweep from the rest of the outbox. The outbox logs a WARNING about it at most once a minute, counting the sends it did not log
+
+**Retry policy by topology.** A failed delivery is retried with a backoff that doubles per attempt, until the attempt cap dead-letters it:
+
+| Where the listener runs | Attempts before dead letter | Wait before attempt n+1 | Set with |
+|---|---|---|---|
+| In the publishing process, through the outbox | `dead_letter_after_attempts` (10) | 2^(n-1) s, capped by `max_retry_backoff_seconds` (300), checked by the sweep every `retry_interval_seconds` | `outbox_options` |
+| In a worker, `shm` or `database` broker | `max_delivery_attempts` (5) | `retry_backoff_base_seconds` (0.05) × 2^(n-1), capped by `retry_backoff_cap_seconds` (5) | `broker_options`, or `MODULITH_BROKER_RETRY_BACKOFF_BASE_SECONDS` / `_CAP_SECONDS` |
+| In a worker, `redis-streams` broker | `max_delivery_attempts` (5) | `reclaim_min_idle_ms` (60 s) plus the same backoff as `shm` and `database` | `broker_options`; the backoff also through `MODULITH_BROKER_RETRY_BACKOFF_BASE_SECONDS` / `_CAP_SECONDS` |
+
+The `shm` and `database` defaults retry five times within about a second, which suits a transient error but not an outage of something the listener calls. To ride one out, raise `retry_backoff_cap_seconds` (at most 86400) and `max_delivery_attempts`. Both backoff values must be positive, and the base must not exceed the cap. The same backoff applies before a reclaim redelivers a message whose consumer died or wedged in its listener (see below). On Redis every redelivery is a reclaim, so a message waits `reclaim_min_idle_ms` and then the backoff for the deliveries it has had.
 
 **Dead-lettered deliveries (database, shm and redis-streams brokers):**
 

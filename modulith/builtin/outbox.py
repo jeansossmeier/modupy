@@ -98,6 +98,7 @@ from modulith._claims import (
     VALID_CLAIM_STRATEGIES,
     LockConnectionTimeout,
 )
+from modulith.adapters._shm_types import ShmStoreFullError
 from modulith.brokers import _split_broker_target
 from modulith.config import MAX_CLAIM_LEASE_SECONDS, ConfigurationError
 from modulith.serializers import JsonEventSerializer, _event_type_name
@@ -235,6 +236,18 @@ _claim_strategy: str = DEFAULT_CLAIM_STRATEGY
 _claim_lease_seconds: float = DEFAULT_CLAIM_LEASE_SECONDS
 _claim_batch_size: int = DEFAULT_CLAIM_BATCH_SIZE
 _claim_owner: str = ""
+
+# A dispatch renews its lease for at most this many leases, the same bound
+# the brokers put on claim renewal (_MAX_LEASE_EXTENSION_FACTOR in
+# modulith/adapters/_delivery_dispatch.py), so a listener that never returns
+# does not hold its row forever.
+_MAX_LEASE_RENEWAL_FACTOR = 10.0
+
+# A full SHM store is backpressure: the broker route stays pending, uncharged,
+# and this warning is logged at most once per interval.
+_STORE_FULL_WARNING_INTERVAL_S = 60.0
+_store_full_warned_at = -math.inf
+_store_full_suppressed = 0
 
 # Guards check-then-set access to ``_retry_task``. The module slot is
 # process-global while event loops are not: the main loop and sync.py's
@@ -1086,6 +1099,15 @@ async def _dispatch_broker_route(publication: EventPublication) -> None:
         if isinstance(publisher, str) and publisher:
             headers[_rt._PUBLISHER_MODULE_HEADER] = publisher
         await registry.publish(target, publication.payload, headers)
+    except ShmStoreFullError as exc:
+        # No attempt is spent: the send succeeds once consumers drain the store,
+        # and the row stays pending for a later sweep instead of dead-lettering.
+        # The attempt time moves it behind newer rows in the sweep order, so a
+        # page of such rows cannot hold every sweep back from the rest.
+        _warn_store_full(target, publication, exc)
+        publication.last_attempt_at = datetime.now(UTC)
+        await _persist_failure(publication)
+        return
     except Exception as exc:
         logger.warning("broker route %s failed for publication %s: %s", target, publication.id, exc)
         await _record_failure(publication, exc)
@@ -1106,6 +1128,25 @@ async def _dispatch_broker_route(publication: EventPublication) -> None:
         await _record_failure(publication, exc)
         return
     logger.debug("routed publication %s to broker target %s", publication.id, target)
+
+
+def _warn_store_full(target: str, publication: EventPublication, exc: Exception) -> None:
+    global _store_full_warned_at, _store_full_suppressed
+    now = time.monotonic()
+    if now - _store_full_warned_at < _STORE_FULL_WARNING_INTERVAL_S:
+        _store_full_suppressed += 1
+        return
+    suppressed, _store_full_suppressed = _store_full_suppressed, 0
+    _store_full_warned_at = now
+    logger.warning(
+        "broker route %s cannot take publication %s: the broker store is full. It stays "
+        "pending without spending an attempt and is sent again on a later sweep "
+        "(%d more such sends since the last warning). %s",
+        target,
+        publication.id,
+        suppressed,
+        exc,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1472,7 +1513,10 @@ async def _dispatch_with_lease_renewal(publication: EventPublication) -> None:
     A lost lease (stale token) stops the renew loop but does not cancel
     dispatch — fencing happens in ``_complete`` / ``_record_failure``. A
     renewal that raises is logged and retried on the next interval until the
-    lease it protects has expired; it never fails the delivery.
+    lease it protects has expired; it never fails the delivery. Renewal stops
+    ``_MAX_LEASE_RENEWAL_FACTOR`` leases after dispatch began, so the lease of
+    a listener that never returns lapses and a peer's sweep reclaims the row,
+    charged as an interrupted delivery.
     """
     token = publication.claim_token
     if not token or not hasattr(_store, "renew_claim"):
@@ -1488,12 +1532,24 @@ async def _dispatch_with_lease_renewal(publication: EventPublication) -> None:
         store_any: Any = _store
         loop = asyncio.get_running_loop()
         lease_deadline = loop.time() + _claim_lease_seconds
+        renew_until = loop.time() + _claim_lease_seconds * _MAX_LEASE_RENEWAL_FACTOR
         while True:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=renew_interval)
                 return
             except TimeoutError:
                 pass
+            if loop.time() >= renew_until:
+                logger.error(
+                    "lease renewal for publication %s stopped after %gs with listener %s "
+                    "still running -- the lease lapses, so another process's sweep may "
+                    "deliver it again, charged as an interrupted delivery; this "
+                    "process's sweep waits until the listener returns",
+                    publication.id,
+                    _claim_lease_seconds * _MAX_LEASE_RENEWAL_FACTOR,
+                    publication.listener,
+                )
+                return
             try:
                 ok = await store_any.renew_claim(publication.id, token, _claim_lease_seconds)
             except Exception:
@@ -1973,7 +2029,7 @@ def _reset_for_testing() -> None:
     global _dead_letter_after_attempts, _retry_interval_seconds
     global _max_retry_backoff_seconds, _retry_stale_seconds, _retry_loop_enabled
     global _claim_strategy, _claim_lease_seconds, _claim_batch_size, _claim_owner
-    global _owned_resources, _shut_down
+    global _owned_resources, _shut_down, _store_full_warned_at, _store_full_suppressed
     _cancel_retry_task()
     _stop_requested.clear()
     _shut_down = False
@@ -1990,6 +2046,8 @@ def _reset_for_testing() -> None:
     _claim_lease_seconds = DEFAULT_CLAIM_LEASE_SECONDS
     _claim_batch_size = DEFAULT_CLAIM_BATCH_SIZE
     _claim_owner = ""
+    _store_full_warned_at = -math.inf
+    _store_full_suppressed = 0
     with _inflight_lock:
         _inflight_ids.clear()
     _swept_dead_letters.clear()

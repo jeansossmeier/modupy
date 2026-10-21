@@ -623,7 +623,15 @@ stall, not your slowest listener; a lease that lapses lets a peer legitimately
 reclaim the row; it also bounds how long a crashed process's in-flight rows
 wait for recovery, see §7.2) and `claim_batch_size` (default 100 rows per claim). A
 renewal that raises (a database blip) is logged and retried until the lease
-expires; it never fails the delivery. `outbox.configure()` and
+expires; it never fails the delivery. Renewal stops 10 leases after dispatch
+began (600 s by default, the bound the brokers put on claim renewal), with an
+ERROR naming the publication and listener, so the lease of a listener that never
+returns lapses and another process's sweep reclaims the row, charged as an
+interrupted delivery, while the first call may still be running. A listener that
+is only slow is treated the same way: once a peer has reclaimed its row, the
+completion write of the first call is fenced off and its result discarded, so
+keep `claim_lease_seconds * 10` above the longest listener run. This process's
+own sweep dispatches serially, so it waits for the listener. `outbox.configure()` and
 `outbox_options` reject a `claim_lease_seconds` above 86400 (one day): no
 delivery needs a longer lease, and an enormous one overflows the clock
 arithmetic of every claim. Any positive value up to that is accepted.
@@ -1015,8 +1023,12 @@ instead of on the first consume.
 (`.modulith-shm-broker.db` by default; the `-wal` file is separate and
 unbounded). Publishes stop earlier: one that would leave
 `page_count - freelist_count` above the configured page count minus a consumer
-reserve rolls back with a store-full `ConfigurationError`, applying
-backpressure without corrupting existing rows. The reserve is 32 pages
+reserve rolls back with a store-full `ShmStoreFullError` (a
+`ConfigurationError` subclass, in `modulith/adapters/_shm_types.py`), applying
+backpressure without corrupting existing rows. The outbox treats it as
+backpressure too: a broker-route row it hits stays pending without spending an
+attempt, its claim is handed back, and its `last_attempt_at` moves it behind newer rows
+in the sweep order, and a rate-limited WARNING reports it. The reserve is 32 pages
 (128 KiB at 4 KiB pages), or one eighth of the pages for stores under 256
 pages.
 
