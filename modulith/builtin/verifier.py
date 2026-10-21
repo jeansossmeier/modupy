@@ -50,9 +50,9 @@ import ast
 import difflib
 import hashlib
 import importlib.util
+import itertools
 import json
 import logging
-import os
 from collections import Counter
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
@@ -142,7 +142,8 @@ def _looks_like_rule_typo(name: str) -> bool:
     for rule in RULE_NAMES:
         words = rule.split("-")
         if len(words) > len(head) and words[: len(head)] == head:
-            shared = len(os.path.commonprefix([last, words[len(head)]]))
+            pairs = zip(last, words[len(head)], strict=False)
+            shared = sum(1 for _ in itertools.takewhile(lambda pair: pair[0] == pair[1], pairs))
             if shared >= 3 and len(last) - shared <= 2:
                 return True
     return False
