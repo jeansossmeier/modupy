@@ -138,6 +138,11 @@ class Configuration:
     # as many consecutive ports as it has replicas.
     worker_port_base: int = 9001
 
+    # Modules that get a worker process of their own when topology is
+    # "processes"; every other module then shares one worker process. Empty
+    # means one worker process per module.
+    own_process: tuple[str, ...] = ()
+
     # Seconds a process-topology worker may leave its loopback /health
     # unanswered, once it is listening, before the supervisor kills it and the
     # restart policy respawns it. None leaves workers that stop answering alone.
@@ -224,8 +229,9 @@ def load_configuration(**overrides: Any) -> Configuration:
 
     # Validate before constructing — fail fast on typos and bad values.
     _validate(explicit)
-    if "verify_disabled_rules" in explicit:
-        explicit["verify_disabled_rules"] = tuple(explicit["verify_disabled_rules"])
+    for list_field in ("verify_disabled_rules", "own_process"):
+        if list_field in explicit:
+            explicit[list_field] = tuple(explicit[list_field])
 
     # Freeze explicit_keys BEFORE injecting the broker default so
     # cfg.is_explicit("broker") stays False for the auto-default case.
@@ -1077,6 +1083,20 @@ def _validate(data: dict[str, Any]) -> None:
             raise ConfigurationError(
                 "[tool.modulith.verify].disabled_rules must be a list of rule-name "
                 f"strings, got {disabled_rules!r}"
+            )
+
+    if "own_process" in data:
+        own_process = data["own_process"]
+        if not isinstance(own_process, (list, tuple)) or any(
+            type(name) is not str or not name for name in own_process
+        ):
+            raise ConfigurationError(
+                f"own_process must be a list of module names, got {own_process!r}"
+            )
+        repeated = sorted({name for name in own_process if own_process.count(name) > 1})
+        if repeated:
+            raise ConfigurationError(
+                f"own_process names {', '.join(repr(n) for n in repeated)} more than once"
             )
 
     subscriptions = data.get("subscriptions")

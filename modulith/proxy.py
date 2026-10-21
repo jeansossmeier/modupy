@@ -101,6 +101,11 @@ class RoutingRule:
     prefix: str  # e.g. "/orders"
     backend_url: str  # e.g. "http://127.0.0.1:9001" (first replica)
     backend_urls: tuple[str, ...] = ()
+    # The worker the backends run, when several modules share it ("billing,orders").
+    worker: str = ""
+    # The module is named in ``own_process``: readiness reports it down as
+    # ``degraded`` without failing, so it never takes the rest out of rotation.
+    own_process: bool = False
     _cycle: Iterator[str] = field(default_factory=_empty_backend_cycle, repr=False, compare=False)
     _down: dict[str, float] = field(default_factory=dict, repr=False, compare=False)
     _foreign: dict[str, float] = field(default_factory=dict, repr=False, compare=False)
@@ -111,6 +116,11 @@ class RoutingRule:
         urls = self.backend_urls or (self.backend_url,)
         object.__setattr__(self, "backend_urls", urls)
         object.__setattr__(self, "_cycle", cycle(urls))
+
+    @property
+    def worker_name(self) -> str:
+        """The name the backends' workers prove their identity under."""
+        return self.worker or self.prefix.strip("/")
 
     def next_backend(self) -> str | None:
         """Round-robin over every replica not currently marked down or foreign.
@@ -430,7 +440,7 @@ def create_proxy_app(
             return True
         if rule.identity_epoch(url) != epoch:
             return False
-        if _answers_for(health, deployment_token, nonce, rule.prefix.lstrip("/"), _port(url)):
+        if _answers_for(health, deployment_token, nonce, rule.worker_name, _port(url)):
             rule.mark_verified(url)
             return True
         rule.mark_foreign(url)
@@ -564,7 +574,11 @@ def create_proxy_app(
 
             Returns 503 when any module is not ``ok`` — a standard readiness
             contract (orchestrators stop routing traffic to a 503 instance)
-            that a constant 200 could never express.
+            that a constant 200 could never express. A module in its own
+            process (``RoutingRule.own_process``) is the exception: when only
+            such modules are down the body still says ``"degraded"``, but the
+            status is 200, so one isolated module never takes the modules that
+            still serve out of rotation.
             """
             denied = _actuator_auth_response(request)
             if denied is not None:
@@ -606,17 +620,21 @@ def create_proxy_app(
                 if "unhealthy" in statuses:
                     return rule.prefix, "unhealthy"
                 if failed_instances is not None and _module_has_given_up(
-                    rule.prefix, failed_instances()
+                    rule.worker_name, failed_instances()
                 ):
                     return rule.prefix, "failed (given up)"
                 return rule.prefix, "unreachable"
 
             # Concurrent fan-out: total latency ~max(per-backend latency), not
             # the sum — a sequential loop scales O(N * per-backend timeout).
-            backends = dict(await asyncio.gather(*(check_one(rule) for rule in rules)))
+            states = await asyncio.gather(*(check_one(rule) for rule in rules))
+            backends = dict(states)
             overall = "ok" if all(state == "ok" for state in backends.values()) else "degraded"
             body = {"status": overall, "backends": backends}
-            if overall != "ok":
+            if any(
+                state != "ok" and not rule.own_process
+                for rule, (_, state) in zip(rules, states, strict=True)
+            ):
                 return JSONResponse(body, status_code=503)
             return body
 
@@ -1131,8 +1149,8 @@ def _answers_for(
     )
 
 
-def _module_has_given_up(prefix: str, failed: frozenset[str]) -> bool:
-    """Whether any instance backing ``prefix`` is in the breaker's give-up set.
+def _module_has_given_up(worker: str, failed: frozenset[str]) -> bool:
+    """Whether any instance of ``worker`` is in the breaker's give-up set.
 
     Only consulted once every replica has already failed its live ``/health``
     probe (see ``check_one``), so this only ever upgrades an already-total
@@ -1140,8 +1158,7 @@ def _module_has_given_up(prefix: str, failed: frozenset[str]) -> bool:
     never masks a module that still has a healthy or merely-restarting
     replica.
     """
-    module_name = prefix.lstrip("/")
-    return any(name == module_name or name.startswith(f"{module_name}-") for name in failed)
+    return any(name == worker or name.startswith(f"{worker}-") for name in failed)
 
 
 async def _safe_stream(resp: Any, upstream: str) -> AsyncIterator[bytes]:

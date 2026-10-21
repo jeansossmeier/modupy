@@ -1707,3 +1707,37 @@ def test_shm_effective_options_treat_a_whitespace_env_payload_cap_as_unset(
     monkeypatch.setenv(_PAYLOAD_CAP_ENV, "   ")
     assert _effective_shm_options({"max_payload_bytes": 4})["max_payload_bytes"] == 4
     assert "max_payload_bytes" not in _effective_shm_options({})
+
+
+def test_own_process_is_read_from_pyproject(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith]\ntopology = "processes"\nown_process = ["agent", "reports"]\n'
+    )
+    assert load_configuration().own_process == ("agent", "reports")
+
+
+def test_own_process_defaults_to_empty() -> None:
+    assert load_configuration().own_process == ()
+
+
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        ('"agent"', "own_process must be a list of module names"),
+        ("[1]", "own_process must be a list of module names"),
+        ('[""]', "own_process must be a list of module names"),
+        ('["agent", "agent"]', "own_process names 'agent' more than once"),
+    ],
+)
+def test_own_process_rejects_malformed_values(tmp_path: Path, value: str, reason: str) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        f'[tool.modulith]\ntopology = "processes"\nown_process = {value}\n'
+    )
+    with pytest.raises(ConfigurationError, match=reason):
+        load_configuration()
+
+
+def test_own_process_loads_under_the_single_topology(tmp_path: Path) -> None:
+    """Like [tool.modulith.workers], it waits for `--topology processes` on the command line."""
+    (tmp_path / "pyproject.toml").write_text('[tool.modulith]\nown_process = ["agent"]\n')
+    assert load_configuration().own_process == ("agent",)

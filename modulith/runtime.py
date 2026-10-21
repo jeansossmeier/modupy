@@ -18,7 +18,7 @@ import os
 import pkgutil
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from contextvars import ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -55,11 +55,33 @@ def _is_regular_package(module: Any) -> bool:
     )
 
 
-# Broker header naming the module package whose process published the event, so
-# a consumer can tell which listeners already ran at the publisher. Absent when
-# the publisher hosts no module. The outbox stores the same name in the row's
-# carrier (``builtin.outbox._dispatch_broker_route``), so keep one spelling.
+# Broker header naming the module packages whose process published the event,
+# comma-separated, so a consumer can tell which listeners already ran at the
+# publisher (see ``Runtime.publisher_modules`` for the co-hosted module whose
+# listener failed there). Absent when the publisher hosts no module. The outbox
+# stores the same name in the row's carrier
+# (``builtin.outbox._dispatch_broker_route``), so keep one spelling.
 _PUBLISHER_MODULE_HEADER = "publisher_module"
+
+
+class _ModuleListeners:
+    """The listeners one co-hosted module owns, read the way consumers read a bus.
+
+    A worker hosting several modules runs one consumer per module, each in that
+    module's own consumer group, so each one subscribes to, allow-lists and
+    dispatches only its module's listeners.
+    """
+
+    def __init__(self, bus: Any, owns: Callable[[Callable[..., Any]], bool]) -> None:
+        self._bus = bus
+        self._owns = owns
+
+    def listeners_for(self, event_type: type) -> list[Callable[..., Any]]:
+        return [h for h in self._bus.listeners_for(event_type) if self._owns(h)]
+
+    def registered_event_types(self) -> list[type]:
+        return [t for t in self._bus.registered_event_types() if self.listeners_for(t)]
+
 
 # Set only by the CLI inspection commands (see ``cli._bootstrap_or_exit``).
 # While true, a bootstrap under ``strict_boundaries`` does not abort on
@@ -176,12 +198,14 @@ class Runtime:
         self._pending_listeners: list[tuple[type, Callable[..., Any]]] = []
 
         # Module package whose import registered each listener (see
-        # _owning_module_package), and the one module package a
-        # process-per-module worker hosts. With a hosted module set, only its
-        # own and untagged listeners are consumed, dispatched or counted as
-        # local; with none (single topology) every listener is local.
+        # _owning_module_package), and the module packages a process-topology
+        # worker hosts: the first, plus any others sharing its process. With a
+        # hosted module set, only their own and untagged listeners (counted as
+        # the first's) are consumed, dispatched or counted as local; with none
+        # (single topology) every listener is local.
         self._listener_owners: dict[Callable[..., Any], str] = {}
         self._hosted_module: str | None = None
+        self._cohosted_modules: tuple[str, ...] = ()
         # Set once a worker's consumer subscriptions and serializer allow-list
         # are computed from the listeners then registered; later listeners
         # are local-only (see register_listener).
@@ -196,6 +220,7 @@ class Runtime:
         # ``outbox_url``; shutdown() disposes both.
         self._owned_outbox: tuple[Any, Any] | None = None
         self._warned_missing_outbox_store = False
+        self._warned_unroutable: set[str] = set()
 
         # Plugins injected programmatically (not via entry points), registered
         # at bootstrap. Embedding contexts — most notably the pytest plugin's
@@ -396,22 +421,49 @@ class Runtime:
                 return package
         return None
 
-    def host_module(self, module_package: str) -> None:
-        """Restrict this process's listeners to one module package's own.
+    def host_module(self, module_package: str, *cohosted: str) -> None:
+        """Restrict this process's listeners to these module packages' own.
 
-        Called by the process-per-module worker. Listeners registered while
+        Called by the process-topology worker with the module it hosts, or
+        with every module sharing its process. Listeners registered while
         importing another module package (a sibling pulled in through its
         public API) are then ignored by consumer subscriptions, broker
         dispatch and local publish, so they run only in their owner's worker.
         """
         self._hosted_module = module_package
+        self._cohosted_modules = cohosted
 
     def local_listeners(self, handlers: list[Callable[..., Any]]) -> list[Callable[..., Any]]:
         """The subset of ``handlers`` this process owns."""
         hosted = self._hosted_module
         if hosted is None:
             return handlers
-        return [h for h in handlers if self._listener_owners.get(h, hosted) == hosted]
+        owned = {hosted, *self._cohosted_modules}
+        return [h for h in handlers if self._listener_owners.get(h, hosted) in owned]
+
+    def module_bus(self, bus: Any, module_package: str) -> Any:
+        """``bus`` narrowed to the listeners one hosted module package owns."""
+        hosted = self._hosted_module
+        return _ModuleListeners(
+            bus, lambda h: self._listener_owners.get(h, hosted) == module_package
+        )
+
+    def publisher_modules(self, failed: Collection[str] = ()) -> str | None:
+        """The ``publisher_module`` header value: the module packages this process hosts.
+
+        ``failed`` names the hosted modules whose listener raised at an
+        in-memory publish. A worker hosting several modules leaves them out, so
+        each one's own consumer runs the broker copy as its retry, just as it
+        would in a worker of its own. A worker hosting one module names it
+        regardless: the failed listener is the publisher's own, which runs in
+        its process only.
+        """
+        if self._hosted_module is None:
+            return None
+        hosted = (self._hosted_module, *self._cohosted_modules)
+        if self._cohosted_modules:
+            hosted = tuple(module for module in hosted if module not in failed)
+        return ",".join(hosted) or None
 
     def bind_configured_outbox(self, bus: Any = None) -> None:
         """Bind a ``PostgresPublicationStore`` on ``outbox_url`` when none is bound.
@@ -546,9 +598,12 @@ class Runtime:
             handlers = self.local_listeners(self._event_bus.listeners_for(type(event)))
             try:
                 records = list(await outbox.persist(event))
-                target = self._broker_route_target(event, has_local_handler=bool(handlers))
-                if target is not None:
-                    records.append(await outbox.persist_broker_route(event, target))
+                route = self._broker_route_target(event, has_local_handler=bool(handlers))
+                if route is not None:
+                    target, optional = route
+                    payload = self._wire_payload(event, optional=optional)
+                    if payload is not None:
+                        records.append(await outbox._persist_broker_payload(event, target, payload))
             except BaseException as exc:
                 # The publish failed BETWEEN the paired publish hooks.
                 # modulith_after_event_published is contractually scoped to
@@ -615,7 +670,9 @@ class Runtime:
 
         return outbox._store is not None and outbox._bound_session() is not None
 
-    async def _route_to_broker_guarded(self, event: Any, *, has_local_handler: bool) -> None:
+    async def _route_to_broker_guarded(
+        self, event: Any, *, has_local_handler: bool, failed_modules: Collection[str] = ()
+    ) -> None:
         """``_maybe_route_to_broker`` + publish-span cleanup on failure.
 
         The inline broker route runs between the paired publish hooks, so a
@@ -623,7 +680,9 @@ class Runtime:
         propagates — the direct-path leg of that pairing.
         """
         try:
-            await self._maybe_route_to_broker(event, has_local_handler=has_local_handler)
+            await self._maybe_route_to_broker(
+                event, has_local_handler=has_local_handler, failed_modules=failed_modules
+            )
         except BaseException as exc:
             self._fire_publish_error(event, exc)
             raise
@@ -734,7 +793,7 @@ class Runtime:
             return
 
         try:
-            first_error = await self._run_listeners(
+            failures = await self._run_listeners(
                 event, handlers, payload=payload, event_type=event_type
             )
         except BaseException as exc:
@@ -753,12 +812,17 @@ class Runtime:
         # is independent of local delivery, so a local listener failure (raised
         # below) must not suppress it. No-op unless the event resolves to a
         # remote target (see _maybe_route_to_broker).
-        await self._route_to_broker_guarded(event, has_local_handler=True)
+        failed = {self._listener_owners.get(h, self._hosted_module) for h, _ in failures}
+        await self._route_to_broker_guarded(
+            event,
+            has_local_handler=True,
+            failed_modules={module for module in failed if module is not None},
+        )
 
         pm.hook.modulith_after_event_published(event=event, publication=publish_pub)
 
-        if first_error is not None:
-            raise first_error
+        if failures:
+            raise failures[0][1]
 
     async def dispatch_local(
         self,
@@ -776,9 +840,9 @@ class Runtime:
         ``trace_context``, so a dispatch span joins the producer's trace.
 
         ``publisher_module`` is the message's ``publisher_module`` header: the
-        module package whose process sent it. That process already ran the
-        module's listeners at publish, so they are skipped here; every other
-        listener runs. Without the header, every local listener runs.
+        module packages, comma-separated, whose process sent it. That process
+        already ran their listeners at publish, so they are skipped here; every
+        other listener runs. Without the header, every local listener runs.
 
         The cross-process consumers call this instead of ``bus.publish`` so a
         remotely-delivered event fires the same per-listener lifecycle hooks
@@ -801,25 +865,26 @@ class Runtime:
             return
         handlers = self.local_listeners(bus.listeners_for(type(event)))
         if publisher_module:
+            publishers = set(publisher_module.split(","))
             handlers = [
                 h
                 for h in handlers
-                if self._listener_owners.get(h, self._hosted_module) != publisher_module
+                if self._listener_owners.get(h, self._hosted_module) not in publishers
             ]
         if not handlers:
             return
         trace_context = {"traceparent": traceparent} if traceparent else None
         if trace_context is not None and tracestate:
             trace_context["tracestate"] = tracestate
-        first_error = await self._run_listeners(
+        failures = await self._run_listeners(
             event,
             handlers,
             payload=self._serialized_payload(event),
             event_type=f"{type(event).__module__}.{type(event).__qualname__}",
             trace_context=trace_context,
         )
-        if first_error is not None:
-            raise first_error
+        if failures:
+            raise failures[0][1]
 
     async def _run_listeners(
         self,
@@ -829,12 +894,14 @@ class Runtime:
         payload: bytes,
         event_type: str,
         trace_context: dict[str, str] | None = None,
-    ) -> BaseException | None:
+    ) -> list[tuple[Callable[..., Any], BaseException]]:
         """Run every listener concurrently, wrapped in the per-listener hooks.
 
-        Returns the first listener failure rather than raising it: the caller
-        still has work to finish (broker fan-out, the post-publish hook) that a
-        local listener failure must not skip. Every failure is logged HERE,
+        Returns each failed listener with its exception, in handler order,
+        rather than raising: the caller still has work to finish (broker
+        fan-out, which needs to know whose listeners failed, and the
+        post-publish hook) that a local listener failure must not skip, and it
+        raises the first failure itself. Every failure is logged HERE,
         before returning, so a caller that goes on to raise for its own reasons
         — a broker route failing during an outage — can never swallow the
         listener diagnostics along with it.
@@ -871,7 +938,7 @@ class Runtime:
 
         results = await asyncio.gather(*(_run_one(h) for h in handlers), return_exceptions=True)
 
-        first_error: BaseException | None = None
+        failures: list[tuple[Callable[..., Any], BaseException]] = []
         for handler, result in zip(handlers, results, strict=False):
             if isinstance(result, BaseException):
                 logger.error(
@@ -880,9 +947,8 @@ class Runtime:
                     type(event).__name__,
                     result,
                 )
-                if first_error is None:
-                    first_error = result
-        return first_error
+                failures.append((handler, result))
+        return failures
 
     def _resolve_broker_target(self, event: Any) -> str | None:
         """Resolve an event's explicit broker target, or None for the default.
@@ -917,9 +983,11 @@ class Runtime:
 
         return None
 
-    def _broker_route_target(self, event: Any, *, has_local_handler: bool) -> str | None:
-        """The validated, whitespace-normalized broker target for this publish,
-        or None (in-process).
+    def _broker_route_target(
+        self, event: Any, *, has_local_handler: bool
+    ) -> tuple[str, bool] | None:
+        """The validated, whitespace-normalized broker target for this publish
+        and whether the route is optional, or None (in-process).
 
         Only resolves in non-``single`` topology. An event routes to the
         broker when EITHER:
@@ -932,9 +1000,13 @@ class Runtime:
             lives in another worker process — routed under the default scheme.
 
         An event with a local listener and no externalization signal stays
-        in-process (no broker traffic). The destination is the fully-qualified
-        event name (module + qualname), matching the ``event_type`` header so a
-        future consumer keys producer and consumer identically.
+        in-process (no broker traffic), except in a worker hosting several
+        modules, which routes it too. That route alone is optional: an event
+        with no JSON form stays in-process (see ``_wire_payload``), as it
+        would in a worker hosting only the publisher. The destination is the
+        fully-qualified event name (module + qualname), matching the
+        ``event_type`` header so a future consumer keys producer and consumer
+        identically.
 
         Returns None when topology is ``single`` or when the event carries no
         cross-process signal. When the event DOES resolve to a broker target
@@ -951,11 +1023,16 @@ class Runtime:
             return None
 
         target = self._resolve_broker_target(event)
+        optional = False
         if target is None:
             # No externalization signal. Route only a listener-less event, by
             # the default scheme; an in-process-only event isn't broker traffic.
-            if has_local_handler:
+            # A worker hosting several modules routes every event: it cannot
+            # tell which of them published, so a local listener may be another
+            # module's, and the publisher's peers elsewhere would miss it.
+            if has_local_handler and not self._cohosted_modules:
                 return None
+            optional = has_local_handler
             fqn = f"{type(event).__module__}.{type(event).__qualname__}"
             target = f"{cfg.broker}:{fqn}"
 
@@ -978,30 +1055,62 @@ class Runtime:
                 f"consumer. Install or register the broker adapter, or fix "
                 f"the configured scheme."
             )
-        return f"{scheme}:{destination}"
+        return f"{scheme}:{destination}", optional
 
-    async def _maybe_route_to_broker(self, event: Any, *, has_local_handler: bool) -> None:
+    def _wire_payload(self, event: Any, *, optional: bool) -> bytes | None:
+        """``event`` in the broker's JSON wire format, or None when an optional
+        route cannot carry it; the event then reaches only this worker's listeners.
+        """
+        from .serializers import JsonEventSerializer
+
+        try:
+            return JsonEventSerializer().serialize(event)
+        except (TypeError, ValueError) as exc:
+            if not optional:
+                raise
+            event_type = f"{type(event).__module__}.{type(event).__qualname__}"
+            if event_type not in self._warned_unroutable:
+                self._warned_unroutable.add(event_type)
+                logger.warning(
+                    "%s cannot be sent to the broker (%s), so only its listeners in "
+                    "this worker receive it. A worker hosting several modules sends "
+                    "their events across processes, since it cannot tell which module "
+                    "published one; give the event a JSON form if a module in another "
+                    "process listens to it.",
+                    event_type,
+                    exc,
+                )
+            return None
+
+    async def _maybe_route_to_broker(
+        self, event: Any, *, has_local_handler: bool, failed_modules: Collection[str] = ()
+    ) -> None:
         """Send an event to the broker when it crosses processes (direct path).
 
         Routing rules and failure modes live in ``_broker_route_target``.
         Used ONLY by the non-durable dispatch path — inside a transaction the
         runtime persists the route via ``outbox.persist_broker_route`` instead
-        and the send happens after commit (see ``publish``).
+        and the send happens after commit (see ``publish``). ``failed_modules``
+        are the hosted modules whose listener just raised (see
+        ``publisher_modules``).
         """
-        target = self._broker_route_target(event, has_local_handler=has_local_handler)
-        if target is None:
+        route = self._broker_route_target(event, has_local_handler=has_local_handler)
+        if route is None:
+            return
+        target, optional = route
+        payload = self._wire_payload(event, optional=optional)
+        if payload is None:
             return
         registry = self._broker_registry
         assert registry is not None  # _broker_route_target resolved a target
 
         from .builtin.observability import _publish_trace_context, trace_headers
-        from .serializers import JsonEventSerializer
 
         event_type = f"{type(event).__module__}.{type(event).__qualname__}"
-        payload = JsonEventSerializer().serialize(event)
         headers = {"event_type": event_type, **trace_headers(_publish_trace_context())}
-        if self._hosted_module is not None:
-            headers[_PUBLISHER_MODULE_HEADER] = self._hosted_module
+        publishers = self.publisher_modules(failed_modules)
+        if publishers is not None:
+            headers[_PUBLISHER_MODULE_HEADER] = publishers
         await registry.publish(target, payload, headers)
         logger.debug("routed %s to broker target %s", event_type, target)
 
@@ -1460,8 +1569,10 @@ class Runtime:
         self._listener_owners = {}
         self._unresolved_listener_modules = {}
         self._hosted_module = None
+        self._cohosted_modules = ()
         self._consumer_built = False
         self._warned_missing_outbox_store = False
+        self._warned_unroutable = set()
         if self._owned_outbox is not None:
             from .adapters import postgres_outbox
 
@@ -1477,6 +1588,12 @@ class Runtime:
         from . import manifest as _manifest_module
 
         _manifest_module._reset_for_testing()
+        # Each discovery walk clears its import-failure ledger, but a worker
+        # bootstraps without one, so a failure an earlier test recorded would
+        # fail the worker's modulith_after_module_load for a same-named module.
+        from .builtin import discovery as _discovery_module
+
+        _discovery_module._import_failures.clear()
 
     def _teardown_test_resources(self) -> None:
         """Close brokers and clear outbox module state for _reset_for_testing."""

@@ -759,6 +759,11 @@ async def persist_broker_route(event: Any, target: str) -> EventPublication:
     ``EventPublishReceipt`` alongside any per-listener records ``persist()``
     saved for the same publish.
     """
+    return await _persist_broker_payload(event, target, _WIRE_SERIALIZER.serialize(event))
+
+
+async def _persist_broker_payload(event: Any, target: str, payload: bytes) -> EventPublication:
+    """``persist_broker_route`` for an event already encoded with ``_WIRE_SERIALIZER``."""
     from .. import runtime as _rt
 
     assert _store is not None  # owns-dispatch guarantees this
@@ -766,13 +771,12 @@ async def persist_broker_route(event: Any, target: str) -> EventPublication:
         _ensure_retry_loop()
     fqcn = f"{type(event).__module__}.{type(event).__qualname__}"
     carrier = _publish_trace_context()
-    publisher = _rt._runtime._hosted_module
+    publisher = _rt._runtime.publisher_modules()
     if publisher is not None:
-        # Any worker may send this row, so the publisher's module must travel
+        # Any worker may send this row, so the publisher's modules must travel
         # with it. EventPublication has no column for it; every store keeps the
         # carrier as JSON and trace_headers ignores keys it does not know.
         carrier = {**(carrier or {}), _rt._PUBLISHER_MODULE_HEADER: publisher}
-    payload = _WIRE_SERIALIZER.serialize(event)
     _WIRE_SERIALIZER.check_payload_size(payload, "persist")
     pub = EventPublication(
         id=uuid4(),

@@ -30,7 +30,7 @@ runtime tiers. Only configuration does.
 |---|---|---|---|
 | **In-process** | `single`, `outbox=memory` | one process, in-memory event bus | dev, small apps |
 | **Durable in-process** | `single`, `outbox=postgres` | one process, events survive crashes via the outbox | production single-process |
-| **Process-per-module** | `processes` (defaults to `shm`) | one subprocess per module behind a reverse proxy, events routed through the broker | when a module needs its own resource budget |
+| **Process-per-module** | `processes` (defaults to `shm`) | one subprocess per module behind a reverse proxy, or, with `own_process`, one per named module and one shared by the rest; events routed through the broker | when a module needs its own resource budget |
 
 The whole architecture exists to make that promise true: the same `publish()`
 call dispatches in-memory, or writes to a durable outbox, or fans out across
@@ -676,8 +676,11 @@ addition to** any local listeners (fan-out across processes). In single-process
 topology it's an inert marker.
 The publishing module's own listeners run once, in the publishing process. A
 module worker stamps its module package in a `publisher_module` broker header
-(also on an outbox-routed send), and a consumer skips the listeners that module
-owns, so the broker copy reaching the publisher's own worker, or a second
+(also on an outbox-routed send), or every package it hosts, comma-separated,
+when several modules share it, less any whose listener failed during a
+`publish()` outside a transaction, so that module's consumer retries it from
+the copy. A consumer skips the listeners those modules
+own, so the broker copy reaching the publisher's own worker, or a second
 replica of it, does not run them again. Listeners of other modules run from the
 broker copy, as do all listeners for a message without the header (a publisher
 that hosts no module, or one sent before the header existed). So a process that
@@ -685,6 +688,7 @@ hosts no module stamps nothing, and a listener registered both in its own bus
 and in a worker runs in each; listeners must be idempotent under at-least-once
 delivery anyway.
 In process topology an event with no local listener is routed too, without `@externalized`, because its listeners live in other workers.
+A worker that several modules share (`own_process`, §10) routes every event it publishes, local listener or not: it cannot tell which of its modules published, so a local listener may belong to another module, and the publisher's peers in other workers would otherwise miss the event. An event of that kind that cannot be JSON-serialized stays with the worker's own listeners, with a WARNING once per event type, as it would in a worker hosting only its publisher; an `@externalized` event, or one with no local listener, still fails the publish.
 The runtime resolves an event's broker target in
 priority order:
 
@@ -1015,8 +1019,9 @@ surfaces by cost (`modulith/manifest.py` module docstring):
   `modulith verify` in CI / pre-commit, and at bootstrap when
   `strict_boundaries = true`): the rules that need static analysis — no
   cross-module imports of internals, no dependency cycles, cross-module imports
-  match `declared_dependencies`, the contracts module is a sink, and best-effort
-  data-ownership (`owns_tables`). It supports a **ratcheting baseline**
+  match `declared_dependencies`, the contracts module is a sink, best-effort
+  data-ownership (`owns_tables`), and a warning when a module imports an
+  `own_process` module. It supports a **ratcheting baseline**
   (count-aware): grandfather existing violations by a stable hash so you can
   adopt modupy on a messy codebase and enforce "no new violations" while paying
   down the old ones. `strict_boundaries` is off by default, because the scan
@@ -1043,10 +1048,21 @@ split-readiness) with 80%/95% thresholds.
 
 - **The worker** (`modulith/_worker.py`): `create_app()` builds a FastAPI app
   exposing exactly **one** module's HTTP surface (and importing the contracts
-  module if present).
+  module if present), or, when `MODULITH_MODULE` lists several modules, each of
+  theirs under its own prefix. Such a shared worker hosts all of them
+  (`Runtime.host_module`), dispatches between them in memory, and runs one
+  consumer per module in that module's own group, each seeing only its module's
+  listeners (`Runtime.module_bus`).
 - **The supervisor** (`modulith/supervisor.py`): `derive_specs_from_config()`
-  reads the config, discovers modules, and produces one `WorkerSpec` per module
+  reads the config and the module names and produces one `WorkerSpec` per module
   (honoring per-module `[tool.modulith.workers]` counts and port assignment).
+  `modulith run` discovers the names in a short-lived subprocess
+  (`modulith._inspect`) that bootstraps the application, runs the boundary
+  checks and reports which modules serve HTTP, so the supervisor itself imports
+  no application module.
+  With `own_process`, only the named modules get a spec each; the others share
+  one spec named by their modules joined with commas, whose proxy rules route
+  each module's prefix to it and check its identity under that joined name.
   The supervisor spawns one uvicorn subprocess per worker spec, forwards each
   worker's logs, and monitors them. Crash recovery restarts a dead worker with
   **exponential backoff (1 s doubling to 16 s)** plus a crash-loop breaker that
@@ -1071,7 +1087,8 @@ split-readiness) with 80%/95% thresholds.
   request lines (each worker filters its uvicorn lines the same way) so
   credentials aren't persisted, bounds request bodies
   (no response-body cap exists — the response streams through unbounded),
-  aggregates worker `/health` into a single readiness signal, keeps one
+  aggregates worker `/health` into a single readiness signal (a module named in
+  `own_process` that is down reports `degraded` without failing it), keeps one
   connection pool per worker replica so a stalled worker cannot starve the
   others, and supports an optional bearer token on its actuator surface.
 
@@ -1085,7 +1102,8 @@ without the `/<module>` prefix, since the worker adds it. The application's
 `main.py`, with its middleware and lifespan, is not served in a worker.
 
 **No merged OpenAPI document at runtime.** Each worker serves its own schema at
-`/<module>/openapi.json`, and the proxy publishes none of its own
+`/<module>/openapi.json` (a worker several modules share serves one, under its
+first module's prefix), and the proxy publishes none of its own
 (`create_proxy_app` sets `openapi_url=None`). A merged schema is out of scope
 for the supervisor, and not for want of plumbing: the proxy already fans out to
 every worker to aggregate readiness. Four problems keep it out:

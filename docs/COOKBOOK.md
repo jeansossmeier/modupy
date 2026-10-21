@@ -763,8 +763,8 @@ arguments instead.
 
 ![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](images/processes.svg)
 
-**Goal:** run one module in its own process (its own CPU/memory budget) while
-keeping the same module code.
+**Goal:** run one module in its own process while keeping the same module
+code.
 
 Switch topology to process-per-module. With no broker or URL configured,
 modupy selects the stdlib-only, durable local `shm` broker:
@@ -866,6 +866,67 @@ left unmounted and startup logs a warning. Export a token if you want them; see
 
 For Redis Streams, install `modupy[redis]` and set
 `broker = "redis-streams"` explicitly.
+
+### Give one module its own process and keep the rest together
+
+One worker process per module isolates everything, but it also puts a broker hop
+between modules that never needed one. When a single module is the risk — it
+blocks, spins the CPU, leaks memory or crashes — name only that one:
+
+```toml
+[tool.modulith]
+topology = "processes"
+own_process = ["agent"]   # agent alone; every other module shares one worker
+worker_liveness_timeout_seconds = 30   # kill and restart a worker that stops answering
+```
+
+`modulith run` then starts two workers: `agent`, and one that hosts every other
+module. Inside the shared worker the modules talk in memory, as in a single
+process; a hang, CPU spin or crash in `agent` stays in its process, and the
+supervisor restarts it after a crash. The workers still share one host, and
+under `modulith run` one container: a CPU spin slows the others once the cores
+or the container's CPU limit run out, and memory `agent` leaks counts against
+the same limit until the kernel's out-of-memory killer ends a process, usually
+the largest. A worker whose event loop is blocked or
+spinning does not exit, so `worker_liveness_timeout_seconds` has the supervisor
+kill it once its `/health` has gone unanswered that long, then restart it as
+after a crash. A Kubernetes liveness probe cannot do that job: the workers
+listen on 127.0.0.1 inside the container, and a failed container probe restarts
+the proxy and the shared worker with it. Point the readiness probe at
+`/_modulith/health`: while only `agent` is down it answers 200 with
+`"status": "degraded"`, so the API stays in rotation, and it answers 503 once a
+module of the shared worker is down. A client that gives up on a blocked `agent`
+frees its connection, and each worker has its own connection pool in the proxy,
+so requests to the other modules are not held up. The proxy
+routes each module's prefix to the worker that hosts it, and the module code
+does not change.
+
+Each module keeps its own consumer group, `modulith-<module>`, wherever it runs,
+so moving a module in or out of `own_process` does not orphan its undelivered
+messages. The shared worker runs one consumer per module and reports ready only
+while all of them are. It cannot tell which of its modules published an event,
+so it sends every event it publishes to the broker as well, whether or not one
+of its own modules listens: a module in another process receives it without
+`@externalized` (one that cannot be JSON-serialized stays with the shared worker's
+listeners, with a WARNING), and the shared worker's consumers skip the copy, because its
+`publisher_module` header names every module the worker hosts. A `publish()`
+outside a transaction leaves out of the header a module whose listener failed
+during it, so that module's consumer retries the listener from the copy, as it
+would in a worker of its own; a transactional publish needs no such retry,
+since the outbox retries each listener's own row. The shared
+worker serves one OpenAPI schema for all its modules, under the first module's
+prefix (`/billing/docs` for `billing` and `orders`). It runs as many replicas as
+the largest `[tool.modulith.workers]` count among its modules.
+
+Keep the other modules from importing an `own_process` module: the import loads
+its code, and whatever that code does at import time, into the importer's
+process as well. `modulith verify` warns about such an import
+(`own-process-import`); share its events through the contracts module instead.
+
+`own_process` applies only when the process topology runs, like
+`[tool.modulith.workers]`, so a project can keep `topology = "single"` in
+`pyproject.toml` and pass `--topology processes` to `modulith run`.
+`modulith k8s-manifest` still writes one Deployment per module.
 
 ### Durable local SHM default
 

@@ -593,7 +593,7 @@ without those objects: a `broker_message` table the broker created already has
 the `dispatch_started` column.
 
 **What changes:**
-- Each module runs in its own worker process.
+- Each module runs in a worker process: its own by default, or, with `own_process`, the named modules alone and every other module in one worker they share.
 - A reverse proxy (`modulith/proxy.py`) routes HTTP requests to the correct worker.
 - Events published by one module are persisted to the broker database and fanned out to subscribed workers.
 - Listeners in other modules run in their own processes and are invoked via async message dispatch.
@@ -1260,6 +1260,17 @@ reporting = 1
 
 Both approaches start every module on every deployment and differ only in worker counts.
 
+**Approach 3: One fault-prone module apart, the rest in one process**
+
+```toml
+[tool.modulith]
+topology = "processes"
+own_process = ["agent"]
+worker_liveness_timeout_seconds = 30
+```
+
+Only `agent` gets a worker of its own; every other module shares one worker, where they dispatch to each other in memory. A crash, hang or CPU spin in `agent` stays in its process, and the supervisor restarts it after a crash. The processes still share the container's CPU and memory limits, so a spin slows the others once the CPU limit runs out, and a leak ends when the out-of-memory killer ends a process, usually the largest. A worker whose event loop is blocked or spinning does not exit, so `worker_liveness_timeout_seconds` has the supervisor kill it once its `/health` has gone unanswered that long, and restart it as after a crash. No container probe can do that: the workers listen on 127.0.0.1, and a failed container liveness probe restarts every worker with the proxy. While only `agent` is down, readiness answers 200 with `"status": "degraded"`, so the rest of the API stays in rotation (see [Readiness Probe](#readiness-probe-are-the-workers-up)). Each module keeps its `modulith-<module>` consumer group, so moving a module in or out of `own_process` leaves its undelivered messages to its own group. The shared worker is named by its modules joined with commas (`billing,orders`) in logs, `/health` and readiness, runs as many replicas as the largest `[tool.modulith.workers]` count among them, and serves one OpenAPI schema for all of them under the first module's prefix. An unknown name in `own_process` is refused at startup like one in `[tool.modulith.workers]`. `modulith k8s-manifest` ignores `own_process` and still writes one Deployment per module. [COOKBOOK recipe 8](COOKBOOK.md#give-one-module-its-own-process-and-keep-the-rest-together) covers how events cross between the two workers.
+
 **Starting one module on its own.** Two things start a single module without its siblings. `modulith dev myapp.main:app --isolate orders` is for development: the other modules are not started and their routes 404 through the proxy. The worker factory is what the generated Kubernetes manifests and extracted services run: `MODULITH_MODULE=orders MODULITH_APP_PACKAGE=myapp uvicorn modulith._worker:create_app --factory` serves that module's `router` under `/orders`; give it the same broker settings as the rest of the deployment.
 
 ---
@@ -1320,6 +1331,8 @@ open http://localhost:8000/orders/docs            # the orders worker's Swagger 
 open http://localhost:8000/inventory/docs         # a different worker, same public port
 ```
 
+A worker that several modules share (`own_process`) serves one schema covering all of them, under its first module's prefix only: `/billing/openapi.json` and `/billing/docs` for a worker hosting `billing` and `orders`, while `/orders/docs` answers 404.
+
 The same URLs answer on each worker's **internal** port (9001+ by default; `--worker-port-base N` on `modulith run` or `modulith dev`, `[tool.modulith] worker_port_base = N` or `MODULITH_WORKER_PORT_BASE=N` moves the range, and each module takes one consecutive port per replica, so a base and replica counts that run past port 65535 are refused at startup), which is where `kubectl port-forward` reaches them — note the module prefix is part of the path there too: `http://127.0.0.1:9001/orders/docs`, not `/docs`. Give each deployment sharing a host its own range: `modulith run` refuses a `--port` inside its worker range, and the proxy checks a worker's identity before its first request, again after the worker was marked down or foreign, and again after its worker process exits, whether or not the supervisor restarts it. A worker answering for another deployment is marked foreign and gets no requests; the proxy answers 503 when no worker of its own serves the module, and readiness reports the module as `foreign deployment`. Each identity probe is bounded (30 s in total and 64 KiB of body); past the deadline the request gets 504 and the worker is not marked down, so a slow but healthy worker is not turned away. With several replicas of a module, a request whose replica is down, foreign, or past that deadline moves to the next replica it has not tried, so the 502, 503 or 504 comes only once every replica was tried. A request is moved only when nothing of it was sent: a failure after the request went out (a read timeout, a dropped connection) answers 502 at once, so the request never reaches a second replica. Requests arriving while a worker's identity check is in flight wait on that one check instead of starting their own, so a stalled worker holds a single probe connection however many requests queue for it. The deployment token is a secret that no worker response contains. Each identity probe sends a fresh random nonce in an `x-modulith-nonce` header, and the worker answers `/health` with a `"proof"`: an HMAC-SHA256, keyed by the token, over the nonce, the module name and the port the probe arrived on (read from the connection, never from a header). The proxy accepts only the proof it computes itself for that worker's module and port, so a listener that echoes a token, relays the probe to another live worker, or replays an earlier answer is marked foreign. A process that cannot read the workers' environment cannot answer the challenge, which tells this deployment's workers from another deployment's and from a process that took over a dead worker's port. A verified port stays trusted until the worker exits, is marked down, or fails a later probe; the check does not authenticate each connection, and a process running as the same user as the workers can read the token from their environment. The proxy stores no upstream cookie: a `Set-Cookie` reaches only the client that made the request, and each client's own `Cookie` header is forwarded unchanged.
 
 Three consequences worth knowing:
@@ -1328,7 +1341,7 @@ Three consequences worth knowing:
 - Inside a module's prefix, the module's own routes win: a module named `docs` keeps every path under `/docs/*`, and a module defining its own `/docs` route keeps serving it. What loses the collision is the generated doc UI for that one module, never the application's route. The one exception is the worker's own `GET /health`: in a module named `health` it answers before the module's root `GET` route, and startup logs a warning that the module route is unreachable. The proxy never forwards the public path `/health`: it answers 404 for it, with or without a query string or a percent-encoded spelling, so the worker's health JSON (which carries the consumer's error text) is not public. The module's other routes, including `/health/`, still reach it. In a module named `health`, the worker's `GET /health` also hides the index page of a `frontend()` mount at the module root (`router.frontend("/", ...)`), and startup logs no warning for that: through the proxy `/health` answers 404 and `/health/` redirects to it, while the mount's other paths, such as `/health/assets/app.js`, still reach it.
 - Each schema also lists the worker's own unprefixed `/health`. The proxy answers 404 for `/health`, whatever the modules are named, so strip it (or ignore the 404) in anything generated against the public port.
 
-**The supervisor serves no merged, cross-module schema.** Each worker publishes only its own module's schema, and a merged one would have to pick a single answer where two modules define the same model name differently and for the `info` block and security schemes, which belong to each worker.
+**The supervisor serves no merged, cross-module schema.** Each worker publishes only the schema of the modules it hosts, and a merged one would have to pick a single answer where two modules define the same model name differently and for the `info` block and security schemes, which belong to each worker.
 
 If you need one document, build it yourself:
 `modulith openapi` imports every module, generates its document in isolation,
@@ -1389,8 +1402,11 @@ Under `modulith run`, the workers listen on 127.0.0.1 inside the container, so n
 
 ```bash
 curl -H "Authorization: Bearer $MODULITH_ACTUATOR_TOKEN" http://localhost:8000/_modulith/health
-# Fans out to every worker's /health. 200 when all are ok, 503 otherwise.
+# Fans out to every worker's /health. 200 when all are ok, 503 otherwise,
+# except that a module named in own_process never fails it alone.
 ```
+
+The body names each module's state, with `"status": "ok"` when all are `ok` and `"degraded"` otherwise. A module named in `own_process` that is down, or has not started yet, makes it `degraded` but leaves the answer 200, because the modules of the shared worker still serve, so traffic is admitted before that module is up; once a module of the shared worker is down too, it answers 503. Without `own_process`, every module that is down fails it.
 
 Each module reports one of these states: `ok`, `unhealthy` (a replica
 answered `/health` with a non-200 status), `foreign deployment` (the port

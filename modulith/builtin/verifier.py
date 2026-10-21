@@ -80,6 +80,7 @@ RULE_NAMES: frozenset[str] = frozenset(
         "data-ownership",
         "contracts-is-sink",
         "no-cyclic-dependency",
+        "own-process-import",
     }
 )
 
@@ -112,6 +113,16 @@ def _disabled_rules_from_config() -> frozenset[str]:
     if cfg is None:
         return frozenset()
     return frozenset(cfg.verify_disabled_rules)
+
+
+def _configured_own_process() -> frozenset[str]:
+    try:
+        from ..runtime import _runtime
+
+        cfg = _runtime.config
+    except Exception:  # pragma: no cover - defensive; runtime import is stable
+        return frozenset()
+    return frozenset(cfg.own_process) if cfg is not None else frozenset()
 
 
 def _looks_like_rule_typo(name: str) -> bool:
@@ -177,7 +188,7 @@ def modulith_verify_module(
     module: ModuleInfo,
     all_modules: list[ModuleInfo],
 ) -> list[Violation]:
-    """Run the per-module default rules (1, 3, 4, 5, 6) against a module.
+    """Run the per-module default rules (1, 3, 4, 5, 6, 7) against a module.
 
     Aggregating hook: returns one module's violations; other plugins run
     alongside and contribute their own. Cycle detection (rule 2) is global
@@ -209,6 +220,10 @@ def modulith_verify_module(
         violations.extend(_check_data_ownership(module, all_modules))
     if "contracts-is-sink" not in disabled_rules:
         violations.extend(_check_contracts_is_sink(module, imports, all_modules, contracts_module))
+    if "own-process-import" not in disabled_rules:
+        violations.extend(
+            _check_own_process_imports(module, imports, all_modules, _configured_own_process())
+        )
 
     return violations
 
@@ -891,6 +906,46 @@ def _check_declared_dependencies(
                     location=_location(record, module),
                 )
             )
+    return violations
+
+
+def _check_own_process_imports(
+    module: ModuleInfo,
+    imports: list[ImportRecord],
+    all_modules: list[ModuleInfo],
+    own_process: frozenset[str],
+) -> list[Violation]:
+    """Rule 7: no runtime import of a module that runs in a process of its own.
+
+    Importing it loads its code, and whatever that code does at import time,
+    into the importer's process as well, which is what ``own_process`` keeps
+    apart. A warning, since the process topology still works; type-only
+    imports load nothing and are not flagged.
+    """
+    violations: list[Violation] = []
+    for record in imports:
+        owner = _owning_module(record.target_module, all_modules)
+        if (
+            record.type_only
+            or owner is None
+            or owner.package == module.package
+            or owner.name not in own_process
+        ):
+            continue
+        violations.append(
+            Violation(
+                rule="own-process-import",
+                message=(
+                    f"{module.name} imports {record.target_module!r}, but {owner.name} runs "
+                    f"in a process of its own (own_process): the import loads "
+                    f"{owner.name}'s code into {module.name}'s process too. Share the "
+                    f"events through the contracts module instead."
+                ),
+                module=module.name,
+                severity=ViolationSeverity.WARNING,
+                location=_location(record, module),
+            )
+        )
     return violations
 
 

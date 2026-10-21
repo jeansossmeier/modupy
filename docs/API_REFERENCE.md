@@ -384,6 +384,7 @@ Mutating it after the runtime starts would create inconsistent state.
 - `subscription_source: str` = `'manifest'`
 - `actuator_mode: str` = `'auto'`
 - `worker_port_base: int` = `9001`
+- `own_process: tuple[str, ...]` = `()`
 - `worker_liveness_timeout_seconds: float | None` = `None`
 - `auto_discover: bool` = `True`
 - `production: bool` = `False`

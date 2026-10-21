@@ -1602,3 +1602,45 @@ def test_strict_boundaries_warn_only_env_var_does_not_affect_other_values(
     _runtime.configure(package="fakeapp", strict_boundaries=True)
     with pytest.raises(ConfigurationError, match="no-internal-imports"):
         _runtime.ensure_bootstrapped()
+
+
+# ---------------------------------------------------------------------------
+# Rule 7: no runtime import of an own_process module
+# ---------------------------------------------------------------------------
+
+
+def test_importing_an_own_process_module_warns(make_fake_app) -> None:
+    from modulith.runtime import _runtime
+
+    make_fake_app(
+        {
+            "agent": "",
+            "tickets": """
+                from typing import TYPE_CHECKING
+
+                from fakeapp.agent import triage
+
+                if TYPE_CHECKING:
+                    from fakeapp.agent import Triaged
+            """,
+            "activity": "from fakeapp.tickets import open_ticket\n",
+        }
+    )
+    _runtime.configure(package="fakeapp", own_process=["agent"], auto_discover=False)
+    _runtime.ensure_bootstrapped()
+    mods = [_module("agent"), _module("tickets"), _module("activity")]
+
+    flagged = {
+        name: [
+            (v.severity, v.location)
+            for v in verifier.modulith_verify_module(_module(name), mods)
+            if v.rule == "own-process-import"
+        ]
+        for name in ("tickets", "activity", "agent")
+    }
+
+    assert flagged == {
+        "tickets": [(ViolationSeverity.WARNING, "fakeapp/tickets/__init__.py:4")],
+        "activity": [],
+        "agent": [],
+    }

@@ -345,7 +345,7 @@ $ modulith verify
 
 ```bash
 $ modulith run myapp.main:app --topology=processes
-modulith → process-per-module: 3 worker(s) [inventory:9001, orders:9002, payments:9003], reverse proxy on http://0.0.0.0:8000
+modulith → process topology: 3 worker(s) [inventory:9001, orders:9002, payments:9003], reverse proxy on http://0.0.0.0:8000
 ```
 
 ![modulith run starts a main process holding the proxy on port 8000 and the supervisor, plus one worker process per module, connected by the built-in SHM broker](https://github.com/jeansossmeier/modupy/raw/main/docs/images/processes.svg)
