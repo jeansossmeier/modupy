@@ -410,6 +410,10 @@ warn_unreachable = true
 # files to map to `tests.*` module names (which the per-module strictness
 # relaxations below key on) instead of colliding top-level names.
 explicit_package_bases = true
+# examples/agent_desk imports its own package as `desk`, the name it runs under.
+# As a package base its files map to `desk.*`, so those imports resolve and are
+# checked instead of being missing.
+mypy_path = "examples/agent_desk"
 exclude = ["^examples/[^/]+/build/"]
 
 [[tool.mypy.overrides]]
@@ -495,6 +499,18 @@ ignore_missing_imports = true
 # `mypy --strict modulith/ tests/` stays green.
 module = ["nonexistent_debug_module"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# examples/agent_desk runs a LangGraph agent, which no modupy extra installs.
+# CI's typecheck job installs the example's dependencies, so the example is
+# checked against LangGraph's types there. Without LangGraph they are Any, and
+# the stand-in chat model then subclasses Any.
+module = ["langgraph", "langgraph.*", "langchain_core", "langchain_core.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["desk.agent.model"]
+disallow_subclassing_any = false
 
 # ---------------------------------------------------------------------------
 # Self-application of modulith (the framework using itself)

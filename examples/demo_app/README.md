@@ -229,7 +229,10 @@ keeps every port on loopback, which is also what lets the operational
 endpoints answer without a token. Startup logs several warnings about the
 default broker; they are for production deployments and do not affect this
 walkthrough. Four processes now write the one `shop.db`; SQLite serializes
-them, and each write waits its turn.
+them, so a write waits for the one ahead of it, but for five seconds at most
+(the `sqlite3` driver's default timeout). Under a load far heavier than this
+walkthrough's, a write that waits longer fails with "database is locked";
+Postgres (stage 4a) has no such single write lock.
 
 ```bash
 export MODULITH_OUTBOX=postgres MODULITH_OUTBOX_URL=sqlite+aiosqlite:///shop.db
