@@ -19,8 +19,11 @@ Everything else (plugins, hooks, protocols) is for adapter authors.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
+import logging
+import math
 import sys
 from collections.abc import Callable
 from typing import Any, TypeVar, cast, overload
@@ -34,6 +37,32 @@ if sys.version_info >= (3, 14):
 
 T = TypeVar("T")
 F = TypeVar("F", bound=Callable[..., Any])
+
+logger = logging.getLogger(__name__)
+
+
+class ListenerTimeoutError(TimeoutError):
+    """A listener ran past its ``@listener(timeout=...)`` budget.
+
+    Only an ``async def`` listener takes a timeout, and past it the listener's
+    task is cancelled, which stops work that is awaiting a cancellable call.
+    Cancellation is cooperative, though. A listener that awaits in a
+    ``finally`` block raises this only once that await finishes. One that
+    catches ``CancelledError`` and returns completes normally, and the timeout
+    only logs a warning. Work running in a thread is not stopped at all:
+    ``run_in_executor``, ``asyncio.to_thread``, or a library's sync fallback
+    (a LangChain chat model without native async support runs its sync call
+    that way) fails the listener on time while the thread runs on, so the
+    retried delivery can run alongside it. Work that can hang outside a
+    cancellable await is contained by running its module in a process of its
+    own (``own_process``), which can be killed and restarted.
+
+    Every dispatch path treats it as a listener failure: an in-memory publish
+    raises it, the outbox records a failed attempt (retried with backoff,
+    dead-lettered at the threshold) and a cross-process consumer fails the
+    delivery so the broker redelivers it. A ``TimeoutError`` the listener
+    raises itself propagates unchanged.
+    """
 
 
 def event(cls: type[T]) -> type[T]:
@@ -217,6 +246,49 @@ def _normalize_listener_targets(targets: object) -> tuple[str, ...]:
     return tuple(normalized)
 
 
+def _validate_listener_timeout(timeout: object) -> float | None:
+    """Return ``timeout`` as seconds, or None when the listener is unbounded."""
+    if timeout is None:
+        return None
+    if isinstance(timeout, bool) or not isinstance(timeout, int | float):
+        raise TypeError(f"listener timeout must be a number of seconds, got {timeout!r}")
+    try:
+        seconds = float(timeout)
+    except OverflowError:  # an int too large for a float
+        seconds = math.inf
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"listener timeout must be a finite number above 0, got {timeout!r}")
+    return seconds
+
+
+def _bounded(registered: Callable[..., Any], seconds: float) -> Callable[..., Any]:
+    """Wrap a registered async listener so one invocation fails after ``seconds``."""
+
+    @functools.wraps(registered)
+    async def bounded(event: Any) -> None:
+        budget = asyncio.timeout(seconds)
+        try:
+            async with budget:
+                await registered(event)
+        # A TaskGroup inside the listener reports its cancelled children as a
+        # group, which asyncio.timeout does not turn into TimeoutError.
+        except (TimeoutError, BaseExceptionGroup) as exc:
+            if not budget.expired():
+                raise
+            raise ListenerTimeoutError(
+                f"listener {bounded.__qualname__} did not finish within {seconds}s"
+            ) from exc
+        if budget.expired():
+            logger.warning(
+                "listener %s returned after its %ss timeout: it caught the "
+                "cancellation instead of stopping, so its work ran past the budget",
+                bounded.__qualname__,
+                seconds,
+            )
+
+    return bounded
+
+
 # Both call forms are overloaded so a decorated function keeps its own
 # signature downstream. With only the ``-> Any`` implementation signature,
 # type checkers erase every ``@listener`` function to ``Any`` — silently
@@ -229,13 +301,16 @@ def listener(func: F) -> F: ...
 
 
 @overload
-def listener(*, broker_targets: list[str] | tuple[str, ...] = ()) -> Callable[[F], F]: ...
+def listener(
+    *, broker_targets: list[str] | tuple[str, ...] = (), timeout: float | None = None
+) -> Callable[[F], F]: ...
 
 
 def listener(
     func: F | None = None,
     *,
     broker_targets: list[str] | tuple[str, ...] = (),
+    timeout: float | None = None,
 ) -> Any:
     """Register a listener for a specific event type.
 
@@ -256,10 +331,23 @@ def listener(
         def send_email(event: OrderCreated) -> None:
             mailer.send(event.order_id)   # sync, runs in threadpool
 
-    Errors in registration (missing annotation, etc.) raise TypeError
-    with a message explaining what to fix.
+        @listener(timeout=30)
+        async def summarize(event: OrderCreated) -> None:
+            await llm.summarize(event.order_id)   # fails after 30 s
+
+    ``timeout`` bounds each invocation of an ``async def`` listener, in
+    seconds; None (the default) leaves it unbounded. Past it the listener is
+    cancelled and fails with ``ListenerTimeoutError`` on every dispatch path;
+    see that class for what cancellation can and cannot stop. A plain ``def``
+    listener rejects a timeout: its thread cannot be stopped, so the retried
+    delivery would run alongside the call still running.
+
+    Errors in registration (missing annotation, a timeout on a sync listener,
+    etc.) raise TypeError with a message explaining what to fix; an
+    out-of-range timeout raises ValueError.
     """
     normalized_targets = _normalize_listener_targets(broker_targets)
+    seconds = _validate_listener_timeout(timeout)
 
     def register(handler: F) -> F:
         # functools.wraps chains can hide an async target behind a sync wrapper.
@@ -278,6 +366,14 @@ def listener(
                 target_is_async = True
                 resolve_target = call
         event_type = _resolve_event_type(handler, resolve_target)
+        if seconds is not None and not target_is_async:
+            raise TypeError(
+                f"listener {getattr(handler, '__qualname__', repr(handler))} is a plain "
+                "def, which cannot take a timeout: its call runs on a thread that "
+                "cannot be stopped, so the retried delivery would run alongside the "
+                "call still running. Make it async def, or leave it unbounded and run "
+                "its module in a process of its own (own_process)."
+            )
         registered: Callable[..., Any]
 
         # A bound method rejects attribute assignment, so it registers through
@@ -304,17 +400,32 @@ def listener(
 
             registered = wrap_sync_listener(handler)
 
+        if seconds is not None:
+            registered = _bounded(registered, seconds)
+            registered.__modulith_sync_wrapped__ = handler  # type: ignore[attr-defined]
+
         if inspect.ismethod(handler):
             # outbox._listener_id adds the owning module package to a bound
             # method's id only when it sees a method or this marker, and the
             # registered adapter or wrapper is not a method.
             registered.__modulith_instance_listener__ = True  # type: ignore[union-attr]
         if registered is not handler and not hasattr(handler, "__qualname__"):
-            # A callable instance has no __qualname__, so functools.wraps leaves
-            # the adapter's own and every instance in a module would share one
-            # outbox listener id. Its class name is distinct and restart-stable.
-            registered.__qualname__ = type(handler).__qualname__
-            registered.__modulith_instance_listener__ = True  # type: ignore[union-attr]
+            named: Callable[..., Any] = handler
+            while isinstance(named, functools.partial):
+                named = named.func
+            if hasattr(named, "__qualname__"):
+                # A partial carries no name of its own. outbox._listener_id
+                # names a bare one by the function it wraps, so a wrapper over
+                # it takes that function's name and keeps the same id.
+                registered.__qualname__ = named.__qualname__
+                registered.__module__ = named.__module__
+            else:
+                # A callable instance has no __qualname__, so functools.wraps
+                # leaves the adapter's own and every instance in a module would
+                # share one outbox listener id. Its class name is distinct and
+                # restart-stable.
+                registered.__qualname__ = type(named).__qualname__
+                registered.__modulith_instance_listener__ = True  # type: ignore[union-attr]
 
         registered.__modulith_broker_targets__ = normalized_targets  # type: ignore[union-attr]
         _runtime.register_listener(event_type, registered)

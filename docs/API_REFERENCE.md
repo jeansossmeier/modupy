@@ -21,6 +21,7 @@ The package also exports `__version__` (the installed package version).
   - [`publish`](#publish)
   - [`publish_sync`](#publish_sync)
   - [`PublishSyncTimeout`](#publishsynctimeout)
+  - [`ListenerTimeoutError`](#listenertimeouterror)
   - [`configure`](#configure)
   - [`bootstrap`](#bootstrap)
   - [`externalized`](#externalized)
@@ -80,7 +81,7 @@ Example:
 ### `listener`
 
 ```python
-def listener(func: F | None = None, *, broker_targets: list[str] | tuple[str, ...] = ()) -> Any:
+def listener(func: F | None = None, *, broker_targets: list[str] | tuple[str, ...] = (), timeout: float | None = None) -> Any:
 ```
 
 Register a listener for a specific event type.
@@ -102,8 +103,20 @@ Example:
     def send_email(event: OrderCreated) -> None:
         mailer.send(event.order_id)   # sync, runs in threadpool
 
-Errors in registration (missing annotation, etc.) raise TypeError
-with a message explaining what to fix.
+    @listener(timeout=30)
+    async def summarize(event: OrderCreated) -> None:
+        await llm.summarize(event.order_id)   # fails after 30 s
+
+``timeout`` bounds each invocation of an ``async def`` listener, in
+seconds; None (the default) leaves it unbounded. Past it the listener is
+cancelled and fails with ``ListenerTimeoutError`` on every dispatch path;
+see that class for what cancellation can and cannot stop. A plain ``def``
+listener rejects a timeout: its thread cannot be stopped, so the retried
+delivery would run alongside the call still running.
+
+Errors in registration (missing annotation, a timeout on a sync listener,
+etc.) raise TypeError with a message explaining what to fix; an
+out-of-range timeout raises ValueError.
 
 ### `publish`
 
@@ -200,6 +213,31 @@ without the dedicated type the two are indistinguishable and the
 testing plugin's scenario runner would swallow real application failures
 as budget overruns. Subclasses TimeoutError, so
 ``except TimeoutError`` handlers also catch it.
+
+### `ListenerTimeoutError`
+
+*Exception — subclasses `TimeoutError`.*
+
+A listener ran past its ``@listener(timeout=...)`` budget.
+
+Only an ``async def`` listener takes a timeout, and past it the listener's
+task is cancelled, which stops work that is awaiting a cancellable call.
+Cancellation is cooperative, though. A listener that awaits in a
+``finally`` block raises this only once that await finishes. One that
+catches ``CancelledError`` and returns completes normally, and the timeout
+only logs a warning. Work running in a thread is not stopped at all:
+``run_in_executor``, ``asyncio.to_thread``, or a library's sync fallback
+(a LangChain chat model without native async support runs its sync call
+that way) fails the listener on time while the thread runs on, so the
+retried delivery can run alongside it. Work that can hang outside a
+cancellable await is contained by running its module in a process of its
+own (``own_process``), which can be killed and restarted.
+
+Every dispatch path treats it as a listener failure: an in-memory publish
+raises it, the outbox records a failed attempt (retried with backoff,
+dead-lettered at the threshold) and a cross-process consumer fails the
+delivery so the broker redelivers it. A ``TimeoutError`` the listener
+raises itself propagates unchanged.
 
 ### `configure`
 
