@@ -1231,17 +1231,26 @@ async def test_renewed_claim_is_not_reclaimed_by_peer(engine: Any) -> None:
     )
     assert len(first) == 1
 
-    # Age the claim past the peer's stale window, then renew it. Generous
-    # margins (0.5s slept vs a 0.25s peer window = 2x, and the renewal stamp
-    # only gets FRESHER if the runner stalls) — no upper-bound race.
-    await asyncio.sleep(0.5)
+    # Age the claim two hours past the peer's 60s window, then renew it. The
+    # renewal stamp goes stale for the peer only once the window has passed,
+    # so a stamp written into the past leaves the runner a full minute between
+    # renewing and the peer's claim, where sleeping past a short window left
+    # it the window alone.
+    from sqlalchemy import update
+
+    _, _, message = broker_schema()
+    long_ago = datetime.now(UTC) - timedelta(hours=2)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(message).where(message.c.id == first[0]["id"]).values(claimed_at=long_ago)
+        )
     assert await broker.renew_claims([first[0]["id"]], consumer_name="c1") == 1
 
-    # The peer's cutoff (now - 0.25s) predates the renewal stamp (~now), so the
+    # The peer's cutoff (now - 60s) predates the renewal stamp (~now), so the
     # row is NOT handed out — without the renewal this claim would win (see
     # test_orphaned_claim_is_reclaimed_after_visibility_timeout).
     stolen = await broker.claim_batch(
-        "modulith-inventory", batch_size=10, consumer_name="c2", reclaim_stale_seconds=0.25
+        "modulith-inventory", batch_size=10, consumer_name="c2", reclaim_stale_seconds=60.0
     )
     assert stolen == []
 
