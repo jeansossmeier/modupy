@@ -3,8 +3,10 @@
 Real ``uvicorn`` workers on the local SHM broker: ``agent`` runs alone, while
 ``orders`` and ``billing`` share a worker. An order placed through the proxy
 reaches billing in-process and the agent across the process boundary, and the
-agent's reply crosses back to orders. Each listener runs exactly once, and the
-proxy checks each worker's identity under the name it runs as.
+agent's reply crosses back to orders. A note only billing consumes stays in the
+shared worker, so the broker's payload cap does not apply to it. Each listener
+runs exactly once, and the proxy checks each worker's identity under the name it
+runs as.
 """
 
 from __future__ import annotations
@@ -46,13 +48,19 @@ _MODULES = {
         class OrderTriaged:
             order_id: str
             pid: int
+
+        @event
+        @dataclass(frozen=True)
+        class OrderNoted:
+            order_id: str
+            text: str
     """,
     "orders": """
         import os
 
         from fastapi import APIRouter
         from modulith import listener, publish
-        from deskapp.contracts import OrderPlaced, OrderTriaged
+        from deskapp.contracts import OrderNoted, OrderPlaced, OrderTriaged
 
         router = APIRouter()
         triaged: list[dict] = []
@@ -60,6 +68,7 @@ _MODULES = {
         @router.post("/place")
         async def place(order_id: str) -> dict:
             await publish(OrderPlaced(order_id=order_id))
+            await publish(OrderNoted(order_id=order_id, text="x" * 2048))
             return {"order_id": order_id, "pid": os.getpid()}
 
         @router.get("/triaged")
@@ -75,18 +84,23 @@ _MODULES = {
 
         from fastapi import APIRouter
         from modulith import listener
-        from deskapp.contracts import OrderPlaced
+        from deskapp.contracts import OrderNoted, OrderPlaced
 
         router = APIRouter()
         billed: list[dict] = []
+        noted: list[str] = []
 
         @router.get("/billed")
         async def get_billed() -> dict:
-            return {"billed": billed}
+            return {"billed": billed, "noted": noted}
 
         @listener
         async def bill(evt: OrderPlaced) -> None:
             billed.append({"order_id": evt.order_id, "pid": os.getpid()})
+
+        @listener
+        async def note(evt: OrderNoted) -> None:
+            noted.append(evt.order_id)
     """,
     "agent": """
         import os
@@ -131,6 +145,7 @@ async def test_agent_in_its_own_worker_and_the_rest_sharing_one(
         "MODULITH_BROKER_SQLITE_PATH": str(state_dir / "broker.db"),
         "MODULITH_BROKER_HINT_PATH": str(state_dir / "broker.hints"),
         "MODULITH_BROKER_POLL_INTERVAL_MS": "10",
+        "MODULITH_BROKER_MAX_PAYLOAD_BYTES": "1024",
         "PYTHONPATH": f"{tmp_path}{os.pathsep}{_REPO_ROOT}",
         "MODULITH_DEPLOYMENT_TOKEN": token,
     }
@@ -138,7 +153,13 @@ async def test_agent_in_its_own_worker_and_the_rest_sharing_one(
     shared_port = agent_port + 1
     specs = [
         WorkerSpec("agent", "deskapp", agent_port, env=dict(worker_env), own_process=True),
-        WorkerSpec("billing,orders", "deskapp", shared_port, env=dict(worker_env)),
+        WorkerSpec(
+            "billing,orders",
+            "deskapp",
+            shared_port,
+            # What modulith run derives: agent, outside this worker, consumes OrderPlaced.
+            env={**worker_env, "MODULITH_REMOTE_EVENT_TYPES": "deskapp.contracts.OrderPlaced"},
+        ),
     ]
     supervisor = Supervisor(specs, shutdown_timeout=5.0)
     try:
@@ -183,14 +204,15 @@ async def test_agent_in_its_own_worker_and_the_rest_sharing_one(
             await _until_async(lambda: replied("o-2"), timeout=20.0)
             await asyncio.sleep(0.5)
 
-            billed = (await client.get("/billing/billed")).json()["billed"]
+            billing = (await client.get("/billing/billed")).json()
             replies = (await client.get("/orders/triaged")).json()["triaged"]
 
         assert (readiness.status_code, readiness.json()) == (
             200,
             {"status": "ok", "backends": {"/agent": "ok", "/billing": "ok", "/orders": "ok"}},
         )
-        assert billed == [
+        assert billing["noted"] == ["o-1", "o-2"]
+        assert billing["billed"] == [
             {"order_id": "o-1", "pid": shared_pid},
             {"order_id": "o-2", "pid": shared_pid},
         ]

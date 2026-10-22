@@ -212,6 +212,44 @@ def test_derive_specs_marks_only_the_modules_own_process_splits_out(make_fake_ap
     assert [s.own_process for s in unset] == [False, False, False]
 
 
+def test_derive_specs_tells_the_shared_worker_which_events_a_module_elsewhere_consumes() -> None:
+    specs = derive_specs_from_config(
+        {
+            "package": "fakeapp",
+            "modules": ["agent", "billing", "orders", "shipping"],
+            "own_process": ["agent", "shipping"],
+            "env": {"UVICORN_LOG_LEVEL": "info"},
+            "consumers": {
+                "fakeapp.orders.OrderPlaced": ["agent", "billing"],
+                "fakeapp.orders.Invoiced": ["billing", "orders"],
+                "fakeapp.orders.Shipped": ["shipping"],
+            },
+        }
+    )
+
+    envs = {s.module_name: s.env for s in specs}
+    assert envs["billing,orders"] == {
+        "UVICORN_LOG_LEVEL": "info",
+        "MODULITH_REMOTE_EVENT_TYPES": "fakeapp.orders.OrderPlaced,fakeapp.orders.Shipped",
+    }
+    assert envs["agent"] == envs["shipping"] == {"UVICORN_LOG_LEVEL": "info"}
+
+
+def test_a_worker_never_inherits_a_remote_event_list_from_the_supervisor(monkeypatch) -> None:
+    """Without the list the supervisor built for it, a shared worker sends every event."""
+    from modulith.supervisor import _build_worker_env
+
+    monkeypatch.setenv("MODULITH_REMOTE_EVENT_TYPES", "fakeapp.orders.OrderPlaced")
+
+    unset = _build_worker_env(WorkerSpec("billing,orders", "fakeapp", 9001))
+    given = _build_worker_env(
+        WorkerSpec("billing,orders", "fakeapp", 9001, env={"MODULITH_REMOTE_EVENT_TYPES": ""})
+    )
+
+    assert "MODULITH_REMOTE_EVENT_TYPES" not in unset
+    assert given["MODULITH_REMOTE_EVENT_TYPES"] == ""
+
+
 def test_rules_from_specs_carry_the_own_process_mark_to_each_prefix() -> None:
     specs = [
         WorkerSpec("agent", "app", 9001, own_process=True),
