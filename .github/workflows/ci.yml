@@ -212,10 +212,12 @@ jobs:
         # constraint (no duplicated ad-hoc pin here that could drift from
         # pyproject.toml) and pulls the integration extras so mypy can
         # resolve the imports in tests/ (testcontainers, asyncpg, psycopg).
-        # `-r` adds examples/agent_desk's dependencies, LangGraph among them,
-        # so the example is checked against LangGraph's types; this job alone
+        # Each `-r` adds an AI example's dependencies, LangGraph among them,
+        # so the examples are checked against LangGraph's types; this job alone
         # installs them. The editable `.` stays the modupy they resolve to.
-        run: uv pip install --system -e ".[dev]" -r examples/agent_desk/pyproject.toml
+        run: >-
+          uv pip install --system -e ".[dev]"
+          -r examples/agent_desk/pyproject.toml -r examples/ai_studio/pyproject.toml
 
       - name: Type check
         # tests/ is type-checked too; per-module strictness relaxations for

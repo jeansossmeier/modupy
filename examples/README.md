@@ -1,6 +1,6 @@
 # Examples
 
-Three runnable projects, each one step up in scale, a fourth that keeps an AI agent from taking the API down, plus three single-file references for extending modupy. CI executes every command in each project's README exactly as written, so the README is the tutorial and the test at once.
+Three runnable projects, each one step up in scale, two that put AI features in a modupy app, plus three single-file references for extending modupy. CI executes every command in each project's README exactly as written, so the README is the tutorial and the test at once.
 
 | Project | Scale | What it teaches | Infrastructure |
 |---|---|---|---|
@@ -11,6 +11,8 @@ Three runnable projects, each one step up in scale, a fourth that keeps an AI ag
 Read them in order: each one assumes you know the projects before it, and none repeats their lessons.
 
 [`agent_desk`](agent_desk/) stands apart from that sequence and assumes `demo_app`. A help desk whose `agent` module runs a LangGraph graph. `own_process = ["agent"]` gives the agent a process of its own while the other modules share one, and its benchmark measures the API while the agent hangs, blocks or crashes. Infrastructure: a SQLite file.
+
+[`ai_studio`](ai_studio/) builds on `agent_desk`: a shop's reviews with three AI modules of different shapes in the same codebase. A local moderation model consumes events in a process of its own, a LangGraph agent drafts replies under a listener timeout, and a summary route answers 504 when its model call runs past its deadline. Its README crashes moderation while the other modules keep answering. Infrastructure: a SQLite file.
 
 The projects live in this repository, not in the installed package. Clone it and change into one project's directory, for example `git clone https://github.com/jeansossmeier/modupy` and then `cd modupy/examples/quickstart`; every command in that project's README runs from there.
 

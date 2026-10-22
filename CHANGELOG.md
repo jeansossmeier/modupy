@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `examples/ai_studio` keeps three AI modules of different shapes beside a shop's `reviews` module in one codebase: `moderation` runs a local model on each new review in a process of its own (`own_process = ["moderation"]`), `replies` drafts a reply with a LangGraph agent under `@listener(timeout=30)`, and `summaries` answers `GET /summaries/{product}` within an `asyncio.timeout`, with a 504 past it. Each stand-in model fails on demand through `STUDIO_<MODULE>_FAULT`. Its README hangs the summarizer in one process, then crashes moderation under `--topology processes` while reviews, replies and summaries keep answering. CI type-checks it against LangGraph and runs its README from the built wheel only, as for `agent_desk`.
+
 ### Fixed
 
 - Under `own_process`, a worker that hosts several modules no longer sends every event it publishes to the broker. While the broker was unreachable, or for an event over its `max_payload_bytes`, a `publish()` outside a transaction raised after the worker's own listeners had run, so the request failed and a client's retry ran them again, even for an event no module in another process listens to. `modulith run` now works out, in the subprocess that inspects the application, which event types a module outside that worker consumes and hands it the list as `MODULITH_REMOTE_EVENT_TYPES`; the worker sends only those to the broker, plus the copy that retries one of its own listeners that failed during a `publish()` outside a transaction. Any other event its modules listen to stays in memory, as in one process. A listener in a file outside its module's package, such as `app/shared.py`, counts as consumed everywhere, since the module that owns it can differ between workers. A worker started without the list, by hand or from a manifest you wrote, still sends every event. The list is built when `modulith run` starts, so a worker of its own that restarts with code listening to an event the list lacks logs an ERROR saying to restart `modulith run`.
