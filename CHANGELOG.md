@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Under the process topology `modulith run` and `modulith dev` warn at startup about what the app they name sets up that no worker runs: its middleware, its app-level dependencies, the dependencies it adds to a module's routes through `include_router`, and its exception handlers, each by name. A worker mounts only the module's `router`, so a login check kept in `main.py` silently stopped guarding the module's routes. The warning says to put such a check on the module's own router, `APIRouter(dependencies=[...])`, and app-wide middleware such as CORS in a proxy in front of modupy. It never stops the command: an app whose import raises is skipped with a note. The app's lifespan is not reported, since the usual one only bootstraps and starts the outbox, which a worker does itself.
+
 ### Fixed
 
 - Under `own_process`, a worker that hosts several modules no longer sends every event it publishes to the broker. While the broker was unreachable, or for an event over its `max_payload_bytes`, a `publish()` outside a transaction raised after the worker's own listeners had run, so the request failed and a client's retry ran them again, even for an event no module in another process listens to. `modulith run` now works out, in the subprocess that inspects the application, which event types a module outside that worker consumes and hands it the list as `MODULITH_REMOTE_EVENT_TYPES`; the worker sends only those to the broker, plus the copy that retries one of its own listeners that failed during a `publish()` outside a transaction. Any other event its modules listen to stays in memory, as in one process. A listener in a file outside its module's package, such as `app/shared.py`, counts as consumed everywhere, since the module that owns it can differ between workers. A worker started without the list, by hand or from a manifest you wrote, still sends every event. The list is built when `modulith run` starts, so a worker of its own that restarts with code listening to an event the list lacks logs an ERROR saying to restart `modulith run`.
