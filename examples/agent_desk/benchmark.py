@@ -1,4 +1,4 @@
-"""Measure the tickets API while the agent hangs, blocks or crashes.
+"""Measure the tickets API while the agent hangs, blocks, crashes or slows down.
 
 Each run serves a fresh copy of this directory with one topology and one
 ``DESK_AGENT_FAULT``, opens a seed ticket so the agent starts on it, then sends
@@ -8,6 +8,12 @@ longer than the client timeout counts as taking the whole timeout, so a dead
 server cannot report fast percentiles. The agent runs with a short
 ``DESK_AGENT_TIMEOUT``, recorded in each row, so a hung call is cancelled and
 retried within the row.
+
+``--postgres`` serves each run from a fresh database on a Postgres server
+instead of SQLite, where the desk's engine has SQLAlchemy's default connection
+pool, and records the most connections the database had open at once. With
+``--hold-session`` the agent keeps its session open across the model calls, so
+the ``slow`` fault measures a pile-up of waiting calls.
 """
 
 import argparse
@@ -23,6 +29,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -31,10 +38,17 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import psycopg
+from psycopg import sql
+from psycopg.conninfo import make_conninfo
+from sqlalchemy.engine import make_url
 
 HERE = Path(__file__).resolve().parent
-FAULTS = ("none", "hang", "block", "crash")
+FAULTS = ("none", "hang", "block", "crash", "slow")
+# slow is opt-in: under the default 2 s agent timeout it fails like a hang.
+DEFAULT_FAULTS = ("none", "hang", "block", "crash")
 TOPOLOGIES = ("single", "processes")
+POSTGRES_DATABASE = "desk_benchmark"
 CLIENT_TIMEOUT = 2.0
 # The default 30 s would outlast a row, so a hang would never reach its timeout.
 # At 2 s, --topology processes dead-letters the seed ticket after its fifth
@@ -79,7 +93,47 @@ def status_of(port: int, path: str) -> int | None:
         return None
 
 
-def open_seed_ticket(port: int, topology: str) -> None:
+def recreate_database(server: str) -> str:
+    """Drop and create the benchmark database on ``server``; the desk's URL for it."""
+    with psycopg.connect(server, autocommit=True) as admin:
+        name = sql.Identifier(POSTGRES_DATABASE)
+        admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(name))
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(name))
+    url = make_url(server).set(drivername="postgresql+psycopg", database=POSTGRES_DATABASE)
+    return url.render_as_string(hide_password=False)
+
+
+class ConnectionPeak(threading.Thread):
+    """Samples the benchmark database's open connections, keeping the most seen at once."""
+
+    def __init__(self, server: str) -> None:
+        super().__init__(daemon=True)
+        self.server = server
+        self.peak = 0
+        self.stopping = threading.Event()
+
+    def run(self) -> None:
+        with psycopg.connect(self.server, autocommit=True) as monitor:
+            while not self.stopping.wait(0.5):
+                row = monitor.execute(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = %s",
+                    (POSTGRES_DATABASE,),
+                ).fetchone()
+                self.peak = max(self.peak, row[0] if row else 0)
+
+
+def count_triaged(workdir: Path, postgres: str | None) -> int:
+    query = "SELECT count(*) FROM agent_triage"
+    if postgres is None:
+        with closing(sqlite3.connect(workdir / "desk.db")) as database:
+            (count,) = database.execute(query).fetchone()
+    else:
+        with psycopg.connect(make_conninfo(postgres, dbname=POSTGRES_DATABASE)) as database:
+            (count,) = database.execute(query).fetchone() or (0,)
+    return int(count)
+
+
+def open_seed_ticket(port: int, topology: str, client_timeout: float) -> None:
     # The proxy answers before its workers do; its health turns 200 once they all do.
     path, ready = ("/_modulith/health", 200) if topology == "processes" else ("/tickets/seed", 404)
     deadline = time.monotonic() + 60
@@ -93,16 +147,18 @@ def open_seed_ticket(port: int, topology: str) -> None:
         data=seed.encode(),
         headers={"content-type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=CLIENT_TIMEOUT):
+    with urllib.request.urlopen(request, timeout=client_timeout):
         pass
     time.sleep(1)  # the agent picks the seed ticket up and fails as told
 
 
-async def drive(port: int, rate: float, seconds: float) -> list[tuple[float, bool, bool]]:
+async def drive(
+    port: int, rate: float, seconds: float, client_timeout: float
+) -> list[tuple[float, bool, bool]]:
     """(latency, ok, opened a ticket) for each request sent."""
     limits = httpx.Limits(max_connections=1000)
     async with httpx.AsyncClient(
-        base_url=f"http://127.0.0.1:{port}", timeout=CLIENT_TIMEOUT, limits=limits
+        base_url=f"http://127.0.0.1:{port}", timeout=client_timeout, limits=limits
     ) as client:
 
         async def send(number: int) -> tuple[float, bool, bool]:
@@ -118,7 +174,7 @@ async def drive(port: int, rate: float, seconds: float) -> list[tuple[float, boo
             except httpx.HTTPError:
                 ok = False
             latency = time.perf_counter() - started
-            return (min(latency, CLIENT_TIMEOUT) if ok else CLIENT_TIMEOUT, ok, opens)
+            return (min(latency, client_timeout) if ok else client_timeout, ok, opens)
 
         start = time.perf_counter()
         sent = []
@@ -141,14 +197,28 @@ def stop(server: subprocess.Popen[bytes]) -> None:
 
 
 def run(
-    topology: str, fault: str, rate: float, seconds: float, port_base: int | None
+    topology: str,
+    fault: str,
+    rate: float,
+    seconds: float,
+    port_base: int | None,
+    *,
+    client_timeout: float = CLIENT_TIMEOUT,
+    agent_timeout: float = AGENT_TIMEOUT,
+    postgres: str | None = None,
+    hold_session: bool = False,
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as scratch:
         workdir = Path(scratch) / "desk"
         shutil.copytree(HERE, workdir, ignore=COPY_IGNORE)
         env = {key: value for key, value in os.environ.items() if not key.startswith("MODULITH_")}
         env["DESK_AGENT_FAULT"] = "" if fault == "none" else fault
-        env["DESK_AGENT_TIMEOUT"] = str(AGENT_TIMEOUT)
+        env["DESK_AGENT_TIMEOUT"] = str(agent_timeout)
+        env["DESK_AGENT_HOLD_SESSION"] = "1" if hold_session else ""
+        connections = None
+        if postgres is not None:
+            env["MODULITH_OUTBOX_URL"] = recreate_database(postgres)
+            connections = ConnectionPeak(postgres)
         python = sys.executable
         subprocess.run([python, "-m", "modulith", "migrate"], cwd=workdir, env=env, check=True)
         subprocess.run([python, "-m", "desk.schema"], cwd=workdir, env=env, check=True)
@@ -181,24 +251,31 @@ def run(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+        if connections is not None:
+            connections.start()
         try:
-            open_seed_ticket(port, topology)
-            results = asyncio.run(drive(port, rate, seconds))
+            open_seed_ticket(port, topology, client_timeout)
+            results = asyncio.run(drive(port, rate, seconds, client_timeout))
             alive = server.poll() is None
         except BaseException:
             sys.stderr.write((workdir / "server.log").read_text(errors="replace")[-5000:])
             raise
         finally:
             stop(server)
-        with closing(sqlite3.connect(workdir / "desk.db")) as database:
-            (triaged,) = database.execute("SELECT count(*) FROM agent_triage").fetchone()
+            if connections is not None:
+                connections.stopping.set()
+                connections.join()
+        triaged = count_triaged(workdir, postgres)
         server_log = (workdir / "server.log").read_text(errors="replace")
     latencies = [latency * 1000 for latency, _, _ in results]
     percentiles = statistics.quantiles(latencies, n=100, method="inclusive")
     return {
         "topology": topology,
         "fault": fault,
-        "agent_timeout_s": AGENT_TIMEOUT,
+        "agent_timeout_s": agent_timeout,
+        "client_timeout_s": client_timeout,
+        "database": "sqlite" if postgres is None else "postgres",
+        "hold_session": hold_session,
         "requests": len(results),
         "errors": sum(not ok for _, ok, _ in results),
         "p50_ms": round(percentiles[49], 1),
@@ -208,6 +285,7 @@ def run(
         "tickets_triaged": triaged,
         "server_alive": alive,
         "agent_restarts": server_log.count("worker agent exited with code"),
+        "peak_connections": None if connections is None else connections.peak,
     }
 
 
@@ -215,13 +293,35 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--seconds", type=float, default=15.0)
     parser.add_argument("--rate", type=float, default=50.0, help="requests per second")
-    parser.add_argument("--faults", default=",".join(FAULTS))
+    parser.add_argument(
+        "--faults", default=",".join(DEFAULT_FAULTS), help=f"any of {', '.join(FAULTS)}"
+    )
     parser.add_argument("--topologies", default=",".join(TOPOLOGIES))
     parser.add_argument("--output", type=Path, default=HERE / "bench-results.json")
     parser.add_argument(
         "--port-base",
         type=int,
         help="first of the three ports a run serves on (default: a free block at random)",
+    )
+    parser.add_argument(
+        "--client-timeout",
+        type=float,
+        default=CLIENT_TIMEOUT,
+        help="seconds a request may take before it counts as failed",
+    )
+    parser.add_argument(
+        "--agent-timeout", type=float, default=AGENT_TIMEOUT, help="the agent's DESK_AGENT_TIMEOUT"
+    )
+    parser.add_argument(
+        "--postgres",
+        metavar="URL",
+        help=f"a Postgres server; each run recreates the database {POSTGRES_DATABASE} on it "
+        "and serves the desk from it instead of SQLite",
+    )
+    parser.add_argument(
+        "--hold-session",
+        action="store_true",
+        help="the agent keeps its session open across the model calls",
     )
     args = parser.parse_args()
     faults = [name.strip() for name in args.faults.split(",")]
@@ -233,17 +333,27 @@ def main() -> None:
     rows = []
     print(
         f"{'topology':<10} {'fault':<6} {'errors':>7} {'p50 ms':>8} {'p95 ms':>8} "
-        f"{'p99 ms':>8} {'triaged':>8} {'restarts':>9}"
+        f"{'p99 ms':>8} {'triaged':>8} {'restarts':>9} {'conns':>6}"
     )
     for topology in topologies:
         for fault in faults:
-            row = run(topology, fault, args.rate, args.seconds, args.port_base)
+            row = run(
+                topology,
+                fault,
+                args.rate,
+                args.seconds,
+                args.port_base,
+                client_timeout=args.client_timeout,
+                agent_timeout=args.agent_timeout,
+                postgres=args.postgres,
+                hold_session=args.hold_session,
+            )
             rows.append(row)
             print(
                 f"{topology:<10} {fault:<6} {row['errors'] / row['requests']:>7.0%} "
                 f"{row['p50_ms']:>8} {row['p95_ms']:>8} {row['p99_ms']:>8} "
                 f"{row['tickets_triaged']:>4}/{row['tickets_opened']:<3} "
-                f"{row['agent_restarts']:>9}",
+                f"{row['agent_restarts']:>9} {row['peak_connections'] or '-':>6}",
                 flush=True,
             )
     args.output.write_text(json.dumps(rows, indent=2) + "\n")

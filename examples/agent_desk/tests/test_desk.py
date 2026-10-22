@@ -88,6 +88,29 @@ def test_the_agent_triages_a_new_ticket_and_reports_back(
     assert activity["activity"] == ["opened", "triaged as outage/high"]
 
 
+def test_a_slow_model_still_triages_while_the_agent_holds_its_session(
+    modulith_app: ModulithTestApp, monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DESK_AGENT_FAULT", "slow")
+    monkeypatch.setenv("DESK_AGENT_SLOW_SECONDS", "0.5")
+    monkeypatch.setenv("DESK_AGENT_HOLD_SESSION", "1")
+    database = prepare_database(monkeypatch, tmp_path)
+    from desk.main import app
+
+    with TestClient(app) as client:
+        started = time.monotonic()
+        client.post("/tickets", json=TICKET)
+        ticket = eventually(
+            lambda: client.get("/tickets/t-1").json(), lambda body: body["reply"] is not None
+        )
+        elapsed = time.monotonic() - started
+
+    # Two model calls, each half a second late.
+    assert elapsed >= 1.0
+    assert ticket["category"] == "outage"
+    assert query(database, TRIAGE_ERRORS) == []
+
+
 def test_a_hung_model_call_is_cancelled_while_the_api_keeps_answering(
     modulith_app: ModulithTestApp, monkeypatch: MonkeyPatch, tmp_path: Path
 ) -> None:

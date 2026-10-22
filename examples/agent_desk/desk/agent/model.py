@@ -2,7 +2,8 @@
 
 It answers from keywords, and fails on demand: ``DESK_AGENT_FAULT`` set to
 ``hang``, ``block`` or ``crash`` makes every call fail the way real model calls
-do, and any other value that is not empty stops this module from importing.
+do, ``slow`` makes every answer arrive ``DESK_AGENT_SLOW_SECONDS`` (15) late,
+and any other value that is not empty stops this module from importing.
 Any LangChain chat model can replace it; the graph does not change.
 """
 
@@ -16,10 +17,11 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
-FAULTS = ("hang", "block", "crash")
+FAULTS = ("hang", "block", "crash", "slow")
 FAULT = os.environ.get("DESK_AGENT_FAULT", "")
 if FAULT not in ("", *FAULTS):
     raise ValueError(f"DESK_AGENT_FAULT must be empty or one of {', '.join(FAULTS)}, got {FAULT!r}")
+SLOW_SECONDS = float(os.environ.get("DESK_AGENT_SLOW_SECONDS", "15"))
 
 CATEGORIES = {
     "billing": ("refund", "charge", "invoice", "card"),
@@ -72,4 +74,7 @@ class DeskModel(BaseChatModel):
         elif FAULT == "crash":
             # What the OOM killer does to a process that loads too big a model.
             os.kill(os.getpid(), signal.SIGKILL)
+        elif FAULT == "slow":
+            # A provider having a bad day: every answer arrives, late.
+            await asyncio.sleep(SLOW_SECONDS)
         return self._generate(messages, stop)

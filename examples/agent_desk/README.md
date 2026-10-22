@@ -13,7 +13,8 @@ some of those take the API down too. `own_process = ["agent"]` in
 `pyproject.toml` gives the agent a process of its own under
 `--topology processes`, while `tickets` and `activity` share another, and the
 API keeps answering through all three failures. [The write-up](../../docs/posts/an-ai-agent-in-its-own-process.md)
-has the numbers.
+has the numbers. [A second one](../../docs/posts/when-model-calls-pile-up.md)
+measures a slow model whose waiting calls hold database connections.
 
 - [`desk/contracts/__init__.py`](desk/contracts/__init__.py): the two events
 - [`desk/tickets/`](desk/tickets): `open_ticket`, the `record_triage` listener, and the `POST /tickets` and `GET /tickets/{id}` routes
@@ -21,12 +22,13 @@ has the numbers.
 - [`desk/agent/__init__.py`](desk/agent/__init__.py): the `triage` listener that runs the graph, with a timeout
 - [`desk/agent/model.py`](desk/agent/model.py): a stand-in chat model that fails on demand
 - [`desk/activity/__init__.py`](desk/activity/__init__.py): the listeners that log each ticket's events, and their route
-- [`benchmark.py`](benchmark.py): the API's latency while the agent hangs, blocks or crashes
-- [`tests/`](tests): the flow, and a hung model call, under `pytest`
+- [`benchmark.py`](benchmark.py): the API's latency while the agent hangs, blocks, crashes or slows down
+- [`tests/`](tests): the flow, a slow model call and a hung one, under `pytest`
 
 The model in `desk/agent/model.py` answers from keywords, so the desk runs
 without an API key. Set `DESK_AGENT_FAULT` to `hang`, `block` or `crash` and
-every model call fails that way; any other value that is not empty stops the
+every model call fails that way, or to `slow` and every answer arrives
+`DESK_AGENT_SLOW_SECONDS` (15) late; any other value that is not empty stops the
 agent from importing. To use a real model, assign any LangChain chat
 model to `model` in `desk/agent/graph.py`; the graph does not change.
 
@@ -248,3 +250,15 @@ ticket's delivery fails its fifth and last attempt about 25 seconds in, and the
 server log records the dead letter. `--port-base` picks the three ports each run serves on. It writes the same rows
 to `bench-results.json`. The run takes about two minutes; the write-up reports
 three runs with `--seconds 30`.
+
+`--postgres` takes a Postgres server's URL, such as
+`postgresql://postgres:secret@127.0.0.1:5432/postgres`, recreates a database
+named `desk_benchmark` on it for each row, and serves the desk from there
+instead of SQLite. The desk's engine then has SQLAlchemy's default connection
+pool, and each row adds the most connections the database had open at once.
+`--hold-session` sets `DESK_AGENT_HOLD_SESSION=1`, which keeps the agent's
+session, and its pooled connection, open across the model calls.
+`--client-timeout` and `--agent-timeout` change the two 2-second timeouts.
+`--faults` runs `slow` only when named, since under a 2-second agent timeout it
+fails like `hang`. [The pile-up write-up](../../docs/posts/when-model-calls-pile-up.md)
+adds `--hold-session --faults none,slow --rate 10 --seconds 45 --client-timeout 5 --agent-timeout 40`.
