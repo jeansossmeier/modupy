@@ -4145,6 +4145,10 @@ def redis_dead_letter_project(make_fake_app, monkeypatch, tmp_path, redis_url, r
             [(_key, [(message_id, fields)])] = await broker.read(
                 "t.Order", consumer="o1", group="modulith-orders", block_ms=50
             )
+            # As the consumer does: the renewal marks it started, its first delivery.
+            await broker.renew_claim(
+                "t.Order", message_id.decode(), consumer="o1", group="modulith-orders"
+            )
             await broker.dead_letter("t.Order", message_id.decode(), fields, "modulith-orders")
         finally:
             await broker.close()

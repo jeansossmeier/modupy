@@ -750,8 +750,8 @@ id. An entry is claimed only once it has been idle for `reclaim_min_idle_ms`
 plus the failure backoff for its delivery count (`retry_backoff_base_seconds`
 × 2^(n-1), capped by `retry_backoff_cap_seconds`, as on the polling brokers).
 A claim raises only the claimed entry's count. `XREADGROUP` counts a delivery
-for every entry it returns, but the consumer runs one listener at a time, so
-`read` sets the count of every entry after the first back to 0 (`XCLAIM ...
+for every entry it returns, but the consumer reads all its streams at once and
+runs one listener at a time, so `read` sets the count of every entry back to 0 (`XCLAIM ...
 RETRYCOUNT 0 JUSTID`, in a Lua script that skips an entry a peer has claimed),
 and `renew_claim`, just before the entry runs, raises a 0 to 1. So when an
 entry kills the worker, the entries read with it are reclaimed as their first

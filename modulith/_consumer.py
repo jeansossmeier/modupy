@@ -26,11 +26,11 @@ streams for exactly the event types that module's local listeners consume
     above the worst-case latency of ONE listener call; listeners must be
     idempotent regardless (at-least-once delivery). A batch's total time does
     not matter: a broker with ``renew_claim`` (Redis Streams) is asked to
-    confirm ownership, restarting the idle clock, just before each entry after
-    the first, and an entry a peer took in the meantime is skipped. The
-    remaining windows are the first entry of a batch (as fresh as the read or
-    reclaim that returned it) and the gap between that check and the
-    dispatch's first await.
+    confirm ownership, restarting the idle clock, just before each entry it
+    read and each reclaimed entry after the first, and an entry a peer took in
+    the meantime is skipped. The remaining windows are the first entry of a
+    reclaim (as fresh as the claim that returned it) and the gap between that
+    check and the dispatch's first await.
   * a background loop ``read`` → deserialize (via the ``event_type`` header) →
     dispatch to local listeners → ``ack`` on success, ``dead_letter`` on poison
     or repeated failure. Broker failures retry with capped exponential backoff
@@ -642,16 +642,19 @@ class BrokerConsumer:
         await asyncio.sleep(delay)
 
     async def _handle(self, target: str, messages: Any) -> None:
-        """Process an XREADGROUP result: [(stream, [(id, fields), ...]), ...]."""
+        """Process an XREADGROUP result: [(stream, [(id, fields), ...]), ...].
+
+        Every entry is renewed, the first included: ``_run`` reads all streams
+        at once, so a stream's first entry can wait behind another stream's
+        batch, and the renewal is what marks it started.
+        """
         if not messages:
             return
-        first = True
         for _stream, entries in messages:
             for message_id, fields in entries:
                 if self._stopping:
                     return
-                await self._dispatch_if_owned(target, message_id, fields, renew=not first)
-                first = False
+                await self._dispatch_if_owned(target, message_id, fields, renew=True)
 
     async def _dispatch_if_owned(
         self,
@@ -667,7 +670,7 @@ class BrokerConsumer:
         Entries are dispatched one after another, so one that waits behind
         slower siblings can idle past ``reclaim_min_idle_ms`` and be claimed by
         a peer replica, which then dispatches it as well. Before every entry
-        after the first, a broker offering ``renew_claim`` confirms this
+        it read, and every reclaimed entry after the first, a broker offering ``renew_claim`` confirms this
         consumer still owns it and restarts its idle clock; an entry it no
         longer owns is skipped, not acknowledged, since the peer now
         owns its outcome. A broker without ``renew_claim`` is trusted unchecked.

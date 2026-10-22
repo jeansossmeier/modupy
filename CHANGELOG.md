@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `examples/agent_desk` measures a slow model whose waiting calls pile up. `DESK_AGENT_FAULT=slow` delays every model answer by `DESK_AGENT_SLOW_SECONDS` (15), `DESK_AGENT_HOLD_SESSION=1` keeps the agent's session open across its model calls, and `benchmark.py` gains `--postgres URL`, which serves each row from a fresh Postgres database and records the most connections it had open, `--hold-session`, `--client-timeout` and `--agent-timeout`. `docs/posts/when-model-calls-pile-up.md` reports a run.
 
+### Fixed
+
+- Under `own_process`, a worker that hosts several modules stops their consumers together instead of one after another. With a hung broker, stopping them in turn could outlast the supervisor's 30 s kill deadline, so the worker was killed before its runtime shutdown ran.
+- On the `redis-streams` broker, a module that consumes several event types no longer charges a delivery to the first entry of each of its other streams when a message kills its process. Those entries waited behind another stream's batch without having started. Every entry a read returns now has its count set to 0, and each one, the first included, is checked for a peer's claim and marked started just before it runs.
+
 ## [0.13.0] — 2026-10-21
 
 ### Added

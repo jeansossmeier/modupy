@@ -333,12 +333,12 @@ class RedisStreamsBroker:
         """XREADGROUP new (never-delivered) messages for this consumer.
 
         XREADGROUP counts a delivery for every entry it returns, but the
-        consumer runs them one at a time, so every entry after the first has
-        its delivery count set back to 0 until ``renew_claim`` marks it
-        started. A worker killed by one entry then leaves the entries it never
-        reached uncharged: the reclaim that hands one over is its first
-        delivery. A crash between the two calls, or a reset that fails (logged),
-        leaves them charged one delivery each.
+        consumer reads all its streams at once and runs their entries one at a
+        time, so every entry has its delivery count set back to 0 until
+        ``renew_claim`` marks it started. A worker killed by one entry then
+        leaves the entries it never reached uncharged: the reclaim that hands
+        one over is its first delivery. A crash between the two calls, or a
+        reset that fails (logged), leaves them charged one delivery each.
         """
         stream = self._stream_name(target)
         group_name = group or self._consumer_group
@@ -346,7 +346,7 @@ class RedisStreamsBroker:
             group_name, consumer, {stream: ">"}, count=count, block=block_ms
         )
         for _stream, entries in messages or ():
-            if len(entries) < 2:
+            if not entries:
                 continue
             try:
                 # The ownership check keeps a peer's claim, as in renew_claim.
@@ -365,13 +365,13 @@ class RedisStreamsBroker:
                     stream,
                     group_name,
                     consumer,
-                    *(message_id for message_id, _fields in entries[1:]),
+                    *(message_id for message_id, _fields in entries),
                 )
             except Exception:
                 logger.warning(
                     "could not mark %d entries read from %s as not started; a crash "
                     "before they run charges each one delivery",
-                    len(entries) - 1,
+                    len(entries),
                     stream,
                     exc_info=True,
                 )
@@ -525,8 +525,8 @@ class RedisStreamsBroker:
     ) -> bool:
         """Reset the idle clock of a pending entry, only while ``consumer`` still owns it.
 
-        The consumer calls this just before dispatching each entry of a batch
-        after the first, so a message that waited behind slower siblings is as
+        The consumer calls this just before dispatching each entry it read,
+        so a message that waited behind slower siblings is as
         fresh as a just-delivered one and a peer's XAUTOCLAIM cannot take it
         mid-dispatch. Returns False, changing nothing, when the entry is
         pending for another consumer (a peer reclaimed it while it waited) or
