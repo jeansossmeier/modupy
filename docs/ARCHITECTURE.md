@@ -1117,6 +1117,8 @@ split-readiness) with 80%/95% thresholds.
   module. The subprocess bootstraps the application, runs the boundary checks,
   reports which modules serve HTTP and warns about the middleware,
   dependencies and exception handlers the named app adds, which no worker runs.
+  It imports that app for the warning, skips the warning when the import takes
+  over 5 seconds, and exits without waiting for threads the import started.
   With `own_process`, only the named modules get a spec each; the others share
   one spec named by their modules joined with commas, whose proxy rules route
   each module's prefix to it and check its identity under that joined name.
