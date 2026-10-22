@@ -1,0 +1,50 @@
+[project]
+name = "ai-studio"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["modupy[fastapi,cli,postgres]", "aiosqlite", "langgraph>=1.2,<2"]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-timeout", "httpx2"]
+
+[tool.modulith]
+package = "studio"
+outbox = "postgres"
+outbox_url = "sqlite+aiosqlite:///studio.db"
+# Under --topology processes moderation gets a worker of its own; reviews,
+# replies and summaries share the other one. Moderation runs its model in its
+# own process, where a crash or a long classification can stop nothing else.
+own_process = ["moderation"]
+
+[tool.modulith.outbox_options]
+# WAL lets the API read while a worker in another process writes.
+sqlite_wal = true
+# Tuned so a delivery that a crash cut short is retried within seconds.
+# Production keeps the defaults.
+claim_lease_seconds = 4
+retry_interval_seconds = 2
+retry_stale_seconds = 2
+max_retry_backoff_seconds = 4
+
+[tool.modulith.broker_options]
+state_dir = ".modulith"
+# A crashed consumer's messages are redelivered after this many seconds; the
+# default is 60. Keep it above a tenth of the longest listener timeout.
+reclaim_stale_seconds = 5
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# A delivery that never ends fails its test instead of stalling the run.
+timeout = 60
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["studio"]
+known-third-party = ["modulith"]

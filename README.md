@@ -76,6 +76,8 @@ Two write-ups measure it with the LangGraph agent in [`examples/agent_desk`](htt
 - [An AI agent in its own process](https://github.com/jeansossmeier/modupy/blob/main/docs/posts/an-ai-agent-in-its-own-process.md): with the agent in the API's process, every request failed while the model call blocked its thread or crashed the process, 1,500 of 1,500 in each run. With the agent in its own process, none failed.
 - [When model calls pile up](https://github.com/jeansossmeier/modupy/blob/main/docs/posts/when-model-calls-pile-up.md): with a slow model and the agent holding its database session across the calls on purpose, 61 to 65% of requests failed in one process, and none with the agent in its own, which also capped it at 10 calls at a time. Closing the session before the model calls fixed it in one process too.
 
+[`examples/ai_studio`](https://github.com/jeansossmeier/modupy/tree/main/examples/ai_studio) keeps three AI modules of different shapes beside the business code, gives only its local model a process of its own, and crashes that model while the other modules keep answering.
+
 A process of its own contains a crash, a blocked event loop or a drained connection pool.
 It does not contain a host that runs out of memory or CPU, or a database server that runs out of connections.
 The module's own routes still fail while it is down, and the supervisor restarts a blocked worker only when `worker_liveness_timeout_seconds` is set, which it is not by default.
@@ -668,6 +670,7 @@ CI runs every command in every example's README exactly as written, from a fresh
 | [`demo_app`](https://github.com/jeansossmeier/modupy/tree/main/examples/demo_app) | mid: a shop with a database | the durable outbox on SQLite, `modulith migrate`, a scaled module, then Postgres and Redis |
 | [`marketplace`](https://github.com/jeansossmeier/modupy/tree/main/examples/marketplace) | large: 7 modules | a payment saga that undoes itself on failure, dead-letter recovery, a team boundary rule shipped as a plugin, tracing, Kubernetes and extracting a service |
 | [`agent_desk`](https://github.com/jeansossmeier/modupy/tree/main/examples/agent_desk) | mid: a help desk with a LangGraph agent | the agent in a process of its own while the rest share one, a listener timeout, and a benchmark of the API while the agent hangs, blocks or crashes |
+| [`ai_studio`](https://github.com/jeansossmeier/modupy/tree/main/examples/ai_studio) | mid: a shop's reviews with three AI modules | a local moderation model in its own process, a LangGraph agent and a summary route under timeouts, and moderation crashing while the rest keep answering |
 
 Single-file plugin examples: [a verifier rule](https://github.com/jeansossmeier/modupy/blob/main/examples/naming_convention_verifier.py), [a Redis Streams broker](https://github.com/jeansossmeier/modupy/blob/main/examples/redis_streams_broker.py) and [a storage serializer](https://github.com/jeansossmeier/modupy/blob/main/examples/versioned_json_serializer.py).
 

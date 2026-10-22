@@ -410,10 +410,11 @@ warn_unreachable = true
 # files to map to `tests.*` module names (which the per-module strictness
 # relaxations below key on) instead of colliding top-level names.
 explicit_package_bases = true
-# examples/agent_desk imports its own package as `desk`, the name it runs under.
-# As a package base its files map to `desk.*`, so those imports resolve and are
-# checked instead of being missing.
-mypy_path = "examples/agent_desk"
+# examples/agent_desk and examples/ai_studio import their own packages as `desk`
+# and `studio`, the names they run under. As package bases their files map to
+# `desk.*` and `studio.*`, so those imports resolve and are checked instead of
+# being missing.
+mypy_path = "examples/agent_desk:examples/ai_studio"
 exclude = ["^examples/[^/]+/build/"]
 
 [[tool.mypy.overrides]]
@@ -501,15 +502,15 @@ module = ["nonexistent_debug_module"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-# examples/agent_desk runs a LangGraph agent, which no modupy extra installs.
-# CI's typecheck job installs the example's dependencies, so the example is
-# checked against LangGraph's types there. Without LangGraph they are Any, and
-# the stand-in chat model then subclasses Any.
+# examples/agent_desk and examples/ai_studio run LangGraph agents, which no
+# modupy extra installs. CI's typecheck job installs the examples' dependencies,
+# so they are checked against LangGraph's types there. Without LangGraph they
+# are Any, and the stand-in chat models then subclass Any.
 module = ["langgraph", "langgraph.*", "langchain_core", "langchain_core.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["desk.agent.model"]
+module = ["desk.agent.model", "studio.replies.model"]
 disallow_subclassing_any = false
 
 # ---------------------------------------------------------------------------
