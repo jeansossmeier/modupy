@@ -31,7 +31,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 import modulith._worker as worker_module
-from modulith import ConfigurationError, Consumer, ConsumerSpec, EventPublication, configure
+from modulith import (
+    ConfigurationError,
+    Consumer,
+    ConsumerSpec,
+    EventPublication,
+    configure,
+    publish,
+)
 from modulith._worker import (
     AccessLogQueryFilter,
     LogTargetQueryFilter,
@@ -2506,6 +2513,7 @@ _SHARED_WORKER_APP = {
         from fakeapp.contracts import Triaged
 
         router = APIRouter()
+        triaged = []
 
         @router.get("/ping")
         async def ping() -> dict[str, str]:
@@ -2513,7 +2521,7 @@ _SHARED_WORKER_APP = {
 
         @listener
         async def on_triaged(event: Triaged) -> None:
-            pass
+            triaged.append(event.order_id)
     """,
     "billing": """
         from fastapi import APIRouter
@@ -2731,6 +2739,104 @@ def test_worker_strips_and_deduplicates_the_modules_it_hosts(make_fake_app, monk
     with TestClient(app) as client:
         assert client.get("/health").json()["module"] == "billing,orders"
         assert client.get("/orders/ping").json() == {"from": "orders"}
+
+
+class _DownBroker(_NoopBroker):
+    def __init__(self) -> None:
+        self.attempts: list[str] = []
+
+    async def publish(
+        self, target: str, payload: bytes, headers: dict[str, str] | None = None
+    ) -> None:
+        self.attempts.append(target)
+        raise ConnectionError("broker unreachable")
+
+
+def _shared_worker_on_a_down_broker(monkeypatch, remote: str | None) -> _DownBroker:
+    _set_worker_env(monkeypatch, "billing,orders")
+    if remote is None:
+        monkeypatch.delenv("MODULITH_REMOTE_EVENT_TYPES", raising=False)
+    else:
+        monkeypatch.setenv("MODULITH_REMOTE_EVENT_TYPES", remote)
+    create_app()
+    broker = _DownBroker()
+    assert _runtime.broker_registry is not None
+    _runtime.broker_registry.register("test-noop-broker", broker)
+    return broker
+
+
+@pytest.mark.parametrize("remote", ["", "fakeapp.contracts.OrderPlaced"])
+async def test_shared_worker_keeps_an_event_only_its_modules_consume_off_the_broker(
+    make_fake_app, monkeypatch, remote: str
+) -> None:
+    """Only ``orders``, which this worker hosts, listens to ``Triaged``, so its
+    publish succeeds while the broker is down, as it would in one process."""
+    make_fake_app(_SHARED_WORKER_APP)
+    broker = _shared_worker_on_a_down_broker(monkeypatch, remote)
+    from fakeapp import orders
+    from fakeapp.contracts import Triaged
+
+    await publish(Triaged(order_id="o-1"))
+
+    assert orders.triaged == ["o-1"]
+    assert broker.attempts == []
+
+
+async def test_shared_worker_still_fails_an_event_a_module_elsewhere_consumes_on_a_down_broker(
+    make_fake_app, monkeypatch
+) -> None:
+    make_fake_app(_SHARED_WORKER_APP)
+    broker = _shared_worker_on_a_down_broker(monkeypatch, "fakeapp.contracts.OrderPlaced")
+    from fakeapp.contracts import OrderPlaced
+
+    with pytest.raises(ConnectionError, match="broker unreachable"):
+        await publish(OrderPlaced(order_id="o-1"))
+
+    assert broker.attempts == ["fakeapp.contracts.OrderPlaced"]
+
+
+async def test_shared_worker_without_the_supervisors_list_sends_every_event(
+    make_fake_app, monkeypatch
+) -> None:
+    """Started by hand, it cannot know that no module elsewhere listens."""
+    make_fake_app(_SHARED_WORKER_APP)
+    broker = _shared_worker_on_a_down_broker(monkeypatch, None)
+    from fakeapp import orders
+    from fakeapp.contracts import Triaged
+
+    with pytest.raises(ConnectionError, match="broker unreachable"):
+        await publish(Triaged(order_id="o-1"))
+
+    assert orders.triaged == ["o-1"]
+    assert broker.attempts == ["fakeapp.contracts.Triaged"]
+
+
+@pytest.mark.parametrize(
+    ("remote", "missing"),
+    [
+        ("fakeapp.contracts.Triaged", True),
+        ("fakeapp.contracts.OrderPlaced,fakeapp.contracts.Triaged", False),
+    ],
+)
+def test_a_worker_of_its_own_reports_a_listener_the_supervisors_list_misses(
+    make_fake_app, monkeypatch, caplog, remote: str, missing: bool
+) -> None:
+    """A worker restarted with new code can listen to an event that the shared
+    worker, given the list when ``modulith run`` started, keeps in memory."""
+    make_fake_app(_SHARED_WORKER_APP)
+    _set_worker_env(monkeypatch, "agent")
+    monkeypatch.setenv("MODULITH_REMOTE_EVENT_TYPES", remote)
+
+    with caplog.at_level(logging.ERROR, logger="modulith.worker"):
+        create_app()
+
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    if missing:
+        assert len(errors) == 1
+        assert "fakeapp.contracts.OrderPlaced" in errors[0]
+        assert "restart modulith run" in errors[0]
+    else:
+        assert errors == []
 
 
 @pytest.mark.parametrize("value", ["billing,,orders", "billing,", " "])

@@ -322,9 +322,13 @@ def _build_worker_env(spec: WorkerSpec) -> dict[str, str]:
 
     ``FORWARDED_ALLOW_IPS`` is dropped from the inherited environment so
     workers trust forwarded headers only from the local proxy at 127.0.0.1.
+    So is ``MODULITH_REMOTE_EVENT_TYPES``, which only ``spec.env`` may set
+    (see ``derive_specs_from_config``): without it a shared worker sends every
+    event to the broker rather than trust a list made for another layout.
     """
     env = dict(os.environ)
     env.pop("FORWARDED_ALLOW_IPS", None)
+    env.pop("MODULITH_REMOTE_EVENT_TYPES", None)
     if spec.env:
         for key, value in spec.env.items():
             if key.startswith("MODULITH_BROKER") and env.get(key):
@@ -1450,6 +1454,12 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
         other module then shares one worker, named by its modules joined
         with commas and run with the largest replica count among them
         (optional; without it each module gets its own worker)
+      - ``consumers`` — ``{event type: [module names]}``, the modules whose
+        listeners consume each fully-qualified event type, as
+        ``modulith._inspect`` reports them (optional). When the shared worker
+        hosts several modules, every worker's ``MODULITH_REMOTE_EVENT_TYPES``
+        then lists the types a module outside it consumes; without it, that
+        worker sends every event to the broker
 
     Every ``workers`` key other than ``default`` and every ``isolate`` and
     ``own_process`` entry must name a discovered, non-contract module; anything else raises
@@ -1518,6 +1528,7 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
     if default_count < 1:
         raise ValueError(f"[tool.modulith.workers] default must be >= 1, got {default_count}")
     worker_env = dict(config.get("env") or {})
+    consumers: dict[str, list[str]] | None = config.get("consumers")
 
     groups: list[list[str]] = []
     shared: list[str] = []
@@ -1529,6 +1540,12 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
                 groups.append(shared)
             shared.append(name)
 
+    # A worker hosting one module routes as any such worker does, without it.
+    remote = (
+        ",".join(sorted(t for t, modules in consumers.items() if set(modules) - set(shared)))
+        if consumers is not None and len(shared) > 1
+        else None
+    )
     specs: list[WorkerSpec] = []
     port = int(config.get("worker_port_base") or 9001)
     for group in groups:
@@ -1551,13 +1568,16 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
                 f"module {name!r} starts at worker port {port} with {count} replicas, "
                 "which runs past port 65535; lower worker_port_base or the replica counts"
             )
+        env = worker_env.copy()
+        if remote is not None:
+            env["MODULITH_REMOTE_EVENT_TYPES"] = remote
         specs.append(
             WorkerSpec(
                 module_name=name,
                 package=package,
                 port=port,
                 worker_count=count,
-                env=worker_env.copy() or None,
+                env=env or None,
                 # Naming every module leaves no shared worker, which is the
                 # layout without own_process, readiness included.
                 own_process=bool(shared) and group is not shared,

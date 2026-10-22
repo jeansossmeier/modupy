@@ -765,9 +765,12 @@ The supervisor ([§9.3](#93-the-supervisor)) sets both variables for every worke
     untagged. They are local in every worker, so a non-externalized event
     they handle is never routed to the broker by a one-module worker, and a
     listener for that event in another worker does not receive it. A worker
-    that several modules share (`own_process`) routes every event it
-    publishes, and counts an untagged listener as its first module's, so
-    only that module's consumer group subscribes to the event.
+    that several modules share (`own_process`) counts an untagged listener
+    as its first module's, so only that module's consumer group subscribes
+    to the event. Such a worker routes an event its own modules listen to
+    only when `modulith run` lists it as consumed by a module in another
+    worker (every event, when started without that list), and an untagged
+    listener puts no event on that list.
   - A listener in a plain, non-package file (`app/shared.py`) or in a
     namespace folder without `__init__.py` (`app/common/audit.py`) belongs
     to the module package whose import first loads that file in each
@@ -779,7 +782,10 @@ The supervisor ([§9.3](#93-the-supervisor)) sets both variables for every worke
     does not run it. If the application package's own `__init__.py` or the
     contracts package loads the file first, no module owns it: it is
     untagged like a plugin listener, runs in every worker, and the
-    non-externalized events it handles are never routed. To run such a
+    non-externalized events it handles are never routed. Because a module's
+    ownership of it can differ between workers, `modulith run` lists the
+    event of a module-owned one as consumed in every worker, so a worker that
+    several modules share routes it. To run such a
     listener in exactly one module's worker, define it inside that module
     package.
 

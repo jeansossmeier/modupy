@@ -1,10 +1,11 @@
 """One worker process hosting several modules (``own_process``).
 
 The modules a deployment does not give their own process share one worker.
-Their listeners run in-process for that worker's publishes, every event it
-publishes still crosses to the broker for the modules in other processes, and
-each co-hosted module consumes the broker through its own consumer group, so a
-consumer must see only its own module's listeners. These tests drive that with
+Their listeners run in-process for that worker's publishes, an event a module
+in another process consumes still crosses to the broker (every event, when the
+supervisor did not say which those are), and each co-hosted module consumes the
+broker through its own consumer group, so a consumer must see only its own
+module's listeners. These tests drive that with
 a fake broker, as ``test_cross_process`` does for one module per worker.
 """
 
@@ -149,6 +150,33 @@ async def test_transactional_route_names_every_cohosted_module(make_fake_app) ->
     assert listener_rows == ["fakeapp.billing.bill"]
 
 
+@pytest.mark.parametrize(
+    ("remote", "routed"), [((), False), (("fakeapp.orders.OrderPlaced",), True)]
+)
+async def test_transactional_publish_persists_a_route_only_for_an_event_consumed_elsewhere(
+    make_fake_app, remote: tuple[str, ...], routed: bool
+) -> None:
+    make_fake_app(_APP)
+    store = Store()
+    outbox.configure(store, JsonEventSerializer(), start_loop=False)
+    configure(package="fakeapp", topology="processes", broker="testbroker")
+    _runtime.ensure_bootstrapped()
+    _runtime.host_module(*_COHOSTED, remote_event_types=remote)
+    _register_fake_broker("testbroker")
+    import fakeapp.billing  # noqa: F401
+    import fakeapp.orders as orders
+
+    token = outbox._current_session.set(Session())
+    try:
+        await orders.place("o-tx")
+    finally:
+        outbox._current_session.reset(token)
+
+    route = f"{outbox._BROKER_ROUTE_LISTENER_PREFIX}testbroker:fakeapp.orders.OrderPlaced"
+    expected = ["fakeapp.billing.bill", *([route] if routed else [])]
+    assert [p.listener for p in store.saved] == expected
+
+
 _LOCAL_ONLY_ORDERS = """
         from dataclasses import dataclass
         from modulith import event, listener, publish
@@ -275,18 +303,20 @@ async def test_the_broker_copy_of_its_own_publish_reruns_no_cohosted_listener(
     assert billing.seen == ["o-1"]
 
 
+@pytest.mark.parametrize("remote", [None, ()])
 @pytest.mark.parametrize("path", ["redis", "polling"])
 async def test_a_cohosted_listener_that_fails_at_publish_is_retried_from_the_broker_copy(
-    make_fake_app, path: str
+    make_fake_app, path: str, remote: tuple[str, ...] | None
 ) -> None:
     """Without a transaction the publish runs a co-hosted module's listener
     in-process and raises its failure, as one process would. The broker copy
     then leaves that module out of its header, so the module's own consumer
-    retries it, as it would were the module in a worker of its own."""
+    retries it, as it would were the module in a worker of its own. The copy
+    is sent even when no module in another process consumes the event."""
     make_fake_app({**_APP, "billing": _FLAKY_BILLING})
     configure(package="fakeapp", topology="processes", broker="testbroker")
     _runtime.ensure_bootstrapped()
-    _runtime.host_module(*_COHOSTED)
+    _runtime.host_module(*_COHOSTED, remote_event_types=remote)
     import fakeapp.billing as billing
     import fakeapp.orders as orders
 
