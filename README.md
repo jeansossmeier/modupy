@@ -343,7 +343,7 @@ Four rules keep this working:
 - Every module is a package with an `__init__.py`, and its `@listener` functions must be imported from there (for example `from . import handlers`) so they register.
 - Names that start with `_` are private to their module.
 - A module with routes re-exports its `router` from `__init__.py`, because a module running in its own process serves exactly that `router` under `/<module>`. A listener-only module like `payments` needs none.
-- A check every route of a module needs, such as a login check or a rate limit, goes on that module's own `router`: `APIRouter(dependencies=[Depends(require_user)])`. A module in its own process serves its routes without `main.py`'s middleware and without the `dependencies` that `main.py` passes to `include_router`, and nothing warns you. App-wide middleware such as CORS goes in a proxy in front of modupy.
+- A check every route of a module needs, such as a login check or a rate limit, goes on that module's own `router`: `APIRouter(dependencies=[Depends(require_user)])`. A module in its own process serves its routes without `main.py`'s middleware, exception handlers and `dependencies`, including the ones `main.py` passes to `include_router`. Under the process topology, `modulith run` and `modulith dev` name each of these in a startup warning, but only moving the check onto the router makes it run. App-wide middleware such as CORS goes in a proxy in front of modupy.
 
 The CLI finds your package through `pyproject.toml`, and one pytest setting lets your tests import it:
 

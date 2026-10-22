@@ -1042,6 +1042,173 @@ def test_run_processes_topology_fails_on_a_module_that_cannot_import(make_fake_a
     assert "orders is broken at import" in result.stderr
 
 
+_GUARDED_ORDERS = """
+from fastapi import APIRouter, Depends
+
+def require_user():
+    pass
+
+router = APIRouter(dependencies=[Depends(require_user)])
+
+@router.get("/")
+def index():
+    return {}
+"""
+
+
+def _run_processes_with_main(make_fake_app, monkeypatch, tmp_path, main: str) -> Any:
+    make_fake_app({"orders": _GUARDED_ORDERS}, extra_files={"main.py": main})
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith]\npackage = "fakeapp"\nbroker = "testbroker"\n'
+    )
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        pass
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+    return runner.invoke(app, ["run", "fakeapp.main:app", "--topology", "processes"])
+
+
+@pytest.mark.parametrize(
+    ("setup", "reported"),
+    [
+        pytest.param(
+            "app = FastAPI()\n"
+            "app.add_middleware(CORSMiddleware, allow_origins=['*'])\n"
+            "@app.middleware('http')\n"
+            "async def check_login(request, call_next):\n"
+            "    return await call_next(request)\n"
+            "app.include_router(router, prefix='/orders')\n",
+            "middleware: check_login, CORSMiddleware",
+            id="middleware",
+        ),
+        pytest.param(
+            "app = FastAPI(dependencies=[Depends(require_login)])\n"
+            "app.include_router(router, prefix='/orders')\n",
+            "app dependencies: require_login",
+            id="app-dependencies",
+        ),
+        pytest.param(
+            "app = FastAPI()\n"
+            "app.include_router(router, prefix='/orders', dependencies=[Depends(require_login)])\n",
+            "dependencies added to the routes of orders: require_login",
+            id="include-router-dependencies",
+        ),
+        pytest.param(
+            "from fastapi import APIRouter\n"
+            "api = APIRouter()\n"
+            "api.include_router(router, prefix='/orders', dependencies=[Depends(require_login)])\n"
+            "app = FastAPI()\n"
+            "app.include_router(api, prefix='/api')\n",
+            "dependencies added to the routes of orders: require_login",
+            id="nested-include-router-dependencies",
+        ),
+        pytest.param(
+            "app = FastAPI()\n"
+            "@app.exception_handler(ValueError)\n"
+            "async def on_value_error(request, exc):\n"
+            "    return None\n"
+            "app.include_router(router, prefix='/orders')\n",
+            "exception handlers: ValueError",
+            id="exception-handlers",
+        ),
+    ],
+)
+def test_run_processes_warns_about_what_the_app_adds_that_no_worker_runs(
+    make_fake_app, monkeypatch, tmp_path, setup, reported
+):
+    """A worker mounts only each module's ``router``; the app ``main.py`` builds
+    never runs there, so a login check kept on it stops guarding the routes."""
+    main = (
+        "from fastapi import Depends, FastAPI\n"
+        "from starlette.middleware.cors import CORSMiddleware\n"
+        "from fakeapp.orders import router\n"
+        "def require_login():\n"
+        "    pass\n"
+    ) + setup
+
+    result = _run_processes_with_main(make_fake_app, monkeypatch, tmp_path, main)
+
+    assert result.exit_code == 0, result.output
+    assert reported in result.stderr
+    assert "require_user" not in result.stderr
+    assert "APIRouter(dependencies=[Depends(...)])" in result.stderr
+    assert "github.com/jeansossmeier/modupy#lay-out-your-project" in result.stderr
+
+
+def test_run_processes_inspects_a_plain_app_without_a_warning(make_fake_app, monkeypatch, tmp_path):
+    """Mounting the module routers, with a lifespan that bootstraps as every
+    example's does, adds nothing a worker lacks."""
+    main = """
+        from contextlib import asynccontextmanager
+        from pathlib import Path
+
+        from fastapi import FastAPI
+        from modulith import bootstrap
+
+        from fakeapp.orders import router
+
+        Path("main-imported").touch()
+
+        @asynccontextmanager
+        async def lifespan(app):
+            bootstrap()
+            yield
+
+        app = FastAPI(lifespan=lifespan)
+        app.include_router(router, prefix="/orders")
+    """
+
+    result = _run_processes_with_main(make_fake_app, monkeypatch, tmp_path, main)
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "main-imported").exists()
+    assert "no worker runs" not in result.stderr
+    assert "skipped" not in result.stderr
+
+
+def test_run_processes_still_starts_when_the_app_fails_to_import(
+    make_fake_app, monkeypatch, tmp_path
+):
+    result = _run_processes_with_main(
+        make_fake_app, monkeypatch, tmp_path, "raise RuntimeError('main is broken')\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "main is broken" in result.stderr
+
+
+@pytest.mark.timeout(60)
+def test_run_processes_still_starts_when_the_app_leaves_a_thread_running(
+    make_fake_app, monkeypatch, tmp_path
+):
+    result = _run_processes_with_main(
+        make_fake_app,
+        monkeypatch,
+        tmp_path,
+        "import threading\n"
+        "from fastapi import FastAPI\n"
+        "threading.Thread(target=threading.Event().wait).start()\n"
+        "app = FastAPI()\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "skipped" not in result.stderr
+
+
+@pytest.mark.timeout(60)
+def test_run_processes_still_starts_when_the_app_import_blocks(
+    make_fake_app, monkeypatch, tmp_path
+):
+    result = _run_processes_with_main(
+        make_fake_app, monkeypatch, tmp_path, "import time\ntime.sleep(3600)\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "check of fakeapp.main:app skipped (its import took over 5 s)" in result.stderr
+
+
 # ---------------------------------------------------------------------------
 # modulith verify
 # ---------------------------------------------------------------------------

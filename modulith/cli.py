@@ -233,7 +233,7 @@ def _configure_process_runtime(app_module: str) -> str:
 
 
 def _inspect_application(
-    package: str, *, log_level: str, verify_warn: bool, isolate: str | None
+    package: str, *, app_module: str, log_level: str, verify_warn: bool, isolate: str | None
 ) -> tuple[list[str], dict[str, list[str]]]:
     """Bootstrap the application in a subprocess and return its module names,
     with the modules that consume each event type (see ``modulith._inspect``).
@@ -257,6 +257,7 @@ def _inspect_application(
             log_level,
             "1" if verify_warn else "0",
             isolate or "",
+            app_module,
             str(out),
         ]
         child = subprocess.Popen(
@@ -783,7 +784,11 @@ def _run_process_topology(
     try:
         package = _configure_process_runtime(app_module)
         names, consumers = _inspect_application(
-            package, log_level=log_level, verify_warn=verify_warn, isolate=isolate
+            package,
+            app_module=app_module,
+            log_level=log_level,
+            verify_warn=verify_warn,
+            isolate=isolate,
         )
         # This process resolves configuration and brokers only: discovery
         # would import every module into the process that outlives them all.

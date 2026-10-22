@@ -15,23 +15,38 @@ The child does everything that needs the modules imported:
 * the dev-time boundary warnings;
 * the report of which modules serve HTTP;
 * which modules consume each event type (``_event_consumers``), from which the
-  supervisor tells a worker hosting several modules what to send to the broker.
+  supervisor tells a worker hosting several modules what to send to the broker;
+* the warning about what the app the command names sets up that no worker
+  runs.
 
 It then writes ``{"modules": [sorted names], "consumers": {...}}``, as JSON, to
-the file its last argument names. A bootstrap failure exits with the CLI's own
-message and code. The arguments are the package, the log level, ``1`` to echo
-boundary warnings, the ``--isolate`` module (empty for none) and the output file.
+the file its last argument names, before it imports the app. A bootstrap failure
+exits with the CLI's own message and code. The arguments are the package, the
+log level, ``1`` to echo boundary warnings, the ``--isolate`` module (empty for
+none), the app the command names and the output file.
+
+Importing the app runs code no worker runs, so it is bounded: an import still
+going after ``_APP_CHECK_SECONDS`` skips the warning, and the child exits
+without waiting for threads the import started.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import os
 import sys
+import threading
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .runtime import Runtime
+
+logger = logging.getLogger(__name__)
+
+# Every worker waits for this child, so the app import may delay them this long.
+_APP_CHECK_SECONDS = 5.0
 
 
 def _event_consumers(rt: Runtime, names: list[str]) -> dict[str, list[str]]:
@@ -59,8 +74,85 @@ def _event_consumers(rt: Runtime, names: list[str]) -> dict[str, list[str]]:
     return consumers
 
 
+def _named(obj: object) -> str:
+    return str(getattr(obj, "__qualname__", obj))
+
+
+def _warn_about_dropped_app_setup(app_module: str, package: str, names: list[str]) -> None:
+    """Warn about what ``app_module``'s app adds that no worker runs.
+
+    A worker builds its own FastAPI app and mounts only each module's
+    ``router`` (``modulith._worker.create_app``), so the app's middleware, its
+    dependencies and its exception handlers never run under the process
+    topology. Its lifespan goes unreported: the one every example has only
+    bootstraps and starts the outbox, which a worker does itself.
+    """
+    from fastapi import FastAPI, routing
+    from uvicorn.importer import ImportFromStringError, import_from_string
+
+    module_path, _, attribute = app_module.partition(":")
+    if not attribute or not f"{module_path}.".startswith(f"{package}."):
+        return  # not an app of the package whose modules the workers run
+    try:
+        app = import_from_string(app_module)
+    except ImportFromStringError:
+        return  # no such app, as in an extracted service; the workers need none
+    if not isinstance(app, FastAPI):
+        return
+    # Older FastAPI flattens included routes into app.routes.
+    walk: Any = getattr(routing, "iter_route_contexts", iter)
+    app_dependencies = [d.dependency for d in app.router.dependencies]
+    added: dict[str, list[str]] = {}
+    for name in names:
+        router = getattr(sys.modules.get(f"{package}.{name}"), "router", None)
+        if router is None:
+            continue
+        # The routes as a worker mounts them, keyed by endpoint.
+        worker = FastAPI()
+        worker.include_router(router, prefix=f"/{name}")
+        own = {
+            route.endpoint: [d.dependency for d in getattr(route, "dependencies", ())]
+            for route in walk(worker.routes)
+            if getattr(route, "endpoint", None) is not None
+        }
+        extra = [
+            _named(d.dependency)
+            for route in walk(app.routes)
+            if (endpoint := getattr(route, "endpoint", None)) in own
+            for d in route.dependencies
+            if d.dependency not in own[endpoint] + app_dependencies
+        ]
+        if extra:
+            added[name] = list(dict.fromkeys(extra))
+    defaults = FastAPI().exception_handlers
+    found = [
+        ("middleware", [_named(m.kwargs.get("dispatch") or m.cls) for m in app.user_middleware]),
+        ("app dependencies", [_named(d) for d in app_dependencies]),
+        *((f"dependencies added to the routes of {name}", deps) for name, deps in added.items()),
+        (
+            "exception handlers",
+            [_named(k) for k, h in app.exception_handlers.items() if defaults.get(k) is not h],
+        ),
+    ]
+    lines = [f"  {label}: {', '.join(items)}" for label, items in found if items]
+    if not lines:
+        return
+    logger.warning(
+        "%s sets up what no worker runs: under the process topology a worker serves "
+        "only its modules' routers under /<module>, and %s never runs there.\n%s\n"
+        "Put a check a module's routes need on that module's own router, "
+        "APIRouter(dependencies=[Depends(...)]), raise HTTPException in the module "
+        "instead of relying on an app exception handler, and put app-wide middleware "
+        "such as CORS in a proxy in front of modupy. See the README's layout rules: "
+        "https://github.com/jeansossmeier/modupy#lay-out-your-project",
+        app_module,
+        module_path,
+        "\n".join(lines),
+    )
+
+
 def main(argv: list[str]) -> int:
-    package, log_level, verify_warn, isolate, out = argv
+    package, log_level, verify_warn, isolate, app_module, out = argv
 
     import typer
 
@@ -88,10 +180,33 @@ def main(argv: list[str]) -> int:
     assert cfg is not None  # ensure_bootstrapped guarantees this
     names = discover_module_names(package, cfg.contracts_module)
     _log_http_surface(package, [name for name in names if name == isolate or not isolate])
+    # Before the app import below, so listeners it registers count for none.
     report = {"modules": names, "consumers": _event_consumers(rt, names)}
     Path(out).write_text(json.dumps(report), encoding="utf-8")
+    watchdog = threading.Timer(_APP_CHECK_SECONDS, _skip_slow_check, (app_module,))
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        _warn_about_dropped_app_setup(app_module, package, names)
+    except Exception as exc:  # a warning only — never fatal
+        typer.echo(f"modulith: check of {app_module} skipped ({exc})", err=True)
+    finally:
+        watchdog.cancel()
     return 0
 
 
+def _skip_slow_check(app_module: str) -> None:
+    """Give up on an app import that is still going; the report is written."""
+    sys.stderr.write(
+        f"modulith: check of {app_module} skipped (its import took over {_APP_CHECK_SECONDS:g} s)\n"
+    )
+    sys.stderr.flush()
+    os._exit(0)
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    code = main(sys.argv[1:])
+    # Threads the app's import started would otherwise keep the command waiting.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
