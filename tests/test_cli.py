@@ -1096,6 +1096,15 @@ def _run_processes_with_main(make_fake_app, monkeypatch, tmp_path, main: str) ->
             id="include-router-dependencies",
         ),
         pytest.param(
+            "from fastapi import APIRouter\n"
+            "api = APIRouter()\n"
+            "api.include_router(router, prefix='/orders', dependencies=[Depends(require_login)])\n"
+            "app = FastAPI()\n"
+            "app.include_router(api, prefix='/api')\n",
+            "dependencies added to the routes of orders: require_login",
+            id="nested-include-router-dependencies",
+        ),
+        pytest.param(
             "app = FastAPI()\n"
             "@app.exception_handler(ValueError)\n"
             "async def on_value_error(request, exc):\n"
@@ -1168,6 +1177,36 @@ def test_run_processes_still_starts_when_the_app_fails_to_import(
 
     assert result.exit_code == 0, result.output
     assert "main is broken" in result.stderr
+
+
+@pytest.mark.timeout(60)
+def test_run_processes_still_starts_when_the_app_leaves_a_thread_running(
+    make_fake_app, monkeypatch, tmp_path
+):
+    result = _run_processes_with_main(
+        make_fake_app,
+        monkeypatch,
+        tmp_path,
+        "import threading\n"
+        "from fastapi import FastAPI\n"
+        "threading.Thread(target=threading.Event().wait).start()\n"
+        "app = FastAPI()\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "skipped" not in result.stderr
+
+
+@pytest.mark.timeout(60)
+def test_run_processes_still_starts_when_the_app_import_blocks(
+    make_fake_app, monkeypatch, tmp_path
+):
+    result = _run_processes_with_main(
+        make_fake_app, monkeypatch, tmp_path, "import time\ntime.sleep(3600)\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "check of fakeapp.main:app skipped (its import took over 5 s)" in result.stderr
 
 
 # ---------------------------------------------------------------------------

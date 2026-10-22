@@ -20,17 +20,23 @@ The child does everything that needs the modules imported:
   runs.
 
 It then writes ``{"modules": [sorted names], "consumers": {...}}``, as JSON, to
-the file its last argument names. A bootstrap failure exits with the CLI's own
-message and code. The arguments are the package, the log level, ``1`` to echo
-boundary warnings, the ``--isolate`` module (empty for none), the app the
-command names and the output file.
+the file its last argument names, before it imports the app. A bootstrap failure
+exits with the CLI's own message and code. The arguments are the package, the
+log level, ``1`` to echo boundary warnings, the ``--isolate`` module (empty for
+none), the app the command names and the output file.
+
+Importing the app runs code no worker runs, so it is bounded: an import still
+going after ``_APP_CHECK_SECONDS`` skips the warning, and the child exits
+without waiting for threads the import started.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +44,9 @@ if TYPE_CHECKING:
     from .runtime import Runtime
 
 logger = logging.getLogger(__name__)
+
+# Every worker waits for this child, so the app import may delay them this long.
+_APP_CHECK_SECONDS = 5.0
 
 
 def _event_consumers(rt: Runtime, names: list[str]) -> dict[str, list[str]]:
@@ -173,13 +182,31 @@ def main(argv: list[str]) -> int:
     _log_http_surface(package, [name for name in names if name == isolate or not isolate])
     # Before the app import below, so listeners it registers count for none.
     report = {"modules": names, "consumers": _event_consumers(rt, names)}
+    Path(out).write_text(json.dumps(report), encoding="utf-8")
+    watchdog = threading.Timer(_APP_CHECK_SECONDS, _skip_slow_check, (app_module,))
+    watchdog.daemon = True
+    watchdog.start()
     try:
         _warn_about_dropped_app_setup(app_module, package, names)
     except Exception as exc:  # a warning only — never fatal
         typer.echo(f"modulith: check of {app_module} skipped ({exc})", err=True)
-    Path(out).write_text(json.dumps(report), encoding="utf-8")
+    finally:
+        watchdog.cancel()
     return 0
 
 
+def _skip_slow_check(app_module: str) -> None:
+    """Give up on an app import that is still going; the report is written."""
+    sys.stderr.write(
+        f"modulith: check of {app_module} skipped (its import took over {_APP_CHECK_SECONDS:g} s)\n"
+    )
+    sys.stderr.flush()
+    os._exit(0)
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    code = main(sys.argv[1:])
+    # Threads the app's import started would otherwise keep the command waiting.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
