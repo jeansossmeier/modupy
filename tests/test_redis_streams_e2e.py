@@ -451,6 +451,8 @@ async def _dead_letter_one(
         target, consumer="c:1", group=group, block_ms=50
     )
     message_id = message_id.decode() if isinstance(message_id, bytes) else message_id
+    # As the consumer does: the renewal marks it started, its first delivery.
+    assert await broker.renew_claim(target, message_id, consumer="c:1", group=group)
     await broker.dead_letter(target, message_id, fields, group)
     return str(message_id)
 
