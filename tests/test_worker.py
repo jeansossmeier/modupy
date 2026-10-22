@@ -1912,6 +1912,43 @@ async def test_lifespan_teardown_runs_runtime_shutdown_when_consumer_stop_fails(
     assert shutdown_called, "runtime.shutdown() was skipped because consumer.stop() raised"
 
 
+async def test_a_shared_worker_stops_its_consumers_together(make_fake_app, monkeypatch) -> None:
+    """Each consumer's stop has its own budget, so a worker that stopped its
+    modules' consumers one after another could outlast the supervisor's kill
+    deadline and never reach runtime.shutdown(). Each stop here waits for the
+    other module's stop to begin, which only happens when they run together."""
+    started: dict[str, asyncio.Event] = {}
+    saw_the_other: list[str] = []
+
+    class _WaitingConsumer:
+        def __init__(self, module: str) -> None:
+            self.module = module
+            started[module] = asyncio.Event()
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            started[self.module].set()
+            other = "billing" if self.module == "orders" else "orders"
+            try:
+                await asyncio.wait_for(started[other].wait(), timeout=2)
+            except TimeoutError:
+                return
+            saw_the_other.append(self.module)
+
+    make_fake_app({"orders": "", "billing": ""})
+    _set_worker_env(monkeypatch, "orders,billing")
+    monkeypatch.setattr(
+        worker_module, "_build_consumer", lambda module, _consumer_name: _WaitingConsumer(module)
+    )
+
+    with TestClient(create_app()):
+        pass
+
+    assert sorted(saw_the_other) == ["billing", "orders"]
+
+
 async def test_lifespan_teardown_combines_both_failures_into_exception_group(
     make_fake_app, monkeypatch
 ) -> None:

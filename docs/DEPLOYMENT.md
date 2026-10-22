@@ -697,7 +697,7 @@ The Redis image sets no password, so the command above requires one and publishe
 
 **⚠️ Redis Durability Caveat:** XADD MAXLEN `~` (approximate trimming) is blind to consumer-group PEL state. An undersized `max_stream_len` can permanently drop unacked entries, violating at-least-once delivery. Size `max_stream_len` well above worst-case backlog: **publish_rate × (consumer_downtime + processing_latency + reclaim_min_idle_ms)**. Default SHM and database brokers are NOT affected.
 
-**Supported Redis versions:** Redis 6.2 or newer, because the consumer recovers pending entries with `XAUTOCLAIM`. A pending entry that `MAXLEN` trimmed is acknowledged and logged at `ERROR` on both 6.2 and 7: Redis 7 reports its id in the `XAUTOCLAIM` reply, while 6.2 answers with a nil row and keeps the entry pending, so the consumer finds it in the group's pending list, confirms with `XRANGE` that it is gone, and acknowledges it.
+**Supported Redis versions:** Redis 6.2 or newer, because the consumer recovers pending entries with `XAUTOCLAIM`. A pending entry that `MAXLEN` trimmed is acknowledged and logged at `ERROR` on both 6.2 and 7: Redis 7 reports its id in the `XAUTOCLAIM` reply, while 6.2 answers with a nil row and keeps the entry pending, so the consumer finds it in the group's pending list, confirms with `XRANGE` that it is gone, and acknowledges it. Avoid Redis 7.0.0 to 7.0.3: when the entry the consumer is about to claim was trimmed, their `XAUTOCLAIM` claims the next idle entry instead, which then runs without waiting out its failure backoff. Redis 6.2, and 7.0.4 and later, claim only the entry named.
 
 **Redis persistence:** the events live in Redis streams, so they are only as durable as the Redis behind them. Redis ships with the append-only file off (`appendonly no`) and takes periodic snapshots, which can lose the latest writes in a crash. For events to survive a crash or restart, set `appendonly yes`, choose an `appendfsync` policy, and keep Redis's data directory on a persistent volume, or use a managed Redis with AOF enabled. `everysec` (Redis's default policy) can lose about the last second of writes in a crash, `always` syncs every write at a large cost in speed, and `no` leaves flushing to the operating system. The Docker command above does none of this, so it suits a first try only. See [Redis persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/).
 
@@ -1723,9 +1723,9 @@ failure backoff, then runs alone: the consumer starts it only when no other
 listener of its own is running and starts nothing beside it. So when a message
 kills the worker, the healthy messages that were running beside it are charged
 once, and each later crash charges only the message that caused it. A Redis
-read counts a delivery for every entry it returns, but the consumer runs one
-listener at a time, so it sets the count of every entry after the first back
-to 0 and raises it to 1 just before running that entry. A reclaim raises the
+read counts a delivery for every entry it returns, but the consumer reads all
+its streams at once and runs one listener at a time, so it sets the count of
+every entry back to 0 and raises it to 1 just before running that entry. A reclaim raises the
 count by one, so it hands over an entry whose listener never started as that
 entry's first delivery. The consumer claims one entry at a time, just before
 running it, once a charged entry has also sat out the failure backoff. So when

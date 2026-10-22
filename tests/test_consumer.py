@@ -1683,7 +1683,9 @@ def _stage_batch(how: str, broker: FakeConsumerBroker, count: int) -> list[str]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("how", ["read", "reclaim"])
-async def test_consumer_renews_each_entry_after_the_first_before_dispatching(how: str) -> None:
+async def test_consumer_renews_each_entry_not_just_claimed_before_dispatching(how: str) -> None:
+    """A read renews every entry, the first included, since that renewal is
+    what marks an entry started; a reclaim's first entry was just claimed."""
     received: list[int] = []
 
     async def handler(evt: CrossEvent) -> None:
@@ -1697,8 +1699,9 @@ async def test_consumer_renews_each_entry_after_the_first_before_dispatching(how
 
     await _run_batch(how, broker, consumer)
 
+    renewed = ids if how == "read" else ids[1:]
     assert received == [1, 2, 3]
-    assert broker.renewed == [("t", mid, "orders:1", "modulith-orders") for mid in ids[1:]]
+    assert broker.renewed == [("t", mid, "orders:1", "modulith-orders") for mid in renewed]
 
 
 @pytest.mark.asyncio
@@ -1757,13 +1760,13 @@ async def test_consumer_leaves_an_entry_pending_when_the_ownership_check_fails()
     bus = InMemoryEventBus()
     bus.register(CrossEvent, handler)
     broker = FailingRenewBroker()
-    ids = _stage_batch("read", broker, 2)
+    _stage_batch("read", broker, 2)
     consumer = _make_consumer(broker, bus, targets=["t"])
 
     await _run_batch("read", broker, consumer)
 
-    assert received == [1]
-    assert broker.acked == [("t", ids[0])]
+    assert received == []
+    assert broker.acked == []
 
 
 # ---------------------------------------------------------------------------

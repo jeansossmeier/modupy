@@ -1131,8 +1131,8 @@ async def test_pending_entries_lists_every_idle_entry_page_by_page(
 
     listed = await stateful_broker.pending_entries("t", min_idle_ms=500, count=2)
 
-    # The read counts a delivery only for the first entry; the rest never started.
-    assert listed == [("1-0", 500, 1)] + [(f"{n}-0", 500, 0) for n in range(2, 5)]
+    # The read counts no delivery: none of these entries started.
+    assert listed == [(f"{n}-0", 500, 0) for n in range(1, 5)]
 
 
 async def test_read_returns_its_batch_when_marking_it_not_started_fails(caplog) -> None:
@@ -1152,7 +1152,7 @@ async def test_read_returns_its_batch_when_marking_it_not_started_fails(caplog) 
         messages = await broker.read("t", consumer="c1")
 
     assert [mid for mid, _fields in messages[0][1]] == [b"1-0", b"2-0"]
-    assert "could not mark 1 entries read from modulith.events.t as not started" in caplog.text
+    assert "could not mark 2 entries read from modulith.events.t as not started" in caplog.text
 
 
 async def test_claim_pending_claims_only_the_named_entry_once_it_has_been_idle_long_enough(
@@ -1180,7 +1180,7 @@ async def test_claim_pending_claims_only_the_named_entry_once_it_has_been_idle_l
         b"1-0": "c2",
         b"2-0": "crashed",
     }
-    assert stateful_fake.times_delivered[("modulith.events.t", "g", b"1-0")] == 2
+    assert stateful_fake.times_delivered[("modulith.events.t", "g", b"1-0")] == 1
     assert stateful_fake.times_delivered[("modulith.events.t", "g", b"2-0")] == 0
 
 
@@ -1991,13 +1991,15 @@ async def test_integration_renew_claim_keeps_ownership_and_the_delivery_count(
 
         assert await broker.renew_claim("t", mid, consumer="b") is False
         [entry] = await redis_client.xpending_range(stream, "g", min=mid, max=mid, count=1)
-        assert (entry["consumer"], entry["times_delivered"]) == (b"a", 1)
+        assert (entry["consumer"], entry["times_delivered"]) == (b"a", 0)
         assert entry["time_since_delivered"] >= 300  # a refused renewal left the clock alone
 
-        assert await broker.renew_claim("t", mid, consumer="a") is True
-        [entry] = await redis_client.xpending_range(stream, "g", min=mid, max=mid, count=1)
-        assert (entry["consumer"], entry["times_delivered"]) == (b"a", 1)
-        assert entry["time_since_delivered"] < 200
+        # The first renewal marks the entry started; a later one spends nothing.
+        for _ in range(2):
+            assert await broker.renew_claim("t", mid, consumer="a") is True
+            [entry] = await redis_client.xpending_range(stream, "g", min=mid, max=mid, count=1)
+            assert (entry["consumer"], entry["times_delivered"]) == (b"a", 1)
+            assert entry["time_since_delivered"] < 200
 
         await broker.ack("t", mid)
         assert await broker.renew_claim("t", mid, consumer="a") is False
@@ -2023,7 +2025,7 @@ async def test_integration_a_reclaim_charges_only_the_entries_their_consumer_sta
             await broker.publish("t", f"m{n}".encode())
         [(_s, entries)] = await broker.read("t", consumer="a", count=10, block_ms=1000)
         ids = [raw_id.decode() for raw_id, _f in entries]
-        assert await counts() == [1, 0, 0]
+        assert await counts() == [0, 0, 0]
 
         assert await broker.renew_claim("t", ids[1], consumer="a") is True
         assert await broker.renew_claim("t", ids[0], consumer="a") is True

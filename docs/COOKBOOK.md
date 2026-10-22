@@ -940,7 +940,11 @@ listeners, with a WARNING), and the shared worker's consumers skip the copy, bec
 outside a transaction leaves out of the header a module whose listener failed
 during it, so that module's consumer retries the listener from the copy, as it
 would in a worker of its own; a transactional publish needs no such retry,
-since the outbox retries each listener's own row. The shared
+since the outbox retries each listener's own row. The copy makes the broker
+part of every such publish: while the broker is unreachable, or for an event
+over its `max_payload_bytes`, a `publish()` outside a transaction in the shared
+worker raises after its own modules' listeners have run, so the request fails
+and a client that retries it runs those listeners again. The shared
 worker serves one OpenAPI schema for all its modules, under the first module's
 prefix (`/billing/docs` for `billing` and `orders`). It runs as many replicas as
 the largest `[tool.modulith.workers]` count among its modules.

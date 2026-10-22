@@ -35,6 +35,7 @@ left by an earlier deployment.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import importlib
@@ -329,12 +330,16 @@ def create_app() -> FastAPI:
             # regardless of each other's outcome — otherwise a stop() failure
             # skips shutdown() entirely, leaking every broker connection the
             # runtime registered on every ordinary stop-time error.
+            # The consumers stop together: one after another, a worker hosting
+            # several modules could outlast the supervisor's kill deadline.
             consumer_error: BaseException | None = None
-            for consumer in consumers:
-                try:
-                    await consumer.stop()
-                except BaseException as exc:
-                    consumer_error = consumer_error or exc
+            try:
+                results = await asyncio.gather(
+                    *(consumer.stop() for consumer in consumers), return_exceptions=True
+                )
+                consumer_error = next((r for r in results if isinstance(r, BaseException)), None)
+            except BaseException as exc:
+                consumer_error = exc
             _app.state.consumers = []
             _app.state.consumer_modules = []
             try:
