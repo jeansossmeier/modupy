@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.13.2] — 2026-10-22
+
 ### Added
 
 - `examples/ai_studio` keeps three AI modules of different shapes beside a shop's `reviews` module in one codebase: `moderation` runs a local model on each new review in a process of its own (`own_process = ["moderation"]`), `replies` drafts a reply with a LangGraph agent under `@listener(timeout=30)`, and `summaries` answers `GET /summaries/{product}` within an `asyncio.timeout`, with a 504 past it. Each stand-in model fails on demand through `STUDIO_<MODULE>_FAULT`. Its README hangs the summarizer in one process, then crashes moderation under `--topology processes` while reviews, replies and summaries keep answering. CI type-checks it against LangGraph and runs its README from the built wheel only, as for `agent_desk`.
