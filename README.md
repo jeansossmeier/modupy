@@ -15,6 +15,10 @@ As your company grows, the same code runs one process per module, scales the bus
 Your events, listeners and module structure stay the same at every step.
 The outbox needs a few lines of session wiring, and splitting what modules share, such as tables, in-memory state and direct calls into another module, is your job.
 
+**Building an AI product?** Your LangGraph, CrewAI or LangChain code is Python, so it can live in the same codebase as the rest of your backend, as modules beside your business code, with no second service just for the AI.
+When an AI feature misbehaves, `modulith run --topology processes` gives its module a process of its own without changing its code, as long as it follows the [layout below](#lay-out-your-project), and the rest of the app keeps answering: [measured here](#keep-a-misbehaving-ai-feature-from-taking-the-api-down).
+modupy is not an AI framework; it is the backend your AI framework runs in.
+
 ```bash
 pip install 'modupy[fastapi,cli]'
 ```
@@ -28,10 +32,11 @@ modupy installs the `modulith` package, so you `import modulith`, run the `modul
 
 ## Why modupy
 
-Most backends end up in one of two painful places:
+Most backends end up in one of two painful places, and AI products often add a third:
 
 - **A big ball of mud.** One app where everything imports everything. It is quick to start, then every change breaks something far away, and splitting it up means a rewrite.
 - **Microservices too early.** Network calls, a dozen deploy pipelines and a platform team, long before your traffic needs them.
+- **A second language for the AI.** A TypeScript or Go backend plus a separate Python service, often only because the agent frameworks are Python-first: two languages, two deploys and a network contract from day one.
 
 modupy is the path in between:
 
@@ -39,6 +44,11 @@ modupy is the path in between:
 - **Events between modules.** A module publishes `OrderCreated`, and every module that cares reacts to it. The publisher never needs to know who is listening.
 - **One codebase, any shape.** The same modules run in one process, in one process per module, or as separate services. Config picks the shape.
 - **No lost events.** With the outbox on, an event published inside your database transaction is saved with your data, then retried until it is delivered or set aside as a *dead letter* you can replay.
+- **Failures that stay put.** A module in its own process can block its event loop, crash or use up its connection pool while the other modules keep answering.
+
+You don't have to pick your architecture on day one.
+Start as one app, and split where your traffic and your failures show you, when they show you.
+That matters most for AI features, where nobody knows in advance which one will take off, cost the most or misbehave.
 
 ## How it grows with your company
 
@@ -54,6 +64,21 @@ modupy is the path in between:
 Your events and listeners never change, and your URLs stay the same as long as `main.py` mounts each module's `router` at `/<module>`, as the quickstart does.
 
 ## Ready for AI
+
+### Keep a misbehaving AI feature from taking the API down
+
+AI features fail in ways ordinary code rarely does.
+Model calls can hang, sync SDKs block the event loop, native code can crash its process, and a slow provider leaves calls waiting while they hold database connections.
+`modulith run --topology processes` gives every module a process of its own, or, with `own_process = ["agent"]` under `[tool.modulith]`, only the agent, while the other modules share one.
+The module's code does not change, as long as it follows the [layout below](#lay-out-your-project): workers do not run `main.py`, so its lifespan and middleware never reach them, including a login check kept there.
+Two write-ups measure it with the LangGraph agent in [`examples/agent_desk`](https://github.com/jeansossmeier/modupy/tree/main/examples/agent_desk), whose stand-in model fails on demand:
+
+- [An AI agent in its own process](https://github.com/jeansossmeier/modupy/blob/main/docs/posts/an-ai-agent-in-its-own-process.md): with the agent in the API's process, every request failed while the model call blocked its thread or crashed the process, 1,500 of 1,500 in each run. With the agent in its own process, none failed.
+- [When model calls pile up](https://github.com/jeansossmeier/modupy/blob/main/docs/posts/when-model-calls-pile-up.md): with a slow model and the agent holding its database session across the calls on purpose, 61 to 65% of requests failed in one process, and none with the agent in its own, which also capped it at 10 calls at a time. Closing the session before the model calls fixed it in one process too.
+
+A process of its own contains a crash, a blocked event loop or a drained connection pool.
+It does not contain a host that runs out of memory or CPU, or a database server that runs out of connections.
+The module's own routes still fail while it is down, and the supervisor restarts a blocked worker only when `worker_liveness_timeout_seconds` is set, which it is not by default.
 
 ### Take LLM calls off the request path
 
@@ -311,11 +336,12 @@ myproject/
     └── main.py             # the FastAPI app
 ```
 
-Three rules keep this working:
+Four rules keep this working:
 
 - Every module is a package with an `__init__.py`, and its `@listener` functions must be imported from there (for example `from . import handlers`) so they register.
 - Names that start with `_` are private to their module.
 - A module with routes re-exports its `router` from `__init__.py`, because a module running in its own process serves exactly that `router` under `/<module>`. A listener-only module like `payments` needs none.
+- A check every route of a module needs, such as a login check or a rate limit, goes on that module's own `router`: `APIRouter(dependencies=[Depends(require_user)])`. A module in its own process serves its routes without `main.py`'s middleware and without the `dependencies` that `main.py` passes to `include_router`, and nothing warns you. App-wide middleware such as CORS goes in a proxy in front of modupy.
 
 The CLI finds your package through `pyproject.toml`, and one pytest setting lets your tests import it:
 
