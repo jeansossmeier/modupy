@@ -206,6 +206,10 @@ class Runtime:
         self._listener_owners: dict[Callable[..., Any], str] = {}
         self._hosted_module: str | None = None
         self._cohosted_modules: tuple[str, ...] = ()
+        # Event types a module in another process consumes, fully qualified,
+        # as the supervisor gave them to a worker hosting several modules
+        # (see host_module); None when it gave none.
+        self._remote_event_types: frozenset[str] | None = None
         # Set once a worker's consumer subscriptions and serializer allow-list
         # are computed from the listeners then registered; later listeners
         # are local-only (see register_listener).
@@ -421,7 +425,12 @@ class Runtime:
                 return package
         return None
 
-    def host_module(self, module_package: str, *cohosted: str) -> None:
+    def host_module(
+        self,
+        module_package: str,
+        *cohosted: str,
+        remote_event_types: Collection[str] | None = None,
+    ) -> None:
         """Restrict this process's listeners to these module packages' own.
 
         Called by the process-topology worker with the module it hosts, or
@@ -429,9 +438,18 @@ class Runtime:
         importing another module package (a sibling pulled in through its
         public API) are then ignored by consumer subscriptions, broker
         dispatch and local publish, so they run only in their owner's worker.
+
+        ``remote_event_types`` names, fully qualified, the event types a module
+        in another process consumes; a worker hosting several modules sends
+        only those of its events with a local listener to the broker (see
+        ``_broker_route_target``). None, the default, means unknown: it then
+        sends every one.
         """
         self._hosted_module = module_package
         self._cohosted_modules = cohosted
+        self._remote_event_types = (
+            None if remote_event_types is None else frozenset(remote_event_types)
+        )
 
     def local_listeners(self, handlers: list[Callable[..., Any]]) -> list[Callable[..., Any]]:
         """The subset of ``handlers`` this process owns."""
@@ -984,7 +1002,7 @@ class Runtime:
         return None
 
     def _broker_route_target(
-        self, event: Any, *, has_local_handler: bool
+        self, event: Any, *, has_local_handler: bool, listener_failed: bool = False
     ) -> tuple[str, bool] | None:
         """The validated, whitespace-normalized broker target for this publish
         and whether the route is optional, or None (in-process).
@@ -1001,9 +1019,15 @@ class Runtime:
 
         An event with a local listener and no externalization signal stays
         in-process (no broker traffic), except in a worker hosting several
-        modules, which routes it too. That route alone is optional: an event
-        with no JSON form stays in-process (see ``_wire_payload``), as it
-        would in a worker hosting only the publisher. The destination is the
+        modules. That worker cannot tell which of its modules published, so it
+        routes such an event when a module in another process consumes it
+        (``host_module``'s ``remote_event_types``; every event when that is
+        unknown), and when ``listener_failed`` says a co-hosted listener raised
+        at a non-transactional publish, whose module's consumer then retries
+        it from the copy (see ``publisher_modules``). That route alone is
+        optional: an event with no JSON form stays in-process (see
+        ``_wire_payload``), as it would in a worker hosting only the
+        publisher. The destination is the
         fully-qualified event name (module + qualname), matching the
         ``event_type`` header so a future consumer keys producer and consumer
         identically.
@@ -1027,13 +1051,17 @@ class Runtime:
         if target is None:
             # No externalization signal. Route only a listener-less event, by
             # the default scheme; an in-process-only event isn't broker traffic.
-            # A worker hosting several modules routes every event: it cannot
-            # tell which of them published, so a local listener may be another
-            # module's, and the publisher's peers elsewhere would miss it.
-            if has_local_handler and not self._cohosted_modules:
+            # A worker hosting several modules also routes the events above:
+            # a local listener may be another module's than the publisher's,
+            # whose peers elsewhere would miss it.
+            fqn = f"{type(event).__module__}.{type(event).__qualname__}"
+            remote = self._remote_event_types
+            copied = bool(self._cohosted_modules) and (
+                listener_failed or remote is None or fqn in remote
+            )
+            if has_local_handler and not copied:
                 return None
             optional = has_local_handler
-            fqn = f"{type(event).__module__}.{type(event).__qualname__}"
             target = f"{cfg.broker}:{fqn}"
 
         event_type = f"{type(event).__module__}.{type(event).__qualname__}"
@@ -1074,9 +1102,9 @@ class Runtime:
                 logger.warning(
                     "%s cannot be sent to the broker (%s), so only its listeners in "
                     "this worker receive it. A worker hosting several modules sends "
-                    "their events across processes, since it cannot tell which module "
-                    "published one; give the event a JSON form if a module in another "
-                    "process listens to it.",
+                    "an event across processes when a module in another process may "
+                    "listen to it, or to retry a listener here that failed, since it "
+                    "cannot tell which module published one; give the event a JSON form.",
                     event_type,
                     exc,
                 )
@@ -1094,7 +1122,9 @@ class Runtime:
         are the hosted modules whose listener just raised (see
         ``publisher_modules``).
         """
-        route = self._broker_route_target(event, has_local_handler=has_local_handler)
+        route = self._broker_route_target(
+            event, has_local_handler=has_local_handler, listener_failed=bool(failed_modules)
+        )
         if route is None:
             return
         target, optional = route
@@ -1570,6 +1600,7 @@ class Runtime:
         self._unresolved_listener_modules = {}
         self._hosted_module = None
         self._cohosted_modules = ()
+        self._remote_event_types = None
         self._consumer_built = False
         self._warned_missing_outbox_store = False
         self._warned_unroutable = set()

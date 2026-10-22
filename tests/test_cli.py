@@ -891,6 +891,92 @@ def test_run_processes_topology_honors_own_process(make_fake_app, monkeypatch, t
     assert [s.module_name for s in captured["specs"]] == ["inventory,payments", "orders"]
 
 
+def test_run_tells_the_shared_worker_which_events_a_module_elsewhere_consumes(
+    make_fake_app, monkeypatch, tmp_path
+):
+    """``orders`` and ``billing`` alone consume ``OrderPlaced``, so their shared
+    worker keeps it in memory. A listener in a shared file belongs to whichever
+    module's import loads that file first, which may differ in each worker, so
+    its event counts as consumed elsewhere."""
+    make_fake_app(
+        {
+            "contracts": """
+                from dataclasses import dataclass
+                from modulith import event
+
+                @event
+                @dataclass(frozen=True)
+                class OrderPlaced:
+                    order_id: str
+
+                @event
+                @dataclass(frozen=True)
+                class ShipmentBooked:
+                    order_id: str
+
+                @event
+                @dataclass(frozen=True)
+                class Noted:
+                    text: str
+            """,
+            "orders": """
+                from modulith import listener
+                from fakeapp.contracts import OrderPlaced
+
+                @listener
+                async def on_placed(evt: OrderPlaced) -> None:
+                    pass
+            """,
+            "billing": """
+                from modulith import listener
+                from fakeapp.contracts import OrderPlaced
+                import fakeapp.shared
+
+                @listener
+                async def bill(evt: OrderPlaced) -> None:
+                    pass
+            """,
+            "agent": """
+                from modulith import listener
+                from fakeapp.contracts import ShipmentBooked
+
+                @listener
+                async def triage(evt: ShipmentBooked) -> None:
+                    pass
+            """,
+        },
+        extra_files={
+            "shared.py": """
+                from modulith import listener
+                from fakeapp.contracts import Noted
+
+                @listener
+                async def note(evt: Noted) -> None:
+                    pass
+            """
+        },
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.modulith]\npackage = "fakeapp"\nbroker = "testbroker"\nown_process = ["agent"]\n'
+    )
+    monkeypatch.setattr(os, "execvp", lambda *a: pytest.fail("must not exec uvicorn"))
+    captured: dict[str, object] = {}
+
+    async def fake_run_supervised(specs, host, port, **kwargs):
+        captured["specs"] = specs
+
+    monkeypatch.setattr("modulith.supervisor.run_supervised", fake_run_supervised)
+
+    result = runner.invoke(app, ["run", "fakeapp:app", "--topology", "processes"])
+
+    assert result.exit_code == 0, result.output
+    envs = {s.module_name: s.env or {} for s in captured["specs"]}
+    assert envs["billing,orders"]["MODULITH_REMOTE_EVENT_TYPES"] == (
+        "fakeapp.contracts.Noted,fakeapp.contracts.ShipmentBooked"
+    )
+    assert "MODULITH_REMOTE_EVENT_TYPES" not in envs["agent"]
+
+
 def test_run_processes_topology_passes_the_worker_liveness_timeout(
     make_fake_app, monkeypatch, tmp_path
 ):

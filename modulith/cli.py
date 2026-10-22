@@ -234,8 +234,9 @@ def _configure_process_runtime(app_module: str) -> str:
 
 def _inspect_application(
     package: str, *, log_level: str, verify_warn: bool, isolate: str | None
-) -> list[str]:
-    """Bootstrap the application in a subprocess and return its module names.
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Bootstrap the application in a subprocess and return its module names,
+    with the modules that consume each event type (see ``modulith._inspect``).
 
     The supervisor never imports an application module (see
     ``modulith._inspect``), so the import-time checks that used to fail its own
@@ -277,8 +278,8 @@ def _inspect_application(
                     err=True,
                 )
             raise typer.Exit(code=code if code > 0 else 1)
-        names: list[str] = json.loads(out.read_text(encoding="utf-8"))
-    return names
+        report = json.loads(out.read_text(encoding="utf-8"))
+    return report["modules"], report["consumers"]
 
 
 def _prefer_sibling_uvicorn() -> None:
@@ -781,7 +782,7 @@ def _run_process_topology(
     modulith_logger.setLevel(logging.ERROR)
     try:
         package = _configure_process_runtime(app_module)
-        names = _inspect_application(
+        names, consumers = _inspect_application(
             package, log_level=log_level, verify_warn=verify_warn, isolate=isolate
         )
         # This process resolves configuration and brokers only: discovery
@@ -879,6 +880,7 @@ def _run_process_topology(
         "env": worker_env,
         "contracts_module": cfg.contracts_module,
         "own_process": list(cfg.own_process),
+        "consumers": consumers,
         "worker_port_base": (
             worker_port_base if worker_port_base is not None else cfg.worker_port_base
         ),

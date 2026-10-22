@@ -220,6 +220,11 @@ def create_app() -> FastAPI:
       * ``MODULITH_MODULE``       — the module this worker hosts, or the
         modules it hosts together, comma-separated (required)
       * ``MODULITH_APP_PACKAGE``  — the application package (required)
+      * ``MODULITH_REMOTE_EVENT_TYPES`` — the event types, fully qualified and
+        comma-separated, that a module in another process consumes, which the
+        supervisor sets for a worker hosting several modules. Unset, such a
+        worker sends every event it publishes to the broker
+        (see ``Runtime.host_module``).
 
     Configures modulith with ``auto_discover=False`` so bootstrap imports no
     modules, then selectively imports the contracts module (shared event types,
@@ -278,7 +283,11 @@ def create_app() -> FastAPI:
     contracts_module = _runtime.config.contracts_module if _runtime.config else "contracts"
     _import_contracts(app_package, contracts_module)
     packages = [f"{app_package}.{name}" for name in names]
-    _runtime.host_module(*packages)
+    remote = os.environ.get("MODULITH_REMOTE_EVENT_TYPES")
+    _runtime.host_module(
+        *packages,
+        remote_event_types=None if remote is None else [t for t in remote.split(",") if t],
+    )
     modules = [importlib.import_module(package) for package in packages]
     for package in packages:
         _import_manifest(package)

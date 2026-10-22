@@ -932,19 +932,22 @@ Each module keeps its own consumer group, `modulith-<module>`, wherever it runs,
 so moving a module in or out of `own_process` does not orphan its undelivered
 messages. The shared worker runs one consumer per module and reports ready only
 while all of them are. It cannot tell which of its modules published an event,
-so it sends every event it publishes to the broker as well, whether or not one
-of its own modules listens: a module in another process receives it without
-`@externalized` (one that cannot be JSON-serialized stays with the shared worker's
-listeners, with a WARNING), and the shared worker's consumers skip the copy, because its
-`publisher_module` header names every module the worker hosts. A `publish()`
-outside a transaction leaves out of the header a module whose listener failed
-during it, so that module's consumer retries the listener from the copy, as it
-would in a worker of its own; a transactional publish needs no such retry,
-since the outbox retries each listener's own row. The copy makes the broker
-part of every such publish: while the broker is unreachable, or for an event
-over its `max_payload_bytes`, a `publish()` outside a transaction in the shared
-worker raises after its own modules' listeners have run, so the request fails
-and a client that retries it runs those listeners again. The shared
+so before starting the workers `modulith run` works out which event types a
+module in another process listens to, and the shared worker sends those to the
+broker as well, whether or not one of its own modules listens: a module in
+another process receives them without `@externalized` (one that cannot be
+JSON-serialized stays with the shared worker's listeners, with a WARNING), and
+the shared worker's consumers skip the copy, because its `publisher_module`
+header names every module the worker hosts. An event only its own modules
+listen to stays in memory, as in a single process, so a broker that is down,
+or an event over its `max_payload_bytes`, does not fail its publish. The
+exception is a `publish()` outside a transaction during which one of its
+modules' listeners fails: the shared worker then sends a copy that leaves that
+module out of the header, so that module's consumer retries the listener from
+it, as it would in a worker of its own; a transactional publish needs no such
+retry, since the outbox retries each listener's own row. A shared worker you
+start yourself, without `modulith run`, sends every event it publishes to the
+broker, since it cannot know that no module elsewhere listens. The shared
 worker serves one OpenAPI schema for all its modules, under the first module's
 prefix (`/billing/docs` for `billing` and `orders`). It runs as many replicas as
 the largest `[tool.modulith.workers]` count among its modules.
