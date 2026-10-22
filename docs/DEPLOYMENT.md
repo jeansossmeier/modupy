@@ -81,8 +81,10 @@ data: the row commits atomically with your data only inside one transaction.
 
 `main.py` does not run under `--topology processes`: its lifespan, middleware
 and this outbox wiring are absent from every worker. A login check kept in
-`main.py` therefore stops guarding the module's routes, with no warning; put
-it on the module's `router`, as the README's layout rules show. Set `outbox_url` (below)
+`main.py` therefore stops guarding the module's routes. `modulith run` and
+`modulith dev` log a startup warning naming the middleware, dependencies and
+exception handlers the app adds (not its lifespan), but the check runs only
+once it is on the module's `router`, as the README's layout rules show. Set `outbox_url` (below)
 so each worker binds the store itself. A worker whose `outbox` is not
 `"memory"` refuses to start with a `ConfigurationError` when neither
 `outbox_url`, the module's import nor a `modulith_after_module_load` hook
