@@ -1056,6 +1056,39 @@ def test_module_router_is_mounted_under_module_prefix(make_fake_app, monkeypatch
     assert resp.json() == {"pong": True}
 
 
+def test_a_check_on_the_module_router_still_guards_its_routes_in_a_worker(
+    make_fake_app, monkeypatch
+) -> None:
+    """A worker never runs main.py, so its middleware is gone; the README sends
+    login checks to the module's router instead, which the worker mounts."""
+    make_fake_app(
+        {
+            "orders": """
+                from fastapi import APIRouter, Depends, Header, HTTPException
+
+                async def require_user(authorization: str = Header(default="")) -> None:
+                    if authorization != "Bearer alice":
+                        raise HTTPException(status_code=401)
+
+                router = APIRouter(dependencies=[Depends(require_user)])
+
+                @router.get("/ping")
+                async def ping() -> dict[str, bool]:
+                    return {"pong": True}
+            """
+        }
+    )
+    _set_worker_env(monkeypatch, "orders")
+
+    app = create_app()
+    with TestClient(app) as client:
+        anonymous = client.get("/orders/ping")
+        signed_in = client.get("/orders/ping", headers={"authorization": "Bearer alice"})
+
+    assert anonymous.status_code == 401
+    assert signed_in.status_code == 200
+
+
 def test_module_without_router_warns_naming_module_and_attribute(
     make_fake_app, monkeypatch, caplog
 ) -> None:

@@ -70,7 +70,7 @@ Your events and listeners never change, and your URLs stay the same as long as `
 AI features fail in ways ordinary code rarely does.
 Model calls can hang, sync SDKs block the event loop, native code can crash its process, and a slow provider leaves calls waiting while they hold database connections.
 `modulith run --topology processes` gives every module a process of its own, or, with `own_process = ["agent"]` under `[tool.modulith]`, only the agent, while the other modules share one.
-The module's code does not change, as long as it follows the [layout below](#lay-out-your-project): workers do not run `main.py`, so its lifespan and middleware never reach them.
+The module's code does not change, as long as it follows the [layout below](#lay-out-your-project): workers do not run `main.py`, so its lifespan and middleware never reach them, including a login check kept there.
 Two write-ups measure it with the LangGraph agent in [`examples/agent_desk`](https://github.com/jeansossmeier/modupy/tree/main/examples/agent_desk), whose stand-in model fails on demand:
 
 - [An AI agent in its own process](https://github.com/jeansossmeier/modupy/blob/main/docs/posts/an-ai-agent-in-its-own-process.md): with the agent in the API's process, every request failed while the model call blocked its thread or crashed the process, 1,500 of 1,500 in each run. With the agent in its own process, none failed.
@@ -336,11 +336,12 @@ myproject/
     └── main.py             # the FastAPI app
 ```
 
-Three rules keep this working:
+Four rules keep this working:
 
 - Every module is a package with an `__init__.py`, and its `@listener` functions must be imported from there (for example `from . import handlers`) so they register.
 - Names that start with `_` are private to their module.
 - A module with routes re-exports its `router` from `__init__.py`, because a module running in its own process serves exactly that `router` under `/<module>`. A listener-only module like `payments` needs none.
+- A check every route of a module needs, such as a login check or a rate limit, goes on that module's own `router`: `APIRouter(dependencies=[Depends(require_user)])`. A module in its own process serves its routes without `main.py`'s middleware and without the `dependencies` that `main.py` passes to `include_router`, and nothing warns you. App-wide middleware such as CORS goes in a proxy in front of modupy.
 
 The CLI finds your package through `pyproject.toml`, and one pytest setting lets your tests import it:
 
