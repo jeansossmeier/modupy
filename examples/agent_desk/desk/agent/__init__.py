@@ -12,6 +12,9 @@ from desk.contracts import TicketOpened, TicketTriaged
 from desk.database import sessionmaker
 
 TIMEOUT = float(os.environ.get("DESK_AGENT_TIMEOUT", "30"))
+# 1 keeps the session open across the model calls: the mistake that
+# benchmark.py --hold-session measures.
+HOLD_SESSION = os.environ.get("DESK_AGENT_HOLD_SESSION") == "1"
 
 
 class Base(DeclarativeBase):
@@ -32,8 +35,12 @@ async def triage(event: TicketOpened) -> None:
         # Delivery is at least once, so a redelivered ticket is not triaged twice.
         if await session.get(Triage, event.ticket_id) is not None:
             return
-    # No session stays open across the model calls, which can take seconds.
-    state = await graph.ainvoke({"subject": event.subject, "body": event.body})
+        if HOLD_SESSION:
+            # The session's pooled connection stays checked out while the model answers.
+            state = await graph.ainvoke({"subject": event.subject, "body": event.body})
+    if not HOLD_SESSION:
+        # No session stays open across the model calls, which can take seconds.
+        state = await graph.ainvoke({"subject": event.subject, "body": event.body})
     async with sessionmaker() as session:
         token = bind_session(session)
         try:

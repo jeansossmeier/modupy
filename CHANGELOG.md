@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `examples/agent_desk` measures a slow model whose waiting calls pile up. `DESK_AGENT_FAULT=slow` delays every model answer by `DESK_AGENT_SLOW_SECONDS` (15), `DESK_AGENT_HOLD_SESSION=1` keeps the agent's session open across its model calls, and `benchmark.py` gains `--postgres URL`, which serves each row from a fresh Postgres database and records the most connections it had open, `--hold-session`, `--client-timeout` and `--agent-timeout`. `docs/posts/when-model-calls-pile-up.md` reports a run.
+
 ## [0.13.0] — 2026-10-21
 
 ### Added
