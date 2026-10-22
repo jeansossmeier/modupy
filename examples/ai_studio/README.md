@@ -30,6 +30,10 @@ Each AI module fails in its own way, so each gets the containment that fits:
   `--topology processes`, while `reviews`, `replies` and `summaries` share
   another.
 
+Delivery is at least once, so a redelivered review runs its model again; a
+second verdict or reply overwrites the first, so the review still holds one of
+each.
+
 - [`studio/contracts/__init__.py`](studio/contracts/__init__.py): the three events
 - [`studio/reviews/`](studio/reviews): `post_review`, `published_reviews`, the listeners that record the verdict and the reply, and the `POST /reviews` and `GET /reviews/{id}` routes
 - [`studio/moderation/`](studio/moderation): the `moderate` listener and a stand-in local classifier
@@ -45,6 +49,9 @@ that module's model fails that way; any other value that is not empty stops
 the module from importing. To use real models, replace `is_abusive` in
 `studio/moderation/model.py` and `summarize` in `studio/summaries/model.py`,
 and assign any LangChain chat model to `model` in `studio/replies/graph.py`.
+The summary and reply timeouts cancel only an awaited call, so use an async
+client there: LangChain runs a chat model that has no native async support on
+a thread, which keeps running past the timeout.
 
 Every command below runs from this directory, `examples/ai_studio` in a clone
 of the repository (the [examples index](../README.md) shows how), exactly as
@@ -175,7 +182,9 @@ runs and can crash its process, so it gets a process of its own.
 Nothing in `studio/` changes. `own_process = ["moderation"]` gives moderation
 one worker, and `replies`, `reviews` and `summaries` share the other. Startup
 logs warnings about the default broker and about modules with no routes;
-neither affects this walkthrough.
+neither affects this walkthrough. Both workers write the one `studio.db`, and
+SQLite lets a write wait at most five seconds for the one ahead of it; under
+real load use Postgres, which has no such single write lock.
 
 ```bash
 export STUDIO_SUMMARIES_FAULT=
@@ -242,10 +251,14 @@ shows with its agent.
 
 ## Fix moderation
 
-`r-4` is still waiting in the broker, which moderation never acknowledged. It
-comes back once its claim expires, after seconds here because `pyproject.toml`
-shortens the broker's `reclaim_stale_seconds`, which defaults to a minute.
-Clear the fault and run the studio again:
+Unless the broker dead-lettered it, `r-4` is still waiting in the broker,
+which moderation never acknowledged. It comes back once its claim expires,
+after seconds here because `pyproject.toml` shortens the broker's
+`reclaim_stale_seconds`, which defaults to a minute. If the studio logged
+`dead-lettered after 5 attempt(s)` before you stopped it, run
+`modulith broker dead-letter --retry-all` before you start it again; it prints
+`resubmitted 1 dead-lettered message(s)`. Clear the fault and run the studio
+again:
 
 ```bash
 export STUDIO_MODERATION_FAULT=
