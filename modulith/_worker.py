@@ -221,10 +221,11 @@ def create_app() -> FastAPI:
         modules it hosts together, comma-separated (required)
       * ``MODULITH_APP_PACKAGE``  — the application package (required)
       * ``MODULITH_REMOTE_EVENT_TYPES`` — the event types, fully qualified and
-        comma-separated, that a module in another process consumes, which the
-        supervisor sets for a worker hosting several modules. Unset, such a
-        worker sends every event it publishes to the broker
-        (see ``Runtime.host_module``).
+        comma-separated, that a module outside the worker hosting several
+        modules consumes, which the supervisor sets for every worker when
+        there is one. Unset, such a worker sends every event it publishes to
+        the broker (see ``Runtime.host_module``). A worker hosting one module
+        logs an error for each event type it listens to that the list lacks.
 
     Configures modulith with ``auto_discover=False`` so bootstrap imports no
     modules, then selectively imports the contracts module (shared event types,
@@ -284,10 +285,8 @@ def create_app() -> FastAPI:
     _import_contracts(app_package, contracts_module)
     packages = [f"{app_package}.{name}" for name in names]
     remote = os.environ.get("MODULITH_REMOTE_EVENT_TYPES")
-    _runtime.host_module(
-        *packages,
-        remote_event_types=None if remote is None else [t for t in remote.split(",") if t],
-    )
+    remote_event_types = None if remote is None else [t for t in remote.split(",") if t]
+    _runtime.host_module(*packages, remote_event_types=remote_event_types)
     modules = [importlib.import_module(package) for package in packages]
     for package in packages:
         _import_manifest(package)
@@ -303,6 +302,8 @@ def create_app() -> FastAPI:
             _runtime.plugin_manager.hook.modulith_after_module_load(
                 module=ModuleInfo(name=name, package=package)
             )
+    if remote_event_types is not None and len(packages) == 1:
+        _report_unlisted_listeners(packages[0], remote_event_types)
     _runtime.bind_configured_outbox()
     _require_outbox_store()
     instance = uuid4().hex
@@ -541,6 +542,37 @@ def create_app() -> FastAPI:
 def consumer_group(module_name: str) -> str:
     """The broker consumer group a module's workers share."""
     return f"modulith-{module_name}"
+
+
+def _report_unlisted_listeners(package: str, remote_event_types: list[str]) -> None:
+    """Log the event types ``package`` listens to that ``remote_event_types`` lacks.
+
+    The supervisor builds the list once, when ``modulith run`` starts. A
+    worker restarted since with new code can listen to an event missing from
+    it, which the worker hosting several modules then keeps in memory whenever
+    one of its own modules listens too. A listener with no owning module
+    counts for none, as in ``modulith._inspect``.
+    """
+    from .runtime import _runtime
+
+    bus = _runtime.event_bus
+    assert bus is not None  # bootstrapped
+    listed = set(remote_event_types)
+    missing = sorted(
+        fqn
+        for event_type in bus.registered_event_types()
+        if (fqn := f"{event_type.__module__}.{event_type.__qualname__}") not in listed
+        and any(_runtime._listener_owners.get(h) == package for h in bus.listeners_for(event_type))
+    )
+    if missing:
+        logger.error(
+            "%s listens to %s, which the list of events consumed outside the shared "
+            "worker lacks: its code changed after modulith run started. The shared "
+            "worker may keep these events in memory, so this worker would never "
+            "receive them; restart modulith run (or modulith dev) to rebuild the list.",
+            package,
+            ", ".join(missing),
+        )
 
 
 def _build_consumer(module_name: str, consumer_name: str | None = None) -> Any:

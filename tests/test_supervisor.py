@@ -227,12 +227,30 @@ def test_derive_specs_tells_the_shared_worker_which_events_a_module_elsewhere_co
         }
     )
 
-    envs = {s.module_name: s.env for s in specs}
-    assert envs["billing,orders"] == {
-        "UVICORN_LOG_LEVEL": "info",
-        "MODULITH_REMOTE_EVENT_TYPES": "fakeapp.orders.OrderPlaced,fakeapp.orders.Shipped",
-    }
-    assert envs["agent"] == envs["shipping"] == {"UVICORN_LOG_LEVEL": "info"}
+    # Every worker gets the list: the others check it covers their listeners.
+    assert [s.module_name for s in specs] == ["agent", "billing,orders", "shipping"]
+    assert all(
+        s.env
+        == {
+            "UVICORN_LOG_LEVEL": "info",
+            "MODULITH_REMOTE_EVENT_TYPES": "fakeapp.orders.OrderPlaced,fakeapp.orders.Shipped",
+        }
+        for s in specs
+    )
+
+
+def test_derive_specs_gives_no_remote_event_list_when_the_shared_worker_hosts_one_module() -> None:
+    """A worker hosting one module routes as any such worker does, without the list."""
+    specs = derive_specs_from_config(
+        {
+            "package": "fakeapp",
+            "modules": ["agent", "orders"],
+            "own_process": ["agent"],
+            "consumers": {"fakeapp.orders.OrderPlaced": ["agent", "orders"]},
+        }
+    )
+
+    assert [s.env for s in specs] == [None, None]
 
 
 def test_a_worker_never_inherits_a_remote_event_list_from_the_supervisor(monkeypatch) -> None:

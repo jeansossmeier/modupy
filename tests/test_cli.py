@@ -974,7 +974,11 @@ def test_run_tells_the_shared_worker_which_events_a_module_elsewhere_consumes(
     assert envs["billing,orders"]["MODULITH_REMOTE_EVENT_TYPES"] == (
         "fakeapp.contracts.Noted,fakeapp.contracts.ShipmentBooked"
     )
-    assert "MODULITH_REMOTE_EVENT_TYPES" not in envs["agent"]
+    # agent gets the same list, to check that it covers agent's listeners.
+    assert (
+        envs["agent"]["MODULITH_REMOTE_EVENT_TYPES"]
+        == (envs["billing,orders"]["MODULITH_REMOTE_EVENT_TYPES"])
+    )
 
 
 def test_run_processes_topology_passes_the_worker_liveness_timeout(

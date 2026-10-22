@@ -2811,6 +2811,34 @@ async def test_shared_worker_without_the_supervisors_list_sends_every_event(
     assert broker.attempts == ["fakeapp.contracts.Triaged"]
 
 
+@pytest.mark.parametrize(
+    ("remote", "missing"),
+    [
+        ("fakeapp.contracts.Triaged", True),
+        ("fakeapp.contracts.OrderPlaced,fakeapp.contracts.Triaged", False),
+    ],
+)
+def test_a_worker_of_its_own_reports_a_listener_the_supervisors_list_misses(
+    make_fake_app, monkeypatch, caplog, remote: str, missing: bool
+) -> None:
+    """A worker restarted with new code can listen to an event that the shared
+    worker, given the list when ``modulith run`` started, keeps in memory."""
+    make_fake_app(_SHARED_WORKER_APP)
+    _set_worker_env(monkeypatch, "agent")
+    monkeypatch.setenv("MODULITH_REMOTE_EVENT_TYPES", remote)
+
+    with caplog.at_level(logging.ERROR, logger="modulith.worker"):
+        create_app()
+
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    if missing:
+        assert len(errors) == 1
+        assert "fakeapp.contracts.OrderPlaced" in errors[0]
+        assert "restart modulith run" in errors[0]
+    else:
+        assert errors == []
+
+
 @pytest.mark.parametrize("value", ["billing,,orders", "billing,", " "])
 def test_worker_refuses_an_empty_module_name(make_fake_app, monkeypatch, value: str) -> None:
     make_fake_app(_SHARED_WORKER_APP)

@@ -1456,9 +1456,10 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
         (optional; without it each module gets its own worker)
       - ``consumers`` — ``{event type: [module names]}``, the modules whose
         listeners consume each fully-qualified event type, as
-        ``modulith._inspect`` reports them (optional). The shared worker's
-        ``MODULITH_REMOTE_EVENT_TYPES`` then lists the types a module outside
-        it consumes; without it, that worker sends every event to the broker
+        ``modulith._inspect`` reports them (optional). When the shared worker
+        hosts several modules, every worker's ``MODULITH_REMOTE_EVENT_TYPES``
+        then lists the types a module outside it consumes; without it, that
+        worker sends every event to the broker
 
     Every ``workers`` key other than ``default`` and every ``isolate`` and
     ``own_process`` entry must name a discovered, non-contract module; anything else raises
@@ -1539,6 +1540,12 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
                 groups.append(shared)
             shared.append(name)
 
+    # A worker hosting one module routes as any such worker does, without it.
+    remote = (
+        ",".join(sorted(t for t, modules in consumers.items() if set(modules) - set(shared)))
+        if consumers is not None and len(shared) > 1
+        else None
+    )
     specs: list[WorkerSpec] = []
     port = int(config.get("worker_port_base") or 9001)
     for group in groups:
@@ -1562,10 +1569,8 @@ def derive_specs_from_config(config: dict[str, Any]) -> list[WorkerSpec]:
                 "which runs past port 65535; lower worker_port_base or the replica counts"
             )
         env = worker_env.copy()
-        if group is shared and consumers is not None:
-            env["MODULITH_REMOTE_EVENT_TYPES"] = ",".join(
-                sorted(t for t, modules in consumers.items() if set(modules) - set(group))
-            )
+        if remote is not None:
+            env["MODULITH_REMOTE_EVENT_TYPES"] = remote
         specs.append(
             WorkerSpec(
                 module_name=name,
