@@ -85,8 +85,89 @@ CURL_POST = (
     '-d \'{"customer_id": "alice"}\''
 )
 OPEN_TICKET = "curl -sX POST localhost:8000/tickets -H 'content-type: application/json' -d "
+POST_REVIEW = "curl -sX POST localhost:8000/reviews -H 'content-type: application/json' -d "
+RUN_STUDIO = "modulith run studio.main:app --topology processes --host 127.0.0.1"
 
 RUNBOOKS: dict[str, tuple[Section, ...]] = {
+    "ai_studio": (
+        # Like agent_desk, it needs LangGraph, so this runbook runs from the
+        # built wheel only.
+        Section(
+            "Install and look around",
+            (
+                Step("pip install 'modupy[fastapi,cli,postgres]' aiosqlite 'langgraph>=1.2,<2'"),
+                Step("modulith info"),
+                Step("modulith verify"),
+            ),
+            repo_env=False,
+        ),
+        Section(
+            "Run its tests", (Step("pip install pytest pytest-timeout httpx2"), Step("pytest"))
+        ),
+        Section(
+            "Run it in one process",
+            (
+                Step("modulith migrate"),
+                Step("python -m studio.schema"),
+                Step("uvicorn studio.main:app", serve=True),
+                Step(
+                    POST_REVIEW + '\'{"review_id": "r-1", "product": "mug", "rating": 5, '
+                    '"text": "Lovely glaze."}\''
+                ),
+                Step("curl -s localhost:8000/reviews/r-1", eventually=True),
+                Step(
+                    POST_REVIEW + '\'{"review_id": "r-2", "product": "mug", "rating": 1, '
+                    '"text": "Total scam."}\''
+                ),
+                Step("curl -s localhost:8000/reviews/r-2", eventually=True),
+                Step("curl -s localhost:8000/summaries/mug"),
+            ),
+        ),
+        Section(
+            "When the summarizer hangs",
+            (
+                Step("export STUDIO_SUMMARIES_FAULT=hang"),
+                Step("uvicorn studio.main:app", serve=True),
+                Step("curl -s localhost:8000/summaries/mug"),
+                Step("curl -s localhost:8000/reviews/r-1"),
+            ),
+        ),
+        Section(
+            "Give moderation its own process",
+            (
+                Step("export STUDIO_SUMMARIES_FAULT="),
+                Step(RUN_STUDIO, serve=True),
+                Step(
+                    POST_REVIEW + '\'{"review_id": "r-3", "product": "mug", "rating": 2, '
+                    '"text": "The handle broke."}\''
+                ),
+                Step("curl -s localhost:8000/reviews/r-3", eventually=True),
+                Step("curl -s localhost:8000/_modulith/health", eventually=True),
+            ),
+        ),
+        Section(
+            "When moderation crashes",
+            (
+                Step("export STUDIO_MODERATION_FAULT=crash"),
+                Step(RUN_STUDIO, serve=True),
+                Step(
+                    POST_REVIEW + '\'{"review_id": "r-4", "product": "mug", "rating": 4, '
+                    '"text": "Keeps tea hot."}\''
+                ),
+                Step("curl -s localhost:8000/reviews/r-4", eventually=True),
+                Step("curl -s localhost:8000/summaries/mug"),
+            ),
+        ),
+        Section(
+            "Fix moderation",
+            (
+                Step("export STUDIO_MODERATION_FAULT="),
+                Step(RUN_STUDIO, serve=True),
+                Step("curl -s localhost:8000/reviews/r-4", eventually=True),
+                Step("curl -s localhost:8000/summaries/mug"),
+            ),
+        ),
+    ),
     "agent_desk": (
         # The repo environment has no LangGraph (see the mypy override in
         # pyproject.toml), so this runbook runs from the built wheel only.
