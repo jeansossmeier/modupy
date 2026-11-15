@@ -123,11 +123,11 @@ from myapp.orders import router as orders_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    bootstrap()     # binds the outbox store from outbox_url
+    bootstrap()  # binds the outbox store from outbox_url
     outbox.start()  # retry loop, plus a sweep for what a crash left undelivered
     yield
     await outbox.shutdown()  # stops the loop, closes the engine modupy built
-    await engine.dispose()   # your own engine
+    await engine.dispose()  # your own engine
 
 
 app = FastAPI(lifespan=lifespan)

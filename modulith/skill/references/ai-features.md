@@ -136,7 +136,9 @@ async def write_thank_you_note(event: OrderCreated) -> None:
     async with sessionmaker() as session:  # 1. read, then give the connection back
         if await session.get(Note, event.order_id) is not None:
             return  # delivered again: at least once
-    text = await model.generate(f"Write a thank-you note for order {event.order_id}")  # 2. nothing held
+    text = await model.generate(
+        f"Write a thank-you note for order {event.order_id}"
+    )  # 2. nothing held
     async with sessionmaker() as session:  # 3. a short transaction for the result
         token = bind_session(session)
         try:

@@ -199,11 +199,11 @@ from modulith import declare_module
 from myapp import orders
 
 declare_module(
-    publishes=["OrderCreated"],            # must be importable as myapp.orders.OrderCreated
-    consumes=["PaymentReceived"],          # descriptive only
-    listeners=[orders.on_payment],         # each must have registered
-    owns_tables=["orders_order"],          # feeds the data-ownership rule
-    declared_dependencies=["contracts"],   # feeds the undeclared-dependency rule
+    publishes=["OrderCreated"],  # must be importable as myapp.orders.OrderCreated
+    consumes=["PaymentReceived"],  # descriptive only
+    listeners=[orders.on_payment],  # each must have registered
+    owns_tables=["orders_order"],  # feeds the data-ownership rule
+    declared_dependencies=["contracts"],  # feeds the undeclared-dependency rule
 )
 ```
 
