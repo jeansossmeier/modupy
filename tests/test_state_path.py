@@ -9,7 +9,6 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -375,7 +374,10 @@ def test_state_file_rejects_path_races(
             changed_kind == "file" and stat.S_ISREG(info.st_mode)
         )
         if is_selected_kind:
-            return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino + 1)
+            # A whole stat result: pytest's own capture reads st_size through os.fstat too.
+            fields = list(info)
+            fields[stat.ST_INO] = info.st_ino + 1
+            return os.stat_result(fields)
         return info
 
     monkeypatch.setattr(os, "fstat", changed_fstat)

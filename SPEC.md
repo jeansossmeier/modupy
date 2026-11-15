@@ -1140,6 +1140,9 @@ modulith_isolated_timeout = "120"
 ### Commands
 
 ```
+modulith init NAME [DIR] [--empty] [--skill/--no-skill] [--install] [--ci=github]
+modulith add module NAME
+modulith skill install [--user] [--dir=PATH]
 modulith dev APP_MODULE [--topology=single|processes] [--isolate=MODULE] [--reload/--no-reload] [--host=HOST] [--port=PORT] [--log-level=LEVEL] [--worker-port-base=PORT]
 modulith run APP_MODULE [--topology=single|processes] [--workers=JSON] [--host=HOST] [--port=PORT] [--log-level=LEVEL] [--worker-port-base=PORT]
 modulith verify [--mode=strict|ratchet] [--baseline=PATH] [--update-baseline] [--fail-on-warnings]
@@ -1159,6 +1162,12 @@ modulith broker dead-letter [--list|--retry-all]
 modulith broker drop-group GROUP [--target=TARGET] [--force] [--yes]
 modulith info  # show detected config, modules, plugins
 ```
+
+`init` takes a required positional `NAME`, a lowercase package name, and writes the quickstart project (`examples/quickstart`, file for file, under that name) into a new `./NAME`, or into the optional `DIR` (`.` for the current directory, such as a fresh repository), then prints the commands that install, test and run it. `--empty` writes its `pyproject.toml` with an app that mounts no router, an empty `contracts/events.py` and one test instead. A `.gitignore` is written unless `DIR` holds one, and the skill is installed as `skill install` does into the project root, unless `--no-skill` or `DIR` holds an earlier install of it, which is kept. `--install` then creates `.venv` with the project's dependencies, through `uv sync --extra test` when `uv` is on `PATH`, else `python -m venv` and pip, and exits 1 when that fails, keeping the files and printing the commands still to run. `--ci=github` adds `.github/workflows/ci.yml`, which runs `modulith verify`, pytest and ruff through uv. It imports no application code, refuses `tests`, a name that is already importable (`modulith`, `json`) and the name of one of the starter's dependencies (`modupy`), and never overwrites: before writing anything it refuses an existing `./NAME`, a `DIR` that already holds a `pyproject.toml`, `NAME`, `tests` or, with `--ci`, the workflow, a file where one of the project's directories goes, and a `modupy` in a skills directory that is not the skill.
+
+`add module` takes a required positional `NAME`, a lowercase module name other than the contracts package's, and writes `NAME/__init__.py` and `NAME/api.py`, a router with one route, into the application package of the nearest `pyproject.toml` (`PACKAGE/` or `src/PACKAGE/` beside it), and `tests/test_NAME.py`. When the package's `main.py` is writable and builds `app = FastAPI(...)` at top level, it adds the router's import where ruff's isort puts it and its `app.include_router(..., prefix="/NAME")`, splitting either past 88 characters, and replaces the file through a rename, keeping its line endings; the test then requests `main.py`'s app. Otherwise, an app from a factory included, it prints those two lines and exits 0, and the test serves the router on an app of its own. It imports no application code and never overwrites: an existing `NAME` package or file, or test file, or a file where one of their directories goes, is refused with exit 1 before anything is written.
+
+`skill install` copies the packaged Agent Skill (`modulith/skill`: a `SKILL.md` and the reference files it links to) to a `modupy` directory inside each skills directory: `.claude/skills` and `.agents/skills` next to the nearest `pyproject.toml` (else in the current directory), the same two under the home directory with `--user`, or only the directories given with `--dir` (repeatable; not with `--user`). It imports no application code and needs no `pyproject.toml`. Running it again replaces an earlier install, so a file the new version no longer ships is removed; a `modupy` that is anything else (a symlink, a file, a directory whose `SKILL.md` does not declare `name: modupy`), or a file or dangling symlink where a skills directory has to be created, is refused with exit 1 before any location is written.
 
 `dev` and `run` take a required positional `APP_MODULE` (the ASGI app, e.g. `myapp.main:app`); `audit` takes an optional positional `PATH` (the codebase root, default `.`; a project root resolves to its single application package, see [§8.4](#84-the-audit-tool)).
 
@@ -1386,6 +1395,9 @@ What each file is. [ROADMAP.md](ROADMAP.md) holds the live delivery status, and 
 | `_claims.py` | ✅ | Claim strategies (`lease`, `advisory_lock`, `none`) and the store capabilities the outbox sweep checks for |
 | `_health_failures.py` | ✅ | Broker-operation failures that hold a consumer's health at `degraded` |
 | `_shutdown.py` | ✅ | Bounded cancellation for consumer shutdown |
+| `_starter.py` | ✅ | `modulith init`: the starter project, the quickstart example file for file; `modulith add module`: a new module |
+| `_skill.py` | ✅ | `modulith skill install`: copy the packaged skill into a skills directory |
+| `skill/` | ✅ | The Agent Skill that teaches AI coding assistants modupy: `SKILL.md` and its `references/` |
 | `extract.py` | ✅ | `modulith extract`: scaffold a standalone service from one module |
 | `k8s.py` | ✅ | `modulith k8s-manifest`: a Deployment and Service per module plus one Ingress |
 | `openapi.py` | ✅ | `modulith openapi`: build each module's OpenAPI document and merge them |
