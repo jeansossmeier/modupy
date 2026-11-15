@@ -268,6 +268,7 @@ jobs:
                   "modulith/py.typed",
               }
           )
+          required.update(path.as_posix() for path in Path("modulith/skill").rglob("*.md"))
 
           # An sdist puts everything under one `<distribution>-<version>/` root
           # and a wheel puts metadata under `<distribution>-<version>.dist-info/`.
@@ -325,6 +326,7 @@ jobs:
           /tmp/smoke/bin/pip install "${WHL}[all]"
           /tmp/smoke/bin/python -c "import modulith; print(modulith.__name__)"
           /tmp/smoke/bin/modulith --help
+          /tmp/smoke/bin/modulith skill install --dir /tmp/smoke/skills
           /tmp/smoke/bin/python -c "from importlib.metadata import entry_points; eps = entry_points(group='console_scripts'); assert any(e.name == 'modulith' for e in eps)"
           /tmp/smoke/bin/python - <<'PY'
           from pathlib import Path

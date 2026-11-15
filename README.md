@@ -129,6 +129,30 @@ It exits with code 1, so CI fails.
 Add it to your agent's instructions (`AGENTS.md`, `CLAUDE.md`) and the agent can catch the mistake before you see it.
 Small modules with a public API also keep the context an assistant needs small, and `modulith docs` draws Mermaid diagrams of how your modules connect.
 
+An assistant that has never seen modupy guesses at its API.
+modupy ships an [Agent Skill](https://agentskills.io) that teaches it: modules and contracts, the outbox, processes and brokers, deployment, testing, configuration and the CLI, with recipes, troubleshooting and a guide to adopting modupy in existing code.
+`modulith init` installs it in every project it starts, and in a project you already have one command copies it in:
+
+```bash
+pip install 'modupy[cli]'
+modulith skill install
+```
+
+With uv, run `uv add 'modupy[cli]'` and then `uv run modulith skill install`.
+It writes `.claude/skills/modupy` and `.agents/skills/modupy` next to your `pyproject.toml`, where these assistants look for skills, so commit both and your whole team's assistants have them:
+
+| Assistant | In the project | Under your home directory, with `--user` |
+|---|---|---|
+| [Claude Code](https://code.claude.com/docs/en/skills) | `.claude/skills` | `~/.claude/skills` |
+| [Codex](https://learn.chatgpt.com/docs/build-skills) | `.agents/skills` | `~/.agents/skills` |
+| [Cursor](https://cursor.com/docs/context/skills) | `.agents/skills`, `.claude/skills` | `~/.agents/skills`, `~/.claude/skills` |
+| [Gemini CLI](https://geminicli.com/docs/cli/skills/) | `.agents/skills` | `~/.agents/skills` |
+| [GitHub Copilot](https://docs.github.com/en/copilot/concepts/agents/about-agent-skills) | `.agents/skills`, `.claude/skills` | `~/.agents/skills` |
+| [OpenCode](https://opencode.ai/docs/skills/) | `.agents/skills`, `.claude/skills` | `~/.agents/skills`, `~/.claude/skills` |
+
+`--user` installs it for all your projects, and `--dir PATH` writes to any other skills directory instead.
+Run the command again after upgrading modupy to replace the skill with the new version's; a `modupy` there that is not this skill is never overwritten.
+
 ## The 30-second pitch
 
 Three modules and one shared contract.
@@ -317,6 +341,11 @@ The other extras are `postgres` (the durable outbox), `redis` and `database` (br
 The core alone, `pip install modupy`, has one dependency: `pluggy`.
 
 ### Lay out your project
+
+`modulith init myapp` writes the example above and its tests into a new `myapp` directory, ready to run, with a `.gitignore` and the AI skill, and `modulith init myapp .` writes them into the current directory, such as a fresh repository.
+`--empty` leaves out the sample modules, `--install` creates `.venv` with the dependencies (`uv sync` when uv is installed, else pip), `--ci github` adds a GitHub Actions workflow that runs `modulith verify`, pytest and ruff, and `--no-skill` skips the skill.
+`modulith add module billing` then adds a module: its package with a router, a test, and the router's mount in `main.py`.
+To lay a project out yourself:
 
 ```text
 myproject/
@@ -636,6 +665,9 @@ Every setting directly under `[tool.modulith]` can also come from an environment
 
 | Command | What it does | When you use it |
 |---|---|---|
+| `modulith init myapp` | writes the quickstart project, with its tests, a `.gitignore` and the AI skill, into a new `myapp` directory, or with `.` into the current one; `--empty` without the sample modules, `--install` with a ready `.venv`, `--ci github` with a CI workflow | starting a project |
+| `modulith add module billing` | adds a module with a router and its test, and mounts the router in `main.py` | growing a project |
+| `modulith skill install` | copies the modupy skill for AI coding assistants into `.claude/skills` and `.agents/skills` | starting a project, and after each upgrade |
 | `modulith dev myapp.main:app` | runs with auto-reload and prints boundary warnings at startup | local development |
 | `modulith run myapp.main:app` | runs for production; add `--topology processes` for one process per module | deploying |
 | `modulith verify` | checks module boundaries and exits 1 on a violation | CI, and AI agents |
@@ -655,7 +687,7 @@ Every setting directly under `[tool.modulith]` can also come from an environment
 
 Commands that inspect your modules find your package through `[tool.modulith].package`, else `[project].name`.
 `disabled_rules = ["use-contracts"]` under `[tool.modulith.verify]` turns off boundary rules by their rule name, whether a built-in rule or one a plugin contributes, in `verify`, `doctor` and the `strict_boundaries` startup check; `parse-error` cannot be turned off.
-Every command except `audit` and `migrate` imports your modules, `verify` included, so run them only on code you trust and where your app's dependencies are installed.
+Every command except `init`, `add module`, `skill install`, `audit` and `migrate` imports your modules, `verify` included, so run them only on code you trust and where your app's dependencies are installed.
 `modulith dev` and `modulith run` take `--log-level` (default `info`) for the supervisor and every worker; in one process they hand over to uvicorn, so modupy's startup banner shows only if your app configures logging, as `myapp/main.py` does.
 With `strict_boundaries = true`, `verify`, `run --topology processes` and `dev --topology=processes` fail on warnings too; a single-process `run` fails when the app first boots modupy, and single-process `modulith dev` stays warn-only by design.
 Exit codes: 0 for success, 1 for violations or bad input, 2 for an internal error or a CLI usage error.

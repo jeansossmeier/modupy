@@ -7,6 +7,9 @@ dependencies = ["modupy[fastapi,cli]"]
 [project.optional-dependencies]
 test = ["pytest", "httpx2"]
 
+[tool.modulith]
+package = "myapp"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

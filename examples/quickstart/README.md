@@ -29,8 +29,9 @@ pip install 'modupy[fastapi,cli]'
 ```
 
 The project is not installed: `uvicorn` and `modulith` both put the current
-directory on the import path. `pyproject.toml` names the package (`myapp`), and
-that is all the CLI needs to find the modules.
+directory on the import path. `pyproject.toml` names the package under
+`[tool.modulith]` (`package = "myapp"`), and that is all the CLI needs to find
+the modules; it also lets a test publish an event from its own body.
 
 ```bash
 $ modulith info

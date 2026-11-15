@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -938,6 +939,264 @@ def _run_process_topology(
         # internal bugs.
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from None
+
+
+# ---------------------------------------------------------------------------
+# modulith init — write a starter project
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def init(
+    name: str = typer.Argument(..., help="Package name"),
+    directory: Path | None = typer.Argument(
+        None,
+        help="Project directory; may exist, as `.` does, but must not hold a "
+        "pyproject.toml, NAME or tests (default: a new ./NAME)",
+    ),
+    empty: bool = typer.Option(
+        False, "--empty", help="Leave out the sample orders, payments and inventory modules."
+    ),
+    skill: bool = typer.Option(
+        True, "--skill/--no-skill", help="Install the modupy skill for AI coding assistants."
+    ),
+    install: bool = typer.Option(
+        False,
+        "--install",
+        help="Create .venv with the dependencies: `uv sync` when uv is on PATH, else pip.",
+    ),
+    ci: str | None = typer.Option(
+        None, "--ci", help="Write a CI workflow running verify, pytest and ruff: github."
+    ),
+) -> None:
+    """Write a runnable starter project into a new ./NAME, or into DIRECTORY.
+
+    The project is the quickstart example under your package name: three
+    modules that talk through two events, a FastAPI app and its tests, with no
+    database or broker to set up; `--empty` leaves the modules out. It gets a
+    .gitignore and the modupy skill in .claude/skills and .agents/skills,
+    each kept as it is when it exists already. `modulith init myapp .` starts
+    it in the current directory, such as a fresh repository. Nothing is
+    overwritten.
+    Exit codes: 0 on success, 1 when NAME cannot be the package name, a path
+    the project needs already exists, or `--install` fails.
+    """
+    from ._skill import NAME as SKILL
+    from ._skill import _is_installed, install_skill
+    from ._starter import requirements, write_starter
+
+    if ci not in (None, "github"):
+        typer.echo(f"error: --ci {ci!r} is not supported; the only choice is 'github'", err=True)
+        raise typer.Exit(code=1)
+    root = Path.cwd() / name if directory is None else directory
+    skills_dirs = [root / ".claude" / "skills", root / ".agents" / "skills"] if skill else []
+    try:
+        # Only a DIRECTORY can hold a skill already; a new ./NAME is checked below.
+        kept = [
+            skills_dir
+            for skills_dir in (skills_dirs if directory is not None else [])
+            if _is_installed(skills_dir / SKILL)
+        ]
+    except OSError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    try:
+        written = write_starter(
+            name, root, existing_ok=directory is not None, empty=empty, github_ci=ci == "github"
+        )
+    except FileExistsError as exc:
+        taken = os.path.relpath(exc.filename or exc.args[0])
+        typer.echo(f"error: {taken} already exists; init never overwrites it", err=True)
+        raise typer.Exit(code=1) from None
+    except (OSError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(f"created {name} ({len(written)} file(s)):")
+    for rel in written:
+        typer.echo(f"  {rel}")
+    if ".gitignore" not in written:
+        typer.echo("kept the existing .gitignore; have it ignore .venv/ and .modulith-schemas.json")
+    for skills_dir in kept:
+        where = os.path.relpath(skills_dir / SKILL)
+        typer.echo(
+            f"kept the existing modupy skill in {where}; `modulith skill install` updates it"
+        )
+    try:
+        new = [skills_dir for skills_dir in skills_dirs if skills_dir not in kept]
+        for target, _ in install_skill(new) if new else []:
+            typer.echo(f"installed the modupy skill in {os.path.relpath(target)}")
+    except OSError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    cd = (
+        []
+        if root.resolve() == Path.cwd().resolve()
+        else [shlex.join(["cd", os.path.relpath(root)])]
+    )
+    if install:
+        run, steps = _install_starter(root, requirements(), cd)
+    else:
+        run, steps = "", [shlex.join(["pip", "install", *requirements()])]
+    steps = [
+        *cd,
+        *steps,
+        f"{run}pytest",
+        f"{run}modulith dev {name}.main:app",
+        f"{run}modulith add module NAME  # a new module with its routes and a test",
+    ]
+    if not skill:
+        steps.append(f"{run}modulith skill install  # teaches AI coding assistants modupy")
+    typer.echo("next:\n" + "".join(f"  {step}\n" for step in steps), nl=False)
+
+
+def _install_starter(root: Path, requirements: list[str], cd: list[str]) -> tuple[str, list[str]]:
+    """Create ``root/.venv`` holding the project's dependencies.
+
+    Uses ``uv sync`` when uv is on PATH, else the venv module and pip. Returns
+    the prefix that runs a tool in the environment (``uv run ``) and the step
+    that activates it, for the printed next steps. A failing command exits 1
+    and prints ``cd``, the step into ``root``, and the commands left to run;
+    the project files stay.
+    """
+    if shutil.which("uv"):
+        commands, run, steps = [["uv", "sync", "--extra", "test"]], "uv run ", []
+    else:
+        scripts = root / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+        commands = [
+            [sys.executable, "-m", "venv", ".venv"],
+            [str(scripts / "python"), "-m", "pip", "install", *requirements],
+        ]
+        run = ""
+        steps = [r".venv\Scripts\activate" if os.name == "nt" else "source .venv/bin/activate"]
+    for index, command in enumerate(commands):
+        typer.echo(f"running: {shlex.join(command)}")
+        try:
+            subprocess.run(command, cwd=root, check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            left = [*cd, *(shlex.join(rest) for rest in commands[index:])]
+            typer.echo(
+                f"error: {str(exc).rstrip('.')}; the project is written, so install its "
+                "dependencies yourself:\n" + "".join(f"  {step}\n" for step in left),
+                err=True,
+                nl=False,
+            )
+            raise typer.Exit(code=1) from None
+    return run, steps
+
+
+# ---------------------------------------------------------------------------
+# modulith add — add code to a project
+# ---------------------------------------------------------------------------
+
+add_app = typer.Typer(help="Add code to a modupy project.")
+app.add_typer(add_app, name="add")
+
+
+@add_app.command("module")
+def add_module(name: str = typer.Argument(..., help="Module name")) -> None:
+    """Add a module with a router and its test, and mount the router in main.py.
+
+    Writes NAME/__init__.py and NAME/api.py in the application package, and
+    tests/test_NAME.py, then mounts the router at /NAME in the package's
+    main.py when it builds `app = FastAPI(...)`. Imports no application code,
+    and overwrites nothing. Exit codes:
+    0 on success, also when main.py could not be changed (the lines to add are
+    printed), 1 when there is no project or package, NAME cannot be a module
+    name, or a path the module needs already exists.
+    """
+    from ._starter import mount_lines, write_module
+
+    pyproject = _find_pyproject()
+    if pyproject is None:
+        typer.echo(
+            "error: no pyproject.toml here or above; start a project with `modulith init`",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    try:
+        resolved = load_configuration()
+    except ConfigurationError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    package = resolved.package or _detect_from_pyproject_name()
+    if package is None:
+        typer.echo(
+            "error: could not determine the application package. Set "
+            "[tool.modulith].package or [project].name in pyproject.toml.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    try:
+        written, main = write_module(
+            pyproject.parent, package, name, contracts=resolved.contracts_module
+        )
+    except FileExistsError as exc:
+        taken = os.path.relpath(exc.filename or exc.args[0])
+        typer.echo(f"error: {taken} already exists; add never overwrites it", err=True)
+        raise typer.Exit(code=1) from None
+    except (OSError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(f"created module {name}:")
+    for rel in written:
+        typer.echo(f"  {rel}")
+    if main is not None:
+        typer.echo(f"mounted its router at /{name} in {main}")
+    else:
+        typer.echo(
+            "warning: no main.py in the package that could be changed builds "
+            "`app = FastAPI(...)` at top level, so the router is not mounted; add these "
+            "lines where your app is built:\n"
+            + "".join(f"  {line}\n" for line in mount_lines(package, name)),
+            err=True,
+            nl=False,
+        )
+    run = "uv run " if (pyproject.parent / "uv.lock").is_file() else ""
+    typer.echo(f"next:\n  {run}pytest\n  {run}modulith verify")
+
+
+# ---------------------------------------------------------------------------
+# modulith skill — the Agent Skill that teaches AI coding assistants modupy
+# ---------------------------------------------------------------------------
+
+skill_app = typer.Typer(help="The modupy skill for AI coding assistants.")
+app.add_typer(skill_app, name="skill")
+
+
+@skill_app.command("install")
+def skill_install(
+    user: bool = typer.Option(
+        False, "--user", help="Install under your home directory, for every project."
+    ),
+    dirs: list[Path] = typer.Option(
+        [], "--dir", help="Skills directory to install into instead (repeatable)."
+    ),
+) -> None:
+    """Install the modupy skill where AI coding assistants look for skills.
+
+    Writes it as a `modupy` directory inside `.claude/skills` and
+    `.agents/skills`, next to the nearest pyproject.toml (else in the current
+    directory), or under your home directory with `--user`. Running it again
+    replaces the skill with this version's. Imports no application code. Exit
+    codes: 0 on success, 1 when a `modupy` that is not this skill is in the way;
+    nothing is written then.
+    """
+    from ._skill import install_skill
+
+    if user and dirs:
+        typer.echo("error: --user and --dir are mutually exclusive", err=True)
+        raise typer.Exit(code=1)
+    if not dirs:
+        pyproject = None if user else _find_pyproject()
+        root = Path.home() if user else pyproject.parent if pyproject else Path.cwd()
+        dirs = [root / ".claude" / "skills", root / ".agents" / "skills"]
+    try:
+        written = install_skill(dirs)
+    except OSError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    for target, updated in written:
+        typer.echo(f"{'updated' if updated else 'installed'} {target}")
 
 
 # ---------------------------------------------------------------------------

@@ -664,6 +664,28 @@ def test_build_smoke_loads_the_packaged_alembic_ini(
     )
 
 
+def test_build_job_ships_the_agent_skill_and_installs_it_from_the_wheel() -> None:
+    """Both archives must carry the skill, and the built wheel must install it.
+
+    The skill is Markdown under ``modulith/skill`` that ``modulith skill
+    install`` finds through ``importlib.resources``. Dropped from an archive it
+    leaves the command nothing to copy, which only a run from the installed
+    wheel shows.
+    """
+    scripts = {
+        step.get("name"): step["run"]
+        for step in _job_steps("build")
+        if isinstance(step.get("run"), str)
+    }
+    assert re.search(
+        r'required\.update\(.*Path\("modulith/skill"\)\.rglob\("\*\.md"\)',
+        scripts["Inspect distribution contents"],
+    ), "inspection `required` set must include every Markdown file under modulith/skill"
+    assert _has_shell_command(
+        scripts["Smoke-test wheel installs"], ["/tmp/smoke/bin/modulith", "skill", "install"]
+    ), "build smoke must run `modulith skill install` from the installed wheel"
+
+
 def test_header_comment_lists_all_optional_extras() -> None:
     """The top-of-file comment enumerating extras must not drift from reality."""
     header = "\n".join(PYPROJECT.read_text(encoding="utf-8").splitlines()[:10])
